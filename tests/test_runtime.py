@@ -1048,6 +1048,45 @@ class AnthropicRuntimeTests(unittest.TestCase):
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
         self.assertEqual([u.get('purpose') for u in usage], ['keep_warm', 'keep_warm', None])
 
+    def test_a_turns_reply_follows_the_schema_it_was_sent_with(self):
+        client, model, path = self.start(settings={'keep_warm': 1})
+        client.request('create', bot='Bob', workspace=str(path), effort='low')
+        schema = {'type': 'object', 'additionalProperties': False, 'required': ['a'],
+                  'properties': {'a': {'type': 'string'}}}
+        def submit(request_id, prompt, **fields):
+            return client.request('submit', bot='Bob', request_id=request_id, prompt=prompt, **fields)
+        self.assertEqual(submit('x1', 'hello', output_schema=['no'])['error'], 'invalid_output_schema')
+        self.assertEqual(submit('x2', 'hello', output_schema={'description': 'x' * 65_536})['error'],
+                         'invalid_output_schema')
+        # It shapes the reply of the turn it starts; a steer joins one.
+        for delivery in ('steer', 'attach'):
+            self.assertEqual(submit('x3', 'hello', output_schema=schema, delivery=delivery)['error'],
+                             'invalid_delivery')
+        # Every call of the turn asks for it, beside the effort, and the
+        # tools stay callable.
+        turn = submit('s1', 'tool:shared', output_schema=schema)['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        first, second = model.requests.get(timeout=1), model.requests.get(timeout=1)
+        for sent in (first, second):
+            self.assertEqual(sent['output_config'],
+                             {'effort': 'low', 'format': {'type': 'json_schema', 'schema': schema}})
+            self.assertNotIn('tool_choice', sent)
+        # Its calls are never refreshed: `max_tokens: 0` refuses a
+        # structured output, so the refresh could only fail.
+        model.generate_delay = 2.5
+        turn = submit('s2', 'long', output_schema=schema)['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = []
+        while not model.requests.empty():
+            requests.append(model.requests.get())
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]['output_config']['format']['schema'], schema)
+        # A turn sent without one is free text.
+        model.generate_delay = 0
+        turn = submit('s3', 'hello')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(model.requests.get(timeout=1)['output_config'], {'effort': 'low'})
+
     def test_a_refresh_in_flight_when_the_reply_ends_carries_into_the_tool(self):
         client, model, path = self.start(settings={'keep_warm': 1})
         model.generate_delay = 1.5

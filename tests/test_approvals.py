@@ -1294,7 +1294,7 @@ class Judge:
         if self.failures:
             self.failures -= 1
             return 'They look fine to me.'
-        return json.dumps({id: assessed(self.answer(round, id)) for id in round['assess']})
+        return verdicts(round, lambda id: assessed(self.answer(round, id)))
 
 
 def risky(round, id):
@@ -1307,14 +1307,21 @@ def risky(round, id):
 def assessed(p):
     """A model judge's assessment for a call the stand-in scores `p`."""
     if p < .5:
-        return {'outcome': 'allow'}
+        return {'risk_level': 'low', 'user_authorization': 'unknown', 'outcome': 'allow',
+                'rationale': ''}
     return {'risk_level': 'high', 'user_authorization': 'unknown', 'outcome': 'deny',
             'rationale': 'It deletes data nobody asked to delete.'}
 
 
+def verdicts(round, assessment):
+    """A model judge's reply to a round, as its verdict schema holds it:
+    `assessment(id)` for every call it asks about."""
+    return json.dumps({'assessments': [{'id': id, **assessment(id)} for id in round['assess']]})
+
+
 def allow_all(user):
     """A model judge's reply allowing every call a round asks about."""
-    return json.dumps({id: {'outcome': 'allow'} for id in json.loads(user)['assess']})
+    return verdicts(json.loads(user), lambda id: assessed(0))
 
 
 REJECTED = 'This action was rejected due to unacceptable risk'
@@ -1404,8 +1411,8 @@ class AutoApproverTests(ModelFixture):
                 return None
             round = json.loads(user)
             asked.put((request, round))
-            answers = {id: assessed(risky(round, id)) for id in round['assess']}
-            return 'Answers: ' + json.dumps(answers) if parsed[0] else 'They look fine to me.'
+            return verdicts(round, lambda id: assessed(risky(round, id))) if parsed[0] \
+                else 'They look fine to me.'
         self.model.reply_for = reply
         self.model.models = ('synthetic-model', 'judge-model')
         daemon = self.daemon(tools='echo,shell,wait,read')
@@ -1463,6 +1470,10 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(request['model'], 'judge-model')
         self.assertEqual(sorted(t['name'] for t in request.get('tools') or []), sorted(LOOKING))
         self.assertIn('You judge tool calls', json.dumps(request))
+        # The provider holds its reply to the verdict's schema.
+        shape = request['text']['format']
+        self.assertEqual((shape['type'], shape['strict']), ('json_schema', True))
+        self.assertEqual(shape['schema']['required'], ['assessments'])
         self.assertEqual(round['state']['request'], [{'by': 'person', 'text': 'shell:printf safe > out'}])
         self.assertEqual(round['assess'], ['c1'])
         self.assertIn('# Outcome policy', json.dumps(request))
@@ -1474,15 +1485,16 @@ class AutoApproverTests(ModelFixture):
         reason = self.denial(daemon, risky_turn)
         self.assertTrue(reason.startswith(REJECTED + ' (risk: high, authorization: unknown).\nReason: It deletes'),
                         reason)
-        # A reply without every assessment is a failed check, not an allow.
+        # A reply that is not the verdict's JSON is a failed check, not an
+        # allow, and says so.
         parsed[0] = False
         vague = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf vague')['result']['turn']
         self.assertEqual(daemon.finished(vague)['data']['status'], 'completed')
-        self.assertTrue(self.denial(daemon, vague).startswith(FAILED + "the judge's answer did not parse."))
+        self.assertTrue(self.denial(daemon, vague).startswith(FAILED + "the judge's answer was not the JSON asked for."))
         events = [lines.get(timeout=5) for _ in range(3)]
         # The reply it could not read is kept, redacted, to be read later.
         self.assertIn({'event': 'judge_failed', 'bot': 'Bob', 'turn': vague,
-                       'detail': "the judge's answer did not parse", 'reply': 'They look fine to me.'}, events)
+                       'detail': "the judge's answer was not the JSON asked for", 'reply': 'They look fine to me.'}, events)
         # Each round's fork expires if the approver stops, and goes once it
         # is answered; the base stays.
         base = bots['approver.auto']['bot_id']

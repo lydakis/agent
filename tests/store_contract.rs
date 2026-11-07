@@ -169,6 +169,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         budget_counts: Default::default(),
         images: Vec::new(),
         wait_ms: None,
+        output_schema: None,
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch, |_, _| {
@@ -3391,6 +3392,83 @@ fn a_store_that_cannot_be_copied_is_not_migrated() {
 }
 
 #[test]
+fn a_turn_keeps_the_schema_its_reply_follows() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema80-output-schema-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let schema = r#"{"type":"object"}"#;
+    let shaped = |schema: Option<&str>| TurnOptions {
+        output_schema: schema.map(Into::into),
+        ..TurnOptions::default()
+    };
+    let earlier = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Ann", Some("/synthetic"), binding()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        db.begin("Ann", "r0", "go", true, &shaped(None), allow_provider)
+            .unwrap()
+            .turn
+    };
+    // A store from before schema 81: its turns asked for no schema.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE turns DROP COLUMN output_schema; PRAGMA user_version=80;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let started = db
+        .begin(
+            "Bob",
+            "r1",
+            "go",
+            true,
+            &shaped(Some(schema)),
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(
+        db.context(started.turn).unwrap().output_schema.as_deref(),
+        Some(schema)
+    );
+    // Kept with the turn, which a resumed turn reads its context from.
+    drop(db);
+    let kept = |turn: i64| -> Option<String> {
+        Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT output_schema FROM turns WHERE id=?", [turn], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(kept(earlier), None);
+    assert_eq!(kept(started.turn).as_deref(), Some(schema));
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // Part of the request: a retry names the same one.
+    assert!(
+        !db.begin(
+            "Bob",
+            "r1",
+            "go",
+            true,
+            &shaped(Some(schema)),
+            allow_provider
+        )
+        .unwrap()
+        .fresh
+    );
+    for other in [None, Some(r#"{"type":"array"}"#)] {
+        let conflict = db
+            .begin("Bob", "r1", "go", false, &shaped(other), allow_provider)
+            .unwrap_err();
+        assert_eq!(conflict.code, "idempotency_conflict");
+        assert_eq!(conflict.facts.unwrap()["field"], "output_schema");
+    }
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
     let path = std::env::temp_dir().join(format!(
         "agent-schema78-taken-{}.sqlite",
@@ -5702,6 +5780,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         budget_counts: Default::default(),
         images: Vec::new(),
         wait_ms: None,
+        output_schema: None,
     };
     let started = db
         .begin("Bob", "r1", "work", true, &options, allow_provider)
@@ -5836,6 +5915,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         budget_counts: Default::default(),
         images: Vec::new(),
         wait_ms: None,
+        output_schema: None,
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options, allow_provider)
@@ -7275,6 +7355,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 budget_counts: Default::default(),
                 images: Vec::new(),
                 wait_ms: None,
+                output_schema: None,
             },
             allow_provider,
         )

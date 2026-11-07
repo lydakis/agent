@@ -475,9 +475,14 @@ this replaced:
   call redone another way is judged as it was; ordinary work (the old
   "person trusts the agent" list) is low risk; and reaching the approval
   channel is `critical` whatever anyone asked. Per call it answers
-  `{"outcome":"allow"}`, or `risk_level` (low, medium, high, critical),
-  `user_authorization` (unknown, low, medium, high), `outcome`, and a
-  one-sentence `rationale`. Low and medium risk are allowed; high only
+  `id`, `risk_level` (low, medium, high, critical), `user_authorization`
+  (unknown, low, medium, high), `outcome`, and a one-sentence `rationale`
+  (empty for a call clearly low risk), as one `assessments` list. Since
+  0.9.0 the reply follows a fixed JSON Schema the provider enforces (the
+  turn's `output_schema`, Codex's way), so it can't come back in another
+  shape; the approver then reads the whole reply and counts it only when it
+  assesses every call asked exactly once and no other, else the check
+  failed and says which. Low and medium risk are allowed; high only
   with at least medium authorization on a narrow action; critical never.
   When the person's latest words or
   the calls already run do not fit the state, it carries

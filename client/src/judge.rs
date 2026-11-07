@@ -1,7 +1,8 @@
-//! The judge that `sonny approver` and Sonny's lookout ask yes/no questions
-//! of: which one, picked in one order, and how it answers. A judge is a
-//! `provider/model` the daemon runs, as a fork of an idle base bot that
-//! takes one turn, so checks run at once and none sees another.
+//! The judge `sonny approver` asks about planned calls: which one, picked
+//! in one order, and how it answers. A judge is a `provider/model` the
+//! daemon runs, as a fork of an idle base bot that takes one turn, so
+//! checks run at once and none sees another. Its reply follows a JSON
+//! Schema the provider enforces, and is checked whole before it counts.
 use crate::{Client, Error};
 use serde_json::{Map, Value, json};
 use std::{
@@ -22,8 +23,7 @@ pub fn pick(named: Option<&str>, caller: Option<&str>) -> Option<String> {
     named.or(caller).map(str::to_owned)
 }
 
-/// Each question's id, and the probability, from 0 to 1, that its answer
-/// is yes.
+/// Each id asked, and the judge's answer for it.
 pub type Answers = Map<String, Value>;
 
 /// What a judge read and wrote for one check, in tokens, as its provider
@@ -64,24 +64,6 @@ pub fn excerpt(text: &str) -> &str {
         cut -= 1;
     }
     &text[..cut]
-}
-
-/// A general model's reply as answers: its JSON object, found in the
-/// reply, with a probability for every id asked. `None` when any is
-/// missing or out of range, a failed check.
-pub fn model_answers<'a>(reply: &str, ids: impl IntoIterator<Item = &'a str>) -> Option<Answers> {
-    let start = reply.find('{')?;
-    let end = reply.rfind('}')?;
-    let given: Map<String, Value> = serde_json::from_str(reply.get(start..=end)?).ok()?;
-    let mut answers = Map::new();
-    for id in ids {
-        let p = given
-            .get(id)?
-            .as_f64()
-            .filter(|p| (0.0..=1.0).contains(p))?;
-        answers.insert(id.to_owned(), json!(p));
-    }
-    Some(answers)
 }
 
 /// How long a judge's fork may sit idle before the daemon deletes it. Each
@@ -190,28 +172,16 @@ impl Base {
         }
     }
 
-    /// One check: a fork reads `prompt` and answers every id with a
-    /// probability by `deadline`.
-    pub async fn ask(
-        &self,
-        client: &Client,
-        prompt: &str,
-        ids: &[&str],
-        deadline: Instant,
-    ) -> Result<(Answers, Usage), Failed> {
-        self.ask_with(client, prompt, ids, probabilities, None, deadline)
-            .await
-    }
-
-    /// One check whose reply `parse` reads as answers to every id, its
-    /// fork started in `workspace` (else `/`), where a judge with tools
-    /// looks. A workspace since removed starts it in `/`.
+    /// One check whose reply follows `reply`'s schema, which the provider
+    /// enforces, and is read by its parse as answers to every id. Its fork
+    /// starts in `workspace` (else `/`), where a judge with tools looks. A
+    /// workspace since removed starts it in `/`.
     pub async fn ask_with(
         &self,
         client: &Client,
         prompt: &str,
         ids: &[&str],
-        parse: Parse,
+        reply: &Reply,
         workspace: Option<&str>,
         deadline: Instant,
     ) -> Result<(Answers, Usage), Failed> {
@@ -239,19 +209,21 @@ impl Base {
             forked => forked,
         };
         forked.map_err(|error| failed(format!("the judge could not start: {}", error.code)))?;
-        let (answered, running) = turn_with(client, &name, prompt, ids, parse, deadline).await;
+        let (answered, running) = turn_with(client, &name, prompt, ids, reply, deadline).await;
         remove(client, &name, running).await;
         answered
     }
 }
 
-/// How a judge's reply is read as answers to the ids asked: `None` when it
-/// does not answer them all, a failed check.
-pub type Parse = fn(&str, &[&str]) -> Option<Answers>;
+/// How a judge's reply is read as answers to the ids asked, or why it
+/// cannot be: a failed check.
+pub type Parse = fn(&str, &[&str]) -> Result<Answers, String>;
 
-/// A reply read as a probability for every id.
-pub fn probabilities(reply: &str, ids: &[&str]) -> Option<Answers> {
-    model_answers(reply, ids.iter().copied())
+/// What a judge replies: the JSON Schema its turn asks the provider to
+/// hold the reply to, and how the reply is then read.
+pub struct Reply {
+    pub schema: &'static str,
+    pub parse: Parse,
 }
 
 /// Whether a bot record is a judge given `instructions`, or an older
@@ -275,27 +247,20 @@ pub fn is_judge(bot: &Value, instructions: &str) -> bool {
         && (tools.is_empty() || bot["settings"]["sandbox"] == "read-only")
 }
 
-/// One turn of a judge's fork `name`: its probabilities for every id by
-/// `deadline`, and the turn if it is still running.
-pub async fn turn(
-    client: &Client,
-    name: &str,
-    prompt: &str,
-    ids: &[&str],
-    deadline: Instant,
-) -> (Result<(Answers, Usage), Failed>, Option<i64>) {
-    turn_with(client, name, prompt, ids, probabilities, deadline).await
-}
-
-/// One turn of a judge's fork, its reply read by `parse`.
+/// One turn of a judge's fork `name`, its reply held to `reply`'s schema
+/// and read by its parse, by `deadline`; and the turn if it is still
+/// running.
 pub async fn turn_with(
     client: &Client,
     name: &str,
     prompt: &str,
     ids: &[&str],
-    parse: Parse,
+    reply: &Reply,
     deadline: Instant,
 ) -> (Result<(Answers, Usage), Failed>, Option<i64>) {
+    let Ok(schema) = serde_json::from_str::<Value>(reply.schema) else {
+        return (Err(failed("the judge's reply schema is not JSON")), None);
+    };
     // Queued when every slot is taken: it starts when one frees, within
     // the deadline.
     let submitted = match client
@@ -303,7 +268,7 @@ pub async fn turn_with(
             "submit",
             // Said by the judge, not the person: clients draw it so.
             json!({"bot": name, "request_id": name, "prompt": prompt, "delivery": "queue",
-                "origin": "judge"}),
+                "origin": "judge", "output_schema": schema}),
         )
         .await
     {
@@ -344,15 +309,19 @@ pub async fn turn_with(
         return (Err(failed(why)), None);
     }
     let text = outcome["text"].as_str().unwrap_or_default();
-    let Some(answers) = (outcome["text_truncated"] != true)
-        .then(|| parse(text, ids))
-        .flatten()
-    else {
-        let failed = Failed {
-            why: "the judge's answer did not parse".into(),
-            reply: Some(text.to_owned()),
-        };
-        return (Err(failed), None);
+    let parsed = match outcome["text_truncated"] == true {
+        true => Err("the judge's answer was cut off".to_owned()),
+        false => (reply.parse)(text, ids),
+    };
+    let answers = match parsed {
+        Ok(answers) => answers,
+        Err(why) => {
+            let failed = Failed {
+                why,
+                reply: Some(text.to_owned()),
+            };
+            return (Err(failed), None);
+        }
     };
     let read = client
         .request("turns", json!({"bot": name, "after": turn - 1, "limit": 1}))
@@ -444,15 +413,5 @@ mod tests {
             &json!({"tools": [], "instructions": "Answer yes"}),
             said
         ));
-    }
-
-    #[test]
-    fn a_general_model_answers_in_one_json_object() {
-        let reply = "Here you go:\n```json\n{\"a\": 0.1, \"b\": 0.9}\n```";
-        let answers = model_answers(reply, ["a", "b"]).unwrap();
-        assert_eq!(answers["a"], json!(0.1));
-        assert_eq!(model_answers(reply, ["a", "c"]), None);
-        assert_eq!(model_answers("{\"a\": 1.5}", ["a"]), None);
-        assert_eq!(model_answers("no json here", ["a"]), None);
     }
 }

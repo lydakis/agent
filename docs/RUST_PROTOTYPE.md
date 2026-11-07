@@ -383,6 +383,23 @@ that last call. Usage and work from failed or incomplete calls count in
 later tool rounds, from the running totals without another store read.
 Successful calls keep their single atomic transcript and usage commit.
 
+`submit` also accepts `output_schema` (protocol 51), a JSON Schema object
+the reply of the turn it starts follows, as Codex's turn output schema:
+each of the turn's model calls asks its provider for structured output,
+`text.format` with a strict `json_schema` for Responses (the ChatGPT plan
+included) and `output_config.format` with a `json_schema` beside the
+effort for Anthropic and Bedrock. The tools stay callable, so a turn may
+look before it answers; a summary is free text and asks for none, and its
+calls' caches are not refreshed, since `max_tokens: 0` refuses a structured
+output. The daemon checks
+only that it is an object of at most 64 KiB as JSON
+(`invalid_output_schema`): which schemas a model takes is its provider's to
+say, as a failed call. It is stored on the turn (`turns.output_schema`,
+schema 81), so a resumed turn asks for it too and a resend naming another is
+an `idempotency_conflict`. It shapes the turn it starts: with `steer` or
+`attach` it is `invalid_delivery`. The judge `sonny approver` runs asks its
+verdict this way.
+
 `submit` also accepts `images`, pictures sent with the prompt: up to 20 of
 `{"media_type", "data"}`, the type one of `image/png`, `image/jpeg`,
 `image/gif` or `image/webp` and the data standard base64 of an image of that
@@ -854,7 +871,8 @@ Anthropic's per-lifetime split or, when a report has none, as the request
 asked. The guidance
 also lists the requests `max_tokens: 0` rejects: streaming, budgeted thinking
 (`thinking.type: "enabled"`), structured outputs, and forced tool choice. So
-older models with thinking on are not refreshed. Bedrock is also left out
+older models with thinking on, and a turn whose reply follows an
+`output_schema`, are not refreshed. Bedrock is also left out
 until the same request is verified there. Refreshes cover foreground tool
 calls only: a turn parked on `wait` has no live task to send them, and a bot
 between turns may never be called again. The Responses cache needs none: the

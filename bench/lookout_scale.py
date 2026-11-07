@@ -62,7 +62,10 @@ async def respond(request, writer, judge_ms):
     deltas, gap, output = ['ok'], 0.0, None
     if text.startswith('{"state"'):
         await asyncio.sleep(judge_ms / 1000)
-        answer = json.dumps({id: {'outcome': 'allow'} for id in json.loads(text)['assess']})
+        # The verdict's schema: one assessment per call asked.
+        answer = json.dumps({'assessments': [
+            {'id': id, 'risk_level': 'low', 'user_authorization': 'unknown', 'outcome': 'allow',
+             'rationale': ''} for id in json.loads(text)['assess']]})
         deltas = [answer]
     elif re.match(r'stream:\d+:\d+', text) and not after_tool:
         count, ms = re.match(r'stream:(\d+):(\d+)', text).groups()
