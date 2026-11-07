@@ -1335,7 +1335,11 @@ impl Service {
                         // lookout last watched it saw then.
                         if news {
                             let id = had.as_ref().and_then(|had| had["bot_id"].as_i64());
-                            self.ended_with(name, id);
+                            // In force at once: a bot made again under the
+                            // name is never heard by what ended.
+                            if self.ended_with(name, id) {
+                                self.reread(&client).await;
+                            }
                         }
                     }
                     // A turn whose goal's check is to run is news only once
@@ -1914,10 +1918,13 @@ impl Service {
     /// A bot was deleted: the subscriptions it held end with it, and so
     /// does any that watched only bots by their names, every one of them
     /// gone now, and no source or maker's tasks.
-    fn ended_with(&self, gone: &str, id: Option<i64>) {
+    /// Whether any ended.
+    fn ended_with(&self, gone: &str, id: Option<i64>) -> bool {
+        let mut any = false;
         if self.subscribers.contains_key(gone) {
             let forgot = subs::forget(&self.store, gone, id);
             if forgot.as_ref().is_ok_and(|n| *n > 0) || forgot.is_err() {
+                any = true;
                 self.write(&json!({"at_ms": epoch_ms(), "lead": gone, "ended": "all",
                     "why": "its subscriber was deleted", "error": forgot.err()}));
             }
@@ -1934,9 +1941,11 @@ impl Service {
                         .all(|name| !name.contains('*') && !self.records.contains_key(*name));
                 if watched_gone && subscriber != gone {
                     self.end_sub(subscriber, sub, "every bot it watched was deleted");
+                    any = true;
                 }
             }
         }
+        any
     }
 
     /// A lead's `react` call naming one of its project's agents: once it
@@ -6181,7 +6190,7 @@ mod tests {
         let docs = json!({"name": "shop.docs", "bot_id": 3});
         let mut service = service(store.clone(), &[lead, docs]);
         service.subscribers = subs::all(&store).into_iter().collect();
-        service.ended_with("shop.fix", Some(2));
+        assert!(service.ended_with("shop.fix", Some(2)));
         assert!(subs::read(&store, "shop.fix").is_empty());
         let names = |store: &Path| -> Vec<String> {
             subs::read(store, "shop.lead")
@@ -6194,8 +6203,11 @@ mod tests {
         assert_eq!(names(&store), ["fix", "both", "glob", "ci"]);
         service.records.remove("shop.docs");
         service.subscribers = subs::all(&store).into_iter().collect();
-        service.ended_with("shop.docs", Some(3));
+        assert!(service.ended_with("shop.docs", Some(3)));
         assert_eq!(names(&store), ["fix", "glob", "ci"]);
+        // Nothing left that it ends: the files are not read again for it.
+        service.subscribers = subs::all(&store).into_iter().collect();
+        assert!(!service.ended_with("shop.docs", Some(3)));
         // A delete the lookout was away for: a subscriber no longer listed
         // ends whole, and one still listed keeps what its bot holds.
         add(
