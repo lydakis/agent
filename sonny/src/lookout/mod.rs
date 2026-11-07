@@ -57,7 +57,7 @@ const WAITING: usize = 1024;
 
 /// What `sonny.lookout_waiting` says now, 0 for no limit; and, read with
 /// it, the most notes a margin holds, the most of a task's notes its lead
-/// hears of at once. Settings that do not read keep the defaults.
+/// hears of at once, and the person's hours, for quiet. Settings that do not read keep the defaults.
 fn waiting() -> usize {
     let Ok(sonny) = agent_client::config::load().map(|config| config.sonny) else {
         crate::margin::set_limits(
@@ -67,6 +67,7 @@ fn waiting() -> usize {
         return WAITING;
     };
     crate::margin::set_limits(sonny.margin_notes, sonny.margin_note_lines);
+    crate::quiet::set_schedule(crate::quiet::Schedule::from(&sonny));
     usize::try_from(sonny.lookout_waiting).unwrap_or(usize::MAX)
 }
 
@@ -392,7 +393,7 @@ async fn tell_bounced(
     // Bounded whatever the names' lengths, as request ids are.
     let request_id = format!("bounce.{turn}.{}", digest(&format!("{bot}\n{turn}\n{to}")));
     let mut submit = json!({"bot": to, "request_id": request_id,
-        "prompt": crate::stamp::now(&prompt), "delivery": "attach", "origin": BOUNCE_ORIGIN,
+        "prompt": crate::stamp::now(&prompt, to), "delivery": "attach", "origin": BOUNCE_ORIGIN,
         "wait_ms": crate::trigger::attach_wait()});
     if let Some(id) = to_id {
         submit["bot_id"] = json!(id);
@@ -2728,7 +2729,7 @@ impl Lookout {
             self.updates.unsent(told);
             return;
         }
-        let prompt = crate::stamp::now(&note(&told, steer.as_ref()));
+        let prompt = crate::stamp::now(&note(&told, steer.as_ref()), &self.lead);
         let key: Vec<String> = told.items.iter().map(|line| line.key.clone()).collect();
         let request_id = format!("lookout-{}", digest(&key.join(",")));
         let delivery = "steer";
@@ -3248,7 +3249,7 @@ impl Lookout {
             .collect();
         let request_id = format!("lookout-{}", digest(&key.join(",")));
         let delivery = "steer";
-        let prompt = crate::stamp::now(&prompt);
+        let prompt = crate::stamp::now(&prompt, &self.lead);
         let asked = json!({"bot": self.lead, "bot_id": self.updates.lead_id(), "prompt": prompt,
             "request_id": request_id, "delivery": delivery, "origin": sources::ORIGIN});
         self.heard_since = None;
