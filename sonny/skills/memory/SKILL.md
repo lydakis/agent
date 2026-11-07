@@ -121,7 +121,9 @@ EOF
 
 A fact file is at most 16 KiB. An index has no limit, and a save is never
 refused for room: save what is worth keeping, and leave merging and
-pruning to the nightly cleanup. `check` reports any file that is not a valid fact and an index
+pruning to the nightly cleanup. A save whose line falls past the head a new
+agent starts with says so in `past_head`: it is saved, and search finds
+it. `check` reports any file that is not a valid fact and an index
 that is out of date; `index` rewrites the index from the facts.
 
 Each night an agent merges duplicates, drops superseded facts and retires

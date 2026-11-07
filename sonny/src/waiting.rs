@@ -153,7 +153,7 @@ pub fn replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 /// Whether what `bot`'s turn `turn`, or a later one, left waiting is kept.
-fn answered(store: &Path, bot: &str, turn: i64) -> bool {
+pub fn answered(store: &Path, bot: &str, turn: i64) -> bool {
     std::fs::read(file(store, bot))
         .ok()
         .and_then(|kept| serde_json::from_slice::<Value>(&kept).ok())
@@ -288,34 +288,42 @@ pub fn just_ended(finished_ms: u64) -> bool {
 /// ([`crate::reviews`]). Not with `[sonny] needs_check` off, nor a side
 /// chat's, a copy's or a turn answered already.
 pub fn spawn(client: Arc<Client>, store: PathBuf, bot: String, turn: i64) {
-    if answered(&store, &bot, turn)
-        || !agent_client::config::load().map_or(true, |c| c.sonny.needs_check)
-    {
-        return;
+    if due(&store, &bot, turn) {
+        tokio::spawn(async move { checked(&client, &store, &bot, turn).await });
     }
-    let key = (bot.clone(), turn);
+}
+
+/// Whether `bot`'s turn `turn` is to be checked: `[sonny] needs_check` is
+/// on and no answer for it, or a later turn, is kept.
+pub fn due(store: &Path, bot: &str, turn: i64) -> bool {
+    !answered(store, bot, turn)
+        && agent_client::config::load().map_or(true, |c| c.sonny.needs_check)
+}
+
+/// [`spawn`]'s check, awaited: once at a time per turn in this window,
+/// whichever way it heard of the turn, and not for a side chat or a copy.
+pub async fn checked(client: &Client, store: &Path, bot: &str, turn: i64) {
+    let key = (bot.to_owned(), turn);
     match CHECKING.lock() {
         Ok(mut checking) if !checking.contains(&key) => checking.push(key.clone()),
         _ => return,
     }
-    tokio::spawn(async move {
-        if let Some(row) = record(&client, &bot).await
-            && let Some(bot_id) = row["bot_id"].as_i64()
-            && !side_or_copy(&bot, &row)
-            && let Ok(_asking) = ASKING.acquire().await
-            // Another window answered it while this one waited its turn.
-            && !answered(&store, &bot, turn)
-            // What could not be checked, a second window's copy the
-            // daemon refused among it, is left unmarked.
-            && let Ok(found) = waiting_for(&client, &store, &bot, bot_id, turn).await
-        {
-            let mark = found.map(|waiting_for| Mark { turn, waiting_for });
-            let _ = keep(&store, &bot, turn, mark.as_ref());
-        }
-        if let Ok(mut checking) = CHECKING.lock() {
-            checking.retain(|kept| *kept != key);
-        }
-    });
+    if let Some(row) = record(client, bot).await
+        && let Some(bot_id) = row["bot_id"].as_i64()
+        && !side_or_copy(bot, &row)
+        && let Ok(_asking) = ASKING.acquire().await
+        // Another window answered it while this one waited its turn.
+        && !answered(store, bot, turn)
+        // What could not be checked, a second window's copy the
+        // daemon refused among it, is left unmarked.
+        && let Ok(found) = waiting_for(client, store, bot, bot_id, turn).await
+    {
+        let mark = found.map(|waiting_for| Mark { turn, waiting_for });
+        let _ = keep(store, bot, turn, mark.as_ref());
+    }
+    if let Ok(mut checking) = CHECKING.lock() {
+        checking.retain(|kept| *kept != key);
+    }
 }
 
 /// What `bot`'s turn `turn` left waiting on the person, once the code

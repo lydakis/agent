@@ -552,7 +552,7 @@ A model reference is `PROVIDER/MODEL`. A provider spec is
 
 | Family | Protocol | Defaults |
 | --- | --- | --- |
-| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://api.openai.com/v1`, the ChatGPT plan login `agent login chatgpt` saved; `bedrock-openai` → `https://bedrock-mantle.{region}.api.aws/openai/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK` |
+| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://api.openai.com/v1`, the ChatGPT plan login `agent login chatgpt` saved; `bedrock-openai` → `https://bedrock-mantle.{region}.api.aws/openai/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK`; `bedrock-openai-runtime` → `https://bedrock-runtime.{region}.amazonaws.com/openai/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK` |
 | `anthropic` | Anthropic Messages API, streaming SSE | `anthropic` → `https://api.anthropic.com/v1`, `ANTHROPIC_API_KEY`; `bedrock` → `https://bedrock-runtime.{region}.amazonaws.com/anthropic/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK` |
 
 The family `responses-ws` is the Responses API over a WebSocket per bot,
@@ -576,7 +576,9 @@ inference profiles (`global.anthropic.claude-opus-5-5`, or `us.`, `eu.`,
 holds the model, from any source region the profile supports (AWS lists them
 per profile, and `ListInferenceProfiles` names only the profiles callable from
 the region asked), and `bedrock-openai` binds OpenAI and other models on Bedrock Mantle, as
-Claude Code and Codex do by default. Both take the region in Claude Code's
+Claude Code and Codex do by default. `bedrock-openai-runtime` binds runtime's
+OpenAI-compatible route, as Codex's `amazon-bedrock-runtime` does, for models
+served only there, by inference profile. All take the region in Claude Code's
 order: `AWS_REGION`, `AWS_DEFAULT_REGION`, the `region` of the active profile
 (`AWS_PROFILE`, else `default`) in the AWS shared credentials file and then
 the config file, else us-east-1; the first value set must be shaped like a region,
@@ -1360,7 +1362,9 @@ does not, and each is one op:
   10 seconds each and 15 for the whole request) and
   answers `providers.NAME.models` as `{id, name?, context_tokens?,
   output_tokens?}`, or `providers.NAME.error` for a provider that would not
-  list. It runs off the dispatch path, only when asked, under the same
+  list, each with `providers.NAME.family` and `providers.NAME.efforts` as the
+  daemon binds it now (a
+  provider a config reload added after the client connected included). It runs off the dispatch path, only when asked, under the same
   connection admission as a turn, and each provider keeps its answer, a
   refusal included, five minutes, while the listings (kept as their JSON
   text) and refusals kept across all providers stay within 2 MiB (past that
@@ -1378,7 +1382,9 @@ does not, and each is one op:
   ChatGPT plan login asks `https://api.openai.com/v1/models` with its
   bearer and keeps `models[]` entries listed as `visibility: "list"`, by
   `slug`. Nothing else reads it: a turn runs whatever model it names.
-  `agent models --discover` uses it once to write `~/.agent/models`.
+  Each daemon start a client makes (`serve --models`) asks it once it is
+  ready to rewrite `~/.agent/models.discovered`, and `agent models --discover`
+  on demand; see [CLI.md](CLI.md).
 - `stats` returns the daemon's live state without sampling its process from
   outside: open sessions, active turns against the bound, parked turns,
   running processes against the process bound and how many of them are

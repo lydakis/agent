@@ -43,6 +43,22 @@ pub(crate) fn valid_call_id(id: &str) -> bool {
     !id.is_empty() && !id.contains('\0') && encoded_len(id) <= MAX_CALL_ID
 }
 
+/// A provider's frame or item that would not parse: serde's words and how
+/// it began, so the shape that broke it shows without the whole of it.
+pub(crate) fn unparsed(error: serde_json::Error, frame: &[u8]) -> Error {
+    const HEAD: usize = 512;
+    let mut error = Error::from(error);
+    let head = String::from_utf8_lossy(&frame[..frame.len().min(HEAD)]);
+    let head: String = head
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let more = if frame.len() > HEAD { "…" } else { "" };
+    let said = error.detail.take().unwrap_or_default();
+    error.detail = Some(format!("{said}; it began {head}{more}"));
+    error
+}
+
 /// The bytes `text` takes as a JSON string body, as serde_json escapes it.
 /// Decoded text can grow up to sixfold when encoded, so output bounds count
 /// this rather than the decoded length.
