@@ -202,6 +202,12 @@ pub const SETTINGS: &[Setting] = &[
         default: "auto",
     },
     Setting {
+        key: "sonny.task_tabs",
+        about: "which tasks open in a tab of their own in Rex, Herdr or cmux: those an agent asks a tab for, shows you, or you open, and any that comes to need you; or every task as its turn starts",
+        values: &["asked", "every"],
+        default: "asked",
+    },
+    Setting {
         key: "sonny.task_windows",
         about: "task windows a lead keeps open in its multiplexer: past it, a new one closes the one you used least recently, never one you have not looked at yet, that needs you, failed or runs something it asked for (with only unseen ones to close, the new one waits for /status); 0 for no limit",
         values: &[],

@@ -50,6 +50,7 @@
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
+//! task_tabs = "every"         # which tasks open in a tab: "asked", the default, those an agent or you asked for; "every", each as its turn starts
 //! task_windows = 64            # task windows a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
 //! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
 //! sky_haikus = false            # no haikus from the sky's busiest agent, on by default
@@ -478,6 +479,8 @@ pub struct Sonny {
     /// before its agent goes on with what it recommended, where it said
     /// it could, or is reminded of it; 0 lets every ask wait for them.
     pub ask_wait_minutes: u64,
+    /// Which tasks open in a tab of their own in the lead's multiplexer.
+    pub task_tabs: TaskTabs,
     /// How many of its tasks' windows a lead keeps open in its
     /// multiplexer: past it, a new one closes the window the person used
     /// least recently, never one they have not looked at yet; 0 for no
@@ -604,6 +607,7 @@ impl Default for Sonny {
             commons_invite_tokens: 1_000_000,
             commons_source: commons_source(),
             ask_wait_minutes: 60,
+            task_tabs: TaskTabs::default(),
             task_windows: 32,
             task_depth: 2,
             sky_haikus: true,
@@ -694,6 +698,17 @@ pub enum AgentOpens {
     #[default]
     Tab,
     Beside,
+}
+
+/// Which tasks open in a tab of their own in the lead's multiplexer:
+/// `"asked"`, the default, those their starter asked a tab for, those an
+/// agent shows, those the person opens and those that come to need them;
+/// or `"every"`, each task as a turn of its starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TaskTabs {
+    #[default]
+    Asked,
+    Every,
 }
 
 /// A command Sonny's lookout runs, whose every printed line is news for
@@ -1220,6 +1235,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invites",
                 "commons_invite_tokens",
                 "ask_wait_minutes",
+                "task_tabs",
                 "task_windows",
                 "task_depth",
                 "sky_haikus",
@@ -1392,6 +1408,16 @@ fn parse(text: &str) -> Result<Config, String> {
                         return Err(format!(
                             "sonny.margin_opens is always, unless-closed or never, not {other}"
                         ));
+                    }
+                };
+                continue;
+            }
+            if key == "task_tabs" {
+                config.sonny.task_tabs = match value.as_str() {
+                    "asked" => TaskTabs::Asked,
+                    "every" => TaskTabs::Every,
+                    other => {
+                        return Err(format!("sonny.task_tabs is asked or every, not {other}"));
                     }
                 };
                 continue;
@@ -2047,6 +2073,10 @@ mod tests {
         let beside = parse("[sonny]\nagent_opens = \"beside\"").unwrap();
         assert_eq!(beside.sonny.agent_opens, AgentOpens::Beside);
         assert!(parse("[sonny]\nagent_opens = \"window\"").is_err());
+        assert_eq!(config.sonny.task_tabs, TaskTabs::Asked);
+        let every = parse("[sonny]\ntask_tabs = \"every\"").unwrap();
+        assert_eq!(every.sonny.task_tabs, TaskTabs::Every);
+        assert!(parse("[sonny]\ntask_tabs = \"all\"").is_err());
         let closed = parse("[sonny]\nmargin_opens = \"unless-closed\"").unwrap();
         assert_eq!(closed.sonny.margin_opens, MarginOpens::UnlessClosed);
         assert!(config.sonny.chime && !config.sonny.verbose);

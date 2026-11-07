@@ -3241,33 +3241,46 @@ struct Fleet {
     /// Tasks' turns that resolved them: their window closes once the turn
     /// completes.
     resolving: resolved::Own,
-    /// `[sonny] task_windows`, read on the worker as the file changes.
+    /// `[sonny] task_windows` and `task_tabs`, read as the file changes.
     windows: Arc<std::sync::Mutex<TaskWindows>>,
 }
 
-/// `[sonny] task_windows` as the config file last said it, read again
-/// only once the file changed, so that a change in `/config` from any
-/// window holds from the next task window on.
+/// `[sonny] task_windows` and `task_tabs` as the config file last said
+/// them, read again only once the file changed, so that a change in
+/// `/config` from any window holds from the next task window on.
 #[derive(Default)]
 struct TaskWindows {
     read: Option<Option<std::time::SystemTime>>,
     most: usize,
+    tabs: agent_client::config::TaskTabs,
 }
 
 impl TaskWindows {
     fn most(&mut self) -> usize {
+        self.fresh();
+        self.most
+    }
+
+    /// Whether every task opens in a tab as its turn starts, rather than
+    /// only those asked for.
+    fn every(&mut self) -> bool {
+        self.fresh();
+        self.tabs == agent_client::config::TaskTabs::Every
+    }
+
+    fn fresh(&mut self) {
         let path = agent_client::config::path();
         let changed = (path.as_ref())
             .and_then(|path| std::fs::metadata(path).ok())
             .and_then(|file| file.modified().ok());
         if self.read != Some(changed) {
             self.read = Some(changed);
-            self.most = agent_client::config::load()
-                .map_or(agent_client::config::Sonny::default().task_windows, |c| {
-                    c.sonny.task_windows
-                }) as usize;
+            let sonny = agent_client::config::load()
+                .map(|c| c.sonny)
+                .unwrap_or_default();
+            self.most = sonny.task_windows as usize;
+            self.tabs = sonny.task_tabs;
         }
-        self.most
     }
 }
 
@@ -3847,11 +3860,18 @@ impl Fleet {
     }
 
     /// Open the task's window, unless it has one, it was closed for room,
-    /// or the person uses another of the project's windows now. With `tell`, the lead's view hears where it opened, when not
+    /// or the person uses another of the project's windows now; with
+    /// `[sonny] task_tabs = "asked"`, the default, none opens here: a task
+    /// has a tab when its starter asked for one, an agent shows it, the
+    /// person opens it or it comes to need them. With `tell`, the lead's view hears where it opened, when not
     /// beside it, or why it did not; windows closed for room are said in
     /// the status row. A task that needs the person has its window, as
     /// [`Fleet::needs_window`] opens it.
     fn show(&mut self, bot: &str, tell: bool) {
+        if !self.windows.lock().is_ok_and(|mut windows| windows.every()) {
+            self.doing(bot, "working");
+            return;
+        }
         let needs = self.needs.waits(bot);
         let doing = match needs {
             true => "needs you",
@@ -3898,7 +3918,8 @@ impl Fleet {
     }
 
     /// A task that came to need the person, its window set aside for
-    /// room, has it open again, as what needs them keeps its window: it
+    /// room or, as `task_tabs = "asked"` has it, never opened, has it open
+    /// now, as what needs them keeps its window: it
     /// closes the window they used least recently for room, never one
     /// they have not looked at yet nor one that needs them, and with no
     /// other passes the limit. The person's focus stays where it is.
@@ -3909,7 +3930,8 @@ impl Fleet {
         let (socket, project) = (self.socket.clone(), self.project.clone());
         let (place, lead) = (self.place.clone(), self.lead.clone());
         self.layout.send(move |layout| {
-            if !layout.aside(&bot) || !mux::mine(&socket, &project, &lead, &place) {
+            let every = windows.lock().is_ok_and(|mut windows| windows.every());
+            if (every && !layout.aside(&bot)) || !mux::mine(&socket, &project, &lead, &place) {
                 return;
             }
             room.most = windows.lock().map_or(0, |mut windows| windows.most());
@@ -3927,15 +3949,18 @@ impl Fleet {
 
     /// Bring the task's own tab into view in the multiplexer, as the
     /// person asked; looked for on the worker, after every window opened
-    /// so far, and opened again when it was closed for room. With none,
-    /// `beside` opens it in the pane, else says so.
+    /// so far, and opened again when it was closed for room, or opened
+    /// now, as `task_tabs = "asked"` opens a task's tab when the person
+    /// asks. With none, `beside` opens it in the pane, else says so.
     fn go_to(&mut self, bot: &str, beside: bool) {
         let doing = self.doing.get(bot).copied().unwrap_or("idle");
         let (command, name) = self.window(bot, doing);
         let (windows, mut room) = self.room();
+        let task = bot != self.lead && self.lineage.contains(bot);
         let (bot, told) = (bot.to_owned(), self.tell.clone());
         self.layout.send(move |layout| {
-            if layout.aside(&bot) {
+            let every = windows.lock().is_ok_and(|mut windows| windows.every());
+            if layout.aside(&bot) || (task && !every) {
                 room.most = windows.lock().map_or(0, |mut windows| windows.most());
                 match layout.show_task(&bot, &name, &command, &room, true) {
                     Ok(mux::Shown::Opened(closed)) if !closed.is_empty() => {
@@ -4015,8 +4040,11 @@ impl Fleet {
     }
 
     /// Close the windows of the tasks whose completed turns the finished
-    /// waits returned.
+    /// waits returned: with `task_tabs = "every"`, as each task opened one;
+    /// a tab asked for stays until the person or an agent closes it, or
+    /// the task is resolved.
     async fn close_taken(&mut self) {
+        let every = self.windows.lock().is_ok_and(|mut windows| windows.every());
         for (bot, node, call) in std::mem::take(&mut self.returned) {
             let Ok(read) = self
                 .client
@@ -4039,7 +4067,9 @@ impl Fleet {
                     && !self.needs.waits(&task)
                 {
                     self.ended.remove(&task);
-                    self.close(&task);
+                    if every {
+                        self.close(&task);
+                    }
                     self.doing.remove(&task);
                     self.activity.remove(&task);
                     self.name_windows();
@@ -19818,6 +19848,7 @@ mod tests {
         fleet.windows = Arc::new(std::sync::Mutex::new(TaskWindows {
             read: Some(read),
             most: 1,
+            tabs: agent_client::config::TaskTabs::Every,
         }));
         let event = |bot: &str, kind: &str, data: Value| json!({"event": kind, "bot": bot, "turn": 1, "data": data});
         let windowed = |fleet: &Fleet| {
@@ -19862,6 +19893,71 @@ mod tests {
         let shown = windowed(fleet);
         assert!(shown.contains(&"calc.a".to_owned()) && shown.contains(&"calc.b".to_owned()));
         assert!(!fleet.layout.aside("calc.b"));
+    }
+
+    /// As `task_tabs = "asked"` has it, a task's turn opens no tab: one
+    /// opens once the task needs the person, or they go to it, and stays
+    /// once its result is taken.
+    #[tokio::test]
+    async fn a_task_opens_a_tab_only_once_it_needs_you_or_you_go_to_it() {
+        let (client, events) = daemon_with_events(json!({}), |asked| {
+            match asked["op"].as_str().unwrap_or("") {
+                "bots" => json!({"bots": [
+                    {"name": "calc.lead", "bot_id": 1, "head": 1},
+                    {"name": "calc.a", "bot_id": 2, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 2},
+                    {"name": "calc.b", "bot_id": 3, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 3},
+                ], "next_after": null}),
+                "approvals" => json!({"approvals": []}),
+                "turns" => json!({"turns": []}),
+                "history_nodes" => json!({"nodes": []}),
+                "history_items" => json!({"items": []}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
+        let read = (agent_client::config::path().as_ref())
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|file| file.modified().ok());
+        fleet.windows = Arc::new(std::sync::Mutex::new(TaskWindows {
+            read: Some(read),
+            most: 32,
+            tabs: agent_client::config::TaskTabs::Asked,
+        }));
+        let event = |bot: &str, kind: &str, data: Value| json!({"event": kind, "bot": bot, "turn": 1, "data": data});
+        let windowed = |fleet: &Fleet| {
+            let (sent, got) = std::sync::mpsc::channel();
+            fleet.layout.send(move |layout| {
+                let labels: Vec<String> = (layout.windows().into_iter())
+                    .flat_map(|(_, labels)| labels)
+                    .collect();
+                let _ = sent.send(labels);
+            });
+            got.recv().unwrap()
+        };
+        for bot in ["calc.a", "calc.b"] {
+            fleet.lineage.insert(bot.into());
+            fleet.event(&event(bot, "accepted", json!({})));
+        }
+        fleet.layout.settle();
+        let shown = windowed(&fleet);
+        assert!(
+            !shown.iter().any(|label| label.starts_with("calc.")),
+            "{shown:?}"
+        );
+        assert_eq!(fleet.doing["calc.a"], "working");
+        // A call of its held for the person opens its tab.
+        fleet.event(&event("calc.a", "approval_asked", json!({"call_id": "c1"})));
+        assert_eq!(fleet.doing["calc.a"], "needs you");
+        fleet.layout.settle();
+        assert!(windowed(&fleet).contains(&"calc.a".to_owned()));
+        assert!(!windowed(&fleet).contains(&"calc.b".to_owned()));
+        // The person goes to the other: its tab opens.
+        fleet.go_to("calc.b", true);
+        fleet.layout.settle();
+        assert!(windowed(&fleet).contains(&"calc.b".to_owned()));
     }
 
     #[tokio::test]
