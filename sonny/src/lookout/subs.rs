@@ -2115,12 +2115,19 @@ mod tests {
         let mut files = Read::default();
         write("aaaa", 60);
         assert_eq!(names(&mut files), ["aaaa"]);
-        // Not read again while its stamp holds.
-        write("bbbb", 60);
+        // Kept under its stamp, so the next look reads nothing.
+        let kept = |files: &Read| files.0.get("shop.lead").map(|(stamp, _)| *stamp);
+        assert_eq!(kept(&files), crate::kept::stamp(&path));
         assert_eq!(names(&mut files), ["aaaa"]);
         // Read again once it changed.
         write("bbbb", 30);
         assert_eq!(names(&mut files), ["bbbb"]);
+        // A permission put right, which changes neither its time nor its
+        // size, is a change too: what read as nothing is read again.
+        use std::os::unix::fs::PermissionsExt;
+        let before = crate::kept::stamp(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_ne!(crate::kept::stamp(&path), before);
         // Just written: no proof a change in the same tick is not missed,
         // so it is read each look until it settles.
         std::fs::write(&path, named("cccc")).unwrap();

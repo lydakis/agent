@@ -1622,6 +1622,14 @@ mod tests {
         assert_eq!(sync(&one, None).unwrap()["unchanged"], true);
         write(&one.repo.join(".gitignore"), "memory/d0/\n");
         assert_eq!(sync(&one, None).unwrap()["unchanged"], Value::Null);
+        // And so is a config whose permission was put right, which
+        // changes neither its time nor its size.
+        settle(&one.home);
+        sync(&one, None).unwrap();
+        assert_eq!(sync(&one, None).unwrap()["unchanged"], true);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&one.config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(sync(&one, None).unwrap()["unchanged"], Value::Null);
         // And a sync that failed is followed by a whole one.
         settle(&one.home);
         sync(&one, None).unwrap();

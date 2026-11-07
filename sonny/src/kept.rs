@@ -24,12 +24,15 @@ pub struct Kept<T> {
 /// What a file or folder's metadata says of its last change: a folder's
 /// changes as an entry in it comes, goes or is renamed, which is how all
 /// that writes the files read here writes one: whole beside its place,
-/// then renamed there.
+/// then renamed there. The inode's own change time is in it too: a
+/// permission put right changes nothing else, and what read as nothing
+/// under the old one must be read again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Stamp {
     modified: std::time::SystemTime,
     len: u64,
     inode: u64,
+    changed: (i64, i64),
 }
 
 pub fn stamp(path: &Path) -> Option<Stamp> {
@@ -39,6 +42,7 @@ pub fn stamp(path: &Path) -> Option<Stamp> {
         modified: meta.modified().ok()?,
         len: meta.len(),
         inode: meta.ino(),
+        changed: (meta.ctime(), meta.ctime_nsec()),
     })
 }
 
