@@ -90,6 +90,13 @@ impl Sub {
 
     /// Whether the bot of `record` holds it: one made for another bot of
     /// its name does not.
+    /// Which subscription it is, for its counts: all it says, and the
+    /// subscriber bot it is for.
+    pub fn identity(&self, subscriber: Option<i64>) -> String {
+        let bot = subscriber.map_or(String::new(), |id| id.to_string());
+        format!("{bot}/{}", super::digest(&self.to_json().to_string()))
+    }
+
     pub fn held_by(&self, record: &Value) -> bool {
         self.owner
             .is_none_or(|owner| record["bot_id"].as_i64().is_none_or(|id| id == owner))
@@ -539,6 +546,10 @@ struct Count {
     last_ms: u64,
     /// The notes it counted last, by request: one sent again counts once.
     notes: std::collections::VecDeque<String>,
+    /// Which subscription it counts, by `Sub::identity`: another under its
+    /// name, or the same for another bot of the subscriber's name, counts
+    /// afresh.
+    of: String,
 }
 
 /// How many notes a subscription's count remembers having counted.
@@ -555,8 +566,22 @@ impl Count {
 
 impl Counts {
     /// A note told what `sub` heard, `heard` of it, steering for it or not.
-    pub fn told(&mut self, sub: &str, note: &str, heard: u64, steered: bool, now_ms: u64) {
+    pub fn told(
+        &mut self,
+        sub: &str,
+        of: &str,
+        note: &str,
+        heard: u64,
+        steered: bool,
+        now_ms: u64,
+    ) {
         let count = self.0.entry(sub.to_owned()).or_default();
+        if count.of != of {
+            *count = Count {
+                of: of.to_owned(),
+                ..Count::default()
+            };
+        }
         if count.notes.iter().any(|had| had == note) {
             return;
         }
@@ -577,11 +602,11 @@ impl Counts {
         count.last_ms = now_ms;
     }
 
-    /// Only the subscriptions `kept` keeps: one removed and added again
-    /// counts afresh. Whether any went.
-    pub fn keep(&mut self, kept: impl Fn(&str) -> bool) -> bool {
+    /// Only the subscriptions `kept` keeps, by name and identity: one
+    /// removed, or another put in its place, counts afresh. Whether any went.
+    pub fn keep(&mut self, kept: impl Fn(&str, &str) -> bool) -> bool {
         let before = self.0.len();
-        self.0.retain(|sub, _| kept(sub));
+        self.0.retain(|sub, count| kept(sub, &count.of));
         self.0.len() < before
     }
 
@@ -597,7 +622,8 @@ impl Counts {
                     .collect();
                 (
                     sub.clone(),
-                    json!({"hours": hours, "last_ms": count.last_ms, "notes": count.notes}),
+                    json!({"hours": hours, "last_ms": count.last_ms, "notes": count.notes,
+                        "of": count.of}),
                 )
             })
             .collect::<serde_json::Map<String, Value>>()
@@ -618,6 +644,7 @@ impl Counts {
                 notes: (value["notes"].as_array().into_iter().flatten())
                     .filter_map(|note| note.as_str().map(str::to_owned))
                     .collect(),
+                of: value["of"].as_str().unwrap_or_default().to_owned(),
             }
         };
         Counts(
@@ -629,8 +656,8 @@ impl Counts {
 
     /// What `sub` told in the last 24 hours as of `now_ms`, as the listing
     /// says it: none when it told nothing yet.
-    pub fn of(&self, sub: &str, now_ms: u64) -> Option<Value> {
-        let mut count = self.0.get(sub)?.clone();
+    pub fn of(&self, sub: &str, of: &str, now_ms: u64) -> Option<Value> {
+        let mut count = (self.0.get(sub)).filter(|count| count.of == of)?.clone();
         count.recent(now_ms);
         let [mut heard, mut notes, mut steers] = [0; 3];
         for (_, [h, n, s]) in &count.hours {
@@ -1062,7 +1089,7 @@ pub fn change(
                 ..sub.clone()
             }
             .to_json();
-            if let Some(told) = counts.of(&sub.name, now) {
+            if let Some(told) = counts.of(&sub.name, &sub.identity(owner), now) {
                 listed["lately"] = told;
             }
             listed
@@ -1743,10 +1770,13 @@ mod tests {
         change(&store, "shop.lead", None, Some(&sub), None, &[]).unwrap();
         let mut counts = Counts::default();
         let now = super::super::epoch_ms() as u64;
-        counts.told("prs", "lookout-a", 3, false, now - 2 * HOUR_MS);
-        counts.told("prs", "lookout-b", 1, true, now);
+        let of = read(&store, "shop.lead")[0].identity(None);
+        // Another's counts under its name, or an older one's, are not its.
+        counts.told("prs", "another", "lookout-z", 9, true, now);
+        counts.told("prs", &of, "lookout-a", 3, false, now - 2 * HOUR_MS);
+        counts.told("prs", &of, "lookout-b", 1, true, now);
         // The same note sent again counts once.
-        counts.told("prs", "lookout-b", 1, true, now);
+        counts.told("prs", &of, "lookout-b", 1, true, now);
         assert_eq!(Counts::from_json(&counts.to_json()), counts);
         let file = counts_file(&store, "shop.lead");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();

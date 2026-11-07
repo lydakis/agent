@@ -3106,28 +3106,33 @@ impl Lookout {
                 heard.subs.retain(|name| !gone.contains(name));
             }
         }
-        if self.counts.keep(|name| !gone.iter().any(|g| g == name)) {
-            self.counts_dirty = true;
-        }
         self.subs = subs;
         self.counting();
     }
 
     /// Notes counted only for subscriptions it has that last so many,
     /// each under when it was added, so one removed and added again, even
-    /// in one call, starts its count afresh.
+    /// in one call, starts its count afresh; and counts only for those it
+    /// has, as they are, for this bot.
     fn counting(&mut self) {
         let subs = &self.subs;
         self.runs_told.retain(|counter, _| {
             subs.iter()
                 .any(|sub| sub.runs.is_some() && &sub.counter() == counter)
         });
-        if self
-            .counts
-            .keep(|name| subs.iter().any(|sub| sub.name == name))
-        {
+        let id = self.updates.lead_id();
+        let kept: Vec<(&str, String)> = (subs.iter())
+            .map(|sub| (sub.name.as_str(), sub.identity(id)))
+            .collect();
+        if (self.counts).keep(|name, of| kept.iter().any(|(n, o)| *n == name && o == of)) {
             self.counts_dirty = true;
         }
+    }
+
+    /// The identity its counts keep for its subscription named `name`.
+    fn of(&self, name: &str) -> Option<String> {
+        (self.subs.iter().find(|sub| sub.name == name))
+            .map(|sub| sub.identity(self.updates.lead_id()))
     }
 
     /// Whether a subscription's `until` came since the files were last
@@ -3161,15 +3166,18 @@ impl Lookout {
             })
     }
 
-    /// A note that told what these subscriptions heard landed: each
-    /// counts what it told, for the listing.
-    /// Once a note, by its request: sent again, it counts no more.
+    /// A note that told what these subscriptions heard landed: each it
+    /// still has counts what it told, for the listing, once a note, by its
+    /// request: sent again, it counts no more.
     fn count(&mut self, key: &[String], heard: &[(String, u64)], steered: &[&str]) {
         let now = epoch_ms() as u64;
         let request = format!("lookout-{}", digest(&key.join(",")));
         for (name, n) in heard {
-            self.counts
-                .told(name, &request, *n, steered.contains(&name.as_str()), now);
+            let Some(of) = self.of(name) else {
+                continue;
+            };
+            let steered = steered.contains(&name.as_str());
+            self.counts.told(name, &of, &request, *n, steered, now);
             self.counts_dirty = true;
         }
     }
@@ -4201,19 +4209,28 @@ mod tests {
         held::written();
         let now = epoch_ms() as u64;
         let counts = subs::counts(&store, "calc.lead");
-        let tasks = counts.of("tasks", now).unwrap();
+        let tasks = counts
+            .of("tasks", &lookout.of("tasks").unwrap_or_default(), now)
+            .unwrap();
         assert_eq!(
             (&tasks["heard"], &tasks["notes"], &tasks["steers"]),
             (&json!(1), &json!(1), &json!(0))
         );
-        let chat = counts.of("chat", now).unwrap();
+        let chat = counts
+            .of("chat", &lookout.of("chat").unwrap_or_default(), now)
+            .unwrap();
         assert_eq!(
             (&chat["heard"], &chat["notes"], &chat["steers"]),
             (&json!(2), &json!(1), &json!(1))
         );
         // A day on, what it told then is no longer counted.
         let day = 24 * 60 * 60 * 1000;
-        assert_eq!(counts.of("chat", now + day).unwrap()["notes"], 0);
+        assert_eq!(
+            counts
+                .of("chat", &lookout.of("chat").unwrap_or_default(), now + day)
+                .unwrap()["notes"],
+            0
+        );
         // One put in its own place under its name takes its counts along,
         // as one removed does, and the file says so; the rest keep theirs.
         let mut other = hears("chat");
@@ -4223,16 +4240,41 @@ mod tests {
             .cloned()
             .chain([other])
             .collect();
+        // Put in its place while the lookout was stopped, the same.
+        let mut again = seated("idle");
+        again.subs = subs.clone();
+        again.counts = subs::counts(&store, "calc.lead");
+        again.counting();
+        assert!(
+            again
+                .counts
+                .of("chat", &again.of("chat").unwrap(), now)
+                .is_none()
+        );
+        assert!(
+            again
+                .counts
+                .of("tasks", &again.of("tasks").unwrap(), now)
+                .is_some()
+        );
         lookout.resubscribed(subs);
         lookout.flush();
         held::written();
         let counts = subs::counts(&store, "calc.lead");
-        assert!(counts.of("chat", now).is_none());
-        assert!(counts.of("tasks", now).is_some());
+        assert!(
+            counts
+                .of("chat", &lookout.of("chat").unwrap_or_default(), now)
+                .is_none()
+        );
+        assert!(
+            counts
+                .of("tasks", &lookout.of("tasks").unwrap_or_default(), now)
+                .is_some()
+        );
         lookout.resubscribed(Vec::new());
         lookout.flush();
         held::written();
-        assert!(subs::counts(&store, "calc.lead").of("tasks", now).is_none());
+        assert!(subs::counts(&store, "calc.lead").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4254,13 +4296,22 @@ mod tests {
         lookout.answered(Answer::Sourced(Ok(())));
         let now = epoch_ms() as u64;
         for name in ["chat", "eng"] {
-            let count = lookout.counts.of(name, now).unwrap();
+            let count = lookout
+                .counts
+                .of(name, &lookout.of(name).unwrap(), now)
+                .unwrap();
             assert_eq!((&count["notes"], &count["steers"]), (&json!(1), &json!(1)));
         }
         // The same note again, its answer lost the first time, counts once.
         lookout.sourcing = Some((sent, vec!["k".into()], "steer"));
         lookout.answered(Answer::Sourced(Err("idempotency_conflict".into())));
-        assert_eq!(lookout.counts.of("chat", now).unwrap()["notes"], 1);
+        assert_eq!(
+            lookout
+                .counts
+                .of("chat", &lookout.of("chat").unwrap_or_default(), now)
+                .unwrap()["notes"],
+            1
+        );
     }
 
     #[test]
@@ -5467,8 +5518,19 @@ mod tests {
         lookout.resubscribed(vec![fixes, docs]);
         lookout.answered(Answer::Noted(Ok(())));
         let now = epoch_ms() as u64;
-        assert_eq!(lookout.counts.of("fixes", now).unwrap()["steers"], 1);
-        assert!(lookout.counts.of("docs", now).is_none());
+        assert_eq!(
+            lookout
+                .counts
+                .of("fixes", &lookout.of("fixes").unwrap_or_default(), now)
+                .unwrap()["steers"],
+            1
+        );
+        assert!(
+            lookout
+                .counts
+                .of("docs", &lookout.of("docs").unwrap_or_default(), now)
+                .is_none()
+        );
     }
 
     #[tokio::test]
