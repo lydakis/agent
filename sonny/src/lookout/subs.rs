@@ -38,6 +38,10 @@ pub struct Sub {
     /// How many notes telling what it heard it lasts, as an automation's
     /// `--runs` counts messages.
     pub runs: Option<u64>,
+    /// When one that lasts so many notes was added, in milliseconds since
+    /// the epoch: its notes are counted under it, so one removed and
+    /// added again under the name starts afresh.
+    pub made: Option<u64>,
 }
 
 impl Sub {
@@ -61,6 +65,7 @@ impl Sub {
             owner: None,
             until: None,
             runs: None,
+            made: None,
         }
     }
 
@@ -79,6 +84,7 @@ impl Sub {
             owner,
             until: None,
             runs: None,
+            made: None,
         }
     }
 
@@ -135,6 +141,9 @@ impl Sub {
         if let Some(runs) = self.runs {
             out["runs"] = json!(runs);
         }
+        if let Some(made) = self.made {
+            out["made"] = json!(made);
+        }
         out
     }
 
@@ -151,6 +160,11 @@ impl Sub {
     /// When it ends, in seconds since the epoch; none when it lasts.
     pub fn ends_at(&self) -> Option<i64> {
         crate::trigger::moment(self.until.as_deref()?).ok()
+    }
+
+    /// What its notes are counted under: its name and when it was added.
+    pub fn counter(&self) -> String {
+        format!("{}@{}", self.name, self.made.unwrap_or(0))
     }
 
     /// Whether it has ended by `now`, seconds since the epoch.
@@ -202,6 +216,7 @@ impl Sub {
                 .filter(|at| crate::trigger::moment(at).is_ok())
                 .map(str::to_owned),
             runs: value["runs"].as_u64().map(|n| n.max(1)),
+            made: value["made"].as_u64(),
         })
     }
 
@@ -810,7 +825,12 @@ pub fn change(
     }
     // What it adds is held by the bot of that ID, so a later bot given
     // the name, a task started again, say, never inherits it.
-    let add = add.map(parse).transpose()?.map(|sub| Sub { owner, ..sub });
+    let made = (super::epoch_ms() as u64).max(1);
+    let add = (add.map(parse).transpose()?).map(|sub| Sub {
+        owner,
+        made: sub.runs.map(|_| made),
+        ..sub
+    });
     let known = |name: &String| {
         let (source, topic) = super::sources::named(name);
         sources.iter().any(|s| s == source) && topic.is_none_or(|topic| plain(topic, NAME_MAX))
@@ -880,7 +900,16 @@ pub fn change(
             }
         }
     }
-    said["subscriptions"] = subs.iter().map(Sub::to_json).collect();
+    // When each was added is the lookout's to count by, not the bot's to read.
+    said["subscriptions"] = (subs.iter())
+        .map(|sub| {
+            Sub {
+                made: None,
+                ..sub.clone()
+            }
+            .to_json()
+        })
+        .collect();
     // Whether what it lists is what the lookout listens for.
     said["lookout"] = taken(store, subscriber);
     // Examples come only from events these subscriptions hear, and are
@@ -990,6 +1019,7 @@ fn parse(value: &Value) -> Result<Sub, String> {
         owner: None,
         until,
         runs,
+        made: None,
     };
     if sub.tasks_of.is_empty() && sub.bots.is_empty() && sub.sources.is_empty() {
         return Err("a subscription watches tasks_of a bot, bots by name or sources".into());
@@ -1125,6 +1155,20 @@ mod tests {
         assert!(sub.rules());
         assert!(!sub.over(now) && sub.over(now + 3600));
         assert!(sub.describe().contains(&soon), "{}", sub.describe());
+        // Its notes count under when it was added, which the bot never
+        // reads; the same added again in one call counts afresh.
+        assert!(sub.made.is_some() && added["subscriptions"][0].get("made").is_none());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        change(
+            &store,
+            "shop.lead",
+            Some(1),
+            Some(&once),
+            Some("deploy"),
+            &[],
+        )
+        .unwrap();
+        assert_ne!(read(&store, "shop.lead")[0].counter(), sub.counter());
         // A time gone, or no notes at all, is refused.
         let past = crate::trigger::until_text(now - 120);
         let refused = change(

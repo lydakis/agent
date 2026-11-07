@@ -2481,7 +2481,7 @@ struct Lookout {
     /// digest counts from.
     told_sources: HashMap<String, Instant>,
     /// How many notes told what each subscription that lasts so many
-    /// (`runs`) heard, kept with what its sources hold.
+    /// (`runs`) heard, under `Sub::counter`, kept with what its sources hold.
     runs_told: HashMap<String, u64>,
     /// Subscriptions whose notes ran out, for the service to end.
     ended: Vec<String>,
@@ -3202,12 +3202,13 @@ impl Lookout {
     }
 
     /// Notes counted only for subscriptions it has that last so many,
-    /// so one removed and added again starts its count afresh.
+    /// each under when it was added, so one removed and added again, even
+    /// in one call, starts its count afresh.
     fn counting(&mut self) {
         let subs = &self.subs;
-        self.runs_told.retain(|name, _| {
+        self.runs_told.retain(|counter, _| {
             subs.iter()
-                .any(|sub| &sub.name == name && sub.runs.is_some())
+                .any(|sub| sub.runs.is_some() && &sub.counter() == counter)
         });
     }
 
@@ -3236,9 +3237,11 @@ impl Lookout {
                 .collect(),
         };
         flying.into_iter().any(|name| {
-            (self.subs.iter().find(|sub| &sub.name == name))
-                .and_then(|sub| sub.runs)
-                .is_some_and(|runs| self.runs_told.get(name).copied().unwrap_or(0) + 1 >= runs)
+            (self.subs.iter().find(|sub| &sub.name == name)).is_some_and(|sub| {
+                sub.runs.is_some_and(|runs| {
+                    self.runs_told.get(&sub.counter()).copied().unwrap_or(0) + 1 >= runs
+                })
+            })
         })
     }
 
@@ -3248,17 +3251,17 @@ impl Lookout {
     fn spend(&mut self, counted: &[String]) {
         let mut spent = false;
         for name in counted {
-            let Some(runs) = (self.subs.iter())
+            let Some((runs, counter)) = (self.subs.iter())
                 .find(|sub| &sub.name == name)
-                .and_then(|s| s.runs)
+                .and_then(|s| Some((s.runs?, s.counter())))
             else {
                 continue;
             };
             spent = true;
-            let told = self.runs_told.entry(name.clone()).or_default();
+            let told = self.runs_told.entry(counter.clone()).or_default();
             *told += 1;
             if *told >= runs {
-                self.runs_told.remove(name);
+                self.runs_told.remove(&counter);
                 if !self.ended.contains(name) {
                     self.ended.push(name.clone());
                 }
@@ -3959,6 +3962,7 @@ mod tests {
             owner: None,
             until: None,
             runs: None,
+            made: None,
         }
     }
 
@@ -5902,6 +5906,7 @@ mod tests {
             let mut lookout = lookout();
             let mut twice = hears("twice");
             twice.runs = Some(2);
+            twice.made = Some(7);
             lookout.subs.push(twice);
             lookout.subs.push(hears("always"));
             (lookout.updates).seat(&json!({"name": "calc.lead", "bot_id": 1, "status": "idle"}));
@@ -5912,13 +5917,16 @@ mod tests {
         let mut lookout = made();
         // One that lasts is never counted; one note told is one spent.
         lookout.spend(&["always".into(), "twice".into()]);
-        assert_eq!(lookout.runs_told, HashMap::from([("twice".to_owned(), 1)]));
+        assert_eq!(
+            lookout.runs_told,
+            HashMap::from([("twice@7".to_owned(), 1)])
+        );
         assert!(lookout.ended.is_empty());
         lookout.flush();
         held::written();
         // Watched again, it has one note to go, and ends after it.
         let mut again = made();
-        assert_eq!(again.runs_told["twice"], 1);
+        assert_eq!(again.runs_told["twice@7"], 1);
         again.spend(&["twice".into()]);
         assert_eq!(again.ended, ["twice"]);
         assert!(again.runs_told.is_empty());
@@ -5930,7 +5938,7 @@ mod tests {
         told.counted = vec!["twice".into()];
         again.sending = Some((told, Vec::new(), "steer"));
         assert!(!again.last_runs_out(false), "two to go");
-        again.runs_told.insert("twice".into(), 1);
+        again.runs_told.insert("twice@7".into(), 1);
         assert!(again.last_runs_out(false));
         assert!(!again.last_runs_out(true), "nothing under way for sources");
         again.sending = None;
@@ -5943,8 +5951,18 @@ mod tests {
         again.subs.push(late);
         assert!(again.overdue());
         assert_eq!(again.over, ["late"]);
-        // Removed and added again, it counts afresh.
-        again.runs_told.insert("twice".into(), 1);
+        // Removed and added again, even in one call, it counts afresh.
+        again.runs_told.insert("twice@7".into(), 1);
+        let twice = again
+            .subs
+            .iter_mut()
+            .find(|sub| sub.name == "twice")
+            .unwrap();
+        twice.made = Some(8);
+        again.counting();
+        assert!(again.runs_told.is_empty());
+        assert!(!again.last_runs_out(false), "the new one has two to go");
+        again.runs_told.insert("twice@8".into(), 1);
         again.subs.retain(|sub| sub.name != "twice");
         again.counting();
         assert!(again.runs_told.is_empty());
