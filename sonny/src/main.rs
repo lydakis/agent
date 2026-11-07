@@ -11,6 +11,7 @@
 mod acp;
 mod approvals;
 mod approver;
+mod asked;
 mod asks;
 mod attach;
 mod background;
@@ -1806,6 +1807,11 @@ fn main() -> std::process::ExitCode {
         }
         // An ask's deadline trigger runs this as its `--if`.
         Some((verb, rest)) if verb == asks::TOOL => {
+            if let Some((list, rest)) = rest.split_first()
+                && list == "list"
+            {
+                return std::process::ExitCode::from(asked::cli(rest) as u8);
+            }
             return std::process::ExitCode::from(asks::cli(rest) as u8);
         }
         Some((verb, rest)) if verb == trigger::VERB => {
