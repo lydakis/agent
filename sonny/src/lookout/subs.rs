@@ -537,7 +537,12 @@ struct Count {
     /// By hour since the epoch: heard, notes, steers.
     hours: std::collections::VecDeque<(u64, [u64; 3])>,
     last_ms: u64,
+    /// The notes it counted last, by request: one sent again counts once.
+    notes: std::collections::VecDeque<String>,
 }
+
+/// How many notes a subscription's count remembers having counted.
+const COUNTED_NOTES: usize = 16;
 
 impl Count {
     fn recent(&mut self, now_ms: u64) {
@@ -550,8 +555,15 @@ impl Count {
 
 impl Counts {
     /// A note told what `sub` heard, `heard` of it, steering for it or not.
-    pub fn told(&mut self, sub: &str, heard: u64, steered: bool, now_ms: u64) {
+    pub fn told(&mut self, sub: &str, note: &str, heard: u64, steered: bool, now_ms: u64) {
         let count = self.0.entry(sub.to_owned()).or_default();
+        if count.notes.iter().any(|had| had == note) {
+            return;
+        }
+        if count.notes.len() == COUNTED_NOTES {
+            count.notes.pop_front();
+        }
+        count.notes.push_back(note.to_owned());
         count.recent(now_ms);
         let hour = now_ms / HOUR_MS;
         if count.hours.back().is_none_or(|(last, _)| *last != hour) {
@@ -585,7 +597,7 @@ impl Counts {
                     .collect();
                 (
                     sub.clone(),
-                    json!({"hours": hours, "last_ms": count.last_ms}),
+                    json!({"hours": hours, "last_ms": count.last_ms, "notes": count.notes}),
                 )
             })
             .collect::<serde_json::Map<String, Value>>()
@@ -603,6 +615,9 @@ impl Counts {
             Count {
                 hours,
                 last_ms: value["last_ms"].as_u64().unwrap_or(0),
+                notes: (value["notes"].as_array().into_iter().flatten())
+                    .filter_map(|note| note.as_str().map(str::to_owned))
+                    .collect(),
             }
         };
         Counts(
@@ -1152,7 +1167,9 @@ pub fn tried(
         })
         .collect();
     let mut tried = json!({"since": super::sources::clock(since), "events": events.len(),
-        "heard": heard, "steers": steers, "notes": notes(&times)});
+        "heard": heard, "steers": steers,
+        // One that lasts so many notes ends after them.
+        "notes": notes(&times).min(sub.runs.map_or(usize::MAX, |runs| runs as usize))});
     if cut > 0 {
         tried["cut"] = json!(format!(
             "{cut} of the events it heard were kept cut, which a filter may misjudge"
@@ -1607,6 +1624,8 @@ mod tests {
         assert_eq!(tried_notes(&store, &digested), 3);
         let all = json!({"name": "red", "sources": ["ci"]});
         assert_eq!(tried_notes(&store, &all), 4);
+        let once = json!({"name": "red", "sources": ["ci"], "runs": 1});
+        assert_eq!(tried_notes(&store, &once), 1);
         let other = tried(&store, "shop.fix", &all, &sources).unwrap();
         assert_eq!(other["test"]["heard"], 5, "{other}");
         // The commons keeps no recent log: a test of it says so.
@@ -1706,8 +1725,10 @@ mod tests {
         change(&store, "shop.lead", None, Some(&sub), None, &[]).unwrap();
         let mut counts = Counts::default();
         let now = super::super::epoch_ms() as u64;
-        counts.told("prs", 3, false, now - 2 * HOUR_MS);
-        counts.told("prs", 1, true, now);
+        counts.told("prs", "lookout-a", 3, false, now - 2 * HOUR_MS);
+        counts.told("prs", "lookout-b", 1, true, now);
+        // The same note sent again counts once.
+        counts.told("prs", "lookout-b", 1, true, now);
         assert_eq!(Counts::from_json(&counts.to_json()), counts);
         let file = counts_file(&store, "shop.lead");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();

@@ -2989,7 +2989,7 @@ impl Lookout {
                         }
                         // The person's words a bounded note left out still cut in.
                         self.urgent &= self.updates.quoting();
-                        self.count(&told.heard, &told.steered());
+                        self.count(&key, &told.heard, &told.steered());
                         self.spend(0, &key);
                         self.updates.sent(told);
                         // When a subscription's digest last told is kept.
@@ -3005,6 +3005,7 @@ impl Lookout {
                     // The same news twice is one note.
                     Err(code) if code == "idempotency_conflict" => {
                         self.urgent &= self.updates.quoting();
+                        self.count(&key, &told.heard, &told.steered());
                         self.spend(0, &key);
                         self.updates.sent(told);
                     }
@@ -3056,18 +3057,20 @@ impl Lookout {
                                     Some((_, n)) => *n += 1,
                                     None => heard.push((sub.clone(), 1)),
                                 }
-                                let by = one.event.steer_by.as_deref();
-                                if one.event.steer
-                                    && by.is_none_or(|by| by == sub)
-                                    && !steered.contains(&sub.as_str())
-                                {
+                                // Its source marked it, or this one's own
+                                // `steer` matched it, whichever set it off.
+                                let marked = one.event.steer && one.event.steer_by.is_none();
+                                let own = (self.subs.iter().find(|had| had.name == *sub))
+                                    .and_then(|had| had.steer.as_ref())
+                                    .is_some_and(|steer| {
+                                        pattern::matches(steer, &one.event.fields)
+                                    });
+                                if (marked || own) && !steered.contains(&sub.as_str()) {
                                     steered.push(sub);
                                 }
                             }
                         }
-                        if submitted.is_ok() {
-                            self.count(&heard, &steered);
-                        }
+                        self.count(&key, &heard, &steered);
                         self.spend(1, &key);
                         self.unkept_sent = Unkept::default();
                         for heard in &sent {
@@ -3160,11 +3163,13 @@ impl Lookout {
 
     /// A note that told what these subscriptions heard landed: each
     /// counts what it told, for the listing.
-    fn count(&mut self, heard: &[(String, u64)], steered: &[&str]) {
+    /// Once a note, by its request: sent again, it counts no more.
+    fn count(&mut self, key: &[String], heard: &[(String, u64)], steered: &[&str]) {
         let now = epoch_ms() as u64;
+        let request = format!("lookout-{}", digest(&key.join(",")));
         for (name, n) in heard {
             self.counts
-                .told(name, *n, steered.contains(&name.as_str()), now);
+                .told(name, &request, *n, steered.contains(&name.as_str()), now);
             self.counts_dirty = true;
         }
     }
@@ -4229,6 +4234,33 @@ mod tests {
         held::written();
         assert!(subs::counts(&store, "calc.lead").of("tasks", now).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_subscription_whose_steer_matched_counts_it_and_a_note_counts_once() {
+        let mut lookout = seated("idle");
+        let down = Some(json!({"text": ["prod is down"]}));
+        let (mut chat, mut eng) = (hears("chat"), hears("eng"));
+        (chat.steer, eng.steer) = (down.clone(), down);
+        lookout.subs = vec![chat, eng];
+        // Its first steer only says why it cut in.
+        let mut event = slack("prod is down", true);
+        event.steer_by = Some("chat".into());
+        let sent = vec![sources::Heard {
+            event,
+            subs: vec!["chat".into(), "eng".into()],
+        }];
+        lookout.sourcing = Some((sent.clone(), vec!["k".into()], "steer"));
+        lookout.answered(Answer::Sourced(Ok(())));
+        let now = epoch_ms() as u64;
+        for name in ["chat", "eng"] {
+            let count = lookout.counts.of(name, now).unwrap();
+            assert_eq!((&count["notes"], &count["steers"]), (&json!(1), &json!(1)));
+        }
+        // The same note again, its answer lost the first time, counts once.
+        lookout.sourcing = Some((sent, vec!["k".into()], "steer"));
+        lookout.answered(Answer::Sourced(Err("idempotency_conflict".into())));
+        assert_eq!(lookout.counts.of("chat", now).unwrap()["notes"], 1);
     }
 
     #[test]
