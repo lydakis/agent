@@ -1165,6 +1165,19 @@ fn owners(open: &Value) -> Vec<Value> {
 /// later is still the cleanup too.
 fn cleanup_start(root: &Path, caller: Option<&str>) -> Result<Value, String> {
     repo(root)?;
+    // A refusal cut short is carried on first, never resumed as a cleanup:
+    // what a run changed after it would stand, as memory goes back once.
+    let refused = std::fs::read_to_string(root.join(CLEANUP))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .is_some_and(|open| open["refused"].is_object());
+    if refused {
+        match cleanup_finish(root) {
+            // Another finish closed it meanwhile: start anew.
+            Err(e) if e.starts_with("cleanup_not_started") => {}
+            done => return done,
+        }
+    }
     // The memory folder's lock, which a finish holds too: two starts, or a
     // start and a finish, never both read the open cleanup and write it.
     let _lock = lock(root)?;
@@ -1281,7 +1294,8 @@ fn noted(root: &Path, caller: Option<&str>, path: &Path, now: Option<&str>) -> R
         return Ok(());
     };
     let open = serde_json::from_str::<Value>(&open).unwrap_or_default();
-    if owners(&open).contains(&json!(caller)) {
+    // Once the cleanup is refused, its owners' changes are no part of it.
+    if owners(&open).contains(&json!(caller)) && !open["refused"].is_object() {
         return Ok(());
     }
     let Ok(relative) = path.strip_prefix(root) else {
@@ -1390,6 +1404,12 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
         .iter()
         .map(|dir| lock(dir))
         .collect::<Result<Vec<_>, _>>()?;
+    // A refusal cut short is carried on: once its revert landed, nothing
+    // here would read as a loss, and finishing it as a clean cleanup would
+    // drop what others saved meanwhile.
+    if open["refused"].is_object() {
+        return refuse(root, &state, &open, start);
+    }
     // A file that is not a fact keeps the cleanup open until it is fixed.
     let after = all_facts(root)?;
     git(root, &["add", "-A"])?;
@@ -1411,17 +1431,11 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
     let before = (before as usize).saturating_sub(work.len());
     let limit = (before / 4).max(2);
     if lost > limit {
-        git(root, &["revert", "--no-edit", &head])?;
-        private(root)?;
-        let kept = put_back(root)?;
-        let _ = std::fs::remove_file(&state);
-        let others = match kept {
-            0 => String::new(),
-            n => format!(" with the {n} facts other agents saved or removed meanwhile"),
-        };
-        return Err(format!(
-            "loss_guard: the cleanup removed {lost} of {before} lasting facts, above {limit}; memory is back as it was at {start}{others}, and the refused cleanup is commit {head}"
-        ));
+        // Said before it is done, so a run killed partway carries it on.
+        let mut open = open.clone();
+        open["refused"] = json!({"head": head, "lost": lost, "before": before, "limit": limit});
+        write(&state, &open.to_string())?;
+        return refuse(root, &state, &open, start);
     }
     let _ = std::fs::remove_file(root.join(OTHERS));
     // A refused cleanup saved nothing of what the person wrote, so the
@@ -1433,6 +1447,44 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
     Ok(
         json!({"commit": head, "facts": after, "removed": removed, "added": added, "changed": changed}),
     )
+}
+
+/// Take a refused cleanup back to `start`, put back what others saved or
+/// removed meanwhile, and close it. Each step can run again: memory goes
+/// back to `start` until the cleanup says it went back, while what others
+/// wrote is still listed to put back or the refused commit is the newest.
+/// Once it says so, memory never goes back again: what others save after
+/// is only put back.
+fn refuse(root: &Path, state: &Path, open: &Value, start: &str) -> Result<Value, String> {
+    let refused = &open["refused"];
+    let head = refused["head"].as_str().unwrap_or_default();
+    if refused["back"] != true {
+        let newest = git(root, &["rev-parse", "HEAD"])?.trim().to_owned();
+        if newest == head || root.join(OTHERS).exists() {
+            // The tree as it was at `start`, whatever is on disk: others'
+            // writes since are listed, and put back next.
+            git(root, &["read-tree", "-u", "--reset", start])?;
+            let message = format!("Memory cleanup refused, back to {start}, {}", today());
+            git(root, &["commit", "-q", "--allow-empty", "-m", &message])?;
+            private(root)?;
+        }
+        // Said before what others wrote is put back and its list removed:
+        // a list begun after that holds only later writes, and going back
+        // again would drop the ones put back.
+        let mut open = open.clone();
+        open["refused"]["back"] = json!(true);
+        write(state, &open.to_string())?;
+    }
+    let kept = put_back(root)?;
+    let _ = std::fs::remove_file(state);
+    let others = match kept {
+        0 => String::new(),
+        n => format!(" with the {n} facts other agents saved or removed meanwhile"),
+    };
+    let (lost, before, limit) = (&refused["lost"], &refused["before"], &refused["limit"]);
+    Err(format!(
+        "loss_guard: the cleanup removed {lost} of {before} lasting facts, above {limit}; memory is back as it was at {start}{others}, and the refused cleanup is commit {head}"
+    ))
 }
 
 /// The automation that runs the cleanup each night: each run in an agent
@@ -2530,6 +2582,205 @@ mod tests {
             "unchanged"
         );
         assert!(!root.join(OTHERS).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_refusal_cut_short_after_its_put_back_goes_back_no_more() {
+        let root = temp("cleanup-cut-late");
+        let as_ = |caller: Option<&str>, line: &[&str]| {
+            run_as(&root, &root, &args(line), &|| Ok("-".into()), caller)
+        };
+        let save = |caller, name: &str, text: &str| {
+            let mut line = vec!["save", name, "--type", "feedback", "--description"];
+            line.extend([name, "--source", "test", "--user", "--", text]);
+            as_(caller, &line).unwrap();
+        };
+        repo(&root).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            save(None, name, "before");
+        }
+        as_(Some("7"), &["cleanup", "start"]).unwrap();
+        save(Some("8"), "e", "new from 8");
+        for name in ["b", "c", "d"] {
+            as_(Some("7"), &["rm", name, "--user"]).unwrap();
+        }
+        let open: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        let start = open["commit"].as_str().unwrap().to_owned();
+        // The finish was killed after it went back and put back agent 8's
+        // save, before it closed the cleanup.
+        git(&root, &["add", "-A"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "cleanup"]).unwrap();
+        let head = git(&root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        let mut cut = open.clone();
+        cut["refused"] = json!({"head": head, "lost": 3, "before": 4, "limit": 2, "back": true});
+        write(&root.join(CLEANUP), &cut.to_string()).unwrap();
+        git(&root, &["read-tree", "-u", "--reset", &start]).unwrap();
+        git(&root, &["commit", "-q", "--allow-empty", "-m", "back"]).unwrap();
+        assert_eq!(put_back(&root).unwrap(), 1);
+        // Agent 8 saves again while the cleanup is still open: a new list.
+        save(Some("8"), "f", "later from 8");
+        assert!(root.join(OTHERS).exists());
+        let refused = as_(Some("7"), &["cleanup", "finish"]).unwrap_err();
+        assert!(refused.starts_with("loss_guard: "), "{refused}");
+        let text = |name: &str| std::fs::read_to_string(root.join(format!("{name}.md"))).ok();
+        // Both of agent 8's saves stay: the first, put back before the
+        // finish was cut short, is not taken back again.
+        assert!(
+            text("e").unwrap().ends_with("new from 8\n"),
+            "{:?}",
+            text("e")
+        );
+        assert!(text("f").unwrap().ends_with("later from 8\n"));
+        for name in ["b", "c", "d"] {
+            assert!(text(name).unwrap().ends_with("before\n"), "{name}");
+        }
+        assert!(!root.join(CLEANUP).exists());
+        assert!(!root.join(OTHERS).exists());
+        assert_eq!(check(&root)["problems"], json!([]));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_start_after_a_refusal_cut_short_carries_the_refusal_on() {
+        let root = temp("cleanup-cut-start");
+        let as_ = |caller: Option<&str>, line: &[&str]| {
+            run_as(&root, &root, &args(line), &|| Ok("-".into()), caller)
+        };
+        let save = |caller, name: &str, text: &str| {
+            let mut line = vec!["save", name, "--type", "feedback", "--description"];
+            line.extend([name, "--source", "test", "--user", "--", text]);
+            as_(caller, &line).unwrap();
+        };
+        repo(&root).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            save(None, name, "before");
+        }
+        as_(Some("7"), &["cleanup", "start"]).unwrap();
+        for name in ["b", "c", "d"] {
+            as_(Some("7"), &["rm", name, "--user"]).unwrap();
+        }
+        // The finish was killed once it had refused the cleanup and gone
+        // back, before it closed it.
+        let open: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        let start = open["commit"].as_str().unwrap().to_owned();
+        git(&root, &["add", "-A"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "cleanup"]).unwrap();
+        let head = git(&root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        let mut cut = open.clone();
+        cut["refused"] = json!({"head": head, "lost": 3, "before": 4, "limit": 2, "back": true});
+        write(&root.join(CLEANUP), &cut.to_string()).unwrap();
+        git(&root, &["read-tree", "-u", "--reset", &start]).unwrap();
+        git(&root, &["commit", "-q", "--allow-empty", "-m", "back"]).unwrap();
+        // The next night's run starts: the refusal is closed, not handed on
+        // for it to carry on, and what it owned saves now stays.
+        let refused = as_(Some("9"), &["cleanup", "start"]).unwrap_err();
+        assert!(refused.starts_with("loss_guard: "), "{refused}");
+        assert!(!root.join(CLEANUP).exists());
+        let text = |name: &str| std::fs::read_to_string(root.join(format!("{name}.md"))).ok();
+        for name in ["a", "b", "c", "d"] {
+            assert!(text(name).unwrap().ends_with("before\n"), "{name}");
+        }
+        let fresh = as_(Some("9"), &["cleanup", "start"]).unwrap();
+        assert_eq!(fresh["duplicate"], json!(false), "{fresh}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_owner_s_save_after_its_cleanup_was_refused_is_put_back() {
+        let root = temp("cleanup-refused-owner");
+        let as_ = |caller: Option<&str>, line: &[&str]| {
+            run_as(&root, &root, &args(line), &|| Ok("-".into()), caller)
+        };
+        repo(&root).unwrap();
+        as_(Some("7"), &["cleanup", "start"]).unwrap();
+        let mut open: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        open["refused"] = json!({"head": "x", "lost": 3, "before": 4, "limit": 2});
+        write(&root.join(CLEANUP), &open.to_string()).unwrap();
+        let line = ["save", "e", "--type", "feedback", "--description", "e"];
+        let mut line = line.to_vec();
+        line.extend(["--source", "test", "--user", "--", "from 7"]);
+        as_(Some("7"), &line).unwrap();
+        let others = std::fs::read_to_string(root.join(OTHERS)).unwrap();
+        assert!(others.contains("from 7"), "{others}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_refusal_cut_short_is_carried_on_and_keeps_what_others_saved() {
+        let root = temp("cleanup-cut");
+        let as_ = |caller: Option<&str>, line: &[&str]| {
+            run_as(&root, &root, &args(line), &|| Ok("-".into()), caller)
+        };
+        let save = |caller, name: &str, text: &str| {
+            let mut line = vec!["save", name, "--type", "feedback", "--description"];
+            line.extend([name, "--source", "test", "--user", "--", text]);
+            as_(caller, &line).unwrap();
+        };
+        repo(&root).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            save(None, name, "before");
+        }
+        as_(Some("7"), &["cleanup", "start"]).unwrap();
+        save(Some("8"), "e", "new from 8");
+        for name in ["b", "c", "d"] {
+            as_(Some("7"), &["rm", name, "--user"]).unwrap();
+        }
+        // The finish was killed after it refused the cleanup and took memory
+        // back to its start, before it put back what agent 8 saved.
+        let open: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        let start = open["commit"].as_str().unwrap().to_owned();
+        git(&root, &["add", "-A"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "cleanup"]).unwrap();
+        let head = git(&root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        let mut cut = open.clone();
+        cut["refused"] = json!({"head": head, "lost": 3, "before": 4, "limit": 2});
+        write(&root.join(CLEANUP), &cut.to_string()).unwrap();
+        git(&root, &["read-tree", "-u", "--reset", &start]).unwrap();
+        git(&root, &["commit", "-q", "--allow-empty", "-m", "back"]).unwrap();
+        assert!(!root.join("e.md").exists());
+        // The next finish carries the refusal on, rather than reading no
+        // loss and closing it with agent 8's fact gone.
+        let refused = as_(Some("7"), &["cleanup", "finish"]).unwrap_err();
+        assert!(
+            refused.starts_with("loss_guard: the cleanup removed 3 of 4 lasting facts, above 2"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("with the 1 facts other agents saved"),
+            "{refused}"
+        );
+        let text = |name: &str| std::fs::read_to_string(root.join(format!("{name}.md"))).ok();
+        assert!(
+            text("e").unwrap().ends_with("new from 8\n"),
+            "{:?}",
+            text("e")
+        );
+        for name in ["b", "c", "d"] {
+            assert!(text(name).unwrap().ends_with("before\n"), "{name}");
+        }
+        assert!(!root.join(CLEANUP).exists());
+        assert!(!root.join(OTHERS).exists());
+        assert_eq!(check(&root)["problems"], json!([]));
+        // Run again after it closed, it is no cleanup at all.
+        let code = |r: Result<Value, String>| error_json(&r.unwrap_err())["error"].clone();
+        assert_eq!(
+            code(as_(Some("7"), &["cleanup", "finish"])),
+            "cleanup_not_started"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

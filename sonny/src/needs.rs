@@ -391,6 +391,11 @@ impl Needs {
                 {
                     calls.retain(|(_, call)| call != id);
                 }
+                // An agent closing a question of its own: which one, the
+                // history says once the turn ends.
+                if data["name"] == crate::asks::CLOSE && self.asks.contains_key(bot) {
+                    self.unsure.insert(bot.to_owned());
+                }
             }
             "tool_started" => {
                 let call = data["call_id"].as_str().map(str::to_owned);
