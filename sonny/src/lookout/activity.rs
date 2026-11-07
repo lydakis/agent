@@ -26,7 +26,7 @@ pub const FIELDS: [(&str, &str); 13] = [
         "status",
         "string, how a turn ended: completed, failed, stopped or interrupted",
     ),
-    ("resolved", "boolean, the turn resolved its task"),
+    ("done", "boolean, the task marked itself done in the turn"),
     (
         "theirs",
         "boolean, the person asked for the turn in the task themselves",

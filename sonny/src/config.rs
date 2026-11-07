@@ -172,6 +172,12 @@ pub const SETTINGS: &[Setting] = &[
         default: "tab",
     },
     Setting {
+        key: "sonny.needs_check",
+        about: "once an agent's turn ends with words and no question asked, a copy of it with no tools says whether they wait on you, and it counts as needing you; one small call, read from the warm cache",
+        values: SWITCH,
+        default: "true",
+    },
+    Setting {
         key: "sonny.suggest",
         about: "after a turn you started, a copy of the agent guesses your next message for Tab to take; one small call",
         values: SWITCH,

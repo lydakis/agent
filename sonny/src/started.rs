@@ -27,7 +27,7 @@ pub struct Task {
 pub fn state(turn: &Value) -> String {
     match turn["status"].as_str() {
         None => "starting",
-        Some("completed" | "steered") => "done",
+        Some("completed" | "steered") => IDLE,
         Some("failed") if turn["error"] == "empty_completion" => QUIET,
         Some("failed") => "failed",
         Some("interrupted") => "stopped",
@@ -36,19 +36,31 @@ pub fn state(turn: &Value) -> String {
     .to_owned()
 }
 
+/// The state of a task whose turn ended with nothing open: it rests, until
+/// it or the person picks the work up again, or it is marked done.
+pub const IDLE: &str = "idle";
+
+/// The state of a task marked done, by itself, its lead or the person:
+/// closed, until new work reopens it.
+pub const DONE: &str = "done";
+
 /// The state of a task whose turn ended with the model saying nothing: no
 /// failure, and not a reply either.
 pub const QUIET: &str = "no reply";
 
 /// Whether a task in `state` waits on nothing more of its own.
 pub fn settled(state: &str) -> bool {
-    matches!(state, "done" | QUIET | "failed" | "stopped" | "removed")
+    matches!(
+        state,
+        IDLE | DONE | QUIET | "failed" | "stopped" | "removed"
+    )
 }
 
 /// A state's mark and its color.
 fn sign(state: &str) -> Span<'static> {
     match state {
-        "done" => Span::raw("✓").fg(Color::Green),
+        IDLE => Span::raw("✓").fg(Color::Green),
+        DONE => Span::raw("✓").dim(),
         QUIET => Span::raw("✓").dim(),
         "failed" => Span::raw("✗").fg(Color::Red),
         "needs you" => Span::raw("?").fg(Color::Yellow).bold(),
@@ -135,7 +147,7 @@ mod tests {
         let asked = json!({"status": "waiting", "waiting_on": {"approval": true}});
         assert_eq!(state(&asked), "working");
         assert_eq!(state(&json!({"status": "waiting"})), "working");
-        assert_eq!(state(&json!({"status": "completed"})), "done");
+        assert_eq!(state(&json!({"status": "completed"})), "idle");
         let empty = json!({"status": "failed", "error": "empty_completion"});
         assert_eq!(state(&empty), "no reply");
         assert_eq!(state(&json!({"status": "failed"})), "failed");

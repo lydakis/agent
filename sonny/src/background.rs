@@ -60,6 +60,8 @@ pub struct Item {
     /// When a trigger last fired, in ms: a fire that sent no turn is still
     /// a fire of its own.
     pub fired_ms: Option<u64>,
+    /// The sources a subscription hears, by name.
+    pub sources: Vec<String>,
     /// What makes its failure the same one when `failed`'s words change:
     /// a broken `--if`'s break, whatever each failed check printed.
     pub episode: Option<String>,
@@ -91,6 +93,14 @@ pub fn read(
         for sub in subs {
             let own = project.is_some_and(|p| sub == lookout::subs::Sub::lead(&subscriber, p));
             let described = sub.describe();
+            let mut sources: Vec<String> = (sub.sources.iter())
+                .map(|s| {
+                    s.split_once(':')
+                        .map_or(s.as_str(), |(name, _)| name)
+                        .to_owned()
+                })
+                .collect();
+            sources.dedup();
             let what = described
                 .strip_prefix(&format!("{} · ", sub.name))
                 .unwrap_or(&described)
@@ -112,6 +122,7 @@ pub fn read(
                 handle: None,
                 fired_ms: None,
                 episode: None,
+                sources,
             });
         }
     }
@@ -238,6 +249,7 @@ fn unscheduled(cleanup: Option<(String, i64)>) -> Option<Item> {
         own: false,
         failed: Some(first_line(&why)),
         episode: None,
+        sources: Vec::new(),
         handle: None,
         fired_ms: None,
     })
@@ -282,6 +294,7 @@ fn servers(view: &Value) -> Vec<Item> {
                 handle: None,
                 fired_ms: None,
                 episode: None,
+                sources: Vec::new(),
             });
         }
     }
@@ -422,6 +435,7 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         handle: trigger::sent(row),
         fired_ms,
         episode,
+        sources: Vec::new(),
     }
 }
 
@@ -435,11 +449,18 @@ pub fn count(items: &[Item], bot: &str) -> usize {
 
 /// What `/status` says of `bot`'s: `↻ 2 automations, 1 follow`, or
 /// nothing.
-pub fn fact(items: &[Item], bot: &str) -> String {
+pub fn fact(items: &[Item], bot: &str, icons: &HashMap<String, String>) -> String {
+    // A follow whose every source has its icon is shown by those.
+    let shown = |i: &Item| {
+        i.kind == Kind::Subscription
+            && !i.sources.is_empty()
+            && i.sources.iter().all(|s| icons.contains_key(s))
+    };
     let of = |kind: Kind| {
         items
             .iter()
             .filter(|i| i.kind == kind && !i.own && i.bots.iter().any(|b| b == bot))
+            .filter(|i| !shown(i))
             .count()
     };
     let said: Vec<String> = [
@@ -454,6 +475,22 @@ pub fn fact(items: &[Item], bot: &str) -> String {
         true => String::new(),
         false => format!("↻ {}", said.join(", ")),
     }
+}
+
+/// The icons of the sources `bot` follows, as `[sonny.sources.NAME]
+/// icon` gives them, each once, in the order of its follows.
+pub fn icons(items: &[Item], bot: &str, icons: &HashMap<String, String>) -> String {
+    let mut said = String::new();
+    let theirs = (items.iter())
+        .filter(|i| i.kind == Kind::Subscription && !i.own && i.bots.iter().any(|b| b == bot));
+    for source in theirs.flat_map(|i| &i.sources) {
+        if let Some(icon) = icons.get(source)
+            && !said.contains(icon.as_str())
+        {
+            said.push_str(icon);
+        }
+    }
+    said
 }
 
 /// The agents a window's `/background` covers: the project's, as
@@ -862,6 +899,7 @@ mod tests {
             handle: None,
             fired_ms: None,
             episode: None,
+            sources: Vec::new(),
         }
     }
 
@@ -881,9 +919,35 @@ mod tests {
         assert_eq!(count(&items, "calc.lead"), 3);
         assert_eq!(count(&items, "calc.digest"), 1);
         assert_eq!(count(&items, "calc.fix"), 0);
-        assert_eq!(fact(&items, "calc.lead"), "↻ 2 automations, 1 follow");
-        assert_eq!(fact(&items, "calc.digest"), "↻ 1 automation");
-        assert_eq!(fact(&items, "calc.fix"), "");
+        let none = HashMap::new();
+        assert_eq!(
+            fact(&items, "calc.lead", &none),
+            "↻ 2 automations, 1 follow"
+        );
+        assert_eq!(fact(&items, "calc.digest", &none), "↻ 1 automation");
+        assert_eq!(fact(&items, "calc.fix", &none), "");
+    }
+
+    #[test]
+    fn a_follow_of_sources_with_icons_shows_as_them() {
+        let follow = |name: &str, sources: &[&str]| Item {
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+            ..item(Kind::Subscription, name, &["calc.lead"], false)
+        };
+        let items = [
+            item(Kind::Subscription, "tasks", &["calc.lead"], true),
+            follow("prs", &["github"]),
+            follow("ci", &["github", "buildkite"]),
+            follow("chat", &["slack"]),
+        ];
+        let icons: HashMap<String, String> = [("github", "▲"), ("slack", "#")]
+            .into_iter()
+            .map(|(s, i)| (s.to_owned(), i.to_owned()))
+            .collect();
+        assert_eq!(super::icons(&items, "calc.lead", &icons), "▲#");
+        // One with a source that has none is still counted.
+        assert_eq!(fact(&items, "calc.lead", &icons), "↻ 1 follow");
+        assert_eq!(super::icons(&items, "calc.fix", &icons), "");
     }
 
     #[test]

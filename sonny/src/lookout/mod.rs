@@ -4863,7 +4863,7 @@ mod tests {
             (json!({"type": ["turn.ended"], "status": ["failed"]}), false),
             (json!({"type": ["turn.ended"], "by": ["you"]}), false),
             (json!({"type": ["turn.ended"], "by": ["person"]}), true),
-            (json!({"type": ["turn.ended"], "resolved": [false]}), false),
+            (json!({"type": ["turn.ended"], "done": [false]}), false),
         ] {
             let mut lookout = seated("idle");
             lookout.subs[0].filter = Some(filter);
@@ -5586,6 +5586,7 @@ mod tests {
             digest: None,
             steer: None,
             watch: Vec::new(),
+            icon: None,
         };
         let down = sources::Event::of_lookout(&source, "down", "down".into(), json!({}));
         // A topic of it, and a filter the notice never matches, hear it.
@@ -6393,6 +6394,7 @@ mod tests {
             digest: None,
             steer: None,
             watch: Vec::new(),
+            icon: None,
         }
     }
 

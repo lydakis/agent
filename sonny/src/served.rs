@@ -275,7 +275,7 @@ fn subscriptions() -> Value {
                             "description": "Only the events this matches are heard, its sources' and its bots' \
                                 alike. A bot's events have type (message.written, turn.ended, approval.waiting, \
                                 ask.posted, turn.silent, note.changed), bot, maker, by (you, person, an agent's \
-                                name, trigger), turn, status (completed, failed, stopped, interrupted), resolved, \
+                                name, trigger), turn, status (completed, failed, stopped, interrupted), done, \
                                 theirs (the person asked for the turn themselves), text (the person's \
                                 words), question, options and id (a margin note's). An event pattern as \
                                 AWS EventBridge writes one. Each field the event must have maps to a list of values, \
