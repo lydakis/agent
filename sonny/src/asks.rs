@@ -1211,12 +1211,16 @@ fn fire(question: &str, plan: Unanswered, label: &str) -> String {
 struct Standing {
     /// The person's answers after the call, by ask, newest first.
     answers: Vec<(String, String)>,
-    /// The agent's closes after it, by ask, newest first, with the turn
-    /// and call each was made as.
-    closes: Vec<((i64, Value), String, State)>,
-    /// The calls refused or failed, by turn and call: a close refused
-    /// closed nothing.
+    /// The agent's closes after it that were not refused, by ask, newest
+    /// first.
+    closes: Vec<(String, State)>,
+    /// The calls refused or failed whose call is not read yet, by turn
+    /// and call: a close refused closed nothing. A result comes after its
+    /// call, so each is let go once its call is read.
     refused: Vec<(i64, Value)>,
+    /// The one ask read for, when only its answers and closes are kept,
+    /// so a long history costs no more than that ask's.
+    wanted: Option<String>,
     /// The person wrote words of their own after it.
     moved_on: bool,
     /// A call not to count, by turn and call: the close being answered.
@@ -1237,25 +1241,43 @@ impl Standing {
         call: &str,
     ) -> Option<Option<(Ask, State)>> {
         let items = crate::responses(&entry["item"]);
+        let wanted = |of: &str| self.wanted.as_deref().is_none_or(|wanted| wanted == of);
+        let (mut refusals, mut closes) = (Vec::new(), Vec::new());
         for item in &items {
             let made = (at, item["call_id"].clone());
             if item["type"] == "function_call_output"
                 && (item["failed"] == true || crate::reactions::refused(item))
             {
-                self.refused.push(made.clone());
+                refusals.push(made.clone());
             }
+            if item["type"] != "function_call" {
+                continue;
+            }
+            let was_refused = (self.refused.iter().position(|r| *r == made))
+                .map(|at| self.refused.swap_remove(at))
+                .is_some();
             if let Some((closed, state)) = closed_by(item)
                 && self.skip.as_ref() != Some(&made)
+                && !was_refused
+                && wanted(&closed)
             {
-                self.closes.push((made, closed, state));
+                closes.push((closed, state));
             }
         }
+        self.refused.extend(refusals);
+        self.closes.extend(closes);
         if crate::lookout::said_by_person(entry).is_some() {
             let text = crate::text(&entry["item"]);
             match (answer_of(&text, None), split(&text)) {
                 (Some(answered), Some((_, answer))) => {
-                    self.answers
-                        .push((answered.to_owned(), answer.trim().to_owned()));
+                    if self
+                        .wanted
+                        .as_deref()
+                        .is_none_or(|wanted| wanted == answered)
+                    {
+                        self.answers
+                            .push((answered.to_owned(), answer.trim().to_owned()));
+                    }
                 }
                 _ if moves_on(&text, entry["from"].as_str()) => self.moved_on = true,
                 _ => {}
@@ -1283,10 +1305,9 @@ impl Standing {
         if let Some((_, answer)) = (self.answers.iter().rev()).find(|(of, _)| of == asked) {
             return State::Answered(answer.clone());
         }
-        let closed = (self.closes.iter().rev())
-            .find(|(made, of, _)| of == asked && !self.refused.contains(made));
+        let closed = (self.closes.iter().rev()).find(|(of, _)| of == asked);
         match closed {
-            Some((.., state)) => state.clone(),
+            Some((_, state)) => state.clone(),
             None if self.moved_on => State::Aside,
             None => State::Open,
         }
@@ -1321,6 +1342,7 @@ pub async fn standing(
 ) -> agent_client::Result<Option<(Ask, State)>> {
     let mut reading = Standing {
         skip: skip.map(|(turn, call)| (turn, json!(call))),
+        wanted: Some(id(turn, call)),
         ..Standing::default()
     };
     let mut found = None;
@@ -1401,7 +1423,11 @@ pub async fn still_open(bot: &str, turn: i64, call: &str) -> Result<bool, String
     let daemon = crate::trigger::Daemon::current()?;
     let socket = daemon.socket()?;
     let client = crate::trigger::connect(&socket, &daemon).await?;
-    let (mut reading, mut found) = (Reading::default(), None);
+    let wanted = Standing {
+        wanted: Some(id(turn, call)),
+        ..Standing::default()
+    };
+    let (mut reading, mut found) = (Reading(wanted), None);
     crate::said::walk(&client, bot, turn, |at, entry| {
         found = reading.entry(at, entry, turn, call);
         found.is_some()
@@ -2096,9 +2122,32 @@ mod tests {
         );
         let ask = call(&id(2, "a1"), &asked("wait")).unwrap();
         assert_eq!(
-            stands(&[(4, person(&answer(&ask, "talk later"))), closing, open_one]),
+            stands(&[
+                (4, person(&answer(&ask, "talk later"))),
+                closing.clone(),
+                open_one
+            ]),
             Some(State::Answered("talk later".into()))
         );
+        // Read for one ask, another's answers and closes are not kept,
+        // and a refusal goes once its call is read.
+        let other = call(&id(1, "z9"), &asked("wait")).unwrap();
+        let mut reading = Standing {
+            wanted: Some(id(2, "a1")),
+            ..Standing::default()
+        };
+        let mut withdrawn_other = closing_call("ask:1/z9", "withdrawn", None, "n");
+        withdrawn_other["turn"] = json!(3);
+        for (at, entry) in [
+            (4, person(&answer(&other, "no"))),
+            (3, entry(7, &withdrawn_other)),
+            (3, entry(6, &refused)),
+            closing,
+        ] {
+            reading.entry(at, &entry, 2, "a1");
+        }
+        assert!(reading.answers.is_empty() && reading.closes.is_empty());
+        assert!(reading.refused.is_empty());
     }
 
     #[test]
