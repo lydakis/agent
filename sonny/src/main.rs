@@ -7768,12 +7768,15 @@ impl App {
     /// page `id`, just drawn, takes into the gap it starts with those the
     /// pages over it end with, and hands the gap it ends with to the one
     /// the page after it starts with. What a page hands on is kept, for
-    /// that page drawn again to take it again.
+    /// that page drawn again to take it again, while it stays drawn.
     fn join_page(&mut self, id: u64) {
+        // A page let go keeps nothing aside: the gap that took what it
+        // handed on holds it, and the page drawn again hands it on again.
+        let screen = &self.screen;
+        self.tails.retain(|page, _| screen.drawn(*page));
         // Drawn again, its own rows hold its gap until handed on again.
-        if self.tails.remove(&id).is_some() {
-            self.put(None, id, Vec::new());
-        }
+        self.tails.remove(&id);
+        self.put(None, id, Vec::new());
         if let Some(row) = self.screen.first_in(id)
             && let Some(at) = self.gap_at(row)
         {
@@ -23501,6 +23504,33 @@ mod tests {
                 "  ↳ Task updates · calc.div completed ▸",
                 "  ↳ Task updates · calc.neg completed ▸",
             ],
+            "{rows:?}"
+        );
+        // A page let go keeps nothing aside; the gap that took from it
+        // still holds it, and the page drawn again hands it on again.
+        app.screen.let_page_go(2);
+        let earlier = |app: &mut App| app.commit(vec![Line::from("› earlier")]);
+        let older = older_page(&mut app, earlier);
+        app.screen.prepend(3, older);
+        app.join_page(3);
+        let aside = |app: &App| {
+            let mut pages: Vec<u64> = app.tails.keys().copied().collect();
+            pages.sort();
+            pages
+        };
+        let took =
+            |app: &App| -> Vec<u64> { app.clusters[&at].took.iter().map(|(p, _)| *p).collect() };
+        assert_eq!(aside(&app), [1]);
+        assert_eq!(took(&app), [2, 1]);
+        let older = older_page(&mut app, oldest);
+        app.screen.fill(2, older);
+        app.join_page(2);
+        assert_eq!(aside(&app), [1, 2]);
+        assert_eq!(took(&app), [2, 1]);
+        let rows = texts(&app);
+        let once = |row: &str| rows.iter().filter(|r| r.as_str() == row).count() == 1;
+        assert!(
+            once("› check the tasks") && once("  ↳ Task updates · calc.add completed ▸"),
             "{rows:?}"
         );
     }

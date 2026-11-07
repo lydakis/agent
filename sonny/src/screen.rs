@@ -473,6 +473,11 @@ impl Screen {
         (self.rows[row].line.spans.iter()).any(|span| !span.content.trim().is_empty())
     }
 
+    /// Whether the page `id` is drawn.
+    pub fn drawn(&self, id: u64) -> bool {
+        self.page_span(id).is_some_and(|(_, drawn)| drawn)
+    }
+
     /// The first row with words of the page `id`, when it is drawn.
     pub fn first_in(&self, id: u64) -> Option<usize> {
         let (span, drawn) = self.page_span(id)?;
