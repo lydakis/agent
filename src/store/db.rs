@@ -224,10 +224,6 @@ pub struct Settings {
     /// model's own limit on Anthropic and sends no bound on Responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
-    /// Seconds an Anthropic prompt cache may sit unread during a tool call
-    /// before it is refreshed; zero never refreshes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub keep_warm: Option<u64>,
     /// Anthropic prompt-cache lifetime.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<CacheTtl>,
@@ -356,14 +352,6 @@ impl Settings {
     pub fn holds(&self, since_ms: Option<u64>, now_ms: u64) -> bool {
         now_ms.saturating_sub(since_ms.unwrap_or(now_ms)) < self.hold_ms()
     }
-    /// How long a cache may sit unread before a refresh; `None` never.
-    pub fn keep_warm(&self) -> Option<std::time::Duration> {
-        match self.keep_warm {
-            Some(0) => None,
-            Some(seconds) => Some(std::time::Duration::from_secs(seconds)),
-            None => Some(crate::provider::KEEP_WARM),
-        }
-    }
     /// These settings for a bot that a bot with `creator`'s settings
     /// makes: no weaker a sandbox than its creator's, as Codex's subagents
     /// inherit their parent's. A sandboxed creator's child takes the
@@ -447,12 +435,6 @@ impl Settings {
         if self.max_output_tokens == Some(0) {
             return refuse("max_output_tokens is at least 1");
         }
-        if self
-            .keep_warm
-            .is_some_and(|n| n >= crate::provider::CACHE_LIFETIME.as_secs())
-        {
-            return refuse("keep_warm is below 300 seconds; 0 never refreshes");
-        }
         let confined = self.sandbox == Some(crate::sandbox::Mode::WorkspaceWrite);
         if !confined && (!self.writable.is_empty() || self.network) {
             return refuse("writable and network go with sandbox workspace-write");
@@ -527,7 +509,6 @@ impl Settings {
             "compact_keep":self.compact_keep(),"compact_tokens":self.compact_tokens,
             "keep_turns":self.keep_turns,"max_rounds":self.max_rounds,
             "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
-            "keep_warm":self.keep_warm().map_or(0, |after| after.as_secs()),
             // Null when never set (five minutes), so a client's default can
             // tell it from five minutes someone chose.
             "cache_ttl":self.cache_ttl,
@@ -551,7 +532,7 @@ const INHERITED: [&str; 2] = ["rules", "env"];
 /// The settings that make a bot's sandbox, which change together.
 pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 23] = [
+pub const SETTINGS: [&str; 22] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -561,7 +542,6 @@ pub const SETTINGS: [&str; 23] = [
     "keep_turns",
     "approval_hold_ms",
     "max_output_tokens",
-    "keep_warm",
     "cache_ttl",
     "speed",
     "sandbox",
@@ -620,7 +600,7 @@ pub enum Charge {
     /// A call that failed, whose request sent `added` input tokens new and
     /// read through node `read`; its output is not kept.
     Failed { added: u64, read: Option<i64> },
-    /// A summary or a cache refresh: it re-reads the history.
+    /// A summary: it re-reads the history.
     Aside,
 }
 impl Work {
@@ -2328,7 +2308,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 83;
+    pub const SCHEMA: i32 = 84;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -7359,23 +7339,6 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(entry)
-    }
-    /// Charge a prompt-cache refresh sent while a tool ran. It generated
-    /// nothing, so it is not a model round.
-    pub fn keep_warm_usage(&mut self, turn: i64, usage: &Usage) -> Result<()> {
-        let bot = self.active(turn)?;
-        let tx = self.conn.savepoint()?;
-        record_usage_for(
-            &tx,
-            &bot,
-            turn,
-            usage,
-            Some("keep_warm"),
-            Charge::Aside,
-            None,
-        )?;
-        tx.commit()?;
-        Ok(())
     }
     /// Charge a summarizer response without adding it to the transcript.
     pub fn compaction_usage(&mut self, turn: i64, usage: Option<&Usage>) -> Result<()> {
@@ -14549,6 +14512,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              DROP TABLE temp.line_depths;",
         )?;
     }
+    // Schema 84: the daemon no longer refreshes an idle prompt cache, so
+    // the setting that timed it goes.
+    if from < 84 {
+        conn.execute(
+            "UPDATE bots SET settings=json_remove(settings,'$.keep_warm')
+             WHERE json_extract(settings,'$.keep_warm') IS NOT NULL",
+            [],
+        )?;
+    }
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
@@ -15260,7 +15232,6 @@ mod tests {
             keep_turns: Some(1),
             approval_hold_ms: Some(1),
             max_output_tokens: Some(1),
-            keep_warm: Some(1),
             cache_ttl: Some(CacheTtl::Hour),
             speed: Some(crate::provider::Speed::Fast),
             sandbox: Some(crate::sandbox::Mode::ReadOnly),

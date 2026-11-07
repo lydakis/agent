@@ -406,13 +406,6 @@ fn parse(args: &[String]) -> Result<Options> {
                             .insert("approval_hold_ms".to_owned(), json!(ms));
                         options.settings_flags.push(flag.to_owned());
                     }
-                    "--keep-warm" => {
-                        let seconds = crate::cli::duration_secs(flag, &value)?;
-                        options
-                            .settings
-                            .insert("keep_warm".to_owned(), json!(seconds));
-                        options.settings_flags.push(flag.to_owned());
-                    }
                     "--sandbox" => {
                         if !matches!(
                             value.as_str(),
