@@ -1366,8 +1366,6 @@ failure.
 
 ![Three task updates in a row gathered into one row that names the tasks](../docs/sonny/task-updates-gathered.png)
 
-![A lead checking on all its projects: one ↳ row between each thing it says, a margin note under one of them](../docs/sonny/one-row-per-gap.png)
-
 ![That row opened: each update one row of its own](../docs/sonny/task-updates-listed.png)
 
 ![One update opened: what it said, and the steer the lead sent about it](../docs/sonny/task-update-opened.png)
