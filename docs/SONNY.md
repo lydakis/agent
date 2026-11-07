@@ -170,8 +170,8 @@ that carries on one cut short changes it as its own. `--fresh` and
 `--fresh` starts its agents over.
 
 **What else.** `--reply-to BOT` keeps the fire's process until the turn it
-sent ends (the daemon's `wait`, up to a day), then queues that turn's
-answer to BOT, pinned by id; the scheduler starts no second fire of the automation
+sent ends (the daemon's `wait`, up to a day), then steers that turn's
+answer to BOT, pinned by id, as the lookout tells a task's update; the scheduler starts no second fire of the automation
 meanwhile, so a repeating one skips the times that turn spans. The fire's
 request id then ends `.to.ID`, BOT's id, so the lookout does not also tell
 that agent of the turn as a task update, unless that answer has not

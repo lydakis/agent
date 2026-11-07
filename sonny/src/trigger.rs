@@ -4554,7 +4554,7 @@ async fn report(
             "submit",
             json!({"bot": to, "bot_id": to_id,
                 "request_id": format!("{}shadow.{to_id}.{id}.{turn}", sent_by(trigger)),
-                "prompt": prompt, "delivery": "queue", "from": {"bot": bot, "turn": turn}}),
+                "prompt": prompt, "delivery": "steer", "from": {"bot": bot, "turn": turn}}),
         )
         .await;
     let mut reply = match sent {
@@ -4937,8 +4937,10 @@ async fn waiting_fire(client: &Client, trigger: &Trigger, bot: &str, request: &s
     }
 }
 
-/// With `--reply-to`, wait for the turn a fire sent and queue its answer
-/// to that agent; what came of it is the outcome's `reply`.
+/// With `--reply-to`, wait for the turn a fire sent and pass its answer
+/// to that agent as a steer, as the lookout tells a task's update: it
+/// joins the agent's running turn or starts one. What came of it is the
+/// outcome's `reply`.
 async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value) -> Value {
     let (Some((to, to_id)), Some(turn)) = (&trigger.reply_to, outcome["turn"].as_i64()) else {
         return outcome;
@@ -4980,7 +4982,7 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
             "submit",
             json!({"bot": to, "bot_id": to_id,
                 "request_id": format!("{}reply.{to_id}.{turn}", sent_by(trigger)),
-                "prompt": prompt, "delivery": "queue", "from": {"bot": bot, "turn": turn}}),
+                "prompt": prompt, "delivery": "steer", "from": {"bot": bot, "turn": turn}}),
         )
         .await;
     outcome["reply"] = match sent {
