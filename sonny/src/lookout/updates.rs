@@ -47,9 +47,6 @@ const REPLY_BYTES: usize = 80 * 1024;
 const FORWARD: Duration = Duration::from_secs(15);
 /// How long a goal's turn waits for its check, which says sooner.
 const GOAL_HOLD: Duration = Duration::from_secs(super::goals::TIMEOUT_MAX_S + 60);
-/// How long a turn waits for a copy to say whether its reply waits on the
-/// person: as long as the copy may take, and a little.
-const CHECK_HOLD: Duration = Duration::from_secs(crate::waiting::WAIT.as_secs() + 15);
 const MEMORY_LINES: usize = 20;
 const ACTIVE: [&str; 5] = ["running", "waiting", "paced", "queued", "ready"];
 const APPROVAL: &str = "waiting for the person's approval";
@@ -77,9 +74,6 @@ struct Turn {
     resolved: bool,
     /// How the task's goal ended with this turn.
     goal: Option<String>,
-    /// What its reply left waiting on the person, as a copy of the task
-    /// said ([`crate::waiting`]).
-    waiting: Option<String>,
     /// What the task replied, ending the turn.
     reply: Option<String>,
     /// The subscription whose `urgent` matched it, kept with the turn as
@@ -335,10 +329,6 @@ pub struct Updates {
     forwarding: HashMap<Key, Forward>,
     /// Turns whose end waits for their goal's check, until it says.
     goaled: HashSet<Key>,
-    /// Turns whose end waits for a copy to say whether their reply waits
-    /// on the person, until it says, and what those that said found.
-    checking: HashSet<Key>,
-    waits: HashMap<Key, String>,
     /// Approvals not yet answered: when they become news, and the call.
     approvals: HashMap<Key, (Instant, Option<String>)>,
     /// Tasks' `margin` calls started, by task and call: the note's id and
@@ -404,9 +394,6 @@ fn turn_event(t: &Turn, theirs: bool) -> Value {
         event["done"] = json!(t.resolved);
         if let Some(goal) = &t.goal {
             event["goal"] = json!(goal);
-        }
-        if let Some(waiting) = &t.waiting {
-            event["waiting_for"] = json!(waiting);
         }
     }
     if let Some(by) = &t.by {
@@ -487,8 +474,6 @@ impl Updates {
             answer_to: HashMap::new(),
             forwarding: HashMap::new(),
             goaled: HashSet::new(),
-            checking: HashSet::new(),
-            waits: HashMap::new(),
             approvals: HashMap::new(),
             margin_calls: HashMap::new(),
             ask_calls: HashMap::new(),
@@ -805,9 +790,6 @@ impl Updates {
                     // News once its goal's check says, or once a check
                     // could have run its longest.
                     true => Some(GOAL_HOLD),
-                    // News once a copy says whether it waits on the
-                    // person, or could have said.
-                    false if self.checking.contains(&key(turn)) => Some(CHECK_HOLD),
                     false => (answered.is_some() && answered == creator).then_some(FORWARD),
                 };
                 if let Some(hold) = hold {
@@ -965,7 +947,6 @@ impl Updates {
             which: None,
             resolved: false,
             goal: None,
-            waiting: None,
             reply: None,
             urgent: None,
             hold: Default::default(),
@@ -1224,15 +1205,12 @@ impl Updates {
             return;
         }
         let handle = format!("turn:{name}/{turn}");
-        let key = (name.to_owned(), turn);
-        let waiting = self.waits.remove(&key);
-        // A wait returns the turn, never how its goal ended nor what it
-        // leaves waiting on the person.
-        if goal.is_none() && waiting.is_none() && self.bots[&self.lead].waiting_on.contains(&handle)
-        {
+        // A wait returns the turn, never how its goal ended.
+        if goal.is_none() && self.bots[&self.lead].waiting_on.contains(&handle) {
             return;
         }
         let by = self.by(status, from, origin);
+        let key = (name.to_owned(), turn);
         let news = self.news_of(name);
         let answered = news.act.as_ref().is_some_and(|asked| {
             asked.turn == turn && [APPROVAL, QUIET].contains(&asked.status.as_str())
@@ -1246,7 +1224,6 @@ impl Updates {
             which,
             resolved,
             goal,
-            waiting,
             reply: None,
             urgent: None,
             hold: Default::default(),
@@ -1334,7 +1311,6 @@ impl Updates {
             .collect();
         for key in late {
             self.goaled.remove(&key);
-            self.checking.remove(&key);
             if let Some(forward) = self.forwarding.remove(&key) {
                 let Forward {
                     status,
@@ -1357,46 +1333,6 @@ impl Updates {
             if let Some((_, call)) = self.approvals.remove(&key) {
                 self.tell(&key.0, key.1, APPROVAL, None, call, None);
             }
-        }
-    }
-
-    /// A turn whose end a copy of its task checks for what it leaves
-    /// waiting on the person: its end waits for `waiting_settled`, if it
-    /// is the turn of a task whose updates the lead hears.
-    pub fn waiting_turn(&mut self, name: &str, turn: i64) {
-        if self.live && self.task(name) {
-            self.checking.insert((name.to_owned(), turn));
-        }
-    }
-
-    /// The copy said what the turn's reply leaves waiting on the person,
-    /// or nothing: its end is news now, saying so, unless its goal's check
-    /// still holds it.
-    pub fn waiting_settled(&mut self, name: &str, turn: i64, waiting: Option<String>) {
-        let key = (name.to_owned(), turn);
-        if !self.checking.remove(&key) {
-            return;
-        }
-        if let Some(waiting) = waiting {
-            self.waits.insert(key.clone(), waiting);
-        }
-        if self.goaled.contains(&key) {
-            return;
-        }
-        let Some(forward) = self.forwarding.remove(&key) else {
-            self.waits.remove(&key);
-            return;
-        };
-        let Forward {
-            status,
-            from,
-            origin,
-            reply,
-            ..
-        } = forward;
-        self.tell(name, turn, &status, from, None, origin);
-        if let Some(reply) = reply {
-            self.replied(name, turn, &reply);
         }
     }
 
@@ -1458,7 +1394,6 @@ impl Updates {
                     t.status != APPROVAL
                         && t.status != QUIET
                         && t.goal.is_none()
-                        && t.waiting.is_none()
                         && handles.contains(&format!("turn:{name}/{}", t.turn))
                 }) {
                     *kind = None;
@@ -1763,8 +1698,6 @@ impl Updates {
         self.unheard.clear();
         self.forwarding.clear();
         self.goaled.clear();
-        self.checking.clear();
-        self.waits.clear();
         self.approvals.clear();
     }
 
@@ -1783,7 +1716,6 @@ impl Updates {
             .chain(self.forwarding.keys().map(|(task, _)| task))
             .chain(self.runs.keys().map(|(task, _)| task))
             .chain(self.goaled.iter().map(|(task, _)| task))
-            .chain(self.checking.iter().map(|(task, _)| task))
             .chain(self.approvals.keys().map(|(task, _)| task))
             .chain(self.noted.iter().map(|(task, _)| task));
         let new: HashSet<String> = held
@@ -1812,8 +1744,6 @@ impl Updates {
         self.unheard.retain(|(task, _), _| task != name);
         self.forwarding.retain(|(task, _), _| task != name);
         self.goaled.retain(|(task, _)| task != name);
-        self.checking.retain(|(task, _)| task != name);
-        self.waits.retain(|(task, _), _| task != name);
         self.approvals.retain(|(task, _), _| task != name);
         self.noted.retain(|(task, _)| task != name);
     }
@@ -1894,9 +1824,6 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
     }
     if let Some(goal) = &t.goal {
         text.push_str(goal);
-    }
-    if let Some(waiting) = &t.waiting {
-        text.push_str(&format!(", and waits on the person for: {waiting}"));
     }
     if t.count > 1 {
         text.push_str(&format!(
@@ -2515,54 +2442,6 @@ mod tests {
             "completed",
         );
         assert!(updates.due());
-    }
-
-    #[test]
-    fn a_turn_s_end_waits_for_its_check_and_says_what_it_waits_on_the_person_for() {
-        let mut updates = fleet();
-        let lead = json!({"from": {"bot": "shop.lead", "turn": 9}});
-        updates.waiting_turn("shop.fix", 4);
-        turn(&mut updates, "shop.fix", 4, lead.clone(), "completed");
-        assert!(!updates.due(), "held for its check");
-        updates.waiting_settled("shop.fix", 4, Some("which branch to deploy".into()));
-        let told = updates.take();
-        assert_eq!(
-            text(&told),
-            "- shop.fix: turn:shop.fix/4 completed, asked by you, \
-             and waits on the person for: which branch to deploy"
-        );
-        updates.sent(told);
-        // Nothing waits: the end as it always reads.
-        updates.waiting_turn("shop.fix", 5);
-        turn(&mut updates, "shop.fix", 5, lead.clone(), "completed");
-        updates.waiting_settled("shop.fix", 5, None);
-        let told = updates.take();
-        assert_eq!(
-            text(&told),
-            "- shop.fix: turn:shop.fix/5 completed, asked by you"
-        );
-        updates.sent(told);
-        // A goal's check and the copy's, in either order: one line, once
-        // both said.
-        updates.goal_turn("shop.fix", 6);
-        updates.waiting_turn("shop.fix", 6);
-        turn(&mut updates, "shop.fix", 6, lead.clone(), "completed");
-        updates.waiting_settled("shop.fix", 6, Some("an approval to merge".into()));
-        assert!(!updates.due(), "its goal still checks");
-        updates.goal_settled("shop.fix", 6, Some(", and met its goal: its check exits 0"));
-        let told = updates.take();
-        assert_eq!(
-            text(&told),
-            "- shop.fix: turn:shop.fix/6 completed, asked by you, and met its goal: its check \
-             exits 0, and waits on the person for: an approval to merge"
-        );
-        updates.sent(told);
-        // A check that never says lets the turn go once it could have.
-        updates.waiting_turn("shop.fix", 7);
-        turn(&mut updates, "shop.fix", 7, lead.clone(), "completed");
-        assert!(!updates.due());
-        updates.expire(Instant::now() + CHECK_HOLD + Duration::from_secs(1));
-        assert!(text(&updates.take()).contains("turn:shop.fix/7 completed"));
     }
 
     #[test]

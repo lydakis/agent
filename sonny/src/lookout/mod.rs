@@ -747,7 +747,6 @@ async fn serve(settings: Settings) -> Result<(), String> {
         cursor: None,
         saved: None,
         goals: goals::Goals::new(&settings.store, &settings.socket),
-        checks: Arc::new(tokio::sync::Semaphore::new(CHECKS)),
         fires: HashMap::new(),
         senders: HashMap::new(),
         resume: marks(&settings.store).0,
@@ -846,45 +845,6 @@ struct Telling {
     ended: Option<i64>,
 }
 
-/// How many copies check at once whether a reply waits on the person.
-const CHECKS: usize = 4;
-
-/// What `bot`'s turn `turn` left waiting on the person, once the pull
-/// requests its reply names are kept beside `store` ([`crate::prs`]):
-/// nothing unless `check`, nor for a turn that ended without words, or
-/// with a question the ask tool put, which every surface reads itself;
-/// else what a copy of `bot` says.
-async fn waiting_for(
-    client: &Client,
-    store: &std::path::Path,
-    bot: &str,
-    turn: i64,
-    check: bool,
-) -> Result<Option<String>, String> {
-    let handle = format!("turn:{bot}/{turn}");
-    let ended = client
-        .request("wait", json!({"handles": [&handle], "timeout_ms": 0}))
-        .await
-        .map_err(|e| e.to_string())?;
-    let said = ended["results"][&handle]["text"].as_str().unwrap_or("");
-    if let Err(error) = crate::prs::note(store, bot, said) {
-        println!(
-            "{}",
-            json!({"event": "prs_unkept", "bot": bot, "turn": turn, "error": error})
-        );
-    }
-    if !check || said.trim().is_empty() {
-        return Ok(None);
-    }
-    if crate::needs::scan(client, bot, Some(turn))
-        .await
-        .is_some_and(|seen| seen.ask.is_some())
-    {
-        return Ok(None);
-    }
-    crate::waiting::check(client, bot).await
-}
-
 struct Service {
     store: PathBuf,
     /// How many events from sources wait for one subscriber
@@ -926,9 +886,6 @@ struct Service {
     saved: Option<(i64, i64)>,
     /// The agents' goals, whose turns it holds until their checks say.
     goals: goals::Goals,
-    /// How many copies may check at once whether a reply waits on the
-    /// person ([`crate::waiting`]).
-    checks: Arc<tokio::sync::Semaphore>,
     /// Turns triggers' fires sent, by agent and turn, each with its
     /// trigger's generation: one that fails is told (`trigger::tell_failed`).
     fires: HashMap<(String, i64), String>,
@@ -1042,9 +999,6 @@ type Call = (String, i64, String);
 /// Where a lookout's answers from the daemon go: its subscriber, its own
 /// number, and the answer.
 type Woken = tokio::sync::mpsc::Sender<(String, u64, Answer)>;
-/// Where the copies that check a reply say what it waits on the person
-/// for, by agent and turn ([`Service::check_waiting`]).
-type Checked = tokio::sync::mpsc::UnboundedSender<(String, i64, Option<String>)>;
 
 /// The person's newest message in `bot`: one no agent or client sent,
 /// with words of theirs, not only tool results, and no reaction of theirs.
@@ -1162,65 +1116,6 @@ fn follow_after(resume: Option<i64>, replay: Option<i64>, replayed: Option<i64>)
 }
 
 impl Service {
-    /// A turn of a project's agent ended with words and no question open:
-    /// a copy of the agent, with no tools, says at once whether they wait
-    /// on the person, and what for, kept as a mark every surface reads
-    /// ([`crate::waiting`]). Not a side chat's, nor a copy's, nor any with
-    /// `[sonny] needs_check = false`, whose turns' replies are only read for
-    /// the pull requests they name ([`crate::prs`]). What the copy found goes to
-    /// `checked` as well, for the leads that hold the turn's end until it
-    /// says: the agent and turn checked, when one is.
-    fn check_waiting(
-        &self,
-        event: &Value,
-        live: bool,
-        client: &Arc<Client>,
-        checked: &Checked,
-    ) -> Option<(String, i64)> {
-        if !live || event["event"] != "turn_finished" || event["data"]["status"] != "completed" {
-            return None;
-        }
-        let (bot, turn) = (event["bot"].as_str()?, event["turn"].as_i64()?);
-        let project = bot.split('.').next().unwrap_or_default();
-        let ours =
-            crate::project::is_lead(bot) || self.records.contains_key(&format!("{project}.lead"));
-        let kept = self
-            .records
-            .get(bot)
-            .is_some_and(|r| r["expire_ms"].is_null());
-        if !ours || !kept || crate::waiting::is_copy(bot) || crate::side_source(bot).is_some() {
-            return None;
-        }
-        let check = agent_client::config::load().map_or(true, |c| c.sonny.needs_check);
-        let (client, checks, checked) = (client.clone(), self.checks.clone(), checked.clone());
-        let (store, bot) = (self.store.clone(), bot.to_owned());
-        let named = bot.clone();
-        tokio::spawn(async move {
-            let Ok(_turn) = checks.acquire().await else {
-                return;
-            };
-            let found = waiting_for(&client, &store, &bot, turn, check).await;
-            if !check {
-                return;
-            }
-            let _ = checked.send((bot.clone(), turn, found.clone().ok().flatten()));
-            let kept = match found {
-                Ok(found) => {
-                    let mark = found.map(|waiting_for| crate::waiting::Mark { turn, waiting_for });
-                    crate::waiting::keep(&store, &bot, turn, mark.as_ref())
-                }
-                Err(error) => Err(error),
-            };
-            if let Err(error) = kept {
-                println!(
-                    "{}",
-                    json!({"event": "waiting_unchecked", "bot": bot, "turn": turn, "error": error})
-                );
-            }
-        });
-        check.then_some((named, turn))
-    }
-
     async fn watch(
         &mut self,
         client: Arc<Client>,
@@ -1323,8 +1218,6 @@ impl Service {
         // as a goal's turn waits on its one settlement, which a full
         // channel would drop: it holds a few per agent with a goal at most.
         let (checked, mut settled) = tokio::sync::mpsc::unbounded_channel();
-        // So too the copies checking replies, each answering once.
-        let (waited, mut found) = tokio::sync::mpsc::unbounded_channel();
         for lookout in self.lookouts.values_mut() {
             // Reads a dropped connection left under way answer the old
             // channel, never this one.
@@ -1462,11 +1355,6 @@ impl Service {
                         .zip(event["turn"].as_i64())
                         .and_then(|(bot, turn)| self.in_flight.get(&(bot.to_owned(), turn)).copied());
                     let bounces = self.sent(&event, live);
-                    if let Some((bot, turn)) = self.check_waiting(&event, live, &client, &waited) {
-                        for lookout in self.lookouts.values_mut() {
-                            lookout.updates.waiting_turn(&bot, turn);
-                        }
-                    }
                     if let Some((bot, turn)) = self.goals.event(&event, bot_id, live, &client, &checked) {
                         for lookout in self.lookouts.values_mut() {
                             lookout.updates.goal_turn(&bot, turn);
@@ -1553,11 +1441,6 @@ impl Service {
                 }
                 Some(key) = bounce_taken.recv() => {
                     self.bouncing.remove(&key);
-                }
-                Some((bot, turn, waiting)) = found.recv() => {
-                    for lookout in self.lookouts.values_mut() {
-                        lookout.updates.waiting_settled(&bot, turn, waiting.clone());
-                    }
                 }
                 Some(settled) = settled.recv() => {
                     let checking = self.goals.settled(&settled, &client, &checked);
@@ -3722,66 +3605,6 @@ mod tests {
         assert_eq!(quick, 7);
     }
 
-    /// A turn that ended with words and no question asked is put to a
-    /// copy of its agent, with no tools and the check's schema; one that
-    /// ended with none, or on the ask tool, is not.
-    #[tokio::test]
-    async fn a_reply_with_words_is_checked_by_a_tool_less_copy() {
-        let asked = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
-        let seen = asked.clone();
-        let client = crate::tests::daemon_answering(move |request| {
-            seen.lock().unwrap().push(request.clone());
-            let handle = request["handles"][0].as_str().unwrap_or("");
-            match request["op"].as_str() {
-                Some("wait") if handle == "turn:calc.plan/3" => json!({"results": {handle:
-                    {"status": "completed", "text":
-                        "Opened https://github.com/o/r/pull/7. Deploy to staging or prod?"}}}),
-                Some("wait") if handle == "turn:calc.quiet/3" => json!({"results": {handle:
-                    {"status": "completed", "text": " "}}}),
-                Some("wait") => json!({"results": {handle: {"status": "completed",
-                    "text": r#"{"waiting": true, "for": "staging or prod"}"#}}}),
-                Some("history_nodes") => json!({"nodes": []}),
-                Some("fork") => json!({"bot_id": 9}),
-                Some("submit") => json!({"handle": "turn:copy/1", "turn": 1}),
-                _ => json!({}),
-            }
-        })
-        .await;
-        let store = std::env::temp_dir()
-            .join(format!("sonny-waiting-for-{}", std::process::id()))
-            .join("store");
-        assert_eq!(
-            waiting_for(&client, &store, "calc.plan", 3, true).await,
-            Ok(Some("staging or prod".into()))
-        );
-        // The pull request its reply named is kept for `/status`.
-        assert_eq!(crate::prs::read(&store, "calc.plan"), ["o/r#7"]);
-        let requests = asked.lock().unwrap().clone();
-        let fork = requests.iter().find(|r| r["op"] == "fork").unwrap();
-        assert_eq!(fork["source"], "calc.plan");
-        assert_eq!(fork["allow"], json!([]));
-        let submit = requests.iter().find(|r| r["op"] == "submit").unwrap();
-        assert_eq!(
-            submit["output_schema"]["required"],
-            json!(["waiting", "for"])
-        );
-        assert!(requests.iter().any(|r| r["op"] == "delete"));
-        // No words, no copy.
-        asked.lock().unwrap().clear();
-        assert_eq!(
-            waiting_for(&client, &store, "calc.quiet", 3, true).await,
-            Ok(None)
-        );
-        assert!(!asked.lock().unwrap().iter().any(|r| r["op"] == "fork"));
-        // With the check off, the pull requests are still kept.
-        assert_eq!(
-            waiting_for(&client, &store, "calc.plan", 3, false).await,
-            Ok(None)
-        );
-        assert!(!asked.lock().unwrap().iter().any(|r| r["op"] == "fork"));
-        let _ = std::fs::remove_dir_all(store.parent().unwrap());
-    }
-
     #[tokio::test]
     async fn a_long_margin_call_is_read_whole_for_its_note_s_id() {
         // The id after a long text, as a model may write it.
@@ -4966,7 +4789,6 @@ mod tests {
             started: false,
             rewriting: HashSet::new(),
             goals: goals::Goals::new(Path::new("/nonexistent"), Path::new("")),
-            checks: Arc::new(tokio::sync::Semaphore::new(CHECKS)),
             fires: HashMap::new(),
             senders: HashMap::new(),
         }

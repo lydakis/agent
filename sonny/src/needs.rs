@@ -74,7 +74,7 @@ impl Seen {
     /// resolved, by its own call in the turn read or by its lead's mark kept
     /// beside `store` that no later turn reopened while nothing `running`.
     /// A lead is never resolved. With no question asked, what its last
-    /// reply left waiting on the person, as the lookout's check marked it
+    /// reply left waiting on the person, as a window's check marked it
     /// ([`crate::waiting`]), while no later turn started.
     pub fn open(
         self,

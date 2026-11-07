@@ -1524,14 +1524,14 @@ handed to you by the approver) or a question it asked you is still open,
 read from the daemon whole when Sonny starts or reconnects, so a restart
 loses neither, and kept current by its events after. A question left in a
 reply's words counts too: once an agent's turn ends with words and no
-question asked, the lookout has a copy of it, with no tools, say at once
-whether they wait on you and what for (one small call, its history read
-from the provider's cache of the turn just ended). A yes is kept beside
-the store (`STORE.waiting/AGENT.json`) until the agent's next turn; its
-lead's window pins it as the task's question, where what you type goes to
-the task, and `/status` says `waits on you for: …`. Its lead hears it
-too: the task's turn-ended update waits the few seconds for the check and
-ends `, and waits on the person for: …`. `[sonny] needs_check = false`
+question asked, the window of its project that sees it end has a copy of
+it, with no tools, say at once whether they wait on you and what for (one
+small call, its history read from the provider's cache of the turn just
+ended). It is the window's own work, so nothing runs for it while no
+window of the project is open. A yes is kept beside the store
+(`STORE.waiting/AGENT.json`) until the agent's next turn; its lead's
+window pins it as the task's question, where what you type goes to the
+task, and `/status` says `waits on you for: …`. `[sonny] needs_check = false`
 turns the check off. `sonny status [AGENT] [--json]` prints the project
 `/status` shows, as text or JSON, for an agent's shell or a script: AGENT
 is a lead, a task or a project, and an agent's own shell defaults to it.

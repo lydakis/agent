@@ -1,20 +1,27 @@
 //! What an agent left waiting on the person in its reply rather than with
 //! the ask tool: a question in its words, a decision it named, a step only
 //! the person can take. Once a turn of an agent of a Sonny project ends
-//! with words and no question open, the lookout asks a copy of the agent,
-//! with no tools, whether that reply waits on the person, and for what
-//! ([`check`]). The copy runs at once, so it reads the history while the
-//! provider's cache of the turn just ended is warm. A yes is kept as a
-//! mark, `STORE.waiting/BOT.json`, holding the turn it covers and what the
-//! person is waited on for ([`Mark`]); a no takes the mark away.
+//! with words and no question open, the window of its project that sees it
+//! end asks a copy of the agent, with no tools, whether that reply waits on
+//! the person, and for what ([`spawn`]). The copy runs at once, so it reads
+//! the history while the provider's cache of the turn just ended is warm.
+//! The answer is kept beside the store, `STORE.waiting/BOT.json`, holding
+//! the turn it covers and, with a yes, what the person is waited on for
+//! ([`Mark`]). It is the window's own work, as only a window shows it: a
+//! turn that ends with no window of its project open is not checked, and
+//! the daemon and its companions do nothing for it. Two windows that see
+//! one turn end ask one copy: the copy is named after the agent and turn,
+//! and the daemon refuses a second of that name while the first is asked,
+//! and a turn answered already is not asked again.
 //!
-//! Every surface that counts what waits on the person reads the mark as
-//! that agent's open question while no later turn of its started
+//! Every surface that counts what waits on the person reads a yes as that
+//! agent's open question while no later turn of its started
 //! ([`crate::needs::Seen::open`]): the footer, `/status`, the agent's tab
 //! and its lead's window, where a word typed under it goes to the agent.
 //! `[sonny] needs_check = false` turns the check off; marks kept then
 //! still hold until the agent's next turn.
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client::Client;
@@ -22,7 +29,7 @@ use serde_json::{Value, json};
 
 /// How long the copy may take to answer.
 pub const WAIT: Duration = Duration::from_secs(60);
-/// How long the copy is kept, should the lookout stop before it is
+/// How long the copy is kept, should its window close before it is
 /// deleted.
 const EXPIRE: Duration = Duration::from_secs(180);
 /// The most of what the person is waited on for a mark keeps, in
@@ -96,28 +103,35 @@ pub fn read_file(file: &Path) -> Option<Mark> {
     })
 }
 
-/// Keep `mark` for `bot`, or with none take its mark away, unless a mark
-/// for a later turn is there already.
+/// Keep what `bot`'s turn `turn` was found to leave waiting: `mark`, or
+/// with none the turn alone, which no surface reads as waiting, unless a
+/// later turn's is there already.
 pub fn keep(store: &Path, bot: &str, turn: i64, mark: Option<&Mark>) -> Result<(), String> {
-    if read(store, bot).is_some_and(|kept| kept.turn > turn) {
+    if answered(store, bot, turn + 1) {
         return Ok(());
     }
     let path = file(store, bot);
     let failed = |e: std::io::Error| format!("{}: {e}", path.display());
-    let Some(mark) = mark else {
-        return match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(failed(e)),
-            _ => Ok(()),
-        };
-    };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(failed)?;
     }
     // Its own, so two writers never write one file together.
     let next = path.with_extension(format!("json.{}.next", std::process::id()));
-    let kept = json!({"turn": mark.turn, "for": mark.waiting_for});
+    let kept = match mark {
+        Some(mark) => json!({"turn": mark.turn, "for": mark.waiting_for}),
+        None => json!({"turn": turn}),
+    };
     std::fs::write(&next, kept.to_string()).map_err(failed)?;
     std::fs::rename(&next, &path).map_err(failed)
+}
+
+/// Whether what `bot`'s turn `turn`, or a later one, left waiting is kept.
+fn answered(store: &Path, bot: &str, turn: i64) -> bool {
+    std::fs::read(file(store, bot))
+        .ok()
+        .and_then(|kept| serde_json::from_slice::<Value>(&kept).ok())
+        .and_then(|kept| kept["turn"].as_i64())
+        .is_some_and(|kept| kept >= turn)
 }
 
 /// Whether `mark` still says what its agent waits for: its turn is the
@@ -159,20 +173,100 @@ pub fn answer(reply: &str) -> Option<Option<String>> {
     }))
 }
 
-/// Ask a copy of `bot`, with no tools, whether its last reply waits on the
-/// person: what for, or none; an error when the copy could not be made or
-/// did not answer as asked.
-pub async fn check(client: &Client, bot: &str) -> Result<Option<String>, String> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let name = copy_name(bot, stamp);
+/// How many copies one window has asking at once.
+const CHECKS: usize = 4;
+static ASKING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CHECKS);
+/// The turns this window checks now, which it heard end more than once.
+static CHECKING: std::sync::Mutex<Vec<(String, i64)>> = std::sync::Mutex::new(Vec::new());
+
+/// How long after a turn ends a window that reads it ended checks it:
+/// about as long as a provider keeps the turn cached. One older ended
+/// while no window was there to check it.
+const JUST_ENDED: Duration = Duration::from_secs(300);
+
+/// Whether a turn that ended at `finished_ms` ended just now.
+pub fn just_ended(finished_ms: u64) -> bool {
+    (crate::home::now_ms() as u64).saturating_sub(finished_ms) < JUST_ENDED.as_millis() as u64
+}
+
+/// Check what `bot`'s turn `turn`, just ended, left waiting on the person,
+/// on its own task so the window never waits on it: the pull requests its
+/// reply names are kept ([`crate::prs`]), and, unless `[sonny]
+/// needs_check` is off, what a copy says is kept as its mark. Not a side
+/// chat's, nor a copy's, nor a turn answered already.
+pub fn spawn(client: Arc<Client>, store: PathBuf, bot: String, turn: i64) {
+    if is_copy(&bot) || crate::side_source(&bot).is_some() || answered(&store, &bot, turn) {
+        return;
+    }
+    let key = (bot.clone(), turn);
+    match CHECKING.lock() {
+        Ok(mut checking) if !checking.contains(&key) => checking.push(key.clone()),
+        _ => return,
+    }
+    let check = agent_client::config::load().map_or(true, |c| c.sonny.needs_check);
+    tokio::spawn(async move {
+        if let Ok(_asking) = ASKING.acquire().await
+            // Another window answered it while this one waited its turn.
+            && !answered(&store, &bot, turn)
+            // What could not be checked, a second window's copy the
+            // daemon refused among it, is left unmarked.
+            && let Ok(found) = waiting_for(&client, &store, &bot, turn, check).await
+            && check
+        {
+            let mark = found.map(|waiting_for| Mark { turn, waiting_for });
+            let _ = keep(&store, &bot, turn, mark.as_ref());
+        }
+        if let Ok(mut checking) = CHECKING.lock() {
+            checking.retain(|kept| *kept != key);
+        }
+    });
+}
+
+/// What `bot`'s turn `turn` left waiting on the person, once the pull
+/// requests its reply names are kept beside `store` ([`crate::prs`]):
+/// nothing unless `check`, nor for a turn that ended without words, or
+/// with a question the ask tool put, which every surface reads itself;
+/// else what a copy of `bot` says.
+async fn waiting_for(
+    client: &Client,
+    store: &Path,
+    bot: &str,
+    turn: i64,
+    check: bool,
+) -> Result<Option<String>, String> {
+    let handle = format!("turn:{bot}/{turn}");
+    let ended = client
+        .request("wait", json!({"handles": [&handle], "timeout_ms": 0}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let said = ended["results"][&handle]["text"].as_str().unwrap_or("");
+    crate::prs::note(store, bot, said)?;
+    if !check || said.trim().is_empty() {
+        return Ok(None);
+    }
+    if crate::needs::scan(client, bot, Some(turn))
+        .await
+        .is_some_and(|seen| seen.ask.is_some())
+    {
+        return Ok(None);
+    }
+    self::check(client, bot, turn).await
+}
+
+/// Ask a copy of `bot`, with no tools, whether its turn `turn`'s reply
+/// waits on the person: what for, or none; an error when the copy could
+/// not be made, another window's copy of that turn is asked already, or
+/// it did not answer as asked.
+pub async fn check(client: &Client, bot: &str, turn: i64) -> Result<Option<String>, String> {
+    let name = copy_name(bot, turn as u128 % 0x80_0000);
+    // This window's own request: another's, of the same name, is refused
+    // while this copy is there.
+    let request = format!("{name}.{}", std::process::id());
     let forked = client
         .request(
             "fork",
             json!({"source": bot, "bot": name, "allow": [],
-                "expire_ms": EXPIRE.as_millis() as u64, "request_id": name}),
+                "expire_ms": EXPIRE.as_millis() as u64, "request_id": request}),
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -188,8 +282,9 @@ pub async fn check(client: &Client, bot: &str) -> Result<Option<String>, String>
 /// request id after it, stay within the daemon's 128 bytes.
 fn copy_name(bot: &str, stamp: u128) -> String {
     let tail = format!(".waiting-{:06x}", stamp % 0x100_0000);
-    // Room for the ".1" the submit's request id adds.
-    let mut keep = (126 - tail.len()).min(bot.len());
+    // Room for the ".1" the submit's request id adds, or the fork's
+    // process id.
+    let mut keep = (116 - tail.len()).min(bot.len());
     while !bot.is_char_boundary(keep) {
         keep -= 1;
     }
@@ -282,6 +377,9 @@ mod tests {
         // The next turn's check found nothing waiting.
         keep(&store, "calc.a", 5, None).unwrap();
         assert_eq!(read(&store, "calc.a"), None);
+        // Kept as answered, so no other window asks it again.
+        assert!(answered(&store, "calc.a", 5));
+        assert!(!answered(&store, "calc.a", 6));
         let _ = std::fs::remove_dir_all(store.parent().unwrap());
     }
 
@@ -293,5 +391,65 @@ mod tests {
         assert!(is_copy(&name));
         assert!(is_copy("calc.a.waiting-00ff10"));
         assert!(!is_copy("calc.waiting-room"));
+    }
+
+    /// A turn that ended with words and no question asked is put to a
+    /// copy of its agent, with no tools and the check's schema; one that
+    /// ended with none, or on the ask tool, is not.
+    #[tokio::test]
+    async fn a_reply_with_words_is_checked_by_a_tool_less_copy() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let seen = asked.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            let handle = request["handles"][0].as_str().unwrap_or("");
+            match request["op"].as_str() {
+                Some("wait") if handle == "turn:calc.plan/3" => json!({"results": {handle:
+                    {"status": "completed", "text":
+                        "Opened https://github.com/o/r/pull/7. Deploy to staging or prod?"}}}),
+                Some("wait") if handle == "turn:calc.quiet/3" => json!({"results": {handle:
+                    {"status": "completed", "text": " "}}}),
+                Some("wait") => json!({"results": {handle: {"status": "completed",
+                    "text": r#"{"waiting": true, "for": "staging or prod"}"#}}}),
+                Some("history_nodes") => json!({"nodes": []}),
+                Some("fork") => json!({"bot_id": 9}),
+                Some("submit") => json!({"handle": "turn:copy/1", "turn": 1}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let store = std::env::temp_dir()
+            .join(format!("sonny-waiting-for-{}", std::process::id()))
+            .join("store");
+        assert_eq!(
+            waiting_for(&client, &store, "calc.plan", 3, true).await,
+            Ok(Some("staging or prod".into()))
+        );
+        // The pull request its reply named is kept for `/status`.
+        assert_eq!(crate::prs::read(&store, "calc.plan"), ["o/r#7"]);
+        let requests = asked.lock().unwrap().clone();
+        let fork = requests.iter().find(|r| r["op"] == "fork").unwrap();
+        assert_eq!(fork["source"], "calc.plan");
+        assert_eq!(fork["allow"], json!([]));
+        let submit = requests.iter().find(|r| r["op"] == "submit").unwrap();
+        assert_eq!(
+            submit["output_schema"]["required"],
+            json!(["waiting", "for"])
+        );
+        assert!(requests.iter().any(|r| r["op"] == "delete"));
+        // No words, no copy.
+        asked.lock().unwrap().clear();
+        assert_eq!(
+            waiting_for(&client, &store, "calc.quiet", 3, true).await,
+            Ok(None)
+        );
+        assert!(!asked.lock().unwrap().iter().any(|r| r["op"] == "fork"));
+        // With the check off, the pull requests are still kept.
+        assert_eq!(
+            waiting_for(&client, &store, "calc.plan", 3, false).await,
+            Ok(None)
+        );
+        assert!(!asked.lock().unwrap().iter().any(|r| r["op"] == "fork"));
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
     }
 }

@@ -1,5 +1,5 @@
 //! The pull and merge requests each agent's replies named, kept by the
-//! lookout as each turn of a project's agent ends, so `/status` counts
+//! window that sees each turn of a project's agent end ([`crate::waiting`]), so `/status` counts
 //! them all and shows the latest, with no history read again:
 //! `STORE.prs/BOT.json`, a list of `owner/repo#N`, oldest first. Whether
 //! one is open or merged is no reply's to say, and Sonny reads no host.

@@ -3467,7 +3467,7 @@ struct App {
     /// pinned here as they come ([`App::pin_task_asks`]).
     asks: Vec<asks::Ask>,
     /// What this agent's last reply left waiting on the person, as the
-    /// lookout's check marked it ([`waiting`]).
+    /// window's check marked it ([`waiting`]).
     waiting: Waiting,
     /// Which of them what is typed answers, by id, so it stays on that
     /// question as others close or the conversation is drawn again; the
@@ -3946,7 +3946,7 @@ struct Fleet {
     resolving: resolved::Own,
     /// `[sonny] task_windows` and `task_tabs`, read as the file changes.
     windows: Arc<std::sync::Mutex<TaskWindows>>,
-    /// What the lookout's checks marked waiting on the person, by agent,
+    /// What the windows' checks marked waiting on the person, by agent,
     /// as the folder of marks last read: when that folder last changed,
     /// and when each agent's mark did.
     marks: (
@@ -4517,7 +4517,7 @@ impl Fleet {
     }
 
     /// Read again the agents whose mark of what their reply left waiting on
-    /// the person the lookout set or took away since the folder of marks
+    /// the person a window's check set or took away since the folder of marks
     /// was last read ([`waiting`]), and show what they wait on.
     async fn rescan_marks(&mut self) {
         let dir = waiting::dir(&self.store);
@@ -5439,6 +5439,18 @@ impl App {
                         fleet.zen = zen;
                         fleet.event(&event)
                     });
+                    // A turn of the project's ended: what its reply left
+                    // waiting on the person is checked from this window,
+                    // as only a window shows it.
+                    if let Some(fleet) = &self.fleet
+                        && fleet.live
+                        && event["event"] == "turn_finished"
+                        && event["data"]["status"] == "completed"
+                        && let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64())
+                        && fleet.lineage.contains(bot)
+                    {
+                        waiting::spawn(self.client.clone(), self.store(), bot.to_owned(), turn);
+                    }
                     if let Some(fleet) = &mut self.fleet
                         && !fleet.returned.is_empty()
                     {
@@ -6617,6 +6629,21 @@ impl App {
                             _ => {
                                 let seen = self.scan(&bot, Some(last)).await;
                                 self.asks_seen.insert(bot.clone(), (last, seen.clone()));
+                                // With no layout, no fleet hears it end: a
+                                // turn just ended is checked from here.
+                                if self.fleet.is_none()
+                                    && turn["status"] == "completed"
+                                    && turn["finished_ms"]
+                                        .as_u64()
+                                        .is_some_and(waiting::just_ended)
+                                {
+                                    waiting::spawn(
+                                        self.client.clone(),
+                                        store.clone(),
+                                        bot.clone(),
+                                        last,
+                                    );
+                                }
                                 seen
                             }
                         };
@@ -9028,6 +9055,15 @@ impl App {
                 let words =
                     (self.live.as_ref()).is_some_and(|live| live.spilled || !live.rows.is_empty());
                 let ended = matches!(status, "completed" | "steered");
+                // A lead's window with no layout hears no fleet: what its
+                // own reply left waiting is checked from here.
+                if status == "completed"
+                    && self.fleet.is_none()
+                    && self.project.is_some()
+                    && let Some(turn) = turn
+                {
+                    waiting::spawn(self.client.clone(), self.store(), self.bot.clone(), turn);
+                }
                 let only_reacted = !words
                     && !self.bot_reactions.is_empty()
                     && self.answering.as_ref().map(|(_, at, _)| *at) == Some(self.rows_drawn);
