@@ -784,10 +784,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   tasks, or `waiting on its reviewer` while the approver weighs a call), **Idle**
   (its turn ended, stopped, or never started, with nothing open; a pull
   request its last reply linked shows on its row), and **Done** (marked
-  done). Each agent is one line: its mark, name, state and time, and one
-  that needs you says what for under it. That is all it shows as it
-  opens; `m` shows more and hides it again: at each row's right edge,
-  dim, what it tracks: what it follows (a source with an
+  done). Each agent is one line: its mark, name, state and time, and at
+  its right edge, dim, its code reviews; one that needs you says what for
+  under it. That is all it shows as it opens; `m` shows more and hides it
+  again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
   `icon` in `[sonny.sources.NAME]` shows as that icon), the code reviews
   its turns opened or wait on, in any system, as the copy that checks
   each turn names them from its commands' output and reply (`3 reviews · CR-881`; a pull or merge request link its last
@@ -1199,7 +1199,7 @@ turn of the task numbered after that one reopens it.
 
 ![A decision the lead asked with the ask tool, drawn where it asked it, its code, bold, math and links read as Markdown](../docs/sonny/ask-markdown.png)
 
-![/status as it opens: one task under Needs you saying what it asks, the lead and two tasks under Working with their times, a task's helper folded under it, Idle and Done folded to their headings](../docs/sonny/status-groups.png)
+![/status as it opens: one task under Needs you saying what it asks, the lead and two tasks under Working with their times and code reviews at the right, a task's helper folded under it, Idle and Done folded to their headings](../docs/sonny/status-groups.png)
 
 ![/status after m: what each agent tracks at the right edge, the picked task's model, profile and latest step under it, Idle opened](../docs/sonny/status-more.png)
 

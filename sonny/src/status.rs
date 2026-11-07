@@ -1,12 +1,12 @@
 //! `/status`: the project's agents on one card, read from the daemon and
-//! Rex with no model call. The lead comes first; its tasks follow grouped
-//! by where they stand, as a thread list is: what needs the person, what
-//! works, what sits idle, and, folded away, what is marked done. Each row
-//! is one line: what the agent is doing and for how long, and at the right
-//! what it follows, its code reviews, what runs for it in the background
-//! and where its window is. The picked one says its model, profile and
-//! latest step, and one that needs the person what for. A task's own
-//! helpers fold under it.
+//! Rex with no model call. Its agents are grouped by where they stand, as
+//! a thread list is, the lead first in its group: what needs the person,
+//! what works, and, folded away, what sits idle and what is marked done.
+//! Each row is one line: the agent, its state and for how long, and at the
+//! right its code reviews; one that needs the person says what for under
+//! it. More, on a key: what it follows, what runs for it in the background
+//! and where its window is, and the picked one's model, profile and latest
+//! step. A task's own helpers fold under it.
 use ratatui::{
     style::{Color, Stylize},
     text::{Line, Span},
@@ -174,9 +174,10 @@ pub fn plain_line(text: &str) -> String {
 pub const FOLDS: [Group; 2] = [Group::Idle, Group::Done];
 
 /// How much `/status` says past each row's agent, state and time, which
-/// every row has, with what a row that needs the person waits for:
-/// nothing more (`Quiet`, as it opens); what each row tracks at its right
-/// and the picked one's model, profile and latest step (`Picked`); or all
+/// every row has, with its code reviews and what a row that needs the
+/// person waits for: nothing more (`Quiet`, as it opens); the rest of what
+/// each row tracks at its right and the picked one's model, profile and
+/// latest step (`Picked`); or all
 /// of that for every row, for `sonny status`'s text.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Details<'a> {
@@ -485,8 +486,8 @@ pub fn alert_lines(alert: &Alert, width: usize) -> Vec<Line<'static>> {
 }
 
 /// One agent's lines, after `indent`: its mark, name, state and time,
-/// and with `trackers` at the right what it follows, its code reviews,
-/// what runs for it and where its window is; under it, with `details` or
+/// at the right its code reviews, and with `trackers` what it follows,
+/// what runs for it and where its window is too; under it, with `details` or
 /// while it waits on the person, its latest step, and with `details` its
 /// model and profile too.
 fn row_lines(
@@ -517,18 +518,19 @@ fn row_lines(
     if !time.is_empty() {
         spans.push(Span::raw(format!(" · {time}")).dim());
     }
+    // Its code reviews always; the rest only when asked for more.
     let trackers: Vec<&str> = match trackers {
-        true => [
+        true => vec![
             row.follows.as_str(),
             row.pr.as_str(),
             row.background.as_str(),
             row.place.as_str(),
-        ]
-        .into_iter()
-        .filter(|f| !f.is_empty())
-        .collect(),
-        false => Vec::new(),
-    };
+        ],
+        false => vec![row.pr.as_str()],
+    }
+    .into_iter()
+    .filter(|f| !f.is_empty())
+    .collect();
     let left: usize = spans.iter().map(|s| s.content.width()).sum();
     let right = trackers.join(" · ");
     let room = width.saturating_sub(left + 2);
@@ -770,6 +772,13 @@ mod tests {
             ]
         );
         assert_eq!(quiet.folds, [(9, Group::Idle), (11, Group::Done)]);
+        // Its code reviews show at the right as it opens, the rest not.
+        let idle = card("calc", &rows, 80, &[Group::Idle], Details::Quiet, &[]);
+        let lines = text(&idle);
+        assert_eq!(lines[10].width(), 80);
+        assert!(lines[10].starts_with(" ✓ equal idle · took 42s "));
+        assert!(lines[10].ends_with(" 2 reviews · o/r#9"), "{}", lines[10]);
+        assert!(!lines[10].contains("tab 2") && !lines[10].contains('▲'));
         // More: what each tracks at its right.
         let plain = card(
             "calc",
