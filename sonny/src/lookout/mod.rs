@@ -61,10 +61,13 @@ const WAITING: usize = 1024;
 /// hears of at once. Settings that do not read keep the defaults.
 fn waiting() -> usize {
     let Ok(sonny) = agent_client::config::load().map(|config| config.sonny) else {
-        crate::margin::set_most_notes(agent_client::config::MARGIN_NOTES);
+        crate::margin::set_limits(
+            agent_client::config::MARGIN_NOTES,
+            agent_client::config::MARGIN_NOTE_LINES,
+        );
         return WAITING;
     };
-    crate::margin::set_most_notes(sonny.margin_notes);
+    crate::margin::set_limits(sonny.margin_notes, sonny.margin_note_lines);
     usize::try_from(sonny.lookout_waiting).unwrap_or(usize::MAX)
 }
 
