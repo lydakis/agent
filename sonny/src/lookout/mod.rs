@@ -2480,9 +2480,14 @@ struct Lookout {
     /// When a note last told the subscriber each source, which a source's
     /// digest counts from.
     told_sources: HashMap<String, Instant>,
-    /// How many notes told what each subscription that lasts so many
-    /// (`runs`) heard, under `Sub::counter`, kept with what its sources hold.
-    runs_told: HashMap<String, u64>,
+    /// The notes, by request, that told what each subscription that lasts
+    /// so many (`runs`) heard, under `Sub::counter`, kept with what its
+    /// sources hold: a note sent again after a restart is one note.
+    runs_told: HashMap<String, Vec<String>>,
+    /// The subscriptions that last so many whose news the note on its way
+    /// on each path tells, by `Sub::counter` as they were when it went: one
+    /// replaced meanwhile is not charged for it. Tasks' path, then sources'.
+    charged: [Vec<String>; 2],
     /// Subscriptions whose notes ran out, for the service to end.
     ended: Vec<String>,
     /// Subscriptions whose `until` came before the files were read again,
@@ -2553,6 +2558,7 @@ impl Lookout {
             heard_since: None,
             told_sources: HashMap::new(),
             runs_told: HashMap::new(),
+            charged: Default::default(),
             ended: Vec::new(),
             over: Vec::new(),
             held: None,
@@ -3052,6 +3058,7 @@ impl Lookout {
         if !quotes.is_empty() {
             asked["quotes"] = json!(quotes);
         }
+        self.charged[0] = self.charges(told.counted.iter());
         self.sending = Some((told, key, delivery));
         self.send(client, woken, asked, Answer::Noted);
     }
@@ -3122,7 +3129,7 @@ impl Lookout {
                         }
                         // The person's words a bounded note left out still cut in.
                         self.urgent &= self.updates.quoting();
-                        self.spend(&told.counted);
+                        self.spend(0, &key);
                         self.updates.sent(told);
                         // When a subscription's digest last told is kept.
                         if !self.updates.told_subs.is_empty() {
@@ -3137,7 +3144,7 @@ impl Lookout {
                     // The same news twice is one note.
                     Err(code) if code == "idempotency_conflict" => {
                         self.urgent &= self.updates.quoting();
-                        self.spend(&told.counted);
+                        self.spend(0, &key);
                         self.updates.sent(told);
                     }
                     Err(code) => {
@@ -3177,13 +3184,7 @@ impl Lookout {
                     submitted => {
                         self.refused = None;
                         self.sourced(true);
-                        let mut counted: Vec<String> = Vec::new();
-                        for sub in sent.iter().flat_map(|heard| &heard.subs) {
-                            if !counted.contains(sub) {
-                                counted.push(sub.clone());
-                            }
-                        }
-                        self.spend(&counted);
+                        self.spend(1, &key);
                         self.unkept_sent = Unkept::default();
                         for heard in &sent {
                             self.told_sources.insert(heard.event.source.clone(), now);
@@ -3228,42 +3229,65 @@ impl Lookout {
     /// news (`tasks`) or the reverse, tells a subscription its last run:
     /// this one waits for it to land, so a one-shot is never told twice.
     fn last_runs_out(&self, tasks: bool) -> bool {
-        let flying: Vec<&String> = match tasks {
-            true => (self.sourcing.iter())
-                .flat_map(|(sent, ..)| sent.iter().flat_map(|heard| &heard.subs))
-                .collect(),
-            false => (self.sending.iter())
-                .flat_map(|(told, ..)| &told.counted)
-                .collect(),
+        let flying = match tasks {
+            true => self.sourcing.is_some(),
+            false => self.sending.is_some(),
         };
-        flying.into_iter().any(|name| {
-            (self.subs.iter().find(|sub| &sub.name == name)).is_some_and(|sub| {
-                sub.runs.is_some_and(|runs| {
-                    self.runs_told.get(&sub.counter()).copied().unwrap_or(0) + 1 >= runs
+        let other = &self.charged[usize::from(tasks)];
+        flying
+            && other.iter().any(|counter| {
+                (self.subs.iter().find(|sub| &sub.counter() == counter)).is_some_and(|sub| {
+                    sub.runs.is_some_and(|runs| {
+                        self.runs_told.get(counter).map_or(0, Vec::len) as u64 + 1 >= runs
+                    })
                 })
             })
-        })
     }
 
-    /// A note that told what these subscriptions heard landed: each that
-    /// lasts so many notes has one fewer to go, and one with none left
-    /// ends, as an automation does after its `--runs`.
-    fn spend(&mut self, counted: &[String]) {
-        let mut spent = false;
-        for name in counted {
-            let Some((runs, counter)) = (self.subs.iter())
-                .find(|sub| &sub.name == name)
-                .and_then(|s| Some((s.runs?, s.counter())))
+    /// What a note telling these subscriptions' news charges: each that
+    /// lasts so many, by its `Sub::counter`.
+    fn charges<'a>(&self, names: impl Iterator<Item = &'a String>) -> Vec<String> {
+        let mut charges: Vec<String> = Vec::new();
+        for name in names {
+            let Some(sub) = self
+                .subs
+                .iter()
+                .find(|sub| &sub.name == name && sub.runs.is_some())
             else {
                 continue;
             };
-            spent = true;
+            let counter = sub.counter();
+            if !charges.contains(&counter) {
+                charges.push(counter);
+            }
+        }
+        charges
+    }
+
+    /// The note on `path` (0 tasks', 1 sources') landed, under `key`:
+    /// each subscription it charged that lasts so many notes has one fewer
+    /// to go, once however often that note is sent, and one with none left
+    /// ends, as an automation does after its `--runs`.
+    fn spend(&mut self, path: usize, key: &[String]) {
+        let request = format!("lookout-{}", digest(&key.join(",")));
+        let mut spent = false;
+        for counter in std::mem::take(&mut self.charged[path]) {
+            let Some(sub) = self.subs.iter().find(|sub| sub.counter() == counter) else {
+                continue;
+            };
+            let (Some(runs), name) = (sub.runs, sub.name.clone()) else {
+                continue;
+            };
             let told = self.runs_told.entry(counter.clone()).or_default();
-            *told += 1;
-            if *told >= runs {
+            if told.contains(&request) {
+                continue;
+            }
+            spent = true;
+            told.push(request.clone());
+            if told.len() as u64 >= runs {
                 self.runs_told.remove(&counter);
-                if !self.ended.contains(name) {
-                    self.ended.push(name.clone());
+                if !self.ended.contains(&name) {
+                    self.ended.push(name);
                 }
             }
         }
@@ -3488,10 +3512,14 @@ impl Lookout {
         };
         self.told_sources.extend(read("told"));
         self.updates.told_subs.extend(read("told_subs"));
-        self.runs_told.extend(
-            (kept["runs_told"].as_object().into_iter().flatten())
-                .filter_map(|(sub, told)| Some((sub.clone(), told.as_u64()?))),
-        );
+        self.runs_told
+            .extend(
+                (kept["runs_told"].as_object().into_iter().flatten()).map(|(sub, told)| {
+                    let told = (told.as_array().into_iter().flatten())
+                        .filter_map(|request| request.as_str().map(str::to_owned));
+                    (sub.clone(), told.collect())
+                }),
+            );
         let heard = |key: &str| -> Vec<sources::Heard> {
             (kept[key].as_array().into_iter().flatten())
                 .filter_map(sources::Event::from_json)
@@ -3661,6 +3689,7 @@ impl Lookout {
         }
         self.updates.fly(&subs);
         self.sourced_subs = subs;
+        self.charged[1] = self.charges(sent.iter().flat_map(|heard| &heard.subs));
         self.sourcing = Some((sent, key, delivery));
         self.keep();
         self.send(client, woken, asked, Answer::Sourced);
@@ -5914,35 +5943,43 @@ mod tests {
             lookout.counting();
             lookout
         };
+        let names =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+        let key = |k: &str| vec![k.to_owned()];
         let mut lookout = made();
-        // One that lasts is never counted; one note told is one spent.
-        lookout.spend(&["always".into(), "twice".into()]);
-        assert_eq!(
-            lookout.runs_told,
-            HashMap::from([("twice@7".to_owned(), 1)])
-        );
+        // One that lasts is never charged; one note told is one spent.
+        lookout.charged[1] = lookout.charges(names(&["always", "twice"]).iter());
+        assert_eq!(lookout.charged[1], ["twice@7"]);
+        lookout.spend(1, &key("a"));
+        assert_eq!(lookout.runs_told["twice@7"].len(), 1);
         assert!(lookout.ended.is_empty());
         lookout.flush();
         held::written();
-        // Watched again, it has one note to go, and ends after it.
+        // Watched again, it has one note to go. The same note sent again
+        // after the restart is that one note, not another.
         let mut again = made();
-        assert_eq!(again.runs_told["twice@7"], 1);
-        again.spend(&["twice".into()]);
+        assert_eq!(again.runs_told["twice@7"].len(), 1);
+        again.charged[0] = again.charges(names(&["twice"]).iter());
+        again.spend(0, &key("a"));
+        assert!(again.ended.is_empty());
+        again.charged[0] = again.charges(names(&["twice"]).iter());
+        again.spend(0, &key("b"));
         assert_eq!(again.ended, ["twice"]);
         assert!(again.runs_told.is_empty());
         // Its last note under way on one path holds the other back, so a
         // one-shot is told once; one with notes to spare holds nothing.
         again.ended.clear();
-        again.runs_told.clear();
-        let mut told = updates::Told::default();
-        told.counted = vec!["twice".into()];
+        let told = updates::Told::default();
+        again.charged[0] = again.charges(names(&["twice"]).iter());
         again.sending = Some((told, Vec::new(), "steer"));
         assert!(!again.last_runs_out(false), "two to go");
-        again.runs_told.insert("twice@7".into(), 1);
+        again
+            .runs_told
+            .insert("twice@7".into(), vec!["lookout-a".into()]);
         assert!(again.last_runs_out(false));
         assert!(!again.last_runs_out(true), "nothing under way for sources");
         again.sending = None;
-        assert!(!again.last_runs_out(false));
+        assert!(!again.last_runs_out(false), "nothing under way for tasks");
         // One whose `until` came before the files are read again holds
         // every note back until the service ends it.
         assert!(!again.overdue());
@@ -5951,8 +5988,9 @@ mod tests {
         again.subs.push(late);
         assert!(again.overdue());
         assert_eq!(again.over, ["late"]);
-        // Removed and added again, even in one call, it counts afresh.
-        again.runs_told.insert("twice@7".into(), 1);
+        // Replaced while its note is on the way, even in one call, the new
+        // one is not charged for it and counts afresh.
+        again.charged[1] = again.charges(names(&["twice"]).iter());
         let twice = again
             .subs
             .iter_mut()
@@ -5961,8 +5999,11 @@ mod tests {
         twice.made = Some(8);
         again.counting();
         assert!(again.runs_told.is_empty());
-        assert!(!again.last_runs_out(false), "the new one has two to go");
-        again.runs_told.insert("twice@8".into(), 1);
+        again.spend(1, &key("c"));
+        assert!(again.runs_told.is_empty() && again.ended.is_empty());
+        again
+            .runs_told
+            .insert("twice@8".into(), vec!["lookout-d".into()]);
         again.subs.retain(|sub| sub.name != "twice");
         again.counting();
         assert!(again.runs_told.is_empty());
