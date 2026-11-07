@@ -1636,6 +1636,8 @@ impl Updates {
         let mut quoted = HashMap::new();
         let mut items: Vec<Line> = Vec::new();
         let mut sent = Vec::new();
+        // The tasks this note tells something of.
+        let mut telling: Vec<String> = Vec::new();
         // What does not fit in this note's bytes waits for the next.
         let mut later = held;
         let (mut bytes, mut quotes) = (0, 0);
@@ -1644,6 +1646,7 @@ impl Updates {
                 later.push((name, news));
                 continue;
             }
+            let before = items.len();
             let (mut kept, mut wait) = (Vec::new(), Vec::new());
             for message in std::mem::take(&mut news.said) {
                 let quote = usize::from(message.words.is_some());
@@ -1717,6 +1720,9 @@ impl Updates {
                 // Nothing more fits this note.
                 bytes = NOTE_BYTES;
             }
+            if items.len() > before {
+                telling.push(name.clone());
+            }
             sent.push((name, news));
         }
         self.tasks = later;
@@ -1725,6 +1731,8 @@ impl Updates {
         let mut subs: Vec<String> = Vec::new();
         let mut heard: Vec<(String, u64)> = Vec::new();
         for (name, news) in &sent {
+            // A task all of whose news waits for a later note told nothing:
+            // it counts, and spends a run, when that note goes.
             let mut hearing: Vec<&String> = Vec::new();
             for hold in news.holds() {
                 for (sub, _) in &hold.windows {
@@ -1737,6 +1745,9 @@ impl Updates {
                         hearing.push(sub);
                     }
                 }
+            }
+            if !telling.contains(name) {
+                continue;
             }
             if hearing.is_empty() {
                 hearing.extend(self.hearers.get(name).into_iter().flat_map(|h| h.iter()));
@@ -2643,6 +2654,24 @@ mod tests {
             "{}",
             second.items[0].text
         );
+    }
+
+    #[test]
+    fn a_task_whose_news_all_waits_is_not_counted_as_told() {
+        let mut updates = fleet();
+        let tasks: Arc<[String]> = Arc::from(vec!["tasks".to_owned()]);
+        updates.hearers.insert("shop.fix".into(), tasks.clone());
+        updates.hearers.insert("shop.docs".into(), tasks);
+        for turn in 1..=NOTE_QUOTES as i64 {
+            updates.said("shop.fix", turn, "the person", Some(&format!("{turn}")));
+        }
+        updates.said("shop.docs", 1, "the person", Some("one more"));
+        let first = updates.take();
+        assert!(first.items.iter().all(|i| i.text.contains("shop.fix")));
+        assert_eq!(first.heard, [("tasks".to_owned(), 1)]);
+        updates.sent(first);
+        let second = updates.take();
+        assert_eq!(second.heard, [("tasks".to_owned(), 1)]);
     }
 
     #[test]

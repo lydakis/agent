@@ -1151,33 +1151,50 @@ pub fn tried(store: &Path, add: &Value, sources: &[String]) -> Result<Value, Str
 
 /// About how many notes events heard at these times would be, each with
 /// whether it steers, the digest it waits for and whose clock that digest
-/// counts on: a note goes once what came settles, no sooner than a digest
-/// after the note before on that clock, and a steer waits for no digest;
-/// what comes while one waits goes with it.
+/// counts on, as the lookout sends them: a note goes once what came
+/// settles, carrying every event ready by then, each no sooner than a
+/// digest after the note before on its clock, a steer at once; one its
+/// digest still holds waits for a later note.
 fn notes(times: &[(u128, bool, Option<std::time::Duration>, &str)]) -> usize {
-    let settle = super::SETTLE.as_millis();
-    let mut last: std::collections::HashMap<&str, u128> = std::collections::HashMap::new();
-    let mut waiting: Vec<&str> = Vec::new();
-    let (mut notes, mut due): (usize, Option<u128>) = (0, None);
-    for &(at, steer, digest, clock) in times {
-        if let Some(went) = due.filter(|due| *due < at) {
-            notes += 1;
-            for clock in waiting.drain(..) {
-                last.insert(clock, went);
-            }
-            due = None;
-        }
-        let window = match steer {
-            true => 0,
-            false => digest.map_or(0, |d| d.as_millis()),
-        };
-        let goes = last.get(clock).map_or(at, |told| at.max(told + window)) + settle;
-        due = Some(due.map_or(goes, |due| due.min(goes)));
-        if !waiting.contains(&clock) {
-            waiting.push(clock);
+    use std::collections::HashMap;
+    /// One waiting event: when it came, whether it steers, its window, its clock.
+    type Waiting<'a> = (u128, bool, u128, &'a str);
+    fn ready(last: &HashMap<&str, u128>, &(at, steer, window, clock): &Waiting) -> u128 {
+        match steer {
+            true => at,
+            false => last.get(clock).map_or(at, |told| at.max(told + window)),
         }
     }
-    notes + usize::from(due.is_some())
+    /// The notes that go before `before`, or all of them: how many.
+    fn send<'a>(
+        waiting: &mut Vec<Waiting<'a>>,
+        last: &mut HashMap<&'a str, u128>,
+        before: Option<u128>,
+    ) -> usize {
+        let settle = super::SETTLE.as_millis();
+        let mut notes = 0;
+        while let Some(went) = (waiting.iter()).map(|e| ready(last, e) + settle).min() {
+            if before.is_some_and(|at| went >= at) {
+                break;
+            }
+            notes += 1;
+            let (carried, held): (Vec<_>, Vec<_>) =
+                waiting.drain(..).partition(|e| ready(last, e) <= went);
+            for (.., clock) in carried {
+                last.insert(clock, went);
+            }
+            *waiting = held;
+        }
+        notes
+    }
+    let mut last: HashMap<&str, u128> = HashMap::new();
+    let mut waiting: Vec<Waiting> = Vec::new();
+    let mut notes = 0;
+    for &(at, steer, digest, clock) in times {
+        notes += send(&mut waiting, &mut last, Some(at));
+        waiting.push((at, steer, digest.map_or(0, |d| d.as_millis()), clock));
+    }
+    notes + send(&mut waiting, &mut last, None)
 }
 
 /// The fields that keep a filter from hearing any event like those its
@@ -1571,13 +1588,13 @@ mod tests {
             (s(120), false, hour, "c"),
         ];
         assert_eq!(notes(&three), 3);
-        // A steer goes at once and takes what waits along.
         let steered = [
             (s(0), false, hour, "a"),
             (s(60), false, hour, "a"),
             (s(120), true, hour, "a"),
         ];
-        assert_eq!(notes(&steered), 2);
+        // A steer goes at once, alone: what its digest holds waits on.
+        assert_eq!(notes(&steered), 3);
         assert_eq!(notes(&[]), 0);
     }
 
