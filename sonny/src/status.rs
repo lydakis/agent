@@ -169,27 +169,26 @@ pub fn plain_line(text: &str) -> String {
     String::new()
 }
 
-/// The groups `/status` shuts until opened: Done folds to its heading,
-/// and Idle shows its newest [`IDLE_SHOWN`] with a line for the rest.
+/// The groups `/status` folds to their headings until opened: Idle and
+/// Done, so what shows is what works and what needs the person.
 pub const FOLDS: [Group; 2] = [Group::Idle, Group::Done];
 
-/// How many idle agents `/status` shows before a line for the rest, as
-/// many as a picker's rows.
-pub const IDLE_SHOWN: usize = 8;
-
-/// Which rows `/status` says more of than their one line: the picked one,
-/// with every row that needs the person saying what it waits for; or every
-/// row, for `sonny status`'s text.
+/// How much `/status` says past each row's agent, state and time, which
+/// every row has, with what a row that needs the person waits for:
+/// nothing more (`Quiet`, as it opens); what each row tracks at its right
+/// and the picked one's model, profile and latest step (`Picked`); or all
+/// of that for every row, for `sonny status`'s text.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Details<'a> {
+    Quiet,
     Picked(Option<&'a str>),
     All,
 }
 
-/// What `/status` shows of a project: the lead, then its tasks by group,
-/// one line each, a task's own helpers folded under it; Done folded to its
-/// heading and Idle to its newest few unless `open` holds their group, and
-/// helpers unless `helpers` holds their task. The line each agent's row is
+/// What `/status` shows of a project: its agents by group, the lead first
+/// in its own, one line each, a task's own helpers folded under it; Idle and Done
+/// folded to their headings unless `open` holds their group, and helpers
+/// unless `helpers` holds their task. The line each agent's row is
 /// on, with its bot, for a click there to open it; each fold's line, for a
 /// click to open or shut its group; and each helpers line, with its task.
 pub struct Card {
@@ -229,7 +228,8 @@ pub fn card(
         (at.bot != row.bot).then(|| at.bot.clone())
     };
     let mut under: HashMap<String, Vec<&Row>> = HashMap::new();
-    let mut listed: Vec<&Row> = Vec::new();
+    // The lead is listed first in its group, as one of the agents.
+    let mut listed: Vec<&Row> = rows.iter().filter(|r| r.name == "lead").collect();
     for row in &tasks {
         match top(row) {
             // One that needs the person is listed there too.
@@ -242,7 +242,7 @@ pub fn card(
             None => listed.push(row),
         }
     }
-    let count = |group: Group| tasks.iter().filter(|r| r.group == group).count();
+    let count = |group: Group| rows.iter().filter(|r| r.group == group).count();
     let mut head = format!(
         "{project} · {} task{}",
         tasks.len(),
@@ -257,11 +257,9 @@ pub fn card(
     let shown = |row: &Row| match details {
         Details::All => true,
         Details::Picked(picked) => picked == Some(row.bot.as_str()),
+        Details::Quiet => false,
     };
-    for row in rows.iter().filter(|r| r.name == "lead") {
-        named.push((out.len(), row.bot.clone()));
-        out.extend(row_lines(row, width, "", shown(row)));
-    }
+    let trackers = details != Details::Quiet;
     for group in [Group::NeedsYou, Group::Working, Group::Idle, Group::Done] {
         let in_group: Vec<&&Row> = listed.iter().filter(|r| r.group == group).collect();
         if in_group.is_empty() {
@@ -274,27 +272,19 @@ pub fn card(
             Span::raw(group.heading()).bold(),
             Span::raw(format!(" · {n}")).dim(),
         ];
-        // Done folds to its heading, as a fold of calls does: ▸ shut, ▾
-        // open; Idle past its few, ▾ while all of it shows.
-        let folding = match group {
-            Group::Done => true,
-            Group::Idle => n > IDLE_SHOWN,
-            _ => false,
-        };
+        // Idle and Done fold to their headings, as a fold of calls does:
+        // ▸ shut, ▾ open.
+        let folding = FOLDS.contains(&group);
         let shut = folding && !opened;
-        if folding && (group == Group::Done || opened) {
+        if folding {
             folds.push((out.len(), group));
             heading.push(Span::raw(if shut { " ▸" } else { " ▾" }).dim());
         }
         out.push(Line::from(heading));
-        let showing = match (group, shut) {
-            (Group::Done, true) => 0,
-            (Group::Idle, true) => IDLE_SHOWN,
-            _ => n,
-        };
+        let showing = if shut { 0 } else { n };
         for row in in_group.iter().take(showing) {
             named.push((out.len(), row.bot.clone()));
-            out.extend(row_lines(row, width, "", shown(row)));
+            out.extend(row_lines(row, width, "", shown(row), trackers));
             // A helper listed with what needs the person shows alone.
             let Some(helped) = under.get(&row.bot).filter(|_| top(row).is_none()) else {
                 continue;
@@ -317,13 +307,9 @@ pub fn card(
             if unfolded {
                 for helper in helped {
                     named.push((out.len(), helper.bot.clone()));
-                    out.extend(row_lines(helper, width, "  ", shown(helper)));
+                    out.extend(row_lines(helper, width, "  ", shown(helper), trackers));
                 }
             }
-        }
-        if group == Group::Idle && showing < n {
-            folds.push((out.len(), group));
-            out.push(Line::from(format!(" +{} more · i shows them", n - showing)).dim());
         }
     }
     Card {
@@ -334,12 +320,11 @@ pub fn card(
     }
 }
 
-/// Something wrong around the agents, which `/status` says under its
-/// heading: a companion that keeps restarting, a skill to fix.
+/// Something broken around the agents, which `/status` says under its
+/// heading after a red `✗`: a companion that keeps restarting, turns held
+/// on a cause the person can fix. When all is well it says nothing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Alert {
-    /// Whether it is broken now (`✗`), not only something to tidy.
-    pub failed: bool,
     pub said: String,
     /// Where to look, muted under it.
     pub detail: String,
@@ -377,7 +362,6 @@ pub fn companion_alerts(companions: &serde_json::Value, now_ms: u64, logs: &str)
                 (None, None, None) => "exits".to_owned(),
             };
             Alert {
-                failed: true,
                 said: format!(
                     "{name} keeps restarting · {how} · {restarts} restart{}",
                     if restarts == 1 { "" } else { "s" }
@@ -465,7 +449,6 @@ pub fn held_alerts(listed: &serde_json::Value) -> Vec<Alert> {
             let count = count.max(names.len() as u64);
             let rest = count - names.len() as u64;
             Alert {
-                failed: true,
                 said: format!(
                     "{what} · {count} agent{} waiting: {}{}",
                     if count == 1 { "" } else { "s" },
@@ -481,38 +464,14 @@ pub fn held_alerts(listed: &serde_json::Value) -> Vec<Alert> {
         .collect()
 }
 
-/// The skills agents are offered whose front matter needs a fix, in one
-/// alert: each by name and what is wrong.
-pub fn skill_alerts(skills: &[agent_client::policy::Skill]) -> Vec<Alert> {
-    let warned: Vec<String> = (skills.iter())
-        .filter_map(|skill| Some(format!("{}: {}", skill.name, skill.warning?)))
-        .collect();
-    if warned.is_empty() {
-        return Vec::new();
-    }
-    let n = warned.len();
-    vec![Alert {
-        failed: false,
-        said: format!(
-            "{n} skill{} to fix, agents may not know when to read {}",
-            if n == 1 { "" } else { "s" },
-            if n == 1 { "it" } else { "them" }
-        ),
-        detail: warned.join(" · "),
-    }]
-}
-
-/// An alert's lines at `width`: a failure after its red `✗`, the rest
-/// muted, and where to look muted under it.
+/// An alert's lines at `width`: what is broken after its red `✗`, and
+/// where to look muted under it.
 pub fn alert_lines(alert: &Alert, width: usize) -> Vec<Line<'static>> {
-    let head = match alert.failed {
-        true => Line::from(vec![
-            Span::raw("✗ ").fg(Color::Red),
-            Span::raw(alert.said.clone()),
-        ]),
-        false => Line::from(alert.said.clone()).dim(),
-    };
-    let lead = if alert.failed { "  " } else { "" };
+    let head = Line::from(vec![
+        Span::raw("✗ ").fg(Color::Red),
+        Span::raw(alert.said.clone()),
+    ]);
+    let lead = "  ";
     let mut out = crate::transcript::wrap(head, width, Span::raw(""), Span::raw(lead));
     if !alert.detail.is_empty() {
         out.extend(crate::transcript::wrap(
@@ -526,11 +485,17 @@ pub fn alert_lines(alert: &Alert, width: usize) -> Vec<Line<'static>> {
 }
 
 /// One agent's lines, after `indent`: its mark, name, state and time,
-/// and at the right what it is followed by, its code reviews, what runs
-/// for it and where its window is; under it, with `details` or while it
-/// waits on the person, its latest step, and with `details` its model and
-/// profile too.
-fn row_lines(row: &Row, width: usize, indent: &str, details: bool) -> Vec<Line<'static>> {
+/// and with `trackers` at the right what it follows, its code reviews,
+/// what runs for it and where its window is; under it, with `details` or
+/// while it waits on the person, its latest step, and with `details` its
+/// model and profile too.
+fn row_lines(
+    row: &Row,
+    width: usize,
+    indent: &str,
+    details: bool,
+    trackers: bool,
+) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     // How long the running turn has been at it, or the last one took.
     let time = match row.seconds {
@@ -552,15 +517,18 @@ fn row_lines(row: &Row, width: usize, indent: &str, details: bool) -> Vec<Line<'
     if !time.is_empty() {
         spans.push(Span::raw(format!(" · {time}")).dim());
     }
-    let trackers: Vec<&str> = [
-        row.follows.as_str(),
-        row.pr.as_str(),
-        row.background.as_str(),
-        row.place.as_str(),
-    ]
-    .into_iter()
-    .filter(|f| !f.is_empty())
-    .collect();
+    let trackers: Vec<&str> = match trackers {
+        true => [
+            row.follows.as_str(),
+            row.pr.as_str(),
+            row.background.as_str(),
+            row.place.as_str(),
+        ]
+        .into_iter()
+        .filter(|f| !f.is_empty())
+        .collect(),
+        false => Vec::new(),
+    };
     let left: usize = spans.iter().map(|s| s.content.width()).sum();
     let right = trackers.join(" · ");
     let room = width.saturating_sub(left + 2);
@@ -647,7 +615,6 @@ mod tests {
                 "helper keeps restarting · killed by signal 9 · 1 restart",
             ]
         );
-        assert!(alerts.iter().all(|a| a.failed));
         assert_eq!(
             alerts[0].detail,
             "its log: ~/.agent/state.sqlite.companions/approver-auto.log"
@@ -692,7 +659,6 @@ mod tests {
                 .detail
                 .contains("add anthropic to ~/.agent/config.toml")
         );
-        assert!(alerts.iter().all(|a| a.failed));
         // Counted in all, named as far as the page goes.
         let many = serde_json::json!({"held": [
             {"bot": "api", "blocked": {"code": "provider_quota_exhausted", "since_ms": 1}},
@@ -704,45 +670,6 @@ mod tests {
         assert_eq!(
             group("held: ChatGPT sign-in", true, false, false),
             Group::NeedsYou
-        );
-    }
-
-    #[test]
-    fn skills_to_fix_are_one_muted_alert_naming_each() {
-        let skill = |name: &str, warning| agent_client::policy::Skill {
-            name: name.into(),
-            path: std::path::PathBuf::from(format!("/s/{name}/SKILL.md")),
-            summary: String::new(),
-            warning,
-        };
-        assert!(skill_alerts(&[skill("good", None)]).is_empty());
-        let alerts = skill_alerts(&[
-            skill("good", None),
-            skill("bare", Some(agent_client::policy::NO_DESCRIPTION)),
-            skill("vague", Some(agent_client::policy::NO_TRIGGER)),
-        ]);
-        assert_eq!(
-            alerts,
-            [Alert {
-                failed: false,
-                said: "2 skills to fix, agents may not know when to read them".into(),
-                detail: "bare: no description · vague: its description never says when to use it"
-                    .into(),
-            }]
-        );
-        let lines = alert_lines(&alerts[0], 40);
-        let dim = |s: &Span| {
-            let style = s.style;
-            s.content.trim().is_empty()
-                || style.add_modifier.contains(ratatui::style::Modifier::DIM)
-        };
-        assert!(
-            lines.iter().all(|line| line
-                .style
-                .add_modifier
-                .contains(ratatui::style::Modifier::DIM)
-                || line.spans.iter().all(dim)),
-            "{lines:?}"
         );
     }
 
@@ -799,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn each_agent_is_one_line_and_the_picked_one_says_more() {
+    fn each_agent_is_its_state_and_time_and_more_says_the_rest() {
         let rows = [
             Row {
                 profile: "superlead".into(),
@@ -821,65 +748,30 @@ mod tests {
             },
             row("old", "done", Group::Done),
         ];
-        let plain = card("calc", &rows, 80, &[], Details::Picked(None), &[]);
-        let lines = text(&plain);
-        assert_eq!(lines[0], "calc · 3 tasks · 1 need you");
+        // As it opens: each agent, its state and time, the lead first in
+        // its group; what one that needs the person waits for; Idle and
+        // Done folded.
+        let quiet = card("calc", &rows, 80, &[], Details::Quiet, &[]);
         assert_eq!(
-            lines[1].trim_end(),
-            " ● lead working · 42s                                                      tab 1"
+            text(&quiet),
+            [
+                "calc · 3 tasks · 1 need you · 1 working",
+                "",
+                "Needs you · 1",
+                " ? zero needs you · took 42s",
+                "   └ asks: staging or prod?",
+                "",
+                "Working · 1",
+                " ● lead working · 42s",
+                "",
+                "Idle · 1 ▸",
+                "",
+                "Done · 1 ▸",
+            ]
         );
-        assert_eq!(lines[1].width(), 80);
-        assert_eq!(lines[3], "Needs you · 1");
-        // What it waits for shows whether picked or not.
-        assert_eq!(lines[4], " ? zero needs you · took 42s");
-        assert_eq!(lines[5], "   └ asks: staging or prod?");
-        assert_eq!(lines[7], "Idle · 1");
-        assert_eq!(
-            lines[8],
-            " ✓ equal idle · took 42s          ▲ · 2 reviews · o/r#9 · ↻ 1 automation · tab 2"
-        );
-        assert_eq!(lines[10], "Done · 1 ▸");
-        assert_eq!(lines.len(), 11);
-        assert_eq!(plain.folds, [(10, Group::Done)]);
-        // Picked, its model, profile and latest step show under it.
-        let picked = card(
-            "calc",
-            &rows,
-            80,
-            &[],
-            Details::Picked(Some("calc.equal")),
-            &[],
-        );
-        let lines = text(&picked);
-        assert_eq!(lines[9], "   GPT 6.1 Sol · chatgpt · task profile");
-        assert_eq!(lines[10], "   └ Opened the pull request.");
-        let named: Vec<&str> = picked.named.iter().map(|(_, b)| b.as_str()).collect();
-        assert_eq!(named, ["calc.lead", "calc.zero", "calc.equal"]);
-        let opened = card(
-            "calc",
-            &rows,
-            80,
-            &[Group::Done],
-            Details::Picked(None),
-            &[],
-        );
-        let lines = text(&opened);
-        assert_eq!(lines[lines.len() - 2], "Done · 1 ▾");
-        assert_eq!(lines[lines.len() - 1], " ✓ old done · took 42s");
-    }
-
-    #[test]
-    fn idle_shows_its_newest_few_and_a_line_for_the_rest() {
-        let rows: Vec<Row> = (0..11)
-            .map(|n| row(&format!("t{n}"), "idle", Group::Idle))
-            .collect();
-        let shut = card("calc", &rows, 80, &[], Details::Picked(None), &[]);
-        let lines = text(&shut);
-        assert_eq!(lines[2], "Idle · 11");
-        assert_eq!(lines[3 + IDLE_SHOWN], " +3 more · i shows them");
-        assert_eq!(shut.named.len(), IDLE_SHOWN);
-        assert_eq!(shut.folds, [(3 + IDLE_SHOWN, Group::Idle)]);
-        let open = card(
+        assert_eq!(quiet.folds, [(9, Group::Idle), (11, Group::Done)]);
+        // More: what each tracks at its right.
+        let plain = card(
             "calc",
             &rows,
             80,
@@ -887,6 +779,55 @@ mod tests {
             Details::Picked(None),
             &[],
         );
+        let lines = text(&plain);
+        // What it waits for shows whether picked or not.
+        assert_eq!(lines[3], " ? zero needs you · took 42s");
+        assert_eq!(lines[4], "   └ asks: staging or prod?");
+        assert_eq!(
+            lines[7].trim_end(),
+            " ● lead working · 42s                                                      tab 1"
+        );
+        assert_eq!(lines[7].width(), 80);
+        assert_eq!(lines[9], "Idle · 1 ▾");
+        assert_eq!(
+            lines[10],
+            " ✓ equal idle · took 42s          ▲ · 2 reviews · o/r#9 · ↻ 1 automation · tab 2"
+        );
+        assert_eq!(lines[12], "Done · 1 ▸");
+        assert_eq!(lines.len(), 13);
+        assert_eq!(plain.folds, [(9, Group::Idle), (12, Group::Done)]);
+        // Picked, its model, profile and latest step show under it.
+        let picked = card(
+            "calc",
+            &rows,
+            80,
+            &[Group::Idle],
+            Details::Picked(Some("calc.equal")),
+            &[],
+        );
+        let lines = text(&picked);
+        assert_eq!(lines[11], "   GPT 6.1 Sol · chatgpt · task profile");
+        assert_eq!(lines[12], "   └ Opened the pull request.");
+        let named: Vec<&str> = picked.named.iter().map(|(_, b)| b.as_str()).collect();
+        assert_eq!(named, ["calc.zero", "calc.lead", "calc.equal"]);
+        let opened = card("calc", &rows, 80, &[Group::Done], Details::Quiet, &[]);
+        let lines = text(&opened);
+        assert_eq!(lines[lines.len() - 2], "Done · 1 ▾");
+        assert_eq!(lines[lines.len() - 1], " ✓ old done · took 42s");
+    }
+
+    #[test]
+    fn idle_folds_to_its_heading_until_opened() {
+        let rows: Vec<Row> = (0..11)
+            .map(|n| row(&format!("t{n}"), "idle", Group::Idle))
+            .collect();
+        let shut = card("calc", &rows, 80, &[], Details::Quiet, &[]);
+        let lines = text(&shut);
+        assert_eq!(lines[2], "Idle · 11 ▸");
+        assert_eq!(lines.len(), 3);
+        assert!(shut.named.is_empty());
+        assert_eq!(shut.folds, [(2, Group::Idle)]);
+        let open = card("calc", &rows, 80, &[Group::Idle], Details::Quiet, &[]);
         let lines = text(&open);
         assert_eq!(lines[2], "Idle · 11 ▾");
         assert_eq!(open.named.len(), 11);
