@@ -1138,7 +1138,7 @@ fn set_deadline(
     );
     let at = crate::trigger::local(deadline);
     let add = json!({"add": {
-        "name": trigger_name(bot, call),
+        "name": trigger_name(bot, turn, call),
         "at": format!("{}-{:02}-{:02} {:02}:{:02}", at.year, at.month, at.day, at.hour, at.minute),
         "if": gate,
         "message": fire(&ask.question, plan, label),
@@ -1153,9 +1153,10 @@ fn deadline(minutes: u64, now: i64) -> i64 {
     at + (60 - at.rem_euclid(60)) % 60
 }
 
-/// The trigger an ask's deadline is, by its agent and call: a name the
-/// person reads in `/background` beside the agent's own.
-fn trigger_name(bot: &str, call: &str) -> String {
+/// The trigger an ask's deadline is, by its agent, turn and call (call IDs
+/// repeat across turns): a name the person reads in `/background` beside
+/// the agent's own.
+fn trigger_name(bot: &str, turn: i64, call: &str) -> String {
     let tail: String = call
         .chars()
         .filter(char::is_ascii_alphanumeric)
@@ -1177,7 +1178,7 @@ fn trigger_name(bot: &str, call: &str) -> String {
         )
         .take(100)
         .collect();
-    format!("{bot}.ask-{tail}")
+    format!("{bot}.ask-{turn}-{tail}")
 }
 
 /// What the deadline's fire tells the agent: Sonny's words, never the
@@ -1382,7 +1383,7 @@ pub async fn served_close(
         ));
     }
     // Its deadline goes with it: nothing to fire, nothing left on disk.
-    let name = trigger_name(bot, &call);
+    let name = trigger_name(bot, turn, &call);
     let _ =
         tokio::task::spawn_blocking(move || crate::trigger::tool(&json!({"remove": name}))).await;
     let outcome = match state {
@@ -2429,10 +2430,10 @@ mod tests {
         assert_eq!(at % 60, 0);
         assert!(at >= 1_800_000_061);
         assert_eq!(
-            trigger_name("shop.lead", "toolu_01AbCdEfGhIjK"),
-            "shop.lead.ask-dEfGhIjK"
+            trigger_name("shop.lead", 12, "toolu_01AbCdEfGhIjK"),
+            "shop.lead.ask-12-dEfGhIjK"
         );
-        assert_eq!(trigger_name("a b", "c-1"), "a-b.ask-c1");
+        assert_eq!(trigger_name("a b", 3, "c-1"), "a-b.ask-3-c1");
     }
 
     #[test]

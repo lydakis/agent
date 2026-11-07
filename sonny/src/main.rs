@@ -2797,12 +2797,17 @@ struct App {
     cards: HashMap<String, (u64, asks::Ask, bool)>,
     /// How many cards were drawn, which numbers the next.
     card_count: u64,
+    /// How many cards were kept at the last look for ones trimmed away.
+    cards_kept: usize,
     /// Where the questions stand that were answered or closed, by key,
     /// drawn or not: a page read later draws a card answered after it.
     settled: HashMap<String, asks::State>,
     /// The tasks' questions that left this window's pins without an
     /// answer from here: where each stands is read from its task.
     unsettled: Vec<asks::Ask>,
+    /// Tasks' questions set aside in their own windows that a click on
+    /// the card brought back here: pinned though the task no longer is.
+    reopened: std::collections::HashSet<String>,
     /// The asks this window answered and closed, by call, until their
     /// answers land.
     sent_answers: Vec<String>,
@@ -4325,8 +4330,10 @@ impl App {
             commands: HashMap::new(),
             cards: HashMap::new(),
             card_count: 0,
+            cards_kept: 0,
             settled: HashMap::new(),
             unsettled: Vec::new(),
+            reopened: Default::default(),
             sent_answers: Vec::new(),
             task_answers: Vec::new(),
             task_asks_read: None,
@@ -11713,6 +11720,7 @@ impl App {
         // number of its own: the one drawn before stays as it was.
         let tag = self.card_count;
         self.card_count += 1;
+        self.forget_trimmed_cards();
         self.cards.insert(key, (tag, ask.clone(), false));
         let state = self.card_state(ask);
         let (rows, marks) = self.card_lines(ask, &state, false);
@@ -11724,6 +11732,34 @@ impl App {
         let tag = screen::Mark::Tag(screen::Tag::Ask(tag));
         self.marks
             .extend((from..from + count).map(|row| (row, tag.clone())));
+    }
+
+    /// Lets go of the cards the screen trimmed away, and where their
+    /// questions stood unless they are pinned still: a page read again
+    /// draws them anew from the history. Looked at each time the cards
+    /// double, so the look costs a row per card drawn.
+    fn forget_trimmed_cards(&mut self) {
+        if self.cards.len() < 64.max(2 * self.cards_kept) {
+            return;
+        }
+        let mut kept = self.screen.ask_tags();
+        // Cards committed but not yet on the screen.
+        kept.extend(self.marks.iter().filter_map(|(_, mark)| match mark {
+            screen::Mark::Tag(screen::Tag::Ask(n)) => Some(*n),
+            _ => None,
+        }));
+        let gone: Vec<String> = (self.cards.iter())
+            .filter(|(_, (tag, ..))| !kept.contains(tag))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in gone {
+            self.cards.remove(&key);
+            let pinned = (self.asks.iter().chain(&self.aside)).any(|ask| ask.key() == key);
+            if !pinned {
+                self.settled.remove(&key);
+            }
+        }
+        self.cards_kept = self.cards.len();
     }
 
     /// The rows of `ask`'s card as it stands, `open` whole when settled,
@@ -11805,6 +11841,12 @@ impl App {
     /// The question at `key` answered or closed, `state` saying how: let
     /// go of, and its card, if drawn, drawn again to say so.
     fn settle(&mut self, key: &str, state: asks::State) {
+        // The person's answer stands: a close read later, from an older
+        // page, is older than it.
+        if matches!(self.settled.get(key), Some(asks::State::Answered(_))) {
+            return;
+        }
+        self.reopened.remove(key);
         self.settled.insert(key.to_owned(), state);
         let before = self.asks.len();
         self.asks.retain(|open| open.key() != key);
@@ -11857,6 +11899,19 @@ impl App {
         // Set aside, it is open again, where its turn puts it.
         if let Some(at) = self.aside.iter().position(|aside| aside.key() == key) {
             let ask = self.aside.remove(at);
+            let to = (self.asks.iter())
+                .position(|open| asks::turn_of(&open.id) > asks::turn_of(&ask.id))
+                .unwrap_or(self.asks.len());
+            self.asks.insert(to, ask);
+            self.draw_card(key);
+        } else if self.settled.get(key) == Some(&asks::State::Aside)
+            && ask.task.is_some()
+            && !self.asks.iter().any(|open| open.key() == key)
+        {
+            // A task's question set aside in its own window: a pick there
+            // still answers it, so it is pinned here again.
+            self.settled.remove(key);
+            self.reopened.insert(key.to_owned());
             let to = (self.asks.iter())
                 .position(|open| asks::turn_of(&open.id) > asks::turn_of(&ask.id))
                 .unwrap_or(self.asks.len());
@@ -11920,7 +11975,10 @@ impl App {
         // the composer shows now.
         self.focus = self.asks.get(self.at()).map(asks::Ask::key);
         let before = self.asks.len();
-        let still = |ask: &asks::Ask| ask.task.is_none() || keys.contains(&ask.key());
+        let reopened = &self.reopened;
+        let still = |ask: &asks::Ask| {
+            ask.task.is_none() || keys.contains(&ask.key()) || reopened.contains(&ask.key())
+        };
         // One that closed elsewhere: where it stands is read from its task.
         let gone: Vec<asks::Ask> = (self.asks.iter().chain(&self.aside))
             .filter(|ask| !still(ask) && !self.settled.contains_key(&ask.key()))
@@ -11966,6 +12024,7 @@ impl App {
         self.cards.clear();
         self.settled.clear();
         self.unsettled.clear();
+        self.reopened.clear();
     }
 
     /// The ask made as call `call` in turn `turn`, as [`asks::id`] names
@@ -20061,6 +20120,45 @@ mod tests {
             Some("that question was answered already")
         );
         assert_eq!(sent.lock().unwrap().len(), 1);
+        // A close read after, from an older page, leaves their answer.
+        app.ask_closed(&json!({"id": "ask:1/c1", "outcome": "withdrawn", "note": "late"}));
+        assert!(drawn(&mut app).contains(&"┃ Answered · Drop it".to_owned()));
+        // A card the screen let go of is let go here too, and where its
+        // question stood with it.
+        for n in 0..64 {
+            let key = format!("ask:{}/gone", n + 100);
+            let ask = asks::call(&key, &arguments).unwrap();
+            app.cards.insert(key.clone(), (10_000 + n, ask, false));
+            app.settled.insert(key, asks::State::Withdrawn("w".into()));
+        }
+        app.forget_trimmed_cards();
+        assert_eq!(app.cards.keys().collect::<Vec<_>>(), ["ask:1/c1"]);
+        assert_eq!(app.settled.len(), 1);
+    }
+
+    /// A task's question set aside in its own window comes back to the
+    /// lead's composer with a click on its card, and stays pinned there.
+    #[tokio::test]
+    async fn a_tasks_question_set_aside_in_its_window_comes_back_with_a_click() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        let arguments = json!({"question": "Signed in?", "why": "w", "command": "gh auth login"});
+        let mut ask = asks::call("ask:4/c9", &arguments).unwrap();
+        ask.task = Some(asks::Asker {
+            bot: "p.fix".into(),
+            name: "fix".into(),
+        });
+        let key = ask.key();
+        app.commit_ask(&ask);
+        app.asks.push(ask);
+        // It left the pins: the person wrote past it in the task's window.
+        app.settle(&key, asks::State::Aside);
+        assert!(app.asking().is_none());
+        app.press(&format!("card/{key}")).await;
+        assert_eq!(app.asking().map(asks::Ask::key), Some(key.clone()));
+        app.pin_task_asks();
+        assert_eq!(app.asking().map(asks::Ask::key), Some(key));
     }
 
     /// Without a multiplexer, a running task that asks and works on is read

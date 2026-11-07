@@ -427,6 +427,16 @@ impl Screen {
     }
 
     /// The row tagged `tag`, the newest if more are.
+    /// The question cards whose rows the screen still keeps, by number.
+    pub fn ask_tags(&self) -> std::collections::HashSet<u64> {
+        (self.rows.iter())
+            .filter_map(|row| match row.tag {
+                Some(Tag::Ask(n)) => Some(n),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn tagged(&self, tag: Tag) -> Option<usize> {
         self.rows.iter().rposition(|row| row.tag == Some(tag))
     }
