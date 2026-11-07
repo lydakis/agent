@@ -1501,7 +1501,7 @@ pub fn relayed_kind(text: &str, from: Option<&str>) -> &'static str {
 pub fn relayed_names(text: &str, from: Option<&str>) -> Vec<String> {
     // News names whom it is about, not what sent it ("task updates").
     if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
-        return (sourced(rest).into_iter().skip(1))
+        return (sourced(rest, &Default::default()).into_iter().skip(1))
             .filter(|source| !source.starts_with('+'))
             .collect();
     }
@@ -1693,7 +1693,7 @@ const FROM_SOURCES: &str = "From your sources: ";
 /// sources said, as its kind and a few words for each thing it tells.
 fn news(text: &str) -> Option<Vec<String>> {
     if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
-        return Some(sourced(rest));
+        return Some(sourced(rest, &crate::background::source_icons()));
     }
     // "- the lead role: theirs at …" is the lead role, "- set up backup: …"
     // the backup, "- do move; …" the step it asks, and a register's rows
@@ -1768,8 +1768,9 @@ fn news(text: &str) -> Option<Vec<String>> {
 }
 
 /// What each source said, counted: "- slack, from \"ana\" (for your
-/// chat): \"lunch?\"" is one from slack.
-fn sourced(rest: &str) -> Vec<String> {
+/// chat): \"lunch?\"" is one from slack, marked by its `icon` when it has
+/// one, as `/status` and `/background` mark it.
+fn sourced(rest: &str, icons: &std::collections::HashMap<String, String>) -> Vec<String> {
     let mut counts: Vec<(String, usize)> = Vec::new();
     let (mut more, mut unkept) = (None, None);
     for item in rest.lines().filter_map(|line| line.strip_prefix("- ")) {
@@ -1790,9 +1791,15 @@ fn sourced(rest: &str) -> Vec<String> {
         }
     }
     let mut parts = vec!["From your sources".to_owned()];
-    parts.extend(counts.into_iter().map(|(source, n)| match n {
-        1 => source,
-        n => format!("{source} {n}"),
+    parts.extend(counts.into_iter().map(|(source, n)| {
+        let named = match icons.get(&source) {
+            Some(icon) => format!("{icon} {source}"),
+            None => source,
+        };
+        match n {
+            1 => named,
+            n => format!("{named} {n}"),
+        }
     }));
     parts.extend(more);
     parts.extend(unkept);
@@ -3547,6 +3554,11 @@ mod tests {
             text(&super::prompt(note, None, 90)),
             ["↳ From your sources · slack 2 · mail · +3 more · 40 not kept"]
         );
+        // A source with an icon is marked by it, as `/status` marks its
+        // followers; one without stays its name.
+        let rest = note.strip_prefix(FROM_SOURCES).unwrap();
+        let icons = [("slack".to_owned(), "▲".to_owned())].into();
+        assert_eq!(super::sourced(rest, &icons)[1..3], ["▲ slack 2", "mail"]);
     }
 
     #[test]
