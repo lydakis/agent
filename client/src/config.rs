@@ -89,6 +89,7 @@
 //! digest = "15m"                # a subscriber hears it at most this often; unset, as it comes
 //! steer = { from = ["boss"] }   # what cuts into a busy subscriber's turn, as a filter is written
 //! watch = ["~/bin/slack-poll"]  # files whose edit starts it again on them; unset, none
+//! icon = "▲"                    # one character /status shows on the row of each agent that follows it
 //! [sonny.sources.commons]       # Sonny's own source: the commons threads an agent posted in
 //! digest = "15m"                # the default; 0 at once. Takes digest and steer alone
 //! ```
@@ -745,6 +746,9 @@ pub struct Source {
     /// Files whose change starts it again on them, as a service manager
     /// restarts a unit on its new binary: each from `/` or `~/`.
     pub watch: Vec<String>,
+    /// One character cell `/status` shows on the row of each agent that
+    /// follows it.
+    pub icon: Option<String>,
 }
 
 /// An MCP server, under Codex's key names for `[mcp_servers.NAME]`: a
@@ -1603,6 +1607,7 @@ fn commons_source() -> Source {
         digest: Some(COMMONS_DIGEST.into()),
         steer: None,
         watch: Vec::new(),
+        icon: None,
     }
 }
 
@@ -1629,6 +1634,7 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
         let mut digest = None;
         let mut steer = None;
         let mut watch = Vec::new();
+        let mut icon = None;
         let own = name == COMMONS_SOURCE;
         for (field, value) in fields {
             match field.as_str() {
@@ -1645,6 +1651,16 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
                     let value = string(&key(field), value)?;
                     span(&key(field), &value)?;
                     digest = Some(value);
+                }
+                "icon" => {
+                    let value = string(&key(field), value)?;
+                    if value.chars().count() != 1 || value.chars().any(char::is_control) {
+                        return Err(format!(
+                            "{} is one character, as \"▲\", not {value:?}",
+                            key(field)
+                        ));
+                    }
+                    icon = Some(value);
                 }
                 "steer" => {
                     if !value.is_table() {
@@ -1673,6 +1689,7 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
         if own {
             commons.digest = digest.or(commons.digest);
             commons.steer = steer;
+            commons.icon = icon;
             continue;
         }
         sources.push(Source {
@@ -1682,6 +1699,7 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
             digest,
             steer,
             watch,
+            icon,
         });
     }
     Ok((sources, commons))

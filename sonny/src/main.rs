@@ -64,6 +64,7 @@ mod place;
 mod plan;
 mod project;
 mod prompt;
+mod prs;
 mod reactions;
 mod recall;
 mod resolved;
@@ -547,6 +548,15 @@ async fn read_status(
         .as_millis() as u64;
     let store = agent_client::socket::canonical_store(options_store)
         .unwrap_or_else(|_| options_store.to_path_buf());
+    // Each source's icon, as the settings give it now.
+    let icons: HashMap<String, String> = agent_client::config::load()
+        .map(|config| {
+            (config.sonny.sources.into_iter())
+                .chain([config.sonny.commons_source])
+                .filter_map(|source| Some((source.name, source.icon?)))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut rows = Vec::new();
     // Each lead's project file read once a refresh; a task's profile
     // is the one noted when it started.
@@ -780,8 +790,13 @@ async fn read_status(
             profile,
             latest: step,
             place,
-            pr: pr.unwrap_or_default(),
-            background: background::fact(&behind, name),
+            pr: match prs::read(&store, name) {
+                kept if !kept.is_empty() => prs::said(&kept),
+                _ => pr.unwrap_or_default(),
+            },
+            background: background::fact(&behind, name, &icons),
+            follows: background::icons(&behind, name, &icons),
+            maker: bot["created_by"].as_str().unwrap_or("").to_owned(),
             group,
         });
     }
@@ -2000,7 +2015,15 @@ fn status_said(project: &str, rows: &[status::Row], as_json: bool) -> String {
             .collect();
         return json!({"project": project, "agents": agents}).to_string();
     }
-    let card = status::card(project, rows, 100, &status::FOLDS);
+    let every: Vec<String> = rows.iter().map(|row| row.bot.clone()).collect();
+    let card = status::card(
+        project,
+        rows,
+        100,
+        &status::FOLDS,
+        status::Details::All,
+        &every,
+    );
     (card.lines.iter())
         .map(|line| {
             let text: String = line
@@ -3304,9 +3327,23 @@ struct Watch {
     /// The agent `/status` has picked from the keys, by its place among
     /// the agents it lists: ↑ and ↓ move it, Enter opens it.
     pick: Option<usize>,
+    /// The tasks whose helpers `/status` shows under them: → or a click
+    /// opens them, ← or a click folds them again.
+    helpers: Vec<String>,
 }
 
 impl Watch {
+    /// The helpers of `bot` shown under it, or folded: as `show` says, or
+    /// the other way from now.
+    fn helpers_of(&mut self, bot: &str, show: Option<bool>) {
+        let shown = self.helpers.iter().any(|b| b == bot);
+        match show.unwrap_or(!shown) {
+            true if !shown => self.helpers.push(bot.to_owned()),
+            false => self.helpers.retain(|b| b != bot),
+            _ => {}
+        }
+    }
+
     /// The group `group` opened, or folded again.
     fn toggle(&mut self, group: status::Group) {
         match self.open.iter().position(|open| *open == group) {
@@ -9153,6 +9190,7 @@ impl App {
             sky: None,
             picked: None,
             pick: None,
+            helpers: Vec::new(),
         });
         // Picked already, the agent named last in what shows: Enter opens
         // the one the conversation just pointed to.
@@ -9194,6 +9232,7 @@ impl App {
             sky: None,
             picked: None,
             pick: None,
+            helpers: Vec::new(),
         });
         self.open_pane(pane::Pane::card("background", STATUS_KEYS));
     }
@@ -9218,6 +9257,7 @@ impl App {
             sky: None,
             picked: None,
             pick: None,
+            helpers: Vec::new(),
         });
         self.open_pane(pane::Pane::card("usage", STATUS_KEYS));
     }
@@ -9242,6 +9282,7 @@ impl App {
             sky: None,
             picked: None,
             pick: None,
+            helpers: Vec::new(),
         });
         self.open_pane(pane::Pane::card("commons", STATUS_KEYS));
     }
@@ -9262,6 +9303,7 @@ impl App {
             sky: Some(sky::View::open(self.options.socket.clone(), self.store())),
             picked: None,
             pick: None,
+            helpers: Vec::new(),
         });
         self.open_pane(pane::Pane::card("sky", STATUS_KEYS));
     }
@@ -9937,6 +9979,10 @@ impl App {
                     }
                 } else if let Some(watch) = &mut self.watch {
                     watch.pick = pick;
+                    // → shows the picked task's helpers under it, ← folds them.
+                    if let (KeyCode::Right | KeyCode::Left, Some(at)) = (key.code, pick) {
+                        watch.helpers_of(&bots[at], Some(key.code == KeyCode::Right));
+                    }
                 }
                 return true;
             }
@@ -10457,6 +10503,12 @@ impl App {
                         "i" => status::Group::Idle,
                         _ => status::Group::Done,
                     });
+                }
+            }
+            // A task's helpers in `/status`: shown under it, or folded.
+            "helpers" => {
+                if let Some(watch) = &mut self.watch {
+                    watch.helpers_of(id, None);
                 }
             }
             // The pane's switch hint, or the footer's for a pane folded
@@ -14319,11 +14371,35 @@ fn watch_card(
             row
         })
         .collect();
+    // The agent picked from the keys says more: its place among the rows
+    // is the same with or without that.
+    let listed = status::card(
+        &watch.project,
+        &rows,
+        width,
+        &watch.open,
+        status::Details::Picked(None),
+        &watch.helpers,
+    );
+    let mut agents = listed
+        .named
+        .iter()
+        .map(|(_, bot)| bot)
+        .filter(|bot| *bot != me);
+    let picked = watch.pick.and_then(|at| agents.nth(at)).cloned();
     let status::Card {
         lines: mut card,
         named,
         folds,
-    } = status::card(&watch.project, &rows, width, &watch.open);
+        helpers,
+    } = status::card(
+        &watch.project,
+        &rows,
+        width,
+        &watch.open,
+        status::Details::Picked(picked.as_deref()),
+        &watch.helpers,
+    );
     // The lookout's line goes under the heading, what is wrong under it,
     // and the agents' under that.
     let mut above: Vec<Line<'static>> = Vec::new();
@@ -14348,9 +14424,17 @@ fn watch_card(
             )
         })
         .collect();
-    let fold_keys: Vec<&str> = folds.iter().map(|(_, group)| group_key(*group)).collect();
+    let mut fold_keys: Vec<&str> = folds.iter().map(|(_, group)| group_key(*group)).collect();
+    fold_keys.dedup();
+    if !helpers.is_empty() {
+        fold_keys.push("→");
+    }
     marks.extend(folds.into_iter().map(|(at, group)| {
         let link = format!("{}group/{}", screen::BUTTON, group_key(group));
+        (below(at), screen::Mark::Link(link))
+    }));
+    marks.extend(helpers.into_iter().map(|(at, bot)| {
+        let link = format!("{}helpers/{bot}", screen::BUTTON);
         (below(at), screen::Mark::Link(link))
     }));
     let lines = card
@@ -14378,6 +14462,10 @@ fn group_key(group: status::Group) -> &'static str {
 fn status_keys(watch: &Watch, keys: &[&str]) -> String {
     let mut said = String::from("↑↓ pick · enter open");
     for key in keys {
+        if *key == "→" {
+            said.push_str(" · →← helpers");
+            continue;
+        }
         let group = match *key {
             "i" => status::Group::Idle,
             _ => status::Group::Done,
@@ -20784,6 +20872,7 @@ mod tests {
             sky: None,
             picked: None,
             pick: None,
+            helpers: Vec::new(),
         };
         // A named lead's window: its own row opens nothing, and the
         // folder's other lead opens by its own name, not its label.
@@ -21270,6 +21359,7 @@ mod tests {
             sky: None,
             picked: None,
             pick: None,
+            helpers: Vec::new(),
         });
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let pick = |app: &App| app.watch.as_ref().unwrap().pick;

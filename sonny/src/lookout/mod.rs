@@ -849,17 +849,31 @@ struct Telling {
 /// How many copies check at once whether a reply waits on the person.
 const CHECKS: usize = 4;
 
-/// What `bot`'s turn `turn` left waiting on the person: nothing for a
-/// turn that ended without words, or with a question the ask tool put,
-/// which every surface reads itself; else what a copy of `bot` says.
-async fn waiting_for(client: &Client, bot: &str, turn: i64) -> Result<Option<String>, String> {
+/// What `bot`'s turn `turn` left waiting on the person, once the pull
+/// requests its reply names are kept beside `store` ([`crate::prs`]):
+/// nothing unless `check`, nor for a turn that ended without words, or
+/// with a question the ask tool put, which every surface reads itself;
+/// else what a copy of `bot` says.
+async fn waiting_for(
+    client: &Client,
+    store: &std::path::Path,
+    bot: &str,
+    turn: i64,
+    check: bool,
+) -> Result<Option<String>, String> {
     let handle = format!("turn:{bot}/{turn}");
     let ended = client
         .request("wait", json!({"handles": [&handle], "timeout_ms": 0}))
         .await
         .map_err(|e| e.to_string())?;
     let said = ended["results"][&handle]["text"].as_str().unwrap_or("");
-    if said.trim().is_empty() {
+    if let Err(error) = crate::prs::note(store, bot, said) {
+        println!(
+            "{}",
+            json!({"event": "prs_unkept", "bot": bot, "turn": turn, "error": error})
+        );
+    }
+    if !check || said.trim().is_empty() {
         return Ok(None);
     }
     if crate::needs::scan(client, bot, Some(turn))
@@ -1152,7 +1166,8 @@ impl Service {
     /// a copy of the agent, with no tools, says at once whether they wait
     /// on the person, and what for, kept as a mark every surface reads
     /// ([`crate::waiting`]). Not a side chat's, nor a copy's, nor any with
-    /// `[sonny] needs_check = false`. What the copy found goes to
+    /// `[sonny] needs_check = false`, whose turns' replies are only read for
+    /// the pull requests they name ([`crate::prs`]). What the copy found goes to
     /// `checked` as well, for the leads that hold the turn's end until it
     /// says: the agent and turn checked, when one is.
     fn check_waiting(
@@ -1176,9 +1191,7 @@ impl Service {
         if !ours || !kept || crate::waiting::is_copy(bot) || crate::side_source(bot).is_some() {
             return None;
         }
-        if !agent_client::config::load().map_or(true, |c| c.sonny.needs_check) {
-            return None;
-        }
+        let check = agent_client::config::load().map_or(true, |c| c.sonny.needs_check);
         let (client, checks, checked) = (client.clone(), self.checks.clone(), checked.clone());
         let (store, bot) = (self.store.clone(), bot.to_owned());
         let named = bot.clone();
@@ -1186,7 +1199,10 @@ impl Service {
             let Ok(_turn) = checks.acquire().await else {
                 return;
             };
-            let found = waiting_for(&client, &bot, turn).await;
+            let found = waiting_for(&client, &store, &bot, turn, check).await;
+            if !check {
+                return;
+            }
             let _ = checked.send((bot.clone(), turn, found.clone().ok().flatten()));
             let kept = match found {
                 Ok(found) => {
@@ -1202,7 +1218,7 @@ impl Service {
                 );
             }
         });
-        Some((named, turn))
+        check.then_some((named, turn))
     }
 
     async fn watch(
@@ -3718,7 +3734,8 @@ mod tests {
             let handle = request["handles"][0].as_str().unwrap_or("");
             match request["op"].as_str() {
                 Some("wait") if handle == "turn:calc.plan/3" => json!({"results": {handle:
-                    {"status": "completed", "text": "Deploy to staging or prod?"}}}),
+                    {"status": "completed", "text":
+                        "Opened https://github.com/o/r/pull/7. Deploy to staging or prod?"}}}),
                 Some("wait") if handle == "turn:calc.quiet/3" => json!({"results": {handle:
                     {"status": "completed", "text": " "}}}),
                 Some("wait") => json!({"results": {handle: {"status": "completed",
@@ -3730,10 +3747,15 @@ mod tests {
             }
         })
         .await;
+        let store = std::env::temp_dir()
+            .join(format!("sonny-waiting-for-{}", std::process::id()))
+            .join("store");
         assert_eq!(
-            waiting_for(&client, "calc.plan", 3).await,
+            waiting_for(&client, &store, "calc.plan", 3, true).await,
             Ok(Some("staging or prod".into()))
         );
+        // The pull request its reply named is kept for `/status`.
+        assert_eq!(crate::prs::read(&store, "calc.plan"), ["o/r#7"]);
         let requests = asked.lock().unwrap().clone();
         let fork = requests.iter().find(|r| r["op"] == "fork").unwrap();
         assert_eq!(fork["source"], "calc.plan");
@@ -3746,8 +3768,18 @@ mod tests {
         assert!(requests.iter().any(|r| r["op"] == "delete"));
         // No words, no copy.
         asked.lock().unwrap().clear();
-        assert_eq!(waiting_for(&client, "calc.quiet", 3).await, Ok(None));
+        assert_eq!(
+            waiting_for(&client, &store, "calc.quiet", 3, true).await,
+            Ok(None)
+        );
         assert!(!asked.lock().unwrap().iter().any(|r| r["op"] == "fork"));
+        // With the check off, the pull requests are still kept.
+        assert_eq!(
+            waiting_for(&client, &store, "calc.plan", 3, false).await,
+            Ok(None)
+        );
+        assert!(!asked.lock().unwrap().iter().any(|r| r["op"] == "fork"));
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
     }
 
     #[tokio::test]
@@ -5617,6 +5649,7 @@ mod tests {
             digest: None,
             steer: None,
             watch: Vec::new(),
+            icon: None,
         };
         let down = sources::Event::of_lookout(&source, "down", "down".into(), json!({}));
         // A topic of it, and a filter the notice never matches, hear it.
@@ -6256,6 +6289,7 @@ mod tests {
             digest: None,
             steer: None,
             watch: Vec::new(),
+            icon: None,
         }
     }
 

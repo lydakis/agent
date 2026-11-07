@@ -1381,6 +1381,7 @@ mod tests {
             digest: None,
             steer: None,
             watch: Vec::new(),
+            icon: None,
         }
     }
 
@@ -1760,6 +1761,7 @@ mod tests {
             digest: Some("5m".into()),
             steer: None,
             watch: Vec::new(),
+            icon: None,
         }]);
         let mut texts = Vec::new();
         while texts.len() < 3 {
@@ -1808,6 +1810,7 @@ mod tests {
             digest: None,
             steer: None,
             watch: vec![script.display().to_string()],
+            icon: None,
         };
         runner.set(vec![source.clone()]);
         assert_eq!(next_event(&mut got).await.text, "v1");
@@ -1852,6 +1855,7 @@ mod tests {
             digest: None,
             steer: None,
             watch: vec![script.display().to_string()],
+            icon: None,
         };
         // Each edit starts it again: three failed runs in a row.
         let edit = |body: &str, n: u64| {
