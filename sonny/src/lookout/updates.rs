@@ -388,6 +388,9 @@ struct Read {
     turn: i64,
     news: Vec<(String, News)>,
     unheard: Vec<(Key, (Turn, bool))>,
+    /// Of those, the ones whose asker was read while the wait ran: their
+    /// end as `asked_by` would have told it.
+    heard: Vec<(Key, Turn, bool)>,
     forwarding: Vec<(Key, Forward)>,
 }
 
@@ -1117,6 +1120,25 @@ impl Updates {
             forward.from = from.clone();
             forward.origin = origin.clone();
         }
+        // Held by a wait still running: kept as heard, for the wait's end.
+        for read in self.waits.values_mut() {
+            for (_, forward) in (read.forwarding.iter_mut()).filter(|(k, _)| *k == key) {
+                forward.from = from.clone();
+                forward.origin = origin.clone();
+            }
+        }
+        let held = (self.waits.iter()).find_map(|(call, read)| {
+            let at = read.unheard.iter().position(|(k, _)| *k == key)?;
+            Some((call.clone(), at, read.unheard[at].1.0.status.clone()))
+        });
+        if let Some((call, at, status)) = held {
+            let by = self.by(&status, from, origin);
+            let read = self.waits.get_mut(&call).expect("found above");
+            let (key, (mut told, answered)) = read.unheard.remove(at);
+            told.by = by;
+            read.heard.push((key, told, answered));
+            return;
+        }
         if let Some((mut told, answered)) = self.unheard.remove(&key) {
             told.by = self.by(&told.status, from, origin);
             if told.run() {
@@ -1484,6 +1506,18 @@ impl Updates {
                 self.unheard.entry(key).or_insert(held);
             }
         }
+        for (key, told, answered) in read.heard {
+            if !self.task(&key.0) {
+                continue;
+            }
+            if told.run() {
+                self.replying.insert(key.clone());
+                self.runs.insert(key, (told, answered));
+            } else {
+                let name = key.0.clone();
+                self.put(&name, told, answered);
+            }
+        }
         for (key, forward) in read.forwarding {
             if self.task(&key.0) {
                 self.forwarding.entry(key).or_insert(forward);
@@ -1826,6 +1860,7 @@ impl Updates {
         for read in self.waits.values_mut() {
             read.news.retain(|(task, _)| task != name);
             read.unheard.retain(|((task, _), _)| task != name);
+            read.heard.retain(|((task, _), ..)| task != name);
             read.forwarding.retain(|((task, _), _)| task != name);
         }
         self.tasks.retain(|(task, _)| task != name);

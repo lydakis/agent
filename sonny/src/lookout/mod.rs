@@ -3999,6 +3999,35 @@ mod tests {
     }
 
     #[test]
+    fn who_asked_read_while_a_wait_held_the_turn_counts_when_the_wait_fails() {
+        let mut lookout = seated("idle");
+        lookout.subs[0].filter = Some(json!({"by": ["you"]}));
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        let ended = ev("calc.fix", 4, "turn_finished", json!({"status": "failed"}));
+        lookout.event(&ended);
+        assert!(lookout.updates.asker_unknown("calc.fix", 4));
+        let handles = json!({"handles": ["turn:calc.fix/4"]}).to_string();
+        let wait = json!({"name": "wait", "call_id": "w1", "arguments": handles});
+        lookout.event(&ev("calc.lead", 7, "tool_started", wait));
+        // Who asked is read while the wait holds the turn, then the wait
+        // fails: the turn's end is news, as the filter hears it.
+        (lookout.updates).asked_by("calc.fix", 4, Some("calc.lead".into()), None);
+        lookout.updates.replied("calc.fix", 4, "");
+        assert!(!lookout.updates.news());
+        let failed = json!({"call_id": "w1", "failed": true});
+        lookout.event(&ev("calc.lead", 7, "tool_completed", failed));
+        lookout.updates.replied("calc.fix", 4, "");
+        let told = lookout.updates.take();
+        assert_eq!(told.items.len(), 1);
+        assert!(
+            told.items[0].text.contains("turn:calc.fix/4 failed"),
+            "{}",
+            told.items[0].text
+        );
+    }
+
+    #[test]
     fn a_filter_on_who_asked_waits_until_who_asked_is_read() {
         let mut lookout = seated("idle");
         lookout.subs[0].filter = Some(json!({"by": ["you"]}));
