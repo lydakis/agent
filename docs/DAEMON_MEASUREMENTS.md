@@ -7567,7 +7567,7 @@ reads no state folder or setting); the rest stay within 6%.
 | lifecycle | p95 turn, ms | 666.913 | 723.258 | +8.4% |
 | lifecycle | peak RSS, MiB | 22.945 | 23.43 | +2.1% |
 
-## An automation gate in its agent's sandbox (#PR)
+## An automation gate in its agent's sandbox (#783)
 
 An `--if` an agent added runs through `agent sandbox --bot`: one `agent`
 process, one `lend` round trip, and, for a confined agent, the sandbox
@@ -7591,5 +7591,4 @@ so the spread is about ±0.4 ms):
 
 So the lend costs about 1.5 ms over the sandbox's own launch, and a
 confined agent's gate about 11 ms over the person's, paid once per check:
-a gate that says no still costs no model call. A gate checks at most
-once a minute.
+a gate that says no still costs no model call.
