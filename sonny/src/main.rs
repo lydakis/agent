@@ -695,7 +695,7 @@ async fn read_status(
         };
         let itself = seen.itself && name != lead && ran["status"] == "completed";
         let resolved =
-            itself || resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
+            itself || resolved::holds(resolved::read(&store, name), ran["turn"].as_i64(), running);
         // With no question asked, what its last reply left waiting on the
         // person, as a copy of it said, until a later turn starts.
         let mark = || {
@@ -728,7 +728,7 @@ async fn read_status(
         }
         // What the done check last found, while no turn since began.
         if let Some(answer) = done_check::read(&store, name, bot["bot_id"].as_i64().unwrap_or(-1))
-            .filter(|answer| done_check::holds(answer, turn["turn"].as_i64(), running))
+            .filter(|answer| done_check::holds(answer, ran["turn"].as_i64(), running))
         {
             let now = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
                 .map_or(0, |d| d.as_secs() as i64);
@@ -5519,6 +5519,12 @@ impl App {
                     if self.project.is_some() {
                         let glob = self.scope().glob;
                         self.done_sweep.look(&self.client, &self.store(), &glob);
+                        // A task the check found done goes as one marked done does.
+                        if let Some(fleet) = &mut self.fleet {
+                            for task in self.done_sweep.done() {
+                                fleet.resolved(&task);
+                            }
+                        }
                     }
                     changed |= self.moving()
                         || drawn.is_none_or(|at| at.elapsed() >= IDLE_FRAME);
@@ -21316,6 +21322,71 @@ mod tests {
         assert_eq!(fleet.doing["calc.ask"], "idle");
         assert_eq!(fleet.doing["calc.new"], "needs you");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The done check judges the turn that ran: a message steered into it
+    /// is newer in the daemon's list yet already taken, so /status shows
+    /// the task done, with the check's reason, until a turn of its own runs.
+    #[tokio::test]
+    async fn a_done_check_covers_messages_steered_into_the_turn_it_judged() {
+        let (client, _events) = daemon_with_events(json!({}), |asked| {
+            match asked["op"].as_str().unwrap_or_default() {
+                "bots" => json!({"bots": [
+                    {"name": "shop.lead", "bot_id": 1, "head": 1, "running_turn": null},
+                    {"name": "shop.fix", "bot_id": 2, "head": 1, "running_turn": null,
+                        "created_by": "shop.lead"},
+                ], "next_after": null}),
+                "turns" if asked["bot"] == "shop.fix" => json!({"turns": [
+                    {"turn": 4, "status": "steered", "finished_ms": 2},
+                    {"turn": 3, "status": "completed", "finished_ms": 2}]}),
+                "turns" => json!({"turns": []}),
+                "history_nodes" => json!({"nodes": []}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let dir = std::env::temp_dir().join(unique("sonny-done-steered"));
+        let store = dir.join("store");
+        let answer = done_check::Answer {
+            turn: 3,
+            done: true,
+            why: "its pull request merged".into(),
+            at: 0,
+        };
+        done_check::keep(&store, "shop.fix", 2, &answer).unwrap();
+        let scope = background::Scope {
+            project: "shop".into(),
+            lead: "shop.lead".into(),
+            glob: "shop.*".into(),
+        };
+        let view = StatusView {
+            bot: "",
+            asks: &[],
+            approvals: &[],
+            turn_model: None,
+            places: Default::default(),
+            aside: &|_| false,
+        };
+        let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
+        let read = read_status(
+            &client,
+            &store,
+            scope,
+            &HashMap::new(),
+            &mut latest,
+            &mut asks,
+            view,
+        )
+        .await
+        .unwrap();
+        let fix = read.rows.iter().find(|row| row.bot == "shop.fix").unwrap();
+        assert_eq!(fix.state, "done");
+        assert!(
+            fix.latest.starts_with("marked done by the check"),
+            "{}",
+            fix.latest
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A reply that left the person something to give, as the lookout's

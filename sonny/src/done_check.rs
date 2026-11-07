@@ -201,43 +201,60 @@ const OFF_LOOK: Duration = Duration::from_secs(60);
 /// a time, on its own task, so the window never waits on it.
 #[derive(Default)]
 pub struct Sweep {
-    /// When it last looked.
-    looked: Option<Instant>,
+    /// When it looks next: the config is read only then, never per tick.
+    next: Option<Instant>,
     /// Whether a sweep is under way.
     running: Arc<AtomicBool>,
     /// Each task's newest turn as last read, so a task is read once per
     /// turn.
     read: Arc<Read>,
+    /// Tasks the check found done since the window last took them.
+    done: Arc<Mutex<Vec<String>>>,
 }
 
 impl Sweep {
     /// Look at the tasks matching `glob` in `store`, if it is time to.
     pub fn look(&mut self, client: &Arc<Client>, store: &Path, glob: &str) {
-        if self.looked.is_some_and(|at| at.elapsed() < OFF_LOOK) {
+        let now = Instant::now();
+        if self.next.is_some_and(|at| now < at) {
             return;
         }
         let Some(after) = after() else {
-            self.looked = Some(Instant::now());
+            self.next = Some(now + OFF_LOOK);
             return;
         };
-        if self.looked.is_some_and(|at| at.elapsed() < every(after))
-            || self.running.swap(true, Ordering::AcqRel)
-        {
+        if self.running.swap(true, Ordering::AcqRel) {
+            self.next = Some(now + OFF_LOOK);
             return;
         }
-        self.looked = Some(Instant::now());
+        self.next = Some(now + every(after));
         let (client, store, glob) = (client.clone(), store.to_owned(), glob.to_owned());
-        let (running, read) = (self.running.clone(), self.read.clone());
+        let (running, read, done) = (self.running.clone(), self.read.clone(), self.done.clone());
         tokio::spawn(async move {
-            sweep(&client, &store, &glob, after, &read).await;
+            sweep(&client, &store, &glob, after, (&read, &done)).await;
             running.store(false, Ordering::Release);
         });
+    }
+
+    /// The tasks the check found done since last asked, for the window to
+    /// resolve as a `mark_done` would.
+    pub fn done(&self) -> Vec<String> {
+        self.done
+            .lock()
+            .map(|mut done| std::mem::take(&mut *done))
+            .unwrap_or_default()
     }
 }
 
 /// Ask each task matching `glob` that sits idle past `after` whether it
 /// is done, one at a time.
-async fn sweep(client: &Client, store: &Path, glob: &str, after: Duration, read: &Read) {
+async fn sweep(
+    client: &Client,
+    store: &Path,
+    glob: &str,
+    after: Duration,
+    (read, done): (&Read, &Mutex<Vec<String>>),
+) {
     let mut listed = Vec::new();
     let mut from: Option<String> = None;
     loop {
@@ -305,7 +322,12 @@ async fn sweep(client: &Client, store: &Path, glob: &str, after: Duration, read:
             Some(seen) if !seen.itself && seen.ask.is_none() => {}
             _ => continue,
         }
-        let _ = ask(client, store, (name, bot_id), turn).await;
+        if let Ok(answer) = ask(client, store, (name, bot_id), turn).await
+            && answer.done
+            && let Ok(mut done) = done.lock()
+        {
+            done.push(name.to_owned());
+        }
     }
     if let Ok(mut read) = read.lock() {
         read.retain(|name, _| names.contains(name));
@@ -458,9 +480,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sonny-sweep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = dir.join("state.sqlite");
-        let read = Mutex::new(HashMap::new());
+        let (read, done) = (Mutex::new(HashMap::new()), Mutex::new(Vec::new()));
         let after = Duration::from_secs(8 * 3600);
-        sweep(&client, &store, "calc.*", after, &read).await;
+        sweep(&client, &store, "calc.*", after, (&read, &done)).await;
         let forks: Vec<Value> = (asked.lock().unwrap().iter())
             .filter(|r| r["op"] == "fork")
             .cloned()
@@ -470,15 +492,18 @@ mod tests {
         assert_eq!(forks[0]["allow"], json!([]));
         assert!(read_answer(&store, "calc.old"));
         assert_eq!(crate::resolved::read(&store, "calc.old"), Some(5));
+        // The window hears of it, to close its window as a mark_done would.
+        assert_eq!(std::mem::take(&mut *done.lock().unwrap()), ["calc.old"]);
         // Asked once: the next sweep reads no turn again and asks no one.
         asked.lock().unwrap().clear();
-        sweep(&client, &store, "calc.*", after, &read).await;
+        sweep(&client, &store, "calc.*", after, (&read, &done)).await;
         let again = asked.lock().unwrap().clone();
         assert!(
             !again
                 .iter()
                 .any(|r| r["op"] == "fork" || r["op"] == "turns")
         );
+        assert!(done.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
