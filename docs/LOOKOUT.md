@@ -93,7 +93,7 @@ turns its own lookout's notes start. Two kinds of event count:
 | Event | When |
 | --- | --- |
 | A message | someone other than the lead writes in a task: the person, a program, another task |
-| A turn's end | a task's turn ends, unless the lead is waiting on it or read it with a wait that returned; a wait that failed or was stopped leaves it news |
+| A turn's end | a task's turn ends, unless the lead is waiting on it or read it with a wait that returned; a wait that failed or was stopped leaves it news. A turn that completed after the task wrote to the lead is no news either: the lead has its words. One that failed or was stopped, or marked the task done, still is |
 
 Both are task updates (below). A note goes with `--delivery steer` once
 its news settles, joining the lead's running turn or starting one; when
