@@ -682,6 +682,33 @@ class TriggerFireTests(ModelFixture):
         finally:
             connection.close()
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_gate_an_agent_wrote_runs_in_its_sandbox(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', '--sandbox', 'read-only', 'hello')
+        connection = Connection(str(self.store) + '.sock')
+        try:
+            connection.request('configure', bot='p.task', settings={'env': {'SONNY_STATE': '/state/p'}})
+        finally:
+            connection.close()
+        bot_id = str(self.bot_id('p.task'))
+        escape = 'test "$SONNY_STATE" = /state/p && ! touch escaped 2> /dev/null'
+        by = lambda id: ['--if', escape, '--if-by', 'p.task', '--if-by-id', id, '--dir', str(self.path)]
+        env = {'AGENT_BIN': str(self.binary)}
+        # The agent's: its variables, and its sandbox, which writes nothing.
+        sent = self.fire('p.task', 'x', extra=by(bot_id), env=env)
+        self.assertEqual((sent['last']['outcome'], sent['checked']['gate']), ('sent', 'go'), sent)
+        self.assertFalse((self.path / 'escaped').exists())
+        self.settle('p.task')
+        # Another agent's identity runs nothing: the check could not run.
+        gone = self.fire('p.task', 'x', extra=by(str(int(bot_id) + 100)), env=env)
+        self.assertEqual(gone['checked']['gate'], 'failed', gone)
+        self.assertIn('125', gone['checked']['detail'])
+        self.assertIn('bot_not_found', gone['checked']['detail'])
+        # The person's runs as the person.
+        no = self.fire('p.task', 'x', extra=['--if', '! touch escaped', '--dir', str(self.path)])
+        self.assertEqual(no['checked']['gate'], 'no', no)
+        self.assertTrue((self.path / 'escaped').exists())
+
     def test_a_gate_that_says_no_costs_no_turn(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         # Its row says when it looked and why it said no, with no result yet.

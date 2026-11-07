@@ -1,5 +1,7 @@
 """The agent command: daemon startup, run/follow/ls, peers, and socket rendezvous."""
 import fcntl
+import shutil
+import sys
 import json
 import re
 import concurrent.futures
@@ -1037,6 +1039,37 @@ class SocketAndCliTests(ModelFixture):
         # The daemon's own names stay its own.
         refused = control.request('configure', bot='Bob', settings={'env': {'AGENT_BOT': 'x'}})
         self.assertEqual(refused['error'], 'invalid_setting')
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_command_run_as_a_bot_has_its_sandbox_socket_and_variables(self):
+        self.agent('run', *self.common, '--new', '--bot', 'Reader', '--sandbox', 'read-only', 'hello')
+        self.agent('run', *self.common, '--new', '--bot', 'Free', 'hello')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        control.request('configure', bot='Reader', settings={'env': {'SONNY_STATE': '/state/Reader'}})
+        reader = control.request('inspect', bot='Reader')['result']
+        store = ['--store', str(self.store)]
+        check = ('printf "%s %s %s\n" "$SONNY_STATE" "$AGENT_BOT" "$AGENT_BOT_ID"; '
+                 '"$AGENT_BIN" ls > /dev/null && echo reached; '
+                 'touch written 2> /dev/null || echo confined; '
+                 '"$AGENT_BIN" sandbox --bot Reader -- true 2> /dev/null; echo "nested $?"; exit 3')
+        ran = self.agent('sandbox', *store, '--bot', 'Reader', '--bot-id', str(reader['bot_id']),
+                         '--', '/bin/sh', '-c', check, check=False)
+        # The command's own status, and what it saw: the bot's variables,
+        # the daemon through the bot's own socket, which lends nothing.
+        self.assertEqual(ran.returncode, 3, ran.stderr)
+        self.assertEqual(ran.stdout.split('\n')[:4],
+                         [f'/state/Reader Reader {reader["bot_id"]}', 'reached', 'confined', 'nested 125'])
+        self.assertFalse((self.path / 'written').exists())
+        # A bot whose commands run unconfined runs this one so too.
+        self.agent('sandbox', *store, '--bot', 'Free', '--', '/bin/sh', '-c', 'touch written')
+        self.assertTrue((self.path / 'written').exists())
+        # Another identity, or a bot that is not there, runs nothing.
+        for flags in (('--bot', 'Reader', '--bot-id', str(reader['bot_id'] + 100)), ('--bot', 'Nobody')):
+            refused = self.agent('sandbox', *store, *flags, '--', 'touch', 'refused', check=False)
+            self.assertEqual((refused.returncode, json.loads(refused.stderr)['error']),
+                             (125, 'bot_not_found'))
+        self.assertFalse((self.path / 'refused').exists())
 
     def test_creator_identity_is_required_and_survives_daemon_restart(self):
         self.agent('run', *self.common, '--new', '--bot', 'Creator',

@@ -413,6 +413,10 @@ pub struct Trigger {
     pub reply_to: Option<(String, i64)>,
     /// `sh -c` this first; anything but exit 0 skips the fire.
     pub gate: Option<String>,
+    /// The agent that wrote `gate`, pinned by id: the gate runs in that
+    /// agent's sandbox, as its own commands do. None runs it as the person,
+    /// who added it, or Sonny, which did.
+    pub gate_by: Option<(String, i64)>,
     /// Ends once this many messages went out.
     pub runs: Option<u64>,
     /// The most tokens each fire's turn may spend.
@@ -498,6 +502,10 @@ impl Trigger {
         if let Some(gate) = &self.gate {
             pair("--if", gate.clone());
         }
+        if let Some((by, id)) = &self.gate_by {
+            pair("--if-by", by.clone());
+            pair("--if-by-id", id.to_string());
+        }
         if let Some(runs) = self.runs {
             pair("--runs", runs.to_string());
         }
@@ -539,7 +547,7 @@ impl Trigger {
             let value = iter
                 .next()
                 .ok_or_else(|| bad(&format!("{flag} needs a value")))?;
-            const FLAGS: [&str; 25] = [
+            const FLAGS: [&str; 27] = [
                 "--name",
                 "--generation",
                 "--bot",
@@ -558,6 +566,8 @@ impl Trigger {
                 "--reply-to",
                 "--reply-to-id",
                 "--if",
+                "--if-by",
+                "--if-by-id",
                 "--runs",
                 "--turn-budget-tokens",
                 "--budget-counts",
@@ -616,6 +626,7 @@ impl Trigger {
             dir: text("--dir").map(PathBuf::from),
             reply_to: pinned("--reply-to", "--reply-to-id")?,
             gate: text("--if"),
+            gate_by: pinned("--if-by", "--if-by-id")?,
             runs: number("--runs")?.map(|n| n.max(1) as u64),
             turn_budget_tokens: number("--turn-budget-tokens")?.map(|n| n.max(1) as u64),
             budget_counts: text("--budget-counts"),
@@ -673,7 +684,10 @@ impl Trigger {
             (target, mine && self.target == other.target),
             ("message", self.message == other.message),
             ("reply_to", self.reply_to == other.reply_to),
-            ("if", self.gate == other.gate),
+            (
+                "if",
+                (&self.gate, &self.gate_by) == (&other.gate, &other.gate_by),
+            ),
             ("runs", self.runs == other.runs),
             (
                 "turn_budget_tokens",
@@ -1440,6 +1454,20 @@ fn read_all(places: &Places) -> impl Iterator<Item = (String, Read)> {
             valid_name(&name).ok()?;
             Some((name, read_trigger(&e.path())))
         })
+}
+
+/// Whether every automation's `if` says whose it is, but Sonny's own (the
+/// memory cleanup's, an ask's deadline's), which run as the person: one
+/// added before gates named their agent runs as the person until it is
+/// added again (upgrade step `agent-gates`).
+pub fn no_gate_unowned() -> bool {
+    let Ok(places) = Places::home() else {
+        return true;
+    };
+    triggers(&places).iter().all(|(trigger, _)| {
+        let sonnys = |gate: &str| trigger.name == "memory-cleanup" || gate.contains(" ask open ");
+        trigger.gate_by.is_some() || trigger.gate.as_deref().is_none_or(sonnys)
+    })
 }
 
 fn triggers(places: &Places) -> Vec<(Trigger, PathBuf)> {
@@ -3542,7 +3570,20 @@ async fn bot_id(client: &Client, name: &str) -> Result<i64, String> {
         .ok_or_else(|| "the daemon named no bot id".into())
 }
 
+/// An automation Sonny adds for an agent with a gate Sonny wrote, as an
+/// ask's deadline is: its gate runs as Sonny's own, not in the agent's
+/// sandbox, since the agent wrote none of it.
+pub fn add_sonnys(asked: &Value) -> Result<Value, String> {
+    add_as(&Places::home()?, &add_args(asked), false)
+}
+
 fn add(places: &Places, args: &[String]) -> Result<Value, String> {
+    add_as(places, args, true)
+}
+
+/// [`add`]; `agents_gate` says whether a gate the shell's agent gives is
+/// that agent's, to run in its sandbox.
+fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, String> {
     let asked = parse_add(args, now())?;
     let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
     // The shell's own agent, when it is an agent's shell.
@@ -3554,6 +3595,11 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         )),
         _ => None,
     };
+    // A gate an agent wrote runs in its sandbox, as Codex runs what an
+    // agent wrote: one the person wrote runs as they do.
+    let gate_by = shell
+        .clone()
+        .filter(|_| agents_gate && asked.gate.is_some());
     let daemon = Daemon::current()?;
     if let Some(watch) = &asked.when.watch {
         // A watched file could be the store, which every send writes: one
@@ -3680,6 +3726,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
             .map_err(|e| e.to_string())?,
         reply_to,
         gate: asked.gate,
+        gate_by,
         runs: asked.runs,
         turn_budget_tokens: asked.turn_budget_tokens,
         budget_counts: asked.budget_counts,
@@ -3837,9 +3884,32 @@ const GATE_SAID: usize = 300;
 /// exit 0 says go, exit 1 says no (and why not), and anything else (a
 /// command not found, a crash, a signal, running past its time) says it
 /// could not check, which is the fire failing, not a no, with the end of
-/// what it wrote to stderr.
-fn gate(command: &str, dir: Option<&Path>, daemon: &Daemon) -> Result<Result<(), String>, String> {
-    let mut sh = std::process::Command::new("/bin/sh");
+/// what it wrote to stderr. One an agent wrote runs as that agent's own
+/// commands do (`agent sandbox --bot`): in its sandbox, with its variables,
+/// reaching the daemon through its own socket; that agent gone, it does
+/// not run.
+fn gate(
+    command: &str,
+    by: Option<&(String, i64)>,
+    dir: Option<&Path>,
+    daemon: &Daemon,
+) -> Result<Result<(), String>, String> {
+    let mut sh = match by {
+        None => std::process::Command::new("/bin/sh"),
+        Some((bot, id)) => {
+            let agent = crate::agent_bin()
+                .ok_or("--if: no agent command to run its agent's sandbox with")?;
+            let mut sh = std::process::Command::new(agent);
+            sh.args(["sandbox", "--bot", bot, "--bot-id", &id.to_string()]);
+            for (flag, value) in [("--store", &daemon.store), ("--socket", &daemon.socket)] {
+                if let Some(value) = value {
+                    sh.arg(flag).arg(value);
+                }
+            }
+            sh.args(["--", "/bin/sh"]);
+            sh
+        }
+    };
     for (key, value) in [
         ("AGENT_SOCKET", &daemon.socket),
         ("AGENT_STORE", &daemon.store),
@@ -5422,10 +5492,10 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     if trigger.gate.is_some() {
         until_resumed(trigger);
     }
-    let said = trigger
-        .gate
-        .as_deref()
-        .map(|c| gate(c, trigger.dir.as_deref(), &trigger.daemon));
+    let said = trigger.gate.as_deref().map(|c| {
+        let by = trigger.gate_by.as_ref();
+        gate(c, by, trigger.dir.as_deref(), &trigger.daemon)
+    });
     // A check that broke is told once, and that it works again once: an
     // `--if` that fails every minute is one note, not one a minute.
     let news = said
@@ -6124,6 +6194,7 @@ pub(crate) mod tests {
             dir: None,
             reply_to: None,
             gate: None,
+            gate_by: None,
             runs: None,
             turn_budget_tokens: None,
             budget_counts: None,
@@ -6245,10 +6316,17 @@ pub(crate) mod tests {
             dir: Some("/r/sub dir".into()),
             reply_to: Some(("p.lead".into(), 7)),
             gate: Some("test -n \"$(git status --porcelain)\" -- x".into()),
+            gate_by: Some(("p.lead".into(), 7)),
             runs: Some(3),
             turn_budget_tokens: Some(50_000),
             ..s.clone()
         };
+        // The same gate written by another is another gate.
+        let by_person = Trigger {
+            gate_by: None,
+            ..full.clone()
+        };
+        assert_eq!(by_person.differs(&full), Some("if"));
         let watching = When {
             watch: Some("/r/50% done/.git/logs/HEAD".into()),
             ..fired()
@@ -7810,7 +7888,7 @@ pub(crate) mod tests {
             store: None,
             socket: None,
         };
-        let gate = |command: &str, dir: Option<&Path>| super::gate(command, dir, &none);
+        let gate = |command: &str, dir: Option<&Path>| super::gate(command, None, dir, &none);
         assert_eq!(gate("true", None), Ok(Ok(())));
         // It asks its trigger's daemon.
         let daemon = Daemon {
@@ -7818,7 +7896,7 @@ pub(crate) mod tests {
             socket: None,
         };
         let on = "test \"$AGENT_STORE\" = /s/state.sqlite && test -z \"$AGENT_SOCKET\"";
-        assert_eq!(super::gate(on, None, &daemon), Ok(Ok(())));
+        assert_eq!(super::gate(on, None, None, &daemon), Ok(Ok(())));
         assert_eq!(gate("exit 1", None), Ok(Err("--if: exit status: 1".into())));
         assert_eq!(gate("false", None), Ok(Err("--if: exit status: 1".into())));
         // Any other end is no answer, not a no: a status past 1, a command

@@ -283,6 +283,16 @@ enum Command {
         #[serde(default)]
         starts_line: bool,
     },
+    /// A bot's record, as `inspect` gives it, and the path of its own
+    /// socket, which listens while this session lasts: so a client can run
+    /// a command as one of that bot's, in its sandbox and reaching the
+    /// daemon only as that bot may, such as an automation's check the bot
+    /// wrote. Only a session outside every sandbox may ask.
+    Lend {
+        bot: String,
+        /// The identity `bot` must hold; another is `bot_not_found`.
+        bot_id: Option<i64>,
+    },
     /// A bot's whole record: what `bots` lists plus its instructions and
     /// settings. A read; nothing about the bot changes.
     Inspect {
@@ -1204,6 +1214,9 @@ struct Service {
     identity: u128,
     /// Open client sessions, kept by the run loop for `stats`.
     sessions: usize,
+    /// The bots' own sockets each session was lent, by bot, which listen
+    /// until it closes.
+    lent: HashMap<u64, HashMap<i64, agent_runtime::sandbox::Listening>>,
     limit_active: usize,
     /// Per bot: the live turn. A parked turn's task ends while a resumed
     /// task may already own the slot.
@@ -1803,6 +1816,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut service = Service {
         store,
         stepping: HashMap::new(),
+        lent: HashMap::new(),
         step_checks: JoinSet::new(),
         companions,
         identity,
@@ -1996,6 +2010,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                         Inbound::Closed(id) => {
                             sessions.remove(&id);
                             callers.remove(&id);
+                            service.lent.remove(&id);
                             companion_sessions.remove(&id);
                             service.sessions = sessions.len();
                             service.hub.close_session(id);
@@ -2257,6 +2272,8 @@ impl Service {
             Command::ApproveStep { .. } => return refuse("put a declared call's step to a gate"),
             Command::StepResult { .. } => return refuse("record a declared call's step"),
             Command::Shutdown { .. } => return refuse("stop the daemon"),
+            // Its own is the one it has; another bot's would answer as it.
+            Command::Lend { .. } => return refuse("borrow a bot's socket"),
             // Any agent may pull the cord; letting the line go on is the
             // person's, from outside any sandbox.
             Command::Resume { .. } => return refuse("resume a pause"),
@@ -3878,6 +3895,29 @@ impl Service {
                         fields.remove("duplicate");
                     }
                     self.hub.live(&bot, event).await?;
+                }
+                Ok(answer)
+            }
+            Command::Lend { bot, bot_id } => {
+                let record = store
+                    .op("inspect", move |db| {
+                        if bot_id.is_some() {
+                            db.identity(&bot, bot_id)?;
+                        }
+                        db.inspect(&bot)
+                    })
+                    .await?;
+                let mut answer = serde_json::to_value(&record)?;
+                // Opening it may bind a socket: off the runtime thread, as
+                // a bot's own command opens it. The session holds one share
+                // per bot, however often it asks.
+                let (daemon, id) = (self.registry.daemon().clone(), record.bot_id);
+                let opened = tokio::task::spawn_blocking(move || daemon.capability(id))
+                    .await
+                    .map_err(|_| Error::new("socket_bind_failed"))??;
+                answer["socket"] = json!(opened.as_ref().map(|(path, _)| path));
+                if let Some((_, listening)) = opened {
+                    self.lent.entry(session).or_default().insert(id, listening);
                 }
                 Ok(answer)
             }
@@ -5645,6 +5685,7 @@ mod tests {
         let mut service = Service {
             store: store.clone(),
             stepping: HashMap::new(),
+            lent: HashMap::new(),
             step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
@@ -5856,6 +5897,7 @@ mod tests {
         let mut service = Service {
             store: store.clone(),
             stepping: HashMap::new(),
+            lent: HashMap::new(),
             step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
@@ -6079,6 +6121,7 @@ mod tests {
             identity: 0,
             store: store.clone(),
             stepping: HashMap::new(),
+            lent: HashMap::new(),
             step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
@@ -6329,6 +6372,7 @@ mod tests {
             identity: 0,
             store: store.clone(),
             stepping: HashMap::new(),
+            lent: HashMap::new(),
             step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),

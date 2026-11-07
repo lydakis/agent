@@ -218,9 +218,9 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "sandbox",
-        about: "Run a command in a sandbox: read-only, or writing only the folders named",
-        usage: "sandbox [--writable PATH]... -- COMMAND [ARGS...]",
-        flags: "--writable",
+        about: "Run a command in a sandbox: read-only, writing only the folders named, or as one of a bot's commands",
+        usage: "sandbox [--writable PATH]... [--bot NAME [--bot-id ID]] -- COMMAND [ARGS...]",
+        flags: "--writable --bot --bot-id",
         settings: "",
         startup: false,
     },
@@ -951,7 +951,14 @@ mod tests {
         );
         assert!(prepare(words(&["sandbox", "--writable", "/a"])).is_err());
         assert!(prepare(words(&["sandbox", "--"])).is_err());
-        assert!(prepare(words(&["sandbox", "--bot", "x", "--", "ls"])).is_err());
+        assert!(prepare(words(&["sandbox", "--bot", "x", "--", "ls"])).is_ok());
+        assert!(
+            prepare(words(&[
+                "sandbox", "--bot", "x", "--bot-id", "3", "--", "ls"
+            ]))
+            .is_ok()
+        );
+        assert!(prepare(words(&["sandbox", "--model", "m", "--", "ls"])).is_err());
         // With the network off, it reaches no socket, the daemon's least.
         assert!(prepare(words(&["sandbox", "--network", "--", "ls"])).is_err());
     }

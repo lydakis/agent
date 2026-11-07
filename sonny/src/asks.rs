@@ -957,8 +957,8 @@ fn set_deadline(
         "if": gate,
         "message": fire(&ask.question, plan, label),
     }});
-    // An add looks at no one's automations.
-    crate::trigger::tool(&add, &crate::trigger::Caller::default()).map(|_| ())
+    // Sonny wrote its gate: it runs as Sonny's own.
+    crate::trigger::add_sonnys(&add).map(|_| ())
 }
 
 /// The whole minute `minutes` from `now`, never before it, as a one-off

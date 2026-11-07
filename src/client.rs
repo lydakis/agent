@@ -953,6 +953,35 @@ fn older_daemon(error: &Error) -> Option<i32> {
         .filter(|pid| *pid > 1)
 }
 
+/// The daemon's lend of a bot's own socket, for `agent sandbox --bot`: the
+/// bot's record with the socket's path, and the connection whose life the
+/// socket listens for.
+pub struct Lent {
+    pub record: Value,
+    /// The daemon's socket and store.
+    pub socket: PathBuf,
+    pub store: PathBuf,
+    _connection: Connection,
+}
+
+/// Ask the daemon `flags` name (`--store`, `--socket`, else as any command
+/// finds it) to lend bot `bot`'s own socket, starting it as a command on a
+/// bot does.
+pub fn lend(flags: &[String], bot: &str, bot_id: Option<i64>) -> Result<Lent> {
+    let args: Vec<String> = std::iter::once("sandbox".to_owned())
+        .chain(flags.iter().cloned())
+        .collect();
+    let options = parse(&args)?;
+    let mut connection = ensure_daemon(&options)?;
+    let record = connection.request("lend", json!({"bot": bot, "bot_id": bot_id}))?;
+    Ok(Lent {
+        record,
+        socket: std::path::absolute(&options.socket)?,
+        store: std::path::absolute(&options.store)?,
+        _connection: connection,
+    })
+}
+
 fn connect_or_start(options: &Options) -> Result<Connection> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let connect = || match Connection::connect_until(&options.socket, deadline) {

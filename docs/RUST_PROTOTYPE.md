@@ -2848,6 +2848,26 @@ programs its config names (an fsmonitor, a filter) even to list its files,
 so a repository an agent made would run what it left there as the person.
 Sonny runs its own git in such places this way (#597).
 
+`agent sandbox --bot NAME [--bot-id ID] -- COMMAND [ARGS...]` runs one
+command as one of that bot's own commands runs, for a client running a
+command a bot wrote outside its turns, as Codex runs whatever an agent wrote
+in its sandbox: Sonny's automation gates (`--if`) that an agent added.
+One `lend` request (protocol 54), `{"op":"lend","bot":NAME,"bot_id":ID?}`,
+answers the bot's record, as `inspect` does, with `socket`: the path of the
+bot's own capped socket, which listens while the session that asked lasts,
+or null for a bot with no sandbox. The command then runs in the bot's
+sandbox (its mode, workspace, `writable`, `network`, `unix_sockets`), with
+its `env` setting, `AGENT_BOT`, `AGENT_BOT_ID`, `AGENT_BIN`, `AGENT_STORE`,
+and `AGENT_SOCKET` reaching the daemon through that socket, as its turns'
+commands do; a bot whose commands run unconfined runs this one unconfined.
+Only a session outside every sandbox may lend (`not_permitted`), so a
+confined command cannot reach another bot's socket; `bot_id` that is not
+the bot's is `bot_not_found`. The lend costs one round trip and, for a bot
+whose socket was not listening, one bind, kept once per session however
+often it asks. `agent sandbox` exits as its command does, or 125 when it
+could not run it (a usage error, no sandbox here, the bot not found), as
+`env` and `timeout` do, with the error on stderr.
+
 ### Command rules
 
 Command rules are Codex's execpolicy: `prefix_rule`s that say which

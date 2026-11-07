@@ -7566,3 +7566,30 @@ reads no state folder or setting); the rest stay within 6%.
 | lifecycle | CPU, s | 0.43 | 0.425 | -1.2% |
 | lifecycle | p95 turn, ms | 666.913 | 723.258 | +8.4% |
 | lifecycle | peak RSS, MiB | 22.945 | 23.43 | +2.1% |
+
+## An automation gate in its agent's sandbox (#PR)
+
+An `--if` an agent added runs through `agent sandbox --bot`: one `agent`
+process, one `lend` round trip, and, for a confined agent, the sandbox
+launch its own commands pay. Nothing changes on the daemon's turn path: the
+service holds one more map, of the shares sessions borrowed, empty unless a
+gate runs, and drops a session's entry when it closes. `lend` binds a bot's
+socket only when it was not listening, and keeps one share per bot per
+session however often it asks. A gate the person or Sonny added runs as
+before.
+
+Mean wall time of a gate of `sh -c true`, 50 runs each, release build on a
+4-core Linux cloud container (three runs: 1.2 to 1.6 ms for the person's,
+so the spread is about ±0.4 ms):
+
+| Gate | Mean, ms |
+| --- | ---: |
+| The person's: `/bin/sh -c true` | 1.4 |
+| An unconfined agent's: `agent sandbox --bot` | 4.3 |
+| A read-only agent's: `agent sandbox --bot` (bubblewrap) | 12.0 |
+| `agent sandbox` with no bot or daemon (bubblewrap) | 10.8 |
+
+So the lend costs about 1.5 ms over the sandbox's own launch, and a
+confined agent's gate about 11 ms over the person's, paid once per check:
+a gate that says no still costs no model call. A gate checks at most
+once a minute.

@@ -115,9 +115,9 @@ the lead as the destination and, when the person wants one, a destination
 for urgent items, such as a direct message to the person.
 
 Run it often and gate each run: `add` with `bot` NAME, `every` `10m`,
-`if` `cd FOLDER && ! ./quiet` and `message` MESSAGE. The `if` command runs
-in your own folder, hence the `cd`, and without `SONNY_STATE`, so FOLDER
-is the job folder's whole path.
+`if` `cd "$SONNY_STATE"/jobs/NAME && ! ./quiet` and `message` MESSAGE. The
+`if` command runs in your own folder, hence the `cd`, and as your own
+commands do: in your sandbox, with your variables.
 
 `every` runs at all hours. To check only in working hours, use `cron`
 instead, for example `*/10 8-18 * * 1-5` for every 10 minutes from 8:00 to

@@ -61,6 +61,14 @@ pub const STEPS: &[Step] = &[
         done: judge_env_done,
         retire: "0.11.0",
     },
+    // An automation's `if` an agent added runs in its sandbox; one added
+    // before runs as the person until added again (0.9.0).
+    Step {
+        id: "agent-gates",
+        text: include_str!("../upgrades/agent-gates.md"),
+        done: crate::trigger::no_gate_unowned,
+        retire: "0.11.0",
+    },
 ];
 
 /// Whether `~/.agent/env` sets no `AGENT_JUDGE`, the reviewer's model
