@@ -103,6 +103,7 @@ mod upgrade;
 mod usage;
 mod used;
 mod user_shell;
+mod waiting;
 mod zen;
 
 use agent_client::{Client, Events};
@@ -2575,6 +2576,46 @@ fn denial(item: &Value) -> Option<String> {
         .then(|| output["detail"].as_str().unwrap_or("").to_owned())
 }
 
+/// This window's agent's mark of what its reply left waiting on the
+/// person: when its file last changed, the mark then, and the newest turn
+/// this window saw start, which a mark for an older one does not cover.
+#[derive(Default)]
+struct Waiting {
+    /// The mark's file, found once.
+    file: Option<PathBuf>,
+    read: Option<std::time::SystemTime>,
+    mark: Option<waiting::Mark>,
+    newest: i64,
+}
+
+impl Waiting {
+    /// Read the mark again once its file changed.
+    fn read(&mut self) {
+        let Some(file) = &self.file else {
+            return;
+        };
+        let changed = std::fs::metadata(file).and_then(|m| m.modified()).ok();
+        if changed != self.read {
+            self.read = changed;
+            self.mark = waiting::read_file(file);
+        }
+    }
+
+    /// Whether the agent waits on the person for what its reply left:
+    /// marked for the newest turn this window saw, none running.
+    fn holds(&self, running: bool) -> bool {
+        !running
+            && self
+                .mark
+                .as_ref()
+                .is_some_and(|mark| mark.turn >= self.newest)
+    }
+
+    fn started(&mut self, turn: i64) {
+        self.newest = self.newest.max(turn);
+    }
+}
+
 struct Running {
     turn: i64,
     started: Instant,
@@ -2871,6 +2912,9 @@ struct App {
     /// calls not yet answered, nor set aside, and its tasks' open ones,
     /// pinned here as they come ([`App::pin_task_asks`]).
     asks: Vec<asks::Ask>,
+    /// What this agent's last reply left waiting on the person, as the
+    /// lookout's check marked it ([`waiting`]).
+    waiting: Waiting,
     /// Which of them what is typed answers, by id, so it stays on that
     /// question as others close or the conversation is drawn again; the
     /// oldest when none was picked or the one picked is gone.
@@ -3348,6 +3392,13 @@ struct Fleet {
     resolving: resolved::Own,
     /// `[sonny] task_windows` and `task_tabs`, read as the file changes.
     windows: Arc<std::sync::Mutex<TaskWindows>>,
+    /// What the lookout's checks marked waiting on the person, by agent,
+    /// as the folder of marks last read: when that folder last changed,
+    /// and when each agent's mark did.
+    marks: (
+        Option<std::time::SystemTime>,
+        HashMap<String, Option<std::time::SystemTime>>,
+    ),
 }
 
 /// `[sonny] task_windows` and `task_tabs` as the config file last said
@@ -3741,6 +3792,7 @@ impl Fleet {
             returned: Vec::new(),
             resolving: Default::default(),
             windows: Default::default(),
+            marks: Default::default(),
         };
         let own = lead.to_owned();
         fleet.layout.send(move |layout| layout.adopt_own(&own));
@@ -3786,6 +3838,7 @@ impl Fleet {
             returned: Vec::new(),
             resolving: Default::default(),
             windows: Default::default(),
+            marks: Default::default(),
         }
     }
 
@@ -3909,10 +3962,51 @@ impl Fleet {
         }
     }
 
+    /// Read again the agents whose mark of what their reply left waiting on
+    /// the person the lookout set or took away since the folder of marks
+    /// was last read ([`waiting`]), and show what they wait on.
+    async fn rescan_marks(&mut self) {
+        let dir = waiting::dir(&self.store);
+        let changed = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+        if changed == self.marks.0 {
+            return;
+        }
+        self.marks.0 = changed;
+        let mut now = HashMap::new();
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(bot) = name.strip_suffix(".json")
+                && self.lineage.contains(bot)
+            {
+                let at = entry.metadata().and_then(|m| m.modified()).ok();
+                now.insert(bot.to_owned(), at);
+            }
+        }
+        let had = std::mem::replace(&mut self.marks.1, now);
+        let mut moved: Vec<String> = (self.marks.1.iter())
+            .filter(|(bot, at)| had.get(*bot) != Some(at))
+            .map(|(bot, _)| bot.clone())
+            .collect();
+        moved.extend(
+            had.into_keys()
+                .filter(|bot| !self.marks.1.contains_key(bot)),
+        );
+        for bot in moved {
+            let Some(seen) = needs::scan(&self.client, &bot, None).await else {
+                continue;
+            };
+            let ask = self.open_ask(&bot, seen);
+            self.needs.asked(&bot, ask);
+            let waits = self.needs.waits(&bot);
+            self.settle(&bot, waits);
+        }
+    }
+
     /// Read again the questions of the agents whose turn ended unsure of
     /// them, and show what they wait on; then those of one agent not read
     /// since the last reconcile.
     async fn rescan(&mut self) {
+        self.rescan_marks().await;
         for (bot, turn) in self.needs.due() {
             let Some(seen) = needs::scan(&self.client, &bot, turn).await else {
                 continue;
@@ -4433,6 +4527,10 @@ impl App {
             calls: HashMap::new(),
             approvals: Vec::new(),
             asks: Vec::new(),
+            waiting: Waiting {
+                newest: record["running_turn"].as_i64().unwrap_or(0),
+                ..Waiting::default()
+            },
             focus: None,
             aside: Vec::new(),
             commands: HashMap::new(),
@@ -4849,6 +4947,11 @@ impl App {
             if let Some(fleet) = &mut self.fleet {
                 fleet.rescan().await;
             }
+            if self.waiting.file.is_none() {
+                self.waiting.file =
+                    Some(waiting::dir(&self.store()).join(format!("{}.json", self.bot)));
+            }
+            self.waiting.read();
             self.pin_task_asks();
             self.recheck_task_answers().await;
             self.read_running_tasks().await;
@@ -5610,6 +5713,7 @@ impl App {
             if self.running.is_none()
                 && let Some(turn) = now
             {
+                self.waiting.started(turn);
                 self.running = Some(Running {
                     turn,
                     started: Instant::now(),
@@ -7885,6 +7989,7 @@ impl App {
                 self.said.clear();
                 self.thought.clear();
                 self.replay = None;
+                self.waiting.started(turn.unwrap_or(0));
                 self.running = Some(Running {
                     turn: turn.unwrap_or(0),
                     started: Instant::now(),
@@ -12810,7 +12915,9 @@ impl App {
         // multiplexer, as the person still has it to answer.
         used::asking(&self.bot, !self.asks.is_empty());
         // Its tasks' questions are theirs: the multiplexer says so of them.
-        let own = self.asks.iter().any(|ask| ask.task.is_none());
+        // What its last reply left waiting on the person counts as its own.
+        let own = self.asks.iter().any(|ask| ask.task.is_none())
+            || self.waiting.holds(self.running.is_some());
         status_asking(&self.bot, own);
         self.show_asked();
         self.margin_back();
@@ -20227,6 +20334,58 @@ mod tests {
         let fleet = app.fleet.as_ref().unwrap();
         assert_eq!(fleet.doing["calc.ask"], "idle");
         assert_eq!(fleet.doing["calc.new"], "needs you");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A reply that left the person something to give, as the lookout's
+    /// check marked it after the turn ended, needs them once the mark
+    /// lands, and no longer once it goes.
+    #[tokio::test]
+    async fn a_reply_marked_waiting_on_you_needs_you_until_the_mark_goes() {
+        let (client, events) = daemon_with_events(json!({}), |asked| {
+            match asked["op"].as_str().unwrap_or("") {
+                "bots" => json!({"bots": [
+                    {"name": "calc.lead", "bot_id": 1, "head": 1},
+                    {"name": "calc.plan", "bot_id": 2, "created_by": "calc.lead", "head": 5},
+                ]}),
+                "approvals" => json!({"approvals": []}),
+                "history_nodes" if asked["bot"] == "calc.plan" => {
+                    json!({"nodes": [{"node": 5, "turn": 3}]})
+                }
+                "history_nodes" => json!({"nodes": []}),
+                "history_items" => json!({"items": [{"node": 5, "item": {
+                    "type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Deploy to staging or prod?"}]}}]}),
+                "turns" => json!({"turns": [{"turn": 3, "status": "completed"}]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
+        let dir = std::env::temp_dir().join(unique("sonny-waiting-needs"));
+        fleet.store = dir.join("store");
+        fleet.reconcile().await;
+        while !fleet.unread.is_empty() {
+            fleet.rescan().await;
+        }
+        assert_eq!(fleet.doing["calc.plan"], "idle");
+        let mark = waiting::Mark {
+            turn: 3,
+            waiting_for: "staging or prod".into(),
+        };
+        waiting::keep(&fleet.store, "calc.plan", 3, Some(&mark)).unwrap();
+        fleet.rescan().await;
+        assert_eq!(fleet.doing["calc.plan"], "needs you");
+        let asked: Vec<_> = fleet
+            .needs
+            .asks()
+            .map(|(bot, ask)| (bot, ask.question.as_str()))
+            .collect();
+        assert_eq!(asked, [("calc.plan", "staging or prod")]);
+        // Its next turn's check found nothing waiting.
+        waiting::keep(&fleet.store, "calc.plan", 4, None).unwrap();
+        fleet.rescan().await;
+        assert_eq!(fleet.doing["calc.plan"], "idle");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

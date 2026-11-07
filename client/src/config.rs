@@ -48,6 +48,7 @@
 //! margin_note_lines = 20         # the most lines a note's Markdown runs to, 12 by default; past it the note is refused
 //! agent_opens = "beside"        # a click on an agent's name: "tab", the default, or "beside"
 //! suggest = false               # no guess at the next message, on by default
+//! needs_check = false           # no copy says whether a reply waits on you, on by default
 //! commons = false               # agents go without the commons, on by default
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
@@ -468,6 +469,9 @@ pub struct Sonny {
     /// Whether a copy of the agent guesses the person's next message after
     /// a turn they started, shown in the empty composer for Tab to take.
     pub suggest: bool,
+    /// Whether, once an agent's turn ends with words and no question open,
+    /// a copy of it says whether they wait on the person.
+    pub needs_check: bool,
     /// Whether the daemon starts when the machine does, for a box whose
     /// agents keep working after a restart. Sonny keeps the job.
     pub start_at_boot: bool,
@@ -612,6 +616,7 @@ impl Default for Sonny {
             mcp_servers: BTreeMap::new(),
             side_chat: SideChat::default(),
             suggest: true,
+            needs_check: true,
             commons: true,
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
@@ -1244,6 +1249,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "margin_note_lines",
                 "agent_opens",
                 "suggest",
+                "needs_check",
                 "start_at_boot",
                 "commons",
                 "commons_invites",
@@ -1325,6 +1331,7 @@ fn parse(text: &str) -> Result<Config, String> {
             if let Some(switch) = match key.as_str() {
                 "chime" => Some(&mut config.sonny.chime),
                 "suggest" => Some(&mut config.sonny.suggest),
+                "needs_check" => Some(&mut config.sonny.needs_check),
                 "commons" => Some(&mut config.sonny.commons),
                 "verbose" => Some(&mut config.sonny.verbose),
                 "start_at_boot" => Some(&mut config.sonny.start_at_boot),

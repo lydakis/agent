@@ -1513,7 +1513,14 @@ opens `/status`. Every surface reads what needs you one way: an agent
 needs you while a call of its waits on your approval (gated for you, or
 handed to you by the approver) or a question it asked you is still open,
 read from the daemon whole when Sonny starts or reconnects, so a restart
-loses neither, and kept current by its events after. The footer, the task
+loses neither, and kept current by its events after. A question left in a
+reply's words counts too: once an agent's turn ends with words and no
+question asked, the lookout has a copy of it, with no tools, say at once
+whether they wait on you and what for (one small call, its history read
+from the provider's cache of the turn just ended). A yes is kept beside
+the store (`STORE.waiting/AGENT.json`) until the agent's next turn; its
+lead's window pins it as the task's question, where what you type goes to
+the task. `[sonny] needs_check = false` turns the check off. The footer, the task
 tabs' names, `/status`, the started roster and `/sky` agree; and next to the model the agent's profile when it runs one
 that isn't its seat's own (`lead` for a lead, `task` for a task). The left
 of the footer says what you talk to and where (the permissions mark, the
