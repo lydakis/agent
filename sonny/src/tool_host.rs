@@ -1,5 +1,5 @@
 //! `sonny tool-host`: the daemon's companion that answers the tools Sonny
-//! gives its agents (`served`): starting tasks, memory, goals, the commons,
+//! gives its agents (`served`): starting tasks, memory, the commons,
 //! and `exec`, whose MCP servers it keeps up between calls. One a store,
 //! apart from the lookout, which only watches and tells: a tool that runs
 //! long, crashes or grows does so here, never in the news a lead hears.

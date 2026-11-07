@@ -163,6 +163,11 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::config::DEPTH,
         retire: "0.11.0",
     },
+    // Goals are gone: the lookout's goals folder goes (0.9.0).
+    Migration {
+        id: crate::lookout::subs::GOALS_GONE,
+        retire: "0.11.0",
+    },
 ];
 
 /// `run` once for each `record`: a file of the ids done, a line each,
