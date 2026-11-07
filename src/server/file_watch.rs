@@ -92,7 +92,8 @@ mod imp {
         }
         // SAFETY: the OwnedFd is open, and it keeps the one descriptor
         // until the AsyncFd that owns it drops.
-        let fd = unsafe { AsyncFd::register(fd) }.map_err(std::io::Error::from)?;
+        let fd = unsafe { AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE) }
+            .map_err(std::io::Error::from)?;
         tokio::spawn(async move {
             let mut buffer = vec![0u8; 4096];
             loop {
@@ -281,8 +282,11 @@ mod imp {
             register(&queue, file, FILE)?;
         }
         // SAFETY: the OwnedFd is open, and it keeps the one descriptor
-        // until the AsyncFd that owns it drops.
-        let queue = unsafe { AsyncFd::register(queue) }.map_err(std::io::Error::from)?;
+        // until the AsyncFd that owns it drops. Readable only: a kqueue
+        // has no write side, and asking for one fails the registration.
+        let queue =
+            unsafe { AsyncFd::register_with_interest(queue, tokio::io::Interest::READABLE) }
+                .map_err(std::io::Error::from)?;
         tokio::spawn(async move {
             let _folder = folder;
             loop {
