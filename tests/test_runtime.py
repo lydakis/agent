@@ -673,7 +673,8 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 return
             if not own:
-                assert 'tool_choice' not in request
+                # A turn's last call may go without tool calls; none is forced.
+                assert request.get('tool_choice') in (None, {'type': 'none'})
             assert [t['name'] for t in request['tools']][:2] == ['echo', 'shell']
             assert 'input_schema' in request['tools'][0]
             last = request['messages'][-1]
@@ -978,7 +979,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         sent = [u.pop('sent_ms') for u in usage]
         self.assertEqual([u for u in usage if u.get('purpose') == 'keep_warm'], [
             {'input_tokens': 9, 'output_tokens': 0, 'cached_input_tokens': 9, 'purpose': 'keep_warm',
-             'served_model': 'synthetic-claude-20260926'}] * 2)
+             'served_model': 'synthetic-claude-20260926', 'work_tokens': 0}] * 2)
         self.assertEqual(len(usage), 4)
         self.assertEqual(sent, sorted(sent))
         self.assertGreaterEqual(sent[2] - sent[1], 900)
@@ -1001,10 +1002,10 @@ class AnthropicRuntimeTests(unittest.TestCase):
 
     def test_refreshes_stop_at_the_turns_cap(self):
         client, model, path = self.start(settings={'keep_warm': 1})
-        def run(bot, cap):
+        def run(bot, cap, counts='tokens'):
             client.request('create', bot=bot, workspace=str(path), effort='low')
             turn = client.request('submit', bot=bot, request_id='w', prompt='shell:sleep 2.5',
-                                  budget_tokens=cap)['result']['turn']
+                                  budget_tokens=cap, budget_counts=counts)['result']['turn']
             end = client.finished(turn)['data']
             requests = []
             while not model.requests.empty():
@@ -1012,13 +1013,22 @@ class AnthropicRuntimeTests(unittest.TestCase):
             usage = [m['data'] for m in client.saved
                      if m.get('event') == 'usage' and m.get('bot') == bot]
             return end, sum(r['max_tokens'] == 0 for r in requests), usage
-        # The call spends the cap: no call follows it, so nothing is refreshed.
+        # The call spends the cap: only a last call without tools follows
+        # it, and nothing reads a cache refreshed for one with them.
         end, warms, usage = run('Bob', 1)
-        self.assertEqual((end['error'], warms), ('turn_budget_exhausted', 0))
+        self.assertEqual((end['status'], end['limit'], warms), ('completed', 'turn_budget', 0))
+        # A refresh bills the history it re-reads: room for one refresh,
+        # and the second would bill past the cap, so the call after it is
+        # the last.
         call = usage[0]['input_tokens'] + usage[0]['output_tokens']
-        # Room for one refresh: the second would bill past the cap.
         end, warms, _ = run('Ann', call + 9)
-        self.assertEqual((end['error'], warms), ('turn_budget_exhausted', 1))
+        self.assertEqual((end['status'], end['limit'], warms), ('completed', 'turn_budget', 1))
+        # But it does no work: under a cap on work with room, the cache is
+        # kept warm as without one.
+        end, warms, usage = run('Cy', usage[0]['work_tokens'] + 9, 'work')
+        self.assertEqual((end['status'], end.get('limit')), ('completed', None))
+        self.assertGreater(warms, 0)
+        self.assertEqual({u['work_tokens'] for u in usage if u.get('purpose') == 'keep_warm'}, {0})
 
     def test_a_long_reply_keeps_its_own_prompt_cache_warm(self):
         client, model, path = self.start(settings={'keep_warm': 1})
@@ -1055,24 +1065,27 @@ class AnthropicRuntimeTests(unittest.TestCase):
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
         self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm', None])
 
-    def test_the_last_replys_refresh_counts_before_a_steer_joins_the_turn(self):
+    def test_a_steer_after_a_reply_that_spent_the_budget_runs_on_its_own(self):
         client, model, path = self.start(settings={'keep_warm': 1})
         model.generate_delay = 1.5
         model.warm_delay = 1
-        # The call bills 14 tokens (5 + 2 cached in, 7 out) and its refresh 9.
-        client.request('create', bot='Bob', workspace=str(path), effort='low', budget_tokens=20)
+        # The call does 14 tokens of work (7 in, 7 out), the whole budget;
+        # its refresh re-reads the history, billing 9 but doing none.
+        client.request('create', bot='Bob', workspace=str(path), effort='low', budget_tokens=14,
+                       budget_counts='work')
         turn = client.request('submit', bot='Bob', request_id='s1', prompt='long')['result']['turn']
         model.requests.get(timeout=5)
         steer = client.request('submit', bot='Bob', request_id='s2', prompt='more', delivery='steer')
         # The refresh still in flight when the reply ends is answered and
-        # counted before the steer could join, and leaves the budget no
-        # call for it: the turn completes without it, rather than failing
-        # with it unheard, and the steer, run on its own, is refused.
+        # counted before the steer could join. The reply spent the budget,
+        # so the turn completes on it rather than calling for the steer,
+        # and the steer, run on its own, is refused.
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(client.finished(steer['result']['turn'])['data']['error'], 'budget_exhausted')
         self.assertEqual(model.requests.get(timeout=1)['max_tokens'], 0)
         self.assertTrue(model.requests.empty())
-        self.assertEqual(client.request('inspect', bot='Bob')['result']['tokens_used'], 23)
+        bob = client.request('inspect', bot='Bob')['result']
+        self.assertEqual((bob['work_tokens'], bob['tokens_used']), (14, 23))
 
     def test_a_call_waiting_to_be_sent_is_refreshed_only_from_its_send(self):
         # One request may start at a time and Ann's waits for its headers,
@@ -1203,7 +1216,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
                                     'cache_write_tokens': 1, 'served_model': 'synthetic-fallback', 'models': [
             {'model': 'synthetic-claude', 'input_tokens': 7, 'output_tokens': 4, 'cached_input_tokens': 2},
             {'model': 'synthetic-fallback', 'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 0,
-             'cache_write_tokens': 1}]})
+             'cache_write_tokens': 1}], 'work_tokens': 18})
         model.requests.get(timeout=1)
         second = model.requests.get(timeout=1)
         # The declined attempt's text continues the answer; its thinking and
@@ -1472,7 +1485,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         # and the model's context window, for a client to say how full it is.
         self.assertEqual(usage[0]['data'], {'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 2,
                                             'served_model': 'synthetic-claude-20260926',
-                                            'context_window': 200000})
+                                            'context_window': 200000, 'work_tokens': 14})
         first, second = model.requests.get(timeout=1), model.requests.get(timeout=1)
         self.assertEqual(first['thinking'], {'type': 'adaptive', 'display': 'summarized',
                                              'block_binding': {'prefix_mismatch_behavior': 'drop_block'}})
@@ -1916,6 +1929,20 @@ class RuntimeTests(ModelFixture):
         self.assertIn('Work has since resumed and this turn goes on', output['detail'])
         self.assertEqual(output['pause']['reason'], 'the loop is sending mail')
         self.assertEqual(marker.read_text(), 'x\n')
+
+    def test_running_processes_counts_a_foreground_command(self):
+        client = self.client('shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='fg', prompt='shell:sleep 1.5')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        deadline = time.monotonic() + 2
+        while not client.request('stats')['result']['running_processes'] and time.monotonic() < deadline:
+            time.sleep(.05)
+        stats = client.request('stats')['result']
+        self.assertEqual((stats['running_processes'], stats['process_limit'] > 0), (1, True))
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(client.request('stats')['result']['running_processes'], 0)
 
     def test_a_pause_ends_the_background_commands_agents_started(self):
         self.model.background_timeout_ms = 30000

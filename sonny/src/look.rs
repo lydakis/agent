@@ -8,6 +8,7 @@
 //! (no-color.org) no color is drawn at all, and bold, dim, underline and
 //! reverse carry what is left; every colored mark has its own shape.
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use ratatui::{
     buffer::{Buffer, Cell},
@@ -96,7 +97,7 @@ impl Look {
 /// no further than keeps 4.5:1 (WCAG's for text), or, in a theme whose own
 /// text reads at under 6:1, three quarters of that, so muted still differs
 /// from the rest.
-fn muted(foreground: Rgb, background: Rgb) -> Rgb {
+pub fn muted(foreground: Rgb, background: Rgb) -> Rgb {
     let floor = (contrast(foreground, background) * 0.75).min(4.5);
     let mut weight = 0.55;
     loop {
@@ -105,6 +106,45 @@ fn muted(foreground: Rgb, background: Rgb) -> Rgb {
             return gray;
         }
         weight += 0.05;
+    }
+}
+
+/// A beat of the pulse: shown this long, then a gap, so a beat is
+/// half a second and two come a second, under the three flashes a second
+/// WCAG 2.3.1 allows.
+const BEAT: Duration = Duration::from_millis(500);
+const BEAT_ON: Duration = Duration::from_millis(320);
+/// Beats in a pulse: enough to catch the eye from across the screen,
+/// as a dock icon's bounce does, and over in a second and a half.
+const BEATS: u32 = 3;
+
+/// Whether a pulse that began `since` ago is on a beat now: a one-shot,
+/// strong while it lasts and then gone for good, never a loop.
+pub fn beat(since: Duration) -> bool {
+    since < BEAT * BEATS && since.as_millis() % BEAT.as_millis() < BEAT_ON.as_millis()
+}
+
+/// A count that pulses once each time it rises, as what needs the person
+/// does when something new comes to need them; steady as it falls or holds.
+#[derive(Clone, Copy, Default)]
+pub struct Pulse {
+    seen: usize,
+    at: Option<Instant>,
+}
+
+impl Pulse {
+    /// The count as it is `now`.
+    pub fn see(&mut self, count: usize, now: Instant) {
+        if count > self.seen {
+            self.at = Some(now);
+        }
+        self.seen = count;
+    }
+
+    /// On a beat `now`.
+    pub fn on(&self, now: Instant) -> bool {
+        self.at
+            .is_some_and(|at| beat(now.saturating_duration_since(at)))
     }
 }
 
@@ -188,6 +228,25 @@ pub fn contrast(a: Rgb, b: Rgb) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pulse_beats_three_times_when_its_count_rises_and_then_holds() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut pulse = Pulse::default();
+        pulse.see(0, start);
+        assert!(!pulse.on(start));
+        pulse.see(1, start);
+        let times = [0, 400, 500, 900, 1000, 1400, 1500, 2000];
+        let beats: Vec<bool> = times.map(|ms| pulse.on(at(ms))).into();
+        assert_eq!(beats, [true, false, true, false, true, false, false, false]);
+        // Held or falling, it stays steady; a new rise pulses again.
+        pulse.see(1, at(2000));
+        pulse.see(0, at(2000));
+        assert!(!pulse.on(at(2000)));
+        pulse.see(1, at(3000));
+        assert!(pulse.on(at(3000)));
+    }
 
     #[test]
     fn muted_text_reads_and_still_differs_from_the_rest() {

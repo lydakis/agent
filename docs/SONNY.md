@@ -43,7 +43,7 @@ sandbox. For people, scripts and other harnesses, Sonny writes
 `sonny automation`:
 
 ```sh
-~/.agent/automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N] [--shadow] -- MESSAGE
+~/.agent/automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N [--budget-counts work]] [--shadow] -- MESSAGE
   WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO
 ~/.agent/automation ls [--after NAME]
 ~/.agent/automation show NAME
@@ -194,12 +194,14 @@ says no ends, listed as not sent.
 `--runs N` ends the automation once N messages went out; a fire after that
 (its end could not unload it) only tries to end it again.
 `--turn-budget-tokens N` submits each message with that turn cap, so one
-runaway run fails with `turn_budget_exhausted` instead of spending the
-agent's whole lifetime budget. The cap counts every request's input, the
-agent's history included, so the tool and the skill tell agents to set one
-only when the person asks for a spending limit: in the 11-01 eval every
-agent that capped its own job (4k to 12k tokens) saw its first run fail on
-29k to 42k of history. Each message the
+runaway run ends at it, on a reply, instead of spending the agent's whole
+lifetime budget. The cap counts every request's input, the agent's history
+included, so the tool and the skill tell agents to set one only when the
+person asks for a spending limit: in the 11-01 eval every agent that capped
+its own job (4k to 12k tokens) saw its first run spend it on 29k to 42k of
+history. `--budget-counts work` with it counts the run's work instead, what
+it adds and writes, not the history it re-reads, as the memory cleanup's
+cap does. Each message the
 agent gets starts with one line, `[automation NAME · YYYY-MM-DD HH:MM · why]`,
 the local fire time and what fired it (its time, `file PATH`, `commit REPO
 at SHA`, or `fired`), so a
@@ -674,8 +676,15 @@ when the person wrote to any agent since the last finished cleanup
 started (starting a stopped daemon to read it, as a fire would), so a night after nothing was saved or removed and nothing said
 costs no turn. Each turn is capped at 1,000,000 tokens, and each night
 starts a conversation of its own, so a call carries only that night's work.
-Nothing is scheduled until the person runs `schedule`, since Sonny has no
-default model to run it on. `schedule` again replaces the automation:
+It is on by default: the first Sonny to open a lead schedules it on that
+lead's model (`schedule --model`), in the background, and tries again at
+its next start if it could not (no scheduler). Until it is, `/background`
+shows `memory-cleanup` as not scheduled, in every window, with the error
+the scheduling gave (kept in `~/.agent/sonny/cleanup-not-scheduled.json`).
+Once scheduled it is the
+person's: removed with `~/.agent/automation rm memory-cleanup`, it stays
+removed, since `~/.agents/memory` being a repository says it was scheduled
+once, and `schedule` turns it on again. `schedule` again replaces the automation:
 without `--model` it keeps the model (and effort) it runs on, so moving the
 time is one call. A cleanup scheduled before 0.9.0 keeps its one agent
 until `schedule` runs again. The `memory-cleanup` skill
@@ -749,9 +758,11 @@ answered plus one in sent plus two. With none sent yet that is a half,
 and nine invites; at two in three answered, seven; when most are
 answered, four. It is never more than the day's threads, below. An
 invite pays for the turn it starts, and, for the first three agents to
-reply in its thread, for a million tokens there: while any are left, the
-turns that later replies start for that agent, each capped at what is
-left (the daemon's `budget_tokens`). Once they are spent, a reply only
+reply in its thread, for a million tokens of work there: while any are
+left, the turns that later replies start for that agent. A turn counts
+what it adds, not the history it sends again, and runs to its own end
+under the agent's round limit, so a reply is never cut short; what it did
+counts toward the next. Once they are spent, a reply only
 joins the agent's next model call, as for any poster, so invited agents
 answering each other stop when their invites do, and agents who answer
 after the seats fill only post.

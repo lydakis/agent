@@ -149,6 +149,21 @@ impl Speed {
     }
 }
 
+/// The TLS client setup every connection the daemon makes shares: TLS 1.2
+/// and 1.3, the platform's verifier and its root certificates, loaded once,
+/// and `alpn` offered in that order. A clone shares the verifier.
+pub(crate) fn tls_config(alpn: &[&[u8]]) -> Result<rustls::ClientConfig> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .and_then(|builder| builder.with_platform_verifier())
+        .map_err(|_| Error::new("http_client_init"))?
+        .with_no_client_auth();
+    tls.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    Ok(tls)
+}
+
 /// HTTP connections and the startup-admission budget shared by every
 /// provider. Each shard is its own client, so its own pooled HTTP/2
 /// connection per host; a request takes the least-loaded shard and holds it
@@ -175,6 +190,9 @@ impl Transport {
     /// no bound beyond the operating system. `connections` is the number of
     /// shards, at least one.
     pub fn new(max_connecting: usize, connections: usize) -> Result<Arc<Self>> {
+        // One TLS setup for every shard: building each client's own loaded
+        // the system's root certificates once per shard.
+        let tls = tls_config(&[b"h2", b"http/1.1"])?;
         let shards = (0..connections.max(1))
             .map(|_| {
                 // No total deadline: long generations are legitimate. Idle
@@ -189,6 +207,7 @@ impl Transport {
                     .read_timeout(IDLE_READ)
                     .pool_idle_timeout(Duration::from_secs(60))
                     .pool_max_idle_per_host(1024)
+                    .use_preconfigured_tls(tls.clone())
                     .build()
                     .map_err(|_| Error::new("http_client_init"))?;
                 Ok(Shard {
@@ -1836,8 +1855,10 @@ fn claude_model(model: &str) -> &str {
 /// and `?` wildcards, as OpenCode sets a model's `limit.context` and
 /// Codex its `model_context_window`: for a model a provider does not list,
 /// or lists wrong, or to hold a bot under its model's full window. The
-/// most specific pattern a path matches wins: the one with the most
-/// characters that are not wildcards, then the first by name.
+/// most specific pattern a path matches wins: an exact path over every
+/// wildcard (a `*` can match nothing, so `a/*b` counts as many literal
+/// characters as `a/b`), then the one with the most characters that are
+/// not wildcards, then the first by name.
 #[derive(Debug, Default)]
 pub struct Windows(Vec<(String, u64)>);
 
@@ -1870,8 +1891,12 @@ impl Windows {
             }
             set.push((pattern, tokens));
         }
-        let literal = |pattern: &str| pattern.chars().filter(|c| !matches!(c, '*' | '?')).count();
-        set.sort_by(|(a, _), (b, _)| literal(b).cmp(&literal(a)).then_with(|| a.cmp(b)));
+        let wild = |c: char| matches!(c, '*' | '?');
+        let rank = |pattern: &str| {
+            let literal = pattern.chars().filter(|c| !wild(*c)).count();
+            (pattern.chars().any(wild), std::cmp::Reverse(literal))
+        };
+        set.sort_by(|(a, _), (b, _)| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
         Ok(Self(set))
     }
     /// The window set for `path`, `PROVIDER/MODEL`.
@@ -2158,6 +2183,35 @@ mod tests {
     }
 
     #[test]
+    fn shards_share_one_tls_setup() {
+        // On Linux, loading the root certificates from disk is most of
+        // what a client costs to build; shared, 64 shards cost little more
+        // than one. Built apart, each loaded them again and 64 took about
+        // 64 times as long. macOS's verifier reads its roots from the
+        // system when it first checks a certificate, so building clients
+        // costs no load there either way.
+        #[cfg(target_os = "linux")]
+        let build = |shards| {
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    Transport::new(0, shards).unwrap();
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let (one, many) = (build(1), build(64));
+            assert!(many < one * 16, "1 shard {one:?}, 64 shards {many:?}");
+        }
+        Transport::new(0, 64).unwrap();
+        let tls = tls_config(&[b"h2", b"http/1.1"]).unwrap();
+        assert_eq!(tls.alpn_protocols, [b"h2".to_vec(), b"http/1.1".to_vec()]);
+    }
+
+    #[test]
     fn retry_after_reads_milliseconds_first_then_seconds() {
         use reqwest::header::{HeaderMap, HeaderValue};
         let mut headers = HeaderMap::new();
@@ -2245,6 +2299,19 @@ mod tests {
             );
         }
         assert!(Windows::parse(["a/b=2000", "a/b=3000"]).is_err());
+    }
+
+    #[test]
+    fn an_exact_window_beats_a_wildcard_that_matches_nothing() {
+        // `provider/*model` has as many literal characters as the exact
+        // path and sorts first by name; its `*` matches nothing here.
+        let windows = Windows::parse(["provider/*model=1000000", "provider/model=200000"]).unwrap();
+        assert_eq!(windows.get("provider/model"), Some(200_000));
+        assert_eq!(windows.get("provider/big-model"), Some(1_000_000));
+        let windows = Windows::parse(["a/b?=3000", "a/b=2000", "a/*=4000"]).unwrap();
+        assert_eq!(windows.get("a/b"), Some(2_000));
+        assert_eq!(windows.get("a/bc"), Some(3_000));
+        assert_eq!(windows.get("a/c"), Some(4_000));
     }
 
     #[test]

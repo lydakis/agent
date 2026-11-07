@@ -636,7 +636,7 @@ pub(crate) fn write_moved(partial: &Path, path: &Path, text: &str) -> std::io::R
 /// This Sonny, told apart from another build of it: its version and when
 /// its binary was written.
 pub(crate) fn identity() -> String {
-    let written = std::env::current_exe()
+    let written = crate::named::me()
         .and_then(std::fs::metadata)
         .and_then(|meta| meta.modified())
         .ok()

@@ -173,7 +173,9 @@ submitting client. `--delivery queue` or `steer` hands a busy bot the work
 instead of getting `bot_busy` ([delivery modes](#delivery-modes)). A controller can inspect metadata through `ls` or observe events through
 `follow` from outside a shell tool. Full records remain available via the protocol.
 
-Shell tool processes receive `AGENT_BIN`, an absolute `AGENT_STORE`,
+Shell tool processes receive `AGENT_BIN` (the daemon's own program, or the
+path its starter gave in `AGENT_BIN` when that names the same program, as a
+client that starts the daemon under a name of its own does), an absolute `AGENT_STORE`,
 `AGENT_SOCKET` when a socket is configured, and `AGENT_MODEL`, the running
 turn's effective model, so newly created peers default to its model.
 Continuing an existing peer keeps that peer's stored model unless `--model`
@@ -316,32 +318,70 @@ totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 input tokens the provider served from its prompt cache, to three places; it
 is the number the context window's hysteresis exists to keep high, and
 `stats` reports the same totals and ratio for every turn since the daemon
-started, from three atomics and no storage read. `create` and `fork` accept
-`budget_tokens`, a lifetime cap on input plus output tokens for that bot. The
-cap is checked before each model call and before each submission: a
-submission on an exhausted bot fails with `budget_exhausted`, and a turn whose
-next call would exceed the cap ends as `failed` with `budget_exhausted` after
-any tool already planned has run, so the bot is never left uncertain. One
-call may overshoot the cap. Forks start at zero with their own optional cap.
-Reported usage from failed or incomplete calls is charged without accepting their
-output into history. Such calls count in `model_rounds` when usage is reported.
-Failed-attempt usage also counts before a retry and later tool rounds: a retry
-cannot start after that usage exhausts the budget. This check uses the running
-total without another store read.
-Cancellation and failures before a usage report is returned can leave usage
-unaccounted for; these totals are not a reconciliation of provider billing.
-Successful calls retain their single atomic transcript/usage commit; budget
-checks use the turn's running total without an extra database read per round.
-`submit` also accepts `budget_tokens`, a cap on the input plus output tokens
-of the turn it starts, checked where the bot's cap is. A turn past it ends as
-`failed` with `turn_budget_exhausted` and the facts `turn_budget_tokens` and
-`turn_tokens_used`; when both caps are reached the bot's `budget_exhausted`
-is named, since it outlasts the turn. The cap is stored on the turn (`turns`
-lists it as `budget_tokens`), so a resumed turn counts what it spent before
-parking, and a resend naming another cap is an `idempotency_conflict`. A
-steer joins a turn that already has its cap: `budget_tokens` with
-`delivery: "steer"` is `invalid_delivery`. A summary held beside a call
-counts toward both caps.
+started, from three atomics and no storage read.
+
+A budget counts one of two measures, named by `budget_counts`: `tokens`, the
+default, is the provider's usage, every call's input and output, the history
+it sends again included; `work` counts what the calls add, for an allowance
+that should not pay again for a history the bot already has. The daemon
+keeps both for every bot and turn, the same way wherever they are counted.
+A call's work is its output, plus the share of its input that the request's
+history items sent for the first time take of the request, by size: the items
+after the newest node the bot's calls have read or written. A history sent
+again, warm in the provider's cache or cold, is free, and what joins it (a
+prompt, a steer, a tool's result) is charged once, on the call that first
+sends it, however much the request lost meanwhile to an elision, a compaction
+or a window moving on: what leaves a request never hides what joins it.
+Output is charged when it is made; sending it back is free. A summary or a
+prompt-cache refresh re-reads the history and is charged its output alone. A
+failed or incomplete call is charged as a call, the history it sent read
+through, its output not accepted, so its retry sends nothing new. A fork's
+history is its source's: what the source's calls read of it is read, through
+the checkpoint at most. Each call counts its new items from the end of the
+window the turn already holds, so the cost is the new items alone, with no
+store read, whatever the history's length. The store keeps the bot's work
+(`work_tokens` in `inspect`, beside `tokens_used`), the node its calls have
+read through, and each turn's (`work_tokens` in the turn view, and on each
+`usage` event what that call charged), so a park or a restart counts on. Cancellation and failures
+before a usage report is returned can leave usage and work unaccounted for;
+these totals are not a reconciliation of provider billing.
+
+`create` and `fork` accept `budget_tokens`, a lifetime cap on the bot, and
+`budget_counts` (`tokens` or `work`, only with a cap; alone it is
+`invalid_budget`); `inspect` and `bots` report both. The cap is checked
+before each model call and before each submission: a submission on an
+exhausted bot fails with `budget_exhausted` and the facts `budget_tokens`,
+`budget_counts` and the count it reached (`tokens_used` or `work_tokens`).
+Forks start at zero with their own optional cap. `submit` also accepts
+`budget_tokens` and `budget_counts`, a cap on the turn it starts, checked
+where the bot's cap is; past it the facts are `turn_budget_tokens`,
+`budget_counts` and `turn_tokens_used` or `turn_work_tokens`, and when both
+caps are reached the bot's `budget_exhausted` is named, since it outlasts the
+turn. The two caps may count different measures. The cap is stored on the
+turn (`turns` lists `budget_tokens` and, with one, `budget_counts`), so a
+resumed turn counts what it did before parking, and a resend naming another
+cap or measure is an `idempotency_conflict`. A steer joins a turn that already has its cap:
+`budget_tokens` with `delivery: "steer"` is `invalid_delivery`. A summary
+held beside a call counts toward both caps, in the measure each counts. A
+prompt-cache refresh spends the tokens it re-reads and no work, so it stops
+at a cap on tokens and goes on under one on work.
+
+A budget ends a turn as the round limit does: its last call goes with the
+tools shown and no call allowed, so the turn ends on a reply rather than
+failing with its work done and unreported. Once any call of the turn (an
+answer, a summary, a failed attempt) has spent a cap and the turn goes on,
+for tool results or a steer, its next call goes so. No call's work is known
+before it is made, so none is predicted, and that last call may overshoot
+the cap by what it spends. The live `tool_calls_withheld` says why (`reason`:
+`budget`, `turn_budget` or `tool_round_limit`), and a turn that completes on such a call is `completed`
+with `limit` (`budget`, `turn_budget` or `rounds`) on its `turn_finished`
+and in its turn view. A retry of a failed attempt that spent a cap goes the
+same way. A cap spent before the turn made any call fails it with
+`budget_exhausted` or `turn_budget_exhausted`, as does one spent again after
+that last call. Usage and work from failed or incomplete calls count in
+`model_rounds` when usage is reported, and toward the caps before a retry and
+later tool rounds, from the running totals without another store read.
+Successful calls keep their single atomic transcript and usage commit.
 
 `submit` also accepts `images`, pictures sent with the prompt: up to 20 of
 `{"media_type", "data"}`, the type one of `image/png`, `image/jpeg`,
@@ -1465,7 +1505,9 @@ name, the sandbox's four as `sandbox`) that differed; the same request again
 changes nothing, so a resend is harmless. A change is told to the bot's
 followers as a live `configured` event with the same fields, which is not
 kept, so a client that attaches later reads the bot as it is. It is refused with `bot_busy`
-while a turn runs or waits parked, and the next turn sends the
+while a turn runs or waits parked, except a change of `rules` alone, which
+the running turn's next round takes ([command rules](#command-rules));
+otherwise the next turn sends the
 new instructions: the provider's cache of the old ones is not read again,
 replayed thinking written after them is withheld as when any context in
 front of it changes, and a fork keys its own prompt cache from then on.
@@ -2539,7 +2581,8 @@ cannot build an invisible backlog behind the process bound. The operating
 system counts processes; it never sees this line, which is why the daemon
 counts it (one counter, one comparison per accepted command). `stats` reports
 it as `queued_processes`, a subset of `running_processes`, which counts every
-accepted command whose result is not yet recorded. stdout and stderr are each
+accepted background command whose result is not yet recorded and every
+foreground command running now. stdout and stderr are each
 retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
 the `artifact` operation, or written to the bot's `outputs` folder (see
@@ -2857,8 +2900,11 @@ only as trusted as the folders there. A turn takes its bot's rules when
 its first round begins, and each call a round plans keeps what they made
 of it, which a parked turn reads back as it resumes: a call runs as its
 round was announced, also after a park or a restart and whatever the
-rules say by then. A turn started after a `configure` takes the new
-rules.
+rules say by then. A `configure` that changes only `rules` is taken while
+a turn runs: its next round, and every one after, rules its calls by the
+new ones; a turn parked then reads them as it resumes. The bots it made,
+and theirs, go by its rules, and so do their running turns, each from its
+next round.
 
 A bot made by another (its `created_by`) goes by its creator's rules: it
 takes them when it is made, whatever its own client gives, and follows
@@ -2948,7 +2994,8 @@ stops waiting: `expire_ms` after it started (1 to 3,600,000, default
 60,000). A client finds such calls by following the bot, or every bot with
 `*`, and lists those still waiting with
 `{"op":"tool_calls","tag","after"?,"limit"?}`: oldest first, each with
-`bot`, `turn`, `call_id`, `name`, `arguments` and `expires_ms`, at most
+`bot`, `turn`, `call_id`, `name`, `arguments`, `expires_ms` and
+`taken_ms`, at most
 `limit` (1 to 256, default 64) and 256 KiB a page, continued from
 `next_after`. It answers with
 `{"op":"tool_result","bot","turn","call_id","output"}`, the text the model
@@ -2967,6 +3014,22 @@ picture does. The client scales a picture; the daemon sends it as given. The fir
 `call_already_answered`, one for a call that ended or ran out of time is
 `no_pending_call` or, once its turn ended, `stale_turn`. There is no lease: a tag is the client's
 to serve.
+
+Protocol version 49 lets a client take a call before it runs it, so that
+no call runs twice: `{"op":"take_call","bot","turn","call_id"}` records
+when (`taken_ms`, returned with `bot`, `turn` and `call_id`), and the
+calls `tool_calls` lists say it, `null` for one not taken. A second take,
+by a client that restarted or by another one, is `call_taken` with the
+first take's `taken_ms` beside its detail; the call may have done its work,
+and only the client that took it knows, so a client answers such a call
+rather than running it again (Sonny answers `tool_outcome_unknown`). A take
+is refused as an answer is: an answered call is `call_already_answered`,
+one that ended or ran out of time is `no_pending_call` or `stale_turn`.
+Taking is the client's choice and never expires; a taken call is answered
+with `tool_result` as before. The daemon never runs its own tools twice
+either: one a restart cut off ends `tool_outcome_unknown`. Schema 79 counts
+every call still unanswered when a store upgrades to it as taken, since an
+older client may have run it with nothing to say so.
 
 The call waits as a gated call waits for its verdict. Its turn holds live
 for the bot's `approval_hold_ms`, but at most 250 ms, and an answer in that

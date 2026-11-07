@@ -381,8 +381,8 @@ fn automations() -> Value {
                         "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N messages."},
                         "turn_budget_tokens": {"type": "integer", "minimum": 1,
                             "description": "A cap on the tokens of each turn a run starts, counting every request's \
-                                input with the agent's history, so a cap below that history fails every run \
-                                before it starts. Set one only when the person asks for a spending limit."},
+                                input with the agent's history, so a cap below that history ends every run on \
+                                its first reply. Set one only when the person asks for a spending limit."},
                         "shadow": {"type": "boolean",
                             "description": "A dry run, as when moving a job from elsewhere onto an automation: \
                                 each run goes to a read-only copy of the agent, where anything past \
@@ -879,8 +879,23 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             }
             Ok(said.to_string())
         }
-        _ => Err(("unknown_tool", format!("Sonny answers no tool {name}"))),
+        _ => Err(("unknown_tool", unknown(name))),
     }
+}
+
+/// What a call of a tool Sonny no longer answers is told: the tools it
+/// answers now, since a bot's list is renewed only once its turn ends, so
+/// one an earlier Sonny gave it (`triggers`, now `automations`) can be
+/// called in the meantime.
+fn unknown(name: &str) -> String {
+    let mut names: Vec<String> = (crate::declared::tools(Role::ALL).iter())
+        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .collect();
+    names.sort();
+    format!(
+        "Sonny answers no tool {name}; the tools it answers now are {}, and this agent's list is renewed when its turn ends",
+        names.join(", ")
+    )
 }
 
 /// Where the agent calling a tool stands in its lead's line, as the
@@ -1159,7 +1174,7 @@ fn hold(serving: &Serving, paused: bool, why: (&str, &str)) {
 const RESEND: Duration = Duration::from_secs(2);
 
 async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Serving) {
-    let Ok(me) = std::env::current_exe() else {
+    let Ok(me) = crate::named::me() else {
         return;
     };
     // The MCP servers scripts call, kept up between calls.
@@ -1267,8 +1282,32 @@ where
         let nudge = nudge.clone();
         let ran = run(call.clone());
         let base = json!({"bot": call["bot"], "turn": call["turn"], "call_id": call["call_id"]});
+        let take = base.clone();
         let job = tokio::spawn(async move {
-            let answer = ran.await;
+            // Taken before it runs, so it runs at most once: a call another
+            // host took, or this one before it restarted, may have done its
+            // work already, and is answered that its outcome is unknown.
+            let taken = client.request("take_call", take).await;
+            let answer = match taken {
+                Ok(_) => ran.await,
+                Err(error) if error.code == "call_taken" => Err((
+                    "tool_outcome_unknown",
+                    "this call may have started before Sonny's tool host restarted or was \
+                     upgraded, and was not run again; whether it did its work is not known"
+                        .to_string(),
+                )),
+                // One that wants no answer is let go; one not known to be
+                // taken is looked at again at the next sweep.
+                Err(error) => {
+                    let mut calls = serving.lock().unwrap();
+                    if wants_none(&error.code) {
+                        calls.retire(&key);
+                    } else if matches!(calls.jobs.get(&key), Some(Job::Running { .. })) {
+                        calls.jobs.remove(&key);
+                    }
+                    return;
+                }
+            };
             let mut asked = json!({"bot": call["bot"], "turn": call["turn"],
                 "call_id": call["call_id"]});
             match answer {
@@ -1769,8 +1808,8 @@ fn kill(group: u32) {
 }
 
 /// Stop every call still being answered, as a tool host that gives way to
-/// another build's does: that one answers them again, and two of a call
-/// would run at once, as two setups in one task's folder.
+/// another build's does, so none goes on behind it. Each was taken, so
+/// that host answers that its outcome is unknown and never runs it again.
 pub fn stop() {
     for group in GROUPS.lock().unwrap().take().unwrap_or_default() {
         kill(group);
@@ -1807,6 +1846,14 @@ fn code(said: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_sonny_no_longer_answers_is_told_the_ones_it_does() {
+        let said = unknown("triggers");
+        assert!(said.starts_with("Sonny answers no tool triggers; the tools it answers now are "));
+        assert!(said.contains("automations"), "{said}");
+        assert!(!said.contains(" triggers,"), "{said}");
+    }
 
     #[tokio::test]
     async fn a_call_that_ran_is_never_run_again_when_its_result_was_not_recorded() {
@@ -1858,6 +1905,60 @@ mod tests {
         assert_eq!(handed.load(Ordering::SeqCst), 3);
         assert!(serving.lock().unwrap().jobs.is_empty());
         assert_eq!(effects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_call_taken_before_a_restart_is_answered_unknown_and_never_run_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // The daemon lists two calls: c1 a host took before it restarted,
+        // c2 none took. It records what each is answered.
+        let answers = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let answered = answers.clone();
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("tool_calls") if answered.lock().unwrap().len() < 2 => json!({"calls": [
+                {"bot": "b", "turn": 1, "call_id": "c1", "name": EXEC},
+                {"bot": "b", "turn": 1, "call_id": "c2", "name": EXEC}],
+                "next_after": null}),
+            Some("tool_calls") => json!({"calls": [], "next_after": null}),
+            Some("take_call") if asked["call_id"] == "c1" => {
+                json!({"error": "call_taken", "detail": "taken"})
+            }
+            Some("tool_result") => {
+                answered.lock().unwrap().push(asked.clone());
+                json!({})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let serving: Serving = Default::default();
+        let effects = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ran = effects.clone();
+        let run = move |call: Value| {
+            let ran = ran.clone();
+            async move {
+                ran.lock().unwrap().push(str_of(&call["call_id"]));
+                Ok(json!("written"))
+            }
+        };
+        let nudge = Arc::new(Notify::new());
+        let swept = Arc::new(AtomicUsize::new(0));
+        while answers.lock().unwrap().len() < 2 && swept.fetch_add(1, Ordering::SeqCst) < 50 {
+            sweep(&client, &serving, &nudge, run.clone()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // c2 ran once; c1 never ran, and is answered that its outcome is
+        // unknown.
+        assert_eq!(*effects.lock().unwrap(), ["c2"]);
+        let answers = answers.lock().unwrap();
+        let of = |id: &str| {
+            answers
+                .iter()
+                .find(|a| a["call_id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(of("c1")["error"]["code"], "tool_outcome_unknown");
+        assert_eq!(of("c2")["output"], "written");
     }
 
     #[tokio::test]

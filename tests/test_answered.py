@@ -115,6 +115,24 @@ class AnsweredToolTests(ModelFixture):
         self.assertEqual(client.request('tool_calls', tag='sonny')['result']['calls'], [])
         self.assertEqual(self.answer(client, turn, output='again')['error'], 'stale_turn')
 
+    def test_a_call_is_taken_once_so_no_client_runs_it_twice(self):
+        client = self.lead(settings={'approval_hold_ms': 0})
+        turn = self.submit(client)
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        [call] = client.request('tool_calls', tag='sonny')['result']['calls']
+        self.assertIsNone(call['taken_ms'])
+        take = {'bot': 'Lead', 'turn': turn, 'call_id': 'script-0'}
+        self.assertEqual(client.request('take_call', **dict(take, call_id='nope'))['error'], 'no_pending_call')
+        self.assertEqual(client.request('take_call', **dict(take, bot='Other'))['error'], 'turn_not_found')
+        took = client.request('take_call', **take)['result']
+        [call] = client.request('tool_calls', tag='sonny')['result']['calls']
+        self.assertEqual(call['taken_ms'], took['taken_ms'])
+        again = client.request('take_call', **take)
+        self.assertEqual((again['error'], again['taken_ms']), ('call_taken', took['taken_ms']))
+        self.assertIn('result', self.answer(client, turn, error={'code': 'tool_outcome_unknown'}))
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertIn(client.request('take_call', **take)['error'], ('call_already_answered', 'stale_turn'))
+
     def test_a_slow_answer_parks_the_turn_and_its_error_is_the_result(self):
         client = self.lead(settings={'approval_hold_ms': 0})
         turn = self.submit(client)
