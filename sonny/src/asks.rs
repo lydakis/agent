@@ -2062,6 +2062,20 @@ mod tests {
             stands(&[closing.clone(), open_one.clone()]),
             Some(State::Withdrawn("no longer needed".into()))
         );
+        // The close being answered reads its own call in the history,
+        // and does not count it.
+        let mut reading = Standing {
+            skip: Some((3, json!("k1"))),
+            ..Standing::default()
+        };
+        assert_eq!(
+            [closing.clone(), open_one.clone()]
+                .iter()
+                .find_map(|(at, entry)| reading.entry(*at, entry, 2, "a1"))
+                .flatten()
+                .map(|(_, state)| state),
+            Some(State::Open)
+        );
         let mut reading = Reading::default();
         assert_eq!(
             [closing.clone(), open_one.clone()]
