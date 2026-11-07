@@ -340,6 +340,21 @@ pub struct Daemon {
     pub socket: Option<PathBuf>,
 }
 
+/// The daemon's own socket for `socket`, which in a confined bot's shell
+/// on macOS is that bot's (`SOCKET.d/ID`, as the daemon opens them), the
+/// only one the shell itself reaches: what an automation keeps is reached
+/// outside every sandbox, after that socket stops listening, and only the
+/// daemon's own lends a gate its sandbox.
+fn public(socket: PathBuf) -> PathBuf {
+    let own = || {
+        socket.file_name()?.to_str()?.parse::<i64>().ok()?;
+        let folder = socket.parent()?;
+        let name = folder.file_name()?.to_str()?.strip_suffix(".d")?;
+        Some(folder.with_file_name(name))
+    };
+    own().unwrap_or(socket)
+}
+
 impl Daemon {
     /// The daemon of the shell the trigger is made from, found as the CLI
     /// finds it. An agent's shell has both its daemon's store and socket.
@@ -392,6 +407,16 @@ pub enum Target {
     },
 }
 
+/// Who wrote a trigger's `--if`, and so where it runs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Writer {
+    /// The person, from their own terminal, or Sonny: it runs as the person.
+    Person,
+    /// An agent, pinned by id: it runs in that agent's sandbox, as its own
+    /// commands do, since the agent can rewrite what it runs.
+    Agent(String, i64),
+}
+
 /// One trigger, as its plist's arguments carry it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Trigger {
@@ -413,6 +438,9 @@ pub struct Trigger {
     pub reply_to: Option<(String, i64)>,
     /// `sh -c` this first; anything but exit 0 skips the fire.
     pub gate: Option<String>,
+    /// Who wrote `gate`. None for one written before Sonny recorded it
+    /// (0.9.0), which runs only when it is one of Sonny's own.
+    pub gate_by: Option<Writer>,
     /// Ends once this many messages went out.
     pub runs: Option<u64>,
     /// Ends at this time, seconds since the epoch, sending nothing more.
@@ -500,6 +528,14 @@ impl Trigger {
         if let Some(gate) = &self.gate {
             pair("--if", gate.clone());
         }
+        match &self.gate_by {
+            Some(Writer::Agent(by, id)) => {
+                pair("--if-by", by.clone());
+                pair("--if-by-id", id.to_string());
+            }
+            Some(Writer::Person) => pair("--if-by-person", "1".into()),
+            None => {}
+        }
         if let Some(runs) = self.runs {
             pair("--runs", runs.to_string());
         }
@@ -544,7 +580,7 @@ impl Trigger {
             let value = iter
                 .next()
                 .ok_or_else(|| bad(&format!("{flag} needs a value")))?;
-            const FLAGS: [&str; 26] = [
+            const FLAGS: [&str; 29] = [
                 "--name",
                 "--generation",
                 "--bot",
@@ -563,6 +599,9 @@ impl Trigger {
                 "--reply-to",
                 "--reply-to-id",
                 "--if",
+                "--if-by",
+                "--if-by-id",
+                "--if-by-person",
                 "--runs",
                 "--until",
                 "--turn-budget-tokens",
@@ -622,6 +661,12 @@ impl Trigger {
             dir: text("--dir").map(PathBuf::from),
             reply_to: pinned("--reply-to", "--reply-to-id")?,
             gate: text("--if"),
+            gate_by: match (pinned("--if-by", "--if-by-id")?, text("--if-by-person")) {
+                (Some((by, id)), None) => Some(Writer::Agent(by, id)),
+                (None, Some(_)) => Some(Writer::Person),
+                (None, None) => None,
+                (Some(_), Some(_)) => return Err(bad("--if-by and --if-by-person")),
+            },
             runs: number("--runs")?.map(|n| n.max(1) as u64),
             until: number("--until")?,
             turn_budget_tokens: number("--turn-budget-tokens")?.map(|n| n.max(1) as u64),
@@ -681,7 +726,10 @@ impl Trigger {
             (target, mine && self.target == other.target),
             ("message", self.message == other.message),
             ("reply_to", self.reply_to == other.reply_to),
-            ("if", self.gate == other.gate),
+            (
+                "if",
+                (&self.gate, &self.gate_by) == (&other.gate, &other.gate_by),
+            ),
             ("runs", self.runs == other.runs),
             ("until", self.until == other.until),
             (
@@ -1463,6 +1511,76 @@ fn read_all(places: &Places) -> impl Iterator<Item = (String, Read)> {
             valid_name(&name).ok()?;
             Some((name, read_trigger(&e.path())))
         })
+}
+
+/// Whether every automation's `if` runs: none was written before Sonny
+/// recorded whose it is, but Sonny's own (upgrade step `agent-gates`).
+pub fn no_gate_unowned() -> bool {
+    let Ok(places) = Places::home() else {
+        return true;
+    };
+    triggers(&places)
+        .iter()
+        .all(|(trigger, _)| trigger.gate_runs_as().is_ok())
+}
+
+impl Trigger {
+    /// The agent whose sandbox runs its `--if`, or None to run it as the
+    /// person. One written before Sonny recorded whose a gate is (0.9.0)
+    /// could be an agent's, so it runs nowhere, and the check fails, told
+    /// once to the agent, until the automation is added again; but for
+    /// Sonny's own, which it knows by their whole text: the memory
+    /// cleanup's `'~/.agent/memory' changed` and an ask's deadline's
+    /// `'SONNY' ask open 'BOT' TURN 'CALL'`.
+    fn gate_runs_as(&self) -> Result<Option<(&str, i64)>, String> {
+        match &self.gate_by {
+            Some(Writer::Agent(by, id)) => Ok(Some((by, *id))),
+            Some(Writer::Person) => Ok(None),
+            None if self
+                .gate
+                .as_deref()
+                .is_none_or(|gate| self.sonnys_gate(gate)) =>
+            {
+                Ok(None)
+            }
+            None => Err(
+                "--if: added before Sonny 0.9.0 recorded who wrote a gate, so it does not \
+                 run until the automation is added again (replace), which runs it in the sandbox \
+                 of the agent that adds it"
+                    .into(),
+            ),
+        }
+    }
+
+    /// Whether `gate` is one Sonny writes, word for word.
+    fn sonnys_gate(&self, gate: &str) -> bool {
+        let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"));
+        let cleanup = || {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            self.name == "memory-cleanup"
+                && home.is_some_and(|home| {
+                    gate == format!("{} changed", quote(&home.join(".agent/memory")))
+                })
+        };
+        /// What follows a quoted word with no quote in it.
+        fn word(text: &str) -> Option<&str> {
+            let text = text.strip_prefix('\'')?;
+            Some(&text[text.find('\'')? + 1..])
+        }
+        let ask = || {
+            let Some(sonny) = crate::skills::sonny_path() else {
+                return false;
+            };
+            (|| {
+                let rest = gate.strip_prefix(&format!("{} ask open ", quote(&sonny)))?;
+                let (turn, rest) = word(rest)?.strip_prefix(' ')?.split_once(' ')?;
+                (turn.bytes().all(|b| b.is_ascii_digit()) && !turn.is_empty()).then_some(())?;
+                word(rest).filter(|end| end.is_empty())
+            })()
+            .is_some()
+        };
+        cleanup() || ask()
+    }
 }
 
 fn triggers(places: &Places) -> Vec<(Trigger, PathBuf)> {
@@ -3582,7 +3700,32 @@ async fn bot_id(client: &Client, name: &str) -> Result<i64, String> {
         .ok_or_else(|| "the daemon named no bot id".into())
 }
 
+/// A one-off `name` at `at` (`YYYY-MM-DD HH:MM`) that Sonny adds for the
+/// shell's agent with a gate Sonny wrote, as an ask's deadline is: its gate
+/// runs as the person, not in the agent's sandbox, since the agent wrote
+/// none of it.
+pub fn add_sonnys(name: &str, at: &str, gate: &str, message: &str) -> Result<Value, String> {
+    add_as(
+        &Places::home()?,
+        &sonnys_args(name, at, gate, message),
+        false,
+    )
+}
+
+/// [`add_sonnys`]'s `add` arguments.
+fn sonnys_args(name: &str, at: &str, gate: &str, message: &str) -> Vec<String> {
+    ["--name", name, "--at", at, "--if", gate, "--", message]
+        .map(String::from)
+        .to_vec()
+}
+
 fn add(places: &Places, args: &[String]) -> Result<Value, String> {
+    add_as(places, args, true)
+}
+
+/// [`add`]; `agents_gate` says whether a gate the shell's agent gives is
+/// that agent's, to run in its sandbox.
+fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, String> {
     let asked = parse_add(args, now())?;
     let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
     // The shell's own agent, when it is an agent's shell.
@@ -3594,6 +3737,12 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         )),
         _ => None,
     };
+    // A gate an agent wrote runs in its sandbox, as Codex runs what an
+    // agent wrote: one the person or Sonny wrote runs as the person.
+    let gate_by = asked.gate.as_ref().map(|_| match (&shell, agents_gate) {
+        (Some((bot, id)), true) => Writer::Agent(bot.clone(), *id),
+        _ => Writer::Person,
+    });
     let daemon = Daemon::current()?;
     if let Some(watch) = &asked.when.watch {
         // A watched file could be the store, which every send writes: one
@@ -3720,11 +3869,16 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
             .map_err(|e| e.to_string())?,
         reply_to,
         gate: asked.gate,
+        gate_by,
         runs: asked.runs,
         until: asked.until,
         turn_budget_tokens: asked.turn_budget_tokens,
         budget_counts: asked.budget_counts,
-        daemon,
+        // Kept as the fire, outside every sandbox, reaches it.
+        daemon: Daemon {
+            socket: daemon.socket.map(public),
+            ..daemon
+        },
         store_id,
         message: asked.message,
         shadow: asked.shadow,
@@ -3901,9 +4055,32 @@ const GATE_SAID: usize = 300;
 /// exit 0 says go, exit 1 says no (and why not), and anything else (a
 /// command not found, a crash, a signal, running past its time) says it
 /// could not check, which is the fire failing, not a no, with the end of
-/// what it wrote to stderr.
-fn gate(command: &str, dir: Option<&Path>, daemon: &Daemon) -> Result<Result<(), String>, String> {
-    let mut sh = std::process::Command::new("/bin/sh");
+/// what it wrote to stderr. One an agent wrote runs as that agent's own
+/// commands do (`agent sandbox --bot`): in its sandbox, with its variables,
+/// reaching the daemon through its own socket; that agent gone, it does
+/// not run.
+fn gate(
+    command: &str,
+    by: Option<(&str, i64)>,
+    dir: Option<&Path>,
+    daemon: &Daemon,
+) -> Result<Result<(), String>, String> {
+    let mut sh = match by {
+        None => std::process::Command::new("/bin/sh"),
+        Some((bot, id)) => {
+            let agent = crate::agent_bin()
+                .ok_or("--if: no agent command to run its agent's sandbox with")?;
+            let mut sh = std::process::Command::new(agent);
+            sh.args(["sandbox", "--bot", bot, "--bot-id", &id.to_string()]);
+            for (flag, value) in [("--store", &daemon.store), ("--socket", &daemon.socket)] {
+                if let Some(value) = value {
+                    sh.arg(flag).arg(value);
+                }
+            }
+            sh.args(["--", "/bin/sh"]);
+            sh
+        }
+    };
     for (key, value) in [
         ("AGENT_SOCKET", &daemon.socket),
         ("AGENT_STORE", &daemon.store),
@@ -5504,10 +5681,10 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     if trigger.gate.is_some() {
         until_resumed(trigger);
     }
-    let said = trigger
-        .gate
-        .as_deref()
-        .map(|c| gate(c, trigger.dir.as_deref(), &trigger.daemon));
+    let said = trigger.gate.as_deref().map(|c| {
+        let by = trigger.gate_runs_as()?;
+        gate(c, by, trigger.dir.as_deref(), &trigger.daemon)
+    });
     // A check that broke is told once, and that it works again once: an
     // `--if` that fails every minute is one note, not one a minute.
     let news = said
@@ -6209,6 +6386,7 @@ pub(crate) mod tests {
             dir: None,
             reply_to: None,
             gate: None,
+            gate_by: None,
             runs: None,
             until: None,
             turn_budget_tokens: None,
@@ -6221,6 +6399,80 @@ pub(crate) mod tests {
             store_id: "00ab".into(),
             message: "Check the PR's CI & reviews; <fix> what's \"red\".\nThen say so.".into(),
             shadow: false,
+        }
+    }
+
+    #[test]
+    fn an_automation_keeps_the_daemon_s_own_socket() {
+        let own = |path: &str| public(PathBuf::from(path));
+        assert_eq!(own("/r/agent.sock.d/42"), PathBuf::from("/r/agent.sock"));
+        for kept in ["/r/agent.sock", "/r/agent.sock.d/x", "/r/other/42", "42"] {
+            assert_eq!(own(kept), PathBuf::from(kept));
+        }
+    }
+
+    #[test]
+    fn sonny_adds_a_one_off_with_its_own_gate() {
+        let now = clock(2026, 9, 28, 9, 7);
+        let asked = sonnys_args(
+            "p.lead.ask-1",
+            "2026-09-28 10:00",
+            "'s' ask open 'b' 3 'c'",
+            "Ask again",
+        );
+        let add = parse_add(&asked, now).unwrap();
+        assert_eq!(add.name.as_deref(), Some("p.lead.ask-1"));
+        assert_eq!(add.gate.as_deref(), Some("'s' ask open 'b' 3 'c'"));
+        assert_eq!(add.message, "Ask again");
+        assert!(add.when.at.is_some());
+    }
+
+    #[test]
+    fn a_gate_runs_as_its_writer_and_one_from_before_only_when_sonny_wrote_it() {
+        let gated = |gate: &str, by: Option<Writer>| Trigger {
+            gate: Some(gate.into()),
+            gate_by: by,
+            ..trigger()
+        };
+        let agent = Writer::Agent("p.lead".into(), 7);
+        assert_eq!(
+            gated("x", Some(agent)).gate_runs_as(),
+            Ok(Some(("p.lead", 7)))
+        );
+        assert_eq!(gated("x", Some(Writer::Person)).gate_runs_as(), Ok(None));
+        assert_eq!(trigger().gate_runs_as(), Ok(None));
+        // From before: whoever wrote it, it does not run, and says why.
+        let unknown = gated("cd /w && ! ./quiet", None)
+            .gate_runs_as()
+            .unwrap_err();
+        assert!(unknown.contains("added again"), "{unknown}");
+        // But Sonny's own, word for word.
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let cleanup = format!("'{}' changed", home.join(".agent/memory").display());
+        let named = |gate: &str| Trigger {
+            name: "memory-cleanup".into(),
+            ..gated(gate, None)
+        };
+        assert_eq!(named(&cleanup).gate_runs_as(), Ok(None));
+        assert!(
+            named(&format!("{cleanup}; touch x"))
+                .gate_runs_as()
+                .is_err()
+        );
+        assert!(
+            gated(&cleanup, None).gate_runs_as().is_err(),
+            "another automation's"
+        );
+        let sonny = crate::skills::sonny_path().unwrap();
+        let ask = format!("'{}' ask open 'p.lead' 12 'call_1'", sonny.display());
+        assert_eq!(gated(&ask, None).gate_runs_as(), Ok(None));
+        for other in [
+            format!("{ask}; touch x"),
+            format!("'{}' ask open 'p.lead' 1x 'call_1'", sonny.display()),
+            format!("'{}' ask open 'p.lead' 12 'call_1'", "/w/sonny"),
+            format!("'{}' ask open 'p.lead' 12 'call'1'", sonny.display()),
+        ] {
+            assert!(gated(&other, None).gate_runs_as().is_err(), "{other}");
         }
     }
 
@@ -6331,10 +6583,18 @@ pub(crate) mod tests {
             dir: Some("/r/sub dir".into()),
             reply_to: Some(("p.lead".into(), 7)),
             gate: Some("test -n \"$(git status --porcelain)\" -- x".into()),
+            gate_by: Some(Writer::Agent("p.lead".into(), 7)),
             runs: Some(3),
             turn_budget_tokens: Some(50_000),
             ..s.clone()
         };
+        // The same gate written by another is another gate.
+        let by_person = Trigger {
+            gate_by: Some(Writer::Person),
+            ..full.clone()
+        };
+        assert_eq!(Trigger::parse(&by_person.args()[1..]).unwrap(), by_person);
+        assert_eq!(by_person.differs(&full), Some("if"));
         let watching = When {
             watch: Some("/r/50% done/.git/logs/HEAD".into()),
             ..fired()
@@ -7941,7 +8201,7 @@ pub(crate) mod tests {
             store: None,
             socket: None,
         };
-        let gate = |command: &str, dir: Option<&Path>| super::gate(command, dir, &none);
+        let gate = |command: &str, dir: Option<&Path>| super::gate(command, None, dir, &none);
         assert_eq!(gate("true", None), Ok(Ok(())));
         // It asks its trigger's daemon.
         let daemon = Daemon {
@@ -7949,7 +8209,7 @@ pub(crate) mod tests {
             socket: None,
         };
         let on = "test \"$AGENT_STORE\" = /s/state.sqlite && test -z \"$AGENT_SOCKET\"";
-        assert_eq!(super::gate(on, None, &daemon), Ok(Ok(())));
+        assert_eq!(super::gate(on, None, None, &daemon), Ok(Ok(())));
         assert_eq!(gate("exit 1", None), Ok(Err("--if: exit status: 1".into())));
         assert_eq!(gate("false", None), Ok(Err("--if: exit status: 1".into())));
         // Any other end is no answer, not a no: a status past 1, a command
@@ -8448,6 +8708,7 @@ pub(crate) mod tests {
             name: "until-slow".into(),
             until: Some(now() + 1),
             gate: Some("sleep 2".into()),
+            gate_by: Some(Writer::Person),
             dir: Some(w.root.clone()),
             ..s.clone()
         };

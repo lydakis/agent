@@ -283,6 +283,16 @@ enum Command {
         #[serde(default)]
         starts_line: bool,
     },
+    /// A bot's record, as `inspect` gives it, and the path of its own
+    /// socket, which listens while this session lasts: so a client can run
+    /// a command as one of that bot's, in its sandbox and reaching the
+    /// daemon only as that bot may, such as an automation's check the bot
+    /// wrote. Only a session outside every sandbox may ask.
+    Lend {
+        bot: String,
+        /// The identity `bot` must hold; another is `bot_not_found`.
+        bot_id: Option<i64>,
+    },
     /// A bot's whole record: what `bots` lists plus its instructions and
     /// settings. A read; nothing about the bot changes.
     Inspect {
@@ -1204,6 +1214,11 @@ struct Service {
     identity: u128,
     /// Open client sessions, kept by the run loop for `stats`.
     sessions: usize,
+    /// What each session was lent, which the daemon holds until it closes:
+    /// the bot's own socket listening, and its sandbox's placeholders, held
+    /// in the one list the daemon's own commands share, so neither side
+    /// removes one the other's sandbox still mounts.
+    lent: HashMap<u64, Vec<agent_runtime::sandbox::Hold>>,
     limit_active: usize,
     /// Per bot: the live turn. A parked turn's task ends while a resumed
     /// task may already own the slot.
@@ -1803,6 +1818,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut service = Service {
         store,
         stepping: HashMap::new(),
+        lent: HashMap::new(),
         step_checks: JoinSet::new(),
         companions,
         identity,
@@ -1996,6 +2012,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                         Inbound::Closed(id) => {
                             sessions.remove(&id);
                             callers.remove(&id);
+                            service.lent.remove(&id);
                             companion_sessions.remove(&id);
                             service.sessions = sessions.len();
                             service.hub.close_session(id);
@@ -2257,6 +2274,8 @@ impl Service {
             Command::ApproveStep { .. } => return refuse("put a declared call's step to a gate"),
             Command::StepResult { .. } => return refuse("record a declared call's step"),
             Command::Shutdown { .. } => return refuse("stop the daemon"),
+            // Its own is the one it has; another bot's would answer as it.
+            Command::Lend { .. } => return refuse("borrow a bot's socket"),
             // Any agent may pull the cord; letting the line go on is the
             // person's, from outside any sandbox.
             Command::Resume { .. } => return refuse("resume a pause"),
@@ -3880,6 +3899,53 @@ impl Service {
                     self.hub.live(&bot, event).await?;
                 }
                 Ok(answer)
+            }
+            Command::Lend { bot, bot_id } => {
+                let record = store
+                    .op("inspect", move |db| {
+                        if bot_id.is_some() {
+                            db.identity(&bot, bot_id)?;
+                        }
+                        db.inspect(&bot)
+                    })
+                    .await?;
+                let id = record.bot_id;
+                // As its turns' commands get them, past what only a turn has.
+                let mut environment: Vec<(String, String)> = (record.settings.env.iter())
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                environment.push(("AGENT_BOT".into(), record.name.clone()));
+                environment.push(("AGENT_BOT_ID".into(), id.to_string()));
+                let mut policy = None;
+                if record.sandboxed() {
+                    let root = (record.workspace.clone().map(std::path::PathBuf::from))
+                        .ok_or_else(|| {
+                            Error::with("sandbox_unavailable", "the bot has no folder")
+                        })?;
+                    // Opening its socket may bind: off the runtime thread,
+                    // as for its turns.
+                    let (daemon, settings) =
+                        (self.registry.daemon().clone(), record.settings.clone());
+                    policy = tokio::task::spawn_blocking(move || {
+                        turn::bot_sandbox(&settings, &root, id, &daemon)
+                    })
+                    .await
+                    .map_err(|_| Error::new("sandbox_unavailable"))??;
+                }
+                if let Some(policy) = policy.as_mut() {
+                    // Held for the session, as for one of the bot's own
+                    // commands: its socket, and its placeholders and what
+                    // its command may not leave, gone once the session is.
+                    let hold = agent_runtime::sandbox::hold(policy).await;
+                    self.lent.entry(session).or_default().push(hold);
+                    policy.listening = None;
+                    if let Some(own) = policy.reach() {
+                        environment.push(("AGENT_SOCKET".into(), own.display().to_string()));
+                    }
+                }
+                let env =
+                    agent_runtime::tools::shell_environment_whole(&self.registry, &environment);
+                Ok(json!({"bot": record.name, "bot_id": id, "policy": policy, "env": env}))
             }
             Command::Inspect { bot, bot_id } => {
                 store
@@ -5645,6 +5711,7 @@ mod tests {
         let mut service = Service {
             store: store.clone(),
             stepping: HashMap::new(),
+            lent: HashMap::new(),
             step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
@@ -5856,6 +5923,7 @@ mod tests {
         let mut service = Service {
             store: store.clone(),
             stepping: HashMap::new(),
+            lent: HashMap::new(),
             step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
@@ -6079,6 +6147,7 @@ mod tests {
             identity: 0,
             store: store.clone(),
             stepping: HashMap::new(),
+            lent: HashMap::new(),
             step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
@@ -6329,6 +6398,7 @@ mod tests {
             identity: 0,
             store: store.clone(),
             stepping: HashMap::new(),
+            lent: HashMap::new(),
             step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),

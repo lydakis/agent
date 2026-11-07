@@ -4714,31 +4714,11 @@ impl Turn {
             .workspace
             .as_ref()
             .map_or_else(|| workspace.to_owned(), PathBuf::from);
-        tokio::task::spawn_blocking(move || {
-            // The probe for a sandbox runs once, here off the runtime
-            // thread, also for a bot from before a restart.
-            agent_runtime::sandbox::available()?;
-            // The bot's own socket, so its commands may use the daemon as
-            // far as a sandboxed bot may; opened first, so its folder is
-            // there to be kept read-only.
-            let (capability, listening) = daemon.capability(bot)?.unzip();
-            let policy = Policy::new(
-                settings.sandbox,
-                Some(&root),
-                &settings.writable,
-                settings.network,
-                &daemon,
-            )?;
-            Ok(policy.map(|policy| Policy {
-                capability,
-                listening,
-                ..policy.with_sockets(&settings.unix_sockets)
-            }))
-        })
-        .await
-        .map_err(|_| Error::new("sandbox_unavailable"))
-        .flatten()
-        .map(|policy| policy.map(Arc::new))
+        tokio::task::spawn_blocking(move || bot_sandbox(&settings, &root, bot, &daemon))
+            .await
+            .map_err(|_| Error::new("sandbox_unavailable"))
+            .flatten()
+            .map(|policy| policy.map(Arc::new))
     }
 
     /// Wait for a gated call's verdict: live for the hold, then parked like
@@ -5848,6 +5828,36 @@ fn for_model(results: BTreeMap<String, Arc<Value>>) -> BTreeMap<String, Arc<Valu
             _ => (handle, result),
         })
         .collect()
+}
+
+/// The sandbox a confined bot's commands run in, rooted at `root`, with
+/// the bot's own socket open: what its turns give each command and `lend`
+/// gives a command run as the bot. Blocking: it may probe and bind.
+pub(super) fn bot_sandbox(
+    settings: &Settings,
+    root: &std::path::Path,
+    bot: i64,
+    daemon: &agent_runtime::sandbox::Daemon,
+) -> Result<Option<Policy>> {
+    // The probe for a sandbox runs once, here off the runtime thread, also
+    // for a bot from before a restart.
+    agent_runtime::sandbox::available()?;
+    // The bot's own socket, so its commands may use the daemon as far as a
+    // sandboxed bot may; opened first, so its folder is there to be kept
+    // read-only.
+    let (capability, listening) = daemon.capability(bot)?.unzip();
+    let policy = Policy::new(
+        settings.sandbox,
+        Some(root),
+        &settings.writable,
+        settings.network,
+        daemon,
+    )?;
+    Ok(policy.map(|policy| Policy {
+        capability,
+        listening,
+        ..policy.with_sockets(&settings.unix_sockets)
+    }))
 }
 
 #[cfg(test)]
