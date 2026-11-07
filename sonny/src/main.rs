@@ -64,6 +64,7 @@ mod place;
 mod plan;
 mod project;
 mod prompt;
+mod quiet;
 mod reactions;
 mod recall;
 mod resolved;
@@ -1560,6 +1561,9 @@ async fn run() -> Result<(), String> {
     app.sounds = sound::Sounds::new(options.sound);
     let settings = settings::Settings::load();
     app.sounds.chime = settings.chime;
+    app.schedule = settings.quiet.clone();
+    quiet::set_schedule(settings.quiet.clone());
+    app.quiet = quiet::away();
     app.verbose = settings.verbose;
     set_measure(settings.text_width);
     margin::set_limits(settings.margin_notes, settings.margin_note_lines);
@@ -2553,7 +2557,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 28] = [
+const COMMANDS: [(&str, &str); 29] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -2600,6 +2604,10 @@ const COMMANDS: [(&str, &str); 28] = [
     ("/mcp", "List the MCP servers agents' scripts call"),
     ("/config", "Change the settings in ~/.agent/config.toml"),
     ("/sound", "Turn the chime when work ends on or off"),
+    (
+        "/quiet",
+        "Go quiet now: agents work on and write you nothing; /quiet off ends it",
+    ),
     (
         "/verbose",
         "Show every tool call, or only what moves the work on",
@@ -2913,6 +2921,14 @@ struct App {
     /// messages here, and when that was last looked at.
     picked: reactions::Picked,
     picked_read: Instant,
+    /// Quiet as its file said when last read ([`quiet`]), when that was,
+    /// and the hours that start it.
+    quiet: Option<quiet::Away>,
+    quiet_read: Instant,
+    schedule: quiet::Schedule,
+    /// What is being sent is a pick or an approval, not words: it leaves
+    /// quiet on.
+    picking: bool,
     /// The first line of the person's message the bot answers, and the
     /// rows drawn when it was: a reaction with none drawn since goes right
     /// under it.
@@ -4375,6 +4391,10 @@ impl App {
             react_calls: HashMap::new(),
             picked: reactions::Picked::default(),
             picked_read: Instant::now(),
+            quiet: None,
+            quiet_read: Instant::now(),
+            schedule: quiet::Schedule::default(),
+            picking: false,
             eyes: Some(banner::Eyes::new(Instant::now())),
             answering: None,
             rows_drawn: 0,
@@ -4686,6 +4706,12 @@ impl App {
                         || drawn.is_none_or(|at| at.elapsed() >= IDLE_FRAME);
                 }
                 _ = self.woken.notified() => changed = true,
+            }
+            // Quiet starts in the lookout and ends in whichever window the
+            // person writes in: read once a minute, never per frame.
+            if self.quiet_read.elapsed() >= quiet::READ_EVERY {
+                self.quiet_read = Instant::now();
+                self.quiet = quiet::away();
             }
             if self.picked_read.elapsed() > Duration::from_secs(1) {
                 self.picked_read = Instant::now();
@@ -6145,8 +6171,12 @@ impl App {
             let answer = asks::answer(&ask, &(at + 1).to_string());
             let sent = match &ask.task {
                 Some(_) => self.answer_task(&ask, &answer, true, &[]).await,
-                None => (self.send(answer, None, false, false, &[]).await)
-                    .map(|()| self.close_ask(&ask)),
+                None => {
+                    self.picking = true;
+                    let sent = self.send(answer, None, false, false, &[]).await;
+                    self.picking = false;
+                    sent.map(|()| self.close_ask(&ask))
+                }
             };
             match sent {
                 Ok(()) => self.notice = None,
@@ -10516,15 +10546,16 @@ impl App {
                     self.approve_shown = None;
                     let kept = self.denials.clone();
                     self.denials.retain(|d| d.call_id != denied.call_id);
-                    self.notice = Some(
-                        match self.send(approval(&denied), None, false, false, &[]).await {
-                            Ok(()) => "approved one retry; the retry is still reviewed".into(),
-                            Err(error) => {
-                                self.denials = kept;
-                                error
-                            }
-                        },
-                    );
+                    self.picking = true;
+                    let sent = self.send(approval(&denied), None, false, false, &[]).await;
+                    self.picking = false;
+                    self.notice = Some(match sent {
+                        Ok(()) => "approved one retry; the retry is still reviewed".into(),
+                        Err(error) => {
+                            self.denials = kept;
+                            error
+                        }
+                    });
                 }
                 list::Act::Close => {
                     self.approving = None;
@@ -10596,6 +10627,8 @@ impl App {
             // has them; a new width written again as a resize is.
             let settings = settings::Settings::load();
             self.sounds.chime = settings.chime;
+            self.schedule = settings.quiet.clone();
+            quiet::set_schedule(settings.quiet.clone());
             self.margin_opens = settings.margin_opens;
             self.agent_opens = settings.agent_opens;
             margin::set_limits(settings.margin_notes, settings.margin_note_lines);
@@ -11281,6 +11314,13 @@ impl App {
             });
             return;
         }
+        if let Some(rest) = prompt.strip_prefix("/quiet")
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.input.clear();
+            self.quiet_command(rest.trim());
+            return;
+        }
         if prompt == "/sound" {
             self.input.clear();
             let mut settings = settings::Settings::load();
@@ -11496,7 +11536,13 @@ impl App {
         // The person's words carry when they were sent; a record of what
         // Sonny did for them is read as it is.
         let sent = match origin {
-            None => stamp::now(&prompt),
+            // The person's words end quiet, here and in every window.
+            // A pick on a question card or an approved retry leaves quiet on.
+            None if self.picking => stamp::now(&prompt),
+            None => {
+                self.quiet = None;
+                stamp::person(&prompt)
+            }
             Some(_) => prompt.clone(),
         };
         // An answer goes once, whichever window sends it ([`answer_once`]).
@@ -11565,7 +11611,15 @@ impl App {
         let Some(task) = ask.task.clone() else {
             return Err("that question is not a task's".into());
         };
-        let submitted = json!({"bot": task.bot, "prompt": stamp::now(prompt),
+        // Words the person typed end quiet; a pick leaves it on.
+        let stamped = match picked {
+            true => stamp::now(prompt),
+            false => {
+                self.quiet = None;
+                stamp::person(prompt)
+            }
+        };
+        let submitted = json!({"bot": task.bot, "prompt": stamped,
             "delivery": "steer", "images": attach::submitted(pictures)});
         let reply = match picked {
             true => answer_once(&self.client, &ask.id, submitted).await?,
@@ -12254,6 +12308,38 @@ impl App {
                 )
             }
         }
+    }
+
+    /// `/quiet`: quiet now, for every agent, until the person writes to
+    /// one; `/quiet off` ends it without writing.
+    fn quiet_command(&mut self, rest: &str) {
+        self.quiet_read = Instant::now();
+        self.notice = Some(match rest {
+            "" => {
+                let since = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64);
+                let asked = quiet::Away {
+                    since,
+                    why: quiet::Why::Asked,
+                };
+                match quiet::start(asked) {
+                    Ok(()) => {
+                        self.quiet = quiet::away();
+                        "quiet: agents work on and write you nothing until you write".to_owned()
+                    }
+                    Err(error) => error,
+                }
+            }
+            "off" => {
+                self.quiet = None;
+                match quiet::end() {
+                    Some(_) => "quiet off".to_owned(),
+                    None => "quiet is not on".to_owned(),
+                }
+            }
+            _ => "/quiet goes quiet now; /quiet off ends it".to_owned(),
+        });
     }
 
     /// This agent's zen as its file now says, set elsewhere: drawn again
@@ -13749,6 +13835,21 @@ impl App {
             }
             items.push(Item::new(Slot::Needs, forms).opens("status"));
         }
+        // Quiet, or waiting for the person to step away outside their hours.
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        if let Some((words, on)) = quiet::footer(self.quiet, &self.schedule, epoch) {
+            let short = match on {
+                true => vec![Span::raw("quiet")],
+                false => Vec::new(),
+            };
+            let long = match on {
+                true => Span::raw(words),
+                false => Span::raw(words).dim(),
+            };
+            items.push(Item::new(Slot::Quiet, vec![vec![long], short]));
+        }
         // In zen, the focus, and only what needs the person besides.
         if let Some(focus) = &self.zen {
             let needs = match waiting {
@@ -13775,7 +13876,7 @@ impl App {
                 line.push('…');
             }
             let focus = format!("zen · {}", transcript::cut(&line, room));
-            items.retain(|item| item.slot == Slot::Needs);
+            items.retain(|item| matches!(item.slot, Slot::Needs | Slot::Quiet));
             let mut place = vec![Span::raw(focus).dim()];
             place.extend(boost.map(Span::raw));
             items.push(Item::new(Slot::Place, vec![place]));

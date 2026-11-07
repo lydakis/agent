@@ -3731,6 +3731,19 @@ fn baseline(places: &Places, trigger: &Trigger, seen: &Seen, fresh: bool) -> Res
     }
 }
 
+/// While the person is away, a line under a fire's own saying so, as
+/// the stamp on Sonny's other messages does ([`crate::quiet`]); nothing
+/// otherwise.
+fn away_line() -> String {
+    match crate::quiet::away() {
+        Some(away) => format!(
+            "[{}]\n",
+            crate::quiet::away_clause(away, &crate::quiet::schedule())
+        ),
+        None => String::new(),
+    }
+}
+
 /// `YYYY-MM-DD HH:MM`, local.
 fn stamp(epoch: i64) -> String {
     let t = local(epoch);
@@ -4082,9 +4095,10 @@ async fn deliver(
     }
     let prompt = || {
         format!(
-            "[automation {} · {} · {why}]\n{}",
+            "[automation {} · {} · {why}]\n{}{}",
             trigger.name,
             stamp(now()),
+            away_line(),
             trigger.message
         )
     };
@@ -4135,10 +4149,11 @@ async fn deliver(
                     Some(sent) => sent,
                     None => {
                         let mut prompt = format!(
-                            "[automation {} · run {} · {} · {why}]\n",
+                            "[automation {} · run {} · {} · {why}]\n{}",
                             trigger.name,
                             run.n,
-                            stamp(now())
+                            stamp(now()),
+                            away_line()
                         );
                         if let Some(before) = before {
                             prompt.push_str(&format!(

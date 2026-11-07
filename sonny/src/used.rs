@@ -162,10 +162,15 @@ impl Marks {
             return;
         }
         self.last = Some(Instant::now());
-        let Some(file) = file(bot) else {
-            return;
-        };
-        tokio::task::spawn_blocking(move || mark(&file));
+        let file = file(bot);
+        // Any window used is the person present: quiet waits for them
+        // to step away (`crate::quiet`), on the same mark, as often.
+        tokio::task::spawn_blocking(move || {
+            if let Some(file) = file {
+                mark(&file);
+            }
+            crate::quiet::mark_present();
+        });
     }
 }
 

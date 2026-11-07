@@ -58,7 +58,7 @@ const WAITING: usize = 1024;
 
 /// What `sonny.lookout_waiting` says now, 0 for no limit; and, read with
 /// it, the most notes a margin holds, the most of a task's notes its lead
-/// hears of at once. Settings that do not read keep the defaults.
+/// hears of at once, and the person's hours, for quiet. Settings that do not read keep the defaults.
 fn waiting() -> usize {
     let Ok(sonny) = agent_client::config::load().map(|config| config.sonny) else {
         crate::margin::set_limits(
@@ -68,6 +68,7 @@ fn waiting() -> usize {
         return WAITING;
     };
     crate::margin::set_limits(sonny.margin_notes, sonny.margin_note_lines);
+    crate::quiet::set_schedule(crate::quiet::Schedule::from(&sonny));
     usize::try_from(sonny.lookout_waiting).unwrap_or(usize::MAX)
 }
 
@@ -1247,6 +1248,9 @@ impl Service {
         // files less often.
         let mut tick = tokio::time::interval(SETTLE / 2);
         let mut reread: Option<Instant> = None;
+        // When quiet's schedule was last checked: once a minute, the
+        // lookout being the one process that always runs to start it.
+        let mut quiet_checked: Option<Instant> = None;
         // Past the replay: a turn that ends now left its folder as it is.
         let mut streaming = false;
         loop {
@@ -1489,6 +1493,12 @@ impl Service {
                             lookout.waiting = self.waiting;
                         }
                         self.reread(&client).await;
+                    }
+                    if quiet_checked.is_none_or(|at| now >= at + crate::quiet::READ_EVERY) {
+                        quiet_checked = Some(now);
+                        if let Some(away) = crate::quiet::arm(&crate::quiet::schedule()) {
+                            println!("{}", json!({"event": "quiet", "since": away.since}));
+                        }
                     }
                     for lookout in self.lookouts.values_mut() {
                         lookout.updates.expire(now);
