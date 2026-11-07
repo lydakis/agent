@@ -1432,7 +1432,7 @@ does not, and each is one op:
   bearer and keeps `models[]` entries listed as `visibility: "list"`, by
   `slug`. Nothing else reads it: a turn runs whatever model it names.
   Each daemon start a client makes (`serve --models`) asks it once it is
-  ready to keep `~/.agent/models` current, and `agent models --discover`
+  ready to rewrite `~/.agent/models.discovered`, and `agent models --discover`
   on demand; see [CLI.md](CLI.md).
 - `stats` returns the daemon's live state without sampling its process from
   outside: open sessions, active turns against the bound, parked turns,

@@ -1019,7 +1019,7 @@ async fn connect_starting(
         }
         started => started.map_err(|e| e.to_string())?,
     }
-    // The daemon keeps `~/.agent/models` current itself, from every start.
+    // The daemon rewrites the model catalog itself, from every start.
     Client::connect(socket).await.map_err(|e| e.to_string())
 }
 
@@ -5154,9 +5154,14 @@ impl App {
                     Some((model, effort)) => (model.as_str(), effort.as_deref()),
                     None => (self.model.as_str(), self.effort.as_deref()),
                 };
+                // Read as the picker opens, never while the window idles.
+                let hidden = agent_client::models::path()
+                    .map(|path| agent_client::models::hidden(&path))
+                    .unwrap_or_default();
                 self.picker = Some(models::Picker::new(
                     &listing,
                     self.client.providers(),
+                    &hidden,
                     model,
                     effort,
                 ));

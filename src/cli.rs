@@ -363,7 +363,7 @@ fn print_flags(flags: &str) {
             "--provider" => ("SPEC", "Register a provider; repeat for multiple providers"),
             "--discover" => (
                 "",
-                "Bring ~/.agent/models up to date from the providers' own model listings, as each daemon start does",
+                "Rewrite the model catalog ~/.agent/models.discovered from the providers' own listings, as each daemon start does",
             ),
             "--model" => (
                 "PROVIDER/MODEL",
@@ -445,7 +445,7 @@ fn print_flags(flags: &str) {
             ),
             "--models" => (
                 "PATH",
-                "Keep the model list at PATH current: refreshed from the providers' listings each time the daemon starts, after it is ready; clients pass ~/.agent/models",
+                "Rewrite the model catalog at PATH from the providers' listings each time the daemon starts, after it is ready; clients pass ~/.agent/models.discovered",
             ),
             "--wall" => (
                 "FOLDER",

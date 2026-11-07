@@ -5411,11 +5411,10 @@ async fn provider_models(providers: Arc<HashMap<String, Provider>>) -> Result<Va
     Ok(json!({"providers": answer}))
 }
 
-/// The model list at `path`, brought up to date from every provider's
-/// listing once the daemon serves: after `ready`, so a start waits on no
-/// provider, and the listings stay kept for the clients that ask next.
-/// What it changed is in the file; a provider that did not answer leaves
-/// its lines as they were.
+/// The model catalog at `path`, rewritten from every provider's listing
+/// once the daemon serves: after `ready`, so a start waits on no provider,
+/// and the listings stay kept for the clients that ask next. A provider
+/// that did not answer keeps its lines as they were.
 async fn refresh_models(providers: Arc<HashMap<String, Provider>>, path: PathBuf) {
     let Ok(listing) = provider_models(providers).await else {
         return;

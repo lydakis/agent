@@ -1610,7 +1610,7 @@ class ListingModel(Model):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class ModelListTests(ModelFixture):
-    """~/.agent/models: what clients offer, kept current by every start and --discover, never read by the daemon."""
+    """What clients offer: discovery's catalog, rewritten by every start and --discover, under the person's own list; the daemon reads neither."""
     handler = ListingModel
 
     def setUp(self):
@@ -1618,6 +1618,7 @@ class ModelListTests(ModelFixture):
         self.home = self.path / 'home'
         self.home.mkdir()
         self.list = self.home / '.agent' / 'models'
+        self.catalog = self.home / '.agent' / 'models.discovered'
         # The daemon of the store beside the list keeps it current.
         self.state = self.home / '.agent' / 'state.sqlite'
         self.store = ['--store', str(self.state)]
@@ -1675,22 +1676,26 @@ class ModelListTests(ModelFixture):
         self.assertEqual(refused.returncode, 1, refused.stderr)
         self.assertIn('daemon.processes', refused.stderr)
 
-    def test_every_start_refreshes_the_list_and_keeps_the_person_s_edits(self):
+    def test_every_start_rewrites_the_catalog_and_never_the_person_s_list(self):
         providers = ['--provider', f'openai=responses,{self.url}']
         self.agent('stats', *self.store, *providers)
         deadline = time.monotonic() + 20
-        while not self.list.exists():
+        while not self.catalog.exists():
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.05)
         self.assertIn('openai/synthetic-model  # Synthetic, 4096 context\nopenai/other-model\n',
-                      self.list.read_text())
-        # The person deletes one model and adds one of their own.
-        self.list.write_text('openai/synthetic-model  # mine\nopenai/by-hand\n')
+                      self.catalog.read_text())
+        self.assertFalse(self.list.exists())
+        # The person hides one model, notes another and adds one of their own.
+        mine = 'openai/synthetic-model  # mine\n-openai/other-model\nopenai/by-hand\n'
+        self.list.write_text(mine)
         self.agent('shutdown', *self.store)
         self.agent('stats', *self.store, *providers)
         self.assertEqual(self.agent('models', '--discover', *self.store).stderr.strip().splitlines()[-1],
-                         f'{self.list} is up to date')
-        self.assertEqual(self.list.read_text(), 'openai/synthetic-model  # mine\nopenai/by-hand\n')
+                         f'{self.catalog} is up to date')
+        self.assertEqual(self.list.read_text(), mine)
+        self.assertEqual(json.loads(self.agent('models').stdout),
+                         [{'id': 'openai/synthetic-model', 'note': 'mine'}, {'id': 'openai/by-hand'}])
 
     def test_a_daemon_on_another_store_leaves_the_list_alone(self):
         other = ['--store', str(self.path / 'side.sqlite')]
@@ -1701,7 +1706,7 @@ class ModelListTests(ModelFixture):
         self.addCleanup(lambda: self.agent('shutdown', *beside, check=False))
         self.agent('stats', *beside, '--provider', f'openai=responses,{self.url}')
         time.sleep(1)
-        self.assertFalse(self.list.exists())
+        self.assertFalse(self.catalog.exists())
         self.assertEqual(getattr(self.model, 'listings', 0), 0)
 
     def test_an_edit_to_the_config_s_providers_applies_without_a_restart(self):
@@ -1792,7 +1797,7 @@ class ModelListTests(ModelFixture):
         self.assertEqual(refused.returncode, 1)
         self.assertIn('models_none_listed', refused.stderr)
         self.assertIn('gone: provider_', refused.stderr)
-        self.assertFalse(self.list.exists(), 'a list of refusals is not installed')
+        self.assertFalse(self.catalog.exists(), 'a catalog of refusals is not installed')
 
     def test_a_fresh_install_names_the_missing_provider_and_stats_starts_its_daemon(self):
         refused = self.agent('stats', *self.store, check=False)
@@ -1813,7 +1818,7 @@ class ModelListTests(ModelFixture):
                              '--provider', f'custom=responses,{url}', check=False)
         self.assertEqual(refused.returncode, 1)
         self.assertIn('models_none_listed', refused.stderr)
-        self.assertFalse(self.list.exists())
+        self.assertFalse(self.catalog.exists())
 
     def test_discover_writes_a_first_list_that_clients_and_bots_read(self):
         bare = self.agent('models')
@@ -1823,7 +1828,7 @@ class ModelListTests(ModelFixture):
         self.assertFalse(self.state.exists(), 'reading the list starts no daemon')
 
         self.agent('models', '--discover', *self.store, *self.providers)
-        text = self.list.read_text()
+        text = self.catalog.read_text()
         self.assertIn('openai/synthetic-model  # Synthetic, 4096 context\nopenai/other-model\n', text)
         self.assertRegex(text, r'# gone: provider_\w+')
         # A listing too large for the reply is refused by name; the rest still arrive.
@@ -1835,9 +1840,9 @@ class ModelListTests(ModelFixture):
                                   {'id': 'paged/second-model'}])
         # Asked again, nothing changed: the file stays as it is.
         again = self.agent('models', '--discover', *self.store)
-        self.assertIn(f'{self.list} is up to date', again.stderr)
+        self.assertIn(f'{self.catalog} is up to date', again.stderr)
         self.assertIn('gone: provider_', again.stderr)
-        self.assertEqual(self.list.read_text(), text)
+        self.assertEqual(self.catalog.read_text(), text)
 
         # The daemon asked each provider once and keeps the answers, the refused one too.
         with socket.socket(socket.AF_UNIX) as s:

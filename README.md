@@ -108,10 +108,11 @@ For a ChatGPT Go, Plus or Pro plan, run `agent login chatgpt` once and start
 the daemon with `--provider chatgpt`; it signs in through OpenAI's
 [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source)
 and keeps the token fresh itself.
-The daemon writes `~/.agent/models` from what your providers list and keeps
-it current each time it starts (`agent models --discover` does it on
-demand); edit it down to the models Sonny and your agents should offer, and
-lines you delete stay deleted.
+Each daemon start rewrites `~/.agent/models.discovered` from what your
+providers list (`agent models --discover` does it on demand). Your own
+`~/.agent/models` goes on top: a `PROVIDER/MODEL` line adds a model or puts
+it first with your note, and `-PROVIDER/MODEL` hides one. Sonny and your
+agents offer the two together.
 
 Each bot has its own model, so bots on different providers can run side by
 side in one daemon. Other OpenAI Responses-compatible gateways

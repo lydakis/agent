@@ -478,38 +478,32 @@ that entry as it changes; a bot the CLI made keeps the one it took, and
 ```
 Other client commands require an already running daemon.
 
-`models` prints `~/.agent/models`, the models clients offer, as JSON
-`[{id, note?}]` (`--pretty`: one line each). The file holds one
-`PROVIDER/MODEL` per line, with anything after `#` a note; no file is an
-empty list, and a malformed line fails with `models_invalid` naming it.
-Reading it needs no daemon, and the daemon never reads it: any model runs.
-The daemon a client starts on the store beside it (`~/.agent/state.sqlite`)
-keeps the file current (`serve --models`): each time it starts, once it is
-ready, it asks every provider for its listing and merges the answers in, so
-a start never waits on a provider. A daemon on another store, such as a
-test's or a side daemon's, leaves it alone.
-`models --discover` does the same on demand through the daemon (starting one
-like `run`) and says on stderr what changed (`+ id`, `- id`) and which
-providers did not answer. With no file it writes a first one, with each
-model's name and context size as its note and a comment for a provider that
-listed nothing; when no usable model survives rendering within the file
-limit, it writes nothing and fails with `models_none_listed`, naming each
-refusal, so it can run again after a login. Once the file exists the merge
-is three-way, against the lines refreshes put in the file
-(`~/.agent/models.listed`): a model a provider newly lists is added after
-that provider's last line while the file stays within its limit, a line it
-added and the provider stopped listing is removed (and added again if it
-comes back), and every other line (the person's own models, even ones a
-provider lists, lines they changed, notes, comments, and the absence of
-lines they deleted, even through a time the provider stopped listing them)
-is kept byte for byte. One refresh of the folder runs at a time, and the
-file is compared just before it is replaced, so an edit saved meanwhile is
-merged again rather than lost. A provider that does not answer
-leaves its lines as they are, and providers the daemon does not run are
-never touched. Model ids are compared as strings, never read for versions
-or families. A file that does not parse is refused, never merged into; a
-linked file is updated where it lives. Bots see the same list by running
-`models`.
+`models` prints the models clients offer as JSON `[{id, note?}]`
+(`--pretty`: one line each), from two files with one owner each.
+`~/.agent/models.discovered` is discovery's catalog: what the providers list,
+rewritten whole, so an edit there is replaced. `~/.agent/models` is the
+person's, and nothing writes it: a `PROVIDER/MODEL` line adds a model, or puts
+a listed one first with its note, and a `-PROVIDER/MODEL` line hides one. In
+both, anything after `#` is a note. The person's models come first in their
+order, then the catalog's they did not name, less what they hide; no files is
+an empty list, and a malformed line fails with `models_invalid` naming it.
+Reading needs no daemon, and the daemon never reads either file: any model
+runs. Model ids are compared as strings, never read for versions or families.
+The daemon a client starts on the store beside them (`~/.agent/state.sqlite`)
+rewrites the catalog (`serve --models`): each time it starts, once it is
+ready, it asks every provider for its listing, so a start never waits on a
+provider. A daemon on another store, such as a test's or a side daemon's,
+leaves it alone. `models --discover` does the same on demand through the
+daemon (starting one like `run`) and says on stderr what changed (`+ id`,
+`- id`) and which providers did not answer. Each model's name and context
+size are its note, with a comment for a provider that listed nothing; a
+provider that does not answer keeps its lines from the catalog there, and one
+the daemon no longer runs loses them. When no usable model survives rendering
+within the file limit, nothing is written and it fails with
+`models_none_listed`, naming each refusal, so it can run again after a login.
+The catalog is written beside itself and renamed into place, so a reader sees
+the old one or the new one, and a link put there is replaced, never written or
+read through. Bots see the same list by running `models`.
 
 `serve` requires explicit `--store` and `--provider` options. It runs the daemon
 directly, with Unix-socket service when `--socket` is

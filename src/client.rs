@@ -1076,10 +1076,11 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     if let Some(file) = agent_client::config::path().filter(|_| options.providers_from_config) {
         command.arg("--provider-config").arg(file);
     }
-    // The list clients offer, kept current by every start of the daemon of
-    // the home store beside it (`state.sqlite`); a daemon on another store
-    // (a test, a side daemon, another file in the same folder) leaves it
-    // alone. The folder is compared resolved, so an alias of it counts.
+    // Discovery's catalog beside the person's model list, rewritten by
+    // every start of the daemon of the home store beside it
+    // (`state.sqlite`); a daemon on another store (a test, a side daemon,
+    // another file in the same folder) leaves it alone. The folder is
+    // compared resolved, so an alias of it counts.
     if let Some(models) = agent_client::models::path().filter(|models| {
         let place = |path: &Path| {
             Some((
@@ -1090,7 +1091,9 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
         let home = place(&models.with_file_name("state.sqlite"));
         home.is_some() && home == place(&options.store)
     }) {
-        command.arg("--models").arg(models);
+        command
+            .arg("--models")
+            .arg(agent_client::models::discovered(&models));
     }
     agent_client::own_session(&mut command);
     let mut child = command
@@ -1579,16 +1582,17 @@ fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
     Ok(())
 }
 
-/// The models clients offer, from `~/.agent/models`; reading it needs no
-/// daemon. `--discover` brings it up to date from the listings of the
-/// providers the daemon runs, as every daemon start does, or writes a first
-/// one, and says on stderr what changed.
+/// The models clients offer: the person's `~/.agent/models` over
+/// discovery's catalog beside it; reading them needs no daemon.
+/// `--discover` rewrites the catalog from the listings of the providers the
+/// daemon runs, as every daemon start does, and says on stderr what changed.
 fn models(options: &Options) -> Result<i32> {
     let path = agent_client::models::path().ok_or(Error::with("usage", "set HOME"))?;
     if options.discover {
+        let catalog = agent_client::models::discovered(&path);
         let mut connection = ensure_daemon(options)?;
         let listing = connection.request("provider_models", json!({}))?;
-        let refreshed = agent_client::models::refresh(&path, &listing).map_err(Error::from)?;
+        let refreshed = agent_client::models::refresh(&catalog, &listing).map_err(Error::from)?;
         for (provider, said) in &refreshed.refused {
             eprintln!("{}: {}", visible(provider), visible(said));
         }
@@ -1601,9 +1605,9 @@ fn models(options: &Options) -> Result<i32> {
             refreshed.created,
             refreshed.added.len() + refreshed.removed.len(),
         ) {
-            (true, _) => eprintln!("wrote {}", path.display()),
-            (false, 0) => eprintln!("{} is up to date", path.display()),
-            (false, _) => eprintln!("updated {}", path.display()),
+            (true, _) => eprintln!("wrote {}", catalog.display()),
+            (false, 0) => eprintln!("{} is up to date", catalog.display()),
+            (false, _) => eprintln!("updated {}", catalog.display()),
         }
     }
     let models = agent_client::models::read(&path).map_err(Error::from)?;
@@ -1623,8 +1627,9 @@ fn models(options: &Options) -> Result<i32> {
     // On stderr, so `[]` on stdout stays what a program reads.
     if models.is_empty() {
         eprintln!(
-            "no models listed in {}; agent models --discover lists the providers' models",
-            path.display()
+            "no models listed in {} or {}; agent models --discover lists the providers' models",
+            path.display(),
+            agent_client::models::discovered(&path).display()
         );
     }
     Ok(0)
