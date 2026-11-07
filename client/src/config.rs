@@ -49,6 +49,7 @@
 //! agent_opens = "beside"        # a click on an agent's name: "tab", the default, or "beside"
 //! suggest = false               # no guess at the next message, on by default
 //! needs_check = false           # no copy says whether a reply waits on you, on by default
+//! task_done_check = 24          # hours a task sits idle before a copy says whether it is done, 8 by default; 0 never
 //! commons = false               # agents go without the commons, on by default
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
@@ -475,6 +476,9 @@ pub struct Sonny {
     /// Whether, once an agent's turn ends with words and no question open,
     /// a copy of it says whether they wait on the person.
     pub needs_check: bool,
+    /// Hours a task sits idle before a copy of it, with no tools, says
+    /// whether its work is done, which marks it done; 0 never.
+    pub task_done_check: u64,
     /// Whether the daemon starts when the machine does, for a box whose
     /// agents keep working after a restart. Sonny keeps the job.
     pub start_at_boot: bool,
@@ -716,6 +720,7 @@ impl Default for Sonny {
             side_chat: SideChat::default(),
             suggest: true,
             needs_check: true,
+            task_done_check: 8,
             commons: true,
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
@@ -1354,6 +1359,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "agent_opens",
                 "suggest",
                 "needs_check",
+                "task_done_check",
                 "start_at_boot",
                 "commons",
                 "commons_invites",
@@ -1462,6 +1468,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
                 "ask_wait_minutes" => Some(&mut config.sonny.ask_wait_minutes),
                 "task_windows" => Some(&mut config.sonny.task_windows),
+                "task_done_check" => Some(&mut config.sonny.task_done_check),
                 "sky_haiku_daily" => Some(&mut config.sonny.sky_haiku_daily),
                 "sky_haiku_keep" => Some(&mut config.sonny.sky_haiku_keep),
                 "sky_haiku_window" => Some(&mut config.sonny.sky_haiku_window),

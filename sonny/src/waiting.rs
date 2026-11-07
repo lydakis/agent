@@ -356,6 +356,22 @@ async fn waiting_for(
 /// that follows [`schema`]; an error when the copy could not be made, or
 /// another window's copy of that turn is asked already.
 pub async fn check(client: &Client, bot: &str, turn: i64) -> Result<String, String> {
+    ask_copy(client, bot, turn, turn as u128 % 0x80_0000, ASK, schema()).await
+}
+
+/// What a copy of `bot`, with no tools, answers `prompt` in JSON that
+/// follows `schema`: the copy, named by `stamp`, is made at the end of
+/// `turn`, asked and deleted, and lives at most [`EXPIRE`] should its
+/// window close first. While it is there the daemon refuses another
+/// window's of that name.
+pub async fn ask_copy(
+    client: &Client,
+    bot: &str,
+    turn: i64,
+    stamp: u128,
+    prompt: &str,
+    schema: Value,
+) -> Result<String, String> {
     let checkpoint = turn_end(client, bot, turn).await?;
     // The copy answers on the model and effort the turn ran on, which may
     // be its own, not the bot's, and has that turn cached.
@@ -364,7 +380,7 @@ pub async fn check(client: &Client, bot: &str, turn: i64) -> Result<String, Stri
         .await
         .map_err(|e| e.to_string())?;
     let ran = Some(&ran["turns"][0]).filter(|ran| ran["turn"].as_i64() == Some(turn));
-    let name = copy_name(bot, turn as u128 % 0x80_0000);
+    let name = copy_name(bot, stamp);
     // This window's own request: another's, of the same name, is refused
     // while this copy is there.
     let request = format!("{name}.{}", std::process::id());
@@ -376,7 +392,7 @@ pub async fn check(client: &Client, bot: &str, turn: i64) -> Result<String, Stri
         )
         .await
         .map_err(|e| e.to_string())?;
-    let reply = ask(client, &name, &forked["bot_id"], ran).await;
+    let reply = ask(client, &name, &forked["bot_id"], ran, prompt, schema).await;
     let _ = client
         .request("delete", json!({"bot": name, "bot_id": forked["bot_id"]}))
         .await;
@@ -429,9 +445,11 @@ async fn ask(
     name: &str,
     id: &Value,
     ran: Option<&Value>,
+    prompt: &str,
+    schema: Value,
 ) -> Result<String, String> {
     let mut submit = json!({"bot": name, "bot_id": id, "request_id": format!("{name}.1"),
-        "prompt": ASK, "delivery": "reject", "output_schema": schema()});
+        "prompt": prompt, "delivery": "reject", "output_schema": schema});
     for field in ["model", "effort"] {
         if let Some(on) = ran.and_then(|ran| ran[field].as_str()) {
             submit[field] = json!(on);

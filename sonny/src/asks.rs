@@ -1011,7 +1011,7 @@ fn meanwhile(ask: &Ask, now: i64) -> Option<Vec<(String, bool)>> {
 
 /// `epoch` as a clock shows it: the time today, else tomorrow's or the
 /// date's, as `11-03 09:30`.
-fn clock(epoch: i64, now: i64) -> String {
+pub fn clock(epoch: i64, now: i64) -> String {
     let (at, today) = (crate::trigger::local(epoch), crate::trigger::local(now));
     let time = format!("{:02}:{:02}", at.hour, at.minute);
     let tomorrow = crate::trigger::local(now + 24 * 3600);

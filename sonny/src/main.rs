@@ -27,6 +27,7 @@ mod config;
 mod declared;
 mod desktop;
 mod diff;
+mod done_check;
 mod embed;
 mod exec;
 mod footer;
@@ -565,13 +566,7 @@ async fn read_status(
     let mut profiles: HashMap<String, Option<String>> = HashMap::new();
     // With other leads in the folder, their tasks are theirs: each
     // lead shows as a row of its own.
-    let shared = lead != format!("{project}.lead")
-        || (listed.iter()).any(|bot| {
-            let name = bot["name"].as_str().unwrap_or("");
-            name != lead && project::lead_project(name) == Some(project.as_str())
-        });
-    let mine = (shared && project::lead_project(&lead) == Some(project.as_str()))
-        .then(|| lineage_of(&listed, &lead, lead == format!("{project}.lead")));
+    let mine = owned(&listed, &project, &lead);
     // Side chats are not the project's agents.
     let mut kept = HashMap::new();
     for bot in &listed {
@@ -695,7 +690,7 @@ async fn read_status(
         };
         let itself = seen.itself && name != lead && ran["status"] == "completed";
         let resolved =
-            itself || resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
+            itself || resolved::holds(resolved::read(&store, name), ran["turn"].as_i64(), running);
         // With no question asked, what its last reply left waiting on the
         // person, as a copy of it said, until a later turn starts.
         let mark = || {
@@ -725,6 +720,14 @@ async fn read_status(
         read.push(name.to_owned());
         if !running {
             idle.push(name.to_owned());
+        }
+        // What the done check last found, while no turn since began.
+        if let Some(answer) = done_check::read(&store, name, bot["bot_id"].as_i64().unwrap_or(-1))
+            .filter(|answer| done_check::holds(answer, ran["turn"].as_i64(), running))
+        {
+            let now = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+                .map_or(0, |d| d.as_secs() as i64);
+            step = answer.said(now);
         }
         if let Some(ask) = &ask {
             step = match waiting::is_mark(ask) {
@@ -3550,6 +3553,9 @@ struct App {
     switch_to: Option<String>,
     started: Instant,
     fleet: Option<Fleet>,
+    /// A lead's window's look for tasks idle long enough to ask whether
+    /// they are done ([`done_check`]).
+    done_sweep: done_check::Sweep,
     /// This window, noted as the one the person uses each time they do,
     /// so that its project's agents open where they look.
     marker: Option<mux::Marker>,
@@ -4172,6 +4178,19 @@ fn kin(
         }
         _ => Kin::None,
     }
+}
+
+/// With other leads in `project`'s folder, the bots among `listed` that
+/// are `lead`'s ([`lineage_of`]); none to tell apart, with it the only one.
+fn owned(listed: &[Value], project: &str, lead: &str) -> Option<std::collections::HashSet<String>> {
+    let first = lead == format!("{project}.lead");
+    let shared = !first
+        || (listed.iter()).any(|bot| {
+            let name = bot["name"].as_str().unwrap_or("");
+            name != lead && project::lead_project(name) == Some(project)
+        });
+    (shared && project::lead_project(lead) == Some(project))
+        .then(|| lineage_of(listed, lead, first))
 }
 
 /// The bots among `bots` (as `bots` lists them) that are `lead`'s: made by
@@ -5144,6 +5163,7 @@ impl App {
             switch_to: None,
             started: Instant::now(),
             fleet: None,
+            done_sweep: Default::default(),
             marker: None,
             held: Vec::new(),
             seen_node: 0,
@@ -5509,6 +5529,15 @@ impl App {
                     }
                 }
                 _ = tick.tick() => {
+                    if self.project.is_some() {
+                        self.done_sweep.look(&self.client, &self.store(), self.scope());
+                        // A task the check found done goes as one marked done does.
+                        if let Some(fleet) = &mut self.fleet {
+                            for task in self.done_sweep.done() {
+                                fleet.resolved(&task);
+                            }
+                        }
+                    }
                     changed |= self.moving()
                         || drawn.is_none_or(|at| at.elapsed() >= IDLE_FRAME);
                 }
@@ -21303,6 +21332,71 @@ mod tests {
         assert_eq!(fleet.doing["calc.ask"], "idle");
         assert_eq!(fleet.doing["calc.new"], "needs you");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The done check judges the turn that ran: a message steered into it
+    /// is newer in the daemon's list yet already taken, so /status shows
+    /// the task done, with the check's reason, until a turn of its own runs.
+    #[tokio::test]
+    async fn a_done_check_covers_messages_steered_into_the_turn_it_judged() {
+        let (client, _events) = daemon_with_events(json!({}), |asked| {
+            match asked["op"].as_str().unwrap_or_default() {
+                "bots" => json!({"bots": [
+                    {"name": "shop.lead", "bot_id": 1, "head": 1, "running_turn": null},
+                    {"name": "shop.fix", "bot_id": 2, "head": 1, "running_turn": null,
+                        "created_by": "shop.lead"},
+                ], "next_after": null}),
+                "turns" if asked["bot"] == "shop.fix" => json!({"turns": [
+                    {"turn": 4, "status": "steered", "finished_ms": 2},
+                    {"turn": 3, "status": "completed", "finished_ms": 2}]}),
+                "turns" => json!({"turns": []}),
+                "history_nodes" => json!({"nodes": []}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let dir = std::env::temp_dir().join(unique("sonny-done-steered"));
+        let store = dir.join("store");
+        let answer = done_check::Answer {
+            turn: 3,
+            done: true,
+            why: "its pull request merged".into(),
+            at: 0,
+        };
+        done_check::keep(&store, "shop.fix", 2, &answer).unwrap();
+        let scope = background::Scope {
+            project: "shop".into(),
+            lead: "shop.lead".into(),
+            glob: "shop.*".into(),
+        };
+        let view = StatusView {
+            bot: "",
+            asks: &[],
+            approvals: &[],
+            turn_model: None,
+            places: Default::default(),
+            aside: &|_| false,
+        };
+        let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
+        let read = read_status(
+            &client,
+            &store,
+            scope,
+            &HashMap::new(),
+            &mut latest,
+            &mut asks,
+            view,
+        )
+        .await
+        .unwrap();
+        let fix = read.rows.iter().find(|row| row.bot == "shop.fix").unwrap();
+        assert_eq!(fix.state, "done");
+        assert!(
+            fix.latest.starts_with("marked done by the check"),
+            "{}",
+            fix.latest
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A reply that left the person something to give, as the lookout's
