@@ -3111,11 +3111,47 @@ pub fn cleanup_by_default(lead: &Value, store: &Path, socket: &Path) {
     ) else {
         return;
     };
-    if let Some(mut schedule) = cleanup_schedule(&home, &sonny, lead, store, socket) {
+    if let Some((mut schedule, upgrade)) = cleanup_schedule(&home, &sonny, lead, store, socket) {
         std::thread::spawn(move || {
-            let failure = cleanup_failure(schedule.output());
+            let said = schedule.output();
+            if upgrade {
+                // Tried again at the next start until it is done.
+                let done = said.is_ok_and(|out| out.status.success());
+                crate::upgrade::once(&migrated_record(&home), CLEANUP_FRESH, || done);
+                return;
+            }
+            let failure = cleanup_failure(said);
             settle_cleanup(&home, failure.as_deref(), now());
         });
+    }
+}
+
+/// Upgrade migration (0.9.0): Sonny's own nightly cleanup, scheduled
+/// before each run started an agent of its own, is scheduled again with
+/// `--fresh`, keeping its model, effort and time, so no run reads the
+/// nights before it.
+pub const CLEANUP_FRESH: &str = "cleanup-fresh";
+
+fn migrated_record(home: &Path) -> PathBuf {
+    home.join(".agent/sonny/migrated")
+}
+
+/// Sonny's own nightly cleanup in `places` as scheduled before 0.9.0, sent
+/// the cleanup's own words and keeping one agent across runs: `Some(true)`
+/// when it names the model to keep (`--start`), `Some(false)` when it does
+/// not (`--bot`, as scheduling again without a model did before 0.9.0), and
+/// `None` when it is fresh, someone else's, or not there.
+fn cleanup_before_fresh(places: &Places) -> Option<bool> {
+    let job = places.job(agent_client::memory::AGENT);
+    let text = read_bounded(&job, MAX_ROW).ok()?;
+    let (trigger, _) = read_job(&text)?;
+    if trigger.message != agent_client::memory::CLEANUP_ASK {
+        return None;
+    }
+    match trigger.target {
+        Target::Start { fresh: false, .. } => Some(true),
+        Target::Bot { .. } => Some(false),
+        Target::Start { fresh: true, .. } => None,
     }
 }
 
@@ -3180,17 +3216,44 @@ pub fn cleanup_unscheduled(home: &Path) -> Option<(String, i64)> {
 }
 
 /// The `sonny memory schedule` that turns the cleanup on, unless it was
-/// scheduled here before or the lead has no model to run it on.
+/// scheduled here before or the lead has no model to run it on; or, for
+/// one scheduled before runs were fresh, that schedules it again as it is
+/// but fresh (true: [`CLEANUP_FRESH`]).
 fn cleanup_schedule(
     home: &Path,
     sonny: &Path,
     lead: &Value,
     store: &Path,
     socket: &Path,
-) -> Option<std::process::Command> {
-    let model = format!("{}/{}", lead["provider"].as_str()?, lead["model"].as_str()?);
-    if agent_client::memory::scheduled_once(home) {
-        return None;
+) -> Option<(std::process::Command, bool)> {
+    let upgrade = agent_client::memory::scheduled_once(home);
+    let mut words = vec!["memory".to_owned(), "schedule".to_owned()];
+    let model = || {
+        Some(format!(
+            "{}/{}",
+            lead["provider"].as_str()?,
+            lead["model"].as_str()?
+        ))
+    };
+    if upgrade {
+        if upgrade_done(home) {
+            return None;
+        }
+        let mut keeps_model = None;
+        // Nothing to do, now or later, once it is fresh or gone.
+        let done = crate::upgrade::once(&migrated_record(home), CLEANUP_FRESH, || {
+            keeps_model = cleanup_before_fresh(&Places::under(home));
+            keeps_model.is_none()
+        });
+        if done {
+            return None;
+        }
+        // One that names no model runs on the lead's, as a new one would.
+        if keeps_model == Some(false) {
+            words.extend(["--model".to_owned(), model()?]);
+        }
+    } else {
+        words.extend(["--model".to_owned(), model()?]);
     }
     let mut schedule = std::process::Command::new(sonny);
     // Absolute: `schedule` works in the memory folder, and adds the
@@ -3198,13 +3261,20 @@ fn cleanup_schedule(
     let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_owned());
     // Sonny's own, not an agent's: the automation is no agent's.
     schedule
-        .args(["memory", "schedule", "--model", &model])
+        .args(&words)
         .env("AGENT_STORE", absolute(store))
         .env("AGENT_SOCKET", absolute(socket))
         .env_remove("AGENT_BOT")
         .env_remove("AGENT_BOT_ID")
         .stdin(std::process::Stdio::null());
-    Some(schedule)
+    Some((schedule, upgrade))
+}
+
+/// Whether [`CLEANUP_FRESH`] ran here already: one read of its record.
+fn upgrade_done(home: &Path) -> bool {
+    crate::upgrade::lines(&migrated_record(home))
+        .iter()
+        .any(|id| id == CLEANUP_FRESH)
 }
 
 /// Each trigger made when it was a job of the system's own (a LaunchAgent
@@ -9244,7 +9314,8 @@ pub(crate) mod tests {
             Path::new("/s.sqlite"),
             Path::new("/s.sock"),
         );
-        let schedule = cleanup_schedule(&home, sonny, &lead, store, socket).unwrap();
+        let (schedule, upgrade) = cleanup_schedule(&home, sonny, &lead, store, socket).unwrap();
+        assert!(!upgrade);
         let args: Vec<_> = schedule
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -9264,7 +9335,8 @@ pub(crate) mod tests {
         // A relative socket is the one Sonny was given, wherever the
         // schedule then works.
         let here = std::env::current_dir().unwrap();
-        let relative = cleanup_schedule(&home, sonny, &lead, store, Path::new("s.sock")).unwrap();
+        let (relative, _) =
+            cleanup_schedule(&home, sonny, &lead, store, Path::new("s.sock")).unwrap();
         let socket_given = relative
             .get_envs()
             .find(|(k, _)| *k == "AGENT_SOCKET")
@@ -9279,6 +9351,88 @@ pub(crate) mod tests {
             "ref: refs/heads/main\n",
         )
         .unwrap();
+        assert!(cleanup_schedule(&home, sonny, &lead, store, socket).is_none());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_cleanup_scheduled_before_fresh_runs_is_scheduled_again_fresh_once() {
+        let home = std::env::temp_dir().join(format!("cleanup-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".agents/memory/.git")).unwrap();
+        std::fs::write(
+            home.join(".agents/memory/.git/HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+        let lead = json!({"provider": "openai", "model": "mini"});
+        let (sonny, store, socket) = (
+            Path::new("/bin/sonny"),
+            Path::new("/s.sqlite"),
+            Path::new("/s.sock"),
+        );
+        let places = Places::under(&home);
+        std::fs::create_dir_all(&places.jobs).unwrap();
+        let write = |target: Target, message: &str| {
+            let cleanup = Trigger {
+                name: "memory-cleanup".into(),
+                target,
+                when: "cron 15 2 * * *".into(),
+                message: message.into(),
+                ..trigger()
+            };
+            let when = When {
+                text: cleanup.when.clone(),
+                entries: Vec::new(),
+                not_before: None,
+                at: None,
+                watch: None,
+            };
+            let text = definition(sonny, &cleanup, &when, &[]);
+            std::fs::write(places.job("memory-cleanup"), text).unwrap();
+        };
+        let start = |fresh: bool| Target::Start {
+            name: "memory-cleanup".into(),
+            model: "anthropic/opus".into(),
+            effort: None,
+            by: None,
+            fresh,
+        };
+        let words = |schedule: &std::process::Command| -> Vec<String> {
+            (schedule.get_args())
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let record = home.join(".agent/sonny/migrated");
+        // Another automation by that name, the person's own words: left.
+        write(start(false), "Tidy my notes.");
+        assert!(cleanup_schedule(&home, sonny, &lead, store, socket).is_none());
+        assert_eq!(crate::upgrade::lines(&record), ["cleanup-fresh"]);
+        // Sonny's own, one agent across runs: scheduled again, keeping its
+        // model (and time, which `schedule` keeps), until that worked.
+        std::fs::remove_file(&record).unwrap();
+        write(start(false), agent_client::memory::CLEANUP_ASK);
+        let (again, upgrade) = cleanup_schedule(&home, sonny, &lead, store, socket).unwrap();
+        assert!(upgrade);
+        assert_eq!(words(&again), ["memory", "schedule"]);
+        assert!(crate::upgrade::lines(&record).is_empty());
+        // One that messages its agent names no model: the lead's.
+        write(
+            Target::Bot {
+                name: "memory-cleanup".into(),
+                id: 7,
+            },
+            agent_client::memory::CLEANUP_ASK,
+        );
+        let (bot, _) = cleanup_schedule(&home, sonny, &lead, store, socket).unwrap();
+        assert_eq!(
+            words(&bot),
+            ["memory", "schedule", "--model", "openai/mini"]
+        );
+        // Fresh already: done, and not read again.
+        write(start(true), agent_client::memory::CLEANUP_ASK);
+        assert!(cleanup_schedule(&home, sonny, &lead, store, socket).is_none());
+        write(start(false), agent_client::memory::CLEANUP_ASK);
         assert!(cleanup_schedule(&home, sonny, &lead, store, socket).is_none());
         std::fs::remove_dir_all(home).unwrap();
     }

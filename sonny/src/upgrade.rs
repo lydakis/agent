@@ -182,6 +182,13 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::git::NO_SNAPSHOTS,
         retire: "0.11.0",
     },
+    // Sonny's own nightly memory cleanup, scheduled before each run started
+    // an agent of its own, is scheduled again fresh, keeping its model and
+    // time (0.9.0).
+    Migration {
+        id: crate::trigger::CLEANUP_FRESH,
+        retire: "0.11.0",
+    },
 ];
 
 /// `run` once for each `record`: a file of the ids done, a line each,
