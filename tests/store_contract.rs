@@ -4711,7 +4711,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
             "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
-            "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null})
+            "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{}})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -16441,6 +16441,88 @@ fn a_bot_made_by_another_goes_by_its_creators_rules() {
         ..Default::default()
     };
     let refused = db.set_settings("Ann", None, &named, &empty).unwrap_err();
+    assert_eq!(refused.code, "invalid_setting");
+}
+
+#[test]
+fn a_bot_s_variables_are_its_creator_s() {
+    let mut db = db();
+    let env = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+        (pairs.iter())
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    };
+    let with = |pairs: &[(&str, &str)]| Settings {
+        env: env(pairs),
+        ..Default::default()
+    };
+    db.create(
+        "Ann",
+        Some("/synthetic"),
+        Binding {
+            settings: with(&[("SONNY_STATE", "/state/Ann")]),
+            ..binding()
+        },
+    )
+    .unwrap();
+    // Whatever a child is made with, it takes its creator's: none plants
+    // a variable that changes what its approved commands run.
+    let made = |db: &mut Database, name: &str, by: &str| {
+        let by_id = db.inspect(by).unwrap().bot_id;
+        db.create(
+            name,
+            Some("/synthetic"),
+            Binding {
+                created_by: Some(by),
+                created_by_id: Some(by_id),
+                settings: with(&[("LD_PRELOAD", "/tmp/x.so")]),
+                ..binding()
+            },
+        )
+        .unwrap();
+    };
+    made(&mut db, "Bob", "Ann");
+    made(&mut db, "Cat", "Bob");
+    assert_eq!(
+        db.inspect("Cat").unwrap().settings.env,
+        env(&[("SONNY_STATE", "/state/Ann")])
+    );
+    // Nor can it be given its own.
+    let named = ["env".to_owned()];
+    let refused = db
+        .set_settings("Bob", None, &named, &with(&[("PATH", "/tmp")]))
+        .unwrap_err();
+    assert_eq!(refused.code, "invalid_setting");
+    // The creator's change reaches every bot it made, and theirs.
+    let moved = with(&[("SONNY_STATE", "/state/Ann2")]);
+    let changed = db.set_settings("Ann", None, &named, &moved).unwrap();
+    assert_eq!(changed, ["env"]);
+    for name in ["Bob", "Cat"] {
+        assert_eq!(db.inspect(name).unwrap().settings.env, moved.env);
+    }
+    let changed = db
+        .set_settings("Ann", None, &named, &Settings::default())
+        .unwrap();
+    assert_eq!(changed, ["env"]);
+    assert_eq!(db.inspect("Cat").unwrap().settings, Settings::default());
+    // The daemon's own names, names no shell sets and NUL are refused.
+    for (name, value) in [
+        ("AGENT_SOCKET", "/s"),
+        ("agent_bot", "x"),
+        ("1X", "x"),
+        ("A-B", "x"),
+        ("", "x"),
+        ("OK", "a\0b"),
+    ] {
+        let refused = db
+            .set_settings("Ann", None, &named, &with(&[(name, value)]))
+            .unwrap_err();
+        assert_eq!(refused.code, "invalid_setting", "{name}");
+    }
+    let big = "x".repeat(17 << 10);
+    let refused = db
+        .set_settings("Ann", None, &named, &with(&[("BIG", &big)]))
+        .unwrap_err();
     assert_eq!(refused.code, "invalid_setting");
 }
 

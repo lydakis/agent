@@ -952,6 +952,9 @@ async fn make(
     });
     let state = lead.as_deref().and_then(crate::state::folder);
     let mut settings = crate::approvals::sandbox(mode, dir, state.as_deref());
+    if let Some(state) = &state {
+        settings.insert("env".into(), json!({crate::state::VAR: state}));
+    }
     let config = agent_client::config::load()?;
     if config.hide_senders {
         settings.insert("hide_senders".into(), json!(true));

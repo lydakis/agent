@@ -275,6 +275,13 @@ pub struct Settings {
     /// ([`crate::rules`]); a bot made by another goes by its creator's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rules: Option<crate::rules::Policy>,
+    /// Variables its commands get beside the daemon's environment, as
+    /// Codex's `shell_environment_policy.set` gives every shell its own;
+    /// the daemon's `AGENT_` ones are its own. A bot made by another goes
+    /// by its creator's, so none is made to run what leaves its sandbox
+    /// with a variable that changes what runs.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
 pub enum CacheTtl {
@@ -286,6 +293,8 @@ pub enum CacheTtl {
 const MIN_CONTEXT_BYTES: usize = 1024;
 /// The most a bot's command rules take as JSON.
 pub const RULES_JSON: usize = 256 << 10;
+/// The most a bot's `env` takes as JSON.
+pub const ENV_JSON: usize = 16 << 10;
 /// The most a bot's `writable` folders, and its `unix_sockets`, each take
 /// as JSON, by their real paths, so a reply that repeats them has a bound.
 pub const FOLDERS_JSON: usize = 32 << 10;
@@ -356,10 +365,12 @@ impl Settings {
     /// inherit their parent's. A sandboxed creator's child takes the
     /// creator's sandbox and writable folders unless it names a stricter
     /// sandbox, and reaches the network only if both do. Every child goes
-    /// by its creator's command rules, so none is made to get past them.
+    /// by its creator's command rules and `env`, so none is made to get
+    /// past them.
     pub fn under(mut self, creator: &Settings) -> Settings {
         use crate::sandbox::Mode;
         self.rules = creator.rules.clone();
+        self.env = creator.env.clone();
         let sandboxed = |settings: &Settings| {
             matches!(
                 settings.sandbox,
@@ -464,6 +475,25 @@ impl Settings {
                 return refuse("rules take at most 256 KiB as JSON");
             }
         }
+        if crate::output::encoded_len(&self.env).unwrap_or(usize::MAX) > ENV_JSON {
+            return refuse("env takes at most 16 KiB as JSON");
+        }
+        for (name, value) in &self.env {
+            // A name a shell can set: a letter or `_`, then letters,
+            // digits and `_`, and none of the daemon's own.
+            let named = name.len() <= 128
+                && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            if !named {
+                return refuse("env names are a letter or _, then letters, digits and _");
+            }
+            if name.to_ascii_uppercase().starts_with("AGENT_") {
+                return refuse("env: AGENT_ variables are the daemon's own");
+            }
+            if value.contains('\0') {
+                return refuse("env values hold no NUL");
+            }
+        }
         if self.writable.len() > 64
             || crate::output::encoded_len(&self.writable).unwrap_or(usize::MAX) > FOLDERS_JSON
         {
@@ -503,7 +533,7 @@ impl Settings {
             "hide_senders":self.hide_senders,"quiet_background":self.quiet_background,
             "hold_ms":self.hold_ms(),
             "unix_sockets":self.unix_sockets,
-            "rules":self.rules})
+            "rules":self.rules,"env":self.env})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())
@@ -511,10 +541,13 @@ impl Settings {
             .transpose()?)
     }
 }
+/// The settings a bot made by another takes from its creator, always,
+/// and that go to the bots it made when they change.
+const INHERITED: [&str; 2] = ["rules", "env"];
 /// The settings that make a bot's sandbox, which change together.
 pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 22] = [
+pub const SETTINGS: [&str; 23] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -537,6 +570,7 @@ pub const SETTINGS: [&str; 22] = [
     "max_rounds",
     "unix_sockets",
     "rules",
+    "env",
 ];
 /// Settings as their stored fields, those at their defaults left out.
 fn settings_map(settings: &Settings) -> Result<serde_json::Map<String, Value>> {
@@ -3235,7 +3269,7 @@ impl Database {
         // keeps the rules it had, and its client sets them from then on, as
         // no creator's sandbox holds it either.
         if let Some(creator) = bot.created_by_id
-            && named.iter().any(|key| key == "rules")
+            && let Some(key) = named.iter().find(|key| INHERITED.contains(&key.as_str()))
             && self
                 .conn
                 .query_row("SELECT 1 FROM bots WHERE id=?", [creator], |_| Ok(()))
@@ -3244,7 +3278,7 @@ impl Database {
         {
             return fail_with(
                 "invalid_setting",
-                "rules: a bot made by another goes by its creator's rules",
+                format!("{key}: a bot made by another goes by its creator's {key}"),
             );
         }
         let confining = named.iter().any(|key| SANDBOX.contains(&key.as_str()));
@@ -3284,25 +3318,36 @@ impl Database {
         let mut kin = Vec::new();
         let tx = self.conn.savepoint()?;
         tx.execute("UPDATE bots SET settings=? WHERE id=?", params![stored, id])?;
-        // The bots it made, and theirs, go by the same rules.
-        if changed.iter().any(|key| key == "rules") {
-            let rules = settings
-                .rules
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?;
-            let mut updating = tx.prepare(
+        // The bots it made, and theirs, go by the same rules and `env`.
+        for key in INHERITED {
+            if !changed.iter().any(|changed| changed == key) {
+                continue;
+            }
+            let value = match key {
+                "rules" => (settings.rules.as_ref())
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                _ => (!settings.env.is_empty())
+                    .then(|| serde_json::to_string(&settings.env))
+                    .transpose()?,
+            };
+            let mut updating = tx.prepare_cached(&format!(
                 "WITH RECURSIVE kin(id) AS (
                      SELECT id FROM bots WHERE created_by_id=?1
                      UNION SELECT b.id FROM bots b JOIN kin ON b.created_by_id=kin.id)
                  UPDATE bots SET settings=NULLIF(CASE WHEN ?2 IS NULL
-                     THEN json_remove(COALESCE(settings,'{}'),'$.rules')
-                     ELSE json_set(COALESCE(settings,'{}'),'$.rules',json(?2)) END,'{}')
+                     THEN json_remove(COALESCE(settings,'{{}}'),'$.{key}')
+                     ELSE json_set(COALESCE(settings,'{{}}'),'$.{key}',json(?2)) END,'{{}}')
                  WHERE id IN kin RETURNING name",
-            )?;
-            kin = updating
-                .query_map(params![id, rules], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<_>>()?;
+            ))?;
+            let named = updating
+                .query_map(params![id, value], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            for name in named {
+                if !kin.contains(&name) {
+                    kin.push(name);
+                }
+            }
         }
         tx.commit()?;
         changed.sort();

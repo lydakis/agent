@@ -1658,6 +1658,10 @@ async fn run() -> Result<(), String> {
     {
         app.gating = Some(mode);
     }
+    // A lead's shell names its state folder, in every row.
+    if project.is_some() {
+        app.env = (app.state.as_deref()).and_then(|state| state::env(&bot, state));
+    }
     // A bot made with no prompt-cache lifetime takes Sonny's, so an idle gap
     // of over five minutes no longer rereads it all; a chosen one stays.
     if options.side.is_none() {
@@ -1826,8 +1830,12 @@ pub(crate) fn made(
                 .filter(|bot| !bot.is_empty())
         })
         .or_else(|| asked["bot"].as_str().map(str::to_owned));
-    let state = owner.as_deref().and_then(state::folder);
+    let state = state::inherited().or_else(|| owner.as_deref().and_then(state::folder));
     let mut settings = approvals::sandbox(mode, workspace, state.as_deref());
+    // Named in its shell too; one another bot makes takes its maker's.
+    if let Some(state) = &state {
+        settings.insert("env".into(), json!({state::VAR: state}));
+    }
     if let Some(ttl) = agent_client::policy::cache_ttl(model) {
         settings.insert("cache_ttl".into(), json!(ttl));
     }
@@ -3099,6 +3107,8 @@ struct App {
     mode: Option<&'static str>,
     /// The state folder its sandbox writes, its lead's ([`state`]).
     state: Option<String>,
+    /// Its `env` setting, waiting to name its state folder in its shell.
+    env: Option<Value>,
     /// `/permissions` or `/fast`, open over the composer.
     choosing: Option<(Choice, list::Picker)>,
     /// The rows `/permissions` lists, as the config had them when it opened.
@@ -4457,6 +4467,7 @@ impl App {
             declared: record["declared"].clone(),
             mode: approvals::mode(record),
             state: state::of(record, &bot),
+            env: None,
             choosing: None,
             rows: Vec::new(),
             reviewing: std::collections::HashSet::new(),
@@ -4893,6 +4904,7 @@ impl App {
             && self.declare.is_none()
             && self.cache.is_none()
             && self.pace.is_none()
+            && self.env.is_none()
         {
             return true;
         }
@@ -4902,6 +4914,7 @@ impl App {
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
         let cache = self.cache.take();
         let pace = self.pace.take();
+        let env = self.env.take();
         let mut declare = self.declare.take();
         // A bot that went without the tools Sonny gates, as its gate was
         // not Sonny's, has them with the mode the person picks.
@@ -4932,6 +4945,9 @@ impl App {
         }
         if let Some(speed) = pace {
             settings.insert("speed".into(), json!(speed));
+        }
+        if let Some(env) = env {
+            settings.insert("env".into(), env);
         }
         if let (Some(mode), Value::Object(fields)) = (gating, &mut asked) {
             let declared = declare.as_ref().unwrap_or(&self.declared);

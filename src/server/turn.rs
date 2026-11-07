@@ -2291,13 +2291,17 @@ impl Turn {
         // level when it has one, the bot's own name
         // so a created peer records who created it, this turn so a prompt it
         // submits records whose model wrote it, and its creator so a peer
-        // can address the bot that spawned it.
-        let mut environment = vec![
+        // can address the bot that spawned it. Before them, the variables
+        // its client gave it, its `env` setting.
+        let mut environment: Vec<(String, String)> = (record.settings.env.iter())
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        environment.extend([
             ("AGENT_MODEL".to_owned(), context.model.clone()),
             ("AGENT_BOT".to_owned(), context.bot.clone()),
             ("AGENT_BOT_ID".to_owned(), context.bot_id.to_string()),
             ("AGENT_TURN".to_owned(), turn.to_string()),
-        ];
+        ]);
         if let Some(level) = &record.effort {
             environment.push(("AGENT_EFFORT".to_owned(), level.clone()));
         }

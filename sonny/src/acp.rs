@@ -1639,6 +1639,10 @@ async fn setup_lead(
         ));
         fields.insert("settings".into(), Value::Object(sandbox(mode)));
     }
+    // Its shell names its state folder, in every row.
+    if let Some(env) = (state.as_deref()).and_then(|state| crate::state::env(&record, state)) {
+        asked["settings"]["env"] = env;
+    }
     // A lead at work keeps its setup until the next thread finds it idle.
     if asked.as_object().is_some_and(|fields| fields.len() > 1) {
         match client.request("configure", asked.clone()).await {

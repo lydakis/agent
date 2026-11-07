@@ -10,6 +10,10 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+/// The variable that names an agent's state folder in its shell, its
+/// tasks' and those of the agents they make, which take their creator's.
+pub const VAR: &str = "SONNY_STATE";
+
 /// Where the state folders are, unmade.
 fn root() -> Option<PathBuf> {
     base().map(|base| base.join("sonny/agents"))
@@ -80,18 +84,38 @@ fn inside(roots: &[PathBuf], path: &str) -> bool {
     })
 }
 
-/// The state folder `record`, a bot as `inspect` gives it, writes now: the
-/// first of its writable folders that is one. An agent keeps the folder it
-/// was made with, its lead's for a task.
+/// The state folder `record`, a bot as `inspect` gives it, has now: the
+/// one its shell names, else the first of its writable folders that is
+/// one. An agent keeps the folder it was made with, its lead's for a task.
 pub fn kept(record: &Value) -> Option<String> {
     let roots = roots();
-    (record["settings"]["writable"]
-        .as_array()
-        .into_iter()
-        .flatten())
-    .filter_map(Value::as_str)
-    .find(|path| inside(&roots, path))
-    .map(str::to_owned)
+    let settings = &record["settings"];
+    let writable = settings["writable"].as_array().into_iter().flatten();
+    (settings["env"][VAR].as_str().into_iter())
+        .chain(writable.filter_map(Value::as_str))
+        .find(|path| inside(&roots, path))
+        .map(str::to_owned)
+}
+
+/// The state folder of the agent whose shell runs this, as its shell
+/// names it.
+pub fn inherited() -> Option<String> {
+    std::env::var(VAR).ok().filter(|path| within(path))
+}
+
+/// The `env` setting that names `state` in the shell of the bot `record`
+/// describes, when it does not yet: its own variables with [`VAR`]. None
+/// for a bot another made, which goes by its creator's variables.
+pub fn env(record: &Value, state: &str) -> Option<Value> {
+    if !record["created_by"].is_null() || !record["created_by_id"].is_null() {
+        return None;
+    }
+    let mut env = (record["settings"]["env"].as_object().cloned()).unwrap_or_default();
+    if env.get(VAR).and_then(Value::as_str) == Some(state) {
+        return None;
+    }
+    env.insert(VAR.into(), Value::from(state));
+    Some(Value::Object(env))
 }
 
 /// The state folder of the agent `name` that `record`, as `inspect` gives
@@ -150,5 +174,25 @@ mod tests {
         assert_eq!(of(&older, "calc.fix").as_deref(), Some(lead.as_str()));
         let alone = json!({"settings": {"writable": []}});
         assert_eq!(of(&alone, "calc.lead").as_deref(), Some(lead.as_str()));
+        // In full access, by the variable its shell has.
+        let full = json!({"settings": {"env": {"SONNY_STATE": lead}}, "created_by": "calc.lead"});
+        assert_eq!(kept(&full).as_deref(), Some(lead.as_str()));
+    }
+
+    #[test]
+    fn a_lead_s_shell_names_its_folder_and_keeps_its_other_variables() {
+        let lead = folder("env.lead").unwrap();
+        let bare = json!({"settings": {}});
+        assert_eq!(env(&bare, &lead), Some(json!({"SONNY_STATE": lead})));
+        let other = json!({"settings": {"env": {"LANG": "C", "SONNY_STATE": "/old"}}});
+        assert_eq!(
+            env(&other, &lead),
+            Some(json!({"LANG": "C", "SONNY_STATE": lead}))
+        );
+        let named = json!({"settings": {"env": {"SONNY_STATE": lead}}});
+        assert_eq!(env(&named, &lead), None);
+        // A task goes by its lead's.
+        let task = json!({"settings": {}, "created_by": "env.lead", "created_by_id": 1});
+        assert_eq!(env(&task, &lead), None);
     }
 }
