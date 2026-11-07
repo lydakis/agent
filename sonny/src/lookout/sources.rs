@@ -752,7 +752,7 @@ async fn emit(
     let Some(mut event) = Event::parse(&source.name, line, super::epoch_ms()) else {
         return true;
     };
-    if event.id.as_deref().is_some_and(|id| !seen.first(id)) {
+    if event.id.as_deref().is_some_and(|id| seen.ids.contains(id)) {
         return true;
     }
     event.digest = digest(source);
@@ -763,7 +763,16 @@ async fn emit(
         event.steer = true;
     }
     shape.saw(&event.fields, event.topic.as_deref());
-    sent.send(Said::Event(Box::new(event))).await.is_ok()
+    let id = event.id.clone();
+    if sent.send(Said::Event(Box::new(event))).await.is_err() {
+        return false;
+    }
+    // Only once it is sent: a run stopped while it waited to send leaves
+    // its ID unseen, so the run after it sends it again.
+    if let Some(id) = id {
+        seen.first(&id);
+    }
+    true
 }
 
 /// IDs a source printed lately.
@@ -1029,10 +1038,16 @@ impl Shape {
         while shape.recent.len() > SHAPE_RECENT {
             shape.recent.pop_front();
         }
-        for topic in (value["topics"].as_array().into_iter().flatten()).take(SHAPE_TOPICS) {
-            if let Some(topic) = topic.as_str() {
-                shape.topics.insert(topic.to_owned(), shape.events);
-            }
+        // Newest first, as written: each a step older than the one before,
+        // so the least recent is still the one a new topic puts out.
+        let topics = value["topics"].as_array().into_iter().flatten();
+        for (age, topic) in topics
+            .filter_map(Value::as_str)
+            .take(SHAPE_TOPICS)
+            .enumerate()
+        {
+            let last = shape.events.saturating_sub(age as u64);
+            shape.topics.entry(topic.to_owned()).or_insert(last);
         }
         shape.written_kinds = shape.kinds();
         shape
@@ -2002,6 +2017,14 @@ mod tests {
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(written["topics"], json!(["eng", "deploys"]));
+        // Read again, as after a restart, the newest is still first and the
+        // least recent still goes first.
+        let mut again = Shape::read(file.clone());
+        assert_eq!(again.to_json()["topics"], json!(["eng", "deploys"]));
+        for n in 0..SHAPE_TOPICS - 1 {
+            again.saw(&json!({"text": "x"}), Some(&format!("t{n}")));
+        }
+        assert!(again.topics.contains_key("eng") && !again.topics.contains_key("deploys"));
         // At most `SHAPE_TOPICS`, the least recent going first.
         let mut shape = Shape::read(file);
         for n in 0..SHAPE_TOPICS {
