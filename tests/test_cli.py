@@ -1696,6 +1696,10 @@ class ModelListTests(ModelFixture):
         other = ['--store', str(self.path / 'side.sqlite')]
         self.addCleanup(lambda: self.agent('shutdown', *other, check=False))
         self.agent('stats', *other, '--provider', f'openai=responses,{self.url}')
+        # Nor does one on another store in the home store's own folder.
+        beside = ['--store', str(self.state.with_name('side.sqlite'))]
+        self.addCleanup(lambda: self.agent('shutdown', *beside, check=False))
+        self.agent('stats', *beside, '--provider', f'openai=responses,{self.url}')
         time.sleep(1)
         self.assertFalse(self.list.exists())
         self.assertEqual(getattr(self.model, 'listings', 0), 0)

@@ -1077,11 +1077,18 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
         command.arg("--provider-config").arg(file);
     }
     // The list clients offer, kept current by every start of the daemon of
-    // the store beside it; a daemon on another store (a test, a side
-    // daemon) leaves it alone.
+    // the home store beside it (`state.sqlite`); a daemon on another store
+    // (a test, a side daemon, another file in the same folder) leaves it
+    // alone. The folder is compared resolved, so an alias of it counts.
     if let Some(models) = agent_client::models::path().filter(|models| {
-        let folder = |path: &Path| path.parent().and_then(|p| std::fs::canonicalize(p).ok());
-        folder(models).is_some() && folder(models) == folder(&options.store)
+        let place = |path: &Path| {
+            Some((
+                std::fs::canonicalize(path.parent()?).ok()?,
+                path.file_name()?.to_owned(),
+            ))
+        };
+        let home = place(&models.with_file_name("state.sqlite"));
+        home.is_some() && home == place(&options.store)
     }) {
         command.arg("--models").arg(models);
     }
