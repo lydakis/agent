@@ -45,7 +45,7 @@ mod imp {
     use super::{c_path, notify, split};
     use std::collections::HashMap;
     use std::ffi::OsString;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::path::{Path, PathBuf};
     use tokio::{io::unix::AsyncFd, sync::mpsc};
 
@@ -59,11 +59,11 @@ mod imp {
 
     /// Watches the folder `path` is in for entries named as it is: the
     /// watch descriptor and the name.
-    fn add(fd: &impl AsRawFd, path: &Path) -> std::io::Result<(i32, OsString)> {
+    fn add(fd: RawFd, path: &Path) -> std::io::Result<(i32, OsString)> {
         let (folder, name) = split(path)?;
         let folder = c_path(&folder)?;
         // SAFETY: fd is a live inotify fd and folder a NUL-terminated path.
-        let wd = unsafe { libc::inotify_add_watch(fd.as_raw_fd(), folder.as_ptr(), MASK) };
+        let wd = unsafe { libc::inotify_add_watch(fd, folder.as_ptr(), MASK) };
         if wd < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -82,11 +82,11 @@ mod imp {
         // changes, and what it resolves to, which an edit through a link
         // (into a dotfiles checkout) changes without touching the name.
         let mut names: HashMap<i32, Vec<OsString>> = HashMap::new();
-        let (own, name) = add(&fd, &path)?;
+        let (own, name) = add(fd.as_raw_fd(), &path)?;
         names.entry(own).or_default().push(name);
         let mut target = std::fs::canonicalize(&path).ok();
         if let Some(resolved) = &target
-            && let Ok((wd, name)) = add(&fd, resolved)
+            && let Ok((wd, name)) = add(fd.as_raw_fd(), resolved)
         {
             names.entry(wd).or_default().push(name);
         }
@@ -156,12 +156,22 @@ mod imp {
                     continue;
                 }
                 // The link may name another file now: watch that one too.
-                let resolved = tokio::fs::canonicalize(&path).await.ok();
-                if resolved.is_some() && resolved != target {
-                    target = resolved;
-                    if let Some(resolved) = &target
-                        && let Ok((wd, name)) = add(fd.get_ref(), resolved)
-                    {
+                // Resolving and watching touch the filesystem: off the
+                // runtime thread. The descriptor outlives the wait.
+                let (raw, given, was) = (fd.get_ref().as_raw_fd(), path.clone(), target.clone());
+                let found = tokio::task::spawn_blocking(move || {
+                    let resolved = std::fs::canonicalize(&given).ok()?;
+                    let added = (Some(&resolved) != was.as_ref())
+                        .then(|| add(raw, &resolved).ok())
+                        .flatten();
+                    Some((resolved, added))
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some((resolved, added)) = found {
+                    target = Some(resolved);
+                    if let Some((wd, name)) = added {
                         let names = names.entry(wd).or_default();
                         if !names.contains(&name) {
                             names.push(name);
@@ -305,7 +315,12 @@ mod imp {
                     // The file may be another inode now: watch the one
                     // there, the old one's watch ending as it closes.
                     drop(file.take());
-                    file = open_events(&path).ok();
+                    // Opening resolves the path: off the runtime thread.
+                    let given = path.clone();
+                    file = tokio::task::spawn_blocking(move || open_events(&given).ok())
+                        .await
+                        .ok()
+                        .flatten();
                     if let Some(file) = &file
                         && register(queue.get_ref(), file, FILE).is_err()
                     {
