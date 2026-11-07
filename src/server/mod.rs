@@ -693,7 +693,8 @@ impl ProviderSpec {
     /// `bedrock` (Claude) defaults to Bedrock runtime, where cross-region
     /// inference profiles (`global.anthropic.…`) route to whichever region
     /// holds the model, from any source region the profile supports, and `bedrock-openai` to Bedrock Mantle, as Claude
-    /// Code and Codex default. Both are in the region the AWS SDKs would
+    /// Code and Codex default; `bedrock-openai-runtime` is runtime's
+    /// OpenAI-compatible route, for models served only there. All are in the region the AWS SDKs would
     /// use (`aws::region`). Any Bedrock URL without a key variable signs
     /// with SigV4, and one with a key variable sends it as a Bedrock API
     /// key; the defaults take `AWS_BEARER_TOKEN_BEDROCK` when it is set.
@@ -747,6 +748,13 @@ impl ProviderSpec {
             "bedrock-openai" => (
                 "responses",
                 "https://bedrock-mantle.{region}.api.aws/openai/v1",
+                Some(BEDROCK_KEY),
+            ),
+            // Runtime's OpenAI-compatible route, as Codex's
+            // `amazon-bedrock-runtime`: some models are served only there.
+            "bedrock-openai-runtime" => (
+                "responses",
+                "https://bedrock-runtime.{region}.amazonaws.com/openai/v1",
                 Some(BEDROCK_KEY),
             ),
             _ => ("", "", None),
@@ -879,6 +887,9 @@ pub struct Configuration {
     pub walled: Vec<PathBuf>,
     /// The context windows the person set, by model path.
     pub context_windows: Arc<agent_runtime::provider::Windows>,
+    /// The model list clients offer (`~/.agent/models`), refreshed from the
+    /// providers' listings each time the daemon starts; none leaves it be.
+    pub models: Option<PathBuf>,
 }
 
 /// `path` by its real path, or, while it doesn't exist, by the real path
@@ -1833,6 +1844,9 @@ pub async fn run(config: Configuration) -> Result<()> {
     // the config): every held turn is tried again at once.
     service.retry_held(None).await?;
     service.holds_due().await?;
+    if let Some(path) = config.models.clone() {
+        tokio::spawn(refresh_models(service.providers.clone(), path));
+    }
     let idle_exit = config
         .idle_exit
         .filter(|_| config.socket.is_some())
@@ -3874,25 +3888,7 @@ impl Service {
                 // Off the dispatch path: a listing waits on the network.
                 let (providers, output) = (self.providers.clone(), output.clone());
                 tokio::spawn(async move {
-                    let mut names: Vec<String> = providers.keys().cloned().collect();
-                    names.sort();
-                    // A few at a time, so bodies being read stay a few limits'
-                    // worth, and all within one deadline however many there are.
-                    let by = tokio::time::Instant::now() + Duration::from_secs(15);
-                    let asks = names.clone().into_iter().map(|name| {
-                        let providers = providers.clone();
-                        async move {
-                            tokio::time::timeout_at(by, providers[&name].models())
-                                .await
-                                .unwrap_or_else(|_| Err(Error::new("provider_models_deadline")))
-                        }
-                    });
-                    let listed: Vec<_> = futures_util::StreamExt::collect(
-                        futures_util::StreamExt::buffered(futures_util::stream::iter(asks), 4),
-                    )
-                    .await;
-                    let answer = fit_listings(names.into_iter().zip(listed), output::MAX_EVENT)
-                        .map(|answer| json!({"providers": answer}));
+                    let answer = provider_models(providers).await;
                     retention_reply(session, &output, id, answer).await;
                 });
                 Err(Error::new("deferred"))
@@ -5236,6 +5232,43 @@ async fn retention_reply(session: u64, output: &Output, id: Value, result: Resul
     sent
 }
 
+/// Every provider's listing, as `provider_models` answers: a few asked at
+/// a time, so bodies being read stay a few limits' worth, and all within
+/// one deadline however many there are.
+async fn provider_models(providers: Arc<HashMap<String, Provider>>) -> Result<Value> {
+    let mut names: Vec<String> = providers.keys().cloned().collect();
+    names.sort();
+    let by = tokio::time::Instant::now() + Duration::from_secs(15);
+    let asks = names.clone().into_iter().map(|name| {
+        let providers = providers.clone();
+        async move {
+            tokio::time::timeout_at(by, providers[&name].models())
+                .await
+                .unwrap_or_else(|_| Err(Error::new("provider_models_deadline")))
+        }
+    });
+    let listed: Vec<_> = futures_util::StreamExt::collect(futures_util::StreamExt::buffered(
+        futures_util::stream::iter(asks),
+        4,
+    ))
+    .await;
+    fit_listings(names.into_iter().zip(listed), output::MAX_EVENT)
+        .map(|answer| json!({"providers": answer}))
+}
+
+/// The model list at `path`, brought up to date from every provider's
+/// listing once the daemon serves: after `ready`, so a start waits on no
+/// provider, and the listings stay kept for the clients that ask next.
+/// What it changed is in the file; a provider that did not answer leaves
+/// its lines as they were.
+async fn refresh_models(providers: Arc<HashMap<String, Provider>>, path: PathBuf) {
+    let Ok(listing) = provider_models(providers).await else {
+        return;
+    };
+    let _ =
+        tokio::task::spawn_blocking(move || agent_client::models::refresh(&path, &listing)).await;
+}
+
 /// One `provider_models` reply carries every listing, so it must fit one
 /// event of `limit` bytes: a listing past what is left is refused by name
 /// rather than failing the whole answer. Room for each refusal is held back
@@ -5450,6 +5483,13 @@ mod tests {
             "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
         );
         assert!(openai.sigv4);
+        let runtime = parse("bedrock-openai-runtime");
+        assert_eq!(runtime.family, Family::Responses);
+        assert_eq!(
+            runtime.url,
+            "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"
+        );
+        assert!(runtime.sigv4);
         // AWS_DEFAULT_REGION is the fallback name the AWS CLI also reads.
         let fallback = |name: &str| (name == "AWS_DEFAULT_REGION").then(|| "eu-west-1".to_owned());
         assert_eq!(
@@ -5471,7 +5511,7 @@ mod tests {
             "AWS_REGION" => Some("us-west-2".to_owned()),
             _ => None,
         };
-        for name in ["bedrock", "bedrock-openai"] {
+        for name in ["bedrock", "bedrock-openai", "bedrock-openai-runtime"] {
             let keyed = ProviderSpec::parse_with(name, &keyed_env, &none).unwrap();
             assert_eq!(keyed.key_env.as_deref(), Some("AWS_BEARER_TOKEN_BEDROCK"));
             assert!(!keyed.sigv4 && keyed.url.contains(".us-west-2."));

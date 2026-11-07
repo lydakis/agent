@@ -201,11 +201,11 @@ impl Provider {
                 if self.url.host_str() == Some("api.openai.com") {
                     models.retain(|model| model["id"].as_str().is_some_and(openai_text));
                 }
-                if let Some((_, service)) = aws::endpoint(&self.url) {
+                if aws::endpoint(&self.url).is_some() {
                     models.retain(|model| {
                         model["id"]
                             .as_str()
-                            .is_some_and(|id| bedrock_runs(service, self.family, id))
+                            .is_some_and(|id| bedrock_runs(self.family, id))
                     });
                 }
                 return Ok(models);
@@ -320,18 +320,21 @@ fn openai_text(id: &str) -> bool {
 
 /// Whether a Bedrock model id is one of the family its binding speaks:
 /// Anthropic's models (`anthropic.`, perhaps under a routing prefix such as
-/// `global.`) on the Messages route; on Responses, every other Mantle model
-/// and runtime's OpenAI ones, the only family its Responses route serves.
+/// `global.`) on the Messages route, every other model on Responses, on
+/// Mantle and runtime alike. Runtime's OpenAI-compatible route serves
+/// models from other vendors too (some only there), so none is guessed
+/// away by its name; the person deletes what they don't use, and a
+/// deleted line stays deleted.
 ///
 /// gpt-oss is listed but refused on the Responses route ("does not support
 /// the '/openai/v1/responses' API", docs/BEDROCK.md), so it is offered on
 /// neither.
-fn bedrock_runs(service: &str, family: Family, id: &str) -> bool {
+fn bedrock_runs(family: Family, id: &str) -> bool {
     let vendor = |name: &str| id.split('.').any(|part| part == name);
     !id.contains("gpt-oss")
         && match family {
             Family::Anthropic => vendor("anthropic"),
-            Family::Responses => !vendor("anthropic") && (service != "bedrock" || vendor("openai")),
+            Family::Responses => !vendor("anthropic"),
         }
 }
 
@@ -538,7 +541,7 @@ mod tests {
     #[test]
     fn bedrock_offers_each_binding_only_its_own_family() {
         use super::bedrock_runs;
-        let mantle = |family, id| bedrock_runs("bedrock-mantle", family, id);
+        let mantle = bedrock_runs;
         assert!(mantle(Family::Anthropic, "anthropic.claude-sonnet-5"));
         assert!(mantle(
             Family::Anthropic,
@@ -550,18 +553,19 @@ mod tests {
         assert!(!mantle(Family::Responses, "anthropic.claude-sonnet-5"));
         assert!(!mantle(Family::Responses, "openai.gpt-oss-20b"));
         assert!(!mantle(Family::Anthropic, "openai.gpt-oss-120b"));
-        // Runtime's Responses route serves OpenAI's models only.
-        let runtime = |family, id| bedrock_runs("bedrock", family, id);
+        // Runtime's OpenAI-compatible route serves other vendors too.
+        let runtime = bedrock_runs;
         assert!(runtime(
             Family::Anthropic,
             "global.anthropic.claude-opus-5-5"
         ));
         assert!(runtime(Family::Responses, "us.openai.gpt-6-luna"));
+        assert!(runtime(Family::Responses, "us.xai.grok-4-7"));
+        assert!(!runtime(Family::Anthropic, "global.openai.gpt-6-luna"));
         assert!(!runtime(
             Family::Responses,
-            "us.meta.llama4-maverick-17b-instruct-v1:0"
+            "global.anthropic.claude-opus-5-5"
         ));
-        assert!(!runtime(Family::Anthropic, "global.openai.gpt-6-luna"));
     }
 
     #[test]

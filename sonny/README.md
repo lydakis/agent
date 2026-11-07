@@ -165,9 +165,10 @@ for Bedrock), `--model PROVIDER/MODEL`, `--import-mcp [codex,claude,...]`
 has, what is set, the MCP servers to bring, missing tools and setup steps. Either step also suggests efforts, `[sonny] lead_effort =
 "medium"` and `task_effort = "high"`, unless the config already sets them,
 and says on stderr which it wrote.
-Outside a terminal both fail, naming what to set. The first start also writes
-`~/.agent/models`, the list agents read with `agent models`, when there is
-none, as `agent models --discover` does.
+Outside a terminal both fail, naming what to set. Every daemon start keeps
+`~/.agent/models`, the list agents read with `agent models`, current from the
+providers' listings, writing a first one when there is none, as `agent models
+--discover` does.
 
 `sonny setup backup URL` keeps the person's home off the machine, for one
 that may be rebuilt or lost: memory, skills and profiles (`~/.agents`) and

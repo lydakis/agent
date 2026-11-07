@@ -977,7 +977,7 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     if options.providers.is_empty() {
         return fail_with(
             "provider_required",
-            "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, bedrock, bedrock-openai, or NAME=FAMILY,URL,KEY_ENV), set AGENT_PROVIDER, or export a provider key",
+            "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, bedrock, bedrock-openai, bedrock-openai-runtime, or NAME=FAMILY,URL,KEY_ENV), set AGENT_PROVIDER, or export a provider key",
         );
     }
     // The daemon's folder and log are its user's alone, as the daemon
@@ -1062,6 +1062,15 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
         command
             .arg("--context-window")
             .arg(format!("{pattern}={tokens}"));
+    }
+    // The list clients offer, kept current by every start of the daemon of
+    // the store beside it; a daemon on another store (a test, a side
+    // daemon) leaves it alone.
+    if let Some(models) = agent_client::models::path().filter(|models| {
+        let folder = |path: &Path| path.parent().and_then(|p| std::fs::canonicalize(p).ok());
+        folder(models).is_some() && folder(models) == folder(&options.store)
+    }) {
+        command.arg("--models").arg(models);
     }
     agent_client::own_session(&mut command);
     let mut child = command
@@ -1551,25 +1560,31 @@ fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
 }
 
 /// The models clients offer, from `~/.agent/models`; reading it needs no
-/// daemon. `--discover` first writes one from the listings of the providers
-/// the daemon runs, and never replaces a list that exists.
+/// daemon. `--discover` brings it up to date from the listings of the
+/// providers the daemon runs, as every daemon start does, or writes a first
+/// one, and says on stderr what changed.
 fn models(options: &Options) -> Result<i32> {
     let path = agent_client::models::path().ok_or(Error::with("usage", "set HOME"))?;
     if options.discover {
-        if path.exists() {
-            return fail_with(
-                "models_file_exists",
-                format!(
-                    "{}: edit it, or remove it to discover again",
-                    path.display()
-                ),
-            );
-        }
         let mut connection = ensure_daemon(options)?;
         let listing = connection.request("provider_models", json!({}))?;
-        let text = agent_client::models::render(&listing, &[]).map_err(Error::from)?;
-        agent_client::models::install(&path, &text).map_err(Error::from)?;
-        eprintln!("wrote {}", path.display());
+        let refreshed = agent_client::models::refresh(&path, &listing).map_err(Error::from)?;
+        for (provider, said) in &refreshed.refused {
+            eprintln!("{}: {}", visible(provider), visible(said));
+        }
+        for (sign, ids) in [('+', &refreshed.added), ('-', &refreshed.removed)] {
+            for id in ids.iter().filter(|_| !refreshed.created) {
+                eprintln!("{sign} {}", visible(id));
+            }
+        }
+        match (
+            refreshed.created,
+            refreshed.added.len() + refreshed.removed.len(),
+        ) {
+            (true, _) => eprintln!("wrote {}", path.display()),
+            (false, 0) => eprintln!("{} is up to date", path.display()),
+            (false, _) => eprintln!("updated {}", path.display()),
+        }
     }
     let models = agent_client::models::read(&path).map_err(Error::from)?;
     if options.pretty {
@@ -1588,7 +1603,7 @@ fn models(options: &Options) -> Result<i32> {
     // On stderr, so `[]` on stdout stays what a program reads.
     if models.is_empty() {
         eprintln!(
-            "no models listed in {}; agent models --discover writes a first list",
+            "no models listed in {}; agent models --discover lists the providers' models",
             path.display()
         );
     }

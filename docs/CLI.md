@@ -466,14 +466,28 @@ Other client commands require an already running daemon.
 `PROVIDER/MODEL` per line, with anything after `#` a note; no file is an
 empty list, and a malformed line fails with `models_invalid` naming it.
 Reading it needs no daemon, and the daemon never reads it: any model runs.
-`models --discover` writes a first file from the listings of the providers
-the daemon runs (starting one like `run`), with each model's name and
-context size as its note and a comment for a provider that listed nothing.
-When no usable model survives rendering within the file limit, it writes
-nothing and fails with
-`models_none_listed`, naming each refusal, so it can run again after a
-login. It refuses with `models_file_exists` once the file exists: after
-that it is the user's to edit. Bots see the same list by running `models`.
+The daemon a client starts on the store beside it (`~/.agent/state.sqlite`)
+keeps the file current (`serve --models`): each time it starts, once it is
+ready, it asks every provider for its listing and merges the answers in, so
+a start never waits on a provider. A daemon on another store, such as a
+test's or a side daemon's, leaves it alone.
+`models --discover` does the same on demand through the daemon (starting one
+like `run`) and says on stderr what changed (`+ id`, `- id`) and which
+providers did not answer. With no file it writes a first one, with each
+model's name and context size as its note and a comment for a provider that
+listed nothing; when no usable model survives rendering within the file
+limit, it writes nothing and fails with `models_none_listed`, naming each
+refusal, so it can run again after a login. Once the file exists the merge
+is three-way, against what each provider listed last time
+(`~/.agent/models.listed`): a model a provider newly lists is added after
+that provider's last line, one it stopped listing is removed, and every
+other line (the person's own models, notes, comments, and the absence of
+lines they deleted) is kept byte for byte. A provider that does not answer
+leaves its lines as they are, and providers the daemon does not run are
+never touched. Model ids are compared as strings, never read for versions
+or families. A file that does not parse is refused, never merged into; a
+linked file is updated where it lives. Bots see the same list by running
+`models`.
 
 `serve` requires explicit `--store` and `--provider` options. It runs the daemon
 directly, with Unix-socket service when `--socket` is

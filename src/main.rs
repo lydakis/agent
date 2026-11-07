@@ -242,6 +242,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut protected_paths = Vec::new();
     let mut walled = Vec::new();
     let mut windows = Vec::new();
+    let mut models = None;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -269,6 +270,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--protect-path" => protected_paths.push(value.into()),
             "--wall" => walled.push(value.into()),
             "--context-window" => windows.push(value.as_str()),
+            "--models" => models = Some(value.into()),
             "--protect-existing" => protected_existing.push(value.clone()),
             "--max-processes"
             | "--max-lasting"
@@ -334,5 +336,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         protected_paths,
         walled,
         context_windows: std::sync::Arc::new(agent_runtime::provider::Windows::parse(windows)?),
+        models,
     })
 }

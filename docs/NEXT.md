@@ -970,7 +970,9 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     config file clients read (the app, and `agent models`, which the preamble
     names so a bot starting a peer sees the same choices); `agent models
     --discover` writes a first one from the providers' own listings through
-    the daemon's `provider_models`. Source read 2026-09-27: Codex (9db8162)
+    the daemon's `provider_models`. Since 2026-11-07 every daemon start
+    merges new listings in (three-way, deletions stick; George: discover on
+    every start, never on a timer). Source read 2026-09-27: Codex (9db8162)
     refreshes its bundled catalog from the Codex backend's `/models`,
     OpenCode (b471c2b) and Pi (badlogic/pi-mono 2b0a123) from models.dev
     catalogs. The daemon never reads the list. Done

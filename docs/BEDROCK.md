@@ -47,6 +47,17 @@ models hosted in its own region, so which models a binding reached depended
 on the region. Claude on Mantle is one explicit URL away; see
 [providers and models](RUST_PROTOTYPE.md#providers-and-models).
 
+`--provider bedrock-openai-runtime` (added 2026-11-07) binds runtime's
+OpenAI-compatible route, `bedrock-runtime.{region}.amazonaws.com/openai/v1`,
+with Responses, as Codex's opt-in `amazon-bedrock-runtime` does, for models
+served only there, by `us.` and `global.` inference profiles, which neither
+other binding reaches (**unverified** in this repository's live runs).
+**Documented** (AWS Chat Completions guide, read
+2026-11-07): runtime does not implement the OpenAI-compatible `GET /models`,
+so discovery lists the control plane's inference profiles, as for `bedrock`,
+offering every one that is not Anthropic's; which vendors' models the
+Responses route serves is left to the model cards, not guessed from ids.
+
 ## Regions and model access
 
 **Observed** 2026-09-28 on the owner's account: Mantle in us-west-2 listed one

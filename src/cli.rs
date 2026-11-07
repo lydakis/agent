@@ -228,7 +228,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --context-window",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --context-window --models",
         settings: "",
         startup: true,
     },
@@ -363,7 +363,7 @@ fn print_flags(flags: &str) {
             "--provider" => ("SPEC", "Register a provider; repeat for multiple providers"),
             "--discover" => (
                 "",
-                "Write ~/.agent/models from the providers' own model listings",
+                "Bring ~/.agent/models up to date from the providers' own model listings, as each daemon start does",
             ),
             "--model" => (
                 "PROVIDER/MODEL",
@@ -438,6 +438,10 @@ fn print_flags(flags: &str) {
             "--context-window" => (
                 "PATTERN=TOKENS",
                 "The context window of each model whose PROVIDER/MODEL path matches PATTERN (* and ? wildcards), over its provider's listing; the most specific pattern wins; repeatable; clients pass [context_windows] from ~/.agent/config.toml",
+            ),
+            "--models" => (
+                "PATH",
+                "Keep the model list at PATH current: refreshed from the providers' listings each time the daemon starts, after it is ready; clients pass ~/.agent/models",
             ),
             "--wall" => (
                 "FOLDER",
