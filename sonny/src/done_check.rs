@@ -271,8 +271,13 @@ async fn sweep(
             _ => break,
         }
     }
-    // With other leads in the folder, their tasks are theirs to ask.
+    // With other leads in the folder, their tasks are theirs to ask, as
+    // are a project's inside it (`shop.web` in `shop`).
     let mine = crate::owned(&listed, &scope.project, &scope.lead);
+    let listed_names = (listed.iter()).filter_map(|bot| bot["name"].as_str());
+    let inner: Vec<String> = (crate::inner_projects(listed_names, &scope.project).into_iter())
+        .map(|inner| format!("{inner}."))
+        .collect();
     let now = crate::home::now_ms() as u64;
     let mut names = Vec::new();
     for bot in &listed {
@@ -288,6 +293,7 @@ async fn sweep(
             || !bot["expire_ms"].is_null()
             || !bot["running_turn"].is_null()
             || mine.as_ref().is_some_and(|mine| !mine.contains(name))
+            || inner.iter().any(|inner| name.starts_with(inner))
         {
             continue;
         }
@@ -455,8 +461,8 @@ mod tests {
 
     /// A window's sweep asks the idle task past the threshold, through a
     /// tool-less copy, and only it: not the lead, a running task, one idle
-    /// too short a while, another lead's task, nor, on the next sweep, the
-    /// one it asked.
+    /// too short a while, another lead's task, a project's inside it, nor,
+    /// on the next sweep, the one it asked.
     #[tokio::test]
     async fn a_sweep_asks_each_task_idle_long_enough_once() {
         let asked = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -473,10 +479,12 @@ mod tests {
                     {"name": "calc.busy", "bot_id": 4, "head": 4, "running_turn": 9, "expire_ms": null},
                     {"name": "calc.lead.ada", "bot_id": 5, "head": 5, "running_turn": null, "expire_ms": null},
                     {"name": "calc.theirs", "bot_id": 6, "head": 6, "running_turn": null, "expire_ms": null,
-                        "created_by": "calc.lead.ada"}]}),
+                        "created_by": "calc.lead.ada"},
+                    {"name": "calc.web.lead", "bot_id": 7, "head": 7, "running_turn": null, "expire_ms": null},
+                    {"name": "calc.web.fix", "bot_id": 8, "head": 8, "running_turn": null, "expire_ms": null}]}),
                 Some("turns") => {
                     let hours = match request["bot"].as_str() {
-                        Some("calc.old" | "calc.theirs") => 9,
+                        Some("calc.old" | "calc.theirs" | "calc.web.fix") => 9,
                         _ => 1,
                     };
                     json!({"turns": [{"turn": 5, "status": "completed",
