@@ -2899,11 +2899,7 @@ impl Lookout {
             (true, false, Some(rule)) => Some(Steer::Rule(rule.to_owned())),
             (true, false, None) => Some(Steer::News),
         };
-        // A subscription's `steer` counts as steering whether or not the
-        // note joins a turn, or the person's words say why.
-        let rule = self.updates.urgent().map(str::to_owned);
-        let mut told = self.updates.take_at(now);
-        told.steered = rule;
+        let told = self.updates.take_at(now);
         // All there is waits on replies being read.
         if told.items.is_empty() && told.memory.is_none() {
             self.updates.unsent(told);
@@ -3096,6 +3092,17 @@ impl Lookout {
     fn resubscribed(&mut self, subs: Vec<subs::Sub>) {
         let gone = gone(&self.subs, &subs);
         self.updates.ended(&gone);
+        // A note under way told what those gone heard: once it lands, it
+        // counts for none of them, nor for one put in another's place.
+        if let Some((told, ..)) = &mut self.sending {
+            told.heard.retain(|(name, _)| !gone.contains(name));
+            told.steered.retain(|name| !gone.contains(name));
+        }
+        if let Some((sent, ..)) = &mut self.sourcing {
+            for heard in sent {
+                heard.subs.retain(|name| !gone.contains(name));
+            }
+        }
         if self.counts.keep(|name| !gone.iter().any(|g| g == name)) {
             self.counts_dirty = true;
         }
@@ -5394,18 +5401,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_subscription_steer_counts_though_its_note_joins_no_turn() {
+    async fn every_subscription_steer_counts_though_its_note_joins_no_turn() {
         let (client, _got) = submits().await;
         let mut lookout = seated("idle");
-        lookout.subs[0].steer = Some(json!({"status": ["failed"]}));
+        (lookout.updates).seat(&json!({"name": "calc.docs", "bot_id": 3, "status": "idle",
+            "created_by": "calc.lead", "created_by_id": 1}));
+        for bot in ["calc.fix", "calc.docs"] {
+            lookout.globbed.insert(bot.to_owned());
+        }
+        let failed = Some(json!({"status": ["failed"]}));
+        let mut fixes = sub("fixes", &[], &["calc.fix"]);
+        fixes.steer = failed.clone();
+        let mut docs = sub("docs", &[], &["calc.docs"]);
+        docs.steer = failed;
+        lookout.subs = vec![fixes, docs.clone()];
         let listed = lookout.updates.listed();
         lookout.sync(&listed);
-        ended(&mut lookout, 5, "failed");
-        assert_eq!(lookout.updates.urgent(), Some("tasks"));
+        for bot in ["calc.fix", "calc.docs"] {
+            let ask = json!({"from": {"bot": "calc.lead"}});
+            lookout.event(&ev(bot, 5, "accepted", ask));
+            lookout.event(&ev(bot, 5, "turn_finished", json!({"status": "failed"})));
+        }
         let (woken, _woke) = tokio::sync::mpsc::channel(4);
         lookout.wake(&client, &woken);
         let (told, ..) = lookout.sending.as_ref().unwrap();
-        assert_eq!(told.steered(), ["tasks"]);
+        let mut steered = told.steered();
+        steered.sort_unstable();
+        assert_eq!(steered, ["docs", "fixes"]);
+        // One put in another's place while the note is under way counts
+        // nothing of it once it lands.
+        docs.steer = None;
+        let fixes = lookout.subs[0].clone();
+        lookout.resubscribed(vec![fixes, docs]);
+        lookout.answered(Answer::Noted(Ok(())));
+        let now = epoch_ms() as u64;
+        assert_eq!(lookout.counts.of("fixes", now).unwrap()["steers"], 1);
+        assert!(lookout.counts.of("docs", now).is_none());
     }
 
     #[tokio::test]

@@ -248,12 +248,16 @@ impl News {
     /// The subscription whose `urgent` matched some of it, while that is
     /// still to be told: each piece keeps its own.
     fn urgent(&self) -> Option<&str> {
+        self.urgents().next()
+    }
+
+    /// Every subscription whose `urgent` matched some of it.
+    fn urgents(&self) -> impl Iterator<Item = &str> {
         let turns = [&self.act, &self.theirs].into_iter().flatten();
         (turns.filter_map(|t| t.urgent.as_deref()))
             .chain(self.said.iter().filter_map(|s| s.urgent.as_deref()))
             .chain(self.notes.iter().filter_map(|n| n.urgent.as_deref()))
             .chain(self.asks.iter().filter_map(|a| a.urgent.as_deref()))
-            .next()
     }
 
     /// It holds the person's words.
@@ -297,12 +301,12 @@ pub struct Told {
     /// news: once it lands, they count it, and one that lasts so many
     /// notes has one fewer to go.
     pub heard: Vec<(String, u64)>,
-    /// The subscription whose `steer` sent it at once, if one did.
-    pub steered: Option<String>,
+    /// The subscriptions whose `steer` matched news it tells.
+    pub steered: Vec<String>,
 }
 
 impl Told {
-    /// The subscriptions it steered for: none, or the one whose `steer` sent it.
+    /// The subscriptions it steered for.
     pub fn steered(&self) -> Vec<&str> {
         self.steered.iter().map(String::as_str).collect()
     }
@@ -1730,6 +1734,7 @@ impl Updates {
         // its digest counts from this note once it lands.
         let mut subs: Vec<String> = Vec::new();
         let mut heard: Vec<(String, u64)> = Vec::new();
+        let mut steered: Vec<String> = Vec::new();
         for (name, news) in &sent {
             // A task all of whose news waits for a later note told nothing:
             // it counts, and spends a run, when that note goes.
@@ -1748,6 +1753,13 @@ impl Updates {
             }
             if !telling.contains(name) {
                 continue;
+            }
+            // Each subscription whose `steer` matched what it tells
+            // steered, whether or not the note joins a turn.
+            for rule in news.urgents().filter(|_| self.live) {
+                if !steered.iter().any(|had| had == rule) {
+                    steered.push(rule.to_owned());
+                }
             }
             if hearing.is_empty() {
                 hearing.extend(self.hearers.get(name).into_iter().flat_map(|h| h.iter()));
@@ -1774,7 +1786,7 @@ impl Updates {
             seen,
             subs,
             heard,
-            steered: None,
+            steered,
         }
     }
 
