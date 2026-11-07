@@ -14,7 +14,6 @@
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ".
 pub(crate) mod activity;
-pub(crate) mod goals;
 pub(crate) mod pattern;
 pub(crate) mod sources;
 pub(crate) mod subs;
@@ -746,7 +745,6 @@ async fn serve(settings: Settings) -> Result<(), String> {
         live: false,
         cursor: None,
         saved: None,
-        goals: goals::Goals::new(&settings.store, &settings.socket),
         fires: HashMap::new(),
         senders: HashMap::new(),
         resume: marks(&settings.store).0,
@@ -772,7 +770,6 @@ async fn serve(settings: Settings) -> Result<(), String> {
         tokio::spawn(async move {
             term.recv().await;
             sources::stop();
-            goals::stop();
             std::process::exit(0);
         });
     }
@@ -884,8 +881,6 @@ struct Service {
     /// a lookout started again tells what came after it.
     cursor: Option<i64>,
     saved: Option<(i64, i64)>,
-    /// The agents' goals, whose turns it holds until their checks say.
-    goals: goals::Goals,
     /// Turns triggers' fires sent, by agent and turn, each with its
     /// trigger's generation: one that fails is told (`trigger::tell_failed`).
     fires: HashMap<(String, i64), String>,
@@ -893,8 +888,8 @@ struct Service {
     /// turn, for whom a turn that fails is a note (`bounced`).
     senders: HashMap<(String, i64), Vec<Sender>>,
     /// Failed fires' turns whose note is under way, by agent and turn: held
-    /// as a goal's check is, so a restart or a reconnect before the daemon
-    /// takes the note replays the turn and tells it again, not never.
+    /// so a restart or a reconnect before the daemon takes the note replays
+    /// the turn and tells it again, not never.
     telling: HashMap<(String, i64), Telling>,
     /// Bounces under way, by agent, turn and who is told: held as a failed
     /// fire's note is, so one the daemon has not taken is told again.
@@ -927,7 +922,7 @@ struct Service {
     /// Not connected yet since it started: its stream starts again where
     /// the last lookout's would.
     started: bool,
-    /// The `subscriptions` and `goal` calls under way, by bot, turn and
+    /// The `subscriptions` and `commons` calls under way, by bot, turn and
     /// ID, whose end means the files the lookout reads changed.
     rewriting: HashSet<(String, i64, String)>,
 }
@@ -1152,6 +1147,7 @@ impl Service {
             crate::commons::subscribe_posters(&home, &self.store, &names);
         }
         subs::steer_files(&self.store);
+        subs::goals_gone(&self.store);
         let revisions = subs::revisions(&self.store);
         self.subscribers = subs::all(&self.store).into_iter().collect();
         self.read_at.clear();
@@ -1213,18 +1209,12 @@ impl Service {
             );
             return;
         }
-        // Goal checks a dropped connection left under way answer the old
-        // channel, never this one: none is under way here yet. Unbounded,
-        // as a goal's turn waits on its one settlement, which a full
-        // channel would drop: it holds a few per agent with a goal at most.
-        let (checked, mut settled) = tokio::sync::mpsc::unbounded_channel();
         for lookout in self.lookouts.values_mut() {
             // Reads a dropped connection left under way answer the old
             // channel, never this one.
             lookout.reading.clear();
             lookout.updates.replies_dropped();
         }
-        self.goals.reconnected();
         // Notes under way answer the old connection: the replay tells them
         // again.
         for telling in
@@ -1271,12 +1261,11 @@ impl Service {
                     }
                     streaming |= event["event"] == "follow_live";
                     self.snapshot(&event, streaming);
-                    // A `subscriptions`, `goal` or `commons` call the tool
+                    // A `subscriptions` or `commons` call the tool
                     // host answered counts from the next event on: its end
                     // is in the stream before any event that follows it.
                     if self.rewrote(&event) {
                         reread = Some(Instant::now());
-                        self.goals.reread();
                         self.runner.reload();
                         self.reread(&client).await;
                         self.runner.poke();
@@ -1322,8 +1311,6 @@ impl Service {
                             self.index();
                         }
                     }
-                    // A turn whose goal's check is to run is news only once
-                    // it says how the goal stands.
                     let bot_id = (event["bot"].as_str())
                         .and_then(|bot| self.records.get(bot))
                         .and_then(|record| record["bot_id"].as_i64());
@@ -1355,11 +1342,6 @@ impl Service {
                         .zip(event["turn"].as_i64())
                         .and_then(|(bot, turn)| self.in_flight.get(&(bot.to_owned(), turn)).copied());
                     let bounces = self.sent(&event, live);
-                    if let Some((bot, turn)) = self.goals.event(&event, bot_id, live, &client, &checked) {
-                        for lookout in self.lookouts.values_mut() {
-                            lookout.updates.goal_turn(&bot, turn);
-                        }
-                    }
                     // Each event goes to the lookouts that hear its bot,
                     // as an informer hands a change to the handlers that
                     // asked for its object; a bot made or deleted, to all.
@@ -1442,17 +1424,6 @@ impl Service {
                 Some(key) = bounce_taken.recv() => {
                     self.bouncing.remove(&key);
                 }
-                Some(settled) = settled.recv() => {
-                    let checking = self.goals.settled(&settled, &client, &checked);
-                    let goals::Settled { bot, turn, outcome, .. } = settled;
-                    let now = Instant::now();
-                    for lookout in self.lookouts.values_mut() {
-                        lookout.updates.goal_settled(&bot, turn, outcome.as_deref());
-                        if let Some(later) = checking {
-                            lookout.updates.goal_checking(&bot, later, now);
-                        }
-                    }
-                }
                 // What sources say is news once the stream is live; until
                 // then it waits in the channel.
                 Some(said) = from_sources.recv(), if self.live => {
@@ -1482,7 +1453,6 @@ impl Service {
                     // What the person or a script wrote since, now and then.
                     if reread.is_none_or(|at| now >= at + REREAD) {
                         reread = Some(now);
-                        self.goals.reread();
                         self.runner.reload();
                         self.waiting = waiting();
                         for lookout in self.lookouts.values_mut() {
@@ -1859,7 +1829,7 @@ impl Service {
     }
 
     /// Whether `event` ends a call of Sonny's that wrote files the lookout
-    /// reads, a `subscriptions`, `goal` or `commons` call (posting
+    /// reads, a `subscriptions` or `commons` call (posting
     /// subscribes), which the tool host answers. A turn that ends forgets the calls it left under way.
     fn rewrote(&mut self, event: &Value) -> bool {
         let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) else {
@@ -1877,7 +1847,6 @@ impl Service {
             Some("tool_started")
                 if data["answered_by"] == crate::served::TAG
                     && (data["name"] == crate::served::SUBSCRIPTIONS
-                        || data["name"] == crate::served::GOAL
                         || data["name"] == crate::served::COMMONS) =>
             {
                 self.rewriting.insert(call());
@@ -2088,7 +2057,7 @@ impl Service {
     }
 
     /// Up to just before the oldest news a lookout has not told, the
-    /// oldest turn whose goal's check runs, or the oldest failed fire whose
+    /// or the oldest failed fire whose
     /// note is under way, which a restart or a reconnect
     /// takes up again: news only in memory, or a read or check a dropped
     /// connection cut short, is told or run again, not lost.
@@ -2099,7 +2068,6 @@ impl Service {
             }
         }
         let floor = (self.lookouts.values().filter_map(|l| l.from))
-            .chain(self.goals.floor())
             .chain(
                 (self.telling.values().chain(self.bouncing.values()))
                     .filter_map(|telling| telling.ended),
@@ -2573,12 +2541,11 @@ impl Lookout {
     /// Who wrote a turn, as the note names them; `None` for the
     /// subscriber, whose words are no news to it.
     fn author(&self, data: &Value) -> Option<String> {
-        // A lookout's own note to a lead another subscriber watches, a
-        // goal's next turn, an automation's run, or the daemon telling a
-        // bot its background command ended: how the turn ends alone is news
-        // (an automation's run that went well and said nothing is none).
-        if (data["request_id"].as_str())
-            .is_some_and(|id| id.starts_with("lookout-") || id.starts_with(goals::REQUEST))
+        // A lookout's own note to a lead another subscriber watches, an
+        // automation's run, or the daemon telling a bot its background
+        // command ended: how the turn ends alone is news (an automation's
+        // run that went well and said nothing is none).
+        if (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-"))
             || (data["origin"]
                 .as_str()
                 .is_some_and(|origin| crate::trigger::sent_it(origin) || origin == "background")
@@ -2868,12 +2835,11 @@ impl Lookout {
     }
 
     /// Whether anything it heard is not told yet: messages to read or
-    /// being read, a turn held on a trigger or its goal's check, news, or
+    /// being read, a turn held on a trigger, news, or
     /// a note the daemon has not answered.
     fn untold(&self) -> bool {
         !self.due.is_empty()
             || !self.reading.is_empty()
-            || self.updates.goal_pending()
             || self.updates.holding()
             || self.updates.news()
             || self.sending.is_some()
@@ -4788,7 +4754,6 @@ mod tests {
             watchers: HashMap::new(),
             started: false,
             rewriting: HashSet::new(),
-            goals: goals::Goals::new(Path::new("/nonexistent"), Path::new("")),
             fires: HashMap::new(),
             senders: HashMap::new(),
         }
@@ -5178,12 +5143,12 @@ mod tests {
         };
         assert!(!service.rewrote(&started("subscriptions", "a")));
         assert!(!service.rewrote(&started("memory", "b")));
-        assert!(!service.rewrote(&event("tool_started", "c", json!({"name": "goal"}))));
+        assert!(!service.rewrote(&event("tool_started", "c", json!({"name": "memory"}))));
         assert!(!service.rewrote(&event("tool_completed", "b", json!({}))));
         assert!(service.rewrote(&event("tool_completed", "a", json!({}))));
         assert!(!service.rewrote(&event("tool_completed", "a", json!({}))));
         // A turn that ends forgets a call it never ended.
-        assert!(!service.rewrote(&started("goal", "d")));
+        assert!(!service.rewrote(&started("subscriptions", "d")));
         assert!(!service.rewrote(&event("turn_finished", "", json!({}))));
         assert!(service.rewriting.is_empty());
         // Posting in the commons subscribes the poster.

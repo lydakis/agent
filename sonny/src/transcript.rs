@@ -1323,7 +1323,6 @@ pub fn from_outside(origin: Option<&str>) -> &'static str {
         Some("lookout") => "the lookout",
         Some("automation" | "trigger") => "an automation",
         Some("commons") => "the commons",
-        Some("goal") => "a goal",
         Some("margin") => "a margin note",
         Some("tasks") => "a task",
         Some("judge") => "a judge",
