@@ -1563,6 +1563,8 @@ async fn run() -> Result<(), String> {
     app.sounds.chime = settings.chime;
     app.schedule = settings.quiet.clone();
     quiet::set_schedule(settings.quiet.clone());
+    // Opening a window is using it: the lookout waits from here.
+    quiet::mark_present();
     app.quiet = quiet::away();
     app.verbose = settings.verbose;
     set_measure(settings.text_width);
