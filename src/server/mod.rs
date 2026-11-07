@@ -1913,10 +1913,10 @@ pub async fn run(config: Configuration) -> Result<()> {
     }
     // The providers' config file, watched by the kernel: nothing runs
     // until it changes.
-    let mut provider_changes = service
-        .reload
-        .as_ref()
-        .and_then(|reload| file_watch::watch(&reload.config));
+    let mut provider_changes = match service.reload.as_ref() {
+        Some(reload) => file_watch::watch(&reload.config).await,
+        None => None,
+    };
     let (reloaded_sender, mut reloaded) = mpsc::unbounded_channel();
     // An edit made while the daemon started, before the watch, is read
     // once now; a file that names the set already bound binds nothing.
@@ -5394,16 +5394,18 @@ async fn provider_models(providers: Arc<HashMap<String, Provider>>) -> Result<Va
         4,
     ))
     .await;
-    // Each entry names its provider's API family, as `ready.providers`
-    // does, so a client connected before a reload added a provider can
-    // still tell which models its agent may switch to; room for that is
-    // held back from the listings.
-    const FAMILY: usize = 32;
-    let limit = output::MAX_EVENT.saturating_sub(FAMILY * names.len());
+    // Each entry names its provider's API family and effort levels, as
+    // `ready.providers` does, so a client connected before a reload added
+    // a provider can still tell which models its agent may switch to and
+    // at what effort; room for that is held back from the listings.
+    const BOUND: usize = 128;
+    let limit = output::MAX_EVENT.saturating_sub(BOUND * names.len());
     let mut answer = fit_listings(names.into_iter().zip(listed), limit)?;
     for (name, entry) in answer.iter_mut() {
         if let (Some(provider), Some(entry)) = (providers.get(name), entry.as_object_mut()) {
-            entry.insert("family".into(), json!(provider.family().name()));
+            let family = provider.family();
+            entry.insert("family".into(), json!(family.name()));
+            entry.insert("efforts".into(), json!(family.efforts()));
         }
     }
     Ok(json!({"providers": answer}))

@@ -23,9 +23,9 @@ impl Picker {
     /// model.
     pub fn new(listing: &Value, providers: &Value, current: &str, effort: Option<&str>) -> Self {
         let provider = current.split_once('/').map_or(current, |(p, _)| p);
-        // The listing says each provider's family as the daemon binds it
-        // now, a provider added since this client connected included;
-        // `ready.providers` answers for a listing that does not.
+        // The listing says each provider's family and effort levels as the
+        // daemon binds it now, a provider added since this client connected
+        // included; `ready.providers` answers for a listing that does not.
         let listed = &listing["providers"];
         let family_of = |name: &str| match &listed[name]["family"] {
             Value::Null => &providers[name]["family"],
@@ -62,8 +62,12 @@ impl Picker {
         }
         let pick = models.iter().position(|m| m == current).unwrap_or(0);
         let mut efforts = vec![None];
+        let levels = match &listed[provider]["efforts"] {
+            Value::Null => &providers[provider]["efforts"],
+            levels => levels,
+        };
         efforts.extend(
-            providers[provider]["efforts"]
+            levels
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -384,5 +388,13 @@ mod tests {
         }});
         let picker = Picker::new(&listing, &providers, "openai/gpt-6", None);
         assert_eq!(picker.shown(), ["openai/gpt-6", "second/gpt-6"]);
+        // Its efforts come from the listing too.
+        let listing = json!({"providers": {
+            "second": {"family": "responses", "efforts": ["low", "high"],
+                       "models": [{"id": "gpt-6"}]},
+        }});
+        let mut picker = Picker::new(&listing, &providers, "second/gpt-6", None);
+        picker.more();
+        assert_eq!(picker.effort(), Some("low"));
     }
 }

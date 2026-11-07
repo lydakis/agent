@@ -431,7 +431,7 @@ them), are refused
 whole, and the old set stays. `stats.provider_reload` says what the last
 change came to (`applied` with `added`, `removed` and `changed`, or
 `refused` with its error); new sessions' `ready.providers` show the set in
-use, `provider_models` names each provider's family for sessions that
+use, `provider_models` names each provider's family and efforts for sessions that
 connected before, and held turns are tried again after a change is applied.
 `run --model` names a new bot's model or an existing bot's turn model; the
 daemon has no model of its own, so a new bot needs `--model`, `AGENT_MODEL`,

@@ -10,9 +10,16 @@ use tokio::sync::mpsc;
 /// A receiver told, at most one notice pending, each time `path` may have
 /// changed. None where the platform has no watch or the folder cannot be
 /// watched; the file is then read at start only.
-pub fn watch(path: &Path) -> Option<mpsc::Receiver<()>> {
+pub async fn watch(path: &Path) -> Option<mpsc::Receiver<()>> {
+    // What touches the filesystem runs off the runtime thread; only the
+    // descriptor's registration with the runtime stays on it.
+    let given = path.to_owned();
+    let prepared = tokio::task::spawn_blocking(move || imp::prepare(&given))
+        .await
+        .ok()?
+        .ok()?;
     let (sender, receiver) = mpsc::channel(1);
-    imp::spawn(path.to_owned(), sender).ok()?;
+    imp::spawn(path.to_owned(), prepared, sender).ok()?;
     Some(receiver)
 }
 
@@ -70,7 +77,16 @@ mod imp {
         Ok((wd, name))
     }
 
-    pub fn spawn(path: PathBuf, sender: mpsc::Sender<()>) -> std::io::Result<()> {
+    /// The descriptor and its watches, made off the runtime thread: adding
+    /// a watch resolves a path.
+    pub struct Prepared {
+        fd: OwnedFd,
+        names: HashMap<i32, Vec<OsString>>,
+        own: i32,
+        target: Option<PathBuf>,
+    }
+
+    pub fn prepare(path: &Path) -> std::io::Result<Prepared> {
         // SAFETY: inotify_init1 takes flags only and returns a new fd or -1.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
@@ -82,14 +98,33 @@ mod imp {
         // changes, and what it resolves to, which an edit through a link
         // (into a dotfiles checkout) changes without touching the name.
         let mut names: HashMap<i32, Vec<OsString>> = HashMap::new();
-        let (own, name) = add(fd.as_raw_fd(), &path)?;
+        let (own, name) = add(fd.as_raw_fd(), path)?;
         names.entry(own).or_default().push(name);
-        let mut target = std::fs::canonicalize(&path).ok();
+        let target = std::fs::canonicalize(path).ok();
         if let Some(resolved) = &target
             && let Ok((wd, name)) = add(fd.as_raw_fd(), resolved)
         {
             names.entry(wd).or_default().push(name);
         }
+        Ok(Prepared {
+            fd,
+            names,
+            own,
+            target,
+        })
+    }
+
+    pub fn spawn(
+        path: PathBuf,
+        prepared: Prepared,
+        sender: mpsc::Sender<()>,
+    ) -> std::io::Result<()> {
+        let Prepared {
+            fd,
+            mut names,
+            own,
+            mut target,
+        } = prepared;
         // SAFETY: the OwnedFd is open, and it keeps the one descriptor
         // until the AsyncFd that owns it drops.
         let fd = unsafe { AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE) }
@@ -265,8 +300,16 @@ mod imp {
         | libc::NOTE_DELETE
         | libc::NOTE_RENAME;
 
-    pub fn spawn(path: PathBuf, sender: mpsc::Sender<()>) -> std::io::Result<()> {
-        let (folder, _) = split(&path)?;
+    /// The queue and the descriptors it watches, made off the runtime
+    /// thread: opening them resolves paths.
+    pub struct Prepared {
+        queue: OwnedFd,
+        folder: OwnedFd,
+        file: Option<OwnedFd>,
+    }
+
+    pub fn prepare(path: &Path) -> std::io::Result<Prepared> {
+        let (folder, _) = split(path)?;
         // SAFETY: kqueue takes no arguments and returns a new fd or -1.
         let queue = unsafe { libc::kqueue() };
         if queue < 0 {
@@ -287,10 +330,27 @@ mod imp {
         // and a file renamed over that one ends its watch and is reopened.
         let folder = open_events(&folder)?;
         register(&queue, &folder, libc::NOTE_WRITE)?;
-        let mut file = open_events(&path).ok();
+        let file = open_events(path).ok();
         if let Some(file) = &file {
             register(&queue, file, FILE)?;
         }
+        Ok(Prepared {
+            queue,
+            folder,
+            file,
+        })
+    }
+
+    pub fn spawn(
+        path: PathBuf,
+        prepared: Prepared,
+        sender: mpsc::Sender<()>,
+    ) -> std::io::Result<()> {
+        let Prepared {
+            queue,
+            folder,
+            mut file,
+        } = prepared;
         // SAFETY: the OwnedFd is open, and it keeps the one descriptor
         // until the AsyncFd that owns it drops. Readable only: a kqueue
         // has no write side, and asking for one fails the registration.
@@ -341,7 +401,13 @@ mod imp {
     use std::path::PathBuf;
     use tokio::sync::mpsc;
 
-    pub fn spawn(_: PathBuf, _: mpsc::Sender<()>) -> std::io::Result<()> {
+    pub struct Prepared;
+
+    pub fn prepare(_: &std::path::Path) -> std::io::Result<Prepared> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
+    pub fn spawn(_: PathBuf, _: Prepared, _: mpsc::Sender<()>) -> std::io::Result<()> {
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
 }
@@ -363,7 +429,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "a = 1\n").unwrap();
-        let mut receiver = super::watch(&path).unwrap();
+        let mut receiver = super::watch(&path).await.unwrap();
         std::fs::write(&path, "a = 2\n").unwrap();
         assert!(told(&mut receiver).await, "write in place");
         // Drain what one write may have told twice.
@@ -394,7 +460,7 @@ mod tests {
         std::fs::write(&target, "a = 1\n").unwrap();
         let path = dir.join("home/config.toml");
         std::os::unix::fs::symlink(&target, &path).unwrap();
-        let mut receiver = super::watch(&path).unwrap();
+        let mut receiver = super::watch(&path).await.unwrap();
         std::fs::write(&target, "a = 2\n").unwrap();
         assert!(told(&mut receiver).await, "write to the target");
         while tokio::time::timeout(Duration::from_millis(200), receiver.recv())
