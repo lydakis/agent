@@ -752,9 +752,14 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 let Some(add) = arguments.get("add") else {
                     return Err(("subscription_refused", "test tries an add".into()));
                 };
-                return crate::lookout::subs::tried(&store, add, &crate::lookout::sources::names())
-                    .map(|tried| tried.to_string())
-                    .map_err(|e| ("subscription_refused", e));
+                return crate::lookout::subs::tried(
+                    &store,
+                    &caller,
+                    add,
+                    &crate::lookout::sources::names(),
+                )
+                .map(|tried| tried.to_string())
+                .map_err(|e| ("subscription_refused", e));
             }
             crate::lookout::subs::change(
                 &store,

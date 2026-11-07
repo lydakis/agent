@@ -1090,8 +1090,14 @@ fn checked(add: &Value, sources: &[String]) -> Result<Sub, String> {
 /// would have heard of its sources' last 24 hours, as the lookout keeps
 /// them, and adding nothing. How many events it would hear, how many
 /// would steer, about how many notes they would be, with its digest or
-/// its sources', and the newest few as examples.
-pub fn tried(store: &Path, add: &Value, sources: &[String]) -> Result<Value, String> {
+/// its sources', and the newest few as examples. What `subscriber` said
+/// itself, or was told another way, it does not hear, as live.
+pub fn tried(
+    store: &Path,
+    subscriber: &str,
+    add: &Value,
+    sources: &[String],
+) -> Result<Value, String> {
     let sub = checked(add, sources)?;
     let now = super::epoch_ms();
     let since = now.saturating_sub(super::sources::RECENT_SPAN.as_millis());
@@ -1108,7 +1114,9 @@ pub fn tried(store: &Path, add: &Value, sources: &[String]) -> Result<Value, Str
     let mut times = Vec::new();
     let mut newest = Vec::new();
     for (event, was_cut) in &events {
-        if !sub.hears(event) {
+        let own =
+            event.from.as_deref() == Some(subscriber) || event.told.iter().any(|t| t == subscriber);
+        if own || !sub.hears(event) {
             continue;
         }
         heard += 1;
@@ -1122,7 +1130,19 @@ pub fn tried(store: &Path, add: &Value, sources: &[String]) -> Result<Value, Str
             Some(_) => (sub.digest_span(), ""),
             None => (event.digest, event.source.as_str()),
         };
-        times.push((event.at_ms, steer, digest, clock));
+        let heard = super::sources::Heard {
+            event: (*event).clone(),
+            subs: vec![sub.name.clone()],
+        };
+        let bytes = super::sources::line(&heard).len();
+        let window = digest.map_or(0, |d| d.as_millis());
+        times.push(Timed {
+            at: event.at_ms,
+            steer,
+            window,
+            clock,
+            bytes,
+        });
         newest.push(event);
     }
     let examples: Vec<Value> = (newest.iter().rev().take(3))
@@ -1149,52 +1169,79 @@ pub fn tried(store: &Path, add: &Value, sources: &[String]) -> Result<Value, Str
     Ok(said)
 }
 
-/// About how many notes events heard at these times would be, each with
-/// whether it steers, the digest it waits for and whose clock that digest
-/// counts on, as the lookout sends them: a note goes once what came
-/// settles, carrying every event ready by then, each no sooner than a
-/// digest after the note before on its clock, a steer at once; one its
-/// digest still holds waits for a later note.
-fn notes(times: &[(u128, bool, Option<std::time::Duration>, &str)]) -> usize {
+/// One event a test heard, as the estimate of its notes sees it.
+#[derive(Clone, Copy)]
+struct Timed<'a> {
+    /// When it came, in epoch ms.
+    at: u128,
+    steer: bool,
+    /// The digest it waits for, in ms; `0` for none.
+    window: u128,
+    /// Whose clock that digest counts on.
+    clock: &'a str,
+    /// Its line's length in the note.
+    bytes: usize,
+}
+
+/// About how many notes these events would be, as the lookout sends
+/// them: a note goes once what came settles, or at once for a steer,
+/// carrying what is ready by then, steers first, as many as a note holds;
+/// each event no sooner than a digest after the note before on its
+/// clock. What a note had no room for, or a digest still holds, waits for
+/// a later one, which goes no sooner than the note before.
+fn notes(times: &[Timed]) -> usize {
     use std::collections::HashMap;
-    /// One waiting event: when it came, whether it steers, its window, its clock.
-    type Waiting<'a> = (u128, bool, u128, &'a str);
-    fn ready(last: &HashMap<&str, u128>, &(at, steer, window, clock): &Waiting) -> u128 {
-        match steer {
-            true => at,
-            false => last.get(clock).map_or(at, |told| at.max(told + window)),
+    fn ready(last: &HashMap<&str, u128>, e: &Timed) -> u128 {
+        match e.steer {
+            true => e.at,
+            false => (last.get(e.clock)).map_or(e.at, |told| e.at.max(told + e.window)),
         }
     }
     /// The notes that go before `before`, or all of them: how many.
     fn send<'a>(
-        waiting: &mut Vec<Waiting<'a>>,
+        waiting: &mut Vec<Timed<'a>>,
         last: &mut HashMap<&'a str, u128>,
+        free: &mut u128,
         before: Option<u128>,
     ) -> usize {
         let settle = super::SETTLE.as_millis();
+        let goes = |last: &HashMap<&str, u128>, free: u128, e: &Timed| {
+            ready(last, e).max(free) + if e.steer { 0 } else { settle }
+        };
         let mut notes = 0;
-        while let Some(went) = (waiting.iter()).map(|e| ready(last, e) + settle).min() {
+        while let Some(went) = (waiting.iter()).map(|e| goes(last, *free, e)).min() {
             if before.is_some_and(|at| went >= at) {
                 break;
             }
             notes += 1;
-            let (carried, held): (Vec<_>, Vec<_>) =
+            let (mut carried, held): (Vec<_>, Vec<_>) =
                 waiting.drain(..).partition(|e| ready(last, e) <= went);
-            for (.., clock) in carried {
-                last.insert(clock, went);
+            carried.sort_by_key(|e| !e.steer);
+            let mut bytes = 0;
+            let take = (carried.iter().take(super::NOTE_ITEMS))
+                .take_while(|e| {
+                    bytes += e.bytes + 1;
+                    bytes <= super::sources::NOTE_BYTES
+                })
+                .count()
+                .max(1);
+            for e in carried.drain(..take) {
+                last.insert(e.clock, went);
             }
-            *waiting = held;
+            carried.extend(held);
+            *waiting = carried;
+            *free = went;
         }
         notes
     }
     let mut last: HashMap<&str, u128> = HashMap::new();
-    let mut waiting: Vec<Waiting> = Vec::new();
-    let mut notes = 0;
-    for &(at, steer, digest, clock) in times {
-        notes += send(&mut waiting, &mut last, Some(at));
-        waiting.push((at, steer, digest.map_or(0, |d| d.as_millis()), clock));
+    let mut waiting: Vec<Timed> = Vec::new();
+    let (mut free, mut notes) = (0, 0);
+    for e in times {
+        notes += send(&mut waiting, &mut last, &mut free, Some(e.at));
+        waiting.push(*e);
     }
-    notes + send(&mut waiting, &mut last, None)
+    notes + send(&mut waiting, &mut last, &mut free, None)
 }
 
 /// The fields that keep a filter from hearing any event like those its
@@ -1521,17 +1568,22 @@ mod tests {
             line(now - 40_000, "failed", true),
             line(now - 1_000, "failed", false),
         ];
+        // What the subscriber said itself it does not hear.
+        let mut own: Value = serde_json::from_str(&line(now - 500, "failed", false)).unwrap();
+        own["from"] = json!("shop.lead");
+        let mut lines = lines.to_vec();
+        lines.push(own.to_string());
         std::fs::write(&file, lines.join("\n") + "\n").unwrap();
         let sources = ["ci".to_owned()];
         let add = json!({"name": "red", "sources": ["ci:main"], "filter": {"status": ["failed"]},
             "bots": ["ci.*"]});
-        let said = tried(&store, &add, &sources).unwrap();
+        let said = tried(&store, "shop.lead", &add, &sources).unwrap();
         let test = &said["test"];
         // What is older than a day is gone; what the filter leaves out is
         // not heard.
         assert_eq!(
             (&test["events"], &test["heard"], &test["steers"]),
-            (&json!(4), &json!(3), &json!(1))
+            (&json!(5), &json!(3), &json!(1))
         );
         assert_eq!(test["notes"], 3, "{said}");
         assert_eq!(test["examples"][0]["text"], "build failed");
@@ -1544,10 +1596,12 @@ mod tests {
         assert_eq!(tried_notes(&store, &digested), 3);
         let all = json!({"name": "red", "sources": ["ci"]});
         assert_eq!(tried_notes(&store, &all), 4);
+        let other = tried(&store, "shop.fix", &all, &sources).unwrap();
+        assert_eq!(other["test"]["heard"], 5, "{other}");
         // A source there is not is refused as add refuses it.
         let none = json!({"name": "x", "sources": ["cd"]});
         assert!(
-            tried(&store, &none, &sources)
+            tried(&store, "shop.lead", &none, &sources)
                 .unwrap_err()
                 .contains("no source")
         );
@@ -1556,7 +1610,7 @@ mod tests {
     }
 
     fn tried_notes(store: &Path, add: &Value) -> u64 {
-        tried(store, add, &["ci".to_owned()]).unwrap()["test"]["notes"]
+        tried(store, "shop.lead", add, &["ci".to_owned()]).unwrap()["test"]["notes"]
             .as_u64()
             .unwrap()
     }
@@ -1564,37 +1618,61 @@ mod tests {
     #[test]
     fn notes_come_at_most_once_a_digest_and_a_steer_goes_at_once() {
         let s = |n: u64| u128::from(n) * 1000;
-        let hour = Some(std::time::Duration::from_secs(3600));
+        let hour = 3_600_000;
+        let t = |at: u128, steer: bool, window: u128, clock: &'static str| Timed {
+            at,
+            steer,
+            window,
+            clock,
+            bytes: 100,
+        };
         // As they come: a spell within the settle is one note.
         assert_eq!(
             notes(&[
-                (s(0), false, None, "a"),
-                (s(1), false, None, "a"),
-                (s(10), false, None, "a")
+                t(s(0), false, 0, "a"),
+                t(s(1), false, 0, "a"),
+                t(s(10), false, 0, "a")
             ]),
             2
         );
         // A digest: the first at once, the rest gathered at its end.
         let digested = [
-            (s(0), false, hour, "a"),
-            (s(60), false, hour, "a"),
-            (s(120), false, hour, "a"),
+            t(s(0), false, hour, "a"),
+            t(s(60), false, hour, "a"),
+            t(s(120), false, hour, "a"),
         ];
         assert_eq!(notes(&digested), 2);
         // Three sources, each its own digest's clock: each first at once.
         let three = [
-            (s(0), false, hour, "a"),
-            (s(60), false, hour, "b"),
-            (s(120), false, hour, "c"),
+            t(s(0), false, hour, "a"),
+            t(s(60), false, hour, "b"),
+            t(s(120), false, hour, "c"),
         ];
         assert_eq!(notes(&three), 3);
         let steered = [
-            (s(0), false, hour, "a"),
-            (s(60), false, hour, "a"),
-            (s(120), true, hour, "a"),
+            t(s(0), false, hour, "a"),
+            t(s(60), false, hour, "a"),
+            t(s(120), true, hour, "a"),
         ];
         // A steer goes at once, alone: what its digest holds waits on.
         assert_eq!(notes(&steered), 3);
+        // Steers wait for no settle: each goes as it comes.
+        assert_eq!(
+            notes(&[
+                t(0, true, 0, "a"),
+                t(500, true, 0, "a"),
+                t(1000, true, 0, "a")
+            ]),
+            3
+        );
+        // A note holds so many events, and so many bytes.
+        let burst = vec![t(0, false, 0, "a"); 2000];
+        assert_eq!(notes(&burst), 2000 / super::super::NOTE_ITEMS);
+        let big = Timed {
+            bytes: super::super::sources::NOTE_BYTES / 2,
+            ..t(0, false, 0, "a")
+        };
+        assert_eq!(notes(&[big; 4]), 4);
         assert_eq!(notes(&[]), 0);
     }
 
