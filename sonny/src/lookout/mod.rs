@@ -1028,6 +1028,9 @@ type Call = (String, i64, String);
 /// Where a lookout's answers from the daemon go: its subscriber, its own
 /// number, and the answer.
 type Woken = tokio::sync::mpsc::Sender<(String, u64, Answer)>;
+/// Where the copies that check a reply say what it waits on the person
+/// for, by agent and turn ([`Service::check_waiting`]).
+type Checked = tokio::sync::mpsc::UnboundedSender<(String, i64, Option<String>)>;
 
 /// The person's newest message in `bot`: one no agent or client sent,
 /// with words of theirs, not only tool results, and no reaction of theirs.
@@ -1149,14 +1152,20 @@ impl Service {
     /// a copy of the agent, with no tools, says at once whether they wait
     /// on the person, and what for, kept as a mark every surface reads
     /// ([`crate::waiting`]). Not a side chat's, nor a copy's, nor any with
-    /// `[sonny] needs_check = false`.
-    fn check_waiting(&self, event: &Value, live: bool, client: &Arc<Client>) {
+    /// `[sonny] needs_check = false`. What the copy found goes to
+    /// `checked` as well, for the leads that hold the turn's end until it
+    /// says: the agent and turn checked, when one is.
+    fn check_waiting(
+        &self,
+        event: &Value,
+        live: bool,
+        client: &Arc<Client>,
+        checked: &Checked,
+    ) -> Option<(String, i64)> {
         if !live || event["event"] != "turn_finished" || event["data"]["status"] != "completed" {
-            return;
+            return None;
         }
-        let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) else {
-            return;
-        };
+        let (bot, turn) = (event["bot"].as_str()?, event["turn"].as_i64()?);
         let project = bot.split('.').next().unwrap_or_default();
         let ours =
             crate::project::is_lead(bot) || self.records.contains_key(&format!("{project}.lead"));
@@ -1165,18 +1174,20 @@ impl Service {
             .get(bot)
             .is_some_and(|r| r["expire_ms"].is_null());
         if !ours || !kept || crate::waiting::is_copy(bot) || crate::side_source(bot).is_some() {
-            return;
+            return None;
         }
         if !agent_client::config::load().map_or(true, |c| c.sonny.needs_check) {
-            return;
+            return None;
         }
-        let (client, checks) = (client.clone(), self.checks.clone());
+        let (client, checks, checked) = (client.clone(), self.checks.clone(), checked.clone());
         let (store, bot) = (self.store.clone(), bot.to_owned());
+        let named = bot.clone();
         tokio::spawn(async move {
             let Ok(_turn) = checks.acquire().await else {
                 return;
             };
             let found = waiting_for(&client, &bot, turn).await;
+            let _ = checked.send((bot.clone(), turn, found.clone().ok().flatten()));
             let kept = match found {
                 Ok(found) => {
                     let mark = found.map(|waiting_for| crate::waiting::Mark { turn, waiting_for });
@@ -1191,6 +1202,7 @@ impl Service {
                 );
             }
         });
+        Some((named, turn))
     }
 
     async fn watch(
@@ -1295,6 +1307,8 @@ impl Service {
         // as a goal's turn waits on its one settlement, which a full
         // channel would drop: it holds a few per agent with a goal at most.
         let (checked, mut settled) = tokio::sync::mpsc::unbounded_channel();
+        // So too the copies checking replies, each answering once.
+        let (waited, mut found) = tokio::sync::mpsc::unbounded_channel();
         for lookout in self.lookouts.values_mut() {
             // Reads a dropped connection left under way answer the old
             // channel, never this one.
@@ -1432,7 +1446,11 @@ impl Service {
                         .zip(event["turn"].as_i64())
                         .and_then(|(bot, turn)| self.in_flight.get(&(bot.to_owned(), turn)).copied());
                     let bounces = self.sent(&event, live);
-                    self.check_waiting(&event, live, &client);
+                    if let Some((bot, turn)) = self.check_waiting(&event, live, &client, &waited) {
+                        for lookout in self.lookouts.values_mut() {
+                            lookout.updates.waiting_turn(&bot, turn);
+                        }
+                    }
                     if let Some((bot, turn)) = self.goals.event(&event, bot_id, live, &client, &checked) {
                         for lookout in self.lookouts.values_mut() {
                             lookout.updates.goal_turn(&bot, turn);
@@ -1519,6 +1537,11 @@ impl Service {
                 }
                 Some(key) = bounce_taken.recv() => {
                     self.bouncing.remove(&key);
+                }
+                Some((bot, turn, waiting)) = found.recv() => {
+                    for lookout in self.lookouts.values_mut() {
+                        lookout.updates.waiting_settled(&bot, turn, waiting.clone());
+                    }
                 }
                 Some(settled) = settled.recv() => {
                     let checking = self.goals.settled(&settled, &client, &checked);
