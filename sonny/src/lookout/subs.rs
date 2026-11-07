@@ -522,6 +522,125 @@ pub fn matches(glob: &str, name: &str) -> bool {
     rest.is_empty()
 }
 
+/// How far back a subscription's counts go, by the hour.
+const COUNTED_HOURS: u64 = 24;
+const HOUR_MS: u64 = 60 * 60 * 1000;
+
+/// What each of a subscriber's subscriptions told it lately, by the hour,
+/// for the listing: what it heard that notes told, those notes, how many
+/// of them steered for it, and when it last told.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Counts(std::collections::BTreeMap<String, Count>);
+
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Count {
+    /// By hour since the epoch: heard, notes, steers.
+    hours: std::collections::VecDeque<(u64, [u64; 3])>,
+    last_ms: u64,
+}
+
+impl Count {
+    fn recent(&mut self, now_ms: u64) {
+        let first = (now_ms / HOUR_MS).saturating_sub(COUNTED_HOURS - 1);
+        while self.hours.front().is_some_and(|(hour, _)| *hour < first) {
+            self.hours.pop_front();
+        }
+    }
+}
+
+impl Counts {
+    /// A note told what `sub` heard, `heard` of it, steering for it or not.
+    pub fn told(&mut self, sub: &str, heard: u64, steered: bool, now_ms: u64) {
+        let count = self.0.entry(sub.to_owned()).or_default();
+        count.recent(now_ms);
+        let hour = now_ms / HOUR_MS;
+        if count.hours.back().is_none_or(|(last, _)| *last != hour) {
+            count.hours.push_back((hour, [0; 3]));
+        }
+        if let Some((_, [h, n, s])) = count.hours.back_mut() {
+            *h += heard;
+            *n += 1;
+            *s += u64::from(steered);
+        }
+        count.last_ms = now_ms;
+    }
+
+    /// Only the subscriptions `kept` keeps: one removed and added again
+    /// counts afresh. Whether any went.
+    pub fn keep(&mut self, kept: impl Fn(&str) -> bool) -> bool {
+        let before = self.0.len();
+        self.0.retain(|sub, _| kept(sub));
+        self.0.len() < before
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn to_json(&self) -> Value {
+        (self.0.iter())
+            .map(|(sub, count)| {
+                let hours: Vec<Value> = (count.hours.iter())
+                    .map(|(hour, [h, n, s])| json!([hour, h, n, s]))
+                    .collect();
+                (
+                    sub.clone(),
+                    json!({"hours": hours, "last_ms": count.last_ms}),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>()
+            .into()
+    }
+
+    pub fn from_json(value: &Value) -> Counts {
+        let count = |value: &Value| -> Count {
+            let hours = (value["hours"].as_array().into_iter().flatten())
+                .filter_map(|row| {
+                    let at = |n: usize| row.get(n).and_then(Value::as_u64);
+                    Some((at(0)?, [at(1)?, at(2)?, at(3)?]))
+                })
+                .collect();
+            Count {
+                hours,
+                last_ms: value["last_ms"].as_u64().unwrap_or(0),
+            }
+        };
+        Counts(
+            (value.as_object().into_iter().flatten())
+                .map(|(sub, value)| (sub.clone(), count(value)))
+                .collect(),
+        )
+    }
+
+    /// What `sub` told in the last 24 hours as of `now_ms`, as the listing
+    /// says it: none when it told nothing yet.
+    pub fn of(&self, sub: &str, now_ms: u64) -> Option<Value> {
+        let mut count = self.0.get(sub)?.clone();
+        count.recent(now_ms);
+        let [mut heard, mut notes, mut steers] = [0; 3];
+        for (_, [h, n, s]) in &count.hours {
+            (heard, notes, steers) = (heard + h, notes + n, steers + s);
+        }
+        let last = super::sources::clock(u128::from(count.last_ms));
+        Some(json!({"heard": heard, "notes": notes, "steers": steers, "last": last}))
+    }
+}
+
+/// Where the lookout keeps a subscriber's counts.
+pub fn counts_file(store: &Path, subscriber: &str) -> PathBuf {
+    dir(store)
+        .join(".counts")
+        .join(format!("{subscriber}.json"))
+}
+
+/// A subscriber's counts, as the lookout last wrote them.
+pub fn counts(store: &Path, subscriber: &str) -> Counts {
+    (std::fs::read_to_string(counts_file(store, subscriber)).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .map(|value| Counts::from_json(&value))
+        .unwrap_or_default()
+}
+
 /// Where subscribers' files are: beside the store.
 pub fn dir(store: &Path) -> PathBuf {
     let mut path = store.as_os_str().to_owned();
@@ -858,25 +977,11 @@ pub fn change(
     // What it adds is held by the bot of that ID, so a later bot given
     // the name, a task started again, say, never inherits it.
     let made = (super::epoch_ms() as u64).max(1);
-    let add = (add.map(parse).transpose()?).map(|sub| Sub {
+    let add = (add.map(|add| checked(add, sources)).transpose()?).map(|sub| Sub {
         owner,
         made: sub.runs.map(|_| made),
         ..sub
     });
-    let known = |name: &String| {
-        let (source, topic) = super::sources::named(name);
-        sources.iter().any(|s| s == source) && topic.is_none_or(|topic| plain(topic, NAME_MAX))
-    };
-    if let Some(unknown) = (add.iter().flat_map(|sub| &sub.sources)).find(|s| !known(s)) {
-        let there = match sources.is_empty() {
-            true => "none: the person sets them up under [sonny.sources] in ~/.agent/config.toml"
-                .to_owned(),
-            false => sources.join(", "),
-        };
-        return Err(format!(
-            "no source {unknown:?}; the sources there are {there}"
-        ));
-    }
     // One change at a time, so two at once both land.
     let _held = held(store)?;
     let mut subs = read_whole(store, subscriber)?;
@@ -932,14 +1037,20 @@ pub fn change(
             }
         }
     }
-    // When each was added is the lookout's to count by, not the bot's to read.
+    // What each told lately, as the lookout counts it; when each was
+    // added is the lookout's to count by, not the bot's to read.
+    let (counts, now) = (counts(store, subscriber), super::epoch_ms() as u64);
     said["subscriptions"] = (subs.iter())
         .map(|sub| {
-            Sub {
+            let mut listed = Sub {
                 made: None,
                 ..sub.clone()
             }
-            .to_json()
+            .to_json();
+            if let Some(told) = counts.of(&sub.name, now) {
+                listed["lately"] = told;
+            }
+            listed
         })
         .collect();
     // Whether what it lists is what the lookout listens for.
@@ -952,6 +1063,111 @@ pub fn change(
         said["examples"] = json!(super::sources::EXAMPLES);
     }
     Ok(said)
+}
+
+/// A subscription `add` names, and the sources it names among `sources`,
+/// the ones there are.
+fn checked(add: &Value, sources: &[String]) -> Result<Sub, String> {
+    let sub = parse(add)?;
+    let known = |name: &String| {
+        let (source, topic) = super::sources::named(name);
+        sources.iter().any(|s| s == source) && topic.is_none_or(|topic| plain(topic, NAME_MAX))
+    };
+    if let Some(unknown) = sub.sources.iter().find(|s| !known(s)) {
+        let there = match sources.is_empty() {
+            true => "none: the person sets them up under [sonny.sources] in ~/.agent/config.toml"
+                .to_owned(),
+            false => sources.join(", "),
+        };
+        return Err(format!(
+            "no source {unknown:?}; the sources there are {there}"
+        ));
+    }
+    Ok(sub)
+}
+
+/// A `subscriptions` call's `test`: what the subscription `add` names
+/// would have heard of its sources' last 24 hours, as the lookout keeps
+/// them, and adding nothing. How many events it would hear, how many
+/// would steer, about how many notes they would be, with its digest or
+/// its sources', and the newest few as examples.
+pub fn tried(store: &Path, add: &Value, sources: &[String]) -> Result<Value, String> {
+    let sub = checked(add, sources)?;
+    let now = super::epoch_ms();
+    let since = now.saturating_sub(super::sources::RECENT_SPAN.as_millis());
+    let mut named: Vec<&str> = (sub.sources.iter())
+        .map(|name| super::sources::named(name).0)
+        .collect();
+    named.sort_unstable();
+    named.dedup();
+    let mut events: Vec<(super::sources::Event, bool)> = (named.iter())
+        .flat_map(|source| super::sources::recent(store, source, since))
+        .collect();
+    events.sort_by_key(|(event, _)| event.at_ms);
+    let (mut heard, mut steers, mut cut) = (0, 0, 0);
+    let mut times = Vec::new();
+    let mut newest = Vec::new();
+    for (event, was_cut) in &events {
+        if !sub.hears(event) {
+            continue;
+        }
+        heard += 1;
+        cut += usize::from(*was_cut);
+        let steer = event.steer
+            || (sub.steer.as_ref()).is_some_and(|s| super::pattern::matches(s, &event.fields));
+        steers += usize::from(steer);
+        let digest = match &sub.digest {
+            Some(_) => sub.digest_span(),
+            None => event.digest,
+        };
+        times.push((event.at_ms, steer, digest));
+        newest.push(event);
+    }
+    let examples: Vec<Value> = (newest.iter().rev().take(3))
+        .map(|event| {
+            json!({"source": event.source, "topic": event.topic, "at": super::sources::clock(event.at_ms),
+                "text": super::sources::cut(&event.text, 200)})
+        })
+        .collect();
+    let mut tried = json!({"since": super::sources::clock(since), "events": events.len(),
+        "heard": heard, "steers": steers, "notes": notes(&times)});
+    if cut > 0 {
+        tried["cut"] = json!(format!(
+            "{cut} of the events it heard were kept cut, which a filter may misjudge"
+        ));
+    }
+    if !sub.tasks_of.is_empty() || !sub.bots.is_empty() {
+        tried["untested"] = json!("its bots: only what sources printed is kept to test on");
+    }
+    let mut said = json!({"test": tried});
+    if !examples.is_empty() {
+        said["test"]["examples"] = json!(examples);
+        said["examples"] = json!(super::sources::EXAMPLES);
+    }
+    Ok(said)
+}
+
+/// About how many notes events heard at these times would be, each with
+/// whether it steers and the digest it waits for: a note goes once what
+/// came settles, no sooner than a digest after the note before, and a
+/// steer waits for no digest; what comes while one waits goes with it.
+fn notes(times: &[(u128, bool, Option<std::time::Duration>)]) -> usize {
+    let settle = super::SETTLE.as_millis();
+    let (mut notes, mut last, mut due): (usize, Option<u128>, Option<u128>) = (0, None, None);
+    for &(at, steer, digest) in times {
+        if let Some(went) = due.filter(|due| *due < at) {
+            notes += 1;
+            last = Some(went);
+            due = None;
+        }
+        let window = match steer {
+            true => 0,
+            false => digest.map_or(0, |d| d.as_millis()),
+        };
+        let goes = last.map_or(at, |told| at.max(told + window)) + settle;
+        due = Some(due.map_or(goes, |due| due.min(goes)));
+    }
+    notes + usize::from(due.is_some())
 }
 
 /// The fields that keep a filter from hearing any event like those its
@@ -1254,6 +1470,121 @@ mod tests {
         change(&store, "shop.lead", Some(2), Some(&theirs), None, &[]).unwrap();
         assert_eq!(forget(&store, "shop.lead", Some(1)), Ok(0));
         assert_eq!(read(&store, "shop.lead")[0].name, "theirs");
+        let _ = std::fs::remove_dir_all(dir(&store));
+    }
+
+    #[test]
+    fn a_test_says_what_a_subscription_would_have_heard_and_adds_nothing() {
+        let store = std::env::temp_dir().join(format!("subs-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let sources_dir = super::super::beside(&store, ".sources");
+        let file = super::super::sources::recent_file(&sources_dir, "ci");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let now = super::super::epoch_ms() as u64;
+        let line = |at: u64, status: &str, steer: bool| {
+            json!({"source": "ci", "text": format!("build {status}"), "topic": "main", "steer": steer,
+                "at_ms": at, "seq": 0, "fields": {"text": format!("build {status}"), "status": status}})
+            .to_string()
+        };
+        let day = 24 * 60 * 60 * 1000;
+        let lines = [
+            line(now - day - 1000, "failed", false),
+            line(now - 60_000, "passed", false),
+            line(now - 50_000, "failed", false),
+            line(now - 40_000, "failed", true),
+            line(now - 1_000, "failed", false),
+        ];
+        std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+        let sources = ["ci".to_owned()];
+        let add = json!({"name": "red", "sources": ["ci:main"], "filter": {"status": ["failed"]},
+            "bots": ["ci.*"]});
+        let said = tried(&store, &add, &sources).unwrap();
+        let test = &said["test"];
+        // What is older than a day is gone; what the filter leaves out is
+        // not heard.
+        assert_eq!(
+            (&test["events"], &test["heard"], &test["steers"]),
+            (&json!(4), &json!(3), &json!(1))
+        );
+        assert_eq!(test["notes"], 3, "{said}");
+        assert_eq!(test["examples"][0]["text"], "build failed");
+        assert_eq!(test["examples"].as_array().unwrap().len(), 3);
+        assert!(test["untested"].as_str().unwrap().contains("its bots"));
+        assert!(said["examples"].as_str().is_some());
+        assert!(read(&store, "shop.lead").is_empty());
+        // A digest gathers what does not steer.
+        let digested = json!({"name": "red", "sources": ["ci"], "digest": "1h"});
+        assert_eq!(tried_notes(&store, &digested), 3);
+        let all = json!({"name": "red", "sources": ["ci"]});
+        assert_eq!(tried_notes(&store, &all), 4);
+        // A source there is not is refused as add refuses it.
+        let none = json!({"name": "x", "sources": ["cd"]});
+        assert!(
+            tried(&store, &none, &sources)
+                .unwrap_err()
+                .contains("no source")
+        );
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let _ = std::fs::remove_dir_all(&sources_dir);
+    }
+
+    fn tried_notes(store: &Path, add: &Value) -> u64 {
+        tried(store, add, &["ci".to_owned()]).unwrap()["test"]["notes"]
+            .as_u64()
+            .unwrap()
+    }
+
+    #[test]
+    fn notes_come_at_most_once_a_digest_and_a_steer_goes_at_once() {
+        let s = |n: u64| u128::from(n) * 1000;
+        let hour = Some(std::time::Duration::from_secs(3600));
+        // As they come: a spell within the settle is one note.
+        assert_eq!(
+            notes(&[
+                (s(0), false, None),
+                (s(1), false, None),
+                (s(10), false, None)
+            ]),
+            2
+        );
+        // A digest: the first at once, the rest gathered at its end.
+        let digested = [
+            (s(0), false, hour),
+            (s(60), false, hour),
+            (s(120), false, hour),
+        ];
+        assert_eq!(notes(&digested), 2);
+        // A steer goes at once and takes what waits along.
+        let steered = [
+            (s(0), false, hour),
+            (s(60), false, hour),
+            (s(120), true, hour),
+        ];
+        assert_eq!(notes(&steered), 2);
+        assert_eq!(notes(&[]), 0);
+    }
+
+    #[test]
+    fn the_listing_says_what_each_subscription_told_lately() {
+        let store = std::env::temp_dir().join(format!("subs-lately-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let sub = json!({"name": "prs", "bots": ["a"]});
+        change(&store, "shop.lead", None, Some(&sub), None, &[]).unwrap();
+        let mut counts = Counts::default();
+        let now = super::super::epoch_ms() as u64;
+        counts.told("prs", 3, false, now - 2 * HOUR_MS);
+        counts.told("prs", 1, true, now);
+        assert_eq!(Counts::from_json(&counts.to_json()), counts);
+        let file = counts_file(&store, "shop.lead");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, counts.to_json().to_string()).unwrap();
+        let listed = change(&store, "shop.lead", None, None, None, &[]).unwrap();
+        let lately = &listed["subscriptions"][0]["lately"];
+        assert_eq!(
+            (&lately["heard"], &lately["notes"], &lately["steers"]),
+            (&json!(4), &json!(2), &json!(1))
+        );
+        assert!(lately["last"].is_string());
         let _ = std::fs::remove_dir_all(dir(&store));
     }
 

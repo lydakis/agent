@@ -204,6 +204,15 @@ seconds. Removing `tasks` stops a lead's lookout until Sonny next opens its
 project. `/background` in Sonny lists the project's agents' subscriptions,
 with their automations; `d` there removes one.
 
+Each subscription in the answer's list says under `lately` what it told
+in the last 24 hours, once it has told anything: the events and tasks'
+news its notes carried (`heard`), those notes (`notes`), how many of them
+steered for it, by its `steer` or the source's mark (`steers`), and when
+it last told (`last`). The lookout counts them by the hour as each note
+lands, in `STORE.lookout/.counts/BOT.json`, written with what it holds;
+a subscription removed takes its counts with it. So a flood shows as a
+subscription with many notes, without reading the log.
+
 ## Sources
 
 A source is news from outside the daemon: a chat, a mailbox, a feed. The
@@ -369,6 +378,28 @@ subscribe to, not a post:
 
 A filter naming a field no recent event of its sources had is added, and
 the answer says so under `unseen`: it hears nothing until one does.
+
+To try a subscription before adding it, a call sends it as `add` with
+`"test": true`. Nothing is added; the answer's `test` says what it would
+have heard of its sources' last 24 hours: how many events there were
+(`events`), how many it hears by source, topic and filter (`heard`), how
+many of those steer, by the source's mark or the subscription's `steer`
+(`steers`), and about how many notes they would have been with its
+digest or its sources' (`notes`), with the newest 3 it hears as examples,
+outside content as the listing's are. For this the lookout keeps what
+each source's command printed in `STORE.sources/.recent/NAME.jsonl`, an
+event a line: a day of it, at most 2,000 events and 4 MiB, an event's
+fields cut as a shape's examples are past 16 KiB (`cut` then counts them,
+since a filter may misjudge a cut event). The same writer thread appends
+it and cuts it back once an hour or when it grows past its bytes. The
+commons is not kept, since its threads are their members'. What bots do
+is not kept either, so a subscription that watches bots says so under
+`untested`.
+
+```
+{"add": {"name": "red", "sources": ["ci:main"], "filter": {"status": ["failed"]}}, "test": true}
+→ {"test": {"since": "Fri 7 Nov 05:10", "events": 412, "heard": 9, "steers": 1, "notes": 9, "examples": […]}, "examples": "The fields' examples are…"}
+```
 
 What sources said goes in a note of its own, as a steer, once the news
 has settled 2 seconds, or at once for an event that steers. Joining a

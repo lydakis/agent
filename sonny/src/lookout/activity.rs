@@ -78,9 +78,9 @@ pub struct Hold {
     /// is when it goes, and a note that tells it, however soon, starts
     /// each one's time again.
     pub windows: Vec<(String, Duration)>,
-    /// The subscriptions that heard it: a note that tells it counts one
-    /// for each that lasts so many notes, and it is no news once they all
-    /// ended.
+    /// The subscriptions that heard it: a note that tells it counts for
+    /// each, toward the listing's counts and a `runs` end, and it is no
+    /// news once they all ended.
     pub heard: Vec<String>,
 }
 

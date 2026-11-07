@@ -293,9 +293,19 @@ pub struct Told {
     seen: Option<HashMap<String, u64>>,
     /// The subscriptions with a digest whose news it tells.
     subs: Vec<String>,
-    /// The subscriptions that last so many notes whose news it tells:
-    /// once it lands, each has one note fewer to go.
-    pub counted: Vec<String>,
+    /// The subscriptions whose news it tells, each with how many tasks'
+    /// news: once it lands, they count it, and one that lasts so many
+    /// notes has one fewer to go.
+    pub heard: Vec<(String, u64)>,
+    /// The subscription whose `steer` sent it at once, if one did.
+    pub steered: Option<String>,
+}
+
+impl Told {
+    /// The subscriptions it steered for: none, or the one whose `steer` sent it.
+    pub fn steered(&self) -> Vec<&str> {
+        self.steered.iter().map(String::as_str).collect()
+    }
 }
 
 pub struct Line {
@@ -319,6 +329,10 @@ pub struct Updates {
     /// bot one with a filter, a digest or `urgent` watches: none for the
     /// rest, whose news goes as it always did.
     pub rules: HashMap<String, Arc<[super::activity::Rule]>>,
+    /// The subscriptions that watch each bot whose news no rule gates,
+    /// by name, each set held once however many bots share it: what a
+    /// note told of such a bot counts for each.
+    pub hearers: HashMap<String, Arc<[String]>>,
     /// When a note last told news a subscription's digest held, which
     /// that digest counts from: its sources' and its bots' alike.
     pub told_subs: HashMap<String, Instant>,
@@ -494,6 +508,7 @@ impl Updates {
             lead: lead.to_owned(),
             memory,
             rules: HashMap::new(),
+            hearers: HashMap::new(),
             told_subs: HashMap::new(),
             flying: HashMap::new(),
             subscribers: Arc::default(),
@@ -1707,8 +1722,10 @@ impl Updates {
         self.tasks = later;
         // What each subscription with a digest heard goes now, however soon:
         // its digest counts from this note once it lands.
-        let (mut subs, mut counted): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
-        for (_, news) in &sent {
+        let mut subs: Vec<String> = Vec::new();
+        let mut heard: Vec<(String, u64)> = Vec::new();
+        for (name, news) in &sent {
+            let mut hearing: Vec<&String> = Vec::new();
             for hold in news.holds() {
                 for (sub, _) in &hold.windows {
                     if !subs.contains(sub) {
@@ -1716,9 +1733,18 @@ impl Updates {
                     }
                 }
                 for sub in &hold.heard {
-                    if !counted.contains(sub) {
-                        counted.push(sub.clone());
+                    if !hearing.contains(&sub) {
+                        hearing.push(sub);
                     }
+                }
+            }
+            if hearing.is_empty() {
+                hearing.extend(self.hearers.get(name).into_iter().flat_map(|h| h.iter()));
+            }
+            for sub in hearing {
+                match heard.iter_mut().find(|(had, _)| had == sub) {
+                    Some((_, n)) => *n += 1,
+                    None => heard.push((sub.clone(), 1)),
                 }
             }
         }
@@ -1736,7 +1762,8 @@ impl Updates {
             sent,
             seen,
             subs,
-            counted,
+            heard,
+            steered: None,
         }
     }
 
