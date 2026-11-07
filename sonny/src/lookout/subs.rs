@@ -1158,8 +1158,19 @@ pub fn tried(
             "{cut} of the events it heard were kept cut, which a filter may misjudge"
         ));
     }
-    if !sub.tasks_of.is_empty() || !sub.bots.is_empty() {
-        tried["untested"] = json!("its bots: only what sources printed is kept to test on");
+    // The commons keeps no recent log, as no bot does.
+    let untested: Vec<&str> = [
+        (!sub.tasks_of.is_empty() || !sub.bots.is_empty()).then_some("its bots"),
+        named.contains(&COMMONS_SOURCE).then_some("the commons"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !untested.is_empty() {
+        tried["untested"] = json!(format!(
+            "{}: only what sources printed is kept to test on",
+            untested.join(" and ")
+        ));
     }
     let mut said = json!({"test": tried});
     if !examples.is_empty() {
@@ -1598,6 +1609,17 @@ mod tests {
         assert_eq!(tried_notes(&store, &all), 4);
         let other = tried(&store, "shop.fix", &all, &sources).unwrap();
         assert_eq!(other["test"]["heard"], 5, "{other}");
+        // The commons keeps no recent log: a test of it says so.
+        let commons = json!({"name": "t", "sources": [format!("{COMMONS_SOURCE}:topic"), "ci"]});
+        let names = ["ci".to_owned(), COMMONS_SOURCE.to_owned()];
+        let said = tried(&store, "shop.lead", &commons, &names).unwrap();
+        assert!(
+            said["test"]["untested"]
+                .as_str()
+                .unwrap()
+                .starts_with("the commons:"),
+            "{said}"
+        );
         // A source there is not is refused as add refuses it.
         let none = json!({"name": "x", "sources": ["cd"]});
         assert!(

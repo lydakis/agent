@@ -2899,10 +2899,11 @@ impl Lookout {
             (true, false, Some(rule)) => Some(Steer::Rule(rule.to_owned())),
             (true, false, None) => Some(Steer::News),
         };
+        // A subscription's `steer` counts as steering whether or not the
+        // note joins a turn, or the person's words say why.
+        let rule = self.updates.urgent().map(str::to_owned);
         let mut told = self.updates.take_at(now);
-        if let Some(Steer::Rule(rule)) = &steer {
-            told.steered = Some(rule.clone());
-        }
+        told.steered = rule;
         // All there is waits on replies being read.
         if told.items.is_empty() && told.memory.is_none() {
             self.updates.unsent(told);
@@ -5390,6 +5391,21 @@ mod tests {
         );
         assert!(service.hearing(&delta("calc.docs")).is_empty());
         assert!(!service.lookouts["calc.lead"].updates.has("calc.docs"));
+    }
+
+    #[tokio::test]
+    async fn a_subscription_steer_counts_though_its_note_joins_no_turn() {
+        let (client, _got) = submits().await;
+        let mut lookout = seated("idle");
+        lookout.subs[0].steer = Some(json!({"status": ["failed"]}));
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        ended(&mut lookout, 5, "failed");
+        assert_eq!(lookout.updates.urgent(), Some("tasks"));
+        let (woken, _woke) = tokio::sync::mpsc::channel(4);
+        lookout.wake(&client, &woken);
+        let (told, ..) = lookout.sending.as_ref().unwrap();
+        assert_eq!(told.steered(), ["tasks"]);
     }
 
     #[tokio::test]
