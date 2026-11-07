@@ -16765,3 +16765,122 @@ fn held_rows(db: &Database) -> Vec<Value> {
         .unwrap()
         .clone()
 }
+
+/// A store at `path` with three finished turns of Bob's: a short prompt, one
+/// past the size a turn shares its prompt node at, and a short one again.
+fn three_prompts(path: &std::path::Path) -> String {
+    let _ = std::fs::remove_file(path);
+    let long = format!("{}\nsecond line", "w".repeat(5000));
+    let mut db = Database::initialize(Connection::open(path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            &long,
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(turn, vec![assistant("r2")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    converse(&mut db, "Bob", 3);
+    long
+}
+
+/// What each listing says of Bob's prompts: the omitted-turns note before
+/// turn 3, the history listing, and the turn listing, previews and lengths.
+fn listed_prompts(db: &Database) -> Value {
+    let start: i64 = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["event"] == "accepted")
+        .unwrap()["data"]["node"]
+        .as_i64()
+        .unwrap();
+    let history = db.history_turns("Bob", 8).unwrap()["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| json!([t["turn"], t["prompt"], t["prompt_bytes"]]))
+        .collect::<Vec<_>>();
+    let turns = db.turns("Bob", 0, None, 8, false).unwrap()["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| json!([t["prompt_preview"], t["prompt_bytes"]]))
+        .collect::<Vec<_>>();
+    json!({"omitted": db.omitted_turns(start, 48).unwrap(), "history": history, "turns": turns})
+}
+
+#[test]
+fn listings_read_each_prompts_opening_never_its_item() {
+    let path = std::env::temp_dir().join(format!("agent-openings-{}.sqlite", std::process::id()));
+    let long = three_prompts(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let before = listed_prompts(&db);
+    let chars = long.chars().count();
+    assert_eq!(before["turns"][1], json!([long[..200], chars]));
+    assert_eq!(before["history"][1], json!([2, long[..200], chars]));
+    assert_eq!(before["omitted"][0][0], json!(2));
+    assert!(before["omitted"][0][1].as_str().unwrap().ends_with('…'));
+    // Prompt items that no longer parse: a listing that opened one fails.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE nodes SET item=zeroblob(70000) WHERE turn_seq IS NOT NULL
+                OR id IN (SELECT prompt_node FROM turns)",
+        )
+        .unwrap();
+    assert_eq!(listed_prompts(&db), before);
+    // A store from before openings gets every prompt's at open.
+    drop(db);
+    std::fs::remove_file(&path).unwrap();
+    three_prompts(&path);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE openings; PRAGMA user_version=78;")
+        .unwrap();
+    db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE nodes SET item=zeroblob(70000) WHERE turn_seq IS NOT NULL
+                OR id IN (SELECT prompt_node FROM turns)",
+        )
+        .unwrap();
+    assert_eq!(listed_prompts(&db), before);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_declined_prompt_is_noted_as_the_model_is_sent_it() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "something declined",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(turn, Some(&Error::new("provider_refusal")))
+        .unwrap();
+    converse(&mut db, "Bob", 2);
+    converse(&mut db, "Bob", 3);
+    let listed = listed_prompts(&db);
+    // The model hears of the note it is sent in the prompt's place; the
+    // person's listing keeps what they wrote.
+    assert_eq!(listed["omitted"][1], json!([1, "[Left out.]"]));
+    assert_eq!(listed["history"][2], json!([1, "[Left out.]", 11]));
+    assert_eq!(listed["turns"][0][0], json!("something declined"));
+}
