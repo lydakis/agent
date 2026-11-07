@@ -6523,6 +6523,10 @@ impl App {
             {
                 self.tell_plan(steps);
             }
+            // A task it started is tracked still, for what it asks.
+            if name == served::START && !failed {
+                self.track_started(arguments, output);
+            }
             return;
         }
         if name == margin::TOOL {
@@ -6664,23 +6668,7 @@ impl App {
     /// The task a `start_task` call started, joining the tasks started
     /// right before it.
     fn commit_started(&mut self, arguments: &Value, output: &str) {
-        let name = arguments["name"].as_str().unwrap_or("task").to_owned();
-        let bot = (output.split(|c: char| c.is_whitespace() || c == '"'))
-            .find(|word| word.starts_with("turn:"))
-            .map(calls::handle_bot)
-            .or_else(|| (self.project.as_ref()).map(|project| format!("{project}.{name}")))
-            .unwrap_or_else(|| name.clone());
-        let task = started::Task {
-            bot,
-            name,
-            // Only its first words are drawn.
-            brief: started::first(arguments["brief"].as_str().unwrap_or("")),
-            state: "starting".into(),
-        };
-        // Its name opens it at once, where it was drawn before it was made.
-        self.names.get_mut().learn(task.bot.clone(), true);
-        self.screen.relink();
-        self.tasks_read = None;
+        let task = self.started_task(arguments, output);
         if let Some((at, drawn)) = self.starting
             && drawn == self.rows_drawn
             && let Some(tasks) = self.tasks.get_mut(&at)
@@ -6706,6 +6694,40 @@ impl App {
         self.starting = Some((at, self.rows_drawn));
     }
 
+    /// A task started, words only: no roster drawn, but tracked as one
+    /// is, so its questions reach this window and the footer counts it;
+    /// those started live or in the newest page, as rows kept would be.
+    fn track_started(&mut self, arguments: &Value, output: &str) {
+        if self.newer.is_some() {
+            return;
+        }
+        let task = self.started_task(arguments, output);
+        let at = self.group();
+        self.tasks.insert(at, vec![task]);
+    }
+
+    /// The task a `start_task` call made, its name known from now on.
+    fn started_task(&mut self, arguments: &Value, output: &str) -> started::Task {
+        let name = arguments["name"].as_str().unwrap_or("task").to_owned();
+        let bot = (output.split(|c: char| c.is_whitespace() || c == '"'))
+            .find(|word| word.starts_with("turn:"))
+            .map(calls::handle_bot)
+            .or_else(|| (self.project.as_ref()).map(|project| format!("{project}.{name}")))
+            .unwrap_or_else(|| name.clone());
+        let task = started::Task {
+            bot,
+            name,
+            // Only its first words are drawn.
+            brief: started::first(arguments["brief"].as_str().unwrap_or("")),
+            state: "starting".into(),
+        };
+        // Its name opens it at once, where it was drawn before it was made.
+        self.names.get_mut().learn(task.bot.clone(), true);
+        self.screen.relink();
+        self.tasks_read = None;
+        task
+    }
+
     /// The rows of the tasks started together as `at`, and the buttons
     /// on them that open each.
     fn started_lines(&self, at: usize) -> (Vec<Line<'static>>, Vec<(usize, screen::Mark)>) {
@@ -6727,6 +6749,10 @@ impl App {
     /// The tasks started together as `at` drawn again where they are;
     /// whether they are still in the conversation.
     fn draw_started(&mut self, at: usize) -> bool {
+        // Words only, no roster is drawn: its tasks are tracked alone.
+        if self.words() {
+            return true;
+        }
         let (lines, marks) = self.started_lines(at);
         self.flush();
         (self.screen).replace_tagged(screen::Tag::Tasks(at as u64), lines, marks)
@@ -6753,7 +6779,7 @@ impl App {
         // read again.
         let gone: Vec<usize> = (self.tasks.keys())
             .copied()
-            .filter(|at| !self.kept(screen::Tag::Tasks(*at as u64)))
+            .filter(|at| !self.words() && !self.kept(screen::Tag::Tasks(*at as u64)))
             .collect();
         for at in gone {
             self.tasks.remove(&at);
@@ -18892,6 +18918,30 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
+        // A task started is no row, but tracked, so what it asks reaches
+        // this window.
+        let start = json!({"name": "add", "brief": "Fix add"});
+        app.commit_call(
+            "s1",
+            Some(1),
+            served::START,
+            &start,
+            "turn:calc.add/1",
+            false,
+        );
+        assert!(
+            app.tasks
+                .values()
+                .flatten()
+                .any(|task| task.bot == "calc.add")
+        );
+        app.read_tasks().await;
+        assert!(
+            app.tasks
+                .values()
+                .flatten()
+                .any(|task| task.bot == "calc.add")
+        );
         // What was asked and what came back, and how long it took no row.
         assert_eq!(rows(&app), ["› check on the tasks", "• Done."]);
         // The plan is the margin's still.
