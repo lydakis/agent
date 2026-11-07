@@ -594,8 +594,13 @@ class ApprovalTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:printf late')['result']['turn']
         waiting = client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
         self.assertEqual(waiting['data'], {'call_id': 'shell-1', 'approval': True, 'deadline_ms': None})
-        stats = client.request('stats')['result']
-        self.assertEqual((stats['active_turns'], stats['waiting_turns']), (0, 1))
+        # turn_waiting commits as the turn parks; its slot is let go as its
+        # task ends, just after.
+        deadline = time.monotonic() + 5
+        while (stats := client.request('stats')['result'])['active_turns']:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        self.assertEqual(stats['waiting_turns'], 1)
         self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'waiting')
         self.assertEqual(len(client.request('approvals')['result']['approvals']), 1)
         self.assertEqual(self.answer(client, turn, 'shell-1', request=0)['error'], 'approval_superseded')

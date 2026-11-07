@@ -138,8 +138,13 @@ class AnsweredToolTests(ModelFixture):
         turn = self.submit(client)
         waiting = client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)['data']
         self.assertEqual((waiting['call_id'], waiting['answer']), ('script-0', 'sonny'))
-        stats = client.request('stats')['result']
-        self.assertEqual((stats['active_turns'], stats['waiting_turns']), (0, 1))
+        # turn_waiting commits as the turn parks; its slot is let go as its
+        # task ends, just after.
+        deadline = time.monotonic() + 5
+        while (stats := client.request('stats')['result'])['active_turns']:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        self.assertEqual(stats['waiting_turns'], 1)
         [view] = client.request('turns', bot='Lead', newest=True, limit=1)['result']['turns']
         self.assertEqual(view['waiting_on'], {'call_id': 'script-0', 'answer': 'sonny',
                                               'deadline_ms': waiting['deadline_ms']})

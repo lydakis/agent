@@ -562,7 +562,9 @@ class DeliveryTests(ModelFixture):
         # its boundary, the other two would have pushed the turn past its budget.
         client = self.client('echo,shell', settings={'context_bytes': 4096})
         client.request('create', bot='Bob', workspace=str(self.path))
-        first = client.request('submit', bot='Bob', request_id='1', prompt='shell:sleep .4')['result']['turn']
+        # The first steer moves the command to the background; it outlasts
+        # the steers' turns, so its finish joins none of their inputs.
+        first = client.request('submit', bot='Bob', request_id='1', prompt='shell:sleep 5')['result']['turn']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == first)
         steers = [client.request('submit', bot='Bob', request_id=f's{n}', prompt=f'{n}' * 1500,
                                  delivery='steer')['result']['turn'] for n in range(3)]
