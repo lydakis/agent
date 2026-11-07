@@ -1792,7 +1792,11 @@ fn sourced(rest: &str, icons: &std::collections::HashMap<String, String>) -> Vec
     }
     let mut parts = vec!["From your sources".to_owned()];
     parts.extend(counts.into_iter().map(|(source, n)| {
-        let named = match icons.get(&source) {
+        // A topic's news names it `SOURCE:TOPIC`; the icon is the source's.
+        let of = source
+            .split_once(':')
+            .map_or(source.as_str(), |(name, _)| name);
+        let named = match icons.get(of) {
             Some(icon) => format!("{icon} {source}"),
             None => source,
         };
@@ -3559,6 +3563,11 @@ mod tests {
         let rest = note.strip_prefix(FROM_SOURCES).unwrap();
         let icons = [("slack".to_owned(), "▲".to_owned())].into();
         assert_eq!(super::sourced(rest, &icons)[1..3], ["▲ slack 2", "mail"]);
+        // One topic of it, too.
+        assert_eq!(
+            super::sourced("- slack:deploys (for your chat): \"ship it\"", &icons)[1],
+            "▲ slack:deploys"
+        );
     }
 
     #[test]
