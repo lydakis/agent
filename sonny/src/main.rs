@@ -1795,7 +1795,13 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     let instructions = project::as_task(&workspace, &info, &composed.text)?;
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
         "instructions": instructions, "request_id": unique("tui-create")});
-    made(client, &mut asked, &model, &workspace)?;
+    // The state folder of the agent whose shell runs this, else of the
+    // agent or person asking by name.
+    let owner = std::env::var("AGENT_BOT")
+        .ok()
+        .filter(|bot| !bot.is_empty());
+    let state = state::inherited().or_else(|| state::folder(owner.as_deref().unwrap_or(bot)));
+    made(client, &mut asked, &model, &workspace, state.as_deref())?;
     client
         .request("create", asked)
         .await
@@ -1813,6 +1819,7 @@ pub(crate) fn made(
     asked: &mut Value,
     model: &str,
     workspace: &Path,
+    state: Option<&str>,
 ) -> Result<(), String> {
     let config = agent_client::config::load()?;
     let declare = json!(declared::tools(served::Role::of(1)));
@@ -1821,17 +1828,10 @@ pub(crate) fn made(
     asked["declare"] = declare.clone();
     asked["compaction_instructions"] = json!(agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS);
     // Confined from the start, as the row it is made in confines it, and
-    // writing the state folder of the agent that makes it, or its own.
+    // writing `state`, the state folder of the agent that makes it, or its
+    // own.
     let mode = approvals::default();
-    let owner = (asked["created_by"].as_str().map(str::to_owned))
-        .or_else(|| {
-            std::env::var("AGENT_BOT")
-                .ok()
-                .filter(|bot| !bot.is_empty())
-        })
-        .or_else(|| asked["bot"].as_str().map(str::to_owned));
-    let state = state::inherited().or_else(|| owner.as_deref().and_then(state::folder));
-    let mut settings = approvals::sandbox(mode, workspace, state.as_deref());
+    let mut settings = approvals::sandbox(mode, workspace, state);
     // Named in its shell too; one another bot makes takes its maker's.
     if let Some(state) = &state {
         settings.insert("env".into(), json!({state::VAR: state}));
@@ -4946,8 +4946,8 @@ impl App {
         if let Some(speed) = pace {
             settings.insert("speed".into(), json!(speed));
         }
-        if let Some(env) = env {
-            settings.insert("env".into(), env);
+        if let Some(env) = &env {
+            settings.insert("env".into(), env.clone());
         }
         if let (Some(mode), Value::Object(fields)) = (gating, &mut asked) {
             let declared = declare.as_ref().unwrap_or(&self.declared);
@@ -5011,6 +5011,7 @@ impl App {
                 self.declare = declare;
                 self.cache = cache;
                 self.pace = pace;
+                self.env = env;
                 return false;
             }
             Err(error) => {
