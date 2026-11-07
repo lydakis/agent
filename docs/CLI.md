@@ -424,6 +424,23 @@ separated by whitespace), else `provider` in `~/.agent/config.toml` (the
 same), else the providers whose key variable is set; a
 running daemon is not checked against either. With none of them, starting
 fails with `provider_required`.
+Providers taken from the config file (no `--provider`, no `AGENT_PROVIDER`)
+follow it while the daemon runs (`serve --provider-config`): the kernel
+tells the daemon when the file changes (inotify, kqueue; nothing runs in
+between), including the file a linked `config.toml` names, and the new set is built and checked beside the old, then swapped
+in whole. Turns that start after the swap use it; running turns finish on
+the providers they started with. A provider whose spec is unchanged is kept
+as it was, with its pacing, connections and keys. A file that does not
+parse, a spec that does not bind (a key variable the daemon was not started
+with, say), and the removal of a provider an agent's model, fallback or
+compaction model, or an unfinished turn's own model, still names, or that
+binds such a provider to another API family (`provider_in_use`, naming
+them), are refused
+whole, and the old set stays. `stats.provider_reload` says what the last
+change came to (`applied` with `added`, `removed` and `changed`, or
+`refused` with its error); new sessions' `ready.providers` show the set in
+use, `provider_models` names each provider's family and efforts for sessions that
+connected before, and held turns are tried again after a change is applied.
 `run --model` names a new bot's model or an existing bot's turn model; the
 daemon has no model of its own, so a new bot needs `--model`, `AGENT_MODEL`,
 or `model` in `~/.agent/config.toml`, in that order. Both are only creation
@@ -469,19 +486,32 @@ that entry as it changes; a bot the CLI made keeps the one it took, and
 ```
 Other client commands require an already running daemon.
 
-`models` prints `~/.agent/models`, the models clients offer, as JSON
-`[{id, note?}]` (`--pretty`: one line each). The file holds one
-`PROVIDER/MODEL` per line, with anything after `#` a note; no file is an
-empty list, and a malformed line fails with `models_invalid` naming it.
-Reading it needs no daemon, and the daemon never reads it: any model runs.
-`models --discover` writes a first file from the listings of the providers
-the daemon runs (starting one like `run`), with each model's name and
-context size as its note and a comment for a provider that listed nothing.
-When no usable model survives rendering within the file limit, it writes
-nothing and fails with
-`models_none_listed`, naming each refusal, so it can run again after a
-login. It refuses with `models_file_exists` once the file exists: after
-that it is the user's to edit. Bots see the same list by running `models`.
+`models` prints the models clients offer as JSON `[{id, note?}]`
+(`--pretty`: one line each), from two files with one owner each.
+`~/.agent/models.discovered` is discovery's catalog: what the providers list,
+rewritten whole, so an edit there is replaced. `~/.agent/models` is the
+person's, and nothing writes it: a `PROVIDER/MODEL` line adds a model, or puts
+a listed one first with its note, and a `-PROVIDER/MODEL` line hides one. In
+both, anything after `#` is a note. The person's models come first in their
+order, then the catalog's they did not name, less what they hide; no files is
+an empty list, and a malformed line fails with `models_invalid` naming it.
+Reading needs no daemon, and the daemon never reads either file: any model
+runs. Model ids are compared as strings, never read for versions or families.
+The daemon a client starts on the store beside them (`~/.agent/state.sqlite`)
+rewrites the catalog (`serve --models`): each time it starts, once it is
+ready, it asks every provider for its listing, so a start never waits on a
+provider. A daemon on another store, such as a test's or a side daemon's,
+leaves it alone. `models --discover` does the same on demand through the
+daemon (starting one like `run`) and says on stderr what changed (`+ id`,
+`- id`) and which providers did not answer. Each model's name and context
+size are its note, with a comment for a provider that listed nothing; a
+provider that does not answer keeps its lines from the catalog there, and one
+the daemon no longer runs loses them. When no usable model survives rendering
+within the file limit, nothing is written and it fails with
+`models_none_listed`, naming each refusal, so it can run again after a login.
+The catalog is written beside itself and renamed into place, so a reader sees
+the old one or the new one, and a link put there is replaced, never written or
+read through. Bots see the same list by running `models`.
 
 `serve` requires explicit `--store` and `--provider` options. It runs the daemon
 directly, with Unix-socket service when `--socket` is

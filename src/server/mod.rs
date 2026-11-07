@@ -2,9 +2,11 @@
 //! the same JSONL protocol; turns run as tasks; events fan out through a hub.
 mod actives;
 mod companions;
+mod file_watch;
 mod handles;
 mod hub;
 mod lane;
+mod reload;
 mod session;
 mod socket;
 mod turn;
@@ -675,6 +677,8 @@ const PAUSE_NAMES: usize = 64;
 /// The variable a Bedrock API key is read from, as the AWS tools name it.
 const BEDROCK_KEY: &str = "AWS_BEARER_TOKEN_BEDROCK";
 pub struct ProviderSpec {
+    /// The spec as given, by which a reload tells a binding it keeps.
+    pub spec: String,
     pub name: String,
     pub family: Family,
     pub url: String,
@@ -701,7 +705,8 @@ impl ProviderSpec {
     /// `bedrock` (Claude) defaults to Bedrock runtime, where cross-region
     /// inference profiles (`global.anthropic.…`) route to whichever region
     /// holds the model, from any source region the profile supports, and `bedrock-openai` to Bedrock Mantle, as Claude
-    /// Code and Codex default. Both are in the region the AWS SDKs would
+    /// Code and Codex default; `bedrock-openai-runtime` is runtime's
+    /// OpenAI-compatible route, for models served only there. All are in the region the AWS SDKs would
     /// use (`aws::region`). Any Bedrock URL without a key variable signs
     /// with SigV4, and one with a key variable sends it as a Bedrock API
     /// key; the defaults take `AWS_BEARER_TOKEN_BEDROCK` when it is set.
@@ -755,6 +760,13 @@ impl ProviderSpec {
             "bedrock-openai" => (
                 "responses",
                 "https://bedrock-mantle.{region}.api.aws/openai/v1",
+                Some(BEDROCK_KEY),
+            ),
+            // Runtime's OpenAI-compatible route, as Codex's
+            // `amazon-bedrock-runtime`: some models are served only there.
+            "bedrock-openai-runtime" => (
+                "responses",
+                "https://bedrock-runtime.{region}.amazonaws.com/openai/v1",
                 Some(BEDROCK_KEY),
             ),
             _ => ("", "", None),
@@ -823,6 +835,7 @@ impl ProviderSpec {
             ));
         }
         Ok(Self {
+            spec: spec.to_owned(),
             sigv4: bedrock && key_env.is_none(),
             chatgpt_login: name == "chatgpt" && key_env.is_none() && url == default_url,
             name: name.to_owned(),
@@ -887,6 +900,14 @@ pub struct Configuration {
     pub walled: Vec<PathBuf>,
     /// The context windows the person set, by model path.
     pub context_windows: Arc<agent_runtime::provider::Windows>,
+    /// Discovery's model catalog (`~/.agent/models.discovered`),
+    /// rewritten from the providers' listings each time the daemon starts;
+    /// none leaves it be.
+    pub models: Option<PathBuf>,
+    /// The config file the providers came from (`~/.agent/config.toml`'s
+    /// `provider`), watched so an edit applies without a restart; none
+    /// when they were given on the command line or by `AGENT_PROVIDER`.
+    pub provider_config: Option<PathBuf>,
     /// The most generations below the bot that starts its line a `create`
     /// or `fork` may make a bot at; none by default.
     pub max_depth: Option<u64>,
@@ -1195,6 +1216,8 @@ struct Service {
     companions: companions::Companions,
     transport: Arc<Transport>,
     providers: Arc<HashMap<String, Provider>>,
+    /// How providers are bound again when their config file changes.
+    reload: Option<Box<reload::Reload>>,
     registry: Registry,
     hub: Hub,
     handles: Handles,
@@ -1466,36 +1489,38 @@ pub(crate) async fn publish(
     }
 }
 
-pub async fn run(config: Configuration) -> Result<()> {
-    let limits = Limits::resolve(&config);
-    let transport = Transport::new(limits.connecting, limits.connections)?;
-    let stall_timeout = config
-        .stall_timeout
-        .map_or(agent_runtime::provider::STALL_TIMEOUT, Duration::from_secs);
-    let registry = Registry::all()?;
-    let mut providers = HashMap::new();
-    let aws_start = agent_runtime::provider::aws::Start::new();
-    let credentials = agent_runtime::tools::Credentials::default();
-    credentials.redact_also(&config.redact_fields, &config.redact_blocks);
-    // Every tool shell inherits the environment the daemon started with,
-    // so the excludes are matched against it once.
-    for (name, _) in std::env::vars_os() {
-        if let Some(name) = name.to_str()
-            && (config.shell_excludes.iter())
-                .any(|pattern| agent_runtime::tools::name_matches(pattern, name))
-        {
-            credentials.withhold(name);
-        }
-    }
-    let mut bindings = serde_json::Map::new();
-    for spec in &config.providers {
+/// What makes a provider of a spec, the same at start and on a reload.
+#[derive(Clone)]
+struct Binder {
+    transport: Arc<Transport>,
+    credentials: agent_runtime::tools::Credentials,
+    stall_timeout: Duration,
+    windows: Arc<agent_runtime::provider::Windows>,
+}
+
+impl Binder {
+    /// The provider `spec` names and its binding as `ready.providers`
+    /// reports it. SigV4 bindings made together share `aws_start`'s one
+    /// resolution of the AWS credential chain.
+    async fn bind(
+        &self,
+        spec: &ProviderSpec,
+        aws_start: &agent_runtime::provider::aws::Start,
+    ) -> Result<(Provider, Value)> {
+        let (transport, credentials) = (&self.transport, &self.credentials);
         let (key, login) = if spec.chatgpt_login {
             // No variable carries the tokens; the shared set redacts them,
             // and every pair a refresh brings later.
-            let login = agent_runtime::provider::login::Login::open(
-                &agent_runtime::provider::login::default_path()?,
-                Some(credentials.clone()),
-            )?;
+            // Read off the run loop: a reload binds while bots run.
+            let redaction = credentials.clone();
+            let login = tokio::task::spawn_blocking(move || {
+                agent_runtime::provider::login::Login::open(
+                    &agent_runtime::provider::login::default_path()?,
+                    Some(redaction),
+                )
+            })
+            .await
+            .map_err(|_| Error::new("provider_login_unavailable"))??;
             (None, Some(Arc::new(login)))
         } else {
             let key = spec
@@ -1527,13 +1552,10 @@ pub async fn run(config: Configuration) -> Result<()> {
         if spec.sigv4 {
             let url = reqwest::Url::parse(&spec.url)
                 .map_err(|_| Error::with("invalid_provider_url", "the base URL does not parse"))?;
-            let (aws, unresolved) = agent_runtime::provider::aws::Aws::open(
-                &url,
-                Some(credentials.clone()),
-                &aws_start,
-            )
-            .await
-            .map_err(named)?;
+            let (aws, unresolved) =
+                agent_runtime::provider::aws::Aws::open(&url, Some(credentials.clone()), aws_start)
+                    .await
+                    .map_err(named)?;
             let mut signed = json!({"auth":"sigv4","region":aws.region(),
                 "credentials":aws.source()});
             // Keys the CLI cannot resolve yet leave this binding waiting on a
@@ -1553,18 +1575,52 @@ pub async fn run(config: Configuration) -> Result<()> {
             provider = provider.with_socket()?;
         }
         let provider = provider
-            .with_stall_timeout(stall_timeout)?
-            .with_windows(&spec.name, config.context_windows.clone());
+            .with_stall_timeout(self.stall_timeout)?
+            .with_windows(&spec.name, self.windows.clone());
         let (searches, speeds) = (provider.searches(), provider.speeds());
-        if providers.insert(spec.name.clone(), provider).is_some() {
-            return fail_with("duplicate_provider", spec.name.as_str());
-        }
         let mut binding = json!({"family":spec.family.name(),"url":spec.url,
             "transport":spec.transport(),"efforts":spec.family.efforts(),
             "speeds":speeds,
             "web_search":searches});
         if let Some(Value::Object(auth)) = auth {
             binding.as_object_mut().expect("object").extend(auth);
+        }
+        Ok((provider, binding))
+    }
+}
+
+pub async fn run(config: Configuration) -> Result<()> {
+    let limits = Limits::resolve(&config);
+    let transport = Transport::new(limits.connecting, limits.connections)?;
+    let stall_timeout = config
+        .stall_timeout
+        .map_or(agent_runtime::provider::STALL_TIMEOUT, Duration::from_secs);
+    let registry = Registry::all()?;
+    let mut providers = HashMap::new();
+    let aws_start = agent_runtime::provider::aws::Start::new();
+    let credentials = agent_runtime::tools::Credentials::default();
+    credentials.redact_also(&config.redact_fields, &config.redact_blocks);
+    // Every tool shell inherits the environment the daemon started with,
+    // so the excludes are matched against it once.
+    for (name, _) in std::env::vars_os() {
+        if let Some(name) = name.to_str()
+            && (config.shell_excludes.iter())
+                .any(|pattern| agent_runtime::tools::name_matches(pattern, name))
+        {
+            credentials.withhold(name);
+        }
+    }
+    let binder = Binder {
+        transport: transport.clone(),
+        credentials: credentials.clone(),
+        stall_timeout,
+        windows: config.context_windows.clone(),
+    };
+    let mut bindings = serde_json::Map::new();
+    for spec in &config.providers {
+        let (provider, binding) = binder.bind(spec, &aws_start).await?;
+        if providers.insert(spec.name.clone(), provider).is_some() {
+            return fail_with("duplicate_provider", spec.name.as_str());
         }
         bindings.insert(spec.name.clone(), binding);
     }
@@ -1675,7 +1731,23 @@ pub async fn run(config: Configuration) -> Result<()> {
     let identity = store.instance_identity(lineage)?;
     // A pause outlives the daemon that took it.
     let paused = store.op("pause", |db| db.pause()).await?;
-    let ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
+    let reload = config.provider_config.clone().map(|path| {
+        Box::new(reload::Reload {
+            config: path,
+            binder: binder.clone(),
+            specs: config
+                .providers
+                .iter()
+                .map(|spec| spec.spec.clone())
+                .collect(),
+            bindings: bindings.clone(),
+            building: false,
+            again: false,
+            refreshing: None,
+            last: Value::Null,
+        })
+    });
+    let mut ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
         "paused":paused,
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
         "limits":{"processes":limits.processes,"lasting":limits.lasting,"active":limits.active,"connecting":limits.connecting,
@@ -1808,6 +1880,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         identity,
         transport,
         providers: Arc::new(providers),
+        reload,
         registry,
         hub,
         handles,
@@ -1846,6 +1919,30 @@ pub async fn run(config: Configuration) -> Result<()> {
     // the config): every held turn is tried again at once.
     service.retry_held(None).await?;
     service.holds_due().await?;
+    if let Some(path) = config.models.clone() {
+        let refreshing = tokio::spawn(refresh_models(service.providers.clone(), path));
+        if let Some(reload) = service.reload.as_mut() {
+            reload.refreshing = Some(refreshing.abort_handle());
+        }
+    }
+    // The providers' config file, watched by the kernel: nothing runs
+    // until it changes.
+    let mut provider_changes = match service.reload.as_ref() {
+        Some(reload) => file_watch::watch(&reload.config).await,
+        None => None,
+    };
+    let (reloaded_sender, mut reloaded) = mpsc::unbounded_channel();
+    // An edit made while the daemon started, before the watch, is read
+    // once now; a file that names the set already bound binds nothing.
+    if provider_changes.is_some()
+        && let Some(reload) = service.reload.as_mut()
+    {
+        reload.start(
+            service.providers.clone(),
+            service.store.clone(),
+            reloaded_sender.clone(),
+        );
+    }
     let idle_exit = config
         .idle_exit
         .filter(|_| config.socket.is_some())
@@ -1875,6 +1972,16 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
                 Some(error) = failures.recv() => return Err(error),
                 _ = service.replays.join_next(), if !service.replays.is_empty() => {}
+                Some(()) = async { provider_changes.as_mut()?.recv().await } => {
+                    if let Some(reload) = service.reload.as_mut() {
+                        reload.start(service.providers.clone(), service.store.clone(), reloaded_sender.clone());
+                    }
+                }
+                Some(built) = reloaded.recv() => {
+                    if let Some(bindings) = service.reloaded(built, &reloaded_sender, config.models.clone()).await? {
+                        ready["providers"] = Value::Object(bindings);
+                    }
+                }
                 _ = service.retention.join_next(), if !service.retention.is_empty() => {}
                 joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
                     let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
@@ -2751,6 +2858,55 @@ impl Service {
             Err(error) => Err(error),
         }
     }
+    /// A finished reload build: an applied set is swapped in for the turns
+    /// that start from now on, held turns are tried again (a provider they
+    /// waited on may be back), and the model list is refreshed from the
+    /// new set. The new `ready.providers` when the set changed.
+    async fn reloaded(
+        &mut self,
+        built: Result<Option<reload::Built>>,
+        again: &mpsc::UnboundedSender<Result<Option<reload::Built>>>,
+        models: Option<PathBuf>,
+    ) -> Result<Option<serde_json::Map<String, Value>>> {
+        if self.reload.is_none() {
+            return Ok(None);
+        }
+        // Asked again in the run loop, after every admission already
+        // stored: one accepted while the set was built is counted too.
+        let built = match built {
+            Ok(Some(built)) => reload::unused(&self.store, &built.unusable)
+                .await
+                .map(|()| Some(built)),
+            other => other,
+        };
+        let Some(reload) = self.reload.as_mut() else {
+            return Ok(None);
+        };
+        let rebuild = reload.finished(&built);
+        let applied = match built {
+            Ok(Some(built)) => {
+                self.providers = Arc::new(built.providers);
+                Some(built.bindings)
+            }
+            _ => None,
+        };
+        if rebuild && let Some(reload) = self.reload.as_mut() {
+            reload.start(self.providers.clone(), self.store.clone(), again.clone());
+        }
+        if applied.is_some() {
+            self.retry_held(None).await?;
+            if let Some(path) = models {
+                let refreshing = tokio::spawn(refresh_models(self.providers.clone(), path));
+                if let Some(reload) = self.reload.as_mut()
+                    && let Some(older) = reload.refreshing.replace(refreshing.abort_handle())
+                {
+                    older.abort();
+                }
+            }
+        }
+        Ok(applied)
+    }
+
     /// Try every held turn again now, or only `bot`'s, as the person may
     /// have fixed what held them: those parked on a call wake, and those
     /// held in line go to the dispatcher. Returns how many.
@@ -3895,25 +4051,7 @@ impl Service {
                 // Off the dispatch path: a listing waits on the network.
                 let (providers, output) = (self.providers.clone(), output.clone());
                 tokio::spawn(async move {
-                    let mut names: Vec<String> = providers.keys().cloned().collect();
-                    names.sort();
-                    // A few at a time, so bodies being read stay a few limits'
-                    // worth, and all within one deadline however many there are.
-                    let by = tokio::time::Instant::now() + Duration::from_secs(15);
-                    let asks = names.clone().into_iter().map(|name| {
-                        let providers = providers.clone();
-                        async move {
-                            tokio::time::timeout_at(by, providers[&name].models())
-                                .await
-                                .unwrap_or_else(|_| Err(Error::new("provider_models_deadline")))
-                        }
-                    });
-                    let listed: Vec<_> = futures_util::StreamExt::collect(
-                        futures_util::StreamExt::buffered(futures_util::stream::iter(asks), 4),
-                    )
-                    .await;
-                    let answer = fit_listings(names.into_iter().zip(listed), output::MAX_EVENT)
-                        .map(|answer| json!({"providers": answer}));
+                    let answer = provider_models(providers).await;
                     retention_reply(session, &output, id, answer).await;
                 });
                 Err(Error::new("deferred"))
@@ -4081,6 +4219,7 @@ impl Service {
                         .map(|shut| json!({"limit": self.limits.load, "shut": shut})),
                     "transport": {"in_flight_by_shard": self.transport.loads()},
                     "providers": providers,
+                    "provider_reload": self.reload.as_ref().map(|reload| &reload.last),
                     "store": store.stats(),
                     "tokens": self.tokens.snapshot(),
                     "handles": {"waiters": waiters, "retained": retained},
@@ -5257,6 +5396,55 @@ async fn retention_reply(session: u64, output: &Output, id: Value, result: Resul
     sent
 }
 
+/// Every provider's listing, as `provider_models` answers: a few asked at
+/// a time, so bodies being read stay a few limits' worth, and all within
+/// one deadline however many there are.
+async fn provider_models(providers: Arc<HashMap<String, Provider>>) -> Result<Value> {
+    let mut names: Vec<String> = providers.keys().cloned().collect();
+    names.sort();
+    let by = tokio::time::Instant::now() + Duration::from_secs(15);
+    let asks = names.clone().into_iter().map(|name| {
+        let providers = providers.clone();
+        async move {
+            tokio::time::timeout_at(by, providers[&name].models())
+                .await
+                .unwrap_or_else(|_| Err(Error::new("provider_models_deadline")))
+        }
+    });
+    let listed: Vec<_> = futures_util::StreamExt::collect(futures_util::StreamExt::buffered(
+        futures_util::stream::iter(asks),
+        4,
+    ))
+    .await;
+    // Each entry names its provider's API family and effort levels, as
+    // `ready.providers` does, so a client connected before a reload added
+    // a provider can still tell which models its agent may switch to and
+    // at what effort; room for that is held back from the listings.
+    const BOUND: usize = 128;
+    let limit = output::MAX_EVENT.saturating_sub(BOUND * names.len());
+    let mut answer = fit_listings(names.into_iter().zip(listed), limit)?;
+    for (name, entry) in answer.iter_mut() {
+        if let (Some(provider), Some(entry)) = (providers.get(name), entry.as_object_mut()) {
+            let family = provider.family();
+            entry.insert("family".into(), json!(family.name()));
+            entry.insert("efforts".into(), json!(family.efforts()));
+        }
+    }
+    Ok(json!({"providers": answer}))
+}
+
+/// The model catalog at `path`, rewritten from every provider's listing
+/// once the daemon serves: after `ready`, so a start waits on no provider,
+/// and the listings stay kept for the clients that ask next. A provider
+/// that did not answer keeps its lines as they were.
+async fn refresh_models(providers: Arc<HashMap<String, Provider>>, path: PathBuf) {
+    let Ok(listing) = provider_models(providers).await else {
+        return;
+    };
+    let _ =
+        tokio::task::spawn_blocking(move || agent_client::models::refresh(&path, &listing)).await;
+}
+
 /// One `provider_models` reply carries every listing, so it must fit one
 /// event of `limit` bytes: a listing past what is left is refused by name
 /// rather than failing the whole answer. Room for each refusal is held back
@@ -5471,6 +5659,13 @@ mod tests {
             "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
         );
         assert!(openai.sigv4);
+        let runtime = parse("bedrock-openai-runtime");
+        assert_eq!(runtime.family, Family::Responses);
+        assert_eq!(
+            runtime.url,
+            "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"
+        );
+        assert!(runtime.sigv4);
         // AWS_DEFAULT_REGION is the fallback name the AWS CLI also reads.
         let fallback = |name: &str| (name == "AWS_DEFAULT_REGION").then(|| "eu-west-1".to_owned());
         assert_eq!(
@@ -5492,7 +5687,7 @@ mod tests {
             "AWS_REGION" => Some("us-west-2".to_owned()),
             _ => None,
         };
-        for name in ["bedrock", "bedrock-openai"] {
+        for name in ["bedrock", "bedrock-openai", "bedrock-openai-runtime"] {
             let keyed = ProviderSpec::parse_with(name, &keyed_env, &none).unwrap();
             assert_eq!(keyed.key_env.as_deref(), Some("AWS_BEARER_TOKEN_BEDROCK"));
             assert!(!keyed.sigv4 && keyed.url.contains(".us-west-2."));
@@ -5654,6 +5849,7 @@ mod tests {
             identity: 0,
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
+            reload: None,
             registry: Registry::new("wait").unwrap(),
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),
@@ -5865,6 +6061,7 @@ mod tests {
             identity: 0,
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
+            reload: None,
             registry: Registry::new("wait").unwrap(),
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),
@@ -6025,6 +6222,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_provider_an_unfinished_turn_names_is_in_use() {
+        let dir = std::env::temp_dir().join(format!("agent-in-use-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let binding = || Binding {
+            provider: "openai",
+            family: Family::Responses,
+            model: "synthetic-model",
+            instructions: "test",
+            effort: None,
+            budget_tokens: None,
+            budget_counts: Default::default(),
+            tools: &[],
+            created_by: None,
+            created_by_id: None,
+            compaction_instructions: None,
+            compaction_model: None,
+            fallback: None,
+            gate: None,
+            settings: Default::default(),
+            declared: None,
+            request_id: None,
+            starts_line: false,
+        };
+        let in_use = |providers: &[&str]| {
+            let providers: Vec<String> = providers.iter().map(|p| (*p).to_owned()).collect();
+            let store = store.clone();
+            async move {
+                store
+                    .op("bots_on_providers", move |db| {
+                        db.bots_on_providers(&providers)
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        store
+            .op("create", move |db| {
+                db.create("Bob", Some("/synthetic"), binding())?;
+                db.create("Cy", Some("/synthetic"), binding())?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(in_use(&["other"]).await.is_empty());
+        assert_eq!(in_use(&["openai"]).await, ["Bob", "Cy"]);
+        // Bob's next turn asks for a model of another provider.
+        store
+            .op("begin", |db| {
+                let options = TurnOptions {
+                    model: Some("other/synthetic-model".into()),
+                    ..Default::default()
+                };
+                db.begin("Bob", "r1", "work", true, &options, |_, _| Ok(()))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(in_use(&["other"]).await, ["Bob"]);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn saturated_dispatch_reconciles_duplicates_but_rejects_new_work() {
         let dir = std::env::temp_dir().join(format!("agent-admission-test-{}", std::process::id()));
         let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
@@ -6087,6 +6348,7 @@ mod tests {
             ),
             transport,
             providers: Arc::new(HashMap::from([("openai".to_owned(), provider)])),
+            reload: None,
             registry,
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),
@@ -6337,6 +6599,7 @@ mod tests {
             ),
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
+            reload: None,
             registry: Registry::new("echo").unwrap(),
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),

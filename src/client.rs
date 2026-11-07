@@ -53,6 +53,10 @@ struct Options {
     store: PathBuf,
     socket: PathBuf,
     providers: Vec<String>,
+    /// Whether the providers came from `~/.agent/config.toml` (or, with no
+    /// `provider` there, from the key variables set), not the command line
+    /// or AGENT_PROVIDER.
+    providers_from_config: bool,
     /// Daemon-scoped values the caller stated, checked against a running
     /// daemon at attach. Defaults and environment-implied values never conflict.
     providers_explicit: bool,
@@ -151,6 +155,7 @@ fn parse(args: &[String]) -> Result<Options> {
         socket: PathBuf::new(),
         store: PathBuf::new(),
         providers: Vec::new(),
+        providers_from_config: false,
         providers_explicit: false,
         tools_explicit: false,
         tools: String::new(),
@@ -542,6 +547,10 @@ fn parse(args: &[String]) -> Result<Options> {
     if options.providers.is_empty() {
         options.providers =
             environment_providers(&|name| std::env::var(name).ok(), &|| Ok(config()?.provider))?;
+        // Providers the config file names follow it while the daemon runs;
+        // ones given on the command line or by AGENT_PROVIDER stay as given.
+        options.providers_from_config =
+            std::env::var("AGENT_PROVIDER").map_or(true, |specs| specs.trim().is_empty());
     }
     Ok(options)
 }
@@ -552,7 +561,7 @@ fn parse(args: &[String]) -> Result<Options> {
 /// well-known key variable is set. Like `AGENT_MODEL`, they are defaults: a
 /// running daemon is not checked against them, since every shell a bot runs
 /// inherits the daemon's environment.
-fn environment_providers(
+pub(crate) fn environment_providers(
     var: &dyn Fn(&str) -> Option<String>,
     configured: &dyn Fn() -> Result<Option<String>>,
 ) -> Result<Vec<String>> {
@@ -979,7 +988,7 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     if options.providers.is_empty() {
         return fail_with(
             "provider_required",
-            "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, bedrock, bedrock-openai, or NAME=FAMILY,URL,KEY_ENV), set AGENT_PROVIDER, or export a provider key",
+            "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, bedrock, bedrock-openai, bedrock-openai-runtime, or NAME=FAMILY,URL,KEY_ENV), set AGENT_PROVIDER, or export a provider key",
         );
     }
     // The daemon's folder and log are its user's alone, as the daemon
@@ -1064,6 +1073,29 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
         command
             .arg("--context-window")
             .arg(format!("{pattern}={tokens}"));
+    }
+    // Where the providers came from, so an edit there applies live.
+    if let Some(file) = agent_client::config::path().filter(|_| options.providers_from_config) {
+        command.arg("--provider-config").arg(file);
+    }
+    // Discovery's catalog beside the person's model list, rewritten by
+    // every start of the daemon of the home store beside it
+    // (`state.sqlite`); a daemon on another store (a test, a side daemon,
+    // another file in the same folder) leaves it alone. The folder is
+    // compared resolved, so an alias of it counts.
+    if let Some(models) = agent_client::models::path().filter(|models| {
+        let place = |path: &Path| {
+            Some((
+                std::fs::canonicalize(path.parent()?).ok()?,
+                path.file_name()?.to_owned(),
+            ))
+        };
+        let home = place(&models.with_file_name("state.sqlite"));
+        home.is_some() && home == place(&options.store)
+    }) {
+        command
+            .arg("--models")
+            .arg(agent_client::models::discovered(&models));
     }
     agent_client::own_session(&mut command);
     let mut child = command
@@ -1552,26 +1584,33 @@ fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
     Ok(())
 }
 
-/// The models clients offer, from `~/.agent/models`; reading it needs no
-/// daemon. `--discover` first writes one from the listings of the providers
-/// the daemon runs, and never replaces a list that exists.
+/// The models clients offer: the person's `~/.agent/models` over
+/// discovery's catalog beside it; reading them needs no daemon.
+/// `--discover` rewrites the catalog from the listings of the providers the
+/// daemon runs, as every daemon start does, and says on stderr what changed.
 fn models(options: &Options) -> Result<i32> {
     let path = agent_client::models::path().ok_or(Error::with("usage", "set HOME"))?;
     if options.discover {
-        if path.exists() {
-            return fail_with(
-                "models_file_exists",
-                format!(
-                    "{}: edit it, or remove it to discover again",
-                    path.display()
-                ),
-            );
-        }
+        let catalog = agent_client::models::discovered(&path);
         let mut connection = ensure_daemon(options)?;
         let listing = connection.request("provider_models", json!({}))?;
-        let text = agent_client::models::render(&listing, &[]).map_err(Error::from)?;
-        agent_client::models::install(&path, &text).map_err(Error::from)?;
-        eprintln!("wrote {}", path.display());
+        let refreshed = agent_client::models::refresh(&catalog, &listing).map_err(Error::from)?;
+        for (provider, said) in &refreshed.refused {
+            eprintln!("{}: {}", visible(provider), visible(said));
+        }
+        for (sign, ids) in [('+', &refreshed.added), ('-', &refreshed.removed)] {
+            for id in ids.iter().filter(|_| !refreshed.created) {
+                eprintln!("{sign} {}", visible(id));
+            }
+        }
+        match (
+            refreshed.created,
+            refreshed.added.len() + refreshed.removed.len(),
+        ) {
+            (true, _) => eprintln!("wrote {}", catalog.display()),
+            (false, 0) => eprintln!("{} is up to date", catalog.display()),
+            (false, _) => eprintln!("updated {}", catalog.display()),
+        }
     }
     let models = agent_client::models::read(&path).map_err(Error::from)?;
     if options.pretty {
@@ -1590,8 +1629,9 @@ fn models(options: &Options) -> Result<i32> {
     // On stderr, so `[]` on stdout stays what a program reads.
     if models.is_empty() {
         eprintln!(
-            "no models listed in {}; agent models --discover writes a first list",
-            path.display()
+            "no models listed in {} or {}; agent models --discover lists the providers' models",
+            path.display(),
+            agent_client::models::discovered(&path).display()
         );
     }
     Ok(0)

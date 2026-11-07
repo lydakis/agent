@@ -1664,7 +1664,7 @@ class ListingModel(Model):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class ModelListTests(ModelFixture):
-    """~/.agent/models: what clients offer, written once by --discover, never read by the daemon."""
+    """What clients offer: discovery's catalog, rewritten by every start and --discover, under the person's own list; the daemon reads neither."""
     handler = ListingModel
 
     def setUp(self):
@@ -1672,7 +1672,10 @@ class ModelListTests(ModelFixture):
         self.home = self.path / 'home'
         self.home.mkdir()
         self.list = self.home / '.agent' / 'models'
-        self.store = ['--store', str(self.path / 'state.sqlite')]
+        self.catalog = self.home / '.agent' / 'models.discovered'
+        # The daemon of the store beside the list keeps it current.
+        self.state = self.home / '.agent' / 'state.sqlite'
+        self.store = ['--store', str(self.state)]
         self.providers = ['--provider', f'openai=responses,{self.url}',
                           '--provider', 'gone=responses,http://127.0.0.1:1/v1',
                           '--provider', f'huge=responses,{self.url.removesuffix("/v1")}/huge/v1',
@@ -1686,13 +1689,22 @@ class ModelListTests(ModelFixture):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result
 
+    def wait_for_listings(self, count):
+        deadline = time.monotonic() + 20
+        while len(getattr(self.model, 'paths', [])) < count:
+            self.assertLess(time.monotonic(), deadline, getattr(self.model, 'paths', []))
+            time.sleep(0.05)
+
     def test_listings_kept_share_one_budget(self):
         base = self.url.removesuffix('/v1')
         big = [arg for i in (1, 2, 3) for arg in ('--provider', f'big{i}=responses,{base}/big{i}/v1')]
-        self.agent('models', '--discover', *self.store, *big)
+        # The start itself asks each provider once, after it is ready.
+        self.agent('stats', *self.store, *big)
+        self.wait_for_listings(3)
+        time.sleep(0.5)
         self.assertEqual(len(self.model.paths), 3)
         with socket.socket(socket.AF_UNIX) as s:
-            s.connect(str(self.path / 'state.sqlite.sock'))
+            s.connect(str(self.state) + '.sock')
             lines = s.makefile('rw')
             lines.readline()
             lines.write(json.dumps({'id': 1, 'op': 'provider_models'}) + '\n')
@@ -1708,7 +1720,7 @@ class ModelListTests(ModelFixture):
         # The command line's own wins over the file's.
         self.agent('stats', *self.store, *self.providers[:2], '--max-processes', '9')
         with socket.socket(socket.AF_UNIX) as s:
-            s.connect(str(self.path / 'state.sqlite.sock'))
+            s.connect(str(self.state) + '.sock')
             limits = json.loads(s.makefile('r').readline())['limits']
         self.assertEqual((limits['processes'], limits['readers'], limits['load']), (9, 2, 1.5))
         # A mistake in the file is refused by name, before any daemon starts.
@@ -1718,22 +1730,137 @@ class ModelListTests(ModelFixture):
         self.assertEqual(refused.returncode, 1, refused.stderr)
         self.assertIn('daemon.processes', refused.stderr)
 
+    def test_every_start_rewrites_the_catalog_and_never_the_person_s_list(self):
+        providers = ['--provider', f'openai=responses,{self.url}']
+        self.agent('stats', *self.store, *providers)
+        deadline = time.monotonic() + 20
+        while not self.catalog.exists():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        self.assertIn('openai/synthetic-model  # Synthetic, 4096 context\nopenai/other-model\n',
+                      self.catalog.read_text())
+        self.assertFalse(self.list.exists())
+        # The person hides one model, notes another and adds one of their own.
+        mine = 'openai/synthetic-model  # mine\n-openai/other-model\nopenai/by-hand\n'
+        self.list.write_text(mine)
+        self.agent('shutdown', *self.store)
+        self.agent('stats', *self.store, *providers)
+        self.assertEqual(self.agent('models', '--discover', *self.store).stderr.strip().splitlines()[-1],
+                         f'{self.catalog} is up to date')
+        self.assertEqual(self.list.read_text(), mine)
+        self.assertEqual(json.loads(self.agent('models').stdout),
+                         [{'id': 'openai/synthetic-model', 'note': 'mine'}, {'id': 'openai/by-hand'}])
+
+    def test_a_daemon_on_another_store_leaves_the_list_alone(self):
+        other = ['--store', str(self.path / 'side.sqlite')]
+        self.addCleanup(lambda: self.agent('shutdown', *other, check=False))
+        self.agent('stats', *other, '--provider', f'openai=responses,{self.url}')
+        # Nor does one on another store in the home store's own folder.
+        beside = ['--store', str(self.state.with_name('side.sqlite'))]
+        self.addCleanup(lambda: self.agent('shutdown', *beside, check=False))
+        self.agent('stats', *beside, '--provider', f'openai=responses,{self.url}')
+        time.sleep(1)
+        self.assertFalse(self.catalog.exists())
+        self.assertEqual(getattr(self.model, 'listings', 0), 0)
+
+    def test_an_edit_to_the_config_s_providers_applies_without_a_restart(self):
+        config = self.home / '.agent' / 'config.toml'
+        config.parent.mkdir(exist_ok=True)
+        base = self.url.removesuffix('/v1')
+        config.write_text(f'provider = "openai=responses,{self.url}"\n')
+
+        def stats():
+            # Over the socket: the CLI itself refuses a config that does not parse.
+            with socket.socket(socket.AF_UNIX) as s:
+                s.connect(str(self.state) + '.sock')
+                lines = s.makefile('rw')
+                lines.readline()
+                lines.write(json.dumps({'id': 1, 'op': 'stats'}) + '\n')
+                lines.flush()
+                return next(m for m in map(json.loads, lines) if m.get('id') == 1)['result']
+
+        self.agent('stats', *self.store)
+
+        def settled(check):
+            deadline = time.monotonic() + 20
+            while True:
+                current = stats()
+                if check(current):
+                    return current
+                self.assertLess(time.monotonic(), deadline, current.get('provider_reload'))
+                time.sleep(0.05)
+
+        before = stats()
+        self.assertEqual(sorted(before['providers']), ['openai'])
+        self.assertIsNone(before['provider_reload'])
+        # A bot runs on openai.
+        self.agent('run', *self.store, '--model', 'openai/synthetic-model', '--new', '--bot', 'Bob', 'hello')
+
+        # Adding a provider binds it for the next turns; openai is kept as it was.
+        config.write_text(f'provider = "openai=responses,{self.url} second=responses,{self.url}"\n')
+        after = settled(lambda s: 'second' in s['providers'])
+        self.assertEqual(after['provider_reload']['status'], 'applied')
+        self.assertEqual(after['provider_reload']['added'], ['second'])
+        self.assertEqual(after['provider_reload']['changed'], [])
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect(str(self.state) + '.sock')
+            ready = json.loads(s.makefile('r').readline())
+        self.assertEqual(sorted(ready['providers']), ['openai', 'second'], 'a new session is told the new set')
+        self.agent('run', *self.store, '--model', 'second/synthetic-model', '--new', '--bot', 'Ann', 'hello')
+
+        # Removing the provider Bob runs on is refused, naming him; the set stays.
+        config.write_text(f'provider = "second=responses,{self.url}"\n')
+        refused = settled(lambda s: (s['provider_reload'] or {}).get('status') == 'refused')
+        self.assertEqual(refused['provider_reload']['error'], 'provider_in_use')
+        self.assertIn('Bob', refused['provider_reload']['detail'])
+        self.assertNotIn('Ann', refused['provider_reload']['detail'])
+        self.assertEqual(sorted(refused['providers']), ['openai', 'second'])
+
+        # A file that does not parse is refused too, and nothing changes.
+        config.write_text('provider = \n')
+        broken = settled(lambda s: s['provider_reload']['error'] != 'provider_in_use')
+        self.assertEqual(broken['provider_reload']['status'], 'refused')
+        self.assertEqual(sorted(broken['providers']), ['openai', 'second'])
+
+        # Binding Bob's provider to another API family is refused like a removal.
+        config.write_text(f'provider = "openai=anthropic,{base} second=responses,{self.url}"\n')
+        retyped = settled(lambda s: s['provider_reload']['error'] == 'provider_in_use')
+        self.assertIn('Bob', retyped['provider_reload']['detail'])
+        self.assertEqual(retyped['provider_reload']['facts']['providers'], ['openai'])
+
+        # A changed spec binds that provider again; the turn after uses it.
+        config.write_text(f'provider = "openai=responses,{self.url} second=responses,{base}/elsewhere/v1"\n')
+        changed = settled(lambda s: s['provider_reload']['status'] == 'applied')
+        self.assertEqual(changed['provider_reload']['changed'], ['second'])
+        self.assertEqual(changed['provider_reload']['added'], [])
+
+    def test_providers_given_on_the_command_line_are_not_reloaded(self):
+        config = self.home / '.agent' / 'config.toml'
+        config.parent.mkdir(exist_ok=True)
+        config.write_text(f'provider = "openai=responses,{self.url}"\n')
+        self.agent('stats', *self.store, '--provider', f'given=responses,{self.url}')
+        config.write_text(f'provider = "other=responses,{self.url}"\n')
+        time.sleep(1)
+        current = json.loads(self.agent('stats', *self.store).stdout)
+        self.assertEqual(sorted(current['providers']), ['given'])
+        self.assertIsNone(current['provider_reload'])
+
     def test_discover_writes_nothing_when_no_provider_lists(self):
         refused = self.agent('models', '--discover', *self.store,
                              '--provider', 'gone=responses,http://127.0.0.1:1/v1', check=False)
         self.assertEqual(refused.returncode, 1)
         self.assertIn('models_none_listed', refused.stderr)
         self.assertIn('gone: provider_', refused.stderr)
-        self.assertFalse(self.list.exists(), 'a list of refusals is not installed')
+        self.assertFalse(self.catalog.exists(), 'a catalog of refusals is not installed')
 
     def test_a_fresh_install_names_the_missing_provider_and_stats_starts_its_daemon(self):
         refused = self.agent('stats', *self.store, check=False)
         self.assertEqual(refused.returncode, 2)
         self.assertEqual(json.loads(refused.stderr)['error'], 'provider_required')
-        self.assertFalse((self.path / 'state.sqlite').exists())
+        self.assertFalse(self.state.exists())
         stats = json.loads(self.agent('stats', *self.store, '--provider', f'openai=responses,{self.url}').stdout)
         self.assertEqual(stats['active_turns'], 0)
-        self.assertTrue((self.path / 'state.sqlite').exists())
+        self.assertTrue(self.state.exists())
         # A command on a bot still never makes a store of its own.
         other = ['--store', str(self.path / 'other.sqlite')]
         missing = self.agent('inspect', *other, '--bot', 'Bob', check=False)
@@ -1745,17 +1872,17 @@ class ModelListTests(ModelFixture):
                              '--provider', f'custom=responses,{url}', check=False)
         self.assertEqual(refused.returncode, 1)
         self.assertIn('models_none_listed', refused.stderr)
-        self.assertFalse(self.list.exists())
+        self.assertFalse(self.catalog.exists())
 
     def test_discover_writes_a_first_list_that_clients_and_bots_read(self):
         bare = self.agent('models')
         self.assertEqual(json.loads(bare.stdout), [])
         self.assertIn('agent models --discover', bare.stderr)
         self.assertIn('agent models --discover', self.agent('models', '--pretty').stderr)
-        self.assertFalse((self.path / 'state.sqlite').exists(), 'reading the list starts no daemon')
+        self.assertFalse(self.state.exists(), 'reading the list starts no daemon')
 
         self.agent('models', '--discover', *self.store, *self.providers)
-        text = self.list.read_text()
+        text = self.catalog.read_text()
         self.assertIn('openai/synthetic-model  # Synthetic, 4096 context\nopenai/other-model\n', text)
         self.assertRegex(text, r'# gone: provider_\w+')
         # A listing too large for the reply is refused by name; the rest still arrive.
@@ -1765,14 +1892,15 @@ class ModelListTests(ModelFixture):
         self.assertEqual(listed, [{'id': 'openai/synthetic-model', 'note': 'Synthetic, 4096 context'},
                                   {'id': 'openai/other-model'}, {'id': 'paged/first-model'},
                                   {'id': 'paged/second-model'}])
-        # It is the user's file from here on: discovery never replaces it.
-        again = self.agent('models', '--discover', *self.store, check=False)
-        self.assertEqual(again.returncode, 1)
-        self.assertIn('models_file_exists', again.stderr)
+        # Asked again, nothing changed: the file stays as it is.
+        again = self.agent('models', '--discover', *self.store)
+        self.assertIn(f'{self.catalog} is up to date', again.stderr)
+        self.assertIn('gone: provider_', again.stderr)
+        self.assertEqual(self.catalog.read_text(), text)
 
         # The daemon asked each provider once and keeps the answers, the refused one too.
         with socket.socket(socket.AF_UNIX) as s:
-            s.connect(str(self.path / 'state.sqlite.sock'))
+            s.connect(str(self.state) + '.sock')
             lines = s.makefile('rw')
             lines.readline()
             lines.write(json.dumps({'id': 1, 'op': 'provider_models'}) + '\n')

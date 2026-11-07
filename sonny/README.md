@@ -165,9 +165,10 @@ for Bedrock), `--model PROVIDER/MODEL`, `--import-mcp [codex,claude,...]`
 has, what is set, the MCP servers to bring, missing tools and setup steps. Either step also suggests efforts, `[sonny] lead_effort =
 "medium"` and `task_effort = "high"`, unless the config already sets them,
 and says on stderr which it wrote.
-Outside a terminal both fail, naming what to set. The first start also writes
-`~/.agent/models`, the list agents read with `agent models`, when there is
-none, as `agent models --discover` does.
+Outside a terminal both fail, naming what to set. Every daemon start rewrites
+`~/.agent/models.discovered` from the providers' listings, as `agent models
+--discover` does; agents read it with `agent models`, under the person's own
+`~/.agent/models` (additions, and `-PROVIDER/MODEL` to hide one).
 
 `sonny setup backup URL` keeps the person's home off the machine, for one
 that may be rebuilt or lost: memory, skills and profiles (`~/.agents`) and
@@ -453,7 +454,7 @@ under its name, or a bot of another store, is refused, and each prompt names
 the bot's identity, so one sent after such a swap reaches neither. T3 Code's model picker lists what the providers list, as `/model`
 does, each by the name its provider lists (else the name Sonny gives it, as
 people say it) beside the provider, as "Global Claude Opus 5.5 · bedrock", with the full id and
-`~/.agent/models`' notes, and the models only that file names, after
+the model list's notes, and the models only that list names, after
 "Default", the model the lead or task runs; its effort picker lists the
 family's efforts after "Default" too. A pick made before the first prompt is
 for a lead Sonny makes: a lead the thread binds to with `/switch NAME` keeps its

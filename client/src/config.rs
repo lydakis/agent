@@ -5,7 +5,7 @@
 //!
 //! ```toml
 //! model = "anthropic/claude-opus-5-5"  # a new agent's, with none named
-//! provider = "chatgpt"          # the daemon's, with no AGENT_PROVIDER
+//! provider = "chatgpt"          # the daemon's, with no AGENT_PROVIDER; an edit applies to its next turns
 //! web_search = "disabled"       # "live", the default, lets new agents search and fetch
 //! senders = "hidden"            # "shown", the default, labels what agents send
 //! attach_wait = "1d"            # how long an attached note waits for a call, the default; "0" as long as it takes

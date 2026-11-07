@@ -276,7 +276,7 @@ impl Agent {
     }
 
     /// A thread's options: its model, picked from what the providers list
-    /// as `/model` lists it, with `~/.agent/models`' notes and the models
+    /// as `/model` lists it, with the model list's notes and the models
     /// only it names, and its effort. Sonny's own choice is first in both.
     /// A bot's thread offers only its family's models, since a bot changes
     /// model only within it, and its family's efforts; `bound` is the
@@ -327,11 +327,17 @@ impl Agent {
     }
 
     /// What the providers list now, as `/model` asks them, with what
-    /// `~/.agent/models` says of them and the models only it names. A
+    /// the model list says of them and the models only it names. A
     /// listing that does not come in time leaves the file's.
     async fn list(&self) {
-        let file = agent_client::models::path()
-            .and_then(|path| agent_client::models::read(&path).ok())
+        let path = agent_client::models::path();
+        let file = path
+            .as_deref()
+            .and_then(|path| agent_client::models::read(path).ok())
+            .unwrap_or_default();
+        let hidden = path
+            .as_deref()
+            .map(agent_client::models::hidden)
             .unwrap_or_default();
         let mut offer = Offer::default();
         if let Ok((client, _events)) = Client::connect(&self.options.socket).await {
@@ -345,7 +351,9 @@ impl Agent {
                 names.sort();
                 for name in names {
                     for model in providers[name]["models"].as_array().into_iter().flatten() {
-                        if let Some(id) = model["id"].as_str() {
+                        if let Some(id) = model["id"].as_str()
+                            && !hidden.contains(&format!("{name}/{id}"))
+                        {
                             offer.models.push(Listed {
                                 id: format!("{name}/{id}"),
                                 name: model["name"].as_str().map(str::to_owned),
@@ -527,7 +535,7 @@ struct Offer {
 }
 
 /// A model a thread may pick: `provider/model`, the name its provider's
-/// listing gives it, and `~/.agent/models`' note.
+/// listing gives it, and the model list's note.
 #[derive(Clone)]
 struct Listed {
     id: String,

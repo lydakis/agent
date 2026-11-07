@@ -3374,6 +3374,49 @@ impl Database {
         changed.sort();
         Ok((changed, kin))
     }
+    /// The bots whose model, fallback or compaction model, or an unfinished
+    /// turn's own model, is served by one of `providers`, by name: the ones
+    /// a provider's removal would leave with nothing to call.
+    pub fn bots_on_providers(&self, providers: &[String]) -> Result<Vec<String>> {
+        let on = |model: Option<String>| {
+            model.is_some_and(|model| {
+                model
+                    .split_once('/')
+                    .is_some_and(|(provider, _)| providers.iter().any(|p| p == provider))
+            })
+        };
+        let mut names = Vec::new();
+        let mut statement = self.conn.prepare(
+            "SELECT name,provider,fallback,compaction_model FROM bots WHERE status!='deleting' ORDER BY name",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let provider: String = row.get(1)?;
+            if providers.contains(&provider) || on(row.get(2)?) || on(row.get(3)?) {
+                names.push(row.get(0)?);
+            }
+        }
+        // A turn accepted with a model of its own and not yet finished
+        // still starts on that model's provider: each status read through
+        // its own index, never the whole history.
+        let mut statement = self.conn.prepare(
+            "SELECT bot,model FROM turns WHERE status='queued' AND model IS NOT NULL
+             UNION ALL SELECT bot,model FROM turns WHERE status='attached' AND model IS NOT NULL
+             UNION ALL SELECT bot,model FROM turns WHERE status='ready' AND model IS NOT NULL
+             UNION ALL SELECT bot,model FROM turns WHERE status='running' AND model IS NOT NULL
+             UNION ALL SELECT bot,model FROM turns WHERE status='waiting' AND model IS NOT NULL
+             UNION ALL SELECT bot,model FROM turns WHERE status='paced' AND model IS NOT NULL",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let bot: String = row.get(0)?;
+            if on(row.get(1)?) && !names.contains(&bot) {
+                names.push(bot);
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
     /// The model a declined request goes to, as `provider/model`, or none;
     /// whether that changed it. The daemon has checked its family.
     pub fn set_fallback(
