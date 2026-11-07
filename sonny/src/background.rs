@@ -9,7 +9,7 @@
 //! fire went out and whose turn then failed, as when the machine was
 //! offline or a login expired, the daemon saying how the turn ended; and a
 //! server the nightly memory cleanup could not read, by the fact it saves.
-use crate::{lookout, trigger};
+use crate::{kept, lookout, trigger};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     style::{Color, Stylize},
@@ -75,15 +75,15 @@ pub fn read(
     ours: impl Fn(&str) -> bool,
 ) -> Vec<Item> {
     let mut items = Vec::new();
-    if let (Some(id), Ok(places)) = (store_id, trigger::Places::home()) {
-        for (mut row, bots) in trigger::on_store(&places, id) {
+    if let Some(id) = store_id {
+        for (mut row, bots) in triggers(id) {
             if bots.iter().any(|bot| ours(bot)) {
                 trigger::with_turn(&mut row, turns);
                 items.push(trigger_item(&row, bots));
             }
         }
     }
-    for (subscriber, subs) in lookout::subs::all(store) {
+    for (subscriber, subs) in subscriptions(store) {
         if !ours(&subscriber) {
             continue;
         }
@@ -116,6 +116,40 @@ pub fn read(
         }
     }
     items
+}
+
+/// Remove the rows of triggers made on the daemon whose store is
+/// `store_id` that have nothing left to say ([`trigger::forget_among`]), found
+/// among the rows as last read: only those are read again. How many went.
+pub fn forget_done(store_id: &str, turns: &HashMap<String, Value>) -> usize {
+    let Ok(places) = trigger::Places::home() else {
+        return 0;
+    };
+    trigger::forget_among(&places, store_id, turns, &triggers(store_id))
+}
+
+/// The rows of the triggers made on the daemon whose store is
+/// `store_id`, as [`trigger::on_store`] reads them, read again only once
+/// the folders they are in change or a row changes with time.
+fn triggers(store_id: &str) -> Vec<(Value, Vec<String>)> {
+    static KEPT: kept::Slot<Vec<(Value, Vec<String>)>> = kept::Slot::new(None);
+    let Ok(places) = trigger::Places::home() else {
+        return Vec::new();
+    };
+    let paths = vec![places.jobs.clone(), places.state.clone()];
+    kept::read(&KEPT, store_id, paths, || {
+        trigger::on_store_until(&places, store_id)
+    })
+}
+
+/// Every subscription beside `store`, as [`lookout::subs::all`] reads
+/// them, read again only once their folder changes.
+fn subscriptions(store: &Path) -> Vec<(String, Vec<lookout::subs::Sub>)> {
+    static KEPT: kept::Slot<Vec<(String, Vec<lookout::subs::Sub>)>> = kept::Slot::new(None);
+    let key = store.to_string_lossy();
+    kept::read(&KEPT, &key, vec![lookout::subs::dir(store)], || {
+        (lookout::subs::all(store), None)
+    })
 }
 
 /// The person's own agents, which no project names, as the one the nightly
@@ -159,16 +193,35 @@ pub fn read_around(
         scope.takes(bot) || personal(bot)
     });
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        items.extend(servers(&home.join(".agents/memory"), &scope.project));
-        items.extend(unscheduled(&home));
+        let (view, cleanup) = memory(&home, &scope.project);
+        items.extend(servers(&view));
+        items.extend(unscheduled(cleanup));
     }
     items
 }
 
+/// The memory's facts the person's and `project`'s, and why the nightly
+/// cleanup could not be scheduled, read again only once their folders or
+/// that file change.
+fn memory(home: &Path, project: &str) -> (Value, Option<(String, i64)>) {
+    static KEPT: kept::Slot<(Value, Option<(String, i64)>)> = kept::Slot::new(None);
+    let root = home.join(".agents/memory");
+    let paths = vec![
+        root.clone(),
+        root.join("projects").join(project),
+        trigger::cleanup_unscheduled_path(home),
+    ];
+    let key = format!("{}\0{project}", home.display());
+    kept::read(&KEPT, &key, paths, || {
+        let view = agent_client::memory::view(&root, Some(project));
+        ((view, trigger::cleanup_unscheduled(home)), None)
+    })
+}
+
 /// The nightly memory cleanup, when Sonny could not schedule it: the
 /// person's to know in every window, since nothing else runs it.
-fn unscheduled(home: &Path) -> Option<Item> {
-    let (why, at) = trigger::cleanup_unscheduled(home)?;
+fn unscheduled(cleanup: Option<(String, i64)>) -> Option<Item> {
+    let (why, at) = cleanup?;
     let tried = (now_ms() / 1000).saturating_sub(at.max(0) as u64);
     Some(Item {
         kind: Kind::Setup,
@@ -191,9 +244,9 @@ fn unscheduled(home: &Path) -> Option<Item> {
 }
 
 /// The `unreadable-SERVER` facts the nightly memory cleanup saves, the
-/// person's and `project`'s, each as the server it names.
-fn servers(root: &Path, project: &str) -> Vec<Item> {
-    let view = agent_client::memory::view(root, Some(project));
+/// person's and the project's, as `view` has them: each as the server it
+/// names.
+fn servers(view: &Value) -> Vec<Item> {
     let scopes =
         std::iter::once(&view["user"]).chain(view["projects"].as_array().into_iter().flatten());
     let mut items = Vec::new();
@@ -860,14 +913,14 @@ mod tests {
         let home = std::env::temp_dir().join(format!("bg-unscheduled-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join(".agent/sonny")).unwrap();
-        assert_eq!(unscheduled(&home), None);
+        assert_eq!(unscheduled(trigger::cleanup_unscheduled(&home)), None);
         let at = now_ms() / 1000 - 120;
         std::fs::write(
             home.join(".agent/sonny/cleanup-not-scheduled.json"),
             json!({"why": "automations_unsupported: no scheduler here", "at": at}).to_string(),
         )
         .unwrap();
-        let item = unscheduled(&home).unwrap();
+        let item = unscheduled(trigger::cleanup_unscheduled(&home)).unwrap();
         assert_eq!(item.kind, Kind::Setup);
         assert_eq!(
             item.failed.as_deref(),
@@ -1066,7 +1119,7 @@ mod tests {
             "unreadable-tracker",
             "tracker: 401",
         );
-        let found = servers(&root, "calc");
+        let found = servers(&agent_client::memory::view(&root, Some("calc")));
         let names: Vec<&str> = found.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["chat", "mail"]);
         assert_eq!(

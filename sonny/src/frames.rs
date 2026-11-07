@@ -22,9 +22,12 @@
 use std::io::{Stdout, Write};
 use std::sync::{LazyLock, Mutex};
 
+use ratatui::backend::{ClearType, CrosstermBackend, WindowSize};
+use ratatui::buffer::Cell;
 use ratatui::crossterm::cursor::Hide;
 use ratatui::crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::crossterm::{execute, queue};
+use ratatui::layout::{Position, Size};
 
 /// A frame's bytes on their way to `out`.
 pub struct Hold<W> {
@@ -110,6 +113,96 @@ impl Write for Screen {
 
     fn flush(&mut self) -> std::io::Result<()> {
         screen().flush()
+    }
+}
+
+/// The terminal's backend: crossterm's, writing to `W`, its size the one
+/// [`crate::term::size`] keeps rather than read from the terminal on
+/// every ask, which `Terminal` makes twice a frame and Sonny three times
+/// more.
+pub struct Backend<W: Write>(CrosstermBackend<W>);
+
+impl<W: Write> Backend<W> {
+    pub const fn new(out: W) -> Self {
+        Self(CrosstermBackend::new(out))
+    }
+}
+
+impl Backend<Screen> {
+    /// What the screen is written through: [`Screen`], held a frame at a
+    /// time.
+    pub const fn screen() -> Self {
+        Self::new(Screen)
+    }
+}
+
+impl<W: Write> Write for Backend<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Write::flush(&mut self.0)
+    }
+}
+
+impl<W: Write> ratatui::backend::Backend for Backend<W> {
+    type Error = std::io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        self.0.draw(content)
+    }
+    fn append_lines(&mut self, n: u16) -> std::io::Result<()> {
+        self.0.append_lines(n)
+    }
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        self.0.hide_cursor()
+    }
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        self.0.show_cursor()
+    }
+    fn get_cursor_position(&mut self) -> std::io::Result<Position> {
+        self.0.get_cursor_position()
+    }
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> std::io::Result<()> {
+        self.0.set_cursor_position(position)
+    }
+    fn clear(&mut self) -> std::io::Result<()> {
+        self.0.clear()
+    }
+    fn clear_region(&mut self, clear_type: ClearType) -> std::io::Result<()> {
+        self.0.clear_region(clear_type)
+    }
+    fn size(&self) -> std::io::Result<Size> {
+        let size = crate::term::size()?;
+        Ok(Size::new(size.columns, size.rows))
+    }
+    fn window_size(&mut self) -> std::io::Result<WindowSize> {
+        let size = crate::term::size()?;
+        Ok(WindowSize {
+            columns_rows: Size::new(size.columns, size.rows),
+            pixels: Size::new(size.width, size.height),
+        })
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        ratatui::backend::Backend::flush(&mut self.0)
+    }
+    fn scroll_region_up(
+        &mut self,
+        region: std::ops::Range<u16>,
+        lines: u16,
+    ) -> std::io::Result<()> {
+        self.0.scroll_region_up(region, lines)
+    }
+    fn scroll_region_down(
+        &mut self,
+        region: std::ops::Range<u16>,
+        lines: u16,
+    ) -> std::io::Result<()> {
+        self.0.scroll_region_down(region, lines)
     }
 }
 

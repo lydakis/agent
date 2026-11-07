@@ -39,6 +39,7 @@ mod home;
 mod html;
 mod image;
 mod js;
+mod kept;
 mod link;
 mod links;
 mod list;
@@ -106,7 +107,7 @@ mod zen;
 use agent_client::{Client, Events};
 use ratatui::{
     Terminal,
-    backend::{Backend, CrosstermBackend},
+    backend::Backend,
     crossterm::{
         event::{
             self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture,
@@ -155,6 +156,10 @@ const DRAW_ATTEMPTS: u32 = 30;
 /// The least time between two draws the daemon's events bring: 30 a
 /// second, Ink's default cap.
 const DRAW_EVERY: Duration = Duration::from_millis(33);
+/// The most time between two frames of a window where nothing moves: its
+/// clocks count seconds, and what it reads now and then (counts, tasks,
+/// the margin's files) shows within one.
+const IDLE_FRAME: Duration = Duration::from_secs(1);
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
 /// How much older history is drawn at a time as the view nears its top:
@@ -264,14 +269,16 @@ fn keys_apart(on: bool) {
     };
 }
 
-type Tui = Terminal<CrosstermBackend<frames::Screen>>;
+type Tui = Terminal<frames::Backend<frames::Screen>>;
 
 /// The whole screen cleared, and drawn whole at the next frame, without
 /// asking the terminal where its cursor is as `Terminal::clear` does to put
 /// it back: an answer late through a multiplexer or a slow link ends Sonny
 /// with "the cursor position could not be read", and nothing here needs
-/// the cursor kept.
+/// the cursor kept. The window's size is read anew for it, should a
+/// resize have gone unsaid.
 fn wipe<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    term::resized();
     let size = terminal.size()?;
     terminal.resize(Rect::new(0, 0, size.width, size.height))
 }
@@ -1522,8 +1529,7 @@ async fn run() -> Result<(), String> {
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     keys_apart(true);
     own_screen(true);
-    let mut terminal =
-        Terminal::new(CrosstermBackend::new(frames::Screen)).map_err(|e| e.to_string())?;
+    let mut terminal = Terminal::new(frames::Backend::screen()).map_err(|e| e.to_string())?;
     // A side chat opens on its window's alternate screen, still drawn on.
     let _ = wipe(&mut terminal);
     let mut app = App::new(client, &name, &bot, options.clone());
@@ -4576,11 +4582,17 @@ impl App {
         // draws at once, so typing never waits on the cap.
         let mut drawn: Option<Instant> = None;
         let mut keyed = false;
+        // Something came that the screen may show: a frame is built only
+        // then, on a tick while something on it moves ([`App::moving`]),
+        // and once a second for what else time changes, so an idle window
+        // builds a frame a second, not ten.
+        let mut changed = true;
         loop {
             let due = drawn.is_none_or(|at| at.elapsed() >= DRAW_EVERY);
+            let wanted = keyed || changed || self.quit;
             let skipped = !(keyed || due || self.quit);
-            if !skipped {
-                keyed = false;
+            if wanted && !skipped {
+                (keyed, changed) = (false, false);
                 drawn = Some(Instant::now());
                 match self.draw(terminal) {
                     Ok(()) => failed_draws = 0,
@@ -4589,21 +4601,25 @@ impl App {
                     Err(_) if failed_draws < DRAW_ATTEMPTS => {
                         failed_draws += 1;
                         self.stale = true;
+                        changed = true;
                     }
                     Err(error) => return Err(error.to_string()),
                 }
             }
             // What came since the last draw waits for the next one, due
             // once the cap allows.
-            let undrawn = drawn.filter(|_| skipped);
+            let undrawn = drawn.filter(|_| wanted && skipped);
             if self.quit {
                 return Ok(());
             }
             tokio::select! {
-                event = events.recv(), if !self.down => match event {
-                    Some(event) => self.daemon(event).await,
-                    None => self.dropped(),
-                },
+                event = events.recv(), if !self.down => {
+                    changed = true;
+                    match event {
+                        Some(event) => self.daemon(event).await,
+                        None => self.dropped(),
+                    }
+                }
                 Some(key) = keys.recv() => {
                     keyed = true;
                     self.key(key).await
@@ -4619,6 +4635,7 @@ impl App {
                         None => std::future::pending().await,
                     }
                 } => {
+                    changed = true;
                     // What the layout's worker said, between the daemon's events.
                     let event = match news {
                         Ok(event) => event,
@@ -4664,8 +4681,11 @@ impl App {
                         self.fleet_said(said);
                     }
                 }
-                _ = tick.tick() => {}
-                _ = self.woken.notified() => {}
+                _ = tick.tick() => {
+                    changed |= self.moving()
+                        || drawn.is_none_or(|at| at.elapsed() >= IDLE_FRAME);
+                }
+                _ = self.woken.notified() => changed = true,
             }
             if self.picked_read.elapsed() > Duration::from_secs(1) {
                 self.picked_read = Instant::now();
@@ -8581,8 +8601,9 @@ impl App {
     }
 
     /// Count what runs for this agent in the background again, every ten
-    /// seconds, and what failed of what `/background` lists: files read,
-    /// and the daemon asked at once how the turns fires sent ended.
+    /// seconds, and what failed of what `/background` lists: files read
+    /// again only once they changed, and the daemon asked at once how the
+    /// turns fires sent ended.
     async fn count_behind(&mut self) {
         if self
             .behind
@@ -8607,10 +8628,10 @@ impl App {
         }
         // A trigger that ended goes once its last turn did well, also one
         // that ended after its turn did, as a `--reply-to` fire passing on
-        // the answer.
-        if !self.turns.is_empty()
-            && let (Some(store), Ok(places)) = (self.client.store(), trigger::Places::home())
-            && trigger::forget_done(&places, store, &self.turns) > 0
+        // the answer, and a one-off its `--if` said no to. Found among the
+        // rows as read: only those that go are read again.
+        if let Some(store) = self.client.store()
+            && background::forget_done(store, &self.turns) > 0
         {
             items = read(&self.turns);
         }
@@ -11870,6 +11891,18 @@ impl App {
     /// The bot's reactions so far to the person's message, right under
     /// it, wherever it is: never a row of their own. A message no longer
     /// in the conversation, or not drawn yet, shows them once it is.
+    /// Whether something on the screen moves with time alone, so each
+    /// tick draws it: the running turn's shimmer and clock, a shell's
+    /// clock and output, a card beside (the sky, or one read again every
+    /// few seconds), a side chat, a count's pulse on its beats. Whatever
+    /// else changes comes with an event, which draws it.
+    fn moving(&self) -> bool {
+        self.running.is_some()
+            || self.shell.is_some()
+            || (self.pane.as_ref()).is_some_and(|pane| pane.is_card() || pane.program.is_some())
+            || self.needs_pulse.get().moving(Instant::now())
+    }
+
     /// Whether zen keeps what the running turn says out of view: the
     /// person did not start it.
     fn zen_hides(&self) -> bool {
@@ -12675,10 +12708,10 @@ impl App {
             chat => chat,
         } as usize;
         self.width = width;
-        self.height = terminal.size()?.height as usize;
+        self.height = size.height as usize;
         let (composer_rows, (cursor_row, cursor_col)) = self.composer(width.min(measure()));
         // A short pane keeps the rows around the cursor, where typing goes on.
-        let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
+        let room = (size.height as usize).saturating_sub(VIEWPORT as usize - 1);
         // What is typed to answer a question has the question over it,
         // as a reply in a chat has what it replies to.
         let heading = self
