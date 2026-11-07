@@ -544,7 +544,7 @@ you missed: another agent, the margin, the commons, or a reply of its own
 you scrolled past. Such a guess says where from after the key, dim, as in
 `› check pricing's failing test  tab  ↳ shop.pricing`; Tab takes only the
 words. The copy names the source from a fixed set (`earlier`, `margin`,
-`commons`, or an agent's name, which Sonny looks up), so a guess about the
+`commons`, or an agent's name, which Sonny looks up and a click opens), so a guess about the
 reply you are reading, or a source it made up, shows none, and a window
 too narrow for the whole guess and its source leaves the source out.
 
@@ -1400,7 +1400,11 @@ has a question for you"), in a row of task updates, in a message from
 another agent, and in the pane's own text. Only a name the daemon knows
 is one, so it is drawn in the agents' blue, and a word that only looks
 like one stays plain. In a row a click opens, such as `↳ From calc.neg
-▸`, the name opens the agent and the rest of the row the message. Leads
+▸`, the name opens the agent and the rest of the row the message. Sonny
+names agents the same way wherever it draws one, by the whole name: a
+task's question pinned in its lead's window says `↳ From shop.fix`, a
+commons post its writer, a guess for your next message the agent it came
+from. Blue is only ever a link, so a name in blue always opens. Leads
 and tasks write an agent's whole name when they point you to it, where
 that helps you act.
 
