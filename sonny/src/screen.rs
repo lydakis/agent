@@ -851,8 +851,21 @@ impl Screen {
     /// The view is a few screens from the first row, or nearer, and the
     /// rows above it can still be drawn: time to ask for older ones.
     pub fn near_top(&self) -> bool {
+        self.wants_older(false)
+    }
+
+    /// Whether to draw older rows above the view: once it is [`AHEAD`]
+    /// screens from the first row or nearer, as the wheel would soon wait
+    /// there; and, `idle` between the person's keys while they read back,
+    /// once it is less than [`NEAR`] screens from it. Never past rows
+    /// trimmed away.
+    pub fn wants_older(&self, idle: bool) -> bool {
         let height = self.area.height as usize;
-        !self.trimmed && self.back + AHEAD * height >= self.most(height)
+        let screens = match idle && self.back > 0 {
+            true => NEAR,
+            false => AHEAD,
+        };
+        !self.trimmed && self.back + screens * height >= self.most(height)
     }
 
     /// The rows `older` was written with drawn above the first row, older
@@ -3119,6 +3132,21 @@ mod tests {
         screen.render(area, &mut buf, |_| None);
         assert_eq!(row(&buf, 0), shown);
         assert!(!screen.near_top());
+    }
+
+    #[test]
+    fn older_rows_are_wanted_further_ahead_between_keys_while_reading_back() {
+        let (mut screen, _) = screen(rows(0..200), 20, 5);
+        // Following the newest, nothing is read ahead.
+        assert!(!screen.wants_older(true));
+        // Read back, older rows are wanted eight screens from the first
+        // row between keys, and three while keys wait.
+        screen.scroll(160);
+        assert!(screen.wants_older(true));
+        assert!(!screen.wants_older(false));
+        screen.scroll(20);
+        assert!(screen.wants_older(false));
+        assert!(screen.near_top());
     }
 
     #[test]
