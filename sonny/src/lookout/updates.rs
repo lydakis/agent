@@ -95,6 +95,14 @@ impl Turn {
     }
 }
 
+/// A turn's end told before who asked was read: `asked_by` names it.
+fn unnamed(t: &Turn, turn: i64) -> bool {
+    t.turn == turn
+        && t.count == 1
+        && t.by.is_none()
+        && ![APPROVAL, QUIET].contains(&t.status.as_str())
+}
+
 /// A message written in a task: who wrote it, and the words, only when
 /// the person did, kept to know the same words again; the note quotes
 /// them whole, `bytes` long.
@@ -382,6 +390,8 @@ struct Forward {
 
 /// What a wait of the lead's took from the news as it started: put back if
 /// the wait ends without handing those turns over, failed or cancelled.
+/// What changes these where they were changes them here too: who asked
+/// (`asked_by`), the reply (`replied`), a forward passed on.
 #[derive(Default)]
 struct Read {
     /// The lead's turn the wait runs in: only its end ends the wait.
@@ -620,6 +630,11 @@ impl Updates {
                             false => {
                                 self.forwarding.remove(&key);
                             }
+                        }
+                        // Or held by a wait still running: passed on all
+                        // the same, whatever the wait comes to.
+                        for read in self.waits.values_mut() {
+                            read.forwarding.retain(|(k, _)| *k != key);
                         }
                     }
                 } else if let Some(by) = data["origin"].as_str().or(data["person"].as_str()) {
@@ -1164,6 +1179,26 @@ impl Updates {
             read.heard.push((key, told, answered));
             return;
         }
+        // Or news a wait holds, with no subscription rules: named as it
+        // would be below, and told by `put` if the wait hands it back.
+        let held = (self.waits.iter()).find_map(|(call, read)| {
+            let at = (read.news.iter()).position(|(task, news)| {
+                task == name && news.act.as_ref().is_some_and(|t| unnamed(t, turn))
+            })?;
+            let status = read.news[at].1.act.as_ref()?.status.clone();
+            Some((call.clone(), at, status))
+        });
+        if let Some((call, at, status)) = held {
+            let by = self.by(&status, from, origin);
+            let read = self.waits.get_mut(&call).expect("found above");
+            let mut told = read.news[at].1.act.take().expect("found above");
+            if read.news[at].1.empty() {
+                read.news.remove(at);
+            }
+            told.by = by;
+            read.heard.push((key, told, false));
+            return;
+        }
         if let Some((mut told, answered)) = self.unheard.remove(&key) {
             told.by = self.by(&told.status, from, origin);
             if told.run() {
@@ -1177,11 +1212,7 @@ impl Updates {
             return;
         };
         let told = self.tasks[at].1.act.as_ref();
-        let Some(status) = told
-            .filter(|t| t.turn == turn && t.count == 1 && t.by.is_none())
-            .filter(|t| ![APPROVAL, QUIET].contains(&t.status.as_str()))
-            .map(|t| t.status.clone())
-        else {
+        let Some(status) = told.filter(|t| unnamed(t, turn)).map(|t| t.status.clone()) else {
             return;
         };
         let by = self.by(&status, from, origin);
@@ -3138,6 +3169,59 @@ mod tests {
             silent(&mut updates, at + 4 * QUIET_AFTER)
                 .contains("turn:shop.fix/8 has printed nothing")
         );
+    }
+
+    #[test]
+    fn what_a_wait_held_takes_who_asked_and_a_forward_passed_on_meanwhile() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        let done = |turn| {
+            ev(
+                "shop.fix",
+                Some(turn),
+                "turn_finished",
+                json!({"status": "completed"}),
+            )
+        };
+        let reads = |handle: &str| HashSet::from([handle.to_owned()]);
+        // Turns not seen starting, their news held by a wait while who
+        // asked is read; then the wait fails. An automation's run that
+        // said nothing is no news.
+        updates.event(&done(4), now);
+        assert!(updates.asker_unknown("shop.fix", 4));
+        updates.read(9, "w1", &reads("turn:shop.fix/4"));
+        assert!(!updates.news());
+        updates.asked_by("shop.fix", 4, None, Some("automation".into()));
+        updates.replied("shop.fix", 4, "");
+        updates.wait_ended("w1", false);
+        assert!(!updates.news());
+        // One the person asked for is theirs.
+        updates.event(&done(5), now);
+        updates.read(9, "w2", &reads("turn:shop.fix/5"));
+        updates.asked_by("shop.fix", 5, None, None);
+        updates.replied("shop.fix", 5, "done");
+        updates.wait_ended("w2", false);
+        let told = updates.take();
+        assert_eq!(told.items.len(), 1);
+        assert!(told.items[0].theirs, "{}", told.items[0].text);
+        assert!(
+            told.items[0].text.contains("> done"),
+            "{}",
+            told.items[0].text
+        );
+        updates.sent(told);
+        // A trigger's answer passed on while a wait held its turn stays
+        // passed on when the wait fails.
+        let fire = json!({"request_id": "trigger_t6.to.1"});
+        turn(&mut updates, "shop.docs", 6, fire, "completed");
+        assert_eq!(updates.forwarding.len(), 1);
+        updates.read(9, "w3", &reads("turn:shop.docs/6"));
+        let passed = json!({"from": {"bot": "shop.docs", "turn": 6}});
+        updates.event(&ev("shop.lead", Some(10), "accepted", passed), now);
+        updates.wait_ended("w3", false);
+        assert!(updates.forwarding.is_empty());
+        updates.expire(Instant::now() + FORWARD);
+        assert!(!updates.news());
     }
 
     #[test]
