@@ -295,6 +295,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
 | The most lines a margin note runs to | `[sonny] margin_note_lines` (12 by default, at least 1, counted in the note's text; a longer one is refused, and the agent told to show a file instead) | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
+| Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
 | Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
@@ -313,10 +314,15 @@ its own, history and all. When Sonny runs in a Rex block (`rex` found as
 on the PATH, or in the Mac app), the project gets one home there: in Rex a
 session (the one Sonny was opened in, else the one the lead is in, else one
 labelled with the project's name), in Herdr or cmux a workspace, chosen the
-same way. Each task the lead (or one of its tasks) starts gets a window (a
-Herdr tab; in cmux a tab in the lead's pane) there running Sonny on that
-task, without taking focus, its block (pane, cmux tab) labelled with the
-task's name. In Rex, each window reports OSC 7501 status, so Rex
+same way. A task the lead (or one of its tasks) starts gets a window there
+(a Herdr tab; in cmux a tab in the lead's pane) running Sonny on that task,
+without taking focus, its block (pane, cmux tab) labelled with the task's
+name, when someone asks for one: its starter, which asks when it judges you
+will want to watch it or talk to it (`start_task`'s `tab`, within
+`task_windows` as any task's window), an agent that shows it, you, from `/status` or a click on its name, or the task itself
+coming to need you. The others, such as reviewers and a lead's own helpers,
+work without one; `/status` and the footer count them. With `[sonny]
+task_tabs = "every"`, each task gets its window as a turn of its starts. In Rex, each window reports OSC 7501 status, so Rex
 shows which task is working, waiting on you (an approval, or a question it
 asked) or done, as its tab and `/status` say. In Herdr, Sonny
 supports Herdr the way its own agents do: each Sonny reports its bot through
@@ -360,7 +366,8 @@ another lead of the project in Rex, each acts where it is spoken to: the
 first's calls open nothing anywhere and say nothing opened would be seen,
 while the Rex lead opens its tasks' tabs as before. With every window closed, the last one used still names the place. A
 project whose lead is in no multiplexer gets none, and its agents get no
-layout skill. A task's window
+layout skill. A tab asked for stays until you or an agent close it, or the
+task is resolved. With `task_tabs = "every"`, a task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, stopped or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
