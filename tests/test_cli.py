@@ -297,15 +297,21 @@ class SocketAndCliTests(ModelFixture):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
         busy = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'slow').stdout)
         self.assertEqual(busy['status'], 'running')
-        refused = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'never', check=False)
+        # Unsaid, a message to a busy bot steers: it waits to join the running turn.
+        joined = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'also').stdout)
+        self.assertEqual(joined['status'], 'queued')
+        turns = json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)
+        self.assertEqual(next(t for t in turns if t['turn'] == joined['turn'])['delivery'], 'steer')
+        refused = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', '--delivery', 'reject',
+                             'never', check=False)
         self.assertEqual(refused.returncode, 1)
         # A failure is one JSON object on stderr: the daemon's fields, and a
         # hint in flags.
         busy_error = json.loads(refused.stderr)
         self.assertEqual((busy_error['error'], busy_error['running_turn']), ('bot_busy', busy['turn']))
         self.assertIn('hint', busy_error)
-        pretty = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', '--pretty', 'never',
-                            check=False)
+        pretty = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', '--pretty',
+                            '--delivery=reject', 'never', check=False)
         self.assertRegex(pretty.stderr, r'^agent: bot_busy: turn \d+ is running; resend with --delivery')
         # The refusal gives flags to copy, not a description of them, and the
         # fork it offers works while the turn runs.

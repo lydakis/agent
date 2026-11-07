@@ -4067,7 +4067,7 @@ async fn deliver(
         Target::Bot { name, id } => (
             name.clone(),
             false,
-            sending(trigger, name, *id, prompt(), false, ask),
+            sending(trigger, name, *id, prompt(), ask),
             trigger.clone(),
         ),
         Target::Start {
@@ -4092,7 +4092,7 @@ async fn deliver(
             (
                 name.clone(),
                 started,
-                sending(trigger, name, id, prompt(), started, ask),
+                sending(trigger, name, id, prompt(), ask),
                 trigger.clone(),
             )
         }
@@ -4125,7 +4125,7 @@ async fn deliver(
                         }
                         prompt.push_str(&trigger.message);
                         let id = run.id.unwrap_or_default();
-                        let asking = sending(trigger, &run.bot, id, prompt, true, ask);
+                        let asking = sending(trigger, &run.bot, id, prompt, ask);
                         run.sent = Some(json!({"generation": trigger.generation,
                             "reply_to": trigger.reply_to, "submit": asking}));
                         kept.runs.running = Some(run.clone());
@@ -4157,24 +4157,12 @@ async fn deliver(
     reply(client, &sender, bot, outcome).await
 }
 
-/// The request a fire sends `bot` (`id`) with `prompt`. A new agent
-/// (`started`) is resting, so its first message never waits.
-fn sending(
-    trigger: &Trigger,
-    bot: &str,
-    id: i64,
-    prompt: String,
-    started: bool,
-    ask: Option<&Asked>,
-) -> Value {
-    let asked = ask.is_some_and(|a| a.kind.sends());
-    let delivery = if trigger.at.is_some() || asked || started {
-        "queue"
-    } else {
-        "reject"
-    };
+/// The request a fire sends `bot` (`id`) with `prompt`: a turn of its
+/// own, after whatever the agent is doing. Whether a repeating fire goes
+/// at all is [`submit`]'s to say.
+fn sending(trigger: &Trigger, bot: &str, id: i64, prompt: String, ask: Option<&Asked>) -> Value {
     json!({"bot": bot, "bot_id": id, "request_id": request_id(trigger, id, ask),
-        "prompt": prompt, "delivery": delivery, "origin": ORIGIN,
+        "prompt": prompt, "delivery": "queue", "origin": ORIGIN,
         "budget_tokens": trigger.turn_budget_tokens, "budget_counts": trigger.budget_counts})
 }
 
@@ -4436,8 +4424,10 @@ async fn shadow(
         stamp(now()),
         trigger.message
     );
+    // The copy is new and at rest, so its turn starts at once; one of its
+    // own, as a turn cap needs.
     let asking = json!({"bot": name, "bot_id": shadow, "request_id": request_id(trigger, shadow, ask),
-        "prompt": prompt, "delivery": "reject", "origin": ORIGIN,
+        "prompt": prompt, "delivery": "queue", "origin": ORIGIN,
         "budget_tokens": trigger.turn_budget_tokens, "budget_counts": trigger.budget_counts});
     let sent = json!({"store_id": trigger.store_id, "generation": trigger.generation,
         "reply_to": trigger.reply_to, "shadow_of": bot, "submit": asking});
@@ -4564,7 +4554,7 @@ async fn report(
             "submit",
             json!({"bot": to, "bot_id": to_id,
                 "request_id": format!("{}shadow.{to_id}.{id}.{turn}", sent_by(trigger)),
-                "prompt": prompt, "delivery": "queue", "from": {"bot": bot, "turn": turn}}),
+                "prompt": prompt, "delivery": "steer", "from": {"bot": bot, "turn": turn}}),
         )
         .await;
     let mut reply = match sent {
@@ -4635,21 +4625,19 @@ async fn submit(
     ask: Option<&Asked>,
 ) -> Value {
     let id = asking["bot_id"].as_i64().unwrap_or_default();
-    let mut submitted = client.request("submit", asking.clone()).await;
     // A repeating trigger's fire that finds its agent busy waits behind its
     // work, as anacron runs a missed job once: one fire of the trigger
-    // waits at a time, so a frequent one does not pile up.
-    let mut late = false;
-    if let Err(error) = &submitted
-        && matches!(error.code.as_str(), "bot_busy" | "active_agent_limit")
-        && asking["delivery"] == "reject"
-        && waiting_fire(client, trigger, bot).await == Some(false)
-    {
-        let mut queued = asking.clone();
-        queued["delivery"] = json!("queue");
-        submitted = client.request("submit", queued).await;
-        late = submitted.is_ok();
-    }
+    // waits at a time, so a frequent one does not pile up. A one-off, a
+    // fire asked for and a new agent's first message always go.
+    let repeating = trigger.at.is_none() && !started && !ask.is_some_and(|a| a.kind.sends());
+    let request = asking["request_id"].as_str().unwrap_or_default();
+    let submitted = match repeating && waiting_fire(client, trigger, bot, request).await {
+        true => Err(agent_client::Error::with(
+            "bot_busy",
+            "an earlier fire waits behind its work",
+        )),
+        false => client.request("submit", asking.clone()).await,
+    };
     let outcome = match submitted {
         Ok(turn) => {
             let mut sent = json!({"outcome": "sent", "turn": turn["turn"],
@@ -4657,7 +4645,8 @@ async fn submit(
             if started {
                 sent["started"] = json!(true);
             }
-            if late {
+            // Behind the agent's work, or waiting for room to run.
+            if matches!(turn["status"].as_str(), Some("queued" | "ready")) {
                 sent["late"] = json!(true);
             }
             // A `fire NAME` waiting for this one finds its turn in its
@@ -4901,42 +4890,57 @@ fn request_id(trigger: &Trigger, id: i64, ask: Option<&Asked>) -> String {
     }
 }
 
-/// Whether a fire of `trigger` already waits behind `bot`'s work; `None`
-/// when the agent's turns could not be read. Queued work starts in order,
-/// so nothing older than a turn that started still waits: the turns are
-/// read newest first, a page at a time, until one that started. Rows that
-/// never ran (a steer the running turn took in, a message cancelled while
-/// it waited, a note attached to the next turn) are passed over.
-async fn waiting_fire(client: &Client, trigger: &Trigger, bot: &str) -> Option<bool> {
+/// Whether another fire of `trigger` already waits behind `bot`'s work.
+/// Queued work starts in order, so nothing older than a turn that started
+/// still waits: the turns are read newest first, a page at a time, until
+/// one that started. Rows that never ran (a steer the running turn took
+/// in, a message cancelled while it waited, a note attached to the next
+/// turn) are passed over. `request` itself, sent before by an attempt cut
+/// short, is not another: sent again, it is the same turn. Turns that
+/// cannot be read hold no fire back, so a fire is never lost to a read.
+///
+/// Every repeating fire asks, so the first page is small: an agent at rest
+/// or at work is answered by its newest turn.
+async fn waiting_fire(client: &Client, trigger: &Trigger, bot: &str, request: &str) -> bool {
     let ours = sent_by(trigger);
     let mut before: Option<i64> = None;
+    let mut limit = 8;
     loop {
-        let mut page = json!({"bot": bot, "newest": true, "limit": 256});
+        let mut page = json!({"bot": bot, "newest": true, "limit": limit});
         if let Some(before) = before {
             page["before"] = json!(before);
         }
-        let read = client.request("turns", page).await.ok()?;
-        let turns = read["turns"].as_array()?;
+        let Ok(read) = client.request("turns", page).await else {
+            return false;
+        };
+        let Some(turns) = read["turns"].as_array() else {
+            return false;
+        };
         for turn in turns {
-            match turn["status"].as_str()? {
-                "running" | "waiting" | "paced" | "completed" | "failed" => return Some(false),
-                "queued" | "ready"
-                    if (turn["request_id"].as_str()).is_some_and(|id| id.starts_with(&ours)) =>
-                {
-                    return Some(true);
+            let id = turn["request_id"].as_str();
+            match turn["status"].as_str() {
+                Some("running" | "waiting" | "paced" | "completed" | "failed") | None => {
+                    return false;
+                }
+                Some("queued" | "ready") if id == Some(request) => return false,
+                Some("queued" | "ready") if id.is_some_and(|id| id.starts_with(&ours)) => {
+                    return true;
                 }
                 _ => {}
             }
         }
         match turns.last().and_then(|turn| turn["turn"].as_i64()) {
-            Some(oldest) if turns.len() == 256 => before = Some(oldest),
-            _ => return Some(false),
+            Some(oldest) if turns.len() == limit => before = Some(oldest),
+            _ => return false,
         }
+        limit = 256;
     }
 }
 
-/// With `--reply-to`, wait for the turn a fire sent and queue its answer
-/// to that agent; what came of it is the outcome's `reply`.
+/// With `--reply-to`, wait for the turn a fire sent and pass its answer
+/// to that agent as a steer, as the lookout tells a task's update: it
+/// joins the agent's running turn or starts one. What came of it is the
+/// outcome's `reply`.
 async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value) -> Value {
     let (Some((to, to_id)), Some(turn)) = (&trigger.reply_to, outcome["turn"].as_i64()) else {
         return outcome;
@@ -4978,7 +4982,7 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
             "submit",
             json!({"bot": to, "bot_id": to_id,
                 "request_id": format!("{}reply.{to_id}.{turn}", sent_by(trigger)),
-                "prompt": prompt, "delivery": "queue", "from": {"bot": bot, "turn": turn}}),
+                "prompt": prompt, "delivery": "steer", "from": {"bot": bot, "turn": turn}}),
         )
         .await;
     outcome["reply"] = match sent {
