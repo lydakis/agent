@@ -652,8 +652,10 @@ async fn run(
         let told = (health.lock().ok()).and_then(|mut health| {
             health.after(&source, failed, stderr, std::time::Instant::now())
         });
-        if let Some(told) = told {
-            place.send(Said::Event(Box::new(told)));
+        match told {
+            Some(told) => place.send(Said::Event(Box::new(told))),
+            // Given back before it sleeps, so it holds no place meanwhile.
+            None => drop(place),
         }
         tokio::time::sleep(every).await;
     }
