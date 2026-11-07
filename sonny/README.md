@@ -677,6 +677,14 @@ way `/react` does, and each note in the margin has its own `↩`.
   own weight rather than muted (no hue: yellow is for what needs you),
   and on a narrow window the mark stays when the word goes.
 
+  A pick reaches the agent and every agent it made, and those they made,
+  and any it makes later takes its row too. A muted line under the rows
+  says so before you pick, with the count, as in `Reaches tally lead, its
+  2 agents and any new ones; 1 is busy and switches when its turn ends`:
+  an agent in a turn keeps its old permissions until the turn ends.
+
+  ![/permissions with the line under its rows: Reaches tally lead, its agent and any new ones; 1 is busy and switches when its turn ends](../docs/sonny/permissions-reach.png)
+
   ![/permissions: Sonny's four rows, then one of the config's](../docs/sonny/permissions.png)
 
   ![The footer leading with ⏵⏵ full access, ? 1 needs you and 37% left in yellow on the right](../docs/sonny/permissions-full-footer.png)

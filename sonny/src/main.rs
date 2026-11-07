@@ -610,6 +610,24 @@ struct Passed {
     sandboxes: approvals::Sandboxes,
 }
 
+/// Every bot the daemon has, page by page; `None` when a page could not
+/// be read.
+async fn every_bot(client: &Client) -> Option<Vec<Value>> {
+    let mut bots = Vec::new();
+    let mut after = json!("");
+    loop {
+        let page = (client)
+            .request("bots", json!({"after": after, "limit": 256}))
+            .await
+            .ok()?;
+        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+        match &page["next_after"] {
+            Value::Null => return Some(bots),
+            next => after = next.clone(),
+        }
+    }
+}
+
 /// One pass of a `/permissions` pick over the agents `lead` made and
 /// those they made, all but those `settled`: each that hasn't `mode` is
 /// configured to it; one busy is left for the next pass. The folder walks
@@ -632,21 +650,9 @@ async fn spread_pass(
         notice: None,
         sandboxes: Default::default(),
     };
-    let mut bots = Vec::new();
-    let mut after = json!("");
-    let listed = loop {
-        let Ok(page) = (client)
-            .request("bots", json!({"after": after, "limit": 256}))
-            .await
-        else {
-            break false;
-        };
-        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-        match &page["next_after"] {
-            Value::Null => break true,
-            next => after = next.clone(),
-        }
-    };
+    let listing = every_bot(&client).await;
+    let listed = listing.is_some();
+    let bots = listing.unwrap_or_default();
     let made: Vec<Value> = match listed {
         true => approvals::made_by(&bots, &lead)
             .into_iter()
@@ -3091,6 +3097,10 @@ struct App {
     config: Option<config::View>,
     /// The model listing `/model` waits on.
     listing: Option<tokio::sync::oneshot::Receiver<Result<Value, String>>>,
+    /// How far a `/permissions` pick reaches, once the listing it is read
+    /// from arrives, for the line under the rows.
+    reach: Option<approvals::Reach>,
+    reaching: Option<tokio::sync::oneshot::Receiver<Option<approvals::Reach>>>,
     /// The model and effort picked, set once no turn runs.
     switch: Option<(String, Option<String>)>,
     /// The prompt-cache lifetime a bot made before Sonny gave its model
@@ -4451,6 +4461,8 @@ impl App {
             searching: None,
             config: None,
             listing: None,
+            reach: None,
+            reaching: None,
             agents: None,
             making: None,
             send_after: None,
@@ -4717,6 +4729,7 @@ impl App {
             self.suggested_now().await;
             self.shell_ran().await;
             self.listed();
+            self.reached();
             self.follow_place().await;
             self.follow_tab().await;
             self.count_behind().await;
@@ -5146,9 +5159,32 @@ impl App {
         (self.making.as_ref()).is_some_and(|making| !matches!(making.step, new::Step::Brief))
     }
 
+    /// The agent as the composer names it: a lead by its project, a side
+    /// chat by what it is, not the copy's own id.
+    fn named(&self) -> String {
+        match &self.project {
+            Some(project) => lead_title(project, &self.bot),
+            None if self.options.side.is_some() => "the side chat".to_owned(),
+            None => self.bot.clone(),
+        }
+    }
+
     /// Whether `/new`'s first message is being written in the composer.
     fn new_brief(&self) -> bool {
         (self.making.as_ref()).is_some_and(|making| matches!(making.step, new::Step::Brief))
+    }
+
+    /// How far a `/permissions` pick reaches, once it is read.
+    fn reached(&mut self) {
+        let Some(reaching) = &mut self.reaching else {
+            return;
+        };
+        match reaching.try_recv() {
+            Ok(reach) => self.reach = reach,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Err(_) => {}
+        }
+        self.reaching = None;
     }
 
     /// `/model`'s listing, once it arrives: the picker opens on it.
@@ -8219,7 +8255,7 @@ impl App {
                     (false, "completed") => limit,
                     _ => detail,
                 };
-                let line = transcript::finished(status, shown, seconds, self.prose());
+                let line = transcript::finished(status, shown, seconds);
                 self.close_live();
                 // A turn that only reacted ends as a reaction under the
                 // message, with no line under it.
@@ -11240,6 +11276,18 @@ impl App {
                 .map(|mode| (mode.label.clone(), mode.about.clone()))
                 .collect();
             self.choosing = Some((Choice::Permissions, list::Picker::new(rows, at)));
+            // How far a pick reaches, read beside the window: the line
+            // under the rows says it in general words until it arrives.
+            self.reach = None;
+            let (send, receive) = tokio::sync::oneshot::channel();
+            let (client, bot, woken) = (self.client.clone(), self.bot.clone(), self.woken.clone());
+            tokio::spawn(async move {
+                let reach =
+                    (every_bot(&client).await).map(|bots| approvals::Reach::of(&bots, &bot));
+                let _ = send.send(reach);
+                woken.notify_one();
+            });
+            self.reaching = Some(receive);
             return;
         }
         if prompt == "/copy" {
@@ -13039,12 +13087,18 @@ impl App {
                         )
                     })
                     .collect();
-                over(
-                    frame,
-                    list::lines(&items, list.at(), width, composer.y as usize),
-                    composer,
+                // The rows, then what a pick reaches, muted, in the
+                // column of their names.
+                let room = (composer.y as usize).saturating_sub(1);
+                let mut rows = list::lines(&items, list.at(), width, room);
+                let reach = approvals::reach_line(
+                    &self.named(),
+                    self.reach,
+                    width.saturating_sub(list::INDENT),
                 );
-                let (line, cursor) = list.line("permissions for this agent and those it makes");
+                rows.push(Line::from(format!("{}{reach}", " ".repeat(list::INDENT))).dim());
+                over(frame, rows, composer);
+                let (line, cursor) = list.line("permissions");
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
                 let keys = Line::from(hint::spans("  ↑↓ pick · enter choose · esc close"));
@@ -13315,12 +13369,7 @@ impl App {
         }
         if self.input.is_empty() {
             // Named, so a message typed in the wrong pane is caught first.
-            let name = match &self.project {
-                Some(project) => lead_title(project, &self.bot),
-                // A side chat by what it is, not the copy's own id.
-                None if self.options.side.is_some() => "the side chat".to_owned(),
-                None => self.bot.clone(),
-            };
+            let name = self.named();
             // What Enter does, muted, then its keys in the one grammar.
             let said = |words: &str, keys: &str| {
                 let mut spans = vec![Span::raw(format!("{words} · ")).dim()];
@@ -17341,7 +17390,7 @@ mod tests {
         assert_eq!(rows[2], ("• Ran ls".into(), true));
         let line = rows
             .iter()
-            .position(|(row, _)| row.starts_with("─ Worked"))
+            .position(|(row, _)| row.starts_with("Worked for"))
             .unwrap();
         assert_eq!(
             rows[line + 1..],
@@ -17370,7 +17419,7 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(!lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+        assert!(!lines(&app).iter().any(|row| row.starts_with("Worked for")));
         // One that says something ends as any other turn.
         app.daemon(turn_event("accepted", 2, note)).await;
         app.daemon(
@@ -17386,7 +17435,7 @@ mod tests {
         ))
         .await;
         let rows = lines(&app);
-        assert!(rows.iter().any(|row| row.starts_with("─ Worked")));
+        assert!(rows.iter().any(|row| row.starts_with("Worked for")));
         assert_eq!(rows.last().map(String::as_str), Some("• Docs are blocked."));
         // A reply long enough to spill above as it streams still speaks.
         app.pending.clear();
@@ -17407,7 +17456,7 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+        assert!(lines(&app).iter().any(|row| row.starts_with("Worked for")));
         // The person's own turn, with nothing said, still ends with its line.
         app.pending.clear();
         app.daemon(turn_event("accepted", 3, json!({"request_id": "r3"})))
@@ -17418,7 +17467,7 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+        assert!(lines(&app).iter().any(|row| row.starts_with("Worked for")));
     }
 
     #[tokio::test]
@@ -17450,8 +17499,7 @@ mod tests {
             .await;
         app.daemon(turn_event("turn_finished", 2, empty)).await;
         let rows = lines(&app);
-        let line = rows.iter().find(|row| row.starts_with("─ ")).unwrap();
-        assert!(line.starts_with("─ Worked"), "{line}");
+        let line = rows.iter().find(|row| row.starts_with("Worked")).unwrap();
         assert!(!line.contains("empty_completion"));
         // Another failure still says what it was.
         app.pending.clear();
@@ -17488,14 +17536,16 @@ mod tests {
         ))
         .await;
         let rows: Vec<String> = app.pending.iter().map(|line| line.to_string()).collect();
-        let line = rows.iter().find(|row| row.starts_with("─ ")).unwrap();
-        assert!(line.starts_with("─ Worked"), "{line}");
+        let line = rows
+            .iter()
+            .find(|row| row.starts_with("Worked for"))
+            .unwrap();
         assert!(line.contains("ended at its budget"), "{line}");
         // Dim, as any turn that ended well: not the red of a failure.
         let drawn = app
             .pending
             .iter()
-            .find(|l| l.to_string().starts_with("─ "))
+            .find(|l| l.to_string().starts_with("Worked for"))
             .unwrap();
         assert!(
             drawn
@@ -17952,7 +18002,7 @@ mod tests {
             ["", "", "› and the notes?", "", "   🎉 "],
             "{rows:?}"
         );
-        assert!(rows[10].starts_with("─ Worked"), "{rows:?}");
+        assert!(rows[10].starts_with("Worked for"), "{rows:?}");
         assert_eq!(rows[11..], ["", "• Updated."]);
         // Once that message is no longer in the conversation, a reaction
         // to it draws no row of its own.
@@ -18260,6 +18310,42 @@ mod tests {
             (&json!("configure"), &json!("1h"))
         );
         assert!(app.cache.is_none());
+    }
+
+    #[tokio::test]
+    async fn permissions_reads_how_far_a_pick_reaches_beside_the_window() {
+        let client = daemon_serving(json!({}), |request| match request["op"].as_str() {
+            Some("bots") => json!({"bots": [
+                {"name": "b", "bot_id": 1, "running_turn": null},
+                {"name": "b.task", "bot_id": 2, "created_by_id": 1, "running_turn": 3},
+                {"name": "b.helper", "bot_id": 3, "created_by_id": 2, "running_turn": null},
+                {"name": "stranger", "bot_id": 4, "running_turn": 5},
+            ], "next_after": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.input.set("/permissions");
+        app.submit().await;
+        assert!(matches!(&app.choosing, Some((Choice::Permissions, _))));
+        // The list opens at once; the reach follows once the listing is in.
+        assert!(app.reach.is_none());
+        let woken = app.woken.clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while app.reaching.is_some() {
+                app.reached();
+                if app.reaching.is_some() {
+                    woken.notified().await;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.reach, Some(approvals::Reach { made: 2, busy: 1 }));
+        assert_eq!(
+            approvals::reach_line(&app.named(), app.reach, 200),
+            "Reaches b, its 2 agents and any new ones; 1 is busy and switches when its turn ends"
+        );
     }
 
     #[tokio::test]

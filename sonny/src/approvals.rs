@@ -3,7 +3,8 @@
 //! rows pair a sandbox with a reviewer. Four rows are Sonny's own; the
 //! person's `[sonny.permissions.NAME]` rows follow them. Agents the lead
 //! makes keep the row it had when it made them, until the person picks
-//! one: it overrides what every one was made with.
+//! one: it overrides what every one was made with, and the list says how
+//! many that is ([`reach_line`]) before the pick.
 use agent_client::approver::AUTO_UNGATED;
 use agent_client::config::{Permissions, Reviewer};
 use serde_json::{Map, Value, json};
@@ -747,6 +748,8 @@ pub fn gateable(tools: &[String], declared: &Value) -> Vec<String> {
 
 /// The agents `lead` made, and those they made, from a `bots` listing:
 /// by the maker's identity, so a reused name's children are strangers.
+/// Each maker's children are found from one index of the listing, so a
+/// listing of thousands is read once, not once per maker.
 pub fn made_by<'a>(bots: &'a [Value], lead: &str) -> Vec<&'a Value> {
     let Some(lead) = bots
         .iter()
@@ -755,13 +758,19 @@ pub fn made_by<'a>(bots: &'a [Value], lead: &str) -> Vec<&'a Value> {
     else {
         return Vec::new();
     };
+    let mut children: std::collections::HashMap<i64, Vec<&Value>> = Default::default();
+    for bot in bots {
+        if let Some(maker) = bot["created_by_id"].as_i64() {
+            children.entry(maker).or_default().push(bot);
+        }
+    }
     let mut makers = vec![lead];
+    let mut seen = std::collections::HashSet::from([lead]);
     let mut made: Vec<&Value> = Vec::new();
     while let Some(maker) = makers.pop() {
-        for bot in bots.iter().filter(|bot| bot["created_by_id"] == maker) {
+        for &bot in children.get(&maker).into_iter().flatten() {
             if let Some(id) = bot["bot_id"].as_i64()
-                && id != lead
-                && !made.iter().any(|seen| seen["bot_id"] == id)
+                && seen.insert(id)
             {
                 made.push(bot);
                 makers.push(id);
@@ -769,6 +778,58 @@ pub fn made_by<'a>(bots: &'a [Value], lead: &str) -> Vec<&'a Value> {
         }
     }
     made
+}
+
+/// How far a `/permissions` pick on an agent reaches, from a `bots`
+/// listing: the agents it made, and those they made, and how many of
+/// them and it are in a turn, which take the pick when the turn ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Reach {
+    pub made: usize,
+    pub busy: usize,
+}
+
+impl Reach {
+    pub fn of(bots: &[Value], agent: &str) -> Self {
+        let made = made_by(bots, agent);
+        let lead = bots.iter().find(|bot| bot["name"] == agent);
+        let busy = (lead.into_iter().chain(made.iter().copied()))
+            .filter(|bot| !bot["running_turn"].is_null())
+            .count();
+        Self {
+            made: made.len(),
+            busy,
+        }
+    }
+}
+
+/// The line under `/permissions`' rows saying what a pick reaches: the
+/// agent `name`, those it made (and those they made) and any new ones,
+/// since each takes its maker's row; and that one in a turn switches when
+/// the turn ends. `reach` is `None` until the listing is read. At most
+/// `width` wide: the new ones go first, then the words are cut.
+pub fn reach_line(name: &str, reach: Option<Reach>, width: usize) -> String {
+    let made = |new: bool| {
+        let new = if new { " and any new ones" } else { "" };
+        match reach.map(|reach| reach.made) {
+            None => format!("Reaches {name} and its agents"),
+            Some(0) => format!("Reaches {name} and any agent it makes"),
+            Some(1) if new.is_empty() => format!("Reaches {name} and its agent"),
+            Some(1) => format!("Reaches {name}, its agent{new}"),
+            Some(n) if new.is_empty() => format!("Reaches {name} and its {n} agents"),
+            Some(n) => format!("Reaches {name}, its {n} agents{new}"),
+        }
+    };
+    let busy = match reach.map(|reach| reach.busy) {
+        None | Some(0) => "busy ones switch when their turn ends".to_owned(),
+        Some(1) => "1 is busy and switches when its turn ends".to_owned(),
+        Some(n) => format!("{n} are busy and switch when their turns end"),
+    };
+    let whole = format!("{}; {busy}", made(true));
+    if unicode_width::UnicodeWidthStr::width(whole.as_str()) <= width {
+        return whole;
+    }
+    crate::transcript::cut(&format!("{}; {busy}", made(false)), width)
 }
 
 /// The `configure` fields that give a bot `mode`, with the sandbox the
@@ -1340,6 +1401,10 @@ mod tests {
         ];
         let names: Vec<_> = made_by(&bots, "lead").iter().map(|b| &b["name"]).collect();
         assert_eq!(names, [&json!("task"), &json!("helper")]);
+        // A pick on the lead reaches those two; on the task, its helper.
+        assert_eq!(Reach::of(&bots, "lead"), Reach { made: 2, busy: 0 });
+        assert_eq!(Reach::of(&bots, "task"), Reach { made: 1, busy: 0 });
+        assert_eq!(Reach::of(&bots, "gone"), Reach { made: 0, busy: 0 });
         // Each takes the mode unless it has it already; a gate Sonny did
         // not set is replaced too.
         assert_eq!(
@@ -1431,5 +1496,65 @@ mod tests {
         // The next pick looks again.
         assert_ne!(Sandboxes::default().of("auto", workspace, None), first);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pick_says_how_far_it_reaches_and_when_busy_agents_take_it() {
+        let bot = |name: &str, id: i64, by: Option<i64>, running: Option<i64>| json!({"name": name, "bot_id": id, "created_by_id": by, "running_turn": running});
+        let bots = [
+            bot("shop.lead", 1, None, Some(9)),
+            bot("shop.cart", 2, Some(1), Some(4)),
+            bot("shop.tests", 3, Some(2), None),
+            bot("other.lead", 4, None, Some(1)),
+        ];
+        // The lead and one of its agents are in a turn; another lead isn't
+        // counted.
+        let reach = Reach::of(&bots, "shop.lead");
+        assert_eq!(reach, Reach { made: 2, busy: 2 });
+        let line = |reach, width| reach_line("shop lead", reach, width);
+        assert_eq!(
+            line(Some(reach), 200),
+            "Reaches shop lead, its 2 agents and any new ones; \
+             2 are busy and switch when their turns end"
+        );
+        assert_eq!(
+            line(Some(Reach { made: 1, busy: 1 }), 200),
+            "Reaches shop lead, its agent and any new ones; \
+             1 is busy and switches when its turn ends"
+        );
+        assert_eq!(
+            line(Some(Reach::default()), 200),
+            "Reaches shop lead and any agent it makes; \
+             busy ones switch when their turn ends"
+        );
+        // Before the listing is read, the same in general words.
+        assert_eq!(
+            line(None, 200),
+            "Reaches shop lead and its agents; busy ones switch when their turn ends"
+        );
+        // Narrower, the new ones go first, then the words are cut.
+        assert_eq!(
+            line(Some(reach), 80),
+            "Reaches shop lead and its 2 agents; 2 are busy and switch when their turns end"
+        );
+        let cut = line(Some(reach), 40);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(cut.as_str()), 40);
+        assert!(cut.starts_with("Reaches shop lead and its 2 agents") && cut.ends_with('…'));
+    }
+
+    #[test]
+    fn made_by_reads_a_large_listing_once() {
+        // A chain 3000 deep and 3000 strangers: each maker's children come
+        // from one index, so this is quick, and the order is the walk's.
+        let mut bots = vec![json!({"name": "lead", "bot_id": 0})];
+        for id in 1..3000 {
+            bots.push(json!({"name": format!("t{id}"), "bot_id": id, "created_by_id": id - 1}));
+            bots.push(json!({"name": format!("s{id}"), "bot_id": 10_000 + id,
+                "created_by_id": 50_000}));
+        }
+        let made = made_by(&bots, "lead");
+        assert_eq!(made.len(), 2999);
+        assert_eq!(made[0]["name"], "t1");
+        assert_eq!(made[2998]["name"], "t2999");
     }
 }
