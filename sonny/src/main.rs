@@ -3015,6 +3015,9 @@ struct Relayed {
 /// alone, or calls all alike, are drawn as themselves.
 struct Cluster {
     entries: Vec<Gathered>,
+    /// What the gaps that older pages end with held, by page, the oldest
+    /// first: one gap, cut by where a page of history ends, read as one.
+    took: Vec<(u64, Vec<Gathered>)>,
     open: bool,
 }
 
@@ -3024,9 +3027,16 @@ impl Cluster {
         matches!(self.entries.first(), Some(Gathered::Message(m)) if m.kind == transcript::ATTACHED)
     }
 
+    /// Everything it holds, what older pages handed it first.
+    fn all(&self) -> impl Iterator<Item = &Gathered> {
+        (self.took.iter())
+            .flat_map(|(_, entries)| entries)
+            .chain(&self.entries)
+    }
+
     /// The messages between agents it holds.
     fn messages(&self) -> impl Iterator<Item = &Clustered> {
-        self.entries.iter().filter_map(|entry| match entry {
+        self.all().filter_map(|entry| match entry {
             Gathered::Message(message) => Some(message),
             _ => None,
         })
@@ -3034,7 +3044,7 @@ impl Cluster {
 
     /// The plans it holds, by the client's number for each.
     fn plans(&self) -> impl Iterator<Item = u64> + '_ {
-        self.entries.iter().filter_map(|entry| match entry {
+        self.all().filter_map(|entry| match entry {
             Gathered::Plan(at) => Some(*at),
             _ => None,
         })
@@ -3042,6 +3052,7 @@ impl Cluster {
 }
 
 /// One thing a [`Cluster`] gathers.
+#[derive(Clone)]
 enum Gathered {
     /// A message between agents.
     Message(Clustered),
@@ -3057,6 +3068,7 @@ enum Gathered {
 }
 
 /// A message in a [`Cluster`]: its node, what it is, and whom it names.
+#[derive(Clone)]
 struct Clustered {
     node: i64,
     kind: &'static str,
@@ -3946,6 +3958,10 @@ struct App {
     /// else was drawn.
     clusters: BTreeMap<usize, Cluster>,
     clustering: Option<(usize, usize)>,
+    /// The gap each page of history ended with, by page, handed to the
+    /// gap the page after it starts with: taken again when that is drawn
+    /// again.
+    tails: HashMap<u64, Vec<Gathered>>,
     /// The rows drawn by the end of the last quiet row (a fold of calls,
     /// a note's marker, messages between agents), which the next one
     /// goes right under while nothing else was drawn.
@@ -5365,6 +5381,7 @@ impl App {
             folding: None,
             relayed: HashMap::new(),
             clusters: BTreeMap::new(),
+            tails: HashMap::new(),
             clustering: None,
             stacked: None,
             tasks: BTreeMap::new(),
@@ -6169,6 +6186,7 @@ impl App {
         self.folding = None;
         self.relayed.clear();
         self.clusters.clear();
+        self.tails.clear();
         self.clustering = None;
         self.stacked = None;
         self.plans.clear();
@@ -6277,6 +6295,7 @@ impl App {
                     self.page_rows.1 += paged.nodes.len();
                     self.pages.insert(id, paged);
                     self.screen.prepend(id, older);
+                    self.join_page(id);
                     return;
                 }
                 // Only read: what its calls returned is all drawing it gives.
@@ -6307,6 +6326,7 @@ impl App {
         self.pages.insert(id, paged);
         if !self.short_read.get() {
             self.screen.fill(id, older);
+            self.join_page(id);
         }
     }
 
@@ -7297,7 +7317,17 @@ impl App {
             }
         }
         // Those the screen no longer keeps are forgotten.
-        let kept: std::collections::HashSet<u64> = held.iter().copied().collect();
+        let mut kept: std::collections::HashSet<u64> = held.iter().copied().collect();
+        // Those a page handed on stay for the gap that takes them again.
+        kept.extend(
+            self.tails
+                .values()
+                .flatten()
+                .filter_map(|entry| match entry {
+                    Gathered::Plan(at) => Some(*at),
+                    _ => None,
+                }),
+        );
         self.plans.retain(|at, _| kept.contains(at));
         let newest = held.last().copied();
         let steps = newest.and_then(|at| self.plans.get(&at)).cloned();
@@ -7491,6 +7521,7 @@ impl App {
         let at = self.group();
         let cluster = Cluster {
             entries: vec![entry],
+            took: Vec::new(),
             open: false,
         };
         // Words attached to a call hang right under what it carried, as
@@ -7519,15 +7550,36 @@ impl App {
     /// in a newer cluster stays for that one, as `landing` does for the
     /// cluster about to be made for it.
     fn forget(&mut self, cluster: Cluster, landing: Option<i64>) {
+        // What a page handed on stays, for the gap that takes it again.
+        let tails: Vec<&Gathered> = self.tails.values().flatten().collect();
+        let tailed = |node: i64| {
+            (tails.iter()).any(|entry| matches!(entry, Gathered::Message(m) if m.node == node))
+        };
+        let planned =
+            |at: u64| (tails.iter()).any(|entry| matches!(entry, Gathered::Plan(p) if *p == at));
+        let mut gone = Vec::new();
         for message in cluster.messages() {
             let held = Some(message.node) == landing
+                || tailed(message.node)
                 || (self.clusters.values())
                     .any(|kept| kept.messages().any(|m| m.node == message.node));
             if !held {
-                self.relayed.remove(&message.node);
+                gone.push(message.node);
             }
         }
-        for plan in cluster.plans() {
+        let plans: Vec<u64> = (cluster.plans())
+            .filter(|at| {
+                !planned(*at)
+                    && !self
+                        .clusters
+                        .values()
+                        .any(|kept| kept.plans().any(|p| p == *at))
+            })
+            .collect();
+        for node in gone {
+            self.relayed.remove(&node);
+        }
+        for plan in plans {
             self.plans.remove(&plan);
         }
     }
@@ -7577,7 +7629,8 @@ impl App {
         };
         let width = self.prose();
         let fold = || screen::Mark::Link(format!("{}fold/{at}", screen::BUTTON));
-        match cluster.entries.as_slice() {
+        let entries: Vec<&Gathered> = cluster.all().collect();
+        match entries.as_slice() {
             [Gathered::Message(message)] => {
                 let lines = self.relayed_lines(message.node, width);
                 return (lines, vec![(0, said_button(message.node))]);
@@ -7589,15 +7642,15 @@ impl App {
         let mut whats = Vec::new();
         let mut calls = Vec::new();
         let mut did = Vec::new();
-        for entry in &cluster.entries {
+        for entry in &entries {
             if let Gathered::Call { verb, what, lines } = entry {
                 whats.push(what.clone());
                 calls.push(lines.clone());
                 did.push((verb.clone(), what.clone()));
             }
         }
-        let alike = calls.len() == cluster.entries.len()
-            && did.windows(2).all(|pair| pair[0].0 == pair[1].0);
+        let alike =
+            calls.len() == entries.len() && did.windows(2).all(|pair| pair[0].0 == pair[1].0);
         if let (true, Some((verb, _))) = (alike, did.first()) {
             let lines = transcript::quiet(transcript::folded(
                 verb,
@@ -7613,8 +7666,12 @@ impl App {
             return (lines, marks);
         }
         let kinds: Vec<&str> = cluster.messages().map(|m| m.kind).collect();
+        // Each name once, as the row says it: a long gap has few.
+        let mut seen = std::collections::HashSet::new();
         let names: Vec<String> = (cluster.messages())
-            .flat_map(|m| m.names.iter().cloned())
+            .flat_map(|m| m.names.iter())
+            .filter(|name| seen.insert(name.as_str()))
+            .cloned()
             .collect();
         let plan = (cluster.plans().last())
             .and_then(|at| self.plans.get(&at))
@@ -7637,7 +7694,7 @@ impl App {
         };
         let mut marks = vec![(0, fold())];
         let inner = width.saturating_sub(2);
-        for entry in &cluster.entries {
+        for entry in entries {
             let rows = match entry {
                 // Shut, the newest plan still shows in full where the
                 // margin cannot show it.
@@ -7709,6 +7766,102 @@ impl App {
         let (lines, marks) = self.cluster_lines(at);
         self.flush();
         (self.screen).replace_tagged(screen::Tag::Group(at as u64), lines, marks)
+    }
+
+    /// One gap, cut by where a page of history ends, read as one row: the
+    /// page `id`, just drawn, takes into the gap it starts with those the
+    /// pages over it end with, and hands the gap it ends with to the one
+    /// the page after it starts with. What a page hands on is kept, for
+    /// that page drawn again to take it again, while it stays drawn.
+    fn join_page(&mut self, id: u64) {
+        // A page let go keeps nothing aside: the gap that took what it
+        // handed on holds it, and the page drawn again hands it on again.
+        let screen = &self.screen;
+        self.tails.retain(|page, _| screen.drawn(*page));
+        // Drawn again, its own rows hold its gap until handed on again.
+        self.tails.remove(&id);
+        self.put(None, id, Vec::new());
+        if let Some(row) = self.screen.first_in(id)
+            && let Some(at) = self.gap_at(row)
+        {
+            let mut took = false;
+            for (page, drawn) in self.screen.pages_over(id) {
+                if !drawn {
+                    break;
+                }
+                if let Some(tail) = self.tails.get(&page).cloned() {
+                    self.put(Some(at), page, tail);
+                    took = true;
+                } else if let Some(last) = self.screen.last_in(page)
+                    && let Some(giver) = self.gap_at(last)
+                    && giver != at
+                {
+                    self.hand(page, giver, at);
+                    took = true;
+                }
+                // A page with words left ends what joins.
+                if self.screen.last_in(page).is_some() {
+                    break;
+                }
+            }
+            if took {
+                self.draw_cluster(at);
+            }
+        }
+        if let Some(row) = self.screen.last_in(id)
+            && let Some(at) = self.gap_at(row)
+            && let Some(next) = self.screen.first_after(id)
+            && let Some(to) = self.gap_at(next)
+            && to != at
+        {
+            self.hand(id, at, to);
+            self.draw_cluster(to);
+        }
+    }
+
+    /// The gap the row `row` is of, if it is one: words attached to a call
+    /// join nothing.
+    fn gap_at(&self, row: usize) -> Option<usize> {
+        let Some(screen::Tag::Group(at)) = self.screen.tag_at(row) else {
+            return None;
+        };
+        let at = at as usize;
+        (self.clusters.get(&at)).and_then(|cluster| (!cluster.attached()).then_some(at))
+    }
+
+    /// The gap `giver` the page `page` ends with handed to the gap `to`:
+    /// its rows taken out, what it held, and what it took, put in `to`.
+    fn hand(&mut self, page: u64, giver: usize, to: usize) {
+        let Some(cluster) = self.clusters.remove(&giver) else {
+            return;
+        };
+        self.screen.cut_tagged(screen::Tag::Group(giver as u64));
+        for (older, entries) in cluster.took {
+            self.put(Some(to), older, entries);
+        }
+        self.tails.insert(page, cluster.entries.clone());
+        self.put(Some(to), page, cluster.entries);
+    }
+
+    /// What the page `page` handed on put in the gap `at`, and in no other
+    /// (none: in none), those it leaves drawn again.
+    fn put(&mut self, at: Option<usize>, page: u64, entries: Vec<Gathered>) {
+        let mut left = Vec::new();
+        for (held, cluster) in self.clusters.iter_mut() {
+            let had = cluster.took.len();
+            cluster.took.retain(|(p, _)| *p != page);
+            if cluster.took.len() != had && Some(*held) != at {
+                left.push(*held);
+            }
+        }
+        if let Some(cluster) = at.and_then(|at| self.clusters.get_mut(&at)) {
+            cluster.took.push((page, entries));
+            // The older the page, the bigger its number: the oldest first.
+            cluster.took.sort_by_key(|(p, _)| std::cmp::Reverse(*p));
+        }
+        for held in left {
+            self.draw_cluster(held);
+        }
     }
 
     /// The cluster the message between agents at `node` is in: the one
@@ -19895,6 +20048,7 @@ mod tests {
                 kind: "task update",
                 names: Vec::new(),
             })],
+            took: Vec::new(),
             open: false,
         };
         app.clusters.insert(1, stale);
@@ -23267,6 +23421,120 @@ mod tests {
         );
         assert!(
             rows.iter().any(|r| r.starts_with("• Saved to memory flow")),
+            "{rows:?}"
+        );
+    }
+
+    /// A page of older items drawn by `draw` on a screen of its own, as
+    /// `draw_page` does, the newer rows put by meanwhile.
+    fn older_page(app: &mut App, draw: impl FnOnce(&mut App)) -> screen::Screen {
+        app.flush();
+        app.newer = Some(std::mem::take(&mut app.screen));
+        let any_history = std::mem::replace(&mut app.any_history, false);
+        let clustering = app.clustering.take();
+        let rows_drawn = app.rows_drawn;
+        draw(app);
+        app.pending.push(Line::default());
+        app.flush();
+        app.any_history = any_history;
+        app.clustering = clustering;
+        app.rows_drawn = rows_drawn;
+        std::mem::replace(&mut app.screen, app.newer.take().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_gap_cut_where_a_page_of_history_ends_is_one_row() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.width = 120;
+        let news = |task: &str| {
+            format!(
+                "Task updates: what happened in your tasks since you last heard.\n\
+                - {task}: turn:{task}/1 completed"
+            )
+        };
+        let land = |app: &mut App, node: i64, task: &str| {
+            app.land(node, (&news(task), ""), (None, false, false), false);
+        };
+        let texts = |app: &App| -> Vec<String> {
+            (app.screen.texts().iter())
+                .map(|t| t.trim_end().to_owned())
+                .collect()
+        };
+        // The newest page starts in the gap the older ones end with.
+        land(&mut app, 30, "calc.neg");
+        app.commit(vec![Line::from("• All done.")]);
+        app.flush();
+        // A page that is all gap, then one with words over it.
+        let middle = |app: &mut App| land(app, 20, "calc.div");
+        let older = older_page(&mut app, middle);
+        app.screen.prepend(1, older);
+        app.join_page(1);
+        assert_eq!(
+            texts(&app),
+            ["↳ 2 task updates · calc.div, calc.neg ▸", "", "• All done."]
+        );
+        let oldest = |app: &mut App| {
+            app.commit(vec![Line::from("› check the tasks")]);
+            land(app, 10, "calc.add");
+        };
+        let older = older_page(&mut app, oldest);
+        app.screen.prepend(2, older);
+        app.join_page(2);
+        let one = [
+            "› check the tasks",
+            "",
+            "↳ 3 task updates · calc.add, calc.div, calc.neg ▸",
+            "",
+            "• All done.",
+        ];
+        assert_eq!(texts(&app), one);
+        // The page between let go and drawn again: still one row.
+        app.screen.let_page_go(1);
+        let older = older_page(&mut app, middle);
+        app.screen.fill(1, older);
+        app.join_page(1);
+        assert_eq!(texts(&app), one);
+        // Open, each in the order it came.
+        let at = app.clusters.keys().next_back().copied().unwrap();
+        app.follow(&format!("sonny:fold/{at}"));
+        let button = app.pressed.pop().unwrap();
+        app.press(&button).await;
+        let rows = texts(&app);
+        let named: Vec<&String> = rows.iter().filter(|r| r.starts_with("  ↳")).collect();
+        assert_eq!(
+            named,
+            [
+                "  ↳ Task updates · calc.add completed ▸",
+                "  ↳ Task updates · calc.div completed ▸",
+                "  ↳ Task updates · calc.neg completed ▸",
+            ],
+            "{rows:?}"
+        );
+        // A page let go keeps nothing aside; the gap that took from it
+        // still holds it, and the page drawn again hands it on again.
+        app.screen.let_page_go(2);
+        let earlier = |app: &mut App| app.commit(vec![Line::from("› earlier")]);
+        let older = older_page(&mut app, earlier);
+        app.screen.prepend(3, older);
+        app.join_page(3);
+        let aside = |app: &App| {
+            let mut pages: Vec<u64> = app.tails.keys().copied().collect();
+            pages.sort();
+            pages
+        };
+        let took =
+            |app: &App| -> Vec<u64> { app.clusters[&at].took.iter().map(|(p, _)| *p).collect() };
+        assert_eq!(aside(&app), [1]);
+        assert_eq!(took(&app), [2, 1]);
+        let older = older_page(&mut app, oldest);
+        app.screen.fill(2, older);
+        app.join_page(2);
+        assert_eq!(aside(&app), [1, 2]);
+        assert_eq!(took(&app), [2, 1]);
+        let rows = texts(&app);
+        let once = |row: &str| rows.iter().filter(|r| r.as_str() == row).count() == 1;
+        assert!(
+            once("› check the tasks") && once("  ↳ Task updates · calc.add completed ▸"),
             "{rows:?}"
         );
     }

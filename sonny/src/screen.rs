@@ -450,6 +450,136 @@ impl Screen {
         true
     }
 
+    /// The tag on the row `row`, if any.
+    pub fn tag_at(&self, row: usize) -> Option<Tag> {
+        self.rows.get(row).and_then(|row| row.tag)
+    }
+
+    /// The rows the page `id` is, among all of them, and whether they are
+    /// drawn.
+    fn page_span(&self, id: u64) -> Option<(std::ops::Range<usize>, bool)> {
+        let mut start = 0;
+        for page in &self.pages {
+            if page.id == id {
+                return Some((start..start + page.rows, page.drawn));
+            }
+            start += page.rows;
+        }
+        None
+    }
+
+    /// Whether the row `row` has words on it.
+    fn worded(&self, row: usize) -> bool {
+        (self.rows[row].line.spans.iter()).any(|span| !span.content.trim().is_empty())
+    }
+
+    /// Whether the page `id` is drawn.
+    pub fn drawn(&self, id: u64) -> bool {
+        self.page_span(id).is_some_and(|(_, drawn)| drawn)
+    }
+
+    /// The first row with words of the page `id`, when it is drawn.
+    pub fn first_in(&self, id: u64) -> Option<usize> {
+        let (span, drawn) = self.page_span(id)?;
+        span.clone().find(|row| drawn && self.worded(*row))
+    }
+
+    /// The last row with words of the page `id`, when it is drawn.
+    pub fn last_in(&self, id: u64) -> Option<usize> {
+        let (span, drawn) = self.page_span(id)?;
+        span.rev().find(|row| drawn && self.worded(*row))
+    }
+
+    /// The first row with words after the page `id`: in the pages after
+    /// it, or among the newest rows. None when a page on the way there is
+    /// not drawn, as what it holds is not known.
+    pub fn first_after(&self, id: u64) -> Option<usize> {
+        let at = self.pages.iter().position(|page| page.id == id)?;
+        let mut start: usize = self.pages[..=at].iter().map(|page| page.rows).sum();
+        for page in &self.pages[at + 1..] {
+            if !page.drawn {
+                return None;
+            }
+            if let Some(row) = (start..start + page.rows).find(|row| self.worded(*row)) {
+                return Some(row);
+            }
+            start += page.rows;
+        }
+        (start..self.rows.len()).find(|row| self.worded(*row))
+    }
+
+    /// The pages over the page `id`, the nearest first, by their ids and
+    /// whether each is drawn.
+    pub fn pages_over(&self, id: u64) -> Vec<(u64, bool)> {
+        let at = self
+            .pages
+            .iter()
+            .position(|page| page.id == id)
+            .unwrap_or(0);
+        (self.pages[..at].iter().rev())
+            .map(|page| (page.id, page.drawn))
+            .collect()
+    }
+
+    /// The rows tagged `tag` taken out of the page they are in, with the
+    /// blank rows right over them; a page left with no words keeps no
+    /// rows at all. Whether there were any.
+    pub fn cut_tagged(&mut self, tag: Tag) -> bool {
+        let Some(first) = self.rows.iter().position(|row| row.tag == Some(tag)) else {
+            return false;
+        };
+        let end = (self.rows[first..].iter())
+            .position(|row| row.tag != Some(tag))
+            .map_or(self.rows.len(), |n| first + n);
+        let mut start = first;
+        let page = self.page_of(first);
+        while start > page.start && !self.worded(start - 1) && self.rows[start - 1].tag.is_none() {
+            start -= 1;
+        }
+        let (mut from, mut to) = (start, end);
+        // Nothing left with words: the page is no rows.
+        if (page.start..start)
+            .chain(end..page.end)
+            .all(|row| !self.worded(row))
+            && page.end > page.start
+        {
+            (from, to) = (page.start, page.end);
+        }
+        let shown = self.shown_at(from);
+        self.grow_page(from, -((to - from) as isize));
+        self.rows.drain(from..to);
+        self.relay(from, shown);
+        true
+    }
+
+    /// The page `id` let go, as when the view is far from it: one blank
+    /// row standing in for it.
+    #[cfg(test)]
+    pub fn let_page_go(&mut self, id: u64) {
+        let Some((span, _)) = self.page_span(id) else {
+            return;
+        };
+        let at = self.pages.iter().position(|page| page.id == id).unwrap();
+        let shown = self.shown_at(span.start);
+        self.rows.splice(span.clone(), [Row::new(Line::default())]);
+        self.pages[at].rows = 1;
+        self.pages[at].drawn = false;
+        self.placed = None;
+        self.relay(span.start, shown);
+    }
+
+    /// The rows of the page the row `row` is in, or the newest rows'.
+    fn page_of(&self, row: usize) -> std::ops::Range<usize> {
+        let mut start = 0;
+        for page in &self.pages {
+            if row < start + page.rows {
+                return start..start + page.rows;
+            }
+            start += page.rows;
+        }
+        start..self.rows.len()
+    }
+
     /// The tags the lines kept carry, oldest first: what is still there
     /// of what was tagged.
     pub fn tags(&self) -> impl Iterator<Item = Tag> + '_ {

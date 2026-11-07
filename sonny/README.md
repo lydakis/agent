@@ -1341,7 +1341,7 @@ calc.neg, saved a memory, plan 1/3 ▸`). It grows in place as the agent
 works, and a click opens it to each one's own row in the order they came,
 a click on one of those opening it in turn. A coordinating agent can work
 for an hour saying nothing; its chat stays the things said, with one row
-between each, and a margin note it puts up stands under that row without
+between each, however much older history loads in pages around it, and a margin note it puts up stands under that row without
 splitting it. Steps of one kind alone keep their own row (`• Steered
 calc.add, calc.neg and calc.div ▸`), and `/verbose` draws each call as
 ever. Quiet rows
