@@ -95,7 +95,7 @@ turns its own lookout's notes start. Two kinds of event count:
 | Event | When |
 | --- | --- |
 | A message | someone other than the lead writes in a task: the person, a program, another task |
-| A turn's end | a task's turn ends, unless the lead is waiting on it |
+| A turn's end | a task's turn ends, unless the lead is waiting on it or read it with a wait that returned; a wait that failed or was stopped leaves it news |
 
 Both are task updates (below). A note goes once the lead rests, except
 when the person writes in a task while the lead is in the middle of a

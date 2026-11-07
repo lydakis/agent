@@ -363,6 +363,8 @@ pub struct Updates {
     /// note the lead had not heard: a filter on who asked hears them as
     /// they are.
     unheard: HashMap<Key, (Turn, bool)>,
+    /// The lead's waits still running, by call, and what each read.
+    waits: HashMap<String, Read>,
     /// The turn that last ended and who asked for it, as its end names
     /// them: none when that is still to be read.
     ended: Option<(Key, Option<String>)>,
@@ -376,6 +378,15 @@ struct Forward {
     from: Option<String>,
     origin: Option<String>,
     reply: Option<String>,
+}
+
+/// What a wait of the lead's took from the news as it started: put back if
+/// the wait ends without handing those turns over, failed or cancelled.
+#[derive(Default)]
+struct Read {
+    news: Vec<(String, News)>,
+    unheard: Vec<(Key, (Turn, bool))>,
+    forwarding: Vec<(Key, Forward)>,
 }
 
 /// A reply cut to `REPLY_CHARS`, and further while it reads past
@@ -488,6 +499,7 @@ impl Updates {
             replying: HashSet::new(),
             runs: HashMap::new(),
             unheard: HashMap::new(),
+            waits: HashMap::new(),
         }
     }
 
@@ -752,6 +764,12 @@ impl Updates {
             }
             "turn_finished" => {
                 let Some(turn) = turn else { return };
+                // A wait still open as the lead's turn ends handed nothing.
+                if name == self.lead {
+                    for (_, read) in std::mem::take(&mut self.waits) {
+                        self.unread(read);
+                    }
+                }
                 self.approvals.remove(&key(turn));
                 let status = data["status"].as_str().unwrap_or("?").to_owned();
                 let from = self.from.remove(&key(turn));
@@ -1390,32 +1408,80 @@ impl Updates {
         }
     }
 
-    /// The lead read these turns with its wait tool: what they said is no
-    /// news to it any more.
-    pub fn read(&mut self, handles: &HashSet<String>) {
+    /// The lead's wait `call` started on these turns: what they said is no
+    /// news to it any more, once the wait hands them over (`wait_ended`).
+    pub fn read(&mut self, call: &str, handles: &HashSet<String>) {
+        let reads = |name: &str, turn: i64| handles.contains(&format!("turn:{name}/{turn}"));
+        let mut read = self.waits.remove(call).unwrap_or_default();
         for (name, news) in &mut self.tasks {
-            for kind in [&mut news.act, &mut news.theirs] {
+            let mut took = News::default();
+            for (kind, into) in [
+                (&mut news.act, &mut took.act),
+                (&mut news.theirs, &mut took.theirs),
+            ] {
                 // How a goal ended is no part of what the wait read.
                 if kind.as_ref().is_some_and(|t| {
                     t.status != APPROVAL
                         && t.status != QUIET
                         && t.goal.is_none()
-                        && handles.contains(&format!("turn:{name}/{}", t.turn))
+                        && reads(name, t.turn)
                 }) {
-                    *kind = None;
+                    *into = kind.take();
                 }
+            }
+            if took != News::default() {
+                read.news.push((name.clone(), took));
             }
         }
         self.tasks.retain(|(_, news)| !news.empty());
         // As is one whose asker is still to be read.
-        self.unheard.retain(|(name, turn), (t, _)| {
-            t.goal.is_some() || !handles.contains(&format!("turn:{name}/{turn}"))
-        });
+        read.unheard.extend(
+            self.unheard
+                .extract_if(|(name, turn), (t, _)| t.goal.is_none() && reads(name, *turn)),
+        );
         // A turn its goal's check holds stays: the wait read how it ended,
         // not how its goal did.
-        self.forwarding.retain(|key, _| {
-            self.goaled.contains(key) || !handles.contains(&format!("turn:{}/{}", key.0, key.1))
-        });
+        let goaled = &self.goaled;
+        read.forwarding.extend(
+            self.forwarding
+                .extract_if(|key, _| !goaled.contains(key) && reads(&key.0, key.1)),
+        );
+        self.waits.insert(call.to_owned(), read);
+    }
+
+    /// The lead's wait `call` ended, and `handed` says whether its result
+    /// holds the turns it read: a failed or cancelled one held none, so
+    /// what it took is news again.
+    pub fn wait_ended(&mut self, call: &str, handed: bool) {
+        if let Some(read) = self.waits.remove(call)
+            && !handed
+        {
+            self.unread(read);
+        }
+    }
+
+    /// What `read` took, put back, less the news of tasks gone since.
+    fn unread(&mut self, read: Read) {
+        for (name, news) in read.news {
+            if self.task(&name) {
+                self.news_of(&name).merge(news);
+            }
+        }
+        for (key, held) in read.unheard {
+            if self.task(&key.0) {
+                self.unheard.entry(key).or_insert(held);
+            }
+        }
+        for (key, forward) in read.forwarding {
+            if self.task(&key.0) {
+                self.forwarding.entry(key).or_insert(forward);
+            }
+        }
+    }
+
+    /// Whether a wait of the lead's still runs on news it took.
+    pub fn waiting(&self) -> bool {
+        !self.waits.is_empty()
     }
 
     /// Whether ended turns wait to be told, on a trigger or a goal's check.
@@ -1698,6 +1764,7 @@ impl Updates {
     /// The lead was deleted, or another took its name: what was news for
     /// it is no one's.
     pub fn forget(&mut self) {
+        self.waits.clear();
         self.tasks.clear();
         self.runs.clear();
         self.unheard.clear();
@@ -1744,6 +1811,11 @@ impl Updates {
     }
 
     fn drop_news(&mut self, name: &str) {
+        for read in self.waits.values_mut() {
+            read.news.retain(|(task, _)| task != name);
+            read.unheard.retain(|((task, _), _)| task != name);
+            read.forwarding.retain(|((task, _), _)| task != name);
+        }
         self.tasks.retain(|(task, _)| task != name);
         self.runs.retain(|(task, _), _| task != name);
         self.unheard.retain(|(task, _), _| task != name);
@@ -2484,7 +2556,7 @@ mod tests {
         // ended is still news.
         updates.goal_turn("shop.fix", 9);
         turn(&mut updates, "shop.fix", 9, goal.clone(), "completed");
-        updates.read(&["turn:shop.fix/9".to_owned()].into());
+        updates.read("w", &["turn:shop.fix/9".to_owned()].into());
         updates.goal_settled("shop.fix", 9, Some(", and met its goal: its check exits 0"));
         let told = updates.take();
         assert!(text(&told).contains("turn:shop.fix/9 completed, asked by goal, and met its goal"));
@@ -2497,7 +2569,7 @@ mod tests {
             10,
             Some(", and met its goal: its check exits 0"),
         );
-        updates.read(&["turn:shop.fix/10".to_owned()].into());
+        updates.read("w", &["turn:shop.fix/10".to_owned()].into());
         let told = updates.take();
         assert!(
             text(&told).contains("turn:shop.fix/10 completed, asked by goal, and met its goal")
@@ -2968,7 +3040,7 @@ mod tests {
         // A wait that returned before the turn ended read no silence.
         updates.event(&ev("shop.fix", Some(3), "text_delta", json!({})), later);
         updates.expire(later + QUIET_AFTER);
-        updates.read(&["turn:shop.fix/3".to_owned()].into());
+        updates.read("w", &["turn:shop.fix/3".to_owned()].into());
         let told = updates.take();
         assert_eq!(told.items.len(), 1);
         // Printing again starts a new silence, which is news of its own.
@@ -3035,9 +3107,9 @@ mod tests {
             "completed",
         );
         // Reading an earlier turn leaves the latest news.
-        updates.read(&["turn:shop.fix/4".to_owned()].into());
+        updates.read("w", &["turn:shop.fix/4".to_owned()].into());
         assert!(updates.due());
-        updates.read(&["turn:shop.fix/5".to_owned()].into());
+        updates.read("w", &["turn:shop.fix/5".to_owned()].into());
         assert!(!updates.due());
     }
 
