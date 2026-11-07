@@ -61,7 +61,7 @@ fn names_a_time(line: &str) -> bool {
 }
 
 /// `epoch` in local time, its weekday and its offset from UTC.
-fn when(epoch: i64) -> String {
+pub fn when(epoch: i64) -> String {
     // SAFETY: localtime_r fills the zeroed struct it is given and nothing else.
     let tm = unsafe {
         let mut tm: libc::tm = std::mem::zeroed();

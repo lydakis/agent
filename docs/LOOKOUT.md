@@ -215,7 +215,21 @@ its name. A line over 64 KiB is skipped, and an event's text is cut at
 run that fails, and a source started or stopped go to `STORE.lookout.log`.
 The lookout reads the settings again every 15 seconds: a source added or
 changed starts, one removed stops, and a lookout that stops stops its
-sources' commands.
+sources' commands. So does a source whose command's files changed since it
+started, as a service manager restarts a unit on its new binary: every
+word of the command that is a path to a file (`~` and `$HOME` read as the
+home folder), and its first word as `PATH` finds it. An edited script, or
+a program upgraded in place, runs on its new code within 15 seconds, a
+stream that never exits included; the log says `source_stopped` with why.
+
+A source whose last 3 runs failed (exited other than 0, or did not start)
+is down: every subscription to it, whatever its topic or filter, hears so
+from the lookout itself, with why the last run failed and its last 5
+lines of stderr, and again each day it stays down; once a run works, they
+hear it works again. Its line in the note reads `- slack, said by the
+lookout (for your eng): "The source slack is down: …"`, and like any
+event from the source it waits for the source's digest. A source no
+longer needs code of its own to say that its reads fail.
 
 Agents never set a source up; they subscribe to one by name, or to one
 of its topics as `NAME:TOPIC`:
@@ -329,10 +343,13 @@ events one of the caller's subscriptions hears, by source, topic and
 filter (a filter is not trusted with an event that was cut), so no agent
 reads a post from a thread or filter it does not follow; when any example
 shows, `examples` says they come from outside, as a note from sources
-does:
+does. A source whose events name topics lists under `topics` the ones its
+last 200 events named, newest first, at most 32: what a subscription may
+name after the colon, shown to every caller, since a topic is a name to
+subscribe to, not a post:
 
 ```
-{"name": "cr", "events": 41, "fields": {"author": "string, as \"ana\"", "paths": "list of strings, as [\"src/billing/tax.rs\"]", "text": "string, as \"CR-12: tidy…\""}}
+{"name": "cr", "events": 41, "fields": {"author": "string, as \"ana\"", "paths": "list of strings, as [\"src/billing/tax.rs\"]", "text": "string, as \"CR-12: tidy…\"", "topic": "string"}, "topics": ["billing", "search"]}
 ```
 
 A filter naming a field no recent event of its sources had is added, and

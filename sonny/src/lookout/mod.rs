@@ -5456,9 +5456,32 @@ mod tests {
             digest: None,
             fields: std::sync::Arc::new(json!({"text": text})),
             told: Vec::new(),
+            lookout: false,
             at_ms: 1,
             seq: 0,
         }
+    }
+
+    #[test]
+    fn the_lookout_s_word_on_a_source_reaches_every_subscription_to_it() {
+        let source = agent_client::config::Source {
+            name: "slack".into(),
+            command: "true".into(),
+            every: None,
+            digest: None,
+            steer: None,
+        };
+        let down = sources::Event::of_lookout(&source, "down", "down".into(), json!({}));
+        // A topic of it, and a filter the notice never matches, hear it.
+        let mut topical = hears("eng");
+        topical.sources = vec!["slack:eng".into()];
+        topical.filter = Some(json!({"from": ["boss"]}));
+        assert!(topical.hears(&down));
+        assert!(!topical.hears(&slack("lunch?", false)));
+        // Another source's subscription does not.
+        let mut other = hears("ci");
+        other.sources = vec!["ci".into()];
+        assert!(!other.hears(&down));
     }
 
     fn hears(name: &str) -> subs::Sub {

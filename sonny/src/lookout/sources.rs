@@ -12,8 +12,10 @@
 //! pattern on the event's fields, leaves it out; the person's command says
 //! what steers. A source's `digest` says how often at most a subscriber
 //! hears it, as Slack batches email. The lookout keeps each source's shape,
-//! the fields its events lately had, so an agent knows what it may filter
-//! on.
+//! the fields its events lately had and the topics it named, so an agent
+//! knows what it may filter on and subscribe to. A source whose command
+//! file changes starts again on the new one, and one that fails runs in a
+//! row is told to its subscribers by the lookout, as is its recovery.
 //!
 //! Sonny makes one source of its own: the commons, whose events are new
 //! posts, a thread's name their topic.
@@ -59,6 +61,14 @@ const SAMPLE_BYTES: usize = 8 * 1024;
 const SHAPE_EVENTS: u64 = 200;
 /// How often, at most, a shape whose fields did not change is written.
 const SHAPE_EVERY: Duration = Duration::from_secs(60);
+/// At most this many topics a shape keeps, the most recent.
+const SHAPE_TOPICS: usize = 32;
+/// Runs in a row a source fails before its subscribers hear it is down.
+const DOWN_AFTER: u32 = 3;
+/// How often at most they hear again that it is still down.
+const DOWN_AGAIN: Duration = Duration::from_secs(24 * 60 * 60);
+/// The last lines of a failed run's stderr the down notice quotes.
+const DOWN_STDERR: usize = 5;
 /// The fields every event has, which the note says on its own.
 const OWN: [&str; 7] = ["text", "id", "topic", "from", "url", "steer", "told"];
 /// How the note to the subscriber starts, which Sonny shows folded.
@@ -162,6 +172,10 @@ pub struct Event {
     /// Subscribers the source says were told it another way, who do not
     /// hear it again: the commons' invite holders, woken with the reply.
     pub told: Vec<String>,
+    /// The lookout's own word about the source, never something it
+    /// printed: that it is down or works again. Every subscription to the
+    /// source hears it, whatever its topic or filter.
+    pub lookout: bool,
     /// When the lookout read it, and its place among what this lookout
     /// read: together they key its note.
     pub at_ms: u128,
@@ -175,7 +189,6 @@ impl Event {
         if line.is_empty() {
             return None;
         }
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let event = |text: &str,
                      id,
                      topic: Option<String>,
@@ -194,8 +207,9 @@ impl Event {
             digest: None,
             fields: Arc::new(fields),
             told: Vec::new(),
+            lookout: false,
             at_ms,
-            seq: SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            seq: next_seq(),
         };
         let object = (line.starts_with('{'))
             .then(|| serde_json::from_str::<Value>(line).ok())
@@ -233,6 +247,32 @@ impl Event {
         Some(parsed)
     }
 
+    /// The lookout's word about `source`: `kind` (`down` or `back`),
+    /// `text`, and the facts in `facts` beside it.
+    pub fn of_lookout(source: &Source, kind: &str, text: String, facts: Value) -> Event {
+        let at_ms = super::epoch_ms();
+        let mut fields = json!({"text": text});
+        for (key, value) in facts.as_object().into_iter().flatten() {
+            fields[key] = value.clone();
+        }
+        Event {
+            source: source.name.clone(),
+            id: Some(format!("lookout.{kind}.{at_ms}")),
+            topic: None,
+            text,
+            from: None,
+            url: None,
+            steer: false,
+            steer_by: None,
+            digest: digest(source),
+            fields: Arc::new(fields),
+            told: Vec::new(),
+            lookout: true,
+            at_ms,
+            seq: next_seq(),
+        }
+    }
+
     /// The fields it printed beyond its own, as compact JSON, cut: none
     /// when it printed no others.
     pub fn others(&self) -> Option<String> {
@@ -252,6 +292,9 @@ impl Event {
             "told": self.told, "fields": *self.fields});
         if let Some(by) = &self.steer_by {
             kept["steer_by"] = json!(by);
+        }
+        if self.lookout {
+            kept["lookout"] = json!(true);
         }
         kept
     }
@@ -277,8 +320,15 @@ impl Event {
             told: (value["told"].as_array().into_iter().flatten())
                 .filter_map(|bot| bot.as_str().map(str::to_owned))
                 .collect(),
+            lookout: value["lookout"] == true,
         })
     }
+}
+
+/// Each event's place among what this lookout read.
+fn next_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn cut(text: &str, max: usize) -> String {
@@ -319,7 +369,8 @@ pub struct Runner {
     /// Where each source keeps what it needs between runs, as a cursor.
     dir: PathBuf,
     sent: Sender<Said>,
-    running: HashMap<String, (Source, tokio::task::JoinHandle<()>)>,
+    /// Each source running, with its command files as last seen.
+    running: HashMap<String, (Source, Stamp, tokio::task::JoinHandle<()>)>,
     /// Why the settings did not read, last time.
     unreadable: Option<String>,
     /// Tells Sonny's own sources to look now.
@@ -361,16 +412,23 @@ impl Runner {
         }
     }
 
-    /// Run these sources: one new or changed starts, one gone stops.
+    /// Run these sources: one new or changed starts, one gone stops, and
+    /// one whose command files changed since it started starts again on
+    /// them, as a service manager restarts a unit on its new binary.
     pub fn set(&mut self, sources: Vec<Source>) {
         let wanted: HashSet<&str> = sources.iter().map(|s| s.name.as_str()).collect();
-        self.running.retain(|name, (had, task)| {
+        self.running.retain(|name, (had, stamp, task)| {
             let keep = sources.contains(had) && wanted.contains(name.as_str());
-            if !keep {
+            let changed = keep && stamp.changed();
+            if !keep || changed {
                 task.abort();
-                println!("{}", json!({"event": "source_stopped", "source": name}));
+                let why = if changed { "its command changed" } else { "" };
+                println!(
+                    "{}",
+                    json!({"event": "source_stopped", "source": name, "why": why})
+                );
             }
-            keep
+            keep && !changed
         });
         for source in sources {
             if self.running.contains_key(&source.name) {
@@ -398,6 +456,7 @@ impl Runner {
             let dir = self.dir.join(&source.name);
             let sent = self.sent.clone();
             let shape = shape_file(&self.dir, &source.name);
+            let stamp = Stamp::of(&source.command);
             let task = match source.command.is_empty() {
                 true => tokio::spawn(own(
                     source.clone(),
@@ -413,17 +472,137 @@ impl Runner {
                 "{}",
                 json!({"event": "source_started", "source": source.name})
             );
-            self.running.insert(source.name.clone(), (source, task));
+            self.running
+                .insert(source.name.clone(), (source, stamp, task));
         }
     }
 }
 
 impl Drop for Runner {
     fn drop(&mut self) {
-        for (_, task) in self.running.values() {
+        for (.., task) in self.running.values() {
             task.abort();
         }
     }
+}
+
+/// The files a source's command names, each with when it last changed:
+/// every word that is a path to a file, `~` and `$HOME` read as the home
+/// folder, and the first word as `PATH` finds it, so an edited script or
+/// a program upgraded in place starts again.
+#[derive(Debug, Default, PartialEq)]
+struct Stamp(Vec<(PathBuf, Option<std::time::SystemTime>)>);
+
+impl Stamp {
+    fn of(command: &str) -> Stamp {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let mut files: Vec<PathBuf> = Vec::new();
+        for (n, word) in command.split_whitespace().enumerate() {
+            let word = word.trim_matches(|c| c == '"' || c == '\'');
+            let path = match (
+                word.strip_prefix("~/").or(word.strip_prefix("$HOME/")),
+                &home,
+            ) {
+                (Some(rest), Some(home)) => home.join(rest),
+                _ if word.contains('/') => PathBuf::from(word),
+                _ if n == 0 => match on_path(word) {
+                    Some(path) => path,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if path.is_file() && !files.contains(&path) {
+                files.push(path);
+            }
+        }
+        Stamp(
+            files
+                .into_iter()
+                .map(|path| (path.clone(), modified(&path)))
+                .collect(),
+        )
+    }
+
+    /// Whether a file it names changed, or went, since.
+    fn changed(&self) -> bool {
+        (self.0.iter()).any(|(path, at)| modified(path) != *at)
+    }
+}
+
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Where `PATH` finds `program`.
+fn on_path(program: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Whether a source works, run by run: after `DOWN_AFTER` failed runs in
+/// a row its subscribers hear it is down, again each `DOWN_AGAIN` while it
+/// stays so, and that it works again once a run does.
+#[derive(Debug, Default)]
+struct Health {
+    failed: u32,
+    /// When the first of the failed runs in a row ended.
+    since_ms: Option<u128>,
+    /// When its subscribers last heard it is down.
+    told: Option<std::time::Instant>,
+}
+
+impl Health {
+    /// After a run that `failed` (why) or not, with its stderr's last
+    /// lines: what its subscribers are to hear, if anything.
+    fn after(
+        &mut self,
+        source: &Source,
+        failed: Option<String>,
+        stderr: Vec<String>,
+        now: std::time::Instant,
+    ) -> Option<Event> {
+        let Some(why) = failed else {
+            self.failed = 0;
+            let since = self.since_ms.take();
+            self.told.take()?;
+            let since = since.map(clock).unwrap_or_default();
+            return Some(Event::of_lookout(
+                source,
+                "back",
+                format!(
+                    "The source {} works again, after failing since {since}.",
+                    source.name
+                ),
+                json!({}),
+            ));
+        };
+        self.failed += 1;
+        let since = *self.since_ms.get_or_insert_with(super::epoch_ms);
+        if self.failed < DOWN_AFTER || self.told.is_some_and(|at| now < at + DOWN_AGAIN) {
+            return None;
+        }
+        self.told = Some(now);
+        Some(Event::of_lookout(
+            source,
+            "down",
+            format!(
+                "The source {} is down: its last {} runs failed, since {}, so nothing from it \
+                 reaches you until it works again, which you will hear. Tell the person, who \
+                 set it up.",
+                source.name,
+                self.failed,
+                clock(since)
+            ),
+            json!({"failed": why, "stderr": stderr}),
+        ))
+    }
+}
+
+/// `ms` since the epoch in local time, as messages are stamped.
+fn clock(ms: u128) -> String {
+    crate::stamp::when((ms / 1000) as i64)
 }
 
 /// Run a source's command again and again, sending each new event, until
@@ -431,22 +610,39 @@ impl Drop for Runner {
 async fn run(source: Source, every: Duration, dir: PathBuf, shape: PathBuf, sent: Sender<Said>) {
     let mut seen = Seen::default();
     let mut shape = Shape::read(shape);
+    let mut health = Health::default();
     loop {
         let _ = super::make_dir(&dir);
-        let ran = once(&source, &dir, &sent, &mut seen, &mut shape).await;
+        let stderr = Arc::new(Mutex::new(VecDeque::new()));
+        let ran = once(&source, &dir, &sent, &mut seen, &mut shape, &stderr).await;
         shape.flush();
-        match ran {
-            Ok(status) if status.success() => {}
-            Ok(status) => println!(
-                "{}",
-                json!({"event": "source_failed", "source": source.name, "status": status.to_string()})
-            ),
-            Err(why) => println!(
-                "{}",
-                json!({"event": "source_failed", "source": source.name, "why": why})
-            ),
-        }
         if sent.is_closed() {
+            return;
+        }
+        let failed = match ran {
+            Ok(status) if status.success() => None,
+            Ok(status) => {
+                println!(
+                    "{}",
+                    json!({"event": "source_failed", "source": source.name, "status": status.to_string()})
+                );
+                Some(status.to_string())
+            }
+            Err(why) => {
+                println!(
+                    "{}",
+                    json!({"event": "source_failed", "source": source.name, "why": why})
+                );
+                Some(why)
+            }
+        };
+        let stderr: Vec<String> = stderr
+            .lock()
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        if let Some(told) = health.after(&source, failed, stderr, std::time::Instant::now())
+            && sent.send(Said::Event(Box::new(told))).await.is_err()
+        {
             return;
         }
         tokio::time::sleep(every).await;
@@ -533,7 +729,7 @@ async fn emit(
     {
         event.steer = true;
     }
-    shape.saw(&event.fields);
+    shape.saw(&event.fields, event.topic.as_deref());
     sent.send(Said::Event(Box::new(event))).await.is_ok()
 }
 
@@ -568,6 +764,7 @@ async fn once(
     sent: &Sender<Said>,
     seen: &mut Seen,
     shape: &mut Shape,
+    tail: &Arc<Mutex<VecDeque<String>>>,
 ) -> Result<std::process::ExitStatus, String> {
     let mut child = tokio::process::Command::new("sh")
         .arg("-c")
@@ -590,6 +787,7 @@ async fn once(
     });
     if let Some(stderr) = child.stderr.take() {
         let name = source.name.clone();
+        let tail = tail.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let (mut line, mut logged) = (Vec::new(), 0);
@@ -598,12 +796,19 @@ async fn once(
                 if read == Read::End {
                     return;
                 }
+                let line = String::from_utf8_lossy(&line);
+                let line = line.trim_end();
+                if let Ok(mut tail) = tail.lock() {
+                    if tail.len() >= DOWN_STDERR {
+                        tail.pop_front();
+                    }
+                    tail.push_back(cut(line, FIELD_CHARS));
+                }
                 if logged < STDERR_LINES {
                     logged += 1;
-                    let line = String::from_utf8_lossy(&line);
                     println!(
                         "{}",
-                        json!({"event": "source_stderr", "source": name, "line": line.trim_end()})
+                        json!({"event": "source_stderr", "source": name, "line": line})
                     );
                 }
             }
@@ -686,6 +891,9 @@ pub struct Heard {
 pub fn line(item: &Heard) -> String {
     let event = &item.event;
     let mut what = event.source.clone();
+    if event.lookout {
+        what.push_str(", said by the lookout");
+    }
     if let Some(topic) = &event.topic {
         what.push_str(&format!(":{topic}"));
     }
@@ -731,6 +939,11 @@ struct Shape {
     /// The last few events, cut (`sample`), newest last: examples only for
     /// a caller that hears them (`listed`).
     recent: VecDeque<Value>,
+    /// The topics its events named lately, with the event each was last
+    /// in: what a subscription may name after the colon.
+    topics: std::collections::BTreeMap<String, u64>,
+    /// It saw a topic it had not, to write at once.
+    new_topic: bool,
     written: Option<std::time::Instant>,
     /// The fields and kinds last written, to write again at once when
     /// they change.
@@ -776,14 +989,33 @@ impl Shape {
         while shape.recent.len() > SHAPE_RECENT {
             shape.recent.pop_front();
         }
+        for topic in (value["topics"].as_array().into_iter().flatten()).take(SHAPE_TOPICS) {
+            if let Some(topic) = topic.as_str() {
+                shape.topics.insert(topic.to_owned(), shape.events);
+            }
+        }
         shape.written_kinds = shape.kinds();
         shape
     }
 
-    /// An event the source printed, written down when its fields are new
-    /// or a while after the last write.
-    fn saw(&mut self, fields: &Value) {
+    /// An event the source printed, about `topic` if it named one, written
+    /// down when its fields or topic are new or a while after the last
+    /// write.
+    fn saw(&mut self, fields: &Value, topic: Option<&str>) {
         self.events += 1;
+        if let Some(topic) = topic {
+            if !self.topics.contains_key(topic) {
+                self.new_topic = true;
+                if self.topics.len() >= SHAPE_TOPICS
+                    && let Some(oldest) = (self.topics.iter())
+                        .min_by_key(|(_, last)| **last)
+                        .map(|(topic, _)| topic.clone())
+                {
+                    self.topics.remove(&oldest);
+                }
+            }
+            self.topics.insert(topic.to_owned(), self.events);
+        }
         let mut found = Vec::new();
         flatten("", fields, 0, &mut found);
         for (name, value) in found {
@@ -800,6 +1032,7 @@ impl Shape {
         }
         let events = self.events;
         (self.fields).retain(|_, field| events - field.last < SHAPE_EVENTS);
+        (self.topics).retain(|_, last| events - *last < SHAPE_EVENTS);
         if let Some(sample) = sample(fields) {
             if self.recent.len() >= SHAPE_RECENT {
                 self.recent.pop_front();
@@ -808,7 +1041,7 @@ impl Shape {
         }
         self.dirty = true;
         let due = self.written.is_none_or(|at| at.elapsed() >= SHAPE_EVERY);
-        if due || self.kinds() != self.written_kinds {
+        if due || self.new_topic || self.kinds() != self.written_kinds {
             self.flush();
         }
     }
@@ -820,6 +1053,7 @@ impl Shape {
             return;
         }
         self.dirty = false;
+        self.new_topic = false;
         self.written_kinds = self.kinds();
         self.written = Some(std::time::Instant::now());
         shapes::write(self.file.clone(), format!("{:#}\n", self.to_json()));
@@ -835,8 +1069,12 @@ impl Shape {
         let fields: serde_json::Map<String, Value> = (self.fields.iter())
             .map(|(name, field)| (name.clone(), json!({"kinds": field.kinds})))
             .collect();
+        // Newest first.
+        let mut topics: Vec<(&String, &u64)> = self.topics.iter().collect();
+        topics.sort_by_key(|(topic, last)| (std::cmp::Reverse(**last), (*topic).clone()));
+        let topics: Vec<&String> = topics.into_iter().map(|(topic, _)| topic).collect();
         json!({"events": self.events, "at_ms": super::epoch_ms() as u64, "fields": fields,
-            "recent": self.recent})
+            "topics": topics, "recent": self.recent})
     }
 }
 
@@ -1031,7 +1269,16 @@ pub fn listed(store: &Path, names: &[String], subs: &[super::subs::Sub]) -> (Vec
                         (field.clone(), json!(said))
                     })
                     .collect();
-            json!({"name": name, "events": shape["events"], "fields": fields})
+            let mut listed = json!({"name": name, "events": shape["events"], "fields": fields});
+            // The topics it named lately, newest first: what a subscription
+            // names after the colon, as `NAME:TOPIC`.
+            if shape["topics"]
+                .as_array()
+                .is_some_and(|topics| !topics.is_empty())
+            {
+                listed["topics"] = shape["topics"].clone();
+            }
+            listed
         })
         .collect();
     (listed, examples)
@@ -1302,9 +1549,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let file = shape_file(&dir, "cr");
         let mut shape = Shape::read(file.clone());
-        shape.saw(&json!({"text": "a", "paths": ["x"], "meta": {"team": "core", "deep": {"a": {"b": 1}}}}));
+        shape.saw(&json!({"text": "a", "paths": ["x"], "meta": {"team": "core", "deep": {"a": {"b": 1}}}}), None);
         // A new field writes at once.
-        shape.saw(&json!({"text": "b", "lines": 3, "draft": null}));
+        shape.saw(&json!({"text": "b", "lines": 3, "draft": null}), None);
         shapes::written();
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
@@ -1332,7 +1579,7 @@ mod tests {
         // A field no recent event had leaves the shape.
         let mut shape = again;
         for _ in 0..SHAPE_EVENTS {
-            shape.saw(&json!({"text": "c"}));
+            shape.saw(&json!({"text": "c"}), None);
         }
         assert_eq!(shape.fields.keys().collect::<Vec<_>>(), ["text"]);
         // Events that change no field are written as the run ends, and
@@ -1403,6 +1650,7 @@ mod tests {
             digest: None,
             fields: Arc::new(json!({"text": text})),
             told: Vec::new(),
+            lookout: false,
             at_ms: 0,
             seq: 0,
         };
@@ -1492,6 +1740,167 @@ mod tests {
         assert_eq!(texts, ["run 1 of count", "same", "run 2 of count"]);
         runner.set(Vec::new());
         assert!(runner.running.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The next event the runner sends, within 10 seconds.
+    async fn next_event(got: &mut tokio::sync::mpsc::Receiver<Said>) -> Event {
+        let Said::Event(event) = tokio::time::timeout(Duration::from_secs(10), got.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("a command's source asks nothing back");
+        };
+        *event
+    }
+
+    #[tokio::test]
+    async fn a_source_starts_again_when_its_command_file_changes() {
+        let dir = std::env::temp_dir().join(format!("lookout-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("poll.sh");
+        std::fs::write(&script, "echo v1\n").unwrap();
+        let (sent, mut got) = tokio::sync::mpsc::channel(16);
+        let mut runner = Runner::new(dir.join("state"), sent);
+        // It runs once an hour: only a restart runs it again soon.
+        let source = Source {
+            name: "poll".into(),
+            command: format!("sh {}", script.display()),
+            every: Some("1h".into()),
+            digest: None,
+            steer: None,
+        };
+        runner.set(vec![source.clone()]);
+        assert_eq!(next_event(&mut got).await.text, "v1");
+        // The same settings, the same file: nothing starts again.
+        runner.set(vec![source.clone()]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), got.recv())
+                .await
+                .is_err()
+        );
+        // An edit, even one that keeps its length, starts it on the new one.
+        std::fs::write(&script, "echo v2\n").unwrap();
+        let later = std::time::SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&script)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        runner.set(vec![source]);
+        assert_eq!(next_event(&mut got).await.text, "v2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_command_s_files_are_the_paths_it_names_and_its_program() {
+        let dir = std::env::temp_dir().join(format!("lookout-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("poll.py");
+        std::fs::write(&script, "print('hi')\n").unwrap();
+        let stamp = Stamp::of(&format!(
+            "python3 '{}' --since {}",
+            script.display(),
+            dir.display()
+        ));
+        let files: Vec<&PathBuf> = stamp.0.iter().map(|(path, _)| path).collect();
+        // The script, and the program `PATH` finds when there is one; a
+        // folder or a plain word is no file.
+        assert!(files.contains(&&script), "{files:?}");
+        assert!(!files.contains(&&dir));
+        assert!(!stamp.changed());
+        std::fs::remove_file(&script).unwrap();
+        assert!(stamp.changed(), "a file gone is a change");
+        assert_eq!(Stamp::of(""), Stamp::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_source_failing_runs_in_a_row_is_down_once_a_day_then_back() {
+        let source = source(None);
+        let mut health = Health::default();
+        let now = std::time::Instant::now();
+        let failed = || Some("exit status: 1".to_owned());
+        let stderr = || vec!["token expired".to_owned()];
+        assert!(health.after(&source, failed(), stderr(), now).is_none());
+        assert!(health.after(&source, failed(), stderr(), now).is_none());
+        let down = health.after(&source, failed(), stderr(), now).unwrap();
+        assert!(down.lookout && !down.steer);
+        assert!(
+            down.text
+                .starts_with("The source slack is down: its last 3 runs failed, since ")
+        );
+        assert_eq!(down.fields["failed"], "exit status: 1");
+        assert_eq!(down.fields["stderr"], json!(["token expired"]));
+        // Said once a day while it stays down.
+        assert!(health.after(&source, failed(), stderr(), now).is_none());
+        let again = health
+            .after(&source, failed(), stderr(), now + DOWN_AGAIN)
+            .unwrap();
+        assert!(
+            again.text.contains("its last 5 runs failed"),
+            "{}",
+            again.text
+        );
+        // A run that works: back, once.
+        let back = health
+            .after(&source, None, Vec::new(), now + DOWN_AGAIN)
+            .unwrap();
+        assert!(back.lookout);
+        assert!(
+            back.text
+                .starts_with("The source slack works again, after failing since ")
+        );
+        assert!(health.after(&source, None, Vec::new(), now).is_none());
+        // A failure or two that never made it down is never told.
+        assert!(health.after(&source, failed(), stderr(), now).is_none());
+        assert!(health.after(&source, None, Vec::new(), now).is_none());
+        // Kept and read again, it is still the lookout's word.
+        assert_eq!(Event::from_json(&down.to_json()), Some(down.clone()));
+        let line = line(&Heard {
+            event: down,
+            subs: vec!["chat".into()],
+        });
+        assert!(
+            line.starts_with("- slack, said by the lookout (for your chat): \"The source"),
+            "{line}"
+        );
+        assert!(line.contains(r#""stderr":["token expired"]"#), "{line}");
+    }
+
+    #[test]
+    fn a_shape_keeps_the_topics_named_lately_newest_first() {
+        let dir = std::env::temp_dir().join(format!("lookout-topics-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = shape_file(&dir, "chat");
+        let mut shape = Shape::read(file.clone());
+        shape.saw(&json!({"text": "a", "topic": "eng"}), Some("eng"));
+        shape.saw(&json!({"text": "b", "topic": "deploys"}), Some("deploys"));
+        shape.saw(&json!({"text": "c", "topic": "eng"}), Some("eng"));
+        shape.saw(&json!({"text": "d"}), None);
+        // As a run ends.
+        shape.flush();
+        shapes::written();
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(written["topics"], json!(["eng", "deploys"]));
+        // At most `SHAPE_TOPICS`, the least recent going first.
+        let mut shape = Shape::read(file);
+        for n in 0..SHAPE_TOPICS {
+            let topic = format!("t{n}");
+            shape.saw(&json!({"text": "x"}), Some(&topic));
+        }
+        assert_eq!(shape.topics.len(), SHAPE_TOPICS);
+        assert!(!shape.topics.contains_key("deploys") && !shape.topics.contains_key("eng"));
+        // A topic no recent event named leaves.
+        for _ in 0..SHAPE_EVENTS {
+            shape.saw(&json!({"text": "y"}), Some("t0"));
+        }
+        assert_eq!(shape.topics.keys().collect::<Vec<_>>(), ["t0"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
