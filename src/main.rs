@@ -272,7 +272,11 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--wall" => walled.push(value.into()),
             "--context-window" => windows.push(value.as_str()),
             "--models" => models = Some(value.into()),
-            "--provider-config" => provider_config = Some(value.into()),
+            // Made whole here, so the file watched and reread on each edit is
+            // the one named, with or without a folder in front of it.
+            "--provider-config" => {
+                provider_config = Some(std::path::absolute(value).unwrap_or_else(|_| value.into()))
+            }
             "--protect-existing" => protected_existing.push(value.clone()),
             "--max-processes"
             | "--max-lasting"

@@ -495,12 +495,12 @@ model's name and context size as its note and a comment for a provider that
 listed nothing; when no usable model survives rendering within the file
 limit, it writes nothing and fails with `models_none_listed`, naming each
 refusal, so it can run again after a login. Once the file exists the merge
-is three-way, against what refreshes put in the file
+is three-way, against the lines refreshes put in the file
 (`~/.agent/models.listed`): a model a provider newly lists is added after
-that provider's last line while the file stays within its limit, one it
+that provider's last line while the file stays within its limit, a line it
 added and the provider stopped listing is removed (and added again if it
 comes back), and every other line (the person's own models, even ones a
-provider lists, notes, comments, and the absence of
+provider lists, lines they changed, notes, comments, and the absence of
 lines they deleted, even through a time the provider stopped listing them)
 is kept byte for byte. One refresh of the folder runs at a time, and the
 file is compared just before it is replaced, so an edit saved meanwhile is

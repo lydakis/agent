@@ -355,10 +355,9 @@ pub fn refresh(path: &Path, listing: &Value) -> Result<Refreshed, Error> {
                 let text = render(listing, &[])?;
                 // What the list holds, not every id listed: a provider
                 // left out for the size limit is not recorded as deleted.
-                let added: Vec<String> = parse(&text)
-                    .map(|models| models.into_iter().map(|m| m.id).collect())
-                    .unwrap_or_default();
-                let record = record_text(added.iter().cloned().collect(), path)?;
+                let lines = written(&text);
+                let added: Vec<String> = lines.keys().cloned().collect();
+                let record = record_text(lines, path)?;
                 match install(path, &text) {
                     // Someone wrote one meanwhile: merge into theirs.
                     Err(error) if error.code == "models_file_exists" => continue,
@@ -377,18 +376,18 @@ pub fn refresh(path: &Path, listing: &Value) -> Result<Refreshed, Error> {
         let merged = merge(&text, &record, &answered);
         // Built and checked before the list is touched, so a record that
         // could not be written never leaves a list it does not describe.
-        let mut next: std::collections::BTreeSet<String> = record
+        let mut next: std::collections::BTreeMap<String, String> = record
             .into_iter()
-            .filter(|id| !merged.removed.contains(id))
+            .filter(|(id, _)| !merged.removed.contains(id))
             .collect();
-        next.extend(merged.listed.iter().cloned());
+        next.extend(merged.listed.clone());
         let next = match record_text(next.clone(), path) {
             Ok(next) => next,
             // Past the limit only through ids deleted by hand long ago:
             // keep only those still listed.
             Err(_) => record_text(
                 next.into_iter()
-                    .filter(|id| merged.listed.contains(id) || merged.offered.contains(id))
+                    .filter(|(id, _)| merged.listed.contains_key(id))
                     .collect(),
                 path,
             )?,
@@ -464,28 +463,40 @@ fn read_text(path: &Path) -> Result<Option<String>, Error> {
     Ok(Some(text))
 }
 
-/// The ids the refresh put in the list; none before the first refresh.
-fn read_record(path: &Path) -> Result<std::collections::HashSet<String>, Error> {
+/// The lines the refresh put in the list, by model, as it wrote them;
+/// none before the first refresh.
+fn read_record(path: &Path) -> Result<std::collections::HashMap<String, String>, Error> {
     let Some(text) = read_file(path, false)? else {
         return Ok(Default::default());
     };
-    let models = parse(&text).map_err(|(line, reason)| {
+    parse(&text).map_err(|(line, reason)| {
         Error::with(
             "models_invalid",
             &format!("{}:{line}: {reason}", path.display()),
         )
     })?;
-    Ok(models.into_iter().map(|model| model.id).collect())
+    Ok(written(&text).into_iter().collect())
+}
+
+/// Each model line in `text`, by the model it names, without its line end.
+fn written(text: &str) -> std::collections::BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| Some((entry(line)?.to_owned(), line.trim_end().to_owned())))
+        .collect()
 }
 
 /// The record's text, refused past the size its reader takes.
-fn record_text(ids: std::collections::BTreeSet<String>, path: &Path) -> Result<String, Error> {
+fn record_text(
+    lines: std::collections::BTreeMap<String, String>,
+    path: &Path,
+) -> Result<String, Error> {
     let mut text = String::from(
-        "# What the refresh put in the list beside this one; a model here and\n\
-         # missing there was deleted by hand and is not added back.\n",
+        "# The lines the refresh put in the list beside this one. A model here\n\
+         # and missing there was deleted by hand and is not added back; a line\n\
+         # that differs there was changed by hand and is the person's to keep.\n",
     );
-    for id in ids {
-        text.push_str(&id);
+    for line in lines.into_values() {
+        text.push_str(&line);
         text.push('\n');
     }
     match text.len() as u64 > LIMIT {
@@ -504,16 +515,15 @@ fn write_record(path: &Path, text: &str) -> Result<(), Error> {
     }
 }
 
-/// A merge: the list's new text, what it added and removed, the refresh's
-/// own ids the answering providers list now that the new text holds
-/// (`listed`), and new ones left out of it for its size (`offered`).
+/// A merge: the list's new text, what it added and removed, and the
+/// refresh's own lines the answering providers list now that the new text
+/// holds, by model (`listed`).
 #[derive(Default)]
 struct Merged {
     text: String,
     added: Vec<String>,
     removed: Vec<String>,
-    listed: std::collections::HashSet<String>,
-    offered: std::collections::HashSet<String>,
+    listed: std::collections::HashMap<String, String>,
 }
 
 /// The merged text: for each provider that answered, lines the refresh put
@@ -523,7 +533,7 @@ struct Merged {
 /// limit. Everything else is kept byte for byte.
 fn merge(
     text: &str,
-    record: &std::collections::HashSet<String>,
+    record: &std::collections::HashMap<String, String>,
     answered: &[(&String, Vec<(String, String)>)],
 ) -> Merged {
     let provider_of = |id: &str| id.split_once('/').map(|(provider, _)| provider.to_owned());
@@ -544,14 +554,17 @@ fn merge(
         if let Some(id) = id {
             present.insert(id.to_owned());
             let now = provider_of(id).and_then(|provider| listed.get(provider.as_str()));
-            if now.is_some_and(|now| record.contains(id) && !now.contains(id)) {
+            // Still the refresh's own line, as it wrote it: one the person
+            // wrote or changed stays theirs, kept whatever the provider lists.
+            let own = record.get(id).is_some_and(|wrote| wrote == line.trim_end());
+            if own && now.is_some_and(|now| !now.contains(id)) {
                 merged.removed.push(id.to_owned());
                 continue;
             }
-            // Still the refresh's own line: one the person wrote stays
-            // theirs, kept whatever the provider lists.
-            if record.contains(id) && now.is_some_and(|now| now.contains(id)) {
-                merged.listed.insert(id.to_owned());
+            if own && now.is_some_and(|now| now.contains(id)) {
+                merged
+                    .listed
+                    .insert(id.to_owned(), line.trim_end().to_owned());
             }
         } else if answered.iter().any(|(name, _)| failure_note(line, name)) {
             // The provider answers now, so what the first list said about
@@ -568,7 +581,7 @@ fn merge(
     for (name, lines) in answered {
         let new: Vec<&(String, String)> = lines
             .iter()
-            .filter(|(id, _)| !present.contains(id) && !record.contains(id))
+            .filter(|(id, _)| !present.contains(id) && !record.contains_key(id))
             .collect();
         if new.is_empty() {
             continue;
@@ -579,12 +592,14 @@ fn merge(
             .rposition(|(provider, _)| provider.as_deref() == Some(name.as_str()));
         let gap = usize::from(last.is_none() && out.last().is_some_and(|l| !l.trim().is_empty()));
         if (size + gap + block.len()) as u64 > LIMIT {
-            merged.offered.extend(new.iter().map(|(id, _)| id.clone()));
             continue;
         }
         size += gap + block.len();
         merged.added.extend(new.iter().map(|(id, _)| id.clone()));
-        merged.listed.extend(new.iter().map(|(id, _)| id.clone()));
+        merged.listed.extend(
+            new.iter()
+                .map(|(id, line)| (id.clone(), line.trim_end().to_owned())),
+        );
         match last {
             Some(index) => out[index].push_str(&block),
             None => {
@@ -926,8 +941,9 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&list).unwrap(), after);
         // The record keeps bedrock's last listing while it was down.
         let record = std::fs::read_to_string(super::listed_path(&list)).unwrap();
+        let recorded = super::written(&record);
         assert!(
-            record.contains("bedrock/x\n") && record.contains("openai/b\n"),
+            recorded.contains_key("bedrock/x") && recorded.contains_key("openai/b"),
             "{record}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1015,6 +1031,31 @@ mod tests {
         );
         let back = refreshed_in(&dir, both);
         assert_eq!(back, super::Refreshed::default());
+        assert_eq!(std::fs::read_to_string(&list).unwrap(), text);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_line_annotated_by_hand_stays_when_the_provider_stops_listing_it() {
+        let dir = temp("annotated");
+        let list = dir.join("models");
+        let both = json!({"providers":{"openai":{"models":[{"id":"a"},{"id":"b","name":"B"}]}}});
+        refreshed_in(&dir, both.clone());
+        let text = std::fs::read_to_string(&list).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("openai/b"))
+            .unwrap();
+        let text = text.replace(line, "openai/b  # B, the one for reviews");
+        std::fs::write(&list, &text).unwrap();
+        let gone = refreshed_in(
+            &dir,
+            json!({"providers":{"openai":{"models":[{"id":"a"}]}}}),
+        );
+        assert_eq!(gone, super::Refreshed::default());
+        assert_eq!(std::fs::read_to_string(&list).unwrap(), text);
+        // Listed again, it is not added a second time.
+        assert_eq!(refreshed_in(&dir, both), super::Refreshed::default());
         assert_eq!(std::fs::read_to_string(&list).unwrap(), text);
         std::fs::remove_dir_all(&dir).unwrap();
     }
