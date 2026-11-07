@@ -609,6 +609,24 @@ struct Passed {
     sandboxes: approvals::Sandboxes,
 }
 
+/// Every bot the daemon has, page by page; `None` when a page could not
+/// be read.
+async fn every_bot(client: &Client) -> Option<Vec<Value>> {
+    let mut bots = Vec::new();
+    let mut after = json!("");
+    loop {
+        let page = (client)
+            .request("bots", json!({"after": after, "limit": 256}))
+            .await
+            .ok()?;
+        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+        match &page["next_after"] {
+            Value::Null => return Some(bots),
+            next => after = next.clone(),
+        }
+    }
+}
+
 /// One pass of a `/permissions` pick over the agents `lead` made and
 /// those they made, all but those `settled`: each that hasn't `mode` is
 /// configured to it; one busy is left for the next pass. The folder walks
@@ -631,21 +649,9 @@ async fn spread_pass(
         notice: None,
         sandboxes: Default::default(),
     };
-    let mut bots = Vec::new();
-    let mut after = json!("");
-    let listed = loop {
-        let Ok(page) = (client)
-            .request("bots", json!({"after": after, "limit": 256}))
-            .await
-        else {
-            break false;
-        };
-        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-        match &page["next_after"] {
-            Value::Null => break true,
-            next => after = next.clone(),
-        }
-    };
+    let listing = every_bot(&client).await;
+    let listed = listing.is_some();
+    let bots = listing.unwrap_or_default();
     let made: Vec<Value> = match listed {
         true => approvals::made_by(&bots, &lead)
             .into_iter()
@@ -1550,7 +1556,7 @@ async fn run() -> Result<(), String> {
     app.sounds.chime = settings.chime;
     app.verbose = settings.verbose;
     set_measure(settings.text_width);
-    margin::set_most_notes(settings.margin_notes);
+    margin::set_limits(settings.margin_notes, settings.margin_note_lines);
     app.zen = zen::focus(app.reactions_key.as_deref());
     app.margin_opens = settings.margin_opens;
     app.agent_opens = settings.agent_opens;
@@ -3068,6 +3074,10 @@ struct App {
     config: Option<config::View>,
     /// The model listing `/model` waits on.
     listing: Option<tokio::sync::oneshot::Receiver<Result<Value, String>>>,
+    /// How far a `/permissions` pick reaches, once the listing it is read
+    /// from arrives, for the line under the rows.
+    reach: Option<approvals::Reach>,
+    reaching: Option<tokio::sync::oneshot::Receiver<Option<approvals::Reach>>>,
     /// The model and effort picked, set once no turn runs.
     switch: Option<(String, Option<String>)>,
     /// The prompt-cache lifetime a bot made before Sonny gave its model
@@ -4424,6 +4434,8 @@ impl App {
             searching: None,
             config: None,
             listing: None,
+            reach: None,
+            reaching: None,
             agents: None,
             making: None,
             send_after: None,
@@ -4688,6 +4700,7 @@ impl App {
             self.suggested_now().await;
             self.shell_ran().await;
             self.listed();
+            self.reached();
             self.follow_place().await;
             self.follow_tab().await;
             self.count_behind().await;
@@ -5111,9 +5124,32 @@ impl App {
         (self.making.as_ref()).is_some_and(|making| !matches!(making.step, new::Step::Brief))
     }
 
+    /// The agent as the composer names it: a lead by its project, a side
+    /// chat by what it is, not the copy's own id.
+    fn named(&self) -> String {
+        match &self.project {
+            Some(project) => lead_title(project, &self.bot),
+            None if self.options.side.is_some() => "the side chat".to_owned(),
+            None => self.bot.clone(),
+        }
+    }
+
     /// Whether `/new`'s first message is being written in the composer.
     fn new_brief(&self) -> bool {
         (self.making.as_ref()).is_some_and(|making| matches!(making.step, new::Step::Brief))
+    }
+
+    /// How far a `/permissions` pick reaches, once it is read.
+    fn reached(&mut self) {
+        let Some(reaching) = &mut self.reaching else {
+            return;
+        };
+        match reaching.try_recv() {
+            Ok(reach) => self.reach = reach,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Err(_) => {}
+        }
+        self.reaching = None;
     }
 
     /// `/model`'s listing, once it arrives: the picker opens on it.
@@ -6912,9 +6948,6 @@ impl App {
                 break;
             }
         }
-        if reference.node.is_none() {
-            reference.whole = from.is_none();
-        }
         for items in pages.iter().rev() {
             reference.read(id, items);
         }
@@ -8022,9 +8055,8 @@ impl App {
                         _ => format!("Calling {name}"),
                     };
                 }
-                if name == margin::TOOL {
-                    self.note_call(id, &arguments, turn);
-                }
+                // A margin call shows once Sonny answers it, so one refused
+                // never shows.
                 self.calls.insert(id.to_owned(), (name, arguments));
             }
             "tool_completed" => {
@@ -8082,8 +8114,7 @@ impl App {
                         }
                     }
                 } else {
-                    // Started before this window read the conversation, it
-                    // ends here; once applied, it counts once.
+                    // Taken: the margin shows it, once.
                     if name == margin::TOOL && !shown.1 {
                         self.note_call(id, &arguments, turn);
                     }
@@ -8184,7 +8215,7 @@ impl App {
                     (false, "completed") => limit,
                     _ => detail,
                 };
-                let line = transcript::finished(status, shown, seconds, self.prose());
+                let line = transcript::finished(status, shown, seconds);
                 self.close_live();
                 // A turn that only reacted ends as a reaction under the
                 // message, with no line under it.
@@ -10546,7 +10577,7 @@ impl App {
             self.sounds.chime = settings.chime;
             self.margin_opens = settings.margin_opens;
             self.agent_opens = settings.agent_opens;
-            margin::set_most_notes(settings.margin_notes);
+            margin::set_limits(settings.margin_notes, settings.margin_note_lines);
             if self.verbose != settings.verbose {
                 self.verbose = settings.verbose;
                 self.repaint = true;
@@ -11205,6 +11236,18 @@ impl App {
                 .map(|mode| (mode.label.clone(), mode.about.clone()))
                 .collect();
             self.choosing = Some((Choice::Permissions, list::Picker::new(rows, at)));
+            // How far a pick reaches, read beside the window: the line
+            // under the rows says it in general words until it arrives.
+            self.reach = None;
+            let (send, receive) = tokio::sync::oneshot::channel();
+            let (client, bot, woken) = (self.client.clone(), self.bot.clone(), self.woken.clone());
+            tokio::spawn(async move {
+                let reach =
+                    (every_bot(&client).await).map(|bots| approvals::Reach::of(&bots, &bot));
+                let _ = send.send(reach);
+                woken.notify_one();
+            });
+            self.reaching = Some(receive);
             return;
         }
         if prompt == "/copy" {
@@ -12097,6 +12140,12 @@ impl App {
                 return;
             }
         };
+        // Its margin starts at the copy, empty: the notes it was copied
+        // with are its source's, and count for none of its own when Sonny
+        // answers its margin calls, as its window shows none of them.
+        if let (Some(id), Some(head)) = (forked["bot_id"].as_i64(), forked["head"].as_i64()) {
+            margin::start_at(&self.options.store, id, head);
+        }
         // On the model this window's turns run on, whose cache is warm.
         if !question.is_empty()
             && let Err(error) = self
@@ -13004,12 +13053,18 @@ impl App {
                         )
                     })
                     .collect();
-                over(
-                    frame,
-                    list::lines(&items, list.at(), width, composer.y as usize),
-                    composer,
+                // The rows, then what a pick reaches, muted, in the
+                // column of their names.
+                let room = (composer.y as usize).saturating_sub(1);
+                let mut rows = list::lines(&items, list.at(), width, room);
+                let reach = approvals::reach_line(
+                    &self.named(),
+                    self.reach,
+                    width.saturating_sub(list::INDENT),
                 );
-                let (line, cursor) = list.line("permissions for this agent and those it makes");
+                rows.push(Line::from(format!("{}{reach}", " ".repeat(list::INDENT))).dim());
+                over(frame, rows, composer);
+                let (line, cursor) = list.line("permissions");
                 frame.render_widget(Paragraph::new(line), composer);
                 frame.set_cursor_position((composer.x + cursor, composer.y));
                 let keys = Line::from(hint::spans("  ↑↓ pick · enter choose · esc close"));
@@ -13280,12 +13335,7 @@ impl App {
         }
         if self.input.is_empty() {
             // Named, so a message typed in the wrong pane is caught first.
-            let name = match &self.project {
-                Some(project) => lead_title(project, &self.bot),
-                // A side chat by what it is, not the copy's own id.
-                None if self.options.side.is_some() => "the side chat".to_owned(),
-                None => self.bot.clone(),
-            };
+            let name = self.named();
             // What Enter does, muted, then its keys in the one grammar.
             let said = |words: &str, keys: &str| {
                 let mut spans = vec![Span::raw(format!("{words} · ")).dim()];
@@ -17306,7 +17356,7 @@ mod tests {
         assert_eq!(rows[2], ("• Ran ls".into(), true));
         let line = rows
             .iter()
-            .position(|(row, _)| row.starts_with("─ Worked"))
+            .position(|(row, _)| row.starts_with("Worked for"))
             .unwrap();
         assert_eq!(
             rows[line + 1..],
@@ -17335,7 +17385,7 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(!lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+        assert!(!lines(&app).iter().any(|row| row.starts_with("Worked for")));
         // One that says something ends as any other turn.
         app.daemon(turn_event("accepted", 2, note)).await;
         app.daemon(
@@ -17351,7 +17401,7 @@ mod tests {
         ))
         .await;
         let rows = lines(&app);
-        assert!(rows.iter().any(|row| row.starts_with("─ Worked")));
+        assert!(rows.iter().any(|row| row.starts_with("Worked for")));
         assert_eq!(rows.last().map(String::as_str), Some("• Docs are blocked."));
         // A reply long enough to spill above as it streams still speaks.
         app.pending.clear();
@@ -17372,7 +17422,7 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+        assert!(lines(&app).iter().any(|row| row.starts_with("Worked for")));
         // The person's own turn, with nothing said, still ends with its line.
         app.pending.clear();
         app.daemon(turn_event("accepted", 3, json!({"request_id": "r3"})))
@@ -17383,7 +17433,7 @@ mod tests {
             json!({"status": "completed"}),
         ))
         .await;
-        assert!(lines(&app).iter().any(|row| row.starts_with("─ Worked")));
+        assert!(lines(&app).iter().any(|row| row.starts_with("Worked for")));
     }
 
     #[tokio::test]
@@ -17415,8 +17465,7 @@ mod tests {
             .await;
         app.daemon(turn_event("turn_finished", 2, empty)).await;
         let rows = lines(&app);
-        let line = rows.iter().find(|row| row.starts_with("─ ")).unwrap();
-        assert!(line.starts_with("─ Worked"), "{line}");
+        let line = rows.iter().find(|row| row.starts_with("Worked")).unwrap();
         assert!(!line.contains("empty_completion"));
         // Another failure still says what it was.
         app.pending.clear();
@@ -17453,14 +17502,16 @@ mod tests {
         ))
         .await;
         let rows: Vec<String> = app.pending.iter().map(|line| line.to_string()).collect();
-        let line = rows.iter().find(|row| row.starts_with("─ ")).unwrap();
-        assert!(line.starts_with("─ Worked"), "{line}");
+        let line = rows
+            .iter()
+            .find(|row| row.starts_with("Worked for"))
+            .unwrap();
         assert!(line.contains("ended at its budget"), "{line}");
         // Dim, as any turn that ended well: not the red of a failure.
         let drawn = app
             .pending
             .iter()
-            .find(|l| l.to_string().starts_with("─ "))
+            .find(|l| l.to_string().starts_with("Worked for"))
             .unwrap();
         assert!(
             drawn
@@ -17917,7 +17968,7 @@ mod tests {
             ["", "", "› and the notes?", "", "   🎉 "],
             "{rows:?}"
         );
-        assert!(rows[10].starts_with("─ Worked"), "{rows:?}");
+        assert!(rows[10].starts_with("Worked for"), "{rows:?}");
         assert_eq!(rows[11..], ["", "• Updated."]);
         // Once that message is no longer in the conversation, a reaction
         // to it draws no row of its own.
@@ -18225,6 +18276,42 @@ mod tests {
             (&json!("configure"), &json!("1h"))
         );
         assert!(app.cache.is_none());
+    }
+
+    #[tokio::test]
+    async fn permissions_reads_how_far_a_pick_reaches_beside_the_window() {
+        let client = daemon_serving(json!({}), |request| match request["op"].as_str() {
+            Some("bots") => json!({"bots": [
+                {"name": "b", "bot_id": 1, "running_turn": null},
+                {"name": "b.task", "bot_id": 2, "created_by_id": 1, "running_turn": 3},
+                {"name": "b.helper", "bot_id": 3, "created_by_id": 2, "running_turn": null},
+                {"name": "stranger", "bot_id": 4, "running_turn": 5},
+            ], "next_after": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.input.set("/permissions");
+        app.submit().await;
+        assert!(matches!(&app.choosing, Some((Choice::Permissions, _))));
+        // The list opens at once; the reach follows once the listing is in.
+        assert!(app.reach.is_none());
+        let woken = app.woken.clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while app.reaching.is_some() {
+                app.reached();
+                if app.reaching.is_some() {
+                    woken.notified().await;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.reach, Some(approvals::Reach { made: 2, busy: 1 }));
+        assert_eq!(
+            approvals::reach_line(&app.named(), app.reach, 200),
+            "Reaches b, its 2 agents and any new ones; 1 is busy and switches when its turn ends"
+        );
     }
 
     #[tokio::test]
@@ -18955,10 +19042,11 @@ mod tests {
         std::fs::write(folder.join("flow.md"), "# Flow").unwrap();
         let workspace = folder.display().to_string();
         let folder_name = workspace.clone();
-        let call = |arguments: Value| {
-            json!({"type": "function_call", "call_id": "t", "name": margin::TOOL,
+        let call = |id: &str, arguments: Value| {
+            json!({"type": "function_call", "call_id": id, "name": margin::TOOL,
                 "arguments": arguments.to_string()})
         };
+        let answer = |id: &str| json!({"type": "function_call_output", "call_id": id, "output": "In the margin."});
         let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ended = gone.clone();
         let client = daemon_answering(move |asked| {
@@ -18970,13 +19058,14 @@ mod tests {
                 Some("history_nodes") if asked["min_node"].is_null() => {
                     json!({"nodes": [{"node": 2}, {"node": 1}]})
                 }
-                Some("history_nodes") => json!({"nodes": [{"node": 3}]}),
+                Some("history_nodes") => json!({"nodes": [{"node": 3}, {"node": 4}]}),
                 Some("history_items") => {
                     json!({"items": (asked["nodes"].as_array().unwrap().iter())
                     .map(|node| json!({"node": node, "item": match node.as_i64() {
-                        Some(1) => call(json!({"id": "flow", "title": "Flow", "markdown": "one"})),
-                        Some(2) => json!({"type": "message", "role": "assistant", "content": []}),
-                        _ => call(json!({"id": "flow", "file": "flow.md"})),
+                        Some(1) => call("t1", json!({"id": "flow", "title": "Flow", "markdown": "one"})),
+                        Some(2) => answer("t1"),
+                        Some(3) => call("t3", json!({"id": "flow", "file": "flow.md"})),
+                        _ => answer("t3"),
                     }}))
                     .collect::<Vec<_>>()})
                 }
@@ -19045,7 +19134,9 @@ mod tests {
                 Some("inspect") => json!({"bot_id": 1, "workspace": "/nowhere"}),
                 Some("history_nodes") => json!({"nodes": [{"node": node}]}),
                 _ => json!({"items": [{"node": node, "item": {"type": "function_call",
-                    "call_id": "t", "name": margin::TOOL, "arguments": arguments.to_string()}}]}),
+                    "call_id": "t", "name": margin::TOOL, "arguments": arguments.to_string()}},
+                    {"node": node, "item": {"type": "function_call_output", "call_id": "t",
+                    "output": "In the margin."}}]}),
             }
         })
         .await;
@@ -19086,9 +19177,11 @@ mod tests {
                 }
                 Some("history_nodes") => json!({"nodes": [{"node": if reused { 9 } else { 1 }}]}),
                 _ => json!({"items": (asked["nodes"].as_array().unwrap().iter())
-                    .map(|node| json!({"node": node, "item": {"type": "function_call",
+                    .flat_map(|node| [json!({"node": node, "item": {"type": "function_call",
                         "call_id": "t", "name": margin::TOOL, "arguments": json!({"id": "flow",
-                        "title": "Flow", "markdown": markdown}).to_string()}}))
+                        "title": "Flow", "markdown": markdown}).to_string()}}),
+                        json!({"node": node, "item": {"type": "function_call_output",
+                        "call_id": "t", "output": "In the margin."}})])
                     .collect::<Vec<_>>()}),
             }
         })
@@ -19131,7 +19224,7 @@ mod tests {
             }
             Some("history_items") => {
                 json!({"items": (asked["nodes"].as_array().unwrap().iter())
-                .map(|node| json!({"node": node, "item": match node.as_i64() {
+                .flat_map(|node| [json!({"node": node, "item": match node.as_i64() {
                     Some(3) => call(json!({"id": "flow", "title": "Flow", "markdown": "start"})),
                     // A call its own margin turns down.
                     Some(5) => call(json!({"id": "flow", "title": 1, "markdown": "wrong"})),
@@ -19143,7 +19236,14 @@ mod tests {
                             "input": {"id": "flow", "markdown": "b"}}]}),
                     Some(6) => call(json!({"id": "flow", "title": "Flow two", "markdown": "c"})),
                     _ => call(json!({"id": "flow", "title": "Flow three", "markdown": "d"})),
-                }}))
+                }}), json!({"node": node, "item": match node.as_i64() {
+                    // Each answered as taken.
+                    Some(4) => json!({"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "u1", "content": "In the margin."},
+                        {"type": "tool_result", "tool_use_id": "u2", "content": "In the margin."}]}),
+                    _ => json!({"type": "function_call_output", "call_id": "t",
+                        "output": "In the margin."}),
+                }})])
                 .collect::<Vec<_>>()})
             }
             _ => json!({}),
@@ -21009,17 +21109,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_note_shows_in_the_margin_as_its_call_starts_and_a_marker_pins_where() {
+    async fn a_note_shows_in_the_margin_once_taken_and_a_marker_pins_where() {
         let mut app = app(daemon_with(json!([])).await);
         app.any_history = true;
         let call = |id: &str, arguments: Value| json!({"call_id": id, "name": "margin", "arguments": arguments.to_string()});
         let post = json!({"id": "routing", "title": "Routing today", "markdown": "a → b"});
         app.daemon(turn_event("tool_started", 3, call("m1", post)))
             .await;
-        // In the margin before the call is done.
-        assert_eq!(app.margin.note("routing").unwrap().title, "Routing today");
+        // Not in the margin until Sonny takes it.
+        assert!(app.margin.note("routing").is_none());
         app.daemon(turn_event("tool_completed", 3, json!({"call_id": "m1"})))
             .await;
+        assert_eq!(app.margin.note("routing").unwrap().title, "Routing today");
         let rows: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert!(
             rows.iter()
@@ -21043,6 +21144,151 @@ mod tests {
             (note.call.as_str(), &note.body),
             ("m1", &margin::Body::Markdown("a → c".into()))
         );
+        // Refused, or failed, it changes nothing.
+        let refused = json!({"id": "routing", "markdown": "a → d"});
+        app.daemon(turn_event("tool_started", 3, call("m3", refused)))
+            .await;
+        app.daemon(turn_event(
+            "tool_completed",
+            3,
+            json!({"call_id": "m3", "failed": true}),
+        ))
+        .await;
+        assert_eq!(
+            app.margin.note("routing").unwrap().body,
+            margin::Body::Markdown("a → c".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_margin_call_is_answered_from_where_it_was_last_read_and_a_side_chat_s_from_its_copy()
+    {
+        use std::sync::atomic::{AtomicI64, Ordering::SeqCst};
+        // The source's six notes, copied with the side chat, then its own
+        // calls, each read before its answer is in.
+        let call = |n: i64, arguments: Value| {
+            json!({"type": "function_call", "call_id": format!("c{n}"), "name": margin::TOOL,
+                "arguments": arguments.to_string()})
+        };
+        let item = move |node: i64| match node {
+            1..=12 if node % 2 == 1 => {
+                call(node, json!({"id": format!("s{node}"), "markdown": "-"}))
+            }
+            _ if node % 2 == 0 => json!({"type": "function_call_output",
+                "call_id": format!("c{}", node - 1), "output": "In the margin."}),
+            _ => call(node, json!({"id": format!("n{node}"), "markdown": "-"})),
+        };
+        let last = Arc::new(AtomicI64::new(13));
+        let read_from = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (newest, asked_from) = (last.clone(), read_from.clone());
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("bots") => json!({"bots": [{"name": "calc.add.side-1", "bot_id": 9}]}),
+            Some("history_nodes") => {
+                let from = asked["min_node"].as_i64().unwrap();
+                asked_from.lock().unwrap().push(from);
+                json!({"nodes": (from..=newest.load(SeqCst)).map(|node| json!({"node": node}))
+                    .collect::<Vec<_>>()})
+            }
+            Some("history_items") => json!({"items": (asked["nodes"].as_array().unwrap().iter())
+                .map(|node| json!({"node": node, "item": item(node.as_i64().unwrap())}))
+                .collect::<Vec<_>>()}),
+            _ => json!({}),
+        })
+        .await;
+        let store = std::env::temp_dir().join(unique("side-store"));
+        std::fs::create_dir_all(&store).unwrap();
+        let canonical = std::fs::canonicalize(&store).unwrap();
+        let key = reactions::key(&canonical, 9);
+        let note = json!({"id": "n15", "markdown": "-"});
+        let answer = || margin::answer(&client, &store, "calc.add.side-1", ("c99", &note));
+        // Copied at node 12: none of its source's notes count for its own.
+        margin::start_at(&store, 9, 12);
+        // A window read past the call waiting on its answer: its margin
+        // is its own, and the call still counts once answered.
+        margin::Margin::load(Some(&key)).advance(13);
+        assert_eq!(answer().await, Ok("In the margin.".into()));
+        // Each call reads on from the first one still waiting on its answer.
+        last.store(15, SeqCst);
+        assert_eq!(answer().await, Ok("In the margin.".into()));
+        last.store(17, SeqCst);
+        assert_eq!(answer().await, Ok("In the margin.".into()));
+        let firsts: Vec<i64> = {
+            let from = read_from.lock().unwrap();
+            // Each answer's first read, and the empty one that ends it.
+            from.iter().step_by(2).copied().collect()
+        };
+        assert_eq!(firsts, [13, 13, 15]);
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".agent/sonny/margin");
+        let kept: Value = serde_json::from_slice(
+            &std::fs::read(home.join(format!("{key}.answered.json"))).unwrap(),
+        )
+        .unwrap();
+        let ids: Vec<&str> = (kept["notes"].as_array().unwrap().iter())
+            .filter_map(|note| note["id"].as_str())
+            .collect();
+        assert_eq!(ids, ["n13", "n15"]);
+        for file in [format!("{key}.json"), format!("{key}.answered.json")] {
+            let _ = std::fs::remove_file(home.join(file));
+        }
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[tokio::test]
+    async fn margin_calls_made_together_take_no_more_than_the_margin_holds() {
+        // Five notes taken, then one response's two new ones, neither
+        // answered yet; then one taking the first five's away, and another
+        // new one, before that one is answered.
+        let item = |node: i64| match node {
+            1..=10 if node % 2 == 0 => json!({"type": "function_call_output",
+                "call_id": format!("c{}", node - 1), "output": "In the margin."}),
+            13 => json!({"type": "function_call", "call_id": "c13", "name": margin::TOOL,
+                "arguments": json!({"id": "n1", "remove": true}).to_string()}),
+            _ => json!({"type": "function_call", "call_id": format!("c{node}"),
+                "name": margin::TOOL,
+                "arguments": json!({"id": format!("n{node}"), "markdown": "-"}).to_string()}),
+        };
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("bots") => json!({"bots": [{"name": "calc.add", "bot_id": 10}]}),
+            Some("history_nodes") => {
+                let from = asked["min_node"].as_i64().unwrap();
+                json!({"nodes": (from..=14).map(|node| json!({"node": node}))
+                    .collect::<Vec<_>>()})
+            }
+            Some("history_items") => json!({"items": (asked["nodes"].as_array().unwrap().iter())
+                .map(|node| json!({"node": node, "item": item(node.as_i64().unwrap())}))
+                .collect::<Vec<_>>()}),
+            _ => json!({}),
+        })
+        .await;
+        let store = std::env::temp_dir().join(unique("together-store"));
+        std::fs::create_dir_all(&store).unwrap();
+        let key = reactions::key(&std::fs::canonicalize(&store).unwrap(), 10);
+        let answer = |call: &'static str, id: &'static str| {
+            let note = json!({"id": id, "markdown": "-"});
+            let (client, store) = (client.clone(), store.clone());
+            async move { margin::answer(&client, &store, "calc.add", (call, &note)).await }
+        };
+        // The first made takes the sixth place, whichever is answered first.
+        assert!(
+            answer("c12", "n12")
+                .await
+                .is_err_and(|(code, _)| code == "margin_full")
+        );
+        assert_eq!(answer("c11", "n11").await, Ok("In the margin.".into()));
+        assert!(
+            answer("c12", "n12")
+                .await
+                .is_err_and(|(code, _)| code == "margin_full")
+        );
+        // A removal not answered yet makes no room: it may yet fail.
+        assert!(
+            answer("c14", "n14")
+                .await
+                .is_err_and(|(code, _)| code == "margin_full")
+        );
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".agent/sonny/margin");
+        let _ = std::fs::remove_file(home.join(format!("{key}.answered.json")));
+        let _ = std::fs::remove_dir_all(&store);
     }
 
     #[tokio::test]
@@ -21193,6 +21439,8 @@ mod tests {
         let update = json!({"id": "routing", "markdown": "a to c"});
         app.daemon(turn_event("tool_started", 3, call("m2", update)))
             .await;
+        app.daemon(turn_event("tool_completed", 3, json!({"call_id": "m2"})))
+            .await;
         app.fold_notes(false);
         assert_eq!(texts(&app)[..], ["✎ Routing today", "a to c", "after"]);
         // With room for the margin, its marker alone again.
@@ -21205,6 +21453,8 @@ mod tests {
         // marker says so.
         let retitle = json!({"id": "routing", "title": "Routing now", "markdown": "a to c"});
         app.daemon(turn_event("tool_started", 3, call("m3", retitle)))
+            .await;
+        app.daemon(turn_event("tool_completed", 3, json!({"call_id": "m3"})))
             .await;
         app.fold_notes(true);
         assert_eq!(texts(&app)[..], ["✎ Routing now · in the margin", "after"]);

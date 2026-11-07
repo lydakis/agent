@@ -292,7 +292,8 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
-| The most notes a margin holds | `[sonny] margin_notes` (20 by default, at least 1; past it the oldest goes) | |
+| The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
+| The most lines a margin note runs to | `[sonny] margin_note_lines` (12 by default, at least 1, counted in the note's text; a longer one is refused, and the agent told to show a file instead) | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
@@ -676,6 +677,14 @@ way `/react` does, and each note in the margin has its own `↩`.
   access`, `⏸ ask me`, `⊘ read only`. Full access's mark is in the text's
   own weight rather than muted (no hue: yellow is for what needs you),
   and on a narrow window the mark stays when the word goes.
+
+  A pick reaches the agent and every agent it made, and those they made,
+  and any it makes later takes its row too. A muted line under the rows
+  says so before you pick, with the count, as in `Reaches tally lead, its
+  2 agents and any new ones; 1 is busy and switches when its turn ends`:
+  an agent in a turn keeps its old permissions until the turn ends.
+
+  ![/permissions with the line under its rows: Reaches tally lead, its agent and any new ones; 1 is busy and switches when its turn ends](../docs/sonny/permissions-reach.png)
 
   ![/permissions: Sonny's four rows, then one of the config's](../docs/sonny/permissions.png)
 

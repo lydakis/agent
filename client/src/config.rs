@@ -43,7 +43,8 @@
 //! verbose = true                # every tool call drawn, not the clean view
 //! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
-//! margin_notes = 40             # the most notes a margin holds, 20 by default; past it the oldest goes
+//! margin_notes = 8              # the most notes a margin holds, 6 by default; past it a new one is refused
+//! margin_note_lines = 20         # the most lines a note's Markdown runs to, 12 by default; past it the note is refused
 //! agent_opens = "beside"        # a click on an agent's name: "tab", the default, or "beside"
 //! suggest = false               # no guess at the next message, on by default
 //! commons = false               # agents go without the commons, on by default
@@ -60,7 +61,6 @@
 //! sky_haiku_hold = 10           # minutes the title is held before it can pass
 //! tool_processes = 8            # processes Sonny runs for agents at once in all: tool calls 3/4, goal checks 1/4; 0, the default, four times the CPUs
 //! lookout_waiting = 4096        # events from sources that wait for one agent, 1024 by default; past it newer ones are not kept, and its next note says so; 0 no limit
-//! lookout_rest_minutes = 30     # longest news without a digest waits for a busy agent to rest, 15 by default; news with a digest waits its digest; then it cuts in; 0 waits for rest however long
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
 //!
@@ -451,9 +451,12 @@ pub struct Sonny {
     pub text_width: u64,
     /// When a note the agent puts up or changes opens the margin.
     pub margin_opens: MarginOpens,
-    /// The most notes a margin holds: a new one past it lets the oldest
-    /// go. At least 1.
+    /// The most notes a margin holds: a new one past it is refused, and
+    /// the agent told why. At least 1.
     pub margin_notes: u64,
+    /// The most lines a note's Markdown runs to, counted in the text, not
+    /// the rows drawn: a longer one is refused. At least 1.
+    pub margin_note_lines: u64,
     /// Where a click on an agent's name takes the person; a right click
     /// takes them to the other.
     pub agent_opens: AgentOpens,
@@ -510,10 +513,6 @@ pub struct Sonny {
     /// newer ones are not kept, and its next note says how many, from
     /// where and when. 0 for no limit.
     pub lookout_waiting: u64,
-    /// The minutes news with no digest waits for a busy agent to rest,
-    /// before it cuts into the running turn; news with a digest waits its
-    /// digest. 0 waits for rest however long.
-    pub lookout_rest_minutes: u64,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
     /// The agent-browser action categories that the `browser` tool puts
@@ -564,7 +563,12 @@ pub const TEXT_WIDTH: u64 = 100;
 /// The most notes a margin holds unless `margin_notes` says otherwise:
 /// a working set to glance at, as Codex's plan and Claude Code's todo
 /// list are, not an archive.
-pub const MARGIN_NOTES: u64 = 20;
+pub const MARGIN_NOTES: u64 = 6;
+
+/// The most lines a note's Markdown runs to unless `margin_note_lines`
+/// says otherwise: something to glance at beside the conversation; a
+/// longer text goes in a file the note shows.
+pub const MARGIN_NOTE_LINES: u64 = 12;
 
 /// The narrowest `text_width` other than 0, the margin's own least width:
 /// a narrower column wraps a path or a line of code at every turn.
@@ -619,13 +623,13 @@ impl Default for Sonny {
             sky_haiku_hold: 10,
             tool_processes: 0,
             lookout_waiting: 1024,
-            lookout_rest_minutes: 15,
             chime: true,
             verbose: false,
             text_width: TEXT_WIDTH,
             start_at_boot: false,
             margin_opens: MarginOpens::default(),
             margin_notes: MARGIN_NOTES,
+            margin_note_lines: MARGIN_NOTE_LINES,
             agent_opens: AgentOpens::default(),
             sources: Vec::new(),
             browser_confirm: BROWSER_CONFIRM.map(str::to_owned).to_vec(),
@@ -1219,6 +1223,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "text_width",
                 "margin_opens",
                 "margin_notes",
+                "margin_note_lines",
                 "agent_opens",
                 "suggest",
                 "start_at_boot",
@@ -1236,7 +1241,6 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_hold",
                 "tool_processes",
                 "lookout_waiting",
-                "lookout_rest_minutes",
                 "unsandboxed",
                 "default_permissions",
                 "browser_confirm",
@@ -1329,9 +1333,9 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_hold" => Some(&mut config.sonny.sky_haiku_hold),
                 "tool_processes" => Some(&mut config.sonny.tool_processes),
                 "lookout_waiting" => Some(&mut config.sonny.lookout_waiting),
-                "lookout_rest_minutes" => Some(&mut config.sonny.lookout_rest_minutes),
                 "text_width" => Some(&mut config.sonny.text_width),
                 "margin_notes" => Some(&mut config.sonny.margin_notes),
+                "margin_note_lines" => Some(&mut config.sonny.margin_note_lines),
                 _ => None,
             } {
                 *count = (value.as_integer())
@@ -1347,6 +1351,11 @@ fn parse(text: &str) -> Result<Config, String> {
                 if key == "margin_notes" && config.sonny.margin_notes == 0 {
                     return Err(format!(
                         "{name}.{key} is the most notes a margin holds, at least 1, not 0"
+                    ));
+                }
+                if key == "margin_note_lines" && config.sonny.margin_note_lines == 0 {
+                    return Err(format!(
+                        "{name}.{key} is the most lines a margin note runs to, at least 1, not 0"
                     ));
                 }
                 continue;
@@ -2031,6 +2040,13 @@ mod tests {
         assert_eq!(
             notes("[sonny]\nmargin_notes = 0"),
             Err("sonny.margin_notes is the most notes a margin holds, at least 1, not 0".into())
+        );
+        let lines = |text: &str| parse(text).map(|config| config.sonny.margin_note_lines);
+        assert_eq!(lines(""), Ok(MARGIN_NOTE_LINES));
+        assert_eq!(lines("[sonny]\nmargin_note_lines = 30"), Ok(30));
+        assert_eq!(
+            lines("[sonny]\nmargin_note_lines = 0"),
+            Err("sonny.margin_note_lines is the most lines a margin note runs to, at least 1, not 0".into())
         );
         assert_eq!(config.sonny.task_depth, 2);
         assert_eq!(

@@ -149,9 +149,15 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "sonny.margin_notes",
-        about: "the most notes a margin holds; past it the oldest goes",
+        about: "the most notes a margin holds; past it the agent's new note is refused, and it is told why",
         values: &[],
-        default: "20",
+        default: "6",
+    },
+    Setting {
+        key: "sonny.margin_note_lines",
+        about: "the most lines a margin note's text runs to; a longer one is refused, and the agent told to show a file instead",
+        values: &[],
+        default: "12",
     },
     Setting {
         key: "sonny.agent_opens",
