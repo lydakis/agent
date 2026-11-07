@@ -863,6 +863,11 @@ impl Updates {
                 if !self.live {
                     self.resolving.ended(name, turn);
                 }
+                // Its end, though no news, answers a note of its silence or
+                // its wait for approval still to go.
+                if self.live && wrote {
+                    self.answered(name, turn);
+                }
                 // A steer's turn is part of the turn it joined.
                 if !self.live || status == "steered" || noted || wrote {
                     return;
@@ -1162,6 +1167,23 @@ impl Updates {
     }
 
     /// Whether who asked for a turn that just ended is still to be read.
+    /// A note still to go of `name`'s turn `turn` waiting for approval or
+    /// gone silent, answered by its end: no news any more.
+    fn answered(&mut self, name: &str, turn: i64) {
+        let Some(at) = self.tasks.iter().position(|(task, _)| task == name) else {
+            return;
+        };
+        let news = &mut self.tasks[at].1;
+        if (news.act.as_ref()).is_some_and(|asked| {
+            asked.turn == turn && [APPROVAL, QUIET].contains(&asked.status.as_str())
+        }) {
+            news.act = None;
+        }
+        if news.empty() {
+            self.tasks.remove(at);
+        }
+    }
+
     /// Whether the turn of `name`'s that just ended wrote to the lead and
     /// completed: no news, so its reply goes unread.
     pub fn wrote_back(&self, name: &str, turn: i64) -> bool {
@@ -2255,6 +2277,14 @@ mod tests {
         let ended = json!({"status": "completed"});
         updates.event(&ev("shop.fix", Some(4), "turn_finished", ended), now);
         assert!(updates.wrote_back("shop.fix", 4));
+        assert!(!updates.news(), "{}", text(&updates.take()));
+        // A silence noted before it wrote is answered by its end too.
+        updates.event(&ev("shop.fix", Some(8), "accepted", lead.clone()), now);
+        updates.expire(now + QUIET_AFTER);
+        assert!(updates.news());
+        wrote(&mut updates, 23, "shop.fix", 8);
+        let ended = json!({"status": "completed"});
+        updates.event(&ev("shop.fix", Some(8), "turn_finished", ended), now);
         assert!(!updates.news(), "{}", text(&updates.take()));
         // Its next turn wrote nothing: told as ever, and so is a turn that
         // wrote but failed, or wrote and marked itself done.
