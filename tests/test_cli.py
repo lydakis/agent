@@ -1016,13 +1016,15 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(configured['result']['changed'], ['env'])
         # Its own shell sees it, and so does a bot its shell makes, which
         # takes its creator's whatever it asks for.
-        nested = ('"$AGENT_BIN" run --no-spawn --new --bot Alice -- '
+        nested = ('"$AGENT_BIN" run --detach --no-spawn --new --bot Alice -- '
                   '\'shell:printf "%s" "$SONNY_STATE" > alice-state\'')
-        self.agent('run', *self.again, '--bot', 'Bob', f'shell:printf "%s" "$SONNY_STATE" > bob-state; {nested}')
+        ran = self.agent('run', *self.again, '--bot', 'Bob', '--pretty',
+                         f'shell:printf "%s" "$SONNY_STATE" > bob-state; {nested}')
         deadline = time.monotonic() + 5
         while not (self.path / 'alice-state').exists() and time.monotonic() < deadline:
             time.sleep(.02)
         self.assertEqual((self.path / 'bob-state').read_text(), '/state/Bob')
+        self.assertTrue((self.path / 'alice-state').exists(), ran.stdout)
         self.assertEqual((self.path / 'alice-state').read_text(), '/state/Bob')
         alice = control.request('inspect', bot='Alice')['result']
         self.assertEqual(alice['settings']['env'], {'SONNY_STATE': '/state/Bob'})

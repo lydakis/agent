@@ -15147,6 +15147,7 @@ mod tests {
                 invalid: Some("x".into()),
                 ..Default::default()
             }),
+            env: [("A".to_owned(), "1".to_owned())].into(),
         };
         let mut names: Vec<String> = settings_map(&all)
             .unwrap()

@@ -4466,7 +4466,7 @@ impl App {
                 .collect(),
             declared: record["declared"].clone(),
             mode: approvals::mode(record),
-            state: state::of(record, &bot),
+            state: state::of(record, bot),
             env: None,
             choosing: None,
             rows: Vec::new(),
