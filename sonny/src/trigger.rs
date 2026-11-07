@@ -3970,6 +3970,7 @@ async fn adopt(client: &Client, name: &str, id: i64) {
         && let Some(fields) = crate::approvals::regate(
             &record,
             crate::approvals::default(),
+            name,
             &mut Default::default(),
         )
     {

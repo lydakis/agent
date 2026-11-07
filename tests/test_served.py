@@ -161,9 +161,13 @@ class ServedToolTests(ModelFixture):
         # It works in a sandbox, reaching the network, and may commit to the
         # repository its worktree shares.
         self.assertEqual(record['settings']['sandbox'], 'workspace-write')
-        # and writes Sonny's zen folder, as every sandboxed row does.
+        # and writes Sonny's zen folder, as every sandboxed row does, and its
+        # lead's state folder, made for the lead alone.
+        state = self.path / '.local/state/sonny/agents/calc.lead'
+        self.assertEqual(state.stat().st_mode & 0o777, 0o700)
         self.assertEqual(sorted(record['settings']['writable']),
-                         sorted([str((repo / '.git').resolve()), str((self.path / '.agent/sonny/zen').resolve())]))
+                         sorted([str((repo / '.git').resolve()), str((self.path / '.agent/sonny/zen').resolve()),
+                                 str(state.resolve())]))
         self.assertTrue(record['settings']['network'])
         # The brief names the task's copy, not the lead's folder.
         turns = self.daemon.request('turns', bot='calc.fix')['result']['turns']

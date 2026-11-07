@@ -83,6 +83,7 @@ mod snapshot;
 mod sound;
 mod stamp;
 mod started;
+mod state;
 mod status;
 mod suggest;
 mod switch;
@@ -681,8 +682,9 @@ async fn spread_pass(
             passed.waiting.push(name);
             continue;
         };
+        let named = name.clone();
         let walked = tokio::task::spawn_blocking(move || {
-            let fields = approvals::regate(&record, mode, &mut sandboxes);
+            let fields = approvals::regate(&record, mode, &named, &mut sandboxes);
             (fields, sandboxes)
         })
         .await;
@@ -1647,7 +1649,11 @@ async fn run() -> Result<(), String> {
         && let Some(mode) = app.mode.filter(|mode| *mode != "full")
         && !approvals::sandboxed_as(
             &bot,
-            &approvals::sandbox(mode, std::path::Path::new(&app.workspace)),
+            &approvals::sandbox(
+                mode,
+                std::path::Path::new(&app.workspace),
+                app.state.as_deref(),
+            ),
         )
     {
         app.gating = Some(mode);
@@ -1810,9 +1816,18 @@ pub(crate) fn made(
     asked["tools"] = json!(tools);
     asked["declare"] = declare.clone();
     asked["compaction_instructions"] = json!(agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS);
-    // Confined from the start, as the row it is made in confines it.
+    // Confined from the start, as the row it is made in confines it, and
+    // writing the state folder of the agent that makes it, or its own.
     let mode = approvals::default();
-    let mut settings = approvals::sandbox(mode, workspace);
+    let owner = (asked["created_by"].as_str().map(str::to_owned))
+        .or_else(|| {
+            std::env::var("AGENT_BOT")
+                .ok()
+                .filter(|bot| !bot.is_empty())
+        })
+        .or_else(|| asked["bot"].as_str().map(str::to_owned));
+    let state = owner.as_deref().and_then(state::folder);
+    let mut settings = approvals::sandbox(mode, workspace, state.as_deref());
     if let Some(ttl) = agent_client::policy::cache_ttl(model) {
         settings.insert("cache_ttl".into(), json!(ttl));
     }
@@ -3082,6 +3097,8 @@ struct App {
     declared: Value,
     /// Its permissions row, when it is one of Sonny's.
     mode: Option<&'static str>,
+    /// The state folder its sandbox writes, its lead's ([`state`]).
+    state: Option<String>,
     /// `/permissions` or `/fast`, open over the composer.
     choosing: Option<(Choice, list::Picker)>,
     /// The rows `/permissions` lists, as the config had them when it opened.
@@ -4439,6 +4456,7 @@ impl App {
                 .collect(),
             declared: record["declared"].clone(),
             mode: approvals::mode(record),
+            state: state::of(record, &bot),
             choosing: None,
             rows: Vec::new(),
             reviewing: std::collections::HashSet::new(),
@@ -4924,7 +4942,7 @@ impl App {
             // An agent's sandbox goes with its row, a lead's, a task's or
             // a side chat's, which the daemon holds within its agent's.
             let workspace = std::path::Path::new(&self.workspace);
-            settings.extend(approvals::sandbox(mode, workspace));
+            settings.extend(approvals::sandbox(mode, workspace, self.state.as_deref()));
         }
         if !settings.is_empty() {
             asked["settings"] = Value::Object(settings);

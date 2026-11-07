@@ -945,7 +945,13 @@ async fn make(
     };
     let declare = json!(crate::declared::tools(crate::served::Role::of(0)));
     let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
-    let mut settings = crate::approvals::sandbox(mode, dir);
+    // Writing its own state folder, by the name it is made under.
+    let lead = (bot.map(str::to_owned)).or_else(|| {
+        let info = agent_client::project::read(dir).ok()?;
+        info["coordinator"].as_str().map(str::to_owned)
+    });
+    let state = lead.as_deref().and_then(crate::state::folder);
+    let mut settings = crate::approvals::sandbox(mode, dir, state.as_deref());
     let config = agent_client::config::load()?;
     if config.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
