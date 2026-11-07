@@ -26,6 +26,7 @@ mod config;
 mod declared;
 mod desktop;
 mod diff;
+mod done_check;
 mod embed;
 mod exec;
 mod footer;
@@ -724,6 +725,14 @@ async fn read_status(
         read.push(name.to_owned());
         if !running {
             idle.push(name.to_owned());
+        }
+        // What the done check last found, while no turn since began.
+        if let Some(answer) = done_check::read(&store, name, bot["bot_id"].as_i64().unwrap_or(-1))
+            .filter(|answer| done_check::holds(answer, turn["turn"].as_i64(), running))
+        {
+            let now = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+                .map_or(0, |d| d.as_secs() as i64);
+            step = answer.said(now);
         }
         if let Some(ask) = &ask {
             step = match waiting::is_mark(ask) {
@@ -3544,6 +3553,9 @@ struct App {
     switch_to: Option<String>,
     started: Instant,
     fleet: Option<Fleet>,
+    /// A lead's window's look for tasks idle long enough to ask whether
+    /// they are done ([`done_check`]).
+    done_sweep: done_check::Sweep,
     /// This window, noted as the one the person uses each time they do,
     /// so that its project's agents open where they look.
     marker: Option<mux::Marker>,
@@ -5138,6 +5150,7 @@ impl App {
             switch_to: None,
             started: Instant::now(),
             fleet: None,
+            done_sweep: Default::default(),
             marker: None,
             held: Vec::new(),
             seen_node: 0,
@@ -5503,6 +5516,10 @@ impl App {
                     }
                 }
                 _ = tick.tick() => {
+                    if self.project.is_some() {
+                        let glob = self.scope().glob;
+                        self.done_sweep.look(&self.client, &self.store(), &glob);
+                    }
                     changed |= self.moving()
                         || drawn.is_none_or(|at| at.elapsed() >= IDLE_FRAME);
                 }

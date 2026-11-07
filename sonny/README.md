@@ -800,7 +800,14 @@ way `/react` does, and each note in the margin has its own `↩`.
   nothing is left to do in it, such as when its pull request merged or
   you dropped the work, and the lead can mark any of its tasks done the
   same way; the lead hears when a task marked itself done, and the task's
-  window closes once its turn ends. New work sent to the task reopens it. Each agent's
+  window closes once its turn ends. New work sent to the task reopens it.
+  A task idle for `[sonny] task_done_check` hours (8 by default, 0
+  never) is asked by its lead's window, through a copy of it with no
+  tools, whether its work is done: a yes marks it done, its row saying
+  `marked done by the check at 14:02: its pull request merged`, and a no
+  says `checked at 14:02, work left: …` until its next turn; either way it
+  is not asked again until another of its turns ends. Leads are never
+  asked, and with no window of the project open nothing is. Each agent's
   time is how long its running turn has been at it, or how long its last
   turn took. Beside its model each agent names the profile it runs
   as, `lead` and `task` too, which the footer leaves out (it names a
