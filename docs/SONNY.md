@@ -710,7 +710,10 @@ meanwhile, and the refused cleanup stays in history for the person to read.
 The refusal is written to `.cleanup` first, so a `finish` cut short is
 carried on by the next one rather than closed as a clean cleanup; once
 memory is back at the start, `.cleanup` says so too, and a later `finish`
-only puts back what others saved since, never going back again. `changed` fails with `unchanged`
+only puts back what others saved since, never going back again. A
+`cleanup start` that finds such a refusal closes it the same way and
+answers `loss_guard`, so no run carries on a refused cleanup, and once a
+cleanup is refused its own agents' saves are put back like the others'. `changed` fails with `unchanged`
 when the folder matches the last commit, which is what keeps the automation
 quiet.
 
