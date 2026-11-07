@@ -3382,9 +3382,7 @@ struct Watch {
     rows: Vec<status::Row>,
     /// When the rows were read: their times count on from here.
     read: Instant,
-    /// The lookout's line for the lead.
-    lookout: String,
-    /// What is wrong around the agents, under the lookout's line.
+    /// What is broken around the agents, under the heading.
     alerts: Vec<status::Alert>,
     /// The groups that fold, opened with a click or their key.
     open: Vec<status::Group>,
@@ -3406,6 +3404,10 @@ struct Watch {
     /// The tasks whose helpers `/status` shows under them: → or a click
     /// opens them, ← or a click folds them again.
     helpers: Vec<String>,
+    /// Whether `/status` says more than each agent's state and time: what
+    /// each tracks, and the picked one's model, profile and latest step.
+    /// `m` shows it and hides it again; it opens without.
+    more: bool,
 }
 
 impl Watch {
@@ -9626,7 +9628,6 @@ impl App {
             project,
             rows,
             read: Instant::now(),
-            lookout: self.lookout_line(),
             alerts,
             open: Vec::new(),
             background: None,
@@ -9636,6 +9637,7 @@ impl App {
             picked: None,
             pick: None,
             helpers: Vec::new(),
+            more: false,
         });
         // Picked already, the agent named last in what shows: Enter opens
         // the one the conversation just pointed to.
@@ -9668,7 +9670,6 @@ impl App {
             project,
             rows: Vec::new(),
             read: Instant::now(),
-            lookout: String::new(),
             alerts: Vec::new(),
             open: Vec::new(),
             background: Some(view),
@@ -9678,6 +9679,7 @@ impl App {
             picked: None,
             pick: None,
             helpers: Vec::new(),
+            more: false,
         });
         self.open_pane(pane::Pane::card("background", STATUS_KEYS));
     }
@@ -9693,7 +9695,6 @@ impl App {
             project,
             rows: Vec::new(),
             read: Instant::now(),
-            lookout: String::new(),
             alerts: Vec::new(),
             open: Vec::new(),
             background: None,
@@ -9703,6 +9704,7 @@ impl App {
             picked: None,
             pick: None,
             helpers: Vec::new(),
+            more: false,
         });
         self.open_pane(pane::Pane::card("usage", STATUS_KEYS));
     }
@@ -9718,7 +9720,6 @@ impl App {
             project: self.scope().project,
             rows: Vec::new(),
             read: Instant::now(),
-            lookout: String::new(),
             alerts: Vec::new(),
             open: Vec::new(),
             background: None,
@@ -9728,6 +9729,7 @@ impl App {
             picked: None,
             pick: None,
             helpers: Vec::new(),
+            more: false,
         });
         self.open_pane(pane::Pane::card("commons", STATUS_KEYS));
     }
@@ -9739,7 +9741,6 @@ impl App {
             project: self.scope().project,
             rows: Vec::new(),
             read: Instant::now(),
-            lookout: String::new(),
             alerts: Vec::new(),
             open: Vec::new(),
             background: None,
@@ -9749,6 +9750,7 @@ impl App {
             picked: None,
             pick: None,
             helpers: Vec::new(),
+            more: false,
         });
         self.open_pane(pane::Pane::card("sky", STATUS_KEYS));
     }
@@ -9793,21 +9795,19 @@ impl App {
             }
             return;
         }
-        let lookout = self.lookout_line();
         let alerts = self.status_alerts().await;
         if let Ok((_, rows)) = self.status_rows().await
             && let Some(watch) = &mut self.watch
         {
             watch.rows = rows;
             watch.read = Instant::now();
-            watch.lookout = lookout;
             watch.alerts = alerts;
         }
     }
 
-    /// What `/status` says is wrong around the agents: the daemon's
-    /// companions that keep restarting, and the skills the lead is offered
-    /// whose front matter needs a fix.
+    /// What `/status` says is broken around the agents: the daemon's
+    /// companions that are down or keep restarting, and turns held on a
+    /// cause the person can fix. Nothing when all is well.
     async fn status_alerts(&self) -> Vec<status::Alert> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -9822,15 +9822,6 @@ impl App {
         // counted by the daemon, named from the first page.
         if let Ok(listed) = self.client.request("held", json!({"limit": 64})).await {
             alerts.extend(status::held_alerts(&listed));
-        }
-        let folder = (self
-            .client
-            .request("inspect", json!({"bot": self.bot}))
-            .await
-            .ok())
-        .and_then(|bot| bot["workspace"].as_str().map(PathBuf::from));
-        if let Some(skills) = folder.and_then(|f| agent_client::policy::skills(&f).ok()) {
-            alerts.extend(status::skill_alerts(&skills));
         }
         alerts
     }
@@ -9887,15 +9878,6 @@ impl App {
         let seen = &self.failures.1;
         self.failed = failures.iter().filter(|f| !seen.contains(*f)).count();
         self.failures.0 = failures;
-    }
-
-    /// What the lookout does for this window's lead.
-    fn lookout_line(&self) -> String {
-        let lookout = match &self.project {
-            Some(_) => lookout::status(&self.options.store, &self.bot),
-            None => String::new(),
-        };
-        tool_host::with_status(lookout, &self.options.store)
     }
 
     /// The agents `/status` and `/background` cover: the project's, and
@@ -10566,6 +10548,17 @@ impl App {
                         && !switches(key)
                         && let Some(view) = self.watch.as_mut().and_then(|w| w.sky.as_mut())
                         && view.press(key.code) => {}
+                    // `/status` says more of each agent, or less again.
+                    KeyCode::Char('m')
+                        if pane.is_card()
+                            && let Some(watch) = &mut self.watch
+                            && watch.background.is_none()
+                            && watch.usage.is_none()
+                            && watch.commons.is_none()
+                            && watch.sky.is_none() =>
+                    {
+                        watch.more = !watch.more
+                    }
                     // `/status` opens or folds its idle and done tasks.
                     KeyCode::Char(key @ ('i' | 'd'))
                         if pane.is_card()
@@ -15189,7 +15182,7 @@ fn watch_card(
         &rows,
         width,
         &watch.open,
-        status::Details::Picked(None),
+        status::Details::Quiet,
         &watch.helpers,
     );
     let mut agents = listed
@@ -15208,15 +15201,14 @@ fn watch_card(
         &rows,
         width,
         &watch.open,
-        status::Details::Picked(picked.as_deref()),
+        match watch.more {
+            true => status::Details::Picked(picked.as_deref()),
+            false => status::Details::Quiet,
+        },
         &watch.helpers,
     );
-    // The lookout's line goes under the heading, what is wrong under it,
-    // and the agents' under that.
+    // What is broken goes under the heading, and the agents under that.
     let mut above: Vec<Line<'static>> = Vec::new();
-    if !watch.lookout.is_empty() {
-        above.push(Line::from(watch.lookout.clone()).dim());
-    }
     for alert in &watch.alerts {
         above.extend(status::alert_lines(alert, width.saturating_sub(1)));
     }
@@ -15291,6 +15283,10 @@ fn status_keys(watch: &Watch, keys: &[&str]) -> String {
         };
         said.push_str(&format!(" · {key} {verb} {name}"));
     }
+    said.push_str(match watch.more {
+        true => " · m less",
+        false => " · m more",
+    });
     said.push_str(" · esc close");
     said
 }
@@ -21956,7 +21952,6 @@ mod tests {
                 row("neg", "calc.neg", status::Group::Working),
             ],
             read: Instant::now(),
-            lookout: "Lookout · on".into(),
             alerts: Vec::new(),
             open: Vec::new(),
             background: None,
@@ -21966,6 +21961,7 @@ mod tests {
             picked: None,
             pick: None,
             helpers: Vec::new(),
+            more: false,
         };
         // A named lead's window: its own row opens nothing, and the
         // folder's other lead opens by its own name, not its label.
@@ -22443,7 +22439,6 @@ mod tests {
             project: "calc".into(),
             rows: vec![row("add"), row("neg")],
             read: Instant::now(),
-            lookout: String::new(),
             alerts: Vec::new(),
             open: Vec::new(),
             background: None,
@@ -22453,6 +22448,7 @@ mod tests {
             picked: None,
             pick: None,
             helpers: Vec::new(),
+            more: false,
         });
         let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
         let pick = |app: &App| app.watch.as_ref().unwrap().pick;
