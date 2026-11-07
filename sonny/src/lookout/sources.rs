@@ -644,13 +644,16 @@ async fn run(
             .lock()
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default();
+        // A place to send it first, so a run stopped while it waits leaves
+        // its health as it was: what it tells is never judged told unsent.
+        let Ok(place) = sent.reserve().await else {
+            return;
+        };
         let told = (health.lock().ok()).and_then(|mut health| {
             health.after(&source, failed, stderr, std::time::Instant::now())
         });
-        if let Some(told) = told
-            && sent.send(Said::Event(Box::new(told))).await.is_err()
-        {
-            return;
+        if let Some(told) = told {
+            place.send(Said::Event(Box::new(told)));
         }
         tokio::time::sleep(every).await;
     }
