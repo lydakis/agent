@@ -1098,7 +1098,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   question opens it. A pick of yours on a withdrawn card, or on one the
   agent closed for you, still answers it. Before it asks, an agent runs
   `sonny ask list`: the newest 20 questions its lead's agents asked in the
-  last week, each with who asked it, when, and where it stands (`--before NODE` for older
+  last week, each with who asked it, when, what a yes covers, and where it stands (`--before NODE` for older
   ones, `--all` for every agent, `--json`), so it goes with an answer you
   already gave instead of asking again; the agent reads and decides, and
   nothing matches wording. The lead does not wait on you blindly: each

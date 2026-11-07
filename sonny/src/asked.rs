@@ -80,7 +80,7 @@ pub fn cli(args: &[String]) -> i32 {
             0
         }
         Ok((found, next)) => {
-            print!("{}", text(&found, next));
+            print!("{}", text(&found, next, asking.all));
             0
         }
         Err(error) => {
@@ -183,7 +183,7 @@ async fn newest(
     let mut more = false;
     for bot in &bots {
         let floor = floor(&kept);
-        if floor.is_some_and(|floor| bot["head"].as_i64() <= Some(floor)) {
+        if floor.is_some_and(|floor| bot["head"].as_i64() < Some(floor)) {
             more = true;
             break;
         }
@@ -194,14 +194,28 @@ async fn newest(
             found.bot_id = bot["bot_id"].as_i64().unwrap_or(i64::MAX);
             keep(&mut kept, found);
         }
-        kept.sort_by_key(|found| std::cmp::Reverse(found.node));
-        if kept.len() > LISTED {
-            kept.truncate(LISTED);
-            more = true;
-        }
+        more |= trim(&mut kept);
     }
     let next = more.then(|| kept.last().map(|found| found.node)).flatten();
     Ok((kept, next))
+}
+
+/// `kept` newest first and cut to [`LISTED`] questions, and whether any
+/// were cut. A node's questions stay together, one more or less, as the
+/// next list starts before a node: an Anthropic message holds every call
+/// it made.
+fn trim(kept: &mut Vec<Found>) -> bool {
+    kept.sort_by_key(|found| std::cmp::Reverse(found.node));
+    let Some(edge) = kept.get(LISTED - 1).map(|found| found.node) else {
+        return false;
+    };
+    let whole = LISTED
+        + (kept[LISTED..].iter())
+            .take_while(|f| f.node == edge)
+            .count();
+    let cut = whole < kept.len();
+    kept.truncate(whole);
+    cut
 }
 
 /// Keeps `found` in `kept`, once: a fork, a side chat among them, shares
@@ -224,8 +238,10 @@ fn floor(kept: &[Found]) -> Option<i64> {
         .flatten()
 }
 
-/// The questions `bot` put after node `floor` and before node `before`,
-/// at most [`LISTED`], newest first, and whether it holds more.
+/// The questions `bot` put from node `floor` on and before node `before`,
+/// newest first, about [`LISTED`] and a node's whole, and whether it holds
+/// more. The floor's own node is read too: a fork read first may keep a
+/// question it shares with its source, which [`keep`] gives the source.
 async fn asked(
     client: &Client,
     bot: &str,
@@ -241,7 +257,7 @@ async fn asked(
         let page = client
             .request(
                 "history_nodes",
-                json!({"bot": bot, "from": from, "limit": PAGE, "min_node": floor.map(|f| f + 1)}),
+                json!({"bot": bot, "from": from, "limit": PAGE, "min_node": floor}),
             )
             .await
             .map_err(failed)?;
@@ -272,13 +288,16 @@ async fn asked(
                 let Some(turn) = listed.and_then(|n| n["turn"].as_i64()) else {
                     continue;
                 };
-                for (ask, state) in reading.entry(turn, entry) {
-                    if before.is_some_and(|before| node >= before) {
-                        continue;
-                    }
-                    if found.len() == LISTED {
-                        return Ok((found, true));
-                    }
+                let asks = reading.entry(turn, entry);
+                if before.is_some_and(|before| node >= before) || asks.is_empty() {
+                    continue;
+                }
+                // A node's questions stay together, as the next list
+                // starts before a node.
+                if found.len() >= LISTED {
+                    return Ok((found, true));
+                }
+                for (ask, state) in asks {
                     found.push(Found {
                         bot: bot.to_owned(),
                         bot_id: i64::MAX,
@@ -333,7 +352,7 @@ fn now_ms() -> i64 {
 
 /// The list as an agent reads it: per question its agent, ID, age and
 /// where it stands, then the question and its options.
-fn text(found: &[Found], next: Option<i64>) -> String {
+fn text(found: &[Found], next: Option<i64>, all: bool) -> String {
     if found.is_empty() {
         return "No questions asked lately.\n".into();
     }
@@ -366,9 +385,14 @@ fn text(found: &[Found], next: Option<i64>) -> String {
         if let Some(command) = &found.ask.command {
             out += &format!("  run: {command}\n");
         }
+        // A yes covers that action, target and revision alone.
+        if let Some(covers) = &found.ask.covers {
+            out += &format!("  covers: {}\n", covers.line());
+        }
     }
     if let Some(next) = next {
-        out += &format!("More: sonny ask list --before {next}\n");
+        let all = if all { " --all" } else { "" };
+        out += &format!("More: sonny ask list{all} --before {next}\n");
     }
     out
 }
@@ -396,6 +420,8 @@ fn to_json(found: &Found) -> Value {
             .collect::<Vec<_>>(),
         "recommended": found.ask.recommended.map(|r| r + 1),
         "command": found.ask.command,
+        "covers": found.ask.covers.as_ref().map(|covers| json!({"action": covers.action,
+            "target": covers.target, "revision": covers.revision})),
         "state": state,
     });
     if let (Some(asked), Some(detail)) = (asked.as_object_mut(), detail.as_object()) {
@@ -481,7 +507,7 @@ mod tests {
             ),
             found("calc.lead", 7, State::Withdrawn("no longer needed".into())),
         ];
-        let text = text(&listed, Some(7));
+        let text = text(&listed, Some(7), false);
         assert!(text.starts_with("calc.fix  ask:12/c1  3h ago  open\n  Bump the major version?\n  1 Bump it · 2 Keep 0.x (recommends 1)\n"), "{text}");
         assert!(text.contains("calc.lead  ask:9/c1  3h ago  answered in their words, going with Keep 0.x: they said keep it\n"), "{text}");
         assert!(text.contains("withdrawn: no longer needed\n"), "{text}");
@@ -496,10 +522,159 @@ mod tests {
         assert_eq!(asked["option"], 2);
         assert_eq!(asked["recommended"], 1);
         assert_eq!(to_json(&found("x", 1, State::Aside))["state"], "set_aside");
+        // A list of every agent goes on as one; a yes says what it covers.
+        assert!(
+            super::text(&listed, Some(7), true)
+                .ends_with("More: sonny ask list --all --before 7\n")
+        );
+        let mut approving = found("calc.fix", 12, State::Answered("Bump it".into()));
+        approving.ask.covers = Some(crate::asks::Covers {
+            action: "merge".into(),
+            target: "calc#4".into(),
+            revision: Some("3f2a9c1".into()),
+        });
+        let shown = super::text(std::slice::from_ref(&approving), None, false);
+        assert!(
+            shown.contains("  covers: merge · calc#4 · at 3f2a9c1\n"),
+            "{shown}"
+        );
+        assert_eq!(
+            to_json(&approving)["covers"],
+            json!({"action": "merge", "target": "calc#4", "revision": "3f2a9c1"})
+        );
+    }
+
+    /// An entry held, by node and turn.
+    type Held = (i64, i64, Value);
+
+    /// A stand-in daemon holding `histories`: per agent its record and its
+    /// entries by node, newest first, each with its turn.
+    async fn daemon_holding(histories: Vec<(Value, Vec<Held>)>) -> std::sync::Arc<Client> {
+        crate::tests::daemon_answering(move |request| {
+            let held = (histories.iter()).find(|(bot, _)| bot["name"] == request["bot"]);
+            match request["op"].as_str() {
+                Some("bots") => {
+                    json!({"bots": histories.iter().map(|(bot, _)| bot.clone()).collect::<Vec<_>>(),
+                        "next_after": null})
+                }
+                Some("history_nodes") => {
+                    let least = request["min_node"].as_i64().unwrap_or(0);
+                    let nodes: Vec<Value> = (held.map(|(_, h)| h.as_slice()).unwrap_or_default())
+                        .iter()
+                        .filter(|(node, ..)| *node >= least)
+                        .map(|(node, turn, _)| {
+                            json!({"node": node, "turn": turn,
+                            "written_ms": now_ms()})
+                        })
+                        .collect();
+                    json!({"nodes": nodes, "next_from": null})
+                }
+                Some("history_items") => {
+                    let wanted = request["nodes"].as_array().cloned().unwrap_or_default();
+                    let items: Vec<Value> = (held.map(|(_, h)| h.as_slice()).unwrap_or_default())
+                        .iter()
+                        .filter(|(node, ..)| wanted.contains(&json!(node)))
+                        .map(|(node, _, entry)| {
+                            let mut entry = entry.clone();
+                            entry["node"] = json!(node);
+                            entry
+                        })
+                        .collect();
+                    json!({"items": items})
+                }
+                _ => json!({}),
+            }
+        })
+        .await
+    }
+
+    fn arguments() -> Value {
+        json!({"question": "Bump it?", "why": "w", "if_unanswered": "wait",
+            "options": [{"label": "Bump it", "explanation": "e"},
+                        {"label": "Keep 0.x", "explanation": "e"}]})
+    }
+
+    /// An `ask` call and its result, at `node` and the node after, as an
+    /// entry each, newest first.
+    fn asking(node: i64, turn: i64, call: &str) -> Vec<Held> {
+        vec![
+            (
+                node + 1,
+                turn,
+                json!({"item": {"type": "function_call_output", "call_id": call,
+                "output": json!({"id": call}).to_string()}}),
+            ),
+            (
+                node,
+                turn,
+                json!({"item": {"type": "function_call", "name": crate::asks::TOOL,
+                "call_id": call, "arguments": arguments().to_string()}}),
+            ),
+        ]
+    }
+
+    /// Two questions one message put share its node: a list cut there
+    /// keeps both, and the next starts past them.
+    #[tokio::test]
+    async fn a_list_keeps_a_nodes_questions_together() {
+        let mut history = Vec::new();
+        for n in (0..19).rev() {
+            history.extend(asking(100 + 2 * n, 100 + n, "c"));
+        }
+        let both = json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "p", "name": crate::asks::TOOL, "input": arguments()},
+            {"type": "tool_use", "id": "q", "name": crate::asks::TOOL, "input": arguments()}]});
+        let results = json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "p", "content": "{}"},
+            {"type": "tool_result", "tool_use_id": "q", "content": "{}"}]});
+        history.push((51, 50, json!({"item": results})));
+        history.push((50, 50, json!({"item": both})));
+        history.extend(asking(10, 10, "o"));
+        let bot = json!({"name": "calc.lead", "bot_id": 1, "head": 137});
+        let client = daemon_holding(vec![(bot.clone(), history)]).await;
+        let (found, next) = newest(&client, vec![bot.clone()], None).await.unwrap();
+        let ids: Vec<&str> = found.iter().map(|f| f.ask.id.as_str()).collect();
+        assert_eq!(ids.len(), 21);
+        assert_eq!(&ids[19..], ["ask:50/p", "ask:50/q"]);
+        assert_eq!(next, Some(50));
+        let (found, next) = newest(&client, vec![bot], next).await.unwrap();
+        let ids: Vec<&str> = found.iter().map(|f| f.ask.id.as_str()).collect();
+        assert_eq!((ids, next), (vec!["ask:10/o"], None));
+    }
+
+    /// A fork read first, its list full down to a question it shares with
+    /// its source, still gives that question to the source, as answered
+    /// there after the fork.
+    #[tokio::test]
+    async fn a_fork_read_first_leaves_its_sources_question_to_the_source() {
+        let shared = asking(1, 1, "s");
+        let mut fork = Vec::new();
+        for n in (0..19).rev() {
+            fork.extend(asking(10 + 2 * n, 10 + n, "f"));
+        }
+        fork.extend(shared.clone());
+        let ask = crate::asks::call("ask:1/s", &arguments()).unwrap();
+        let answer = json!({"from": null, "origin": null, "item": {"role": "user",
+            "content": [{"type": "input_text", "text": crate::asks::answer(&ask, "2")}]}});
+        let mut source = vec![(5, 5, answer)];
+        source.extend(shared);
+        let bots = vec![
+            json!({"name": "calc.side", "bot_id": 5, "head": 47}),
+            json!({"name": "calc.lead", "bot_id": 1, "head": 5}),
+        ];
+        let client = daemon_holding(vec![(bots[0].clone(), fork), (bots[1].clone(), source)]).await;
+        let (found, _) = newest(&client, bots, None).await.unwrap();
+        let last = found.last().unwrap();
+        assert_eq!(found.len(), 20);
+        assert_eq!(
+            (last.bot.as_str(), last.ask.id.as_str()),
+            ("calc.lead", "ask:1/s")
+        );
+        assert_eq!(last.state, State::Answered("Keep 0.x".into()));
     }
 
     fn text_of_none() -> String {
-        text(&[], None)
+        text(&[], None, false)
     }
 
     #[test]
