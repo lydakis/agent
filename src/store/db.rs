@@ -2285,12 +2285,17 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 81;
+    pub const SCHEMA: i32 = 82;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
     pub const COMPACTION_PROMPT_BYTES: usize = 2048;
     pub const COMPACTION_PROMPTS_BYTES: usize = 16 * 1024;
+    /// How much of each prompt's text its opening keeps, in characters: as
+    /// much as the longest reader takes, a compaction's kept prompt and the
+    /// one past it that says it was cut. Listings and the omitted-turns note
+    /// read openings, so none of them parses a whole prompt item.
+    pub const OPENING_CHARS: usize = Self::COMPACTION_PROMPT_BYTES + 1;
     /// Turns per retention piece: a delete or explicit prune of a large bot
     /// runs as a series of jobs this size, so other bots' work interleaves.
     /// Small, because every job of a turn in flight can land behind one
@@ -2414,6 +2419,8 @@ impl Database {
                 item BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS declined(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 item BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS openings(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                text TEXT, chars INTEGER);
             CREATE TABLE IF NOT EXISTS senders(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 bot TEXT, bot_id INTEGER, turn INTEGER, origin TEXT, person TEXT, quotes TEXT,
                 attached INTEGER);
@@ -4372,8 +4379,8 @@ impl Database {
             })));
         }
         // A source bot's turn records may be deleted while its nodes survive
-        // in a fork. Decode only prompt nodes, outside the metadata-only walk,
-        // and return bounded text rather than whole native items to Rust.
+        // in a fork. Prompt nodes' text comes from their openings, so the
+        // walk reads no item and returns bounded text to Rust.
         let mut statement = self.conn.prepare_cached(
             "WITH RECURSIVE chain(id,parent,total_bytes,turn_seq,total_thinking,pictured) AS (
                 SELECT id,parent,total_bytes-MIN(total_elided,?4),turn_seq,total_thinking,
@@ -4385,8 +4392,7 @@ impl Database {
                 WHERE c.id IS NOT ?2)
              SELECT c.id,c.total_bytes,COALESCE(p.total_bytes-MIN(p.total_elided,?4),0),c.turn_seq,
                 CASE WHEN c.turn_seq IS NOT NULL THEN
-                    (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,?3)
-                     FROM nodes WHERE id=c.id) END,c.total_thinking,c.pictured
+                    (SELECT substr(text,1,?3) FROM openings WHERE node=c.id) END,c.total_thinking,c.pictured
              FROM chain c LEFT JOIN nodes p ON p.id=c.parent ORDER BY c.id DESC",
         )?;
         // Newest first: id, own total, parent's total, ordinal, prompt,
@@ -4556,8 +4562,7 @@ impl Database {
                 FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.id IS NOT ?2 AND c.k<?5)
              SELECT c.id,c.parent,c.depth,c.total_bytes,c.turn_seq,c.child,c.child_seq,
                 CASE WHEN c.turn_seq IS NOT NULL AND c.total_bytes-c.total_thinking<=?7 AND c.depth<=?8 THEN
-                    (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,?6)
-                     FROM nodes WHERE id=c.id) END,c.total_thinking,c.pictured
+                    (SELECT substr(text,1,?6) FROM openings WHERE node=c.id) END,c.total_thinking,c.pictured
              FROM chain c WHERE (c.total_bytes-c.total_thinking<=?7 AND c.depth<=?8)
                 OR c.k=?5 OR c.id IS ?2 OR c.parent IS NULL OR (?10 AND c.turn_seq IS NOT NULL)",
         )?;
@@ -5196,8 +5201,7 @@ impl Database {
                 UNION ALL SELECT n.id,n.parent,n.turn_seq FROM nodes n JOIN chain c ON n.id=c.parent
                 WHERE c.turn_seq IS NULL OR c.turn_seq>?2)
              SELECT c.turn_seq,
-                (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,400)
-                 FROM nodes WHERE id=c.id) FROM chain c
+                (SELECT substr(text,1,400) FROM openings WHERE node=c.id) FROM chain c
              WHERE c.turn_seq>?2 ORDER BY c.turn_seq DESC",
         )?;
         let seq: Option<i64> = self
@@ -5603,9 +5607,8 @@ impl Database {
                 UNION ALL SELECT n.id,n.parent,n.turn,n.turn_seq,c.seen+(n.turn_seq IS NOT NULL)
                 FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.seen<?2)
              SELECT c.turn_seq,t.bot,c.turn,t.status,
-                    substr(json_extract(CAST(n.item AS TEXT),'$.content[0].text'),1,200),
-                    length(json_extract(CAST(n.item AS TEXT),'$.content[0].text'))
-             FROM chain c JOIN nodes n ON n.id=c.id LEFT JOIN turns t ON t.id=c.turn
+                    substr(o.text,1,200),o.chars
+             FROM chain c LEFT JOIN openings o ON o.node=c.id LEFT JOIN turns t ON t.id=c.turn
              WHERE c.turn_seq IS NOT NULL ORDER BY c.turn_seq DESC",
         )?;
         let mut rows = statement.query(params![head, limit as i64])?;
@@ -9609,6 +9612,17 @@ impl Database {
                     .execute(params![id, item])?;
                 tx.prepare_cached("UPDATE nodes SET item=? WHERE id=?")?
                     .execute(params![note, id])?;
+                // A prompt's opening says what the model is now sent.
+                if tx
+                    .prepare_cached("SELECT 1 FROM openings WHERE node=?")?
+                    .exists([id])?
+                {
+                    tx.prepare_cached(OPENING)?.execute(params![
+                        id,
+                        note,
+                        Self::OPENING_CHARS as i64
+                    ])?;
+                }
                 // A stub quotes the result, so it says the same.
                 let stub: Option<i64> = tx
                     .prepare_cached("SELECT length(item) FROM stubs WHERE node=?")?
@@ -11287,6 +11301,7 @@ impl Database {
             tx.execute("DELETE FROM elisions WHERE node=?", [id])?;
             tx.execute("DELETE FROM stubs WHERE node=?", [id])?;
             tx.execute("DELETE FROM declined WHERE node=?", [id])?;
+            tx.execute("DELETE FROM openings WHERE node=?", [id])?;
             tx.execute("DELETE FROM senders WHERE node=?", [id])?;
             tx.execute("DELETE FROM lineage WHERE node=?", [id])?;
             tx.execute("DELETE FROM nodes WHERE id=?", [id])?;
@@ -11799,12 +11814,15 @@ impl Database {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT {TURN_VIEW},COALESCE(t.workspace,b.workspace),
                     COALESCE(t.model,t.bot_model,b.provider||'/'||b.model),
-                    substr(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content[0].text') END,1,200),
-                    length(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content[0].text') END),
+                    CASE WHEN t.prompt_node IS NULL THEN substr(t.prompt,1,200)
+                        WHEN d.node IS NULL THEN substr(o.text,1,200)
+                        ELSE substr(json_extract(CAST(d.item AS TEXT),'$.content[0].text'),1,200) END,
+                    CASE WHEN t.prompt_node IS NULL THEN length(t.prompt) WHEN d.node IS NULL THEN o.chars
+                        ELSE length(json_extract(CAST(d.item AS TEXT),'$.content[0].text')) END,
                     t.delivery,COALESCE(t.reasoning,t.inherited_reasoning,
                         CASE WHEN t.bot_model IS NULL THEN b.reasoning ELSE t.bot_reasoning END),t.summary_ms,
                     t.budget_tokens,t.budget_counts
-             FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
+             FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN openings o ON o.node=t.prompt_node
              LEFT JOIN declined d ON d.node=t.prompt_node
              WHERE t.bot=?1 AND t.id>?2 AND t.id<?3 ORDER BY t.id {order} LIMIT ?4"
         ))?;
@@ -14384,6 +14402,23 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
     {
         conn.execute("ALTER TABLE turns ADD COLUMN output_schema TEXT", [])?;
     }
+    // Schema 82: each prompt keeps its opening beside it, so listings read
+    // a short row instead of parsing the whole prompt. Every stored prompt
+    // is parsed once here.
+    if from < 82 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS openings(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                text TEXT, chars INTEGER);",
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO openings(node,text,chars)
+             SELECT id,substr(text,1,?1),length(text) FROM (SELECT id,
+                json_extract(CAST(item AS TEXT),'$.content[0].text') AS text
+                FROM nodes WHERE turn_seq IS NOT NULL
+                    OR id IN (SELECT prompt_node FROM turns WHERE prompt_node IS NOT NULL))",
+            [Database::OPENING_CHARS as i64],
+        )?;
+    }
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
@@ -14739,6 +14774,9 @@ fn prompt_node(
     let weight = item.len() as i64 - pictured.extra;
     let elided = stub.as_ref().map_or(0, |stub| weight - stub.len() as i64);
     let id = insert_node(conn, parent, item, turn, elided, *pictured)?;
+    // How the prompt begins, parsed once here rather than by each read.
+    conn.prepare_cached(OPENING)?
+        .execute(params![id, item, Database::OPENING_CHARS as i64])?;
     if let Some(stub) = stub {
         conn.prepare_cached("INSERT INTO stubs(node,item) VALUES (?,?)")?
             .execute(params![id, stub])?;
@@ -14849,6 +14887,12 @@ fn insert_node(
         ])?;
     Ok(id)
 }
+/// A prompt node's opening from its item (`?2`): the first `?3` characters
+/// of its text and the text's length, kept under the node (`?1`). SQLite
+/// keeps the item it parsed for the statement, so it is parsed once.
+const OPENING: &str = "INSERT OR REPLACE INTO openings(node,text,chars) VALUES (?1,
+    substr(json_extract(CAST(?2 AS TEXT),'$.content[0].text'),1,?3),
+    length(json_extract(CAST(?2 AS TEXT),'$.content[0].text')))";
 /// Where a node sits in the history tree, in a narrow row beside it so a
 /// walk never pages through the item: its parent, depth, skip pointer, and
 /// the nearest turn start at or above it.

@@ -118,9 +118,12 @@ tries its held turns at once.
   `--bot NAME`; a fork uses `--source NAME` and `--bot DESTINATION`.
 - `--all` selects all bots for `follow`; `--any` selects first-completion
   behavior for `wait`. `follow --all --bot NAME` is an error.
-- `run --delivery MODE` is `reject`, `queue`, `steer`, or `attach`: what the
+- `run --delivery MODE` is `steer`, `queue`, `attach`, or `reject`: what the
   submission does when the bot is busy. Without the flag, `AGENT_DELIVERY`
-  applies, then `reject`. `--turn N` with `steer` makes it strict: for that
+  applies, then `steer`, as a person's message to a busy bot does; with
+  `--workspace` or `--turn-budget-tokens`, which only a turn of its own
+  takes, `queue`. `reject` refuses a busy bot with `bot_busy`, for a
+  program that must start now or hear why. `--turn N` with `steer` makes it strict: for that
   running turn or `stale_turn`. The daemon has no default of its own: the client
   always sends the mode it resolved, so one person's preference never
   changes what a program's submission means. A blocking `run` with `queue`

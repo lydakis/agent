@@ -61,6 +61,10 @@ toml = "1.1"
 # Line and word diffs for edits, as Codex's TUI uses it.
 similar = { version = "3", features = ["inline"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process", "signal", "net", "io-util", "io-std"] }
+# Says the window changed size (SIGWINCH), so the size Sonny keeps is read
+# again only then: crossterm opens /dev/tty for each read (term.rs). The
+# version crossterm's own event reader already uses.
+signal-hook = "0.3"
 # Moves the cursor and wraps by what the terminal draws as one character.
 unicode-segmentation = "1"
 unicode-width = "0.2"

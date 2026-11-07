@@ -141,6 +141,12 @@ impl Pulse {
         self.seen = count;
     }
 
+    /// Still beating `now`, whether on a beat or between two.
+    pub fn moving(&self, now: Instant) -> bool {
+        self.at
+            .is_some_and(|at| now.saturating_duration_since(at) < BEAT * BEATS)
+    }
+
     /// On a beat `now`.
     pub fn on(&self, now: Instant) -> bool {
         self.at
