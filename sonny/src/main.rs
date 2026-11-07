@@ -2971,6 +2971,15 @@ fn said_button(node: i64) -> screen::Mark {
     screen::Mark::Link(format!("{}said/{node}", screen::BUTTON))
 }
 
+/// The node of the message `entry` is, which a cluster let go keeps for
+/// the cluster it lands in.
+fn landing(entry: &Gathered) -> Option<i64> {
+    match entry {
+        Gathered::Message(message) => Some(message.node),
+        _ => None,
+    }
+}
+
 /// A message one bot sent another, drawn quiet until a click opens it.
 struct Relayed {
     /// What its shut row says, as [`transcript::relayed_head`] has it.
@@ -2986,29 +2995,61 @@ struct Relayed {
     text: Option<String>,
 }
 
-/// Messages between agents that came one after another, with nothing of
-/// the agent's own words between them, drawn as one row that counts them
-/// and a click opens to list them; one alone is drawn as itself.
+/// What went on between two things said to the person, drawn as one
+/// row: messages between agents, and in the clean view the calls the
+/// agent made on other agents and the plan it set, with nothing of its
+/// own words between them. The row counts what came in, names whom, says
+/// what the agent did, and a click opens it to each one's own rows; one
+/// alone, or calls all alike, are drawn as themselves.
 struct Cluster {
-    messages: Vec<Clustered>,
+    entries: Vec<Gathered>,
     open: bool,
 }
 
 impl Cluster {
-    /// Whether it gathers words attached to calls, which no message joins.
+    /// Whether it gathers words attached to calls, which nothing else joins.
     fn attached(&self) -> bool {
-        (self.messages.first()).is_some_and(|message| message.kind == transcript::ATTACHED)
+        matches!(self.entries.first(), Some(Gathered::Message(m)) if m.kind == transcript::ATTACHED)
+    }
+
+    /// The messages between agents it holds.
+    fn messages(&self) -> impl Iterator<Item = &Clustered> {
+        self.entries.iter().filter_map(|entry| match entry {
+            Gathered::Message(message) => Some(message),
+            _ => None,
+        })
+    }
+
+    /// The plans it holds, by the client's number for each.
+    fn plans(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries.iter().filter_map(|entry| match entry {
+            Gathered::Plan(at) => Some(*at),
+            _ => None,
+        })
     }
 }
 
-/// A message in a [`Cluster`]: its node, what it is, and the calls the
-/// agent made about it while it said nothing, shown under it once open.
+/// One thing a [`Cluster`] gathers.
+enum Gathered {
+    /// A message between agents.
+    Message(Clustered),
+    /// A call on another agent or on what runs for this one, as Sonny says
+    /// it (`Steered`, `calc.fix`) and its own rows, shown once open.
+    Call {
+        verb: String,
+        what: String,
+        lines: Vec<Line<'static>>,
+    },
+    /// A `plan` call, by the client's number for it.
+    Plan(u64),
+}
+
+/// A message in a [`Cluster`]: its node, what it is, and whom it names.
 struct Clustered {
     node: i64,
     kind: &'static str,
     /// Whom it is from or about, which the row gathering it names.
     names: Vec<String>,
-    calls: Vec<Vec<Line<'static>>>,
 }
 
 /// The efforts Alt+T steps through for `model` (`provider/name`), whose
@@ -6428,7 +6469,15 @@ impl App {
             return;
         }
         if name == margin::TOOL {
+            // A note stands out under the row of what went on around it,
+            // which what comes after it still joins.
+            let gathering = (self.clustering).filter(|(_, drawn)| *drawn == self.rows_drawn);
             self.commit_note(id, arguments, failed);
+            if let Some((at, _)) = gathering
+                && !self.verbose
+            {
+                self.clustering = Some((at, self.rows_drawn));
+            }
             return;
         }
         // A question closed shows on its card, not as a row of its own.
@@ -6453,6 +6502,14 @@ impl App {
         {
             let at = self.plan_count;
             self.plan_count += 1;
+            // In the clean view a plan is told with what goes on around
+            // it, as how far it has got; the margin shows it in full.
+            if !self.verbose {
+                self.plans.insert(at, steps);
+                self.refold = true;
+                self.gather(Gathered::Plan(at), false);
+                return;
+            }
             let lines = transcript::plan_lines(&steps, false, self.prose());
             let from = self.pending.len() + usize::from(self.any_history);
             let rows = lines.len();
@@ -6488,21 +6545,12 @@ impl App {
             self.commit(lines);
             return;
         };
-        // What the agent did about messages from other agents while it
-        // said nothing goes under them, opened with them: an agent it
-        // made stands out still.
-        if !self.verbose
-            && !matches!(verb.as_str(), "Started" | "Forked")
-            && let Some((at, drawn)) = self.clustering
-            && drawn == self.rows_drawn
-            && let Some(message) = (self.clusters.get_mut(&at)).and_then(|c| c.messages.last_mut())
-        {
-            message.calls.push(lines.clone());
-            if self.draw_cluster(at) {
-                return;
-            }
-            self.clusters.remove(&at);
-            self.clustering = None;
+        // In the clean view what the agent did with other agents is told
+        // with what goes on around it, one row between two things said:
+        // an agent it made stands out still.
+        if !self.verbose && !matches!(verb.as_str(), "Started" | "Forked") {
+            self.gather(Gathered::Call { verb, what, lines }, false);
+            return;
         }
         if let Some((at, drawn)) = self.folding
             && drawn == self.rows_drawn
@@ -7212,36 +7260,54 @@ impl App {
     /// was set when the margin is not `beside` the conversation; every
     /// other plan call a row of how far it had got.
     fn fold_plan(&mut self, beside: bool) {
+        // The plans the conversation holds, in its order: a plan call's
+        // own row, or the newest of those a cluster gathered.
+        let mut held: Vec<u64> = Vec::new();
+        let mut last = None;
+        for tag in self.screen.tags() {
+            if last == Some(tag) {
+                continue;
+            }
+            last = Some(tag);
+            match tag {
+                screen::Tag::Plan(at) => held.push(at),
+                screen::Tag::Group(at) => {
+                    if let Some(cluster) = self.clusters.get(&(at as usize)) {
+                        held.extend(cluster.plans());
+                    }
+                }
+                _ => {}
+            }
+        }
         // Those the screen no longer keeps are forgotten.
-        let kept: std::collections::HashSet<u64> = (self.screen.tags())
-            .filter_map(|tag| match tag {
-                screen::Tag::Plan(at) => Some(at),
-                _ => None,
-            })
-            .collect();
+        let kept: std::collections::HashSet<u64> = held.iter().copied().collect();
         self.plans.retain(|at, _| kept.contains(at));
-        let newest = (self.screen.tags())
-            .filter_map(|tag| match tag {
-                screen::Tag::Plan(at) => Some(at),
-                _ => None,
-            })
-            .last();
+        let newest = held.last().copied();
         let steps = newest.and_then(|at| self.plans.get(&at)).cloned();
         self.margin.set_plan(steps.as_deref().unwrap_or_default());
-        let full = newest.filter(|_| !beside);
+        // A cleared plan has no steps to show: its row says so.
+        let cleared = steps.as_ref().is_none_or(|steps| steps.is_empty());
+        let full = newest.filter(|_| !beside && !cleared);
         if full == self.plan_full {
             return;
         }
+        let was = std::mem::replace(&mut self.plan_full, full);
         let width = self.prose();
-        for (at, full) in [(self.plan_full, false), (full, true)] {
-            let Some(steps) = at.and_then(|at| self.plans.get(&at)) else {
+        for at in [was, full].into_iter().flatten() {
+            let holding = (self.clusters.iter())
+                .find(|(_, cluster)| cluster.plans().any(|plan| plan == at))
+                .map(|(group, _)| *group);
+            if let Some(group) = holding {
+                self.draw_cluster(group);
+                continue;
+            }
+            let Some(steps) = self.plans.get(&at) else {
                 continue;
             };
-            let lines = transcript::plan_lines(steps, full, width);
-            let tag = screen::Tag::Plan(at.expect("found"));
-            self.screen.replace_tagged(tag, lines, Vec::new());
+            let lines = transcript::plan_lines(steps, Some(at) == full, width);
+            self.screen
+                .replace_tagged(screen::Tag::Plan(at), lines, Vec::new());
         }
-        self.plan_full = full;
     }
 
     /// A `margin` call applied as it starts, so a note shows while the
@@ -7367,41 +7433,47 @@ impl App {
                 false => transcript::relayed_kind(said, from),
             },
             names: transcript::relayed_names(said, from),
-            calls: Vec::new(),
         };
+        self.gather(Gathered::Message(message), attached);
+    }
+
+    /// `entry` put in the cluster drawn last when nothing was drawn since
+    /// and it gathers the same (words attached to a call only with
+    /// others attached), or else in a cluster of its own.
+    fn gather(&mut self, entry: Gathered, attached: bool) {
         if let Some((at, drawn)) = self.clustering
             && drawn == self.rows_drawn
             && let Some(cluster) = self.clusters.get_mut(&at)
             && cluster.attached() == attached
         {
-            cluster.messages.push(message);
+            cluster.entries.push(entry);
             if self.draw_cluster(at) {
                 return;
             }
             // Gone from the conversation: this one starts a cluster of
             // its own.
             let mut gone = self.clusters.remove(&at).expect("the cluster just drawn");
-            let message = gone.messages.pop().expect("the message just put in");
-            self.forget(gone, node);
-            return self.new_cluster(message);
+            let entry = gone.entries.pop().expect("the entry just put in");
+            self.forget(gone, landing(&entry));
+            return self.new_cluster(entry);
         }
-        self.new_cluster(message);
+        self.new_cluster(entry);
     }
 
-    /// `message` drawn as a cluster of its own, which those after it join.
-    fn new_cluster(&mut self, message: Clustered) {
+    /// `entry` drawn as a cluster of its own, which those after it join.
+    fn new_cluster(&mut self, entry: Gathered) {
         // Clusters whose rows the conversation let go keep nothing.
         while let Some(&first) = self.clusters.keys().next() {
             if self.kept(screen::Tag::Group(first as u64)) {
                 break;
             }
             if let Some(gone) = self.clusters.remove(&first) {
-                self.forget(gone, message.node);
+                self.forget(gone, landing(&entry));
             }
         }
         let at = self.group();
         let cluster = Cluster {
-            messages: vec![message],
+            entries: vec![entry],
             open: false,
         };
         // Words attached to a call hang right under what it carried, as
@@ -7429,25 +7501,23 @@ impl App {
     /// Ctrl+O reads none of them again; a message a page drawn again put
     /// in a newer cluster stays for that one, as `landing` does for the
     /// cluster about to be made for it.
-    fn forget(&mut self, cluster: Cluster, landing: i64) {
-        for message in cluster.messages {
-            let held = message.node == landing
+    fn forget(&mut self, cluster: Cluster, landing: Option<i64>) {
+        for message in cluster.messages() {
+            let held = Some(message.node) == landing
                 || (self.clusters.values())
-                    .any(|kept| kept.messages.iter().any(|m| m.node == message.node));
+                    .any(|kept| kept.messages().any(|m| m.node == message.node));
             if !held {
                 self.relayed.remove(&message.node);
             }
         }
+        for plan in cluster.plans() {
+            self.plans.remove(&plan);
+        }
     }
 
     /// The rows of the message between agents at `node`, open or shut,
-    /// at `width`; open, the calls the agent made about it under it.
-    fn relayed_lines(
-        &self,
-        node: i64,
-        calls: &[Vec<Line<'static>>],
-        width: usize,
-    ) -> Vec<Line<'static>> {
+    /// at `width`.
+    fn relayed_lines(&self, node: i64, width: usize) -> Vec<Line<'static>> {
         let Some(relayed) = self.relayed.get(&node) else {
             return Vec::new();
         };
@@ -7457,12 +7527,7 @@ impl App {
             false => width,
         };
         let lines = match &relayed.text {
-            Some(text) => {
-                let mut lines = transcript::relayed(text, relayed.from.as_deref(), true, width);
-                let calls = calls.iter().flatten().cloned().collect();
-                lines.extend(transcript::indented(calls, 2));
-                lines
-            }
+            Some(text) => transcript::relayed(text, relayed.from.as_deref(), true, width),
             None => {
                 // Only an agent's name takes the agents' colour.
                 let agent = relayed.from.as_deref().filter(|_| !relayed.person);
@@ -7475,22 +7540,68 @@ impl App {
         }
     }
 
+    /// The rows of the plan `at`: how far it has got, or in full where
+    /// the newest shows when the margin is not beside the conversation.
+    fn plan_rows(&self, at: u64, width: usize) -> Vec<Line<'static>> {
+        match self.plans.get(&at) {
+            Some(steps) => transcript::plan_lines(steps, self.plan_full == Some(at), width),
+            None => Vec::new(),
+        }
+    }
+
     /// The rows of the cluster `at`, and the buttons on them: one message
-    /// as itself; several as a row that counts them, and once open each
-    /// one's own rows under it.
+    /// or plan as itself; calls all alike as one row that says what they
+    /// did and to whom; anything else as a row that counts what came in,
+    /// names whom and says what the agent did, and once open each one's
+    /// own rows under it.
     fn cluster_lines(&self, at: usize) -> (Vec<Line<'static>>, Vec<(usize, screen::Mark)>) {
         let Some(cluster) = self.clusters.get(&at) else {
             return (Vec::new(), Vec::new());
         };
         let width = self.prose();
-        if let [message] = cluster.messages.as_slice() {
-            let lines = self.relayed_lines(message.node, &message.calls, width);
-            return (lines, vec![(0, said_button(message.node))]);
+        let fold = || screen::Mark::Link(format!("{}fold/{at}", screen::BUTTON));
+        match cluster.entries.as_slice() {
+            [Gathered::Message(message)] => {
+                let lines = self.relayed_lines(message.node, width);
+                return (lines, vec![(0, said_button(message.node))]);
+            }
+            [Gathered::Plan(plan)] => return (self.plan_rows(*plan, width), Vec::new()),
+            _ => {}
         }
-        let kinds: Vec<&str> = cluster.messages.iter().map(|m| m.kind).collect();
-        let names: Vec<String> = (cluster.messages.iter())
+        // Calls alike, with nothing else: what they did, said once.
+        let mut whats = Vec::new();
+        let mut calls = Vec::new();
+        let mut did = Vec::new();
+        for entry in &cluster.entries {
+            if let Gathered::Call { verb, what, lines } = entry {
+                whats.push(what.clone());
+                calls.push(lines.clone());
+                did.push((verb.clone(), what.clone()));
+            }
+        }
+        let alike = calls.len() == cluster.entries.len()
+            && did.windows(2).all(|pair| pair[0].0 == pair[1].0);
+        if let (true, Some((verb, _))) = (alike, did.first()) {
+            let lines = transcript::quiet(transcript::folded(
+                verb,
+                &whats,
+                &calls,
+                cluster.open,
+                width,
+            ));
+            let marks = match transcript::unfolds(&whats, &calls) {
+                true => vec![(0, fold())],
+                false => Vec::new(),
+            };
+            return (lines, marks);
+        }
+        let kinds: Vec<&str> = cluster.messages().map(|m| m.kind).collect();
+        let names: Vec<String> = (cluster.messages())
             .flat_map(|m| m.names.iter().cloned())
             .collect();
+        let plan = (cluster.plans().last())
+            .and_then(|at| self.plans.get(&at))
+            .map(|steps| transcript::plan_progress(steps));
         let mut lines = match cluster.attached() {
             true => transcript::attached(vec![transcript::gathered(
                 &kinds,
@@ -7498,19 +7609,33 @@ impl App {
                 cluster.open,
                 width.saturating_sub(transcript::ATTACHED_INDENT + 1),
             )]),
-            false => vec![transcript::gathered(&kinds, &names, cluster.open, width)],
+            false => vec![transcript::gap(
+                &kinds,
+                &names,
+                &did,
+                plan.as_deref(),
+                cluster.open,
+                width,
+            )],
         };
-        let mut marks = vec![(
-            0,
-            screen::Mark::Link(format!("{}fold/{at}", screen::BUTTON)),
-        )];
-        if cluster.open {
-            for message in &cluster.messages {
-                marks.push((lines.len(), said_button(message.node)));
-                let rows =
-                    self.relayed_lines(message.node, &message.calls, width.saturating_sub(2));
-                lines.extend(transcript::indented(rows, 2));
-            }
+        let mut marks = vec![(0, fold())];
+        let inner = width.saturating_sub(2);
+        for entry in &cluster.entries {
+            let rows = match entry {
+                // Shut, the newest plan still shows in full where the
+                // margin cannot show it.
+                Gathered::Plan(plan) if cluster.open || self.plan_full == Some(*plan) => {
+                    self.plan_rows(*plan, inner)
+                }
+                _ if !cluster.open => continue,
+                Gathered::Message(message) => {
+                    marks.push((lines.len(), said_button(message.node)));
+                    self.relayed_lines(message.node, inner)
+                }
+                Gathered::Call { lines: rows, .. } => rows.clone(),
+                Gathered::Plan(_) => continue,
+            };
+            lines.extend(transcript::indented(rows, 2));
         }
         (lines, marks)
     }
@@ -7573,7 +7698,7 @@ impl App {
     /// drawn, when a page drawn again put it in a newer one too.
     fn cluster_of(&self, node: i64) -> Option<usize> {
         let holding = (self.clusters.iter().rev())
-            .filter(|(_, cluster)| cluster.messages.iter().any(|m| m.node == node))
+            .filter(|(_, cluster)| cluster.messages().any(|m| m.node == node))
             .map(|(at, _)| *at);
         let mut newest = None;
         for at in holding {
@@ -19633,7 +19758,7 @@ mod tests {
         assert_eq!(drawn(&mut app), ["↳ From calc.add ▸"]);
         // An agent's name takes the agents' colour; a person's never does.
         let blue = |app: &App, node| {
-            (app.relayed_lines(node, &[], 80).iter())
+            (app.relayed_lines(node, 80).iter())
                 .flat_map(|line| &line.spans)
                 .any(|span| span.style.fg == Some(Color::Blue))
         };
@@ -19671,7 +19796,7 @@ mod tests {
         app.key(Event::Key(ctrl_o)).await;
         assert_eq!(drawn(&mut app), ["↳ From calc.add ▸"]);
         // Those that come one after another are one row that counts them,
-        // with what the agent did about them while it said nothing.
+        // and says what the agent did while it said nothing.
         let updates = "Task updates: what happened in your tasks since you last heard.\n\
             - calc.neg: turn:calc.neg/3 completed";
         app.land(5, (updates, ""), (None, false, false), false);
@@ -19685,30 +19810,28 @@ mod tests {
             "turn:calc.neg/4",
             false,
         );
-        assert_eq!(
-            drawn(&mut app),
-            ["↳ 1 message, 1 task update · calc.add, calc.neg ▸"]
-        );
-        // A click lists them; a click on one opens it, the calls under it.
+        let shut = "↳ 1 message, 1 task update · calc.add, calc.neg · sent to calc.neg ▸";
+        assert_eq!(drawn(&mut app), [shut]);
+        // A click lists them, each in the order it came; a click on a
+        // message opens it.
         app.press("fold/0").await;
+        let open = drawn(&mut app);
         assert_eq!(
-            drawn(&mut app),
+            open[..3],
             [
-                "↳ 1 message, 1 task update · calc.add, calc.neg ▾",
+                "↳ 1 message, 1 task update · calc.add, calc.neg · sent to calc.neg ▾",
                 "  ↳ From calc.add ▸",
                 "  ↳ Task updates · calc.neg completed ▸",
             ]
         );
+        assert!(open[3].starts_with("  • Steered calc.neg"), "{open:?}");
         app.press("said/5").await;
         let open = drawn(&mut app);
         assert_eq!(open[2], "  ↳ Task updates ▾");
         assert_eq!(open[4], "    - calc.neg: turn:calc.neg/3 completed");
-        assert!(open[5].starts_with("    • Steered calc.neg"), "{open:?}");
+        assert!(open[5].starts_with("  • Steered calc.neg"), "{open:?}");
         app.press("fold/0").await;
-        assert_eq!(
-            drawn(&mut app),
-            ["↳ 1 message, 1 task update · calc.add, calc.neg ▸"]
-        );
+        assert_eq!(drawn(&mut app), [shut]);
         // The agent's words end it: what comes after starts anew.
         app.commit(vec![Line::from("• calc.neg is done.")]);
         app.land(6, (updates, ""), (None, false, false), false);
@@ -19728,12 +19851,11 @@ mod tests {
         app.next_group = 9;
         app.land(8, (updates, ""), (None, false, false), false);
         let stale = Cluster {
-            messages: vec![Clustered {
+            entries: vec![Gathered::Message(Clustered {
                 node: 8,
                 kind: "task update",
                 names: Vec::new(),
-                calls: Vec::new(),
-            }],
+            })],
             open: false,
         };
         app.clusters.insert(1, stale);
@@ -19745,11 +19867,11 @@ mod tests {
         // A cluster let go takes its messages with it, so Ctrl+O reads
         // none of them; one a newer cluster holds stays.
         let stale = app.clusters.remove(&1).unwrap();
-        app.forget(stale, 0);
+        app.forget(stale, Some(0));
         assert!(app.relayed.contains_key(&8));
         let first = app.clusters.remove(&0).unwrap();
         // The message landing, which a new cluster is about to hold, stays.
-        app.forget(first, 4);
+        app.forget(first, Some(4));
         assert!(app.relayed.contains_key(&4) && !app.relayed.contains_key(&5));
     }
 
@@ -19836,14 +19958,14 @@ mod tests {
         // An older page written on a screen of its own, as older() does.
         app.newer = Some(std::mem::take(&mut app.screen));
         app.any_history = false;
-        let folding = app.folding.take();
+        let clustering = app.clustering.take();
         start(&mut app, "calc.old");
         start(&mut app, "calc.older");
         app.flush();
-        app.folding = folding;
+        app.clustering = clustering;
         let older = std::mem::replace(&mut app.screen, app.newer.take().unwrap());
         app.screen.prepend(0, older);
-        assert_eq!(app.folds.len(), 2, "the newer fold is kept");
+        assert_eq!(app.clusters.len(), 2, "the newer fold is kept");
         app.follow("sonny:fold/0");
         let button = app.pressed.pop().unwrap();
         app.press(&button).await;
@@ -19908,8 +20030,9 @@ mod tests {
         let button = app.pressed.pop().unwrap();
         app.press(&button).await;
         assert_eq!(drawn(&mut app).len(), 3);
-        // Something drawn between, or another kind of call, starts anew;
-        // a call the clean view hides does not.
+        // Another kind of call joins them, the row then saying what each
+        // did; something drawn between starts anew, and a call the clean
+        // view hides does not.
         app.commit_call("c", Some(1), "shell", &json!({"command": "ls"}), "a", false);
         start(&mut app, "calc.mul");
         app.commit_call(
@@ -19924,12 +20047,15 @@ mod tests {
         start(&mut app, "calc.sub");
         let rows = drawn(&mut app);
         assert_eq!(
-            rows[2],
-            "• Steered calc.add, calc.neg, calc.div and calc.mul ▸"
+            rows[2..],
+            [
+                "↳ sent to calc.add, calc.neg, calc.div, calc.mul, removed calc.add ▸",
+                "",
+                "• Messaged those.",
+                "",
+                "• Steered calc.sub ▸",
+            ]
         );
-        // Quiet rows one after another sit together.
-        assert_eq!(rows[3], "• Removed calc.add");
-        assert_eq!(rows[7], "• Steered calc.sub ▸");
     }
 
     #[tokio::test]
@@ -22977,6 +23103,133 @@ mod tests {
         app.refold = true;
         app.fold_notes(false);
         assert!(app.plans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn what_goes_on_between_two_things_said_is_one_row() {
+        let mut app = app(daemon_with(json!([])).await);
+        app.any_history = true;
+        app.width = 120;
+        let texts = |app: &App| -> Vec<String> {
+            (app.screen.texts().iter())
+                .map(|t| t.trim_end().to_owned())
+                .filter(|t| !t.trim().is_empty())
+                .collect()
+        };
+        app.commit(vec![Line::from("› check on the tasks")]);
+        // News in, a plan, two sends, a memory: one row, in that order.
+        let plan = json!({"steps": ["[x] Read", "[>] Fix", "[ ] Test"]});
+        app.commit_call("p1", Some(1), "plan", &plan, "Plan set.", false);
+        let updates = "Task updates: what happened in your tasks since you last heard.\n\
+            - calc.neg: turn:calc.neg/3 completed";
+        app.land(5, (updates, ""), (None, false, false), false);
+        let steer = |bot: &str| {
+            json!({"command": format!(
+                r#""$AGENT_BIN" run --detach --delivery steer --bot {bot} -- 'Check div too.'"#
+            )})
+        };
+        app.commit_call(
+            "c1",
+            Some(1),
+            "shell",
+            &steer("calc.neg"),
+            "turn:calc.neg/4",
+            false,
+        );
+        app.commit_call(
+            "c2",
+            Some(1),
+            "shell",
+            &steer("calc.neg"),
+            "turn:calc.neg/5",
+            false,
+        );
+        let save = json!({"command": r#""$HOME/.agent/memory" save flow --type user -- -"#});
+        app.commit_call("c3", Some(1), "shell", &save, r#"{"saved": "flow"}"#, false);
+        app.commit(vec![Line::from("• calc.neg is on it.")]);
+        app.flush();
+        app.fold_notes(true);
+        let shut = "↳ 1 task update · calc.neg · sent 2 to calc.neg, saved a memory, plan 1/3 ▸";
+        assert_eq!(texts(&app)[1..], [shut, "• calc.neg is on it."]);
+        // The plan it holds is still the margin's.
+        let margin = app.margin.lines(60, std::path::Path::new("/"), None).0;
+        let margin: Vec<String> = margin.iter().map(|l| l.to_string()).collect();
+        assert!(margin.iter().any(|r| r.contains("Plan  1/3")), "{margin:?}");
+        // With no margin beside, the newest plan shows in full under it.
+        app.fold_notes(false);
+        let rows = texts(&app);
+        assert_eq!(rows[1], shut);
+        assert!(rows[2..].iter().any(|r| r.contains("→ Fix")), "{rows:?}");
+        app.fold_notes(true);
+        assert_eq!(texts(&app)[1..], [shut, "• calc.neg is on it."]);
+        // Open, each one's own rows in the order they came.
+        app.follow("sonny:fold/0");
+        let button = app.pressed.pop().unwrap();
+        app.press(&button).await;
+        let rows = texts(&app);
+        assert!(rows[1].ends_with("plan 1/3 ▾"), "{rows:?}");
+        assert!(
+            rows[2].starts_with("  • Updated the plan · 1/3"),
+            "{rows:?}"
+        );
+        assert_eq!(rows[3], "  ↳ Task updates · calc.neg completed ▸");
+        assert!(rows[4].starts_with("  • Steered calc.neg"), "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|r| r.starts_with("  • Saved to memory flow")),
+            "{rows:?}"
+        );
+        // A note stands out under the row; what comes after still joins it.
+        let mut noted = tests::app(daemon_with(json!([])).await);
+        noted.any_history = true;
+        noted.width = 120;
+        noted.commit(vec![Line::from("› check on the tasks")]);
+        noted.commit_call(
+            "c1",
+            Some(1),
+            "shell",
+            &steer("calc.neg"),
+            "turn:calc.neg/4",
+            false,
+        );
+        let note = json!({"call_id": "m1", "name": "margin", "arguments": json!({
+            "id": "routing", "title": "Routing today", "markdown": "a → b"
+        }).to_string()});
+        noted.daemon(turn_event("tool_started", 1, note)).await;
+        noted
+            .daemon(turn_event("tool_completed", 1, json!({"call_id": "m1"})))
+            .await;
+        noted.commit_call("c2", Some(1), "shell", &save, r#"{"saved": "flow"}"#, false);
+        noted.flush();
+        assert_eq!(
+            texts(&noted)[1..],
+            [
+                "↳ sent to calc.neg, saved a memory ▸",
+                "  ✎ Routing today · in the margin"
+            ]
+        );
+        // Verbose draws each call as its own row, as ever.
+        let mut verbose = tests::app(daemon_with(json!([])).await);
+        verbose.verbose = true;
+        verbose.commit_call(
+            "c1",
+            Some(1),
+            "shell",
+            &steer("calc.neg"),
+            "turn:calc.neg/4",
+            false,
+        );
+        verbose.commit_call("c3", Some(1), "shell", &save, r#"{"saved": "flow"}"#, false);
+        verbose.flush();
+        let rows = texts(&verbose);
+        assert!(
+            rows.iter().any(|r| r.starts_with("• Steered calc.neg")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.starts_with("• Saved to memory flow")),
+            "{rows:?}"
+        );
     }
 
     #[test]

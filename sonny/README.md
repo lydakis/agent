@@ -1330,11 +1330,18 @@ open.
 What agents tell each other stays quiet too: a message from another agent
 is one dim row naming who sent it (`↳ From calc.neg ▸`), the lead's task
 updates one row with what happened in them, and a click opens the whole
-message. Such messages that come one after another, with nothing the agent
-said between them, gather into one row that counts them (`↳ 3 task
-updates ▸`): a click lists them, a click on one opens it, and what the
-agent did about it while saying nothing, such as a task steered or a
-memory saved, is under it there rather than a row of its own. Quiet rows
+message. Everything between two things said (your message, the agent's
+words, a question, a failure, a task started) is one such row: what came
+in counted and who from, then in a few words what the agent did about it
+and where its plan stands (`↳ 3 task updates · calc.neg · sent 2 to
+calc.neg, saved a memory, plan 1/3 ▸`). It grows in place as the agent
+works, and a click opens it to each one's own row in the order they came,
+a click on one of those opening it in turn. A coordinating agent can work
+for an hour saying nothing; its chat stays the things said, with one row
+between each, and a margin note it puts up stands under that row without
+splitting it. Steps of one kind alone keep their own row (`• Steered
+calc.add, calc.neg and calc.div ▸`), and `/verbose` draws each call as
+ever. Quiet rows
 one after another (calls folded, notes put in the margin, messages
 between agents) sit together, with no blank row between. Words that only
 rode along on a call, an attach note from an automation that found the
