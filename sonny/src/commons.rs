@@ -221,7 +221,7 @@ pub fn call(
         let text = reply["text"].as_str().unwrap_or_default();
         return add(&dir, thread, &entry(author, author_id, model, text, reply)?);
     }
-    list(&dir, from, LIST_BYTES, &mut Summaries::new())
+    list(&dir, from, LIST_BYTES, &mut Summaries::new(), &sent(&dir))
 }
 
 fn valid_name(name: &str) -> Result<(), String> {
@@ -1023,11 +1023,18 @@ fn summary(name: &str, path: &Path) -> Option<Value> {
 }
 
 /// The threads from the `from`th newest, as many as `bytes` holds, with
-/// `next` where the rest start; `known` keeps what each read found.
-fn list(dir: &Path, from: usize, bytes: usize, known: &mut Summaries) -> Result<Value, String> {
+/// `next` where the rest start; `known` keeps what each read found, and
+/// `sent` is the week's invites, read once by the caller.
+fn list(
+    dir: &Path,
+    from: usize,
+    bytes: usize,
+    known: &mut Summaries,
+    sent: &[Value],
+) -> Result<Value, String> {
     let entries = match std::fs::read_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(json!({"dir": dir, "threads": [], "invites": budget(&[], agents(dir))}));
+            return Ok(json!({"dir": dir, "threads": [], "invites": budget(sent, agents(dir))}));
         }
         entries => entries.map_err(|e| format!("commons_failed: {}: {e}", dir.display()))?,
     };
@@ -1072,7 +1079,7 @@ fn list(dir: &Path, from: usize, bytes: usize, known: &mut Summaries) -> Result<
     }
     let next = from + shown.len();
     let mut listed = json!({"dir": dir, "threads": shown,
-        "invites": budget(&sent(dir), agents(dir))});
+        "invites": budget(sent, agents(dir))});
     if next < of {
         listed["next"] = json!(next);
         listed["of"] = json!(of);
@@ -1381,6 +1388,8 @@ pub struct View {
     open_stamp: Option<(u64, std::time::SystemTime)>,
     /// What the listing last read of each thread.
     known: Summaries,
+    /// The golden tickets the week's invites held, each one agent's.
+    golden: usize,
     notice: Option<String>,
 }
 
@@ -1401,6 +1410,7 @@ impl View {
             open: None,
             open_stamp: None,
             known: Summaries::new(),
+            golden: 0,
             notice: None,
         };
         view.reload();
@@ -1410,10 +1420,16 @@ impl View {
     /// Read it all again, the pick kept on the same thread where it still is.
     pub fn reload(&mut self) {
         let picked = self.picked().map(str::to_owned);
-        match list(&self.dir, 0, usize::MAX, &mut self.known) {
+        // The invites file is read once for the budget and the golden
+        // tickets both.
+        let sent = sent(&self.dir);
+        match list(&self.dir, 0, usize::MAX, &mut self.known, &sent) {
             Ok(listed) => {
                 self.threads = listed["threads"].as_array().cloned().unwrap_or_default();
                 self.invites = listed["invites"].clone();
+                self.golden = (sent.iter())
+                    .filter(|invite| !invite["bot"].is_null() && invite["golden"] == true)
+                    .count();
             }
             Err(error) => self.notice = Some(error),
         }
@@ -1508,12 +1524,14 @@ impl View {
             ))
             .bold(),
             Span::raw(format!(
-                " · {} of {} invited today, {} invites each · {} of {} answered this week",
+                " · {} of {} invited today, {} invites each · {} of {} answered this week · {} golden ticket{}",
                 invites("today"),
                 invites("a_day"),
                 invites("reach"),
                 invites("answered"),
                 invites("this_week"),
+                self.golden,
+                if self.golden == 1 { "" } else { "s" },
             ))
             .dim(),
         ])];
@@ -2158,7 +2176,7 @@ mod tests {
         assert!(empty.iter().any(|l| l == "No thread yet."));
         // An empty commons counts its invites as 0, never null.
         let counts = format!(
-            "0 of {} invited today, {} invites each · 0 of 0 answered this week",
+            "0 of {} invited today, {} invites each · 0 of 0 answered this week · 0 golden tickets",
             invites_a_day(0),
             reach(0, 0, invites_a_day(0) as usize)
         );
@@ -2241,6 +2259,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_view_counts_the_golden_tickets_the_week_sent() {
+        let home = &home("golden_count");
+        call(
+            home,
+            "a.x",
+            None,
+            None,
+            &json!({"post": {"name": "t", "title": "T", "text": "x"}}),
+        )
+        .unwrap();
+        let dir = dir(home);
+        // One agent held the golden ticket, one a plain invite, and a
+        // thread still sending holds no agent's yet.
+        let sent = [
+            json!({"thread": "t", "at": now(), "bot": "b.y", "golden": true, "turns": []}),
+            json!({"thread": "t", "at": now(), "bot": "c.z", "golden": false, "turns": []}),
+            json!({"thread": "u", "at": now(), "golden": true, "reach": 3}),
+        ];
+        assert!(keep(&dir, &sent, 2));
+        let view = View::open(home);
+        let head: String = (view.card(200).0[0].spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(head.ends_with(" · 1 golden ticket"), "{head}");
     }
 
     #[test]
