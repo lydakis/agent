@@ -6384,6 +6384,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_parked_task_reaped_after_its_turn_resumed_leaves_the_new_task_in_place() {
+        let dir = std::env::temp_dir().join(format!("agent-late-reap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turns = running(&store, &["Bob".into()]).await;
+        let bob = turns[0].1;
+        let mut service = bare_service(&store);
+        // Task 1 parked Bob's turn; a wake-up resumed it as task 2 before
+        // task 1 was reaped.
+        service.active.start("Bob".into(), |slot| Active {
+            turn: bob,
+            task: 2,
+            cancel: watch::channel(None).0,
+            steers: Arc::default(),
+            compact: Arc::default(),
+            lift: Arc::default(),
+            slot,
+            given_rules: Default::default(),
+        });
+        let later = now_ms() + 60_000;
+        for exit in [turn::Exit::Paced(later), turn::Exit::Parked] {
+            service
+                .complete("Bob".into(), bob, 1, Ok(exit))
+                .await
+                .unwrap();
+            // Task 2 still owns the bot and its slot, and the old park sets
+            // no wake-up for a turn that already runs.
+            assert_eq!(service.active.get("Bob").map(|a| a.task), Some(2));
+            assert_eq!(service.active.holding(), 1);
+            assert_eq!(service.wakes.next(), None);
+        }
+        // Task 2's own completion is the one that lets the bot go.
+        service
+            .complete("Bob".into(), bob, 2, Ok(turn::Exit::Paced(later)))
+            .await
+            .unwrap();
+        assert!(service.active.is_empty());
+        assert_eq!(service.wakes.next(), Some(later));
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_finish_that_cannot_commit_retries_while_other_bots_go_on() {
         let dir = std::env::temp_dir().join(format!("agent-finish-retry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
