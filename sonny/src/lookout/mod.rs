@@ -1043,6 +1043,9 @@ impl Service {
         from_sources: &mut tokio::sync::mpsc::Receiver<sources::Said>,
     ) {
         let readers = Readers::connect(&self.socket, client.clone()).await;
+        // Subscriptions written after this are left as they are: a bot
+        // made since, which the listing may miss, may have written them.
+        let listed_at = std::time::SystemTime::now();
         let (bots, complete) = listed(&client).await;
         self.records = (bots.iter())
             .filter_map(|b| Some((b["name"].as_str()?.to_owned(), b.clone())))
@@ -1075,6 +1078,11 @@ impl Service {
         subs::goals_gone(&self.store);
         let revisions = subs::revisions(&self.store);
         self.subscribers = subs::all(&self.store).into_iter().collect();
+        // Bots deleted while it was away: their subscriptions end now, as
+        // ones it hears deleted do. Only from a whole listing.
+        if complete && self.unheld(listed_at) {
+            self.subscribers = subs::all(&self.store).into_iter().collect();
+        }
         self.read_at.clear();
         subs::take(&mut self.read_at, &revisions, epoch_ms());
         subs::took(&self.store, &self.read_at);
@@ -1168,6 +1176,7 @@ impl Service {
             // The lookouts whose news may have changed: those an event
             // reached, or all of them.
             let mut touched: Option<Vec<String>> = None;
+            let mut overdue: Vec<(String, Vec<subs::Sub>)> = Vec::new();
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else {
@@ -1196,6 +1205,8 @@ impl Service {
                         self.runner.poke();
                     }
                     let cursor = event["cursor"].as_i64();
+                    let news =
+                        live || cursor.is_some_and(|at| self.resume.is_some_and(|seen| at > seen));
                     // What happened since the lookout last watched live, as
                     // a task that ended while it was down, is news now.
                     if !live && cursor.is_some_and(|at| self.resume.is_some_and(|seen| at > seen)) {
@@ -1223,12 +1234,23 @@ impl Service {
                         && let Some(name) = event["bot"].as_str()
                     {
                         self.in_flight.retain(|(bot, _), _| bot != name);
-                        if let Some(had) = self.records.remove(name) {
-                            self.made.remove(name, &had);
+                        let had = self.records.remove(name);
+                        if let Some(had) = &had {
+                            self.made.remove(name, had);
                         }
                         if let Some(lookout) = self.lookouts.remove(name) {
                             lookout.unheld();
                             self.index();
+                        }
+                        // Only as news: what the replay shows from before the
+                        // lookout last watched it saw then.
+                        if news {
+                            let id = had.as_ref().and_then(|had| had["bot_id"].as_i64());
+                            // In force at once: a bot made again under the
+                            // name is never heard by what ended.
+                            if self.ended_with(name, id) {
+                                self.reread(&client).await;
+                            }
                         }
                     }
                     let bot_id = (event["bot"].as_str())
@@ -1360,10 +1382,18 @@ impl Service {
                     touched = Some(vec![lead]);
                 }
                 Some((lead, id, answer)) = woke.recv() => {
+                    let mut ended = Vec::new();
                     if let Some(lookout) = self.lookouts.get_mut(&lead)
                         && lookout.id == id
                     {
                         lookout.answered(answer);
+                        ended = std::mem::take(&mut lookout.ended);
+                    }
+                    if !ended.is_empty() {
+                        for sub in &ended {
+                            self.end_sub(String::as_str(&lead), sub, "its runs were told");
+                        }
+                        self.reread(&client).await;
                     }
                     touched = Some(vec![lead]);
                 }
@@ -1408,6 +1438,20 @@ impl Service {
                 }
                 lookout.wake(&client, &woken);
                 lookout.wake_sources(&client, &woken);
+                let over = std::mem::take(&mut lookout.over);
+                if !over.is_empty() {
+                    overdue.push((name, over));
+                }
+            }
+            // Subscriptions whose `until` came between rereads end before
+            // any note tells what they heard.
+            if !overdue.is_empty() {
+                for (lead, over) in std::mem::take(&mut overdue) {
+                    for sub in &over {
+                        self.end_sub(&lead, sub, "its until came");
+                    }
+                }
+                self.reread(&client).await;
             }
         }
     }
@@ -1699,7 +1743,17 @@ impl Service {
     /// watched, and each lookout watches what its file says.
     async fn reread(&mut self, client: &Client) {
         let revisions = subs::revisions(&self.store);
-        let read: HashMap<String, Vec<subs::Sub>> = subs::all(&self.store).into_iter().collect();
+        let mut read: HashMap<String, Vec<subs::Sub>> =
+            subs::all(&self.store).into_iter().collect();
+        // A subscription whose `until` came ends, as an automation does.
+        let now_s = (epoch_ms() / 1000) as i64;
+        for (subscriber, subs) in read.iter_mut() {
+            for sub in subs.iter().filter(|sub| sub.over(now_s)) {
+                self.end_sub(subscriber, sub, "its until came");
+            }
+            subs.retain(|sub| !sub.over(now_s));
+        }
+        read.retain(|_, subs| !subs.is_empty());
         // Every revision read is kept, one that changes nothing and a
         // file that went included, so the listing knows it was taken.
         let now = epoch_ms();
@@ -1725,6 +1779,65 @@ impl Service {
             self.seat(client, &record).await;
         }
         self.resubscribe(false);
+    }
+
+    /// End `subscriber`'s subscription `name`, as it says `why`, in its
+    /// file and the log; the next read of the files stops it.
+    fn end_sub(&self, subscriber: &str, sub: &subs::Sub, why: &str) {
+        let removed = subs::end(&self.store, subscriber, sub);
+        self.write(
+            &json!({"at_ms": epoch_ms(), "lead": subscriber, "ended": sub.name, "why": why,
+            "removed": removed.as_ref().is_ok_and(|r| *r), "error": removed.err()}),
+        );
+    }
+
+    /// Subscribers no bot now listed holds, as after deletes the lookout
+    /// was away for: what they held ends. Whether any did.
+    fn unheld(&self, listed: std::time::SystemTime) -> bool {
+        let mut any = false;
+        for name in self.subscribers.keys() {
+            let live = (self.records.get(name)).and_then(|bot| bot["bot_id"].as_i64());
+            let ended = subs::unheld(&self.store, name, live, listed);
+            if ended.as_ref().is_ok_and(|n| *n > 0) || ended.is_err() {
+                any = true;
+                self.write(&json!({"at_ms": epoch_ms(), "lead": name, "ended": "all",
+                    "why": "its subscriber was deleted", "error": ended.err()}));
+            }
+        }
+        any
+    }
+
+    /// A bot was deleted: the subscriptions it held end with it, and so
+    /// does any that watched only bots by their names, every one of them
+    /// gone now, and no source or maker's tasks.
+    /// Whether any ended.
+    fn ended_with(&self, gone: &str, id: Option<i64>) -> bool {
+        let mut any = false;
+        if self.subscribers.contains_key(gone) {
+            let forgot = subs::forget(&self.store, gone, id);
+            if forgot.as_ref().is_ok_and(|n| *n > 0) || forgot.is_err() {
+                any = true;
+                self.write(&json!({"at_ms": epoch_ms(), "lead": gone, "ended": "all",
+                    "why": "its subscriber was deleted", "error": forgot.err()}));
+            }
+        }
+        for (subscriber, subs) in &self.subscribers {
+            for sub in subs {
+                // A maker's tasks outlive it: one that watches them stays.
+                let names: Vec<&String> = sub.bots.iter().collect();
+                let watched_gone = names.iter().any(|name| *name == gone)
+                    && sub.sources.is_empty()
+                    && sub.tasks_of.is_empty()
+                    && names
+                        .iter()
+                        .all(|name| !name.contains('*') && !self.records.contains_key(*name));
+                if watched_gone && subscriber != gone {
+                    self.end_sub(subscriber, sub, "every bot it watched was deleted");
+                    any = true;
+                }
+            }
+        }
+        any
     }
 
     /// Whether `event` ends a call of Sonny's that wrote files the lookout
@@ -1818,6 +1931,7 @@ impl Service {
         lookout.roots(&self.records, &self.made);
         let held = beside(&self.store, ".sources").join(".held");
         lookout.restore(held.join(format!("{lead}.json")));
+        lookout.counting();
         self.lookouts.insert(lead.to_owned(), lookout);
         // Said once a subscriber is watched, so `/status` shows it from
         // the start.
@@ -1874,7 +1988,9 @@ impl Service {
                 .cloned()
                 .collect();
             if all || subs != lookout.subs {
+                lookout.updates.ended(&gone(&lookout.subs, &subs));
                 lookout.subs = subs;
+                lookout.counting();
                 lookout.roots(&self.records, &self.made);
                 lookout.rehear();
             }
@@ -1928,11 +2044,20 @@ impl Service {
         if self.saved == Some((cursor, replay)) {
             return;
         }
+        // What the lookouts hold goes to disk first, the runs a note spent
+        // with it: the stream never starts again past news whose spending
+        // a crash lost.
+        for lookout in self.lookouts.values_mut() {
+            lookout.flush();
+        }
         let path = cursor_path(&self.store);
         let partial = path.with_extension(format!("cursor.{}.partial", std::process::id()));
-        if write_moved(&partial, &path, &format!("{cursor} {replay}")).is_ok() {
-            self.saved = Some((cursor, replay));
-        }
+        self.saved = Some((cursor, replay));
+        held::then(move |written| {
+            if written {
+                let _ = write_moved(&partial, &path, &format!("{cursor} {replay}"));
+            }
+        });
     }
 
     /// Just before the oldest turn under way that a lookout hears, or
@@ -2174,6 +2299,20 @@ struct Lookout {
     /// When a note last told the subscriber each source, which a source's
     /// digest counts from.
     told_sources: HashMap<String, Instant>,
+    /// The notes, by request, that told what each subscription that lasts
+    /// so many (`runs`) heard, under `Sub::counter`, kept with what its
+    /// sources hold: a note sent again after a restart is one note.
+    runs_told: HashMap<String, Vec<String>>,
+    /// The subscriptions that last so many whose news the note on its way
+    /// on each path tells, by `Sub::counter` as they were when it went: one
+    /// replaced meanwhile is not charged for it. Tasks' path, then sources'.
+    charged: [Vec<String>; 2],
+    /// Subscriptions whose notes ran out, for the service to end, as they
+    /// were read: one put in its place since stays.
+    ended: Vec<subs::Sub>,
+    /// Subscriptions whose `until` came before the files were read again,
+    /// for the service to end.
+    over: Vec<subs::Sub>,
     /// Where what its sources said waits, untold, so a restart loses none
     /// of what a digest or a busy subscriber held.
     held: Option<PathBuf>,
@@ -2238,6 +2377,10 @@ impl Lookout {
             unkept_sent: Unkept::default(),
             heard_since: None,
             told_sources: HashMap::new(),
+            runs_told: HashMap::new(),
+            charged: Default::default(),
+            ended: Vec::new(),
+            over: Vec::new(),
             held: None,
             dirty: false,
             resend: Vec::new(),
@@ -2709,7 +2852,7 @@ impl Lookout {
         {
             self.ask(client, woken, now);
         }
-        if self.sending.is_some() {
+        if self.sending.is_some() || self.last_runs_out(true) || self.overdue() {
             return;
         }
         let Some(joins) = self.wake_due(now) else {
@@ -2742,6 +2885,7 @@ impl Lookout {
         if !quotes.is_empty() {
             asked["quotes"] = json!(quotes);
         }
+        self.charged[0] = self.charges(told.counted.iter());
         self.sending = Some((told, key, delivery));
         self.send(client, woken, asked, Answer::Noted);
     }
@@ -2812,6 +2956,7 @@ impl Lookout {
                         }
                         // The person's words a bounded note left out still cut in.
                         self.urgent &= self.updates.quoting();
+                        self.spend(0, &key);
                         self.updates.sent(told);
                         // When a subscription's digest last told is kept.
                         if !self.updates.told_subs.is_empty() {
@@ -2826,6 +2971,7 @@ impl Lookout {
                     // The same news twice is one note.
                     Err(code) if code == "idempotency_conflict" => {
                         self.urgent &= self.updates.quoting();
+                        self.spend(0, &key);
                         self.updates.sent(told);
                     }
                     Err(code) => {
@@ -2865,6 +3011,7 @@ impl Lookout {
                     submitted => {
                         self.refused = None;
                         self.sourced(true);
+                        self.spend(1, &key);
                         self.unkept_sent = Unkept::default();
                         for heard in &sent {
                             self.told_sources.insert(heard.event.source.clone(), now);
@@ -2879,6 +3026,100 @@ impl Lookout {
                 self.heard_since = (!self.heard.is_empty()).then_some(now);
                 self.keep();
             }
+        }
+    }
+
+    /// Notes counted only for subscriptions it has that last so many,
+    /// each under when it was added, so one removed and added again, even
+    /// in one call, starts its count afresh.
+    fn counting(&mut self) {
+        let subs = &self.subs;
+        self.runs_told.retain(|counter, _| {
+            subs.iter()
+                .any(|sub| sub.runs.is_some() && &sub.counter() == counter)
+        });
+    }
+
+    /// Whether a subscription's `until` came since the files were last
+    /// read: it goes to `over`, to end before any note is sent.
+    fn overdue(&mut self) -> bool {
+        let now = (epoch_ms() / 1000) as i64;
+        for sub in self.subs.iter().filter(|sub| sub.over(now)) {
+            if !self.over.contains(sub) {
+                self.over.push(sub.clone());
+            }
+        }
+        !self.over.is_empty()
+    }
+
+    /// Whether the note under way on the other path, the sources' for task
+    /// news (`tasks`) or the reverse, tells a subscription its last run:
+    /// this one waits for it to land, so a one-shot is never told twice.
+    fn last_runs_out(&self, tasks: bool) -> bool {
+        let flying = match tasks {
+            true => self.sourcing.is_some(),
+            false => self.sending.is_some(),
+        };
+        let other = &self.charged[usize::from(tasks)];
+        flying
+            && other.iter().any(|counter| {
+                (self.subs.iter().find(|sub| &sub.counter() == counter)).is_some_and(|sub| {
+                    sub.runs.is_some_and(|runs| {
+                        self.runs_told.get(counter).map_or(0, Vec::len) as u64 + 1 >= runs
+                    })
+                })
+            })
+    }
+
+    /// What a note telling these subscriptions' news charges: each that
+    /// lasts so many, by its `Sub::counter`.
+    fn charges<'a>(&self, names: impl Iterator<Item = &'a String>) -> Vec<String> {
+        let mut charges: Vec<String> = Vec::new();
+        for name in names {
+            let Some(sub) = self
+                .subs
+                .iter()
+                .find(|sub| &sub.name == name && sub.runs.is_some())
+            else {
+                continue;
+            };
+            let counter = sub.counter();
+            if !charges.contains(&counter) {
+                charges.push(counter);
+            }
+        }
+        charges
+    }
+
+    /// The note on `path` (0 tasks', 1 sources') landed, under `key`:
+    /// each subscription it charged that lasts so many notes has one fewer
+    /// to go, once however often that note is sent, and one with none left
+    /// ends, as an automation does after its `--runs`.
+    fn spend(&mut self, path: usize, key: &[String]) {
+        let request = format!("lookout-{}", digest(&key.join(",")));
+        let mut spent = false;
+        for counter in std::mem::take(&mut self.charged[path]) {
+            let Some(sub) = self.subs.iter().find(|sub| sub.counter() == counter) else {
+                continue;
+            };
+            let (Some(runs), sub) = (sub.runs, sub.clone()) else {
+                continue;
+            };
+            let told = self.runs_told.entry(counter.clone()).or_default();
+            if told.contains(&request) {
+                continue;
+            }
+            spent = true;
+            told.push(request.clone());
+            if told.len() as u64 >= runs {
+                self.runs_told.remove(&counter);
+                if !self.ended.contains(&sub) {
+                    self.ended.push(sub);
+                }
+            }
+        }
+        if spent {
+            self.keep();
         }
     }
 
@@ -3025,6 +3266,7 @@ impl Lookout {
             && sending.is_empty()
             && self.told_sources.is_empty()
             && told_subs.is_empty()
+            && self.runs_told.is_empty()
         {
             return Some((path, None));
         }
@@ -3043,6 +3285,9 @@ impl Lookout {
         // reads as it did before there were any.
         if !told_subs.is_empty() {
             body["told_subs"] = json!(at_ms(told_subs));
+        }
+        if !self.runs_told.is_empty() {
+            body["runs_told"] = json!(self.runs_told);
         }
         if unkept.count > 0 {
             body["unkept"] = unkept.to_json();
@@ -3094,6 +3339,14 @@ impl Lookout {
         };
         self.told_sources.extend(read("told"));
         self.updates.told_subs.extend(read("told_subs"));
+        self.runs_told
+            .extend(
+                (kept["runs_told"].as_object().into_iter().flatten()).map(|(sub, told)| {
+                    let told = (told.as_array().into_iter().flatten())
+                        .filter_map(|request| request.as_str().map(str::to_owned));
+                    (sub.clone(), told.collect())
+                }),
+            );
         let heard = |key: &str| -> Vec<sources::Heard> {
             (kept[key].as_array().into_iter().flatten())
                 .filter_map(sources::Event::from_json)
@@ -3186,7 +3439,7 @@ impl Lookout {
         if self.updates.waited(now, since) {
             self.ask(client, woken, now);
         }
-        if self.sourcing.is_some() {
+        if self.sourcing.is_some() || self.last_runs_out(false) || self.overdue() {
             return;
         }
         if self.refused(now) {
@@ -3263,6 +3516,7 @@ impl Lookout {
         }
         self.updates.fly(&subs);
         self.sourced_subs = subs;
+        self.charged[1] = self.charges(sent.iter().flat_map(|heard| &heard.subs));
         self.sourcing = Some((sent, key, delivery));
         self.keep();
         self.send(client, woken, asked, Answer::Sourced);
@@ -3376,6 +3630,16 @@ mod held {
         });
         told.recv().unwrap_or(false)
     }
+}
+
+/// The subscriptions of `had` that `now` no longer holds, by name: one
+/// put in another's place under its name ends the one before, so what
+/// that heard is not the new one's to tell.
+fn gone(had: &[subs::Sub], now: &[subs::Sub]) -> Vec<String> {
+    (had.iter())
+        .filter(|had| !now.contains(had))
+        .map(|had| had.name.clone())
+        .collect()
 }
 
 fn epoch_ms() -> u128 {
@@ -3562,6 +3826,9 @@ mod tests {
             digest: None,
             steer: None,
             owner: None,
+            until: None,
+            runs: None,
+            made: None,
         }
     }
 
@@ -3937,6 +4204,30 @@ mod tests {
         let told = lookout.updates.take();
         assert!(told.items.iter().all(|l| !l.text.contains("failed")));
         assert_eq!(lookout.updates.urgent(), Some("tasks"));
+    }
+
+    #[test]
+    fn news_only_an_ended_subscription_heard_goes_with_it() {
+        let mut lookout = seated("idle");
+        lookout.subs[0].digest = Some("1h".into());
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        let now = Instant::now();
+        ended(&mut lookout, 4, "completed");
+        let told = lookout.updates.take_at(now);
+        lookout.updates.sent(told);
+        // Held by the digest, then the subscription ends: no note tells it.
+        ended(&mut lookout, 5, "completed");
+        assert!(lookout.updates.news());
+        lookout.updates.ended(&["other".into()]);
+        assert!(lookout.updates.news(), "another's end leaves it");
+        // Put in its own place under its name, it ended all the same.
+        let mut again = lookout.subs[0].clone();
+        assert!(gone(&lookout.subs, &[again.clone()]).is_empty());
+        again.made = Some(1);
+        assert_eq!(gone(&lookout.subs, &[again]), ["tasks"]);
+        lookout.updates.ended(&["tasks".into()]);
+        assert!(!lookout.updates.news());
     }
 
     #[test]
@@ -5036,10 +5327,12 @@ mod tests {
         service.in_flight.insert(("calc.fix".into(), 7), 40);
         service.in_flight.insert(("calc.docs".into(), 9), 60);
         service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(90), Some(39)));
         // Nothing under way: it starts again where its news ended.
         service.in_flight.clear();
         service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(90), Some(90)));
         // A failed fire whose note is under way is told again from its
         // start: its end is news and its start names its trigger.
@@ -5050,10 +5343,12 @@ mod tests {
         };
         service.telling.insert(("calc.fix".into(), 7), telling);
         service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(49), Some(29)));
         // The daemon took it: nothing holds the stream.
         service.telling.clear();
         service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(90), Some(90)));
         std::fs::write(cursor_path(&store), "12").unwrap();
         assert_eq!(marks(&store), (Some(12), Some(12)));
@@ -5481,6 +5776,174 @@ mod tests {
         held::written();
         assert!(other.heard.is_empty());
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_subscription_that_lasts_so_many_notes_ends_after_them_across_a_restart() {
+        let dir = std::env::temp_dir().join(format!("sonny-runs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("calc.lead.json");
+        let made = || {
+            let mut lookout = lookout();
+            let mut twice = hears("twice");
+            twice.runs = Some(2);
+            twice.made = Some(7);
+            lookout.subs.push(twice);
+            lookout.subs.push(hears("always"));
+            (lookout.updates).seat(&json!({"name": "calc.lead", "bot_id": 1, "status": "idle"}));
+            lookout.restore(path.clone());
+            lookout.counting();
+            lookout
+        };
+        let names =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+        let key = |k: &str| vec![k.to_owned()];
+        let mut lookout = made();
+        // One that lasts is never charged; one note told is one spent.
+        lookout.charged[1] = lookout.charges(names(&["always", "twice"]).iter());
+        assert_eq!(lookout.charged[1], ["twice@7"]);
+        lookout.spend(1, &key("a"));
+        assert_eq!(lookout.runs_told["twice@7"].len(), 1);
+        assert!(lookout.ended.is_empty());
+        lookout.flush();
+        held::written();
+        // Watched again, it has one note to go. The same note sent again
+        // after the restart is that one note, not another.
+        let mut again = made();
+        assert_eq!(again.runs_told["twice@7"].len(), 1);
+        again.charged[0] = again.charges(names(&["twice"]).iter());
+        again.spend(0, &key("a"));
+        assert!(again.ended.is_empty());
+        again.charged[0] = again.charges(names(&["twice"]).iter());
+        again.spend(0, &key("b"));
+        assert_eq!(again.ended[0].name, "twice");
+        assert!(again.runs_told.is_empty());
+        // Its last note under way on one path holds the other back, so a
+        // one-shot is told once; one with notes to spare holds nothing.
+        again.ended.clear();
+        let told = updates::Told::default();
+        again.charged[0] = again.charges(names(&["twice"]).iter());
+        again.sending = Some((told, Vec::new(), "steer"));
+        assert!(!again.last_runs_out(false), "two to go");
+        again
+            .runs_told
+            .insert("twice@7".into(), vec!["lookout-a".into()]);
+        assert!(again.last_runs_out(false));
+        assert!(!again.last_runs_out(true), "nothing under way for sources");
+        again.sending = None;
+        assert!(!again.last_runs_out(false), "nothing under way for tasks");
+        // One whose `until` came before the files are read again holds
+        // every note back until the service ends it.
+        assert!(!again.overdue());
+        let mut late = hears("late");
+        late.until = Some("2020-01-01 00:00".into());
+        again.subs.push(late);
+        assert!(again.overdue());
+        assert_eq!(again.over[0].name, "late");
+        // Replaced while its note is on the way, even in one call, the new
+        // one is not charged for it and counts afresh.
+        again.charged[1] = again.charges(names(&["twice"]).iter());
+        let twice = again
+            .subs
+            .iter_mut()
+            .find(|sub| sub.name == "twice")
+            .unwrap();
+        twice.made = Some(8);
+        again.counting();
+        assert!(again.runs_told.is_empty());
+        again.spend(1, &key("c"));
+        assert!(again.runs_told.is_empty() && again.ended.is_empty());
+        again
+            .runs_told
+            .insert("twice@8".into(), vec!["lookout-d".into()]);
+        again.subs.retain(|sub| sub.name != "twice");
+        again.counting();
+        assert!(again.runs_told.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deleted_bot_ends_its_subscriptions_and_those_that_watched_only_it() {
+        let dir = std::env::temp_dir().join(format!("sonny-ended-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let add = |subscriber: &str, owner: i64, sub: Value| {
+            subs::change(
+                &store,
+                subscriber,
+                Some(owner),
+                Some(&sub),
+                None,
+                &["ci".into()],
+            )
+            .unwrap();
+        };
+        add(
+            "shop.fix",
+            2,
+            json!({"name": "mine", "bots": ["shop.lead"]}),
+        );
+        add(
+            "shop.lead",
+            1,
+            json!({"name": "fix", "tasks_of": ["shop.fix"]}),
+        );
+        add(
+            "shop.lead",
+            1,
+            json!({"name": "both", "bots": ["shop.fix", "shop.docs"]}),
+        );
+        add("shop.lead", 1, json!({"name": "glob", "bots": ["shop.*"]}));
+        add(
+            "shop.lead",
+            1,
+            json!({"name": "ci", "bots": ["shop.fix"], "sources": ["ci"]}),
+        );
+        let lead = json!({"name": "shop.lead", "bot_id": 1});
+        let docs = json!({"name": "shop.docs", "bot_id": 3});
+        let mut service = service(store.clone(), &[lead, docs]);
+        service.subscribers = subs::all(&store).into_iter().collect();
+        assert!(service.ended_with("shop.fix", Some(2)));
+        assert!(subs::read(&store, "shop.fix").is_empty());
+        let names = |store: &Path| -> Vec<String> {
+            subs::read(store, "shop.lead")
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        };
+        // One bot of two still there, a glob, a source, or the tasks a
+        // maker made, which outlive it, keeps it.
+        assert_eq!(names(&store), ["fix", "both", "glob", "ci"]);
+        service.records.remove("shop.docs");
+        service.subscribers = subs::all(&store).into_iter().collect();
+        assert!(service.ended_with("shop.docs", Some(3)));
+        assert_eq!(names(&store), ["fix", "glob", "ci"]);
+        // Nothing left that it ends: the files are not read again for it.
+        service.subscribers = subs::all(&store).into_iter().collect();
+        assert!(!service.ended_with("shop.docs", Some(3)));
+        // A delete the lookout was away for: a subscriber no longer listed
+        // ends whole, and one still listed keeps what its bot holds.
+        add(
+            "shop.gone",
+            4,
+            json!({"name": "old", "bots": ["shop.lead"]}),
+        );
+        service.subscribers = subs::all(&store).into_iter().collect();
+        let after = std::time::SystemTime::now() + Duration::from_secs(5);
+        assert!(service.unheld(after));
+        assert!(subs::read(&store, "shop.gone").is_empty());
+        assert_eq!(names(&store), ["fix", "glob", "ci"]);
+        service.subscribers = subs::all(&store).into_iter().collect();
+        assert!(!service.unheld(after), "nothing more");
+        // A file written since the listing is left: a bot made since may
+        // have written it.
+        add("shop.new", 5, json!({"name": "new", "bots": ["shop.lead"]}));
+        service.subscribers = subs::all(&store).into_iter().collect();
+        let before = std::time::SystemTime::now() - Duration::from_secs(5);
+        assert!(!service.unheld(before));
+        assert_eq!(subs::read(&store, "shop.new").len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
