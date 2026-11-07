@@ -1,0 +1,317 @@
+//! A file the kernel tells the daemon about when it may have changed:
+//! inotify on Linux and kqueue on macOS, so a watch costs nothing between
+//! changes (no polling). The folder is watched, not only the file, since an
+//! editor or a settings writer usually replaces a file by renaming another
+//! over it. A notice says only that the file may have changed; the reader
+//! compares what it reads now with what it read last.
+use std::path::{Path, PathBuf};
+use tokio::sync::mpsc;
+
+/// A receiver told, at most one notice pending, each time `path` may have
+/// changed. None where the platform has no watch or the folder cannot be
+/// watched; the file is then read at start only.
+pub fn watch(path: &Path) -> Option<mpsc::Receiver<()>> {
+    let (sender, receiver) = mpsc::channel(1);
+    imp::spawn(path.to_owned(), sender).ok()?;
+    Some(receiver)
+}
+
+/// Tells the receiver without waiting: one pending notice covers any number
+/// of changes, since each reads the file whole.
+fn notify(sender: &mpsc::Sender<()>) -> bool {
+    !matches!(
+        sender.try_send(()),
+        Err(mpsc::error::TrySendError::Closed(_))
+    )
+}
+
+fn split(path: &Path) -> std::io::Result<(PathBuf, std::ffi::OsString)> {
+    match (path.parent(), path.file_name()) {
+        (Some(folder), Some(name)) if !folder.as_os_str().is_empty() => {
+            Ok((folder.to_owned(), name.to_owned()))
+        }
+        _ => Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+    }
+}
+
+fn c_path(path: &Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+}
+
+#[cfg(target_os = "linux")]
+mod imp {
+    use super::{c_path, notify, split};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::path::PathBuf;
+    use tokio::{io::unix::AsyncFd, sync::mpsc};
+
+    pub fn spawn(path: PathBuf, sender: mpsc::Sender<()>) -> std::io::Result<()> {
+        let (folder, name) = split(&path)?;
+        // SAFETY: inotify_init1 takes flags only and returns a new fd or -1.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fd was just returned to this process and is owned here.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let folder = c_path(&folder)?;
+        // A write closed, or an entry made, moved or removed in the folder:
+        // never a plain modify, so a log appended beside it costs no wakeup.
+        let mask = libc::IN_CLOSE_WRITE
+            | libc::IN_MOVED_TO
+            | libc::IN_MOVED_FROM
+            | libc::IN_CREATE
+            | libc::IN_DELETE;
+        // SAFETY: fd is a live inotify fd and folder a NUL-terminated path.
+        if unsafe { libc::inotify_add_watch(fd.as_raw_fd(), folder.as_ptr(), mask) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the OwnedFd is open, and it keeps the one descriptor
+        // until the AsyncFd that owns it drops.
+        let fd = unsafe { AsyncFd::register(fd) }.map_err(std::io::Error::from)?;
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 4096];
+            loop {
+                let Ok(mut ready) = fd.readable().await else {
+                    return;
+                };
+                let mut changed = false;
+                loop {
+                    // SAFETY: buffer is writable for its length.
+                    let read = unsafe {
+                        libc::read(
+                            fd.get_ref().as_raw_fd(),
+                            buffer.as_mut_ptr().cast(),
+                            buffer.len(),
+                        )
+                    };
+                    if read < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::WouldBlock {
+                            ready.clear_ready();
+                            break;
+                        }
+                        return;
+                    }
+                    let read = read as usize;
+                    let mut at = 0;
+                    const HEADER: usize = std::mem::size_of::<libc::inotify_event>();
+                    while at + HEADER <= read {
+                        // SAFETY: the kernel wrote a whole event at `at`; it
+                        // may be unaligned, so it is read unaligned.
+                        let event: libc::inotify_event =
+                            unsafe { std::ptr::read_unaligned(buffer[at..].as_ptr().cast()) };
+                        let end = (at + HEADER + event.len as usize).min(read);
+                        let named = &buffer[at + HEADER..end];
+                        let named =
+                            &named[..named.iter().position(|b| *b == 0).unwrap_or(named.len())];
+                        // The folder itself went away: nothing more will come.
+                        if event.mask & (libc::IN_IGNORED | libc::IN_DELETE_SELF) != 0 {
+                            return;
+                        }
+                        if named == std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str())
+                            || event.mask & libc::IN_Q_OVERFLOW != 0
+                        {
+                            changed = true;
+                        }
+                        at = end;
+                    }
+                }
+                if changed && !notify(&sender) {
+                    return;
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::{c_path, notify, split};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::path::{Path, PathBuf};
+    use tokio::{io::unix::AsyncFd, sync::mpsc};
+
+    fn open_events(path: &Path) -> std::io::Result<OwnedFd> {
+        let path = c_path(path)?;
+        // SAFETY: path is NUL-terminated; O_EVTONLY opens for events only.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_EVTONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fd was just returned to this process and is owned here.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn register(queue: &OwnedFd, watched: &OwnedFd, flags: u32) -> std::io::Result<()> {
+        // SAFETY: an all-zero kevent is valid; the fields set below follow.
+        let mut change: libc::kevent = unsafe { std::mem::zeroed() };
+        change.ident = watched.as_raw_fd() as libc::uintptr_t;
+        change.filter = libc::EVFILT_VNODE;
+        change.flags = libc::EV_ADD | libc::EV_CLEAR;
+        change.fflags = flags;
+        // SAFETY: one change in, no events out, on a live kqueue.
+        let added = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        match added {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
+
+    /// Takes every event the queue holds without waiting: whether there
+    /// were any, or none if the queue failed.
+    fn drain(queue: &OwnedFd) -> Option<bool> {
+        // SAFETY: an all-zero kevent array is valid output space.
+        let mut events: [libc::kevent; 8] = unsafe { std::mem::zeroed() };
+        let none = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let mut changed = false;
+        loop {
+            // SAFETY: no changes in, up to 8 events out, no wait.
+            let count = unsafe {
+                libc::kevent(
+                    queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    events.as_mut_ptr(),
+                    events.len() as libc::c_int,
+                    &none,
+                )
+            };
+            match count {
+                ..0 => return None,
+                0 => return Some(changed),
+                _ => changed = true,
+            }
+        }
+    }
+
+    const FILE: u32 = libc::NOTE_WRITE
+        | libc::NOTE_EXTEND
+        | libc::NOTE_ATTRIB
+        | libc::NOTE_DELETE
+        | libc::NOTE_RENAME;
+
+    pub fn spawn(path: PathBuf, sender: mpsc::Sender<()>) -> std::io::Result<()> {
+        let (folder, _) = split(&path)?;
+        // SAFETY: kqueue takes no arguments and returns a new fd or -1.
+        let queue = unsafe { libc::kqueue() };
+        if queue < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: queue was just returned to this process and is owned here.
+        let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+        // SAFETY: fcntl on a live fd this process owns.
+        unsafe {
+            let flags = libc::fcntl(queue.as_raw_fd(), libc::F_GETFD);
+            libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            let flags = libc::fcntl(queue.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(queue.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        // The folder's entries (a file renamed into place), and the file
+        // itself while it is there (written in place).
+        let folder = open_events(&folder)?;
+        register(&queue, &folder, libc::NOTE_WRITE)?;
+        let mut file = open_events(&path).ok();
+        if let Some(file) = &file {
+            register(&queue, file, FILE)?;
+        }
+        // SAFETY: the OwnedFd is open, and it keeps the one descriptor
+        // until the AsyncFd that owns it drops.
+        let queue = unsafe { AsyncFd::register(queue) }.map_err(std::io::Error::from)?;
+        tokio::spawn(async move {
+            let _folder = folder;
+            loop {
+                let Ok(mut ready) = queue.readable().await else {
+                    return;
+                };
+                let Some(changed) = drain(queue.get_ref()) else {
+                    return;
+                };
+                ready.clear_ready();
+                drop(ready);
+                if changed {
+                    // A write in place is told as it happens, not as it
+                    // ends: let it finish before the file is read.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    // The file may be another inode now: watch the one
+                    // there, the old one's watch ending as it closes.
+                    drop(file.take());
+                    file = open_events(&path).ok();
+                    if let Some(file) = &file
+                        && register(queue.get_ref(), file, FILE).is_err()
+                    {
+                        return;
+                    }
+                    if !notify(&sender) {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod imp {
+    use std::path::PathBuf;
+    use tokio::sync::mpsc;
+
+    pub fn spawn(_: PathBuf, _: mpsc::Sender<()>) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    async fn told(receiver: &mut tokio::sync::mpsc::Receiver<()>) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_write_in_place_and_a_rename_over_the_file_are_both_told() {
+        let dir = std::env::temp_dir().join(format!("watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "a = 1\n").unwrap();
+        let mut receiver = super::watch(&path).unwrap();
+        std::fs::write(&path, "a = 2\n").unwrap();
+        assert!(told(&mut receiver).await, "write in place");
+        // Drain what one write may have told twice.
+        while tokio::time::timeout(Duration::from_millis(200), receiver.recv())
+            .await
+            .is_ok()
+        {}
+        std::fs::write(dir.join(".config.toml.tmp"), "a = 3\n").unwrap();
+        std::fs::rename(dir.join(".config.toml.tmp"), &path).unwrap();
+        assert!(told(&mut receiver).await, "rename over");
+        while tokio::time::timeout(Duration::from_millis(200), receiver.recv())
+            .await
+            .is_ok()
+        {}
+        // A rewrite after the rename is still told: the new file is watched.
+        std::fs::write(&path, "a = 4\n").unwrap();
+        assert!(told(&mut receiver).await, "write after rename");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

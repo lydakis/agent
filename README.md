@@ -101,7 +101,9 @@ Bedrock runtime's OpenAI-compatible endpoint serves, by inference profile
 needs no flags.
 To keep them instead, put `provider = "bedrock"` and
 `model = "bedrock/global.anthropic.claude-sonnet-5"` in `~/.agent/config.toml`;
-the shell's variables come first.
+the shell's variables come first. An edit to `provider` there applies to a
+running daemon's next turns without a restart; running turns finish where
+they started.
 For a ChatGPT Go, Plus or Pro plan, run `agent login chatgpt` once and start
 the daemon with `--provider chatgpt`; it signs in through OpenAI's
 [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source)

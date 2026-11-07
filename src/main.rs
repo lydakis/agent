@@ -243,6 +243,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut walled = Vec::new();
     let mut windows = Vec::new();
     let mut models = None;
+    let mut provider_config = None;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -271,6 +272,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--wall" => walled.push(value.into()),
             "--context-window" => windows.push(value.as_str()),
             "--models" => models = Some(value.into()),
+            "--provider-config" => provider_config = Some(value.into()),
             "--protect-existing" => protected_existing.push(value.clone()),
             "--max-processes"
             | "--max-lasting"
@@ -337,5 +339,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         walled,
         context_windows: std::sync::Arc::new(agent_runtime::provider::Windows::parse(windows)?),
         models,
+        provider_config,
     })
 }

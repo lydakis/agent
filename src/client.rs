@@ -53,6 +53,10 @@ struct Options {
     store: PathBuf,
     socket: PathBuf,
     providers: Vec<String>,
+    /// Whether the providers came from `~/.agent/config.toml` (or, with no
+    /// `provider` there, from the key variables set), not the command line
+    /// or AGENT_PROVIDER.
+    providers_from_config: bool,
     /// Daemon-scoped values the caller stated, checked against a running
     /// daemon at attach. Defaults and environment-implied values never conflict.
     providers_explicit: bool,
@@ -151,6 +155,7 @@ fn parse(args: &[String]) -> Result<Options> {
         socket: PathBuf::new(),
         store: PathBuf::new(),
         providers: Vec::new(),
+        providers_from_config: false,
         providers_explicit: false,
         tools_explicit: false,
         tools: String::new(),
@@ -541,6 +546,10 @@ fn parse(args: &[String]) -> Result<Options> {
     if options.providers.is_empty() {
         options.providers =
             environment_providers(&|name| std::env::var(name).ok(), &|| Ok(config()?.provider))?;
+        // Providers the config file names follow it while the daemon runs;
+        // ones given on the command line or by AGENT_PROVIDER stay as given.
+        options.providers_from_config =
+            std::env::var("AGENT_PROVIDER").map_or(true, |specs| specs.trim().is_empty());
     }
     Ok(options)
 }
@@ -551,7 +560,7 @@ fn parse(args: &[String]) -> Result<Options> {
 /// well-known key variable is set. Like `AGENT_MODEL`, they are defaults: a
 /// running daemon is not checked against them, since every shell a bot runs
 /// inherits the daemon's environment.
-fn environment_providers(
+pub(crate) fn environment_providers(
     var: &dyn Fn(&str) -> Option<String>,
     configured: &dyn Fn() -> Result<Option<String>>,
 ) -> Result<Vec<String>> {
@@ -1062,6 +1071,10 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
         command
             .arg("--context-window")
             .arg(format!("{pattern}={tokens}"));
+    }
+    // Where the providers came from, so an edit there applies live.
+    if let Some(file) = agent_client::config::path().filter(|_| options.providers_from_config) {
+        command.arg("--provider-config").arg(file);
     }
     // The list clients offer, kept current by every start of the daemon of
     // the store beside it; a daemon on another store (a test, a side

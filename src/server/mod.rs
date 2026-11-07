@@ -2,9 +2,11 @@
 //! the same JSONL protocol; turns run as tasks; events fan out through a hub.
 mod actives;
 mod companions;
+mod file_watch;
 mod handles;
 mod hub;
 mod lane;
+mod reload;
 mod session;
 mod socket;
 mod turn;
@@ -667,6 +669,8 @@ const PAUSE_NAMES: usize = 64;
 /// The variable a Bedrock API key is read from, as the AWS tools name it.
 const BEDROCK_KEY: &str = "AWS_BEARER_TOKEN_BEDROCK";
 pub struct ProviderSpec {
+    /// The spec as given, by which a reload tells a binding it keeps.
+    pub spec: String,
     pub name: String,
     pub family: Family,
     pub url: String,
@@ -823,6 +827,7 @@ impl ProviderSpec {
             ));
         }
         Ok(Self {
+            spec: spec.to_owned(),
             sigv4: bedrock && key_env.is_none(),
             chatgpt_login: name == "chatgpt" && key_env.is_none() && url == default_url,
             name: name.to_owned(),
@@ -890,6 +895,10 @@ pub struct Configuration {
     /// The model list clients offer (`~/.agent/models`), refreshed from the
     /// providers' listings each time the daemon starts; none leaves it be.
     pub models: Option<PathBuf>,
+    /// The config file the providers came from (`~/.agent/config.toml`'s
+    /// `provider`), watched so an edit applies without a restart; none
+    /// when they were given on the command line or by `AGENT_PROVIDER`.
+    pub provider_config: Option<PathBuf>,
 }
 
 /// `path` by its real path, or, while it doesn't exist, by the real path
@@ -1195,6 +1204,8 @@ struct Service {
     companions: companions::Companions,
     transport: Arc<Transport>,
     providers: Arc<HashMap<String, Provider>>,
+    /// How providers are bound again when their config file changes.
+    reload: Option<Box<reload::Reload>>,
     registry: Registry,
     hub: Hub,
     handles: Handles,
@@ -1466,29 +1477,25 @@ pub(crate) async fn publish(
     }
 }
 
-pub async fn run(config: Configuration) -> Result<()> {
-    let limits = Limits::resolve(&config);
-    let transport = Transport::new(limits.connecting, limits.connections)?;
-    let stall_timeout = config
-        .stall_timeout
-        .map_or(agent_runtime::provider::STALL_TIMEOUT, Duration::from_secs);
-    let registry = Registry::all()?;
-    let mut providers = HashMap::new();
-    let aws_start = agent_runtime::provider::aws::Start::new();
-    let credentials = agent_runtime::tools::Credentials::default();
-    credentials.redact_also(&config.redact_fields, &config.redact_blocks);
-    // Every tool shell inherits the environment the daemon started with,
-    // so the excludes are matched against it once.
-    for (name, _) in std::env::vars_os() {
-        if let Some(name) = name.to_str()
-            && (config.shell_excludes.iter())
-                .any(|pattern| agent_runtime::tools::name_matches(pattern, name))
-        {
-            credentials.withhold(name);
-        }
-    }
-    let mut bindings = serde_json::Map::new();
-    for spec in &config.providers {
+/// What makes a provider of a spec, the same at start and on a reload.
+#[derive(Clone)]
+struct Binder {
+    transport: Arc<Transport>,
+    credentials: agent_runtime::tools::Credentials,
+    stall_timeout: Duration,
+    windows: Arc<agent_runtime::provider::Windows>,
+}
+
+impl Binder {
+    /// The provider `spec` names and its binding as `ready.providers`
+    /// reports it. SigV4 bindings made together share `aws_start`'s one
+    /// resolution of the AWS credential chain.
+    async fn bind(
+        &self,
+        spec: &ProviderSpec,
+        aws_start: &agent_runtime::provider::aws::Start,
+    ) -> Result<(Provider, Value)> {
+        let (transport, credentials) = (&self.transport, &self.credentials);
         let (key, login) = if spec.chatgpt_login {
             // No variable carries the tokens; the shared set redacts them,
             // and every pair a refresh brings later.
@@ -1527,13 +1534,10 @@ pub async fn run(config: Configuration) -> Result<()> {
         if spec.sigv4 {
             let url = reqwest::Url::parse(&spec.url)
                 .map_err(|_| Error::with("invalid_provider_url", "the base URL does not parse"))?;
-            let (aws, unresolved) = agent_runtime::provider::aws::Aws::open(
-                &url,
-                Some(credentials.clone()),
-                &aws_start,
-            )
-            .await
-            .map_err(named)?;
+            let (aws, unresolved) =
+                agent_runtime::provider::aws::Aws::open(&url, Some(credentials.clone()), aws_start)
+                    .await
+                    .map_err(named)?;
             let mut signed = json!({"auth":"sigv4","region":aws.region(),
                 "credentials":aws.source()});
             // Keys the CLI cannot resolve yet leave this binding waiting on a
@@ -1553,18 +1557,52 @@ pub async fn run(config: Configuration) -> Result<()> {
             provider = provider.with_socket()?;
         }
         let provider = provider
-            .with_stall_timeout(stall_timeout)?
-            .with_windows(&spec.name, config.context_windows.clone());
+            .with_stall_timeout(self.stall_timeout)?
+            .with_windows(&spec.name, self.windows.clone());
         let (searches, speeds) = (provider.searches(), provider.speeds());
-        if providers.insert(spec.name.clone(), provider).is_some() {
-            return fail_with("duplicate_provider", spec.name.as_str());
-        }
         let mut binding = json!({"family":spec.family.name(),"url":spec.url,
             "transport":spec.transport(),"efforts":spec.family.efforts(),
             "speeds":speeds,
             "web_search":searches});
         if let Some(Value::Object(auth)) = auth {
             binding.as_object_mut().expect("object").extend(auth);
+        }
+        Ok((provider, binding))
+    }
+}
+
+pub async fn run(config: Configuration) -> Result<()> {
+    let limits = Limits::resolve(&config);
+    let transport = Transport::new(limits.connecting, limits.connections)?;
+    let stall_timeout = config
+        .stall_timeout
+        .map_or(agent_runtime::provider::STALL_TIMEOUT, Duration::from_secs);
+    let registry = Registry::all()?;
+    let mut providers = HashMap::new();
+    let aws_start = agent_runtime::provider::aws::Start::new();
+    let credentials = agent_runtime::tools::Credentials::default();
+    credentials.redact_also(&config.redact_fields, &config.redact_blocks);
+    // Every tool shell inherits the environment the daemon started with,
+    // so the excludes are matched against it once.
+    for (name, _) in std::env::vars_os() {
+        if let Some(name) = name.to_str()
+            && (config.shell_excludes.iter())
+                .any(|pattern| agent_runtime::tools::name_matches(pattern, name))
+        {
+            credentials.withhold(name);
+        }
+    }
+    let binder = Binder {
+        transport: transport.clone(),
+        credentials: credentials.clone(),
+        stall_timeout,
+        windows: config.context_windows.clone(),
+    };
+    let mut bindings = serde_json::Map::new();
+    for spec in &config.providers {
+        let (provider, binding) = binder.bind(spec, &aws_start).await?;
+        if providers.insert(spec.name.clone(), provider).is_some() {
+            return fail_with("duplicate_provider", spec.name.as_str());
         }
         bindings.insert(spec.name.clone(), binding);
     }
@@ -1673,7 +1711,22 @@ pub async fn run(config: Configuration) -> Result<()> {
     let identity = store.instance_identity(lineage)?;
     // A pause outlives the daemon that took it.
     let paused = store.op("pause", |db| db.pause()).await?;
-    let ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
+    let reload = config.provider_config.clone().map(|path| {
+        Box::new(reload::Reload {
+            config: path,
+            binder: binder.clone(),
+            specs: config
+                .providers
+                .iter()
+                .map(|spec| spec.spec.clone())
+                .collect(),
+            bindings: bindings.clone(),
+            building: false,
+            again: false,
+            last: Value::Null,
+        })
+    });
+    let mut ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
         "paused":paused,
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
         "limits":{"processes":limits.processes,"lasting":limits.lasting,"active":limits.active,"connecting":limits.connecting,
@@ -1806,6 +1859,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         identity,
         transport,
         providers: Arc::new(providers),
+        reload,
         registry,
         hub,
         handles,
@@ -1847,6 +1901,13 @@ pub async fn run(config: Configuration) -> Result<()> {
     if let Some(path) = config.models.clone() {
         tokio::spawn(refresh_models(service.providers.clone(), path));
     }
+    // The providers' config file, watched by the kernel: nothing runs
+    // until it changes.
+    let mut provider_changes = service
+        .reload
+        .as_ref()
+        .and_then(|reload| file_watch::watch(&reload.config));
+    let (reloaded_sender, mut reloaded) = mpsc::unbounded_channel();
     let idle_exit = config
         .idle_exit
         .filter(|_| config.socket.is_some())
@@ -1876,6 +1937,16 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
                 Some(error) = failures.recv() => return Err(error),
                 _ = service.replays.join_next(), if !service.replays.is_empty() => {}
+                Some(()) = async { provider_changes.as_mut()?.recv().await } => {
+                    if let Some(reload) = service.reload.as_mut() {
+                        reload.start(service.providers.clone(), service.store.clone(), reloaded_sender.clone());
+                    }
+                }
+                Some(built) = reloaded.recv() => {
+                    if let Some(bindings) = service.reloaded(built, &reloaded_sender, config.models.clone()).await? {
+                        ready["providers"] = Value::Object(bindings);
+                    }
+                }
                 _ = service.retention.join_next(), if !service.retention.is_empty() => {}
                 joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
                     let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
@@ -2749,6 +2820,39 @@ impl Service {
     /// Try every held turn again now, or only `bot`'s, as the person may
     /// have fixed what held them: those parked on a call wake, and those
     /// held in line go to the dispatcher. Returns how many.
+    /// A finished reload build: an applied set is swapped in for the turns
+    /// that start from now on, held turns are tried again (a provider they
+    /// waited on may be back), and the model list is refreshed from the
+    /// new set. The new `ready.providers` when the set changed.
+    async fn reloaded(
+        &mut self,
+        built: Result<Option<reload::Built>>,
+        again: &mpsc::UnboundedSender<Result<Option<reload::Built>>>,
+        models: Option<PathBuf>,
+    ) -> Result<Option<serde_json::Map<String, Value>>> {
+        let Some(reload) = self.reload.as_mut() else {
+            return Ok(None);
+        };
+        let rebuild = reload.finished(&built);
+        let applied = match built {
+            Ok(Some(built)) => {
+                self.providers = Arc::new(built.providers);
+                Some(built.bindings)
+            }
+            _ => None,
+        };
+        if rebuild && let Some(reload) = self.reload.as_mut() {
+            reload.start(self.providers.clone(), self.store.clone(), again.clone());
+        }
+        if applied.is_some() {
+            self.retry_held(None).await?;
+            if let Some(path) = models {
+                tokio::spawn(refresh_models(self.providers.clone(), path));
+            }
+        }
+        Ok(applied)
+    }
+
     async fn retry_held(&mut self, bot: Option<String>) -> Result<usize> {
         let (parked, lined) = self
             .store
@@ -4056,6 +4160,7 @@ impl Service {
                         .map(|shut| json!({"limit": self.limits.load, "shut": shut})),
                     "transport": {"in_flight_by_shard": self.transport.loads()},
                     "providers": providers,
+                    "provider_reload": self.reload.as_ref().map(|reload| &reload.last),
                     "store": store.stats(),
                     "tokens": self.tokens.snapshot(),
                     "handles": {"waiters": waiters, "retained": retained},
@@ -5672,6 +5777,7 @@ mod tests {
             identity: 0,
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
+            reload: None,
             registry: Registry::new("wait").unwrap(),
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),
@@ -5882,6 +5988,7 @@ mod tests {
             identity: 0,
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
+            reload: None,
             registry: Registry::new("wait").unwrap(),
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),
@@ -6103,6 +6210,7 @@ mod tests {
             ),
             transport,
             providers: Arc::new(HashMap::from([("openai".to_owned(), provider)])),
+            reload: None,
             registry,
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),
@@ -6352,6 +6460,7 @@ mod tests {
             ),
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
+            reload: None,
             registry: Registry::new("echo").unwrap(),
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),

@@ -416,6 +416,20 @@ separated by whitespace), else `provider` in `~/.agent/config.toml` (the
 same), else the providers whose key variable is set; a
 running daemon is not checked against either. With none of them, starting
 fails with `provider_required`.
+Providers taken from the config file (no `--provider`, no `AGENT_PROVIDER`)
+follow it while the daemon runs (`serve --provider-config`): the kernel
+tells the daemon when the file changes (inotify, kqueue; nothing runs in
+between), and the new set is built and checked beside the old, then swapped
+in whole. Turns that start after the swap use it; running turns finish on
+the providers they started with. A provider whose spec is unchanged is kept
+as it was, with its pacing, connections and keys. A file that does not
+parse, a spec that does not bind (a key variable the daemon was not started
+with, say), and the removal of a provider an agent's model, fallback or
+compaction model still names (`provider_in_use`, naming them) are refused
+whole, and the old set stays. `stats.provider_reload` says what the last
+change came to (`applied` with `added`, `removed` and `changed`, or
+`refused` with its error); new sessions' `ready.providers` show the set in
+use, and held turns are tried again after a change is applied.
 `run --model` names a new bot's model or an existing bot's turn model; the
 daemon has no model of its own, so a new bot needs `--model`, `AGENT_MODEL`,
 or `model` in `~/.agent/config.toml`, in that order. Both are only creation

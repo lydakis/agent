@@ -1700,6 +1700,82 @@ class ModelListTests(ModelFixture):
         self.assertFalse(self.list.exists())
         self.assertEqual(getattr(self.model, 'listings', 0), 0)
 
+    def test_an_edit_to_the_config_s_providers_applies_without_a_restart(self):
+        config = self.home / '.agent' / 'config.toml'
+        config.parent.mkdir(exist_ok=True)
+        base = self.url.removesuffix('/v1')
+        config.write_text(f'provider = "openai=responses,{self.url}"\n')
+
+        def stats():
+            # Over the socket: the CLI itself refuses a config that does not parse.
+            with socket.socket(socket.AF_UNIX) as s:
+                s.connect(str(self.state) + '.sock')
+                lines = s.makefile('rw')
+                lines.readline()
+                lines.write(json.dumps({'id': 1, 'op': 'stats'}) + '\n')
+                lines.flush()
+                return next(m for m in map(json.loads, lines) if m.get('id') == 1)['result']
+
+        self.agent('stats', *self.store)
+
+        def settled(check):
+            deadline = time.monotonic() + 20
+            while True:
+                current = stats()
+                if check(current):
+                    return current
+                self.assertLess(time.monotonic(), deadline, current.get('provider_reload'))
+                time.sleep(0.05)
+
+        before = stats()
+        self.assertEqual(sorted(before['providers']), ['openai'])
+        self.assertIsNone(before['provider_reload'])
+        # A bot runs on openai.
+        self.agent('run', *self.store, '--model', 'openai/synthetic-model', '--new', '--bot', 'Bob', 'hello')
+
+        # Adding a provider binds it for the next turns; openai is kept as it was.
+        config.write_text(f'provider = "openai=responses,{self.url} second=responses,{self.url}"\n')
+        after = settled(lambda s: 'second' in s['providers'])
+        self.assertEqual(after['provider_reload']['status'], 'applied')
+        self.assertEqual(after['provider_reload']['added'], ['second'])
+        self.assertEqual(after['provider_reload']['changed'], [])
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect(str(self.state) + '.sock')
+            ready = json.loads(s.makefile('r').readline())
+        self.assertEqual(sorted(ready['providers']), ['openai', 'second'], 'a new session is told the new set')
+        self.agent('run', *self.store, '--model', 'second/synthetic-model', '--new', '--bot', 'Ann', 'hello')
+
+        # Removing the provider Bob runs on is refused, naming him; the set stays.
+        config.write_text(f'provider = "second=responses,{self.url}"\n')
+        refused = settled(lambda s: (s['provider_reload'] or {}).get('status') == 'refused')
+        self.assertEqual(refused['provider_reload']['error'], 'provider_in_use')
+        self.assertIn('Bob', refused['provider_reload']['detail'])
+        self.assertNotIn('Ann', refused['provider_reload']['detail'])
+        self.assertEqual(sorted(refused['providers']), ['openai', 'second'])
+
+        # A file that does not parse is refused too, and nothing changes.
+        config.write_text('provider = \n')
+        broken = settled(lambda s: s['provider_reload']['error'] != 'provider_in_use')
+        self.assertEqual(broken['provider_reload']['status'], 'refused')
+        self.assertEqual(sorted(broken['providers']), ['openai', 'second'])
+
+        # A changed spec binds that provider again; the turn after uses it.
+        config.write_text(f'provider = "openai=responses,{self.url} second=responses,{base}/elsewhere/v1"\n')
+        changed = settled(lambda s: s['provider_reload']['status'] == 'applied')
+        self.assertEqual(changed['provider_reload']['changed'], ['second'])
+        self.assertEqual(changed['provider_reload']['added'], [])
+
+    def test_providers_given_on_the_command_line_are_not_reloaded(self):
+        config = self.home / '.agent' / 'config.toml'
+        config.parent.mkdir(exist_ok=True)
+        config.write_text(f'provider = "openai=responses,{self.url}"\n')
+        self.agent('stats', *self.store, '--provider', f'given=responses,{self.url}')
+        config.write_text(f'provider = "other=responses,{self.url}"\n')
+        time.sleep(1)
+        current = json.loads(self.agent('stats', *self.store).stdout)
+        self.assertEqual(sorted(current['providers']), ['given'])
+        self.assertIsNone(current['provider_reload'])
+
     def test_discover_writes_nothing_when_no_provider_lists(self):
         refused = self.agent('models', '--discover', *self.store,
                              '--provider', 'gone=responses,http://127.0.0.1:1/v1', check=False)
