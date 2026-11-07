@@ -3416,7 +3416,7 @@ impl Lookout {
         if !sent.is_empty() {
             let urgent = sent.iter().any(|heard| heard.event.steer);
             // One that went because it was late is late still.
-            let late = !urgent && sent.iter().any(|heard| self.late_one(heard));
+            let late = !urgent && sent.iter().any(|heard| self.late_one(heard, None));
             let unkept = self.unkept_sent.line(self.waiting, epoch_ms() as u64);
             let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref(), late);
             return self.source(client, woken, sent, prompt, urgent || late);
@@ -3458,28 +3458,47 @@ impl Lookout {
     fn heard_late(&self, now: Instant) -> bool {
         (self.heard.iter())
             .filter(|heard| self.ready(heard, now))
-            .any(|heard| self.late_one(heard))
+            .any(|heard| self.late_one(heard, Some(now)))
     }
 
     /// Whether this, heard, has waited as long as it may for the subscriber
     /// to rest. Each subscription that hears it waits its own digest, `0`
-    /// none, else its source's, as `ready` reads them; the first that may
-    /// tell it says when it is late.
-    fn late_one(&self, heard: &sources::Heard) -> bool {
+    /// none, else its source's, as `ready` reads them; of those that allow
+    /// it now, the first says when it is late. With no `now`, a note sent
+    /// already and sent again, every one counts.
+    fn late_one(&self, heard: &sources::Heard, now: Option<Instant>) -> bool {
         let Some(rest) = self.rest else {
             return false;
         };
-        let window = |name: &String| {
-            let own = (self.subs.iter()).find(|sub| sub.name == *name);
-            match own.filter(|sub| sub.digest.is_some()) {
-                Some(sub) => sub.digest_span(),
-                None => heard.event.digest,
+        let event = &heard.event;
+        let source = || {
+            let allows = |digest: Duration| {
+                now.is_none_or(|now| {
+                    (self.told_sources.get(&event.source)).is_none_or(|at| now >= *at + digest)
+                })
+            };
+            match event.digest {
+                Some(digest) => allows(digest).then_some(digest),
+                None => Some(rest),
             }
-            .unwrap_or(rest)
         };
-        let wait = (heard.subs.iter().map(window).min())
-            .unwrap_or_else(|| heard.event.digest.unwrap_or(rest));
-        epoch_ms().saturating_sub(heard.event.at_ms) >= wait.as_millis()
+        let window = |name: &String| {
+            let own = (self.subs.iter()).find(|sub| sub.name == *name && sub.digest.is_some());
+            match own {
+                Some(sub) => match sub.digest_span() {
+                    Some(digest) => now
+                        .is_none_or(|now| self.updates.sub_ready(name, digest, now))
+                        .then_some(digest),
+                    None => Some(rest),
+                },
+                None => source(),
+            }
+        };
+        let wait = match heard.subs.is_empty() {
+            true => source(),
+            false => heard.subs.iter().filter_map(window).min(),
+        };
+        wait.is_some_and(|wait| epoch_ms().saturating_sub(event.at_ms) >= wait.as_millis())
     }
 
     /// Sends `sent` as one note, its request named by the events it tells,
@@ -5707,6 +5726,23 @@ mod tests {
         // `0` waits however long.
         lookout.rest = None;
         assert!(!lookout.heard_late(now));
+        // Of two that hear it, only one whose digest allows it now counts.
+        lookout.rest = Some(REST_WAIT);
+        let mut ten_minutes = hears("ten");
+        ten_minutes.digest = Some("10m".into());
+        let mut hourly = hears("hourly");
+        hourly.digest = Some("1h".into());
+        lookout.subs = vec![ten_minutes, hourly];
+        lookout.rehear();
+        lookout.heard[0].event.at_ms = at(REST_WAIT);
+        lookout.updates.told_subs.insert("ten".into(), now);
+        assert!(lookout.ready(&lookout.heard[0], now));
+        assert!(!lookout.heard_late(now));
+        lookout.heard[0].event.at_ms = at(Duration::from_secs(3600));
+        assert!(lookout.heard_late(now));
+        // Sent already and sent again, every one counts.
+        lookout.heard[0].event.at_ms = at(ten);
+        assert!(lookout.late_one(&lookout.heard[0], None));
         // The note says why it cuts in.
         let note = sources::note(&lookout.heard, 0, None, true);
         assert!(note.ends_with(
