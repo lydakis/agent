@@ -3978,10 +3978,7 @@ struct Fleet {
     /// What the windows' checks marked waiting on the person, by agent,
     /// as the folder of marks last read: when that folder last changed,
     /// and when each agent's mark did.
-    marks: (
-        Option<std::time::SystemTime>,
-        HashMap<String, Option<std::time::SystemTime>>,
-    ),
+    marks: waiting::Marks,
 }
 
 /// `[sonny] task_windows` and `task_tabs` as the config file last said
@@ -4549,31 +4546,8 @@ impl Fleet {
     /// the person a window's check set or took away since the folder of marks
     /// was last read ([`waiting`]), and show what they wait on.
     async fn rescan_marks(&mut self) {
-        let dir = waiting::dir(&self.store);
-        let changed = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
-        if changed == self.marks.0 {
-            return;
-        }
-        self.marks.0 = changed;
-        let mut now = HashMap::new();
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(bot) = name.strip_suffix(".json")
-                && self.lineage.contains(bot)
-            {
-                let at = entry.metadata().and_then(|m| m.modified()).ok();
-                now.insert(bot.to_owned(), at);
-            }
-        }
-        let had = std::mem::replace(&mut self.marks.1, now);
-        let mut moved: Vec<String> = (self.marks.1.iter())
-            .filter(|(bot, at)| had.get(*bot) != Some(at))
-            .map(|(bot, _)| bot.clone())
-            .collect();
-        moved.extend(
-            had.into_keys()
-                .filter(|bot| !self.marks.1.contains_key(bot)),
-        );
+        let lineage = &self.lineage;
+        let moved = (self.marks).moved(&self.store, |bot| lineage.contains(bot));
         for bot in moved {
             let Some(seen) = needs::scan(&self.client, &bot, None).await else {
                 continue;

@@ -25,9 +25,10 @@
 //! `[sonny] needs_check = false` turns the check off, and with it what
 //! reviews are kept; marks kept then still hold until the agent's next
 //! turn.
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use agent_client::Client;
 use serde_json::{Value, json};
@@ -141,6 +142,45 @@ fn answered(store: &Path, bot: &str, turn: i64) -> bool {
         .is_some_and(|kept| kept >= turn)
 }
 
+/// What a window last read of the folder of marks: when the folder last
+/// changed, and when each agent's mark did.
+#[derive(Default)]
+pub struct Marks {
+    changed: Option<SystemTime>,
+    each: HashMap<String, Option<SystemTime>>,
+}
+
+impl Marks {
+    /// The agents, of those `keep` takes, whose mark a check set, changed
+    /// or took away since the folder was last read: none, after one stat,
+    /// while the folder is as it was.
+    pub fn moved(&mut self, store: &Path, keep: impl Fn(&str) -> bool) -> Vec<String> {
+        let dir = dir(store);
+        let changed = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+        if changed == self.changed {
+            return Vec::new();
+        }
+        self.changed = changed;
+        let mut now = HashMap::new();
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(bot) = name.strip_suffix(".json")
+                && keep(bot)
+            {
+                let at = entry.metadata().and_then(|m| m.modified()).ok();
+                now.insert(bot.to_owned(), at);
+            }
+        }
+        let had = std::mem::replace(&mut self.each, now);
+        let mut moved: Vec<String> = (self.each.iter())
+            .filter(|(bot, at)| had.get(*bot) != Some(at))
+            .map(|(bot, _)| bot.clone())
+            .collect();
+        moved.extend(had.into_keys().filter(|bot| !self.each.contains_key(bot)));
+        moved
+    }
+}
+
 /// Whether `mark` still says what its agent waits for: its turn is the
 /// agent's newest, `newest`, and none runs.
 pub fn holds(mark: &Mark, newest: Option<i64>, running: bool) -> bool {
@@ -192,6 +232,21 @@ pub fn reviews(reply: &str) -> Vec<String> {
 /// How many copies one window has asking at once.
 const CHECKS: usize = 4;
 static ASKING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CHECKS);
+/// Whether `bot` is a side chat, as its record says: only a bot named as
+/// `/side` names one is looked up, so a task named `NAME.side-feed` is
+/// checked as any other.
+async fn side_chat(client: &Client, bot: &str) -> bool {
+    if crate::side_source(bot).is_none() {
+        return false;
+    }
+    let page = (client
+        .request("bots", json!({"name": bot, "limit": 1}))
+        .await)
+        .unwrap_or_default();
+    let row = &page["bots"][0];
+    row["name"] == bot && crate::side_copy(row).is_some()
+}
+
 /// The turns this window checks now, which it heard end more than once.
 static CHECKING: std::sync::Mutex<Vec<(String, i64)>> = std::sync::Mutex::new(Vec::new());
 
@@ -212,7 +267,6 @@ pub fn just_ended(finished_ms: u64) -> bool {
 /// chat's, a copy's or a turn answered already.
 pub fn spawn(client: Arc<Client>, store: PathBuf, bot: String, turn: i64) {
     if is_copy(&bot)
-        || crate::side_source(&bot).is_some()
         || answered(&store, &bot, turn)
         || !agent_client::config::load().map_or(true, |c| c.sonny.needs_check)
     {
@@ -224,7 +278,8 @@ pub fn spawn(client: Arc<Client>, store: PathBuf, bot: String, turn: i64) {
         _ => return,
     }
     tokio::spawn(async move {
-        if let Ok(_asking) = ASKING.acquire().await
+        if !side_chat(&client, &bot).await
+            && let Ok(_asking) = ASKING.acquire().await
             // Another window answered it while this one waited its turn.
             && !answered(&store, &bot, turn)
             // What could not be checked, a second window's copy the
@@ -436,6 +491,48 @@ mod tests {
     /// A turn that ended with words and no question asked is put to a
     /// copy of its agent, with no tools and the check's schema; one that
     /// ended with none, or on the ask tool, is not.
+    #[test]
+    fn marks_moved_are_those_set_changed_or_taken_away_since() {
+        let store = std::env::temp_dir()
+            .join(format!("sonny-waiting-marks-{}", std::process::id()))
+            .join("store");
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let mut marks = Marks::default();
+        assert!(marks.moved(&store, |_| true).is_empty());
+        let mark = |w: &str| Mark {
+            turn: 2,
+            waiting_for: w.into(),
+        };
+        keep(&store, "calc.a", 2, Some(&mark("a"))).unwrap();
+        keep(&store, "calc.b", 2, Some(&mark("b"))).unwrap();
+        let mut moved = marks.moved(&store, |bot| bot != "calc.b");
+        moved.sort();
+        assert_eq!(moved, ["calc.a"]);
+        // Nothing changed: one stat, nothing read.
+        assert!(marks.moved(&store, |_| true).is_empty());
+        std::fs::remove_file(file(&store, "calc.a")).unwrap();
+        // calc.a's mark went; calc.b is taken now and new to it.
+        let mut moved = marks.moved(&store, |_| true);
+        moved.sort();
+        assert_eq!(moved, ["calc.a", "calc.b"]);
+        let _ = std::fs::remove_dir_all(dir(&store));
+    }
+
+    #[tokio::test]
+    async fn a_task_named_like_a_side_chat_is_one_only_if_its_record_says() {
+        let client = crate::tests::daemon_answering(|request| match request["name"].as_str() {
+            Some("shop.side-feed") => json!({"bots": [{"name": "shop.side-feed",
+                "created_by": "shop.lead", "expire_ms": null}]}),
+            Some("shop.side-a1") => json!({"bots": [{"name": "shop.side-a1",
+                "created_by": "shop", "expire_ms": 99}]}),
+            _ => json!({"bots": []}),
+        })
+        .await;
+        assert!(!side_chat(&client, "shop.side-feed").await);
+        assert!(side_chat(&client, "shop.side-a1").await);
+        assert!(!side_chat(&client, "shop.web").await);
+    }
+
     #[tokio::test]
     async fn a_reply_with_words_is_checked_by_a_tool_less_copy() {
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
