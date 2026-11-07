@@ -12238,6 +12238,12 @@ impl App {
         if let (Some(id), Some(head)) = (forked["bot_id"].as_i64(), forked["head"].as_i64()) {
             margin::start_at(&self.options.store, id, head);
         }
+        // A question is the person's words: it ends quiet as a message does.
+        if !question.is_empty() {
+            self.quiet = None;
+            quiet::mark_present();
+            quiet::end();
+        }
         // On the model this window's turns run on, whose cache is warm.
         if !question.is_empty()
             && let Err(error) = self

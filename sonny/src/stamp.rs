@@ -53,6 +53,9 @@ pub fn now(prompt: &str) -> String {
 /// The person's own words, stamped now: they end quiet for every agent,
 /// and the first message back says since when they were away.
 pub fn person(prompt: &str) -> String {
+    // Words are use, from a window or an editor alike: the lookout waits
+    // `quiet_after` from here before it starts quiet again.
+    crate::quiet::mark_present();
     let clause = crate::quiet::end().map(crate::quiet::back_clause);
     stamped_with(prompt, epoch_now(), clause.as_deref())
 }
