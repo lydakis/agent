@@ -3461,10 +3461,19 @@ impl Lookout {
         (self.heard.iter())
             .filter(|heard| self.ready(heard, now))
             .any(|heard| {
-                let own = (heard.subs.iter())
-                    .filter_map(|sub| self.sub_digest(sub))
-                    .min();
-                let wait = own.or(heard.event.digest).unwrap_or(rest);
+                // Each subscription that hears it waits its own digest, `0`
+                // none, else its source's, as `ready` reads them; the
+                // first that may tell it says when it is late.
+                let window = |name: &String| {
+                    let own = (self.subs.iter()).find(|sub| sub.name == *name);
+                    match own.filter(|sub| sub.digest.is_some()) {
+                        Some(sub) => sub.digest_span(),
+                        None => heard.event.digest,
+                    }
+                    .unwrap_or(rest)
+                };
+                let wait = (heard.subs.iter().map(window).min())
+                    .unwrap_or_else(|| heard.event.digest.unwrap_or(rest));
                 now_ms.saturating_sub(heard.event.at_ms) >= wait.as_millis()
             })
     }
@@ -5661,6 +5670,14 @@ mod tests {
         assert!(!lookout.heard_late(now));
         lookout.heard[0].event.at_ms = at(Duration::from_secs(3600));
         assert!(lookout.heard_late(now));
+        // A subscription's own `0` waits for no digest, its source's either.
+        lookout.subs[0].digest = Some("0".into());
+        lookout.heard[0].event.at_ms = at(REST_WAIT);
+        assert!(lookout.heard_late(now));
+        lookout.heard[0].event.at_ms = at(Duration::from_secs(1800));
+        assert!(lookout.heard_late(now));
+        lookout.subs[0].digest = None;
+        assert!(!lookout.heard_late(now));
         // `0` waits however long.
         lookout.rest = None;
         assert!(!lookout.heard_late(now));
