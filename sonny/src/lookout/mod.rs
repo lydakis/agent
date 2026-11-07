@@ -59,7 +59,7 @@ const WAITING: usize = 1024;
 /// it, the most notes a margin holds, the most of a task's notes its lead
 /// hears of at once, and the person's hours, for quiet. Settings that do not read keep the defaults.
 fn waiting() -> usize {
-    let Ok(sonny) = agent_client::config::load().map(|config| config.sonny) else {
+    let Ok(sonny) = crate::kept::config().map(|config| config.sonny) else {
         crate::margin::set_limits(
             agent_client::config::MARGIN_NOTES,
             agent_client::config::MARGIN_NOTE_LINES,
@@ -736,6 +736,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         records: HashMap::new(),
         made: Made::default(),
         subscribers: HashMap::new(),
+        files: subs::Read::default(),
         read_at: HashMap::new(),
         registry: Arc::default(),
         socket: settings.socket.clone(),
@@ -855,6 +856,9 @@ struct Service {
     /// Subscriptions by subscriber, as their files held them at the last
     /// read.
     subscribers: HashMap<String, Vec<subs::Sub>>,
+    /// The subscribers' files as last read, so a look reads only those
+    /// that changed.
+    files: subs::Read,
     /// Which revision of each subscriber's file the lookout took and when,
     /// kept beside the store ([`subs::taken`]) for its `subscriptions`
     /// listing to show.
@@ -1621,7 +1625,7 @@ impl Service {
     async fn reread(&mut self, client: &Client) {
         let revisions = subs::revisions(&self.store);
         let mut read: HashMap<String, Vec<subs::Sub>> =
-            subs::all(&self.store).into_iter().collect();
+            self.files.all(&self.store).into_iter().collect();
         // A subscription whose `until` came ends, as an automation does.
         let now_s = (epoch_ms() / 1000) as i64;
         for (subscriber, subs) in read.iter_mut() {
@@ -5119,6 +5123,7 @@ mod tests {
                     .collect(),
             ),
             subscribers: HashMap::new(),
+            files: subs::Read::default(),
             read_at: HashMap::new(),
             registry: Arc::default(),
             socket: PathBuf::new(),

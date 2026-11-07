@@ -70,7 +70,7 @@ pub fn cli(args: &[String]) -> i32 {
         // which holds the person's SSH agent and credential helpers.
         [verb, job] if verb == "sync" && job == "--job" => {
             let environment = crate::login::environment();
-            sync(&places, environment.as_deref())
+            sync_job(&places, environment.as_deref())
         }
         [verb] if verb == "status" => Ok(status(&places)),
         _ => Err(format!("usage: {USAGE}")),
@@ -293,15 +293,60 @@ fn last(places: &Places) -> Option<Value> {
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
 }
 
-/// Copy the home into the repository, commit and push. Nothing to commit
-/// and nothing unpushed is a sync too.
+/// Copy the home into the repository, commit and push, whole. Nothing to
+/// commit and nothing unpushed is a sync too. What the person or setup runs.
 pub fn sync(places: &Places, env: Option<&[(OsString, OsString)]>) -> Result<Value, String> {
-    let result = sync_once(places, env);
+    sync_as(places, env, false)
+}
+
+/// The scheduler's sync every ten minutes: a home that reads as it did
+/// when the last sync went through, with its copy as that sync left it, is
+/// that sync again, with no file read and no git run, so an idle machine's
+/// costs a walk of stats. Once a day it is whole all the same, so what no
+/// stamp sees (a hand edit in the copy's files, say) is put right within
+/// the day.
+pub fn sync_job(places: &Places, env: Option<&[(OsString, OsString)]>) -> Result<Value, String> {
+    sync_as(places, env, true)
+}
+
+/// How long the scheduler's syncs may go without a whole one.
+const WHOLE_EVERY_MS: u128 = 24 * 60 * 60 * 1000;
+
+fn sync_as(
+    places: &Places,
+    env: Option<&[(OsString, OsString)]>,
+    idle_may_skip: bool,
+) -> Result<Value, String> {
+    // Stamped before anything is read, so a change during the sync is the
+    // next one's.
+    let home = stamp_home(places);
+    let had = last(places);
+    let now = now_ms();
+    let skip = |home: &u64, had: &Value| {
+        idle_may_skip
+            && went_through(had)
+            && (had["whole_ms"].as_u64())
+                .is_some_and(|at| now.saturating_sub(u128::from(at)) < WHOLE_EVERY_MS)
+            && had["stamp"] == stamps(home, places)
+    };
+    let (result, whole) = match (&home, &had) {
+        (Some(home), Some(had)) if skip(home, had) => (
+            Ok(json!({"committed": false, "commit": had["commit"],
+                "config_skipped": had["config_skipped"], "unchanged": true})),
+            had["whole_ms"].clone(),
+        ),
+        _ => (sync_once(places, env), json!(now)),
+    };
     let mut record = match &result {
         Ok(done) => done.clone(),
         Err(error) => error_json(error),
     };
-    let now = now_ms();
+    if result.is_ok()
+        && let Some(home) = &home
+    {
+        record["stamp"] = stamps(home, places);
+        record["whole_ms"] = whole;
+    }
     record["at_ms"] = json!(now);
     record["ok_ms"] = match &result {
         Ok(_) => json!(now),
@@ -313,6 +358,85 @@ pub fn sync(places: &Places, env: Option<&[(OsString, OsString)]>) -> Result<Val
     }
     let _ = std::fs::write(&places.state, format!("{record}\n"));
     result
+}
+
+/// Whether the sync `had` went through: one that failed keeps when the
+/// last that did went.
+fn went_through(had: &Value) -> bool {
+    had["ok_ms"].is_u64() && had["ok_ms"] == had["at_ms"]
+}
+
+/// What a sync reads, stamped without reading it: each entry of `.agents`
+/// it would copy (its kind, size, time and mode, a link's target),
+/// `config.toml`, and the list of triggers it would write. None while any
+/// of it changed too lately to tell from a change in the same tick, so the
+/// sync then is whole, as Git reads a racily clean file again.
+fn stamp_home(places: &Places) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    walk_stamps(&places.agents, Path::new(""), &mut hash)?;
+    let config = crate::kept::stamp(&places.config);
+    if config.is_some_and(|config| !config.settled()) {
+        return None;
+    }
+    config.hash(&mut hash);
+    triggers_list(places).ok()?.hash(&mut hash);
+    Some(hash.finish())
+}
+
+fn walk_stamps(dir: &Path, at: &Path, hash: &mut impl std::hash::Hasher) -> Option<()> {
+    use std::hash::Hash;
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // None there is a home with none; one that cannot be read is no
+        // proof of anything.
+        return (!dir.exists()).then_some(());
+    };
+    let settled = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(2))?;
+    let mut entries: Vec<std::fs::DirEntry> = entries.collect::<Result<_, _>>().ok()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let name = entry.file_name();
+        if SKIP.iter().any(|skip| name == *skip) {
+            continue;
+        }
+        // Not followed: a link is stamped as a link, with its target.
+        let meta = entry.metadata().ok()?;
+        let modified = meta.modified().ok()?;
+        if modified >= settled {
+            return None;
+        }
+        let path = at.join(&name);
+        // The inode's change time too: a copy that keeps its source's time
+        // over a file of the same size changes nothing else.
+        let changed = (meta.ctime(), meta.ctime_nsec());
+        (&path, meta.mode(), meta.len(), modified, changed).hash(hash);
+        if meta.file_type().is_symlink() {
+            std::fs::read_link(entry.path()).ok()?.hash(hash);
+        } else if meta.is_dir() {
+            walk_stamps(&entry.path(), &path, hash)?;
+        }
+    }
+    Some(())
+}
+
+/// The home's stamp with its copy's, as a sync record keeps them: the
+/// copy's index and HEAD, which git changes when anyone adds, commits or
+/// moves in it, here or by hand; its own ignore rules, which say what a
+/// sync leaves out; and its config, which names where it pushes.
+fn stamps(home: &u64, places: &Places) -> Value {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    for file in [
+        ".git/index",
+        ".git/HEAD",
+        ".git/config",
+        ".git/info/exclude",
+        ".gitignore",
+    ] {
+        crate::kept::stamp(&places.repo.join(file)).hash(&mut hash);
+    }
+    json!(format!("{home:016x}-{:016x}", hash.finish()))
 }
 
 fn sync_once(places: &Places, env: Option<&[(OsString, OsString)]>) -> Result<Value, String> {
@@ -380,6 +504,21 @@ fn keep_triggers(places: &Places) -> Result<(), String> {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
         _ => {}
     }
+    let Some(text) = triggers_list(places)? else {
+        return match std::fs::remove_file(&held) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        };
+    };
+    if std::fs::read(&held).ok().as_deref() != Some(text.as_bytes()) {
+        std::fs::write(&held, text).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// The list of triggers the copy holds, as its file's text; none when
+/// there are none.
+fn triggers_list(places: &Places) -> Result<Option<String>, String> {
     let mut list = crate::trigger::backed_up(&crate::trigger::Places::moved(&places.home, false));
     // What a restore brought for leads not opened since stays backed up,
     // under any trigger of the same name set up here since.
@@ -390,16 +529,10 @@ fn keep_triggers(places: &Places) -> Result<(), String> {
     }
     list.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     if list.is_empty() {
-        return match std::fs::remove_file(&held) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
-            _ => Ok(()),
-        };
+        return Ok(None);
     }
     let text = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())? + "\n";
-    if std::fs::read(&held).ok().as_deref() != Some(text.as_bytes()) {
-        std::fs::write(&held, text).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    Ok(Some(text))
 }
 
 /// Whether the branch has commits its upstream lacks, or no upstream.
@@ -673,6 +806,12 @@ fn mirror_at(
             }
             if !file || !same(&source, &target) {
                 std::fs::copy(&source, &target).map_err(|e| fail(&target, e))?;
+                // Changed now: macOS's copy keeps the source's time, and git
+                // takes a file of the same size and time as unchanged.
+                let copied = std::fs::File::open(&target).map_err(|e| fail(&target, e))?;
+                copied
+                    .set_modified(std::time::SystemTime::now())
+                    .map_err(|e| fail(&target, e))?;
             }
             own_bits(&source, &target).map_err(|e| fail(&target, e))?;
         } else {
@@ -1453,6 +1592,118 @@ mod tests {
         assert!(!done(&places), "no first sync");
         write(&places.state, "{\"at_ms\": 1000000}");
         assert!(done(&places));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Every file and folder under `dir` as last changed a minute ago,
+    /// past the racy window, as a home idle a while is.
+    fn settle(dir: &Path) {
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                settle(&entry.path());
+            } else if kind.is_file() {
+                // Opened to read: git's objects are read-only, and the
+                // owner may set a time without writing.
+                let opened = std::fs::File::open(entry.path()).unwrap();
+                opened.set_modified(past).unwrap();
+            }
+        }
+        let opened = std::fs::File::options().read(true).open(dir).unwrap();
+        opened.set_modified(past).unwrap();
+    }
+
+    #[test]
+    fn an_idle_home_syncs_with_no_git_and_a_change_syncs_whole() {
+        let root = scratch("idle");
+        let remote = root.join("remote.git");
+        sh(&root, &["init", "--quiet", "--bare", "remote.git"]);
+        let url = remote.to_string_lossy().into_owned();
+        let one = places(&root.join("one"));
+        write(&one.agents.join("memory/fact.md"), "fact");
+        write(&one.config, "provider = \"chatgpt\"\n");
+        adopt(&one, &url, None).unwrap();
+        sh(&one.repo, &["config", "user.email", "t@example.com"]);
+        sh(&one.repo, &["config", "user.name", "T"]);
+        // Just written: no stamp proves nothing changed since, so whole.
+        assert_eq!(sync_job(&one, None).unwrap()["committed"], true);
+        assert!(last(&one).unwrap()["stamp"].is_null());
+        settle(&one.home);
+        let whole = sync_job(&one, None).unwrap();
+        assert_eq!(whole["unchanged"], Value::Null);
+        assert!(last(&one).unwrap()["stamp"].is_string());
+        // Nothing changed since: the last sync again, with no git run, as
+        // one where no git can be found shows.
+        let no_git = [(OsString::from("PATH"), OsString::from("/nonexistent"))];
+        let idle = sync_job(&one, Some(&no_git)).unwrap();
+        assert_eq!(idle["unchanged"], true);
+        assert_eq!(idle["commit"], whole["commit"]);
+        // A change in the home, its time set back too, is synced whole.
+        write(&one.agents.join("memory/fact.md"), "fact, revised");
+        settle(&one.home);
+        let changed = sync_job(&one, None).unwrap();
+        assert_eq!(changed["committed"], true);
+        let held = sh(&remote, &["show", "HEAD:agents/memory/fact.md"]);
+        assert_eq!(held, "fact, revised");
+        // So is a copy changed by hand.
+        settle(&one.home);
+        sync_job(&one, None).unwrap();
+        assert_eq!(sync_job(&one, None).unwrap()["unchanged"], true);
+        sh(&one.repo, &["rm", "--quiet", "--cached", "config.toml"]);
+        assert_eq!(sync_job(&one, None).unwrap()["unchanged"], Value::Null);
+        // And so are the copy's own ignore rules, changed by hand.
+        settle(&one.home);
+        sync_job(&one, None).unwrap();
+        assert_eq!(sync_job(&one, None).unwrap()["unchanged"], true);
+        write(&one.repo.join(".gitignore"), "memory/d0/\n");
+        assert_eq!(sync_job(&one, None).unwrap()["unchanged"], Value::Null);
+        // And so is a file copied over with its time kept and the same
+        // size, which changes only its inode's change time.
+        settle(&one.home);
+        sync_job(&one, None).unwrap();
+        assert_eq!(sync_job(&one, None).unwrap()["unchanged"], true);
+        let fact = one.agents.join("memory/fact.md");
+        let kept = std::fs::metadata(&fact).unwrap().modified().unwrap();
+        std::fs::write(&fact, "FACT, REVISED").unwrap();
+        std::fs::File::open(&fact)
+            .unwrap()
+            .set_modified(kept)
+            .unwrap();
+        assert_eq!(sync_job(&one, None).unwrap()["committed"], true);
+        // And so is a config whose permission was put right, which
+        // changes neither its time nor its size.
+        settle(&one.home);
+        sync_job(&one, None).unwrap();
+        assert_eq!(sync_job(&one, None).unwrap()["unchanged"], true);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&one.config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(sync_job(&one, None).unwrap()["unchanged"], Value::Null);
+        // A file of the copy's own changed by hand, which no stamp sees, is
+        // put right by the person's own sync, and by the first of the
+        // scheduler's a day after the last whole one.
+        settle(&one.home);
+        sync_job(&one, None).unwrap();
+        let copied = one.repo.join("agents/memory/fact.md");
+        std::fs::remove_file(&copied).unwrap();
+        assert_eq!(sync_job(&one, None).unwrap()["unchanged"], true);
+        assert_eq!(sync(&one, None).unwrap()["unchanged"], Value::Null);
+        assert!(copied.exists());
+        settle(&one.home);
+        sync_job(&one, None).unwrap();
+        std::fs::remove_file(&copied).unwrap();
+        let mut day_old = last(&one).unwrap();
+        day_old["whole_ms"] = json!(now_ms() as u64 - 24 * 60 * 60 * 1000);
+        write(&one.state, &day_old.to_string());
+        assert_eq!(sync_job(&one, None).unwrap()["unchanged"], Value::Null);
+        assert!(copied.exists());
+        // And a sync that failed is followed by a whole one.
+        settle(&one.home);
+        sync_job(&one, None).unwrap();
+        let mut failed = last(&one).unwrap();
+        failed["ok_ms"] = json!(1);
+        write(&one.state, &failed.to_string());
+        assert_eq!(sync_job(&one, None).unwrap()["unchanged"], Value::Null);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
