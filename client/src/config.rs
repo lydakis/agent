@@ -93,6 +93,7 @@
 //! steer = { from = ["boss"] }   # what cuts into a busy subscriber's turn, as a filter is written
 //! watch = ["~/bin/slack-poll"]  # files whose edit starts it again on them; unset, none
 //! icon = "▲"                    # one character /status shows on the row of each agent that follows it
+//! wants = "channel"             # a field of its events: the values subscriptions' filters name are written for the command
 //! [sonny.sources.commons]       # Sonny's own source: the commons threads an agent posted in
 //! digest = "15m"                # the default; 0 at once. Takes digest and steer alone
 //! ```
@@ -854,6 +855,10 @@ pub struct Source {
     /// One character cell `/status` shows on the row of each agent that
     /// follows it.
     pub icon: Option<String>,
+    /// A field of its events whose values subscriptions' filters name,
+    /// as `id` or `meta.repo`: the lookout writes those values to a file
+    /// the command reads, so it fetches only what someone subscribed to.
+    pub wants: Option<String>,
 }
 
 /// An MCP server, under Codex's key names for `[mcp_servers.NAME]`: a
@@ -1739,6 +1744,7 @@ fn commons_source() -> Source {
         steer: None,
         watch: Vec::new(),
         icon: None,
+        wants: None,
     }
 }
 
@@ -1766,10 +1772,11 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
         let mut steer = None;
         let mut watch = Vec::new();
         let mut icon = None;
+        let mut wants = None;
         let own = name == COMMONS_SOURCE;
         for (field, value) in fields {
             match field.as_str() {
-                "command" | "every" | "watch" if own => {
+                "command" | "every" | "watch" | "wants" if own => {
                     return Err(format!(
                         "{}: the commons is a source of Sonny's own, which takes digest and steer alone; \
                          name yours another way",
@@ -1814,6 +1821,22 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
                         watch.push(path);
                     }
                 }
+                "wants" => {
+                    let value = string(&key(field), value)?;
+                    let plain = |part: &str| {
+                        !part.is_empty()
+                            && part.len() <= 64
+                            && (part.bytes())
+                                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+                    };
+                    if value.split('.').count() > 6 || !value.split('.').all(plain) {
+                        return Err(format!(
+                            "{} names a field of its events, as \"id\" or \"meta.repo\"",
+                            key(field)
+                        ));
+                    }
+                    wants = Some(value);
+                }
                 _ => return Err(format!("unknown key {}", key(field))),
             }
         }
@@ -1831,6 +1854,7 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
             steer,
             watch,
             icon,
+            wants,
         });
     }
     Ok((sources, commons))
@@ -2630,6 +2654,13 @@ mod tests {
             ["~/bin/poll.py", "/opt/poll/lib.py"]
         );
         assert!(config.sonny.sources[0].watch.is_empty());
+        let watching =
+            parse("[sonny.sources.cr]\ncommand = \"x\"\nwants = \"meta.repo\"\n").unwrap();
+        assert_eq!(
+            watching.sonny.sources[0].wants.as_deref(),
+            Some("meta.repo")
+        );
+        assert_eq!(config.sonny.sources[0].wants, None);
         // The commons is a source of Sonny's own, set as any other.
         assert_eq!(config.sonny.commons_source.digest.as_deref(), Some("15m"));
         let commons =
@@ -2691,6 +2722,14 @@ mod tests {
             (
                 "[sonny.sources.slack]\ncommand = \"x\"\nargs = \"y\"",
                 "unknown key sonny.sources.slack.args",
+            ),
+            (
+                "[sonny.sources.slack]\ncommand = \"x\"\nwants = \"a b\"",
+                "sonny.sources.slack.wants names a field of its events, as \"id\" or \"meta.repo\"",
+            ),
+            (
+                "[sonny.sources.commons]\nwants = \"topic\"",
+                "sonny.sources.commons.wants: the commons is a source of Sonny's own, which takes digest and steer alone; name yours another way",
             ),
             (
                 "[sonny.sources.\"a b\"]\ncommand = \"x\"",
