@@ -1017,12 +1017,6 @@ impl Updates {
         self.live && self.tasks.iter().any(|(_, news)| self.ready(news, now))
     }
 
-    /// Whether the lead is to hear now: there is news it may hear and it
-    /// rests.
-    pub fn due_at(&self, now: Instant) -> bool {
-        self.news_ready(now) && self.idle()
-    }
-
     /// The subscription whose `urgent` matched news not told yet.
     pub fn urgent(&self) -> Option<&str> {
         if !self.live {
@@ -1440,6 +1434,7 @@ impl Updates {
     }
 
     /// Whether the lead rests, as its events say.
+    #[cfg(test)]
     pub fn idle(&self) -> bool {
         (self.bots.get(&self.lead))
             .is_some_and(|lead| lead.id.is_some() && !ACTIVE.contains(&lead.status.as_str()))

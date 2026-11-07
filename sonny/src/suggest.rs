@@ -195,7 +195,7 @@ async fn ask(
         .request(
             "submit",
             json!({"bot": name, "bot_id": id, "request_id": format!("{name}.1"),
-                "prompt": ASK, "delivery": "reject", "model": model}),
+                "prompt": ASK, "delivery": "steer", "model": model}),
         )
         .await
         .ok()?;

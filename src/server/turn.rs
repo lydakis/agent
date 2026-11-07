@@ -6548,6 +6548,7 @@ mod tests {
                             settings: Default::default(),
                             declared: None,
                             request_id: None,
+                            starts_line: false,
                         },
                     )?;
                     let turn = db
@@ -6767,6 +6768,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )?;
                 Ok(db
@@ -6904,6 +6906,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )?;
                 let turn = (db.begin(

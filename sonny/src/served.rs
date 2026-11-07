@@ -68,65 +68,26 @@ const SWEEP: Duration = Duration::from_secs(30);
 const SPLIT: [&str; 5] = crate::mux::SPLITS;
 
 /// What an agent may do beyond what every agent may: a lead makes
-/// projects, and an agent with room below it in its lead's line, as the
-/// config's `task_depth` bounds it, starts and removes tasks, which the
-/// agents it starts take too while they have room of their own.
+/// projects. Every agent starts and removes tasks; how deep a line goes
+/// is the daemon's to bound (`[daemon] depth`), and a start past it is
+/// refused with the daemon's own error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Role {
     pub lead: bool,
-    pub starts: bool,
-    /// How many generations below it start tasks too, `None` for no end:
-    /// the daemon passes its start down that far, one fewer each time.
-    pub passes: Option<u64>,
 }
 
 impl Role {
     /// Every tool: for telling Sonny's tools from others by name.
-    pub const ALL: Role = Role {
-        lead: true,
-        starts: true,
-        passes: None,
-    };
-
-    /// The role of an agent `depth` generations below its lead, the lead
-    /// itself at 0, in a line `limit` generations deep, 0 for no end.
-    pub fn at(depth: u64, limit: u64) -> Role {
-        Role {
-            lead: depth == 0,
-            starts: limit == 0 || depth < limit,
-            passes: (limit != 0).then(|| limit.saturating_sub(depth + 1)),
-        }
-    }
-
-    /// [`Role::at`] in the line the person's config bounds.
-    pub fn of(depth: u64) -> Role {
-        Role::at(depth, depth_limit())
-    }
-}
-
-/// How many generations of tasks a lead's line has, as the config says.
-pub fn depth_limit() -> u64 {
-    agent_client::config::load().map_or(2, |config| config.sonny.task_depth)
+    pub const ALL: Role = Role { lead: true };
+    pub const LEAD: Role = Role { lead: true };
+    pub const TASK: Role = Role { lead: false };
 }
 
 /// Sonny's answered tools, as it declares them on a bot in `role`: a
-/// lead's own and a starter's, and those every agent has, `exec` while the
-/// person has MCP servers.
+/// lead's own, and those every agent has, `exec` while the person has MCP
+/// servers.
 pub fn tools(role: Role) -> Vec<Value> {
-    let mut tools = Vec::new();
-    if role.starts {
-        tools.extend([start(), remove()]);
-        // The daemon gives them to the agents this one makes, and theirs,
-        // as many generations down as have room, `false` for none.
-        if let Some(generations) = role.passes {
-            for tool in &mut tools {
-                tool["inherit"] = match generations {
-                    0 => json!(false),
-                    n => json!(n),
-                };
-            }
-        }
-    }
+    let mut tools = vec![start(), remove()];
     if role.lead {
         tools.push(project());
     }
@@ -269,7 +230,7 @@ fn subscriptions() -> Value {
         "description": "Your subscriptions in the person's lookout, which watches agents for you and tells you \
             what happens in them in a note starting \"Task updates\": every message someone other than you \
             writes in them, the person's quoted, and how each turn ends, by the handle your wait tool reads. \
-            The person's own words cut into your running turn; the rest waits until your turn ends. Each \
+            Each note joins your running turn, or starts one. Each \
             watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
             sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
             \"From your sources\": every event, at once when the source says it steers, or one topic of a \
@@ -316,7 +277,7 @@ fn subscriptions() -> Value {
                                 never wait for it."},
                         "steer": {"type": "object",
                             "description": "What it hears that this matches, a pattern as filter's, is a steer: \
-                                it cuts into your running turn and waits for no digest, as the person's words do. As \
+                                it goes at once and waits for no digest, as the person's words do. As \
                                 {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."}
                     },
                     "required": ["name"],
@@ -619,14 +580,35 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ),
                 ));
             }
-            if !line.role.starts {
+            // The daemon bounds how deep a line goes and refuses the
+            // agent past it; asked first, by its own facts, so a start it
+            // would refuse makes no folder and runs no setup.
+            let itself = text("from")
+                .and_then(|from| crate::resolved::call(&json!({"task": from}), &line.project))
+                .is_some_and(|from| from == caller);
+            // Without a daemon to ask, the start goes on to meet its answer.
+            let most = match (line.depth > 0 && !itself)
+                .then(|| crate::daemon_paths(None, None).ok())
+                .flatten()
+            {
+                Some((_, socket)) => match Client::connect(&socket).await {
+                    Ok((client, _events)) => {
+                        let most = client.max_depth();
+                        client.close().await;
+                        most
+                    }
+                    Err(_) => None,
+                },
+                None => None,
+            };
+            if let Some(most) = most.filter(|most| line.depth >= *most) {
                 return Err((
-                    "task_depth_reached",
+                    "depth_limit",
                     format!(
-                        "{caller} is as deep in its lead's line as task_depth ({}) in the \
-                         person's config lets agents start tasks: do this work yourself, or ask \
-                         your lead for a task of its own",
-                        line.limit
+                        "a task you start would be {} generations below the agent that starts \
+                         your line, and the daemon's max_depth is {most}: do this work yourself, \
+                         or ask the agent that started you for a task of its own",
+                        line.depth + 1
                     ),
                 ));
             }
@@ -664,14 +646,14 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 from: text("from"),
                 turn: arguments["turn"].as_i64(),
                 // A task's own helper builds on its work.
-                builds_on: (!line.role.lead).then(|| caller.clone()),
+                builds_on: (!line.lead).then(|| caller.clone()),
                 env: Vec::new(),
                 made_by: None,
             };
             let started = crate::task::start(&line.folder, &line.project, &caller, &start)
                 .map_err(|e| ("task_not_started", e))?;
             // What the lead's gone tasks left, which only it can clear.
-            let left = match line.role.lead {
+            let left = match line.lead {
                 true => crate::task::left_behind(&line.folder, &line.project),
                 false => Vec::new(),
             };
@@ -697,7 +679,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .ok_or(("invalid_arguments", "a task's name, without /".to_owned()))?;
             // A lead removes any of its project's; another agent only one
             // of its own line, so no task removes its lead's others.
-            if !line.role.lead && !Line::made(&task, &caller) {
+            if !line.lead && !Line::made(&task, &caller) {
                 return Err((
                     "task_not_removed",
                     format!("{task} is not a task you or yours started; ask your lead"),
@@ -909,12 +891,15 @@ fn unknown(name: &str) -> String {
     )
 }
 
-/// Where the agent calling a tool stands in its lead's line, as the
-/// person's config bounds it: what it may start, the folder its tasks
+/// Where the agent calling a tool stands in its lead's line: whether it
+/// leads it, how deep in it the daemon counts it, the folder its tasks
 /// start from, its lead's, and the project they are named in.
 struct Line {
-    role: Role,
-    limit: u64,
+    /// A lead, or a side chat of one, which starts tasks as its lead does.
+    lead: bool,
+    /// Generations below the agent that starts its line, as the daemon
+    /// keeps it.
+    depth: u64,
     folder: PathBuf,
     project: String,
     /// The task a side chat of a task is a copy of, which starts that
@@ -927,17 +912,19 @@ impl Line {
     /// and so is that of an agent no lead heads the line of. Read with the
     /// daemon's CLI, as the start itself is made.
     fn of(caller: &str, here: &Path) -> Line {
-        let limit = depth_limit();
         let mut side_of = None;
-        let (depth, lead) = match crate::project::is_lead(caller) {
-            true => (0, None),
+        let (below, depth, lead) = match crate::project::is_lead(caller) {
+            true => (false, 0, None),
             false => {
                 let record =
                     crate::task::record_of_bot(caller).unwrap_or_else(|| json!({"name": caller}));
                 side_of = crate::side_copy(&record).map(str::to_owned);
-                crate::declared::line_by(&record, limit, |at| {
+                let lead = crate::declared::lead_by(&record, |at| {
                     crate::task::record_of_bot(at["created_by"].as_str()?)
-                })
+                });
+                // A lead's side chat starts its tasks as the lead does.
+                let below = !side_of.as_deref().is_some_and(crate::project::is_lead);
+                (below, record["depth"].as_u64().unwrap_or(0), lead)
             }
         };
         let lead = lead.as_ref().and_then(|lead| {
@@ -947,16 +934,15 @@ impl Line {
         });
         let project = project_of(lead.as_ref().map_or(caller, |(lead, _)| lead));
         let folder = match lead {
-            Some((_, folder)) if depth > 0 => folder,
+            Some((_, folder)) if below => folder,
             _ => here.to_owned(),
         };
         Line {
-            role: Role::at(depth, limit),
-            limit,
+            lead: !below,
+            depth,
             folder,
             project,
-            // A lead's side chat starts its tasks as the lead does.
-            side_of: side_of.filter(|_| depth > 0),
+            side_of: side_of.filter(|_| below),
         }
     }
 
@@ -1835,7 +1821,7 @@ fn code(said: &str) -> &'static str {
         "no_caller",
         "invalid_arguments",
         "task_not_started",
-        "task_depth_reached",
+        "depth_limit",
         "tasks_exist",
         "task_not_removed",
         "not_shown",
@@ -2499,26 +2485,18 @@ mod tests {
                 .collect()
         };
         let every = [SUBSCRIPTIONS, SHOW, RUN, AUTOMATIONS, MEMORY, COMMONS, GOAL];
-        assert_eq!(names(tools(Role::at(2, 2))), every);
+        // Every agent starts and removes tasks; the daemon bounds how deep.
         let mut task = vec![START, REMOVE];
         task.extend(every);
-        assert_eq!(names(tools(Role::at(1, 2))), task);
+        assert_eq!(names(tools(Role::TASK)), task);
         let mut lead = vec![START, REMOVE, PROJECT];
         lead.extend(every);
-        assert_eq!(names(tools(Role::at(0, 2))), lead);
-        for tool in tools(Role::at(0, 1))
-            .into_iter()
-            .filter(|t| t["name"] != EXEC)
-        {
+        assert_eq!(names(tools(Role::LEAD)), lead);
+        for tool in tools(Role::LEAD).into_iter().filter(|t| t["name"] != EXEC) {
             assert_eq!(tool["answered_by"], TAG);
-            // A lead's own are not its tasks', in a line one deep.
-            // The browser and the desktop, when there, are every agent's
-            // as well.
+            // Making projects alone is a lead's own, never its tasks'.
             let name = str_of(&tool["name"]);
-            assert_eq!(
-                tool.get("inherit").is_some(),
-                !(every.contains(&name.as_str()) || name == BROWSER || name == DESKTOP)
-            );
+            assert_eq!(tool.get("inherit").is_some(), name == PROJECT);
         }
         assert_eq!(project_of("shop.web.lead"), "shop.web");
         assert_eq!(project_of("shop.fix"), "shop");

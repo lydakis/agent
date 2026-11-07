@@ -1147,6 +1147,7 @@ mod tests {
                             settings: Default::default(),
                             declared: None,
                             request_id: None,
+                            starts_line: false,
                         },
                     )?;
                 }
@@ -1305,6 +1306,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )?;
                 db.connection().execute("DELETE FROM events", [])?;
@@ -1520,6 +1522,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )?;
                 let options = TurnOptions {

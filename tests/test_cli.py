@@ -297,15 +297,21 @@ class SocketAndCliTests(ModelFixture):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
         busy = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'slow').stdout)
         self.assertEqual(busy['status'], 'running')
-        refused = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'never', check=False)
+        # Unsaid, a message to a busy bot steers: it waits to join the running turn.
+        joined = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'also').stdout)
+        self.assertEqual(joined['status'], 'queued')
+        turns = json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)
+        self.assertEqual(next(t for t in turns if t['turn'] == joined['turn'])['delivery'], 'steer')
+        refused = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', '--delivery', 'reject',
+                             'never', check=False)
         self.assertEqual(refused.returncode, 1)
         # A failure is one JSON object on stderr: the daemon's fields, and a
         # hint in flags.
         busy_error = json.loads(refused.stderr)
         self.assertEqual((busy_error['error'], busy_error['running_turn']), ('bot_busy', busy['turn']))
         self.assertIn('hint', busy_error)
-        pretty = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', '--pretty', 'never',
-                            check=False)
+        pretty = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', '--pretty',
+                            '--delivery=reject', 'never', check=False)
         self.assertRegex(pretty.stderr, r'^agent: bot_busy: turn \d+ is running; resend with --delivery')
         # The refusal gives flags to copy, not a description of them, and the
         # fork it offers works while the turn runs.
@@ -1069,6 +1075,30 @@ class SocketAndCliTests(ModelFixture):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertNotIn('result', control.request('inspect', bot='Child'))
         self.assertEqual(control.request('inspect', bot='Creator')['result']['head'], replacement['head'])
+
+    def test_a_bot_s_shell_makes_bots_no_deeper_than_the_daemon_lets_lines_go(self):
+        # The CLI starts the daemon with [daemon] depth, 2 unless set.
+        self.agent('run', *self.common, '--new', '--bot', 'Lead', 'hello')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+
+        def made_by(maker, name):
+            record = control.request('inspect', bot=maker)['result']
+            turn = control.request('turns', bot=maker)['result']['turns'][-1]['turn']
+            env = dict(clean_env(), AGENT_BOT=maker, AGENT_BOT_ID=str(record['bot_id']),
+                       AGENT_TURN=str(turn))
+            return subprocess.run([*self.base, 'run', *self.common, '--new', '--bot', name, 'hello'],
+                                  env=env, cwd=self.path, capture_output=True, text=True, timeout=15)
+
+        for maker, name, depth in (('Lead', 'Task', 1), ('Task', 'Helper', 2)):
+            made = made_by(maker, name)
+            self.assertEqual(made.returncode, 0, made.stderr)
+            self.assertEqual(control.request('inspect', bot=name)['result']['depth'], depth)
+        refused = made_by('Helper', 'Deeper')
+        self.assertNotEqual(refused.returncode, 0)
+        error = json.loads(refused.stderr.strip().splitlines()[-1])
+        self.assertEqual((error['error'], error['depth'], error['max_depth']), ('depth_limit', 3, 2), error)
+        self.assertEqual(control.request('inspect', bot='Deeper')['error'], 'bot_not_found')
 
     def test_large_shell_output_is_previewed_and_retained_as_an_artifact(self):
         run = self.agent('run', *self.common, '--new', '--bot', 'Bob',

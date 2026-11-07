@@ -1436,7 +1436,7 @@ mod tests {
         // Of the tools its client declared, those that can drop work, run
         // something outside the sandbox or send words elsewhere wait for
         // the verdict too.
-        let panes = json!({"tools": ["shell", "read"], "declared": crate::declared::tools(crate::served::Role::at(0, 2)),
+        let panes = json!({"tools": ["shell", "read"], "declared": crate::declared::tools(crate::served::Role::LEAD),
             "gates": [{"tag": "auto", "tools": ["shell"]}]});
         let mut waiting = json!([
             "shell",

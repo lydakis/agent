@@ -2003,7 +2003,7 @@ pub fn tool(
 }
 
 /// What the clean view keeps of a call: the calls that move the work on,
-/// said as [`tool`] says them (an agent started, messaged or waited for,
+/// said as [`tool`] says them (an agent started, steered or waited for,
 /// a question to the person, the plan, a task resolved, memory, a
 /// trigger, a window opened), and nothing of the rest. A command line keeps only those of
 /// its commands.
@@ -2019,11 +2019,12 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 26] = [
+const KEPT: [&str; 27] = [
     "Started",
-    "Messaged",
+    "Started a turn for",
     "Steered",
     "Queued for",
+    "Left a note for",
     "Forked",
     "Interrupted",
     "Removed",
@@ -2056,11 +2057,12 @@ fn kept(said: &crate::calls::Said) -> bool {
 /// and folded into one when several come in a row: those that start,
 /// message, wait for or change agents and what runs for them, which a
 /// lead often makes a few of at once. What they said opens on a click.
-const FOLDS: [&str; 22] = [
+const FOLDS: [&str; 23] = [
     "Started",
-    "Messaged",
+    "Started a turn for",
     "Steered",
     "Queued for",
+    "Left a note for",
     "Waited for",
     "Forked",
     "Interrupted",
@@ -2250,7 +2252,7 @@ fn drawn(
                     own = rows.join("\n");
                 } else if matches!(
                     first.verb.as_str(),
-                    "Started" | "Messaged" | "Queued for" | "Steered"
+                    "Started" | "Started a turn for" | "Steered" | "Queued for" | "Left a note for"
                 ) {
                     own = claim(&mut printed, &|v| {
                         v.get("handle").is_some() || v.get("error").is_some()
@@ -3660,7 +3662,11 @@ mod tests {
         );
         assert_eq!(
             text(&rows),
-            ["• Ran cd /tmp", "• Messaged calc.fix · turn 2", "  └ Go"]
+            [
+                "• Ran cd /tmp",
+                "• Started a turn for calc.fix · turn 2",
+                "  └ Go"
+            ]
         );
     }
 

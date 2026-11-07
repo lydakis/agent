@@ -363,7 +363,8 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--max-pending"
                     | "--max-pending-bytes"
                     | "--max-input-bytes"
-                    | "--max-readers" => {
+                    | "--max-readers"
+                    | "--max-depth" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
@@ -778,6 +779,7 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             "--max-input-bytes" => "input_bytes",
             "--max-readers" => "readers",
             "--max-load" => "load",
+            "--max-depth" => "depth",
             "--stall-timeout" => "stall_timeout_seconds",
             "--idle-exit" => "idle_exit_seconds",
             _ => continue,
@@ -796,7 +798,7 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             "--stall-timeout" | "--idle-exit" => crate::cli::duration_secs(flag, value).ok(),
             _ => value.parse::<u64>().ok(),
         }
-        .filter(|value| flag != "--idle-exit" || *value != 0);
+        .filter(|value| !matches!(flag.as_str(), "--idle-exit" | "--max-depth") || *value != 0);
         if running.as_u64() != requested {
             differences.push(format!(
                 "{flag}: requested {value} but daemon has {}",
@@ -1763,7 +1765,16 @@ fn run(options: &Options) -> Result<i32> {
         .iter()
         .map(|path| image(path))
         .collect::<Result<Vec<_>>>()?;
-    let delivery = options.delivery.as_deref().unwrap_or("reject");
+    // Unsaid, a message steers: it joins the running turn at its next
+    // round, or starts one, as the person's own words do. A folder or a
+    // turn cap belongs to a turn of its own, which a steer may not be, so
+    // with either it queues instead.
+    let delivery = options.delivery.as_deref().unwrap_or(
+        match options.workspace.is_some() || options.turn_budget_tokens.is_some() {
+            true => "queue",
+            false => "steer",
+        },
+    );
     if options.attach_wait_ms.is_some() && delivery != "attach" {
         return fail_with("usage", "--attach-wait needs --delivery attach");
     }

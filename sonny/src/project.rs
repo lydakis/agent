@@ -943,7 +943,7 @@ async fn make(
                 .collect()
         }
     };
-    let declare = json!(crate::declared::tools(crate::served::Role::of(0)));
+    let declare = json!(crate::declared::tools(crate::served::Role::LEAD));
     let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
     // Writing its own state folder, by the name it is made under.
     let lead = (bot.map(str::to_owned)).or_else(|| {

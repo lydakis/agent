@@ -33,7 +33,7 @@ impl Lab {
         std::fs::write(
             &agent,
             "#!/bin/sh\ncase \"$1\" in\n\
-             run) for a in \"$@\"; do if [ \"$a\" = - ]; then cat; echo; else printf '%s\\n' \"$a\"; fi; done > \"$AGENT_LOG\"; [ -z \"$AGENT_FAIL\" ] || exit 1; echo '{\"handle\":\"h\"}';;\n\
+             run) [ ! -e \"$AGENT_LOG.refuse\" ] || { cat \"$AGENT_LOG.refuse\" >&2; exit 1; }; for a in \"$@\"; do if [ \"$a\" = - ]; then cat; echo; else printf '%s\\n' \"$a\"; fi; done > \"$AGENT_LOG\"; [ -z \"$AGENT_FAIL\" ] || exit 1; echo '{\"handle\":\"h\"}';;\n\
              ls) cat \"$AGENT_LOG.ls\" 2>/dev/null || echo '[]';;\n\
              rm) printf '%s\\n' \"$@\" > \"$AGENT_LOG.rm\";;\n\
              fork) printf '%s\\n' \"$@\" > \"$AGENT_LOG.fork\";;\nesac\n",
@@ -1198,15 +1198,24 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
     );
     let ran = lab.ran();
     assert_eq!(ran[3..5], ["--bot", "demo.review"]);
-    // Its helper, two below the lead, starts none of its own.
+    // Its helper, two below the lead, asks the daemon for one of its own,
+    // which refuses it past its max_depth: the call says what the daemon
+    // said, and leaves no folder behind.
     let helper = serde_json::json!({"name": "demo.review", "bot_id": 3, "created_by": "demo.fix",
-        "created_by_id": 2, "workspace": review.join("src")});
+        "created_by_id": 2, "workspace": review.join("src"), "depth": 2});
     listed(serde_json::json!([lead, task, helper]));
     *lab.bot.borrow_mut() = "demo.review".into();
+    let refused = lab.scratch.join("run.log.refuse");
+    std::fs::write(
+        &refused,
+        r#"{"error":"depth_limit","detail":"demo.deeper would be 3 generations below the bot that starts its line; max_depth is 2","depth":3,"max_depth":2}"#,
+    )
+    .unwrap();
     let call = serde_json::json!({"name": "deeper", "brief": "b"});
     let (ok, said) = lab.tool(&review.join("src"), "start_task", call.clone(), false);
     assert!(!ok);
-    assert!(said.contains("task_depth (2)"), "{said}");
+    assert!(said.contains("depth_limit"), "{said}");
+    assert!(said.contains("max_depth is 2"), "{said}");
     assert!(!lab.home.join(".agent/worktrees/demo.deeper").exists());
     // Nor removes what it did not start.
     let call = serde_json::json!({"task": "fix"});
@@ -1214,13 +1223,8 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
     assert!(!ok);
     assert!(said.contains("not a task you or yours started"), "{said}");
     assert!(fix.exists());
-    // With no end to a line, it does.
-    std::fs::create_dir_all(lab.home.join(".agent")).unwrap();
-    std::fs::write(
-        lab.home.join(".agent/config.toml"),
-        "[sonny]\ntask_depth = 0\n",
-    )
-    .unwrap();
+    // With a daemon that lets lines go deeper, it does.
+    std::fs::remove_file(&refused).unwrap();
     let call = serde_json::json!({"name": "deeper", "brief": "b"});
     let (ok, said) = lab.tool(&review.join("src"), "start_task", call, false);
     assert!(ok, "{said}");
