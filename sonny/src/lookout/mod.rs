@@ -2235,11 +2235,20 @@ impl Service {
         if self.saved == Some((cursor, replay)) {
             return;
         }
+        // What the lookouts hold goes to disk first, the runs a note spent
+        // with it: the stream never starts again past news whose spending
+        // a crash lost.
+        for lookout in self.lookouts.values_mut() {
+            lookout.flush();
+        }
         let path = cursor_path(&self.store);
         let partial = path.with_extension(format!("cursor.{}.partial", std::process::id()));
-        if write_moved(&partial, &path, &format!("{cursor} {replay}")).is_ok() {
-            self.saved = Some((cursor, replay));
-        }
+        self.saved = Some((cursor, replay));
+        held::then(move |written| {
+            if written {
+                let _ = write_moved(&partial, &path, &format!("{cursor} {replay}"));
+            }
+        });
     }
 
     /// Just before the oldest turn under way that a lookout hears, or
@@ -5617,10 +5626,12 @@ mod tests {
         service.in_flight.insert(("calc.fix".into(), 7), 40);
         service.in_flight.insert(("calc.docs".into(), 9), 60);
         service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(90), Some(39)));
         // Nothing under way: it starts again where its news ended.
         service.in_flight.clear();
         service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(90), Some(90)));
         // A failed fire whose note is under way is told again from its
         // start: its end is news and its start names its trigger.
@@ -5631,10 +5642,12 @@ mod tests {
         };
         service.telling.insert(("calc.fix".into(), 7), telling);
         service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(49), Some(29)));
         // The daemon took it: nothing holds the stream.
         service.telling.clear();
         service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(90), Some(90)));
         std::fs::write(cursor_path(&store), "12").unwrap();
         assert_eq!(marks(&store), (Some(12), Some(12)));
