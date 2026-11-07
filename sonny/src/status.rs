@@ -55,6 +55,18 @@ pub enum Group {
 }
 
 impl Group {
+    /// The group as a word for scripts: `needs_you`, `working`,
+    /// `review`, `done`, `resolved`.
+    pub fn key(self) -> &'static str {
+        match self {
+            Group::NeedsYou => "needs_you",
+            Group::Working => "working",
+            Group::Review => "review",
+            Group::Done => "done",
+            Group::Resolved => "resolved",
+        }
+    }
+
     fn heading(self) -> &'static str {
         match self {
             Group::NeedsYou => "Needs you",

@@ -1520,8 +1520,14 @@ whether they wait on you and what for (one small call, its history read
 from the provider's cache of the turn just ended). A yes is kept beside
 the store (`STORE.waiting/AGENT.json`) until the agent's next turn; its
 lead's window pins it as the task's question, where what you type goes to
-the task. `[sonny] needs_check = false` turns the check off. The footer, the task
-tabs' names, `/status`, the started roster and `/sky` agree; and next to the model the agent's profile when it runs one
+the task, and `/status` says `waits on you for: …`. Its lead hears it
+too: the task's turn-ended update waits the few seconds for the check and
+ends `, and waits on the person for: …`. `[sonny] needs_check = false`
+turns the check off. `sonny status [AGENT] [--json]` prints the project
+`/status` shows, as text or JSON, for an agent's shell or a script: AGENT
+is a lead, a task or a project, and an agent's own shell defaults to it.
+The footer, the task tabs' names, `/status`, `sonny status`, the started
+roster and `/sky` agree; and next to the model the agent's profile when it runs one
 that isn't its seat's own (`lead` for a lead, `task` for a task). The left
 of the footer says what you talk to and where (the permissions mark, the
 model as pickers name it, its effort, the folder and its branch), and the

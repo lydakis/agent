@@ -326,6 +326,9 @@ fn usage() -> String {
      and follow agents in the lookout with tools Sonny gives them, which its tool host answers.\n\
      sonny memory ... and sonny automation ... are what ~/.agent/memory and ~/.agent/automation\n\
      run, which Sonny writes at each start.\n\
+     sonny status [AGENT] [--json] prints AGENT's project as /status shows it: each agent's\n\
+     state, what it is doing or waits on you for, and its pull request; AGENT is a lead or\n\
+     task, or a project for its lead, and from an agent's shell defaults to that agent.\n\
      sonny sky draws every agent on the daemon lighting up as they talk, as /sky does,\n\
      on its own in the whole terminal; --center NAME puts an agent in the middle, and\n\
      --replay [WHEN] plays the past back from WHEN: 2h, 30m or 1d ago, or 02:10 (an hour ago).\n\
@@ -450,6 +453,412 @@ async fn task_tab(caller: &str, bot: &str) -> Result<String, String> {
             ),
         },
     )
+}
+
+/// A failed `turn` with why it failed, which `turns` leaves out, as
+/// `wait` has it: a model that said nothing is no failure.
+async fn with_error(client: &Client, mut turn: Value) -> Value {
+    if turn["status"] == "failed"
+        && let Some(handle) = turn["handle"].as_str().map(str::to_owned)
+        && let Ok(answer) = client
+            .request("wait", json!({"handles": [handle], "timeout_ms": 0}))
+            .await
+    {
+        turn["error"] = answer["results"][&handle]["error"].clone();
+    }
+    turn
+}
+
+/// What a window adds to what `/status` reads: its own agent's questions
+/// and calls, as it holds them, its model, and where its project's windows
+/// sit. `sonny status` reads with none.
+struct StatusView<'a> {
+    bot: &'a str,
+    asks: &'a [asks::Ask],
+    approvals: &'a [Value],
+    turn_model: Option<&'a str>,
+    places: mux::Places,
+    aside: &'a dyn Fn(&str) -> bool,
+}
+
+/// What `/status` read: its rows, what waits on the person, and which
+/// agents it read and found idle.
+struct StatusRead {
+    project: String,
+    rows: Vec<status::Row>,
+    needs: needs::Needs,
+    /// Whether the calls waiting on someone were listed.
+    listed: bool,
+    read: Vec<String>,
+    idle: Vec<String>,
+}
+
+/// The agents of `scope` as `/status` shows them, and footers and leads
+/// read them: each one's state, step, question, pull request and place.
+/// `status_read` and `asks_seen` hold, between reads, each agent's latest
+/// items by its history's head and its question by its last turn, so only
+/// histories that moved are read again.
+async fn read_status(
+    client: &Client,
+    options_store: &std::path::Path,
+    scope: background::Scope,
+    turns: &HashMap<String, Value>,
+    status_read: &mut HashMap<String, (Value, Latest)>,
+    asks_seen: &mut HashMap<String, (i64, Seen)>,
+    view: StatusView<'_>,
+) -> Result<StatusRead, String> {
+    let background::Scope {
+        project,
+        lead,
+        glob: pattern,
+    } = scope;
+    let behind = background::read(options_store, client.store(), turns, |bot| {
+        lookout::subs::matches(&pattern, bot)
+    });
+    // Every page of the listing: past the first 256, agents are the
+    // project's too.
+    let mut listed = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let mut ask = json!({"name": pattern, "limit": 256});
+        if let Some(after) = &after {
+            ask["after"] = json!(after);
+        }
+        let Ok(page) = client.request("bots", ask).await else {
+            return Err("could not list the agents".into());
+        };
+        listed.extend(page["bots"].as_array().cloned().unwrap_or_default());
+        match page["next_after"].as_str() {
+            Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
+            _ => break,
+        }
+    }
+    // What waits on the person, read as every surface reads it: the
+    // calls listed for them now, and each agent's open question below.
+    let mut needs = needs::Needs::default();
+    let held = needs::listing(client, None).await;
+    if let Ok(held) = &held {
+        needs.held(held.clone(), |_| true);
+    }
+    let (mut read, mut idle) = (Vec::new(), Vec::new());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let store = agent_client::socket::canonical_store(options_store)
+        .unwrap_or_else(|_| options_store.to_path_buf());
+    let mut rows = Vec::new();
+    // Each lead's project file read once a refresh; a task's profile
+    // is the one noted when it started.
+    let mut profiles: HashMap<String, Option<String>> = HashMap::new();
+    // With other leads in the folder, their tasks are theirs: each
+    // lead shows as a row of its own.
+    let shared = lead != format!("{project}.lead")
+        || (listed.iter()).any(|bot| {
+            let name = bot["name"].as_str().unwrap_or("");
+            name != lead && project::lead_project(name) == Some(project.as_str())
+        });
+    let mine = (shared && project::lead_project(&lead) == Some(project.as_str()))
+        .then(|| lineage_of(&listed, &lead, lead == format!("{project}.lead")));
+    // Side chats are not the project's agents.
+    let mut kept = HashMap::new();
+    for bot in &listed {
+        let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
+            continue;
+        };
+        if let Some(mine) = &mine
+            && name != lead
+            && !mine.contains(name)
+            && project::lead_project(name) != Some(project.as_str())
+        {
+            continue;
+        }
+        let page = (client)
+            .request("turns", json!({"bot": name, "newest": true, "limit": 8}))
+            .await
+            .ok();
+        let turns = (page.as_ref())
+            .and_then(|page| page["turns"].as_array().cloned())
+            .unwrap_or_default();
+        // Its latest items are read again only once its history moved:
+        // the same head is the same history. A failed read is kept
+        // for none, so the next refresh tries again.
+        let head = json!([bot["bot_id"], bot["head"]]);
+        let latest = match status_read.remove(name) {
+            Some((seen, latest)) if seen == head && !bot["head"].is_null() => Some(latest),
+            _ => read_latest(client, name).await,
+        };
+        if let Some(latest) = &latest {
+            kept.insert(name.to_owned(), (head, latest.clone()));
+        }
+        let latest = latest.unwrap_or_default();
+        let turn = turns.first().cloned().unwrap_or(Value::Null);
+        // The turn that runs is the one the daemon names, however many
+        // messages were steered into it or queued after it since; an
+        // idle agent's is the newest that ran ([`last_ran`]).
+        let running_turn = bot["running_turn"].as_i64();
+        let running = running_turn.is_some();
+        let ran = match running || page.is_some() {
+            true => {
+                let ran = active_turn(client, name, running_turn, page).await;
+                with_error(client, ran.unwrap_or(Value::Null)).await
+            }
+            false => Value::Null,
+        };
+        // A turn held on a cause, parked on its call or in line, says so.
+        let blocked_on = (std::iter::once(&ran).chain(&turns)).find_map(|turn| {
+            let blocked = &turn["waiting_on"]["blocked"];
+            blocked.is_object().then(|| {
+                status::held_cause(
+                    blocked["code"].as_str().unwrap_or(""),
+                    blocked["detail"].as_str(),
+                )
+                .0
+            })
+        });
+        let state = match (running, ran["status"].as_str()) {
+            _ if let Some(what) = &blocked_on => format!("{}{what}", status::HELD),
+            // A call a reviewer weighs waits on no one here.
+            (true, Some("waiting")) if ran["waiting_on"]["approval"] == true => {
+                match held {
+                    Ok(_) => "waiting on its reviewer".into(),
+                    // Unlisted, the call may be the person's.
+                    Err(_) => "needs you".into(),
+                }
+            }
+            (true, Some("waiting")) => {
+                let on: Vec<String> = ran["waiting_on"]["handles"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(calls::handle_bot)
+                    .map(|b| short(&b, &project, &lead))
+                    .collect();
+                format!("waiting on {}", on.join(", "))
+            }
+            (true, Some("paced")) => "rate limited".into(),
+            (true, Some("queued")) => "queued".into(),
+            (true, _) => "working".into(),
+            // One with a goal says whether that turn met it.
+            (false, Some("completed" | "steered")) => {
+                lookout::goals::standing(options_store, name, ran["turn"].as_i64())
+                    .unwrap_or("done")
+                    .into()
+            }
+            (false, Some("failed")) if ran["error"] == EMPTY => started::QUIET.into(),
+            (false, Some("interrupted")) => "stopped".into(),
+            (false, Some(other)) => other.to_owned(),
+            (false, None) => "idle".into(),
+        };
+        // A running turn counts on from its start; one that ended
+        // shows how long it took.
+        let started = ran["started_ms"].as_u64();
+        let finished = ran["finished_ms"].as_u64();
+        let (at, seconds) = match running {
+            true => (started, started.map(|at| now.saturating_sub(at) / 1000)),
+            false => (
+                finished,
+                started
+                    .zip(finished)
+                    .map(|(began, ended)| ended.saturating_sub(began) / 1000),
+            ),
+        };
+        let Latest { mut step, pr, ask } = latest;
+        // A question stays open until its answer lands, past work that
+        // does not wait on it and messages that answer something else:
+        // an idle agent's recent history is read once per turn it
+        // ended, as is whether that turn resolved the task. A running
+        // turn shows its work, as its last items say; a question still
+        // open shows again once it ends.
+        let seen = match turn["turn"].as_i64() {
+            Some(last) if !running => match asks_seen.get(name) {
+                Some((at, seen)) if *at == last => seen.clone(),
+                _ => {
+                    let seen =
+                        (needs::scan(client, name, ran["turn"].as_i64()).await).unwrap_or_default();
+                    asks_seen.insert(name.to_owned(), (last, seen.clone()));
+                    seen
+                }
+            },
+            _ => Seen {
+                ask,
+                ..Default::default()
+            },
+        };
+        let itself = seen.itself && name != lead && ran["status"] == "completed";
+        let resolved =
+            itself || resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
+        // With no question asked, what its last reply left waiting on the
+        // person, as a copy of it said, until a later turn starts.
+        let mark = || {
+            waiting::read(&store, name)
+                .filter(|mark| waiting::holds(mark, seen.turn, running))
+                .map(|mark| mark.ask())
+        };
+        let open = seen.ask.clone().or_else(mark);
+        // This window's own agent waits on what it shows open here too,
+        // its transcript read only so far back.
+        let ask = match name == view.bot {
+            true => (view.asks.iter())
+                .find(|ask| ask.task.is_none())
+                .cloned()
+                .or(open),
+            false => open,
+        };
+        // Unlisted, this window's own calls still say what they wait on.
+        if name == view.bot && held.is_err() {
+            let calls = (view.approvals.iter()).filter_map(|call| {
+                let (turn, id) = (call["turn"].as_i64()?, call["call_id"].as_str()?);
+                Some((name.to_owned(), turn, id.to_owned()))
+            });
+            needs.held(calls.collect(), |bot| bot == name);
+        }
+        needs.asked(name, ask.clone().filter(|_| !resolved));
+        read.push(name.to_owned());
+        if !running {
+            idle.push(name.to_owned());
+        }
+        if let Some(ask) = &ask {
+            step = match waiting::is_mark(ask) {
+                true => format!("waits on you for: {}", first_line(&ask.question)),
+                false => format!("asks: {}", first_line(&ask.question)),
+            };
+        }
+        let state = match needs.waits(name) {
+            true => "needs you".to_owned(),
+            false => state,
+        };
+        let group = status::group(&state, running, ask.is_some(), pr.is_some(), resolved);
+        let place = match view.places.get(name) {
+            Some((tab, Some((side, other)))) => {
+                format!("tab {tab}, {side} {}", short(other, &project, &lead))
+            }
+            Some((tab, None)) => format!("tab {tab}"),
+            // Its window waits for room, until a click on the row.
+            None if (view.aside)(name) => "window set aside for room".into(),
+            None => String::new(),
+        };
+        // This window's turns run on its own model, when it has one.
+        let model = match view.turn_model {
+            Some(model) if name == view.bot => model.to_owned(),
+            _ => format!(
+                "{}/{}",
+                bot["provider"].as_str().unwrap_or("?"),
+                bot["model"].as_str().unwrap_or("?")
+            ),
+        };
+        // The profile it runs as, said even when it is its seat's own,
+        // which the footer leaves out.
+        // A folder's own lead profile is read once; a lead made in a
+        // role of its own by `/new` keeps that.
+        let profile = match project::is_lead(name) {
+            true => project::chosen(&store, name).or_else(|| {
+                let folder = bot["workspace"].as_str().unwrap_or("").to_owned();
+                (profiles.entry(folder))
+                    .or_insert_with_key(|folder| match folder.as_str() {
+                        "" => None,
+                        folder => seat_profile(&store, name, true, std::path::Path::new(folder)),
+                    })
+                    .clone()
+            }),
+            false => seat_profile(&store, name, false, std::path::Path::new("")),
+        }
+        .unwrap_or_default();
+        rows.push(status::Row {
+            name: short(name, &project, &lead),
+            bot: name.to_owned(),
+            state,
+            running,
+            seconds,
+            at,
+            model,
+            profile,
+            latest: step,
+            place,
+            pr: pr.unwrap_or_default(),
+            background: background::fact(&behind, name),
+            group,
+        });
+    }
+    // Agents gone from the listing are forgotten with it.
+    *status_read = kept;
+    // The lead first, then by group, the latest first in each.
+    rows.sort_by_key(|row| {
+        (
+            row.name != "lead",
+            row.group,
+            std::cmp::Reverse(row.at.unwrap_or(0)),
+        )
+    });
+    Ok(StatusRead {
+        project,
+        rows,
+        listed: held.is_ok(),
+        needs,
+        read,
+        idle,
+    })
+}
+
+/// `bot`'s latest step, question and pull request; none when a read
+/// failed, which an empty history is not.
+async fn read_latest(client: &Client, bot: &str) -> Option<Latest> {
+    let page = client
+        .request("history_nodes", json!({"bot": bot, "limit": 4}))
+        .await
+        .ok()?;
+    let nodes: Vec<i64> = page["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n["node"].as_i64())
+        .collect();
+    // Each node's turn, which names an ask with its call.
+    let turns: HashMap<i64, i64> = (page["nodes"].as_array().into_iter().flatten())
+        .filter_map(|n| Some((n["node"].as_i64()?, n["turn"].as_i64()?)))
+        .collect();
+    let read = client
+        .request("history_items", json!({"bot": bot, "nodes": nodes}))
+        .await
+        .ok()?;
+    // Newest first, as the nodes were asked for.
+    let entries = read["items"].as_array().cloned().unwrap_or_default();
+    let items: Vec<Value> = entries.iter().map(|entry| entry["item"].clone()).collect();
+    let pr = items
+        .iter()
+        .find(|item| item["role"] == "assistant")
+        .and_then(|item| status::pull_request(&text(item)));
+    // Who sent each prompt, as `items_of` keeps it: another agent's
+    // message sets no question aside.
+    let flat: Vec<Value> = entries
+        .iter()
+        .flat_map(|entry| {
+            let from = transcript::sender(
+                entry["from"]["bot"].as_str(),
+                entry["origin"].as_str(),
+                entry["person"].as_str(),
+            );
+            let turn = (entry["node"].as_i64()).and_then(|node| turns.get(&node).copied());
+            responses(&entry["item"])
+                .into_iter()
+                .rev()
+                .map(move |mut item| {
+                    if let Some(from) = from.as_ref().filter(|_| item["role"] == "user") {
+                        item["from"] = json!(from);
+                    }
+                    if let Some(turn) = turn {
+                        item["turn"] = json!(turn);
+                    }
+                    item
+                })
+        })
+        .collect();
+    Some(Latest {
+        ask: asks::open(&flat),
+        pr,
+        step: App::step(&entries),
+    })
 }
 
 /// Open `bot`, a lead of `project`, in that project's own home, made when needed in
@@ -1404,6 +1813,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(rules::cli(rest) as u8);
         }
         Some((verb, rest)) if verb == "sky" => sky_cli(rest),
+        Some((verb, rest)) if verb == "status" => status_cli(rest),
         // An agent's shell runs this, for zen it was asked for in words.
         Some((verb, rest)) if verb == "zen" => zen::cli(rest),
         Some((verb, rest)) if verb == "home" => {
@@ -1497,6 +1907,107 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
     sky::watch(&runtime, socket, store, centre, replay)
+}
+
+/// `sonny status [AGENT] [--json]`: what `/status` reads, for an agent's
+/// shell or a script, with no window: the project of AGENT (a lead, a task,
+/// or a project for its lead), as text or as JSON.
+fn status_cli(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: sonny status [AGENT] [--json] [--store PATH] [--socket PATH]";
+    let (mut store, mut socket, mut agent, mut as_json) = (None, None, None, false);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--store" => store = args.next().map(PathBuf::from),
+            "--socket" => socket = args.next().map(PathBuf::from),
+            "--json" => as_json = true,
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            name if !name.starts_with('-') && agent.is_none() => agent = Some(name.to_owned()),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let agent = (agent.or_else(|| std::env::var("AGENT_BOT").ok()))
+        .filter(|agent| !agent.is_empty())
+        .ok_or(format!("name an agent or a project\n{USAGE}"))?;
+    let (store, socket) = daemon_paths(store, socket)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let read = runtime.block_on(async {
+        let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
+        let bot = match agent.contains('.') {
+            true => agent,
+            false => format!("{agent}.lead"),
+        };
+        let project = project_of(&client, &bot).await;
+        let lead = match project::is_lead(&bot) {
+            true => bot.clone(),
+            false => (makers(&client, &bot).await.into_iter())
+                .rfind(|maker| project::is_lead(maker))
+                .unwrap_or_else(|| format!("{project}.lead")),
+        };
+        let scope = background::Scope {
+            glob: format!("{project}.*"),
+            project,
+            lead,
+        };
+        let view = StatusView {
+            bot: "",
+            asks: &[],
+            approvals: &[],
+            turn_model: None,
+            places: Default::default(),
+            aside: &|_| false,
+        };
+        let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
+        read_status(
+            &client,
+            &store,
+            scope,
+            &HashMap::new(),
+            &mut latest,
+            &mut asks,
+            view,
+        )
+        .await
+    })?;
+    println!("{}", status_said(&read.project, &read.rows, as_json));
+    Ok(())
+}
+
+/// `sonny status`'s output: the card `/status` draws, as plain text, every
+/// group open; or its rows as JSON.
+fn status_said(project: &str, rows: &[status::Row], as_json: bool) -> String {
+    if as_json {
+        let agents: Vec<Value> = (rows.iter())
+            .map(|row| {
+                json!({
+                    "name": row.name, "bot": row.bot, "state": row.state,
+                    "group": row.group.key(), "running": row.running,
+                    "seconds": row.seconds, "at_ms": row.at, "model": row.model,
+                    "profile": row.profile, "latest": row.latest, "pr": row.pr,
+                    "background": row.background,
+                })
+            })
+            .collect();
+        return json!({"project": project, "agents": agents}).to_string();
+    }
+    let card = status::card(project, rows, 100, &status::FOLDS);
+    (card.lines.iter())
+        .map(|line| {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            text.trim_end().to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn run() -> Result<(), String> {
@@ -6130,16 +6641,8 @@ impl App {
 
     /// A failed `turn` with why it failed, which `turns` leaves out, as
     /// `wait` has it: a model that said nothing is no failure.
-    async fn with_error(&self, mut turn: Value) -> Value {
-        if turn["status"] == "failed"
-            && let Some(handle) = turn["handle"].as_str().map(str::to_owned)
-            && let Ok(answer) = (self.client)
-                .request("wait", json!({"handles": [handle], "timeout_ms": 0}))
-                .await
-        {
-            turn["error"] = answer["results"][&handle]["error"].clone();
-        }
-        turn
+    async fn with_error(&self, turn: Value) -> Value {
+        with_error(&self.client, turn).await
     }
 
     /// An agent named or picked: to its own tab, when the lead's layout
@@ -8919,296 +9422,34 @@ impl App {
 
     /// The project's agents, as `/status` shows them.
     async fn status_rows(&mut self) -> Result<(String, Vec<status::Row>), String> {
-        let background::Scope {
-            project,
-            lead,
-            glob: pattern,
-        } = self.scope();
-        let behind = background::read(
+        let scope = self.scope();
+        let fleet = self.fleet.as_ref();
+        let view = StatusView {
+            bot: &self.bot,
+            asks: &self.asks,
+            approvals: &self.approvals,
+            turn_model: self.turn_model.as_deref(),
+            places: fleet.map(|fleet| fleet.layout.places()).unwrap_or_default(),
+            aside: &|name| fleet.is_some_and(|fleet| fleet.layout.aside(name)),
+        };
+        let read = read_status(
+            &self.client,
             &self.options.store,
-            self.client.store(),
+            scope,
             &self.turns,
-            |bot| lookout::subs::matches(&pattern, bot),
-        );
-        // Every page of the listing: past the first 256, agents are the
-        // project's too.
-        let mut listed = Vec::new();
-        let mut after: Option<String> = None;
-        loop {
-            let mut ask = json!({"name": pattern, "limit": 256});
-            if let Some(after) = &after {
-                ask["after"] = json!(after);
-            }
-            let Ok(page) = self.client.request("bots", ask).await else {
-                return Err("could not list the agents".into());
-            };
-            listed.extend(page["bots"].as_array().cloned().unwrap_or_default());
-            match page["next_after"].as_str() {
-                Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
-                _ => break,
-            }
-        }
-        let places = self
-            .fleet
-            .as_ref()
-            .map(|fleet| fleet.layout.places())
-            .unwrap_or_default();
-        // What waits on the person, read as every surface reads it: the
-        // calls listed for them now, and each agent's open question below.
-        let mut needs = needs::Needs::default();
-        let held = needs::listing(&self.client, None).await;
-        if let Ok(held) = &held {
-            needs.held(held.clone(), |_| true);
-        }
-        let (mut read, mut idle) = (Vec::new(), Vec::new());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let store = self.store();
-        let mut rows = Vec::new();
-        // Each lead's project file read once a refresh; a task's profile
-        // is the one noted when it started.
-        let mut profiles: HashMap<String, Option<String>> = HashMap::new();
-        // With other leads in the folder, their tasks are theirs: each
-        // lead shows as a row of its own.
-        let shared = lead != format!("{project}.lead")
-            || (listed.iter()).any(|bot| {
-                let name = bot["name"].as_str().unwrap_or("");
-                name != lead && project::lead_project(name) == Some(project.as_str())
-            });
-        let mine = (shared && project::lead_project(&lead) == Some(project.as_str()))
-            .then(|| lineage_of(&listed, &lead, lead == format!("{project}.lead")));
-        // Side chats are not the project's agents.
-        let mut kept = HashMap::new();
-        for bot in &listed {
-            let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
-                continue;
-            };
-            if let Some(mine) = &mine
-                && name != lead
-                && !mine.contains(name)
-                && project::lead_project(name) != Some(project.as_str())
-            {
-                continue;
-            }
-            let page = (self.client)
-                .request("turns", json!({"bot": name, "newest": true, "limit": 8}))
-                .await
-                .ok();
-            let turns = (page.as_ref())
-                .and_then(|page| page["turns"].as_array().cloned())
-                .unwrap_or_default();
-            // Its latest items are read again only once its history moved:
-            // the same head is the same history. A failed read is kept
-            // for none, so the next refresh tries again.
-            let head = json!([bot["bot_id"], bot["head"]]);
-            let latest = match self.status_read.remove(name) {
-                Some((seen, latest)) if seen == head && !bot["head"].is_null() => Some(latest),
-                _ => self.read_latest(name).await,
-            };
-            if let Some(latest) = &latest {
-                kept.insert(name.to_owned(), (head, latest.clone()));
-            }
-            let latest = latest.unwrap_or_default();
-            let turn = turns.first().cloned().unwrap_or(Value::Null);
-            // The turn that runs is the one the daemon names, however many
-            // messages were steered into it or queued after it since; an
-            // idle agent's is the newest that ran ([`last_ran`]).
-            let running_turn = bot["running_turn"].as_i64();
-            let running = running_turn.is_some();
-            let ran = match running || page.is_some() {
-                true => {
-                    let ran = active_turn(&self.client, name, running_turn, page).await;
-                    self.with_error(ran.unwrap_or(Value::Null)).await
-                }
-                false => Value::Null,
-            };
-            // A turn held on a cause, parked on its call or in line, says so.
-            let blocked_on = (std::iter::once(&ran).chain(&turns)).find_map(|turn| {
-                let blocked = &turn["waiting_on"]["blocked"];
-                blocked.is_object().then(|| {
-                    status::held_cause(
-                        blocked["code"].as_str().unwrap_or(""),
-                        blocked["detail"].as_str(),
-                    )
-                    .0
-                })
-            });
-            let state = match (running, ran["status"].as_str()) {
-                _ if let Some(what) = &blocked_on => format!("{}{what}", status::HELD),
-                // A call a reviewer weighs waits on no one here.
-                (true, Some("waiting")) if ran["waiting_on"]["approval"] == true => {
-                    match held {
-                        Ok(_) => "waiting on its reviewer".into(),
-                        // Unlisted, the call may be the person's.
-                        Err(_) => "needs you".into(),
-                    }
-                }
-                (true, Some("waiting")) => {
-                    let on: Vec<String> = ran["waiting_on"]["handles"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .map(calls::handle_bot)
-                        .map(|b| short(&b, &project, &lead))
-                        .collect();
-                    format!("waiting on {}", on.join(", "))
-                }
-                (true, Some("paced")) => "rate limited".into(),
-                (true, Some("queued")) => "queued".into(),
-                (true, _) => "working".into(),
-                // One with a goal says whether that turn met it.
-                (false, Some("completed" | "steered")) => {
-                    lookout::goals::standing(&self.options.store, name, ran["turn"].as_i64())
-                        .unwrap_or("done")
-                        .into()
-                }
-                (false, Some("failed")) if ran["error"] == EMPTY => started::QUIET.into(),
-                (false, Some("interrupted")) => "stopped".into(),
-                (false, Some(other)) => other.to_owned(),
-                (false, None) => "idle".into(),
-            };
-            // A running turn counts on from its start; one that ended
-            // shows how long it took.
-            let started = ran["started_ms"].as_u64();
-            let finished = ran["finished_ms"].as_u64();
-            let (at, seconds) = match running {
-                true => (started, started.map(|at| now.saturating_sub(at) / 1000)),
-                false => (
-                    finished,
-                    started
-                        .zip(finished)
-                        .map(|(began, ended)| ended.saturating_sub(began) / 1000),
-                ),
-            };
-            let Latest { mut step, pr, ask } = latest;
-            // A question stays open until its answer lands, past work that
-            // does not wait on it and messages that answer something else:
-            // an idle agent's recent history is read once per turn it
-            // ended, as is whether that turn resolved the task. A running
-            // turn shows its work, as its last items say; a question still
-            // open shows again once it ends.
-            let seen = match turn["turn"].as_i64() {
-                Some(last) if !running => match self.asks_seen.get(name) {
-                    Some((at, seen)) if *at == last => seen.clone(),
-                    _ => {
-                        let seen = self.scan(name, ran["turn"].as_i64()).await;
-                        self.asks_seen.insert(name.to_owned(), (last, seen.clone()));
-                        seen
-                    }
-                },
-                _ => Seen {
-                    ask,
-                    ..Default::default()
-                },
-            };
-            let itself = seen.itself && name != lead && ran["status"] == "completed";
-            let resolved = itself
-                || resolved::holds(resolved::read(&store, name), turn["turn"].as_i64(), running);
-            // This window's own agent waits on what it shows open here too,
-            // its transcript read only so far back.
-            let ask = match name == self.bot {
-                true => (self.asks.iter())
-                    .find(|ask| ask.task.is_none())
-                    .cloned()
-                    .or(seen.ask),
-                false => seen.ask,
-            };
-            // Unlisted, this window's own calls still say what they wait on.
-            if name == self.bot && held.is_err() {
-                let calls = (self.approvals.iter()).filter_map(|call| {
-                    let (turn, id) = (call["turn"].as_i64()?, call["call_id"].as_str()?);
-                    Some((name.to_owned(), turn, id.to_owned()))
-                });
-                needs.held(calls.collect(), |bot| bot == name);
-            }
-            needs.asked(name, ask.clone().filter(|_| !resolved));
-            read.push(name.to_owned());
-            if !running {
-                idle.push(name.to_owned());
-            }
-            if let Some(ask) = &ask {
-                step = format!("asks: {}", first_line(&ask.question));
-            }
-            let state = match needs.waits(name) {
-                true => "needs you".to_owned(),
-                false => state,
-            };
-            let group = status::group(&state, running, ask.is_some(), pr.is_some(), resolved);
-            let place = match places.get(name) {
-                Some((tab, Some((side, other)))) => {
-                    format!("tab {tab}, {side} {}", short(other, &project, &lead))
-                }
-                Some((tab, None)) => format!("tab {tab}"),
-                // Its window waits for room, until a click on the row.
-                None if (self.fleet.as_ref()).is_some_and(|fleet| fleet.layout.aside(name)) => {
-                    "window set aside for room".into()
-                }
-                None => String::new(),
-            };
-            // This window's turns run on its own model, when it has one.
-            let model = match &self.turn_model {
-                Some(model) if name == self.bot => model.clone(),
-                _ => format!(
-                    "{}/{}",
-                    bot["provider"].as_str().unwrap_or("?"),
-                    bot["model"].as_str().unwrap_or("?")
-                ),
-            };
-            // The profile it runs as, said even when it is its seat's own,
-            // which the footer leaves out.
-            // A folder's own lead profile is read once; a lead made in a
-            // role of its own by `/new` keeps that.
-            let profile = match project::is_lead(name) {
-                true => project::chosen(&store, name).or_else(|| {
-                    let folder = bot["workspace"].as_str().unwrap_or("").to_owned();
-                    (profiles.entry(folder))
-                        .or_insert_with_key(|folder| match folder.as_str() {
-                            "" => None,
-                            folder => {
-                                seat_profile(&store, name, true, std::path::Path::new(folder))
-                            }
-                        })
-                        .clone()
-                }),
-                false => seat_profile(&store, name, false, std::path::Path::new("")),
-            }
-            .unwrap_or_default();
-            rows.push(status::Row {
-                name: short(name, &project, &lead),
-                bot: name.to_owned(),
-                state,
-                running,
-                seconds,
-                at,
-                model,
-                profile,
-                latest: step,
-                place,
-                pr: pr.unwrap_or_default(),
-                background: background::fact(&behind, name),
-                group,
-            });
-        }
-        // Agents gone from the listing are forgotten with it.
-        self.status_read = kept;
+            &mut self.status_read,
+            &mut self.asks_seen,
+            view,
+        )
+        .await?;
         // The windows' names and the footer say what this read, as it is
         // newer than what they had. A running agent's question is read
         // from its last few items here, so its events keep theirs.
         if let Some(fleet) = &mut self.fleet {
-            fleet.adopt(&needs, held.is_ok().then_some(&read[..]), &idle);
+            let calls = read.listed.then_some(&read.read[..]);
+            fleet.adopt(&read.needs, calls, &read.idle);
         }
-        // The lead first, then by group, the latest first in each.
-        rows.sort_by_key(|row| {
-            (
-                row.name != "lead",
-                row.group,
-                std::cmp::Reverse(row.at.unwrap_or(0)),
-            )
-        });
-        Ok((project, rows))
+        Ok((read.project, read.rows))
     }
 
     /// Count the running turn's time from when the daemon started it, not
@@ -9259,69 +9500,7 @@ impl App {
     /// still open. Its last few items say: asking ends a turn.
     #[cfg(test)]
     async fn latest(&self, bot: &str) -> Latest {
-        self.read_latest(bot).await.unwrap_or_default()
-    }
-
-    /// `bot`'s latest step, question and pull request; none when a read
-    /// failed, which an empty history is not.
-    async fn read_latest(&self, bot: &str) -> Option<Latest> {
-        let page = self
-            .client
-            .request("history_nodes", json!({"bot": bot, "limit": 4}))
-            .await
-            .ok()?;
-        let nodes: Vec<i64> = page["nodes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|n| n["node"].as_i64())
-            .collect();
-        // Each node's turn, which names an ask with its call.
-        let turns: HashMap<i64, i64> = (page["nodes"].as_array().into_iter().flatten())
-            .filter_map(|n| Some((n["node"].as_i64()?, n["turn"].as_i64()?)))
-            .collect();
-        let read = self
-            .client
-            .request("history_items", json!({"bot": bot, "nodes": nodes}))
-            .await
-            .ok()?;
-        // Newest first, as the nodes were asked for.
-        let entries = read["items"].as_array().cloned().unwrap_or_default();
-        let items: Vec<Value> = entries.iter().map(|entry| entry["item"].clone()).collect();
-        let pr = items
-            .iter()
-            .find(|item| item["role"] == "assistant")
-            .and_then(|item| status::pull_request(&text(item)));
-        // Who sent each prompt, as `items_of` keeps it: another agent's
-        // message sets no question aside.
-        let flat: Vec<Value> = entries
-            .iter()
-            .flat_map(|entry| {
-                let from = transcript::sender(
-                    entry["from"]["bot"].as_str(),
-                    entry["origin"].as_str(),
-                    entry["person"].as_str(),
-                );
-                let turn = (entry["node"].as_i64()).and_then(|node| turns.get(&node).copied());
-                responses(&entry["item"])
-                    .into_iter()
-                    .rev()
-                    .map(move |mut item| {
-                        if let Some(from) = from.as_ref().filter(|_| item["role"] == "user") {
-                            item["from"] = json!(from);
-                        }
-                        if let Some(turn) = turn {
-                            item["turn"] = json!(turn);
-                        }
-                        item
-                    })
-            })
-            .collect();
-        Some(Latest {
-            ask: asks::open(&flat),
-            pr,
-            step: Self::step(&entries),
-        })
+        read_latest(&self.client, bot).await.unwrap_or_default()
     }
 
     /// The newest of history `entries` that reads as a step, as a line.
@@ -15735,6 +15914,75 @@ mod tests {
         assert_eq!(fleet.doing["shop.fix"], "needs you");
         assert_eq!(fleet.doing["shop.web"], "working");
         assert_eq!(app.agents(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn sonny_status_reads_what_a_reply_waits_on_you_for_as_status_does() {
+        let (client, _events) = daemon_with_events(json!({}), |asked| {
+            match asked["op"].as_str().unwrap_or_default() {
+                "bots" => json!({"bots": [
+                    {"name": "shop.lead", "bot_id": 1, "head": 1, "running_turn": null},
+                    {"name": "shop.fix", "bot_id": 2, "head": 1, "running_turn": null,
+                        "created_by": "shop.lead"},
+                ], "next_after": null}),
+                "turns" if asked["bot"] == "shop.fix" => {
+                    json!({"turns": [{"turn": 3, "status": "completed"}]})
+                }
+                "turns" => json!({"turns": []}),
+                "history_nodes" => json!({"nodes": []}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("sonny-status-cli-{}", std::process::id()));
+        let store = dir.join("store");
+        let mark = waiting::Mark {
+            turn: 3,
+            waiting_for: "which branch to deploy".into(),
+        };
+        waiting::keep(&store, "shop.fix", 3, Some(&mark)).unwrap();
+        let scope = background::Scope {
+            project: "shop".into(),
+            lead: "shop.lead".into(),
+            glob: "shop.*".into(),
+        };
+        let view = StatusView {
+            bot: "",
+            asks: &[],
+            approvals: &[],
+            turn_model: None,
+            places: Default::default(),
+            aside: &|_| false,
+        };
+        let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
+        let read = read_status(
+            &client,
+            &store,
+            scope,
+            &HashMap::new(),
+            &mut latest,
+            &mut asks,
+            view,
+        )
+        .await
+        .unwrap();
+        let fix = read.rows.iter().find(|row| row.bot == "shop.fix").unwrap();
+        assert_eq!(fix.state, "needs you");
+        assert_eq!(fix.latest, "waits on you for: which branch to deploy");
+        let text = status_said(&read.project, &read.rows, false);
+        assert!(text.starts_with("shop · 1 task · 1 need you"), "{text}");
+        assert!(
+            text.contains("waits on you for: which branch to deploy"),
+            "{text}"
+        );
+        let said: Value =
+            serde_json::from_str(&status_said(&read.project, &read.rows, true)).unwrap();
+        let fix = (said["agents"].as_array().unwrap().iter())
+            .find(|agent| agent["bot"] == "shop.fix")
+            .unwrap();
+        assert_eq!(fix["group"], "needs_you");
+        assert_eq!(fix["latest"], "waits on you for: which branch to deploy");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

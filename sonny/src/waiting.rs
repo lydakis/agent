@@ -65,6 +65,12 @@ impl Mark {
     }
 }
 
+/// Whether `ask` is a mark's, as [`Mark::ask`] makes it, not a question
+/// the agent asked.
+pub fn is_mark(ask: &crate::asks::Ask) -> bool {
+    ask.id.ends_with("/waiting")
+}
+
 /// Where the marks are kept: beside the store, one file per agent.
 pub fn dir(store: &Path) -> PathBuf {
     let mut dir = store.as_os_str().to_owned();
