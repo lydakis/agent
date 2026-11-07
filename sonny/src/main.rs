@@ -5512,6 +5512,22 @@ impl App {
                     Err(error) => return Err(error.to_string()),
                 }
             }
+            // Older items are drawn above the view after a frame, never
+            // before one: a page each time round once the view is a few
+            // screens from the first row, and while the person reads back,
+            // more between their keys, so the wheel finds rows drawn
+            // rather than waits on a page. A lead's page can be a row or
+            // two, its gaps one row each, so reading ahead is what keeps
+            // the wheel off the first row.
+            let mut reading = false;
+            if self.older.is_some() && !self.to_first && self.screen.wants_older(keys.is_empty()) {
+                let from = self.older;
+                self.older().await;
+                changed = true;
+                // Round again at once while pages come; a read that failed
+                // or was cut short waits for the next event.
+                reading = self.older != from;
+            }
             // What came since the last draw waits for the next one, due
             // once the cap allows.
             let undrawn = drawn.filter(|_| wanted && skipped);
@@ -5613,6 +5629,7 @@ impl App {
                         || drawn.is_none_or(|at| at.elapsed() >= IDLE_FRAME);
                 }
                 _ = self.woken.notified() => changed = true,
+                _ = std::future::ready(()), if reading => {}
             }
             // A window starts quiet once it is due (this check, at most a
             // minute late) and it ends in whichever window the person
@@ -5688,8 +5705,8 @@ impl App {
             for what in std::mem::take(&mut self.pressed) {
                 self.press(&what).await;
             }
-            // Older items drawn above before the view reaches the first row.
-            if self.older.is_some() && self.screen.near_top() {
+            // On the way up to the first turn, a page each time round.
+            if self.to_first && self.older.is_some() && self.screen.near_top() {
                 self.older().await;
             }
             if self.to_first {
