@@ -18,18 +18,33 @@ pub struct Picker {
 
 impl Picker {
     /// The models of every binding in `current`'s family, from a
-    /// `provider_models` answer and `ready.providers`, the current one
-    /// picked. A provider that would not list still offers the current
-    /// model.
-    pub fn new(listing: &Value, providers: &Value, current: &str, effort: Option<&str>) -> Self {
+    /// `provider_models` answer and `ready.providers`, less the ones the
+    /// person hides, the current one picked. A provider that would not
+    /// list still offers the current model.
+    pub fn new(
+        listing: &Value,
+        providers: &Value,
+        hidden: &std::collections::HashSet<String>,
+        current: &str,
+        effort: Option<&str>,
+    ) -> Self {
         let provider = current.split_once('/').map_or(current, |(p, _)| p);
-        let family = &providers[provider]["family"];
-        let mut names: Vec<&String> = providers
+        // The listing says each provider's family and effort levels as the
+        // daemon binds it now, a provider added since this client connected
+        // included; `ready.providers` answers for a listing that does not.
+        let listed = &listing["providers"];
+        let family_of = |name: &str| match &listed[name]["family"] {
+            Value::Null => &providers[name]["family"],
+            family => family,
+        };
+        let family = family_of(provider);
+        let mut names: Vec<&String> = listed
             .as_object()
+            .filter(|all| all.values().any(|entry| !entry["family"].is_null()))
+            .or(providers.as_object())
             .map(|all| {
-                all.iter()
-                    .filter(|(_, binding)| binding["family"] == *family)
-                    .map(|(name, _)| name)
+                all.keys()
+                    .filter(|name| !family.is_null() && family_of(name) == family)
                     .collect()
             })
             .unwrap_or_default();
@@ -48,13 +63,18 @@ impl Picker {
                 }
             }
         }
+        models.retain(|m| m == current || !hidden.contains(m));
         if !models.iter().any(|m| m == current) {
             models.insert(0, current.to_owned());
         }
         let pick = models.iter().position(|m| m == current).unwrap_or(0);
         let mut efforts = vec![None];
+        let levels = match &listed[provider]["efforts"] {
+            Value::Null => &providers[provider]["efforts"],
+            levels => levels,
+        };
         efforts.extend(
-            providers[provider]["efforts"]
+            levels
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -315,7 +335,13 @@ mod tests {
             "chatgpt": {"models": [{"id": "gpt-6-luna"}]},
             "anthropic": {"models": [{"id": "claude-opus-5-5"}]},
         }});
-        let mut picker = Picker::new(&listing, &providers, "chatgpt/gpt-6-luna", Some("high"));
+        let mut picker = Picker::new(
+            &listing,
+            &providers,
+            &Default::default(),
+            "chatgpt/gpt-6-luna",
+            Some("high"),
+        );
         assert_eq!(
             picker.shown(),
             ["chatgpt/gpt-6-luna", "openai/gpt-6", "openai/gpt-6-luna"]
@@ -356,11 +382,63 @@ mod tests {
     fn a_provider_that_would_not_list_still_offers_the_current_model() {
         let providers = json!({"anthropic": {"family": "anthropic", "efforts": ["low"]}});
         let listing = json!({"providers": {"anthropic": {"error": "unauthorized"}}});
-        let mut picker = Picker::new(&listing, &providers, "anthropic/claude-opus-5-5", None);
+        let mut picker = Picker::new(
+            &listing,
+            &providers,
+            &Default::default(),
+            "anthropic/claude-opus-5-5",
+            None,
+        );
         assert_eq!(picker.shown(), ["anthropic/claude-opus-5-5"]);
         assert_eq!(picker.refused, ["anthropic: unauthorized"]);
         assert_eq!(picker.effort(), None);
         picker.less();
         assert_eq!(picker.effort(), None);
+    }
+
+    #[test]
+    fn a_provider_added_after_connecting_is_offered_from_the_listing() {
+        // `ready.providers` as it was when this client connected.
+        let providers = json!({"openai": {"family": "responses"}});
+        let listing = json!({"providers": {
+            "openai": {"family": "responses", "models": [{"id": "gpt-6"}]},
+            "second": {"family": "responses", "models": [{"id": "gpt-6"}]},
+            "anthropic": {"family": "anthropic", "models": [{"id": "claude-opus-5-5"}]},
+        }});
+        let picker = Picker::new(
+            &listing,
+            &providers,
+            &Default::default(),
+            "openai/gpt-6",
+            None,
+        );
+        assert_eq!(picker.shown(), ["openai/gpt-6", "second/gpt-6"]);
+        // Its efforts come from the listing too.
+        let listing = json!({"providers": {
+            "second": {"family": "responses", "efforts": ["low", "high"],
+                       "models": [{"id": "gpt-6"}]},
+        }});
+        let mut picker = Picker::new(
+            &listing,
+            &providers,
+            &Default::default(),
+            "second/gpt-6",
+            None,
+        );
+        picker.more();
+        assert_eq!(picker.effort(), Some("low"));
+    }
+
+    #[test]
+    fn a_model_the_person_hides_is_not_offered_unless_it_runs_now() {
+        let providers = json!({"openai": {"family": "responses"}});
+        let listing = json!({"providers": {
+            "openai": {"models": [{"id": "gpt-6"}, {"id": "old"}, {"id": "gpt-6-luna"}]},
+        }});
+        let hidden = ["openai/old".to_owned(), "openai/gpt-6-luna".to_owned()].into();
+        let picker = Picker::new(&listing, &providers, &hidden, "openai/gpt-6", None);
+        assert_eq!(picker.shown(), ["openai/gpt-6"]);
+        let picker = Picker::new(&listing, &providers, &hidden, "openai/old", None);
+        assert_eq!(picker.shown(), ["openai/gpt-6", "openai/old"]);
     }
 }

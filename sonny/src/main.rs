@@ -1352,9 +1352,14 @@ fn agent_command(bin: &std::path::Path) -> Result<std::process::Command, String>
 }
 
 /// `~/.agent/env` over `command`'s environment: an empty value unsets.
+/// Its keys only: the providers are set in `~/.agent/config.toml`, so an
+/// `AGENT_PROVIDER` there is passed over ([`env_file_provider`] says so).
 fn apply_env_file(command: &mut std::process::Command) -> Result<(), String> {
     if let Some(file) = agent_client::env_file::path() {
         for (key, value) in agent_client::env_file::read(&file)? {
+            if key == "AGENT_PROVIDER" {
+                continue;
+            }
             match value.is_empty() {
                 true => command.env_remove(key),
                 false => command.env(key, value),
@@ -1362,6 +1367,24 @@ fn apply_env_file(command: &mut std::process::Command) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// What to tell the person when `~/.agent/env` still sets `AGENT_PROVIDER`,
+/// which nothing reads now: `~/.agent/config.toml`'s `provider` is the one
+/// place providers are set (a shell's own `AGENT_PROVIDER` still wins, for
+/// scripts).
+fn env_file_provider() -> Option<String> {
+    env_file_provider_at(&agent_client::env_file::path()?)
+}
+
+fn env_file_provider_at(file: &std::path::Path) -> Option<String> {
+    let set = agent_client::env_file::read(file).ok()?;
+    set.iter().any(|(key, value)| key == "AGENT_PROVIDER" && !value.is_empty()).then(|| {
+        format!(
+            "{} sets AGENT_PROVIDER, which is no longer read; move it to provider in ~/.agent/config.toml (/config provider)",
+            file.display()
+        )
+    })
 }
 
 /// The daemon's companion that answers an `auto` gate: `sonny approver`,
@@ -1518,11 +1541,8 @@ async fn connect_starting(
         }
         started => started.map_err(|e| e.to_string())?,
     }
-    let connected = Client::connect(socket).await.map_err(|e| e.to_string())?;
-    if let Some(path) = agent_client::models::path().filter(|path| !path.exists()) {
-        tokio::spawn(first_models(connected.0.clone(), path));
-    }
-    Ok(connected)
+    // The daemon rewrites the model catalog itself, from every start.
+    Client::connect(socket).await.map_err(|e| e.to_string())
 }
 
 /// Why a daemon that stopped is not started again: it has no provider,
@@ -1537,19 +1557,6 @@ fn older_daemon(error: &agent_client::Error) -> bool {
         && (error.facts.as_ref())
             .and_then(|facts| facts.get("protocol")?.as_u64())
             .is_some_and(|protocol| protocol < agent_client::PROTOCOL)
-}
-
-/// `~/.agent/models`, the list agents read with `agent models`, written
-/// from the providers' listings when there is none yet, as `agent models
-/// --discover` writes it. A provider that will not list leaves it for the
-/// next start.
-async fn first_models(client: Arc<Client>, path: PathBuf) {
-    let Ok(listing) = client.request("provider_models", json!({})).await else {
-        return;
-    };
-    if let Ok(text) = agent_client::models::render(&listing, &[]) {
-        let _ = agent_client::models::install(&path, &text);
-    }
 }
 
 /// Why the daemon did not start: the CLI's error code when it named one,
@@ -2225,6 +2232,11 @@ async fn run() -> Result<(), String> {
         app.notice = Some(format!(
             "a new lead for this folder; {above} leads the folder above: sonny --agent {above}"
         ));
+    }
+    if let Some(said) = env_file_provider()
+        && app.notice.is_none()
+    {
+        app.notice = Some(said);
     }
     app.lead = project::lead(&app.options.socket, &bot);
     // The lookout knows no leads: it watches a lead's tasks because Sonny
@@ -6077,9 +6089,14 @@ impl App {
                     Some((model, effort)) => (model.as_str(), effort.as_deref()),
                     None => (self.model.as_str(), self.effort.as_deref()),
                 };
+                // Read as the picker opens, never while the window idles.
+                let hidden = agent_client::models::path()
+                    .map(|path| agent_client::models::hidden(&path))
+                    .unwrap_or_default();
                 self.picker = Some(models::Picker::new(
                     &listing,
                     self.client.providers(),
+                    &hidden,
                     model,
                     effort,
                 ));
@@ -15240,6 +15257,28 @@ fn zen_notice(on: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_env_file_that_sets_providers_is_told_to_move_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sonny-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("env");
+        let write = |text: &str| {
+            std::fs::write(&file, text).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write("OPENAI_API_KEY=k\nAGENT_PROVIDER=\"openai bedrock\"\n");
+        let said = env_file_provider_at(&file).unwrap();
+        assert!(
+            said.contains("AGENT_PROVIDER, which is no longer read"),
+            "{said}"
+        );
+        assert!(said.contains("provider in ~/.agent/config.toml"), "{said}");
+        write("OPENAI_API_KEY=k\nAGENT_PROVIDER=\n");
+        assert_eq!(env_file_provider_at(&file), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn the_screen_is_wiped_without_asking_the_terminal_anything() {

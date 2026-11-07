@@ -228,7 +228,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --context-window",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --context-window --models --provider-config",
         settings: "",
         startup: true,
     },
@@ -363,7 +363,7 @@ fn print_flags(flags: &str) {
             "--provider" => ("SPEC", "Register a provider; repeat for multiple providers"),
             "--discover" => (
                 "",
-                "Write ~/.agent/models from the providers' own model listings",
+                "Rewrite the model catalog ~/.agent/models.discovered from the providers' own listings, as each daemon start does",
             ),
             "--model" => (
                 "PROVIDER/MODEL",
@@ -438,6 +438,14 @@ fn print_flags(flags: &str) {
             "--context-window" => (
                 "PATTERN=TOKENS",
                 "The context window of each model whose PROVIDER/MODEL path matches PATTERN (* and ? wildcards), over its provider's listing; the most specific pattern wins; repeatable; clients pass [context_windows] from ~/.agent/config.toml",
+            ),
+            "--provider-config" => (
+                "PATH",
+                "The config file the providers came from (its `provider`), watched: an edit binds the new set for turns that start after it, running turns finish on the old, and a set that fails to bind or drops a provider agents use is refused; clients pass ~/.agent/config.toml when no --provider or AGENT_PROVIDER names them",
+            ),
+            "--models" => (
+                "PATH",
+                "Rewrite the model catalog at PATH from the providers' listings each time the daemon starts, after it is ready; clients pass ~/.agent/models.discovered",
             ),
             "--wall" => (
                 "FOLDER",

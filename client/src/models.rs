@@ -1,9 +1,13 @@
-//! The model list: `~/.agent/models`, one `PROVIDER/MODEL` per line, with
-//! anything after `#` a note. Clients read it to offer choices: the app's
-//! model picker, and `agent models`, which is how a bot sees what it may give
-//! the agents it starts. The daemon never reads it and runs whatever model it
-//! is given. `agent models --discover` writes a first one from the
-//! providers' own listings; after that it is the user's file.
+//! The model list clients offer, from two files with one owner each.
+//! Discovery owns `~/.agent/models.discovered`: the providers' own
+//! listings, rewritten whole at each daemon start and by `agent models
+//! --discover`, so it says what the providers report now and nothing else.
+//! The person owns `~/.agent/models`, which nothing writes: a
+//! `PROVIDER/MODEL` line adds a model, or puts a listed one first with
+//! their note, and a `-PROVIDER/MODEL` line hides one. In both, one entry
+//! per line, with anything after `#` a note. Clients read the two together
+//! ([`read`]): the person's lines first, then the catalog's, less what they
+//! hide. The daemon never reads either and runs whatever model it is given.
 use crate::Error;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -26,12 +30,64 @@ impl Model {
     }
 }
 
+/// The person's list.
 pub fn path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent").join("models"))
 }
 
-/// The listed models in file order, each once. No file is no list.
+/// Discovery's catalog beside the person's list at `path`.
+pub fn discovered(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".discovered");
+    path.with_file_name(name)
+}
+
+/// What clients offer: the person's models at `path` in their order, then
+/// the catalog's they did not name, less every model they hide; each once.
+/// No files is no list.
 pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
+    fn invalid(path: &Path) -> impl Fn((usize, &'static str)) -> Error + '_ {
+        move |(line, reason)| {
+            Error::with(
+                "models_invalid",
+                &format!("{}:{line}: {reason}", path.display()),
+            )
+        }
+    }
+    let mine = match read_file(path, true)? {
+        Some(text) => lines(&text).map_err(invalid(path))?,
+        None => Vec::new(),
+    };
+    // Only discovery writes the catalog, never through a link.
+    let catalog = discovered(path);
+    let listed = match read_file(&catalog, false)? {
+        Some(text) => parse(&text).map_err(invalid(&catalog))?,
+        None => Vec::new(),
+    };
+    let hidden: std::collections::HashSet<&str> = mine
+        .iter()
+        .filter(|(hide, _)| *hide)
+        .map(|(_, model)| model.id.as_str())
+        .collect();
+    let mut seen: std::collections::HashSet<String> =
+        hidden.iter().map(|id| (*id).to_owned()).collect();
+    let mut models = Vec::new();
+    for model in mine
+        .into_iter()
+        .filter_map(|(hide, model)| (!hide).then_some(model))
+        .chain(listed)
+    {
+        if seen.insert(model.id.clone()) {
+            models.push(model);
+        }
+    }
+    Ok(models)
+}
+
+/// A list file's text, or none where there is none: a regular file of at
+/// most 1 MiB of UTF-8. The catalog is read with `follow` false, so a link
+/// put where discovery writes is refused rather than read through.
+fn read_file(path: &Path, follow: bool) -> Result<Option<String>, Error> {
     use std::io::Read;
     let unreadable = |error: std::io::Error| {
         Error::with("models_unreadable", &format!("{}: {error}", path.display()))
@@ -40,14 +96,15 @@ pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
     // rather than waited on; reads of a regular file are unaffected.
     let opened = {
         use std::os::unix::fs::OpenOptionsExt;
+        let link = if follow { 0 } else { libc::O_NOFOLLOW };
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | link)
             .open(path)
     };
     let file = match opened {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(unreadable(error)),
     };
     if !file.metadata().map_err(unreadable)?.is_file() {
@@ -67,57 +124,40 @@ pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
             &format!("{}: larger than 1 MiB", path.display()),
         ));
     }
-    let text = String::from_utf8(bytes).map_err(|error| {
+    String::from_utf8(bytes).map(Some).map_err(|error| {
         Error::with(
             "models_unreadable",
             &format!("{}: {}", path.display(), error.utf8_error()),
         )
-    })?;
-    parse(&text).map_err(|(line, reason)| {
-        Error::with(
-            "models_invalid",
-            &format!("{}:{line}: {reason}", path.display()),
-        )
     })
 }
 
-/// Writes a first list at `path`, whole beside it and then linked into
-/// place: a failed write leaves no partial list, and a list made meanwhile
-/// is not replaced but refused with `models_file_exists`.
-pub fn install(path: &Path, text: &str) -> Result<(), Error> {
-    use std::io::Write;
-    let failed = |error: std::io::Error| match error.kind() {
-        std::io::ErrorKind::AlreadyExists => {
-            Error::with("models_file_exists", &path.display().to_string())
-        }
-        _ => Error::with("models_unwritable", &format!("{}: {error}", path.display())),
-    };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(failed)?;
-    }
-    let staged = path.with_file_name(format!(".models.{}", std::process::id()));
-    let installed = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staged)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        std::fs::hard_link(&staged, path)
-    })();
-    let _ = std::fs::remove_file(&staged);
-    installed.map_err(failed)?;
-    // The new name is durable only once its directory is.
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(failed)?;
-    }
-    Ok(())
+/// The models the person's list at `path` hides, for a client that offers
+/// what the providers list now rather than [`read`]'s list; none when it
+/// cannot be read.
+pub fn hidden(path: &Path) -> std::collections::HashSet<String> {
+    read_file(path, true)
+        .ok()
+        .flatten()
+        .and_then(|text| lines(&text).ok())
+        .into_iter()
+        .flatten()
+        .filter_map(|(hide, model)| hide.then_some(model.id))
+        .collect()
 }
 
+/// The models a list names, hides left out.
 fn parse(text: &str) -> Result<Vec<Model>, (usize, &'static str)> {
-    let mut models: Vec<Model> = Vec::new();
+    Ok(lines(text)?
+        .into_iter()
+        .filter_map(|(hide, model)| (!hide).then_some(model))
+        .collect())
+}
+
+/// Each entry in file order, as whether it hides (`-PROVIDER/MODEL`) and
+/// the model it names; an entry repeated counts once.
+fn lines(text: &str) -> Result<Vec<(bool, Model)>, (usize, &'static str)> {
+    let mut models = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (index, line) in text.lines().enumerate() {
         let (entry, note) = match line.split_once('#') {
@@ -127,38 +167,47 @@ fn parse(text: &str) -> Result<Vec<Model>, (usize, &'static str)> {
         if entry.is_empty() {
             continue;
         }
+        let (hide, entry) = match entry.strip_prefix('-') {
+            Some(entry) => (true, entry.trim_start()),
+            None => (false, entry),
+        };
         let valid = entry.split_once('/').is_some_and(|(provider, model)| {
             (1..=64).contains(&provider.len())
                 && provider
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                && !provider.starts_with('-')
                 && (1..=256).contains(&model.len())
                 && !model.contains(char::is_whitespace)
         });
         if !valid {
-            return Err((index + 1, "expected PROVIDER/MODEL"));
+            return Err((index + 1, "expected PROVIDER/MODEL or -PROVIDER/MODEL"));
         }
-        if !seen.insert(entry) {
+        if !seen.insert((hide, entry)) {
             continue;
         }
-        models.push(Model {
-            id: entry.to_owned(),
-            note: note.filter(|note| !note.is_empty()).map(str::to_owned),
-        });
+        models.push((
+            hide,
+            Model {
+                id: entry.to_owned(),
+                note: note.filter(|note| !note.is_empty()).map(str::to_owned),
+            },
+        ));
     }
     Ok(models)
 }
 
-/// A list from the daemon's `provider_models` answer: every model each
-/// provider listed, with what it said about it as the note, and a comment for
-/// a provider that listed nothing. A provider that failed keeps its lines
-/// from `kept`, the list being replaced, so one provider down never empties
-/// the list; a provider no longer running loses them. Refuses output with no
+/// A catalog from the daemon's `provider_models` answer: every model each
+/// provider listed, with what it said about it as the note, and a comment
+/// for a provider that listed nothing. A provider that failed keeps its
+/// lines from `kept`, the catalog being replaced, so one provider down never
+/// empties it; a provider no longer running loses them. Refuses output with no
 /// usable model lines, including listings dropped to keep the file within
 /// its limit.
 pub fn render(listing: &Value, kept: &[Model]) -> Result<String, Error> {
     let mut text = String::from(
-        "# PROVIDER/MODEL per line; clients offer these. Delete what you don't use.\n",
+        "# What the providers list, rewritten whole at each daemon start; edits here\n\
+         # are replaced. Add a model, or hide one with -PROVIDER/MODEL, in `models`.\n",
     );
     let Some(providers) = listing["providers"].as_object() else {
         return Err(Error::with("models_none_listed", "no provider listings"));
@@ -233,7 +282,27 @@ fn provider_block(name: &str, listed: &Value, kept: &[Model]) -> (Option<String>
             .map(|detail| comment(format!("{name}: {error}: {detail}")));
         return (full, Some(comment(format!("{name}: {error}"))));
     };
-    let mut lines = String::new();
+    let lines: String = listed_lines(name, models)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect();
+    // A provider that answered but gave nothing usable says so by name.
+    if lines.is_empty() {
+        return (None, Some(comment(format!("{name}: no models listed"))));
+    }
+    let over = comment(format!(
+        "{name}: {} bytes of models, past the list's 1 MiB",
+        lines.len()
+    ));
+    (Some(lines), Some(over))
+}
+
+/// A provider's listed models as `(PROVIDER/MODEL, line)`, in the order it
+/// listed them, each line with what the provider said about the model as
+/// its note. An id that would not read back as one line is left out.
+fn listed_lines(name: &str, models: &[Value]) -> Vec<(String, String)> {
+    let mut lines = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for model in models {
         let Some(id) = model["id"].as_str() else {
             continue;
@@ -253,22 +322,167 @@ fn provider_block(name: &str, listed: &Value, kept: &[Model]) -> (Option<String>
         if !parse(&id).is_ok_and(|parsed| parsed.len() == 1 && parsed[0].id == id) {
             continue;
         }
-        // `#` starts the note, so it cannot appear inside one's text either way.
-        let note = note.join(", ").replace('\n', " ");
-        match note.is_empty() {
-            true => lines.push_str(&format!("{id}\n")),
-            false => lines.push_str(&format!("{id}  # {note}\n")),
+        if !seen.insert(id.clone()) {
+            continue;
         }
+        // `#` starts the note, so it cannot appear inside one's text either way.
+        let note = note.join(", ").replace(['\n', '\r'], " ");
+        let line = match note.is_empty() {
+            true => format!("{id}\n"),
+            false => format!("{id}  # {note}\n"),
+        };
+        lines.push((id, line));
     }
-    // A provider that answered but gave nothing usable says so by name.
-    if lines.is_empty() {
-        return (None, Some(comment(format!("{name}: no models listed"))));
+    lines
+}
+
+/// What a refresh did to the catalog: models added and removed, whether it
+/// wrote a first one, and each provider that did not answer, with why.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Refreshed {
+    pub created: bool,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub refused: Vec<(String, String)>,
+}
+
+/// Rewrites the catalog at `path` whole from the daemon's
+/// `provider_models` answer. A provider that did not answer keeps its
+/// lines from the catalog there now; nothing else in it is read, so an
+/// edit there is replaced. Written beside it and renamed over it, so a
+/// reader sees the old catalog or the new one, never part of either.
+pub fn refresh(path: &Path, listing: &Value) -> Result<Refreshed, Error> {
+    let Some(providers) = listing["providers"].as_object() else {
+        return Err(Error::with("models_none_listed", "no provider listings"));
+    };
+    let refused: Vec<(String, String)> = providers
+        .iter()
+        .filter(|(_, listed)| !listed["models"].is_array())
+        .map(|(name, listed)| {
+            let error = listed["error"].as_str().unwrap_or("no listing");
+            let said = match listed["detail"].as_str() {
+                Some(detail) => format!("{error}: {detail}"),
+                None => error.to_owned(),
+            };
+            (
+                name.clone(),
+                said.split_whitespace().collect::<Vec<_>>().join(" "),
+            )
+        })
+        .collect();
+    // A catalog that is missing, a link or broken is simply replaced.
+    let old = read_file(path, false).ok().flatten();
+    let kept = old
+        .as_deref()
+        .and_then(|text| parse(text).ok())
+        .unwrap_or_default();
+    let text = render(listing, &kept)?;
+    let now = parse(&text).unwrap_or_default();
+    let had: std::collections::HashSet<&str> = kept.iter().map(|m| m.id.as_str()).collect();
+    let has: std::collections::HashSet<&str> = now.iter().map(|m| m.id.as_str()).collect();
+    let refreshed = Refreshed {
+        created: old.is_none(),
+        added: now
+            .iter()
+            .filter(|m| !had.contains(m.id.as_str()))
+            .map(|m| m.id.clone())
+            .collect(),
+        removed: kept
+            .iter()
+            .filter(|m| !has.contains(m.id.as_str()))
+            .map(|m| m.id.clone())
+            .collect(),
+        refused,
+    };
+    if old.as_deref() != Some(text.as_str()) {
+        let staged = stage(path, &text)?;
+        commit(&staged, path)?;
     }
-    let over = comment(format!(
-        "{name}: {} bytes of models, past the list's 1 MiB",
-        lines.len()
-    ));
-    (Some(lines), Some(over))
+    Ok(refreshed)
+}
+
+fn folder(path: &Path) -> &Path {
+    path.parent()
+        .filter(|folder| !folder.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Writes `text` to a new file beside `path`, durable and with the
+/// permissions `path` has. The file is made new under a name not used
+/// before, never opened through a link or over a file already there, so a
+/// name planted in the folder can only be skipped, never written through.
+fn stage(path: &Path, text: &str) -> Result<PathBuf, Error> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let failed = |error: std::io::Error| {
+        Error::with("models_unwritable", &format!("{}: {error}", path.display()))
+    };
+    std::fs::create_dir_all(folder(path)).map_err(failed)?;
+    // The permissions of the list there now, never of what a link names.
+    let permissions = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|meta| meta.permissions());
+    for _ in 0..8 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.subsec_nanos());
+        let mut name = std::ffi::OsString::from(".");
+        name.push(path.file_name().unwrap_or_default());
+        name.push(format!(
+            ".{}.{}{nanos:08x}",
+            std::process::id(),
+            STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let staged = path.with_file_name(name);
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&staged)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(failed(error)),
+        };
+        let written = (|| {
+            if let Some(permissions) = &permissions {
+                file.set_permissions(permissions.clone())?;
+            }
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        })();
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&staged);
+            return Err(failed(error));
+        }
+        return Ok(staged);
+    }
+    Err(Error::with(
+        "models_unwritable",
+        &format!("{}: no free name to write beside it", path.display()),
+    ))
+}
+
+/// Renames a staged file over `path`, which replaces the name there (a
+/// link too) and never writes through it.
+fn commit(staged: &Path, path: &Path) -> Result<(), Error> {
+    if let Err(error) = std::fs::rename(staged, path) {
+        let _ = std::fs::remove_file(staged);
+        return Err(Error::with(
+            "models_unwritable",
+            &format!("{}: {error}", path.display()),
+        ));
+    }
+    sync_folder(path)
+}
+
+/// A new name is durable only once its folder is.
+fn sync_folder(path: &Path) -> Result<(), Error> {
+    std::fs::File::open(folder(path))
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| Error::with("models_unwritable", &format!("{}: {error}", path.display())))
 }
 
 #[cfg(test)]
@@ -417,5 +631,165 @@ mod tests {
         assert!(text.len() <= super::LIMIT as usize);
         assert!(text.contains("more providers left out, past the list's 1 MiB\n"));
         assert!(parse(&text).is_ok());
+    }
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("models-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn ids(models: &[super::Model]) -> Vec<&str> {
+        models.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    #[test]
+    fn each_refresh_rewrites_the_catalog_whole_from_what_the_providers_list() {
+        let dir = temp("catalog");
+        let catalog = dir.join("models.discovered");
+        let first = super::refresh(
+            &catalog,
+            &json!({"providers":{
+                "openai":{"models":[{"id":"a"},{"id":"b"}]},
+                "bedrock":{"models":[{"id":"x","name":"X"}]}}}),
+        )
+        .unwrap();
+        assert!(first.created);
+        // An edit to the catalog does not survive the next refresh.
+        let text = std::fs::read_to_string(&catalog).unwrap();
+        std::fs::write(&catalog, text.replace("openai/a\n", "openai/a  # mine\n")).unwrap();
+        // b is gone, c is new; bedrock is down and keeps its lines.
+        let second = super::refresh(
+            &catalog,
+            &json!({"providers":{
+                "openai":{"models":[{"id":"a"},{"id":"c"}]},
+                "bedrock":{"error":"provider_aws_credentials_expired"}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            second,
+            super::Refreshed {
+                created: false,
+                added: vec!["openai/c".into()],
+                removed: vec!["openai/b".into()],
+                refused: vec![("bedrock".into(), "provider_aws_credentials_expired".into())],
+            }
+        );
+        let after = std::fs::read_to_string(&catalog).unwrap();
+        let models = parse(&after).unwrap();
+        assert_eq!(ids(&models), ["bedrock/x", "openai/a", "openai/c"]);
+        assert_eq!(models[0].note.as_deref(), Some("X"));
+        assert_eq!(models[1].note, None, "{after}");
+        // The same listing again leaves the file as it is.
+        let again = super::refresh(
+            &catalog,
+            &json!({"providers":{"openai":{"models":[{"id":"a"},{"id":"c"}]},
+                "bedrock":{"error":"provider_aws_credentials_expired"}}}),
+        )
+        .unwrap();
+        assert!(again.added.is_empty() && again.removed.is_empty());
+        assert_eq!(std::fs::read_to_string(&catalog).unwrap(), after);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clients_read_the_person_s_models_first_then_the_catalog_less_what_they_hide() {
+        let dir = temp("mine");
+        let list = dir.join("models");
+        super::refresh(
+            &super::discovered(&list),
+            &json!({"providers":{"openai":{"models":[
+                {"id":"a","name":"A"},{"id":"b"},{"id":"c"}]}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&super::read(&list).unwrap()),
+            ["openai/a", "openai/b", "openai/c"]
+        );
+        std::fs::write(
+            &list,
+            "# mine\nopenai/c  # for reviews\n-openai/b\nanthropic/by-hand\n- openai/gone\n",
+        )
+        .unwrap();
+        let models = super::read(&list).unwrap();
+        assert_eq!(ids(&models), ["openai/c", "anthropic/by-hand", "openai/a"]);
+        assert_eq!(models[0].note.as_deref(), Some("for reviews"));
+        assert_eq!(models[2].note.as_deref(), Some("A"));
+        // A refresh never touches the person's file.
+        super::refresh(
+            &super::discovered(&list),
+            &json!({"providers":{"openai":{"models":[{"id":"d"}]}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&list).unwrap(),
+            "# mine\nopenai/c  # for reviews\n-openai/b\nanthropic/by-hand\n- openai/gone\n"
+        );
+        assert_eq!(
+            ids(&super::read(&list).unwrap()),
+            ["openai/c", "anthropic/by-hand", "openai/d"]
+        );
+        // Neither file is no list.
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(super::read(&list).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_hide_names_one_model_and_a_bad_line_is_refused_by_number() {
+        let models = super::lines("-openai/a\nopenai/a\n-openai/a\n").unwrap();
+        let listed: Vec<_> = models
+            .iter()
+            .map(|(hide, m)| (*hide, m.id.as_str()))
+            .collect();
+        assert_eq!(listed, [(true, "openai/a"), (false, "openai/a")]);
+        assert_eq!(super::lines("ok/a\n--openai/a\n").unwrap_err().0, 2);
+        assert_eq!(super::lines("-\n").unwrap_err().0, 1);
+        assert_eq!(ids(&parse("-openai/a\nopenai/b\n").unwrap()), ["openai/b"]);
+    }
+
+    #[test]
+    fn a_link_put_where_the_catalog_goes_is_replaced_never_written_through() {
+        let dir = temp("planted");
+        let catalog = dir.join("models.discovered");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep/this\n").unwrap();
+        std::os::unix::fs::symlink(&victim, &catalog).unwrap();
+        let listing = json!({"providers":{"openai":{"models":[{"id":"a"}]}}});
+        let refreshed = super::refresh(&catalog, &listing).unwrap();
+        // The link is not read through either: nothing it named is kept.
+        assert!(refreshed.created);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep/this\n");
+        assert!(
+            !std::fs::symlink_metadata(&catalog)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            ids(&parse(&std::fs::read_to_string(&catalog).unwrap()).unwrap()),
+            ["openai/a"]
+        );
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_refresh_that_lists_nothing_usable_writes_nothing() {
+        let dir = temp("none");
+        let catalog = dir.join("models.discovered");
+        let error = super::refresh(
+            &catalog,
+            &json!({"providers":{"gone":{"error":"provider_connection"}}}),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "models_none_listed");
+        assert!(!catalog.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
