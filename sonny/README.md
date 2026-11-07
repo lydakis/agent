@@ -1141,8 +1141,9 @@ person sees, as a checklist), `margin` (notes beside the conversation),
 `resolve_task`, `subscriptions`, `show_agent` and
 `run_in_pane`, `start_task` and `remove_task`; a lead's own, which its
 tasks never take, is `new_project`. The daemon shows them to
-the model and records each call: `react`, `plan`, `margin` and
-`resolve_task` run nothing, and the rest wait for Sonny's answer. Sonny's tool host answers
+the model and records each call: `plan` and `resolve_task` run nothing,
+and the rest wait for Sonny's answer, a `react` naming another agent kept
+under the person's newest message there as it is answered. Sonny's tool host answers
 those, running each call in the calling agent's folder, so they work with
 every Sonny window closed; a call nobody answers in time ends as
 `tool_unserved`, and the agent goes on. All but `show_agent` wait for a

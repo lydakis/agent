@@ -1034,7 +1034,7 @@ impl Reading {
     /// call IDs are unique only within a turn, so another turn's call of
     /// the same ID is not the ask, and the reading goes on past it.
     fn entry(&mut self, at: i64, entry: &Value, turn: i64, call: &str) -> Option<bool> {
-        if crate::lookout::said_by_person(entry).is_some() {
+        if crate::reactions::said_by_person(entry).is_some() {
             let text = crate::text(&entry["item"]);
             match answer_of(&text, None) {
                 Some(answered) => self.answers.push(answered.to_owned()),

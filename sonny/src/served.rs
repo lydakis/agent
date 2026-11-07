@@ -759,6 +759,18 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             .map(|listed| listed.to_string())
             .map_err(|e| ("subscription_refused", e))
         }
+        // One on the caller's own messages is the call itself: nothing to
+        // read or keep.
+        name if name == crate::reactions::TOOL && crate::reactions::target(arguments).is_none() => {
+            Ok("Done.".to_owned())
+        }
+        name if name == crate::reactions::TOOL => {
+            let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
+            let (client, _events) = Client::connect(&socket)
+                .await
+                .map_err(|e| ("react_unread", e.to_string()))?;
+            crate::reactions::answer(&client, &store, &caller, arguments).await
+        }
         name if name == crate::margin::TOOL => {
             let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
             let (client, _events) = Client::connect(&socket)
