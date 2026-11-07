@@ -1568,8 +1568,10 @@ mod tests {
             if kind.is_dir() {
                 settle(&entry.path());
             } else if kind.is_file() {
-                let opened = std::fs::File::options().write(true).open(entry.path());
-                opened.unwrap().set_modified(past).unwrap();
+                // Opened to read: git's objects are read-only, and the
+                // owner may set a time without writing.
+                let opened = std::fs::File::open(entry.path()).unwrap();
+                opened.set_modified(past).unwrap();
             }
         }
         let opened = std::fs::File::options().read(true).open(dir).unwrap();
