@@ -294,13 +294,17 @@ fn subscriptions() -> Value {
 fn automations() -> Value {
     json!({
         "name": AUTOMATIONS,
-        "description": "Your automations, which wake an agent later, again and again, or when something \
-            happens, even with Sonny closed (a Mac keeps watch). Each run gives the agent the message in its \
-            own conversation after a line with the run's time and what started it; a run while the agent is working \
-            waits for its work, one run of a repeating automation at a time. Add one, or remove, run or show one by name; with none, the result lists \
-            them all with any problems. Adding the same one again changes nothing; a different one under a name \
-            in use is refused with the field that differs unless replace is set. Write the message as what to \
-            check and when to stop, including removing its own automation once the work is done.",
+        // Its gate judges what `automate` puts to it: an add, a removal
+        // or a run, not a look.
+        "steps": true,
+        "description": "Your automations, which wake an agent later, repeatedly, or when something \
+            happens, even with Sonny closed. Each run gives the agent the message in its own conversation, \
+            after a line saying when and why it ran; a run waits for the agent's work, one run of an automation \
+            at a time. Add one, or remove, run or show one by name; with none, the result lists yours (those \
+            that wake you, answer to you or start an agent you added) with any problems. Adding the same one \
+            again changes nothing; a different one under a name in use is refused with the field that differs \
+            unless replace is set. Write the message as what to check and when to stop, and to remove its \
+            automation once the work is done.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -828,19 +832,30 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             .map_err(|e| ("ask_refused", e))
         }
         AUTOMATIONS => {
+            // The daemon's store says whose automations are the caller's:
+            // its id there, as fires deliver to it.
+            let client = match crate::daemon_paths(None, None) {
+                Ok((_, socket)) => Client::connect(&socket).await.ok().map(|(c, _)| c),
+                Err(_) => None,
+            };
+            let caller = crate::trigger::Caller {
+                id: std::env::var("AGENT_BOT_ID")
+                    .ok()
+                    .and_then(|id| id.parse().ok()),
+                store: client.as_ref().and_then(|c| c.store()).map(str::to_owned),
+            };
             // A trigger's add runs on a runtime of its own.
             let arguments = arguments.clone();
-            let mut said = tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments))
-                .await
-                .map_err(|e| ("tool_failed", e.to_string()))?
-                .map_err(|e| ("automation_refused", e))?;
+            let mut said =
+                tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments, &caller))
+                    .await
+                    .map_err(|e| ("tool_failed", e.to_string()))?
+                    .map_err(|e| ("automation_refused", e))?;
             // How the turns their last fires sent ended, as the person's
             // `/background` shows them; without the daemon, as the files say.
             // Only a trigger made on this daemon's store: a turn handle names
             // a bot and a turn, which another store's daemon has its own of.
-            if let Ok((_, socket)) = crate::daemon_paths(None, None)
-                && let Ok((client, _events)) = Client::connect(&socket).await
-            {
+            if let Some(client) = client {
                 let ours: Vec<Value> = match (client.store(), crate::trigger::Places::home()) {
                     (Some(store), Ok(places)) => crate::trigger::on_store(&places, store)
                         .into_iter()
@@ -1204,6 +1219,9 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                                 Some(EXEC) => script(&hub, &client, &call).await,
                                 Some(BROWSER) => browse(&client, &call).await,
                                 Some(DESKTOP) => desktop(&client, &call).await,
+                                Some(AUTOMATIONS) => automate(&client, &call, &me, &store, &socket)
+                                    .await
+                                    .map(Value::String),
                                 _ => answer(&client, &call, &me, &store, &socket)
                                     .await
                                     .map(Value::String),
@@ -1489,6 +1507,50 @@ async fn browse(client: &Arc<Client>, call: &Value) -> Result<Value, (&'static s
     }
 }
 
+/// Whether an `automations` call only looks: it lists them or shows one,
+/// and adds, removes and runs none.
+fn looks(arguments: &Value) -> bool {
+    ["add", "remove", "run"]
+        .iter()
+        .all(|key| arguments.get(key).is_none_or(Value::is_null))
+}
+
+/// Answer an `automations` call: one that adds, removes or runs one is a
+/// step the agent's gate judges first, as a script's calls are; a look
+/// runs unjudged, as reads do.
+async fn automate(
+    client: &Arc<Client>,
+    call: &Value,
+    me: &Path,
+    store: &Path,
+    socket: &Path,
+) -> Answer {
+    if looks(&call["arguments"]) {
+        return answer(client, call, me, store, socket).await;
+    }
+    let bot = str_of(&call["bot"]);
+    unreviewed(client, &bot, &Value::Null, AUTOMATIONS).await?;
+    let steps = crate::exec::Steps::new(
+        client.clone(),
+        bot,
+        call["turn"].as_i64().unwrap_or(0),
+        str_of(&call["call_id"]),
+    );
+    let asked = std::time::Instant::now();
+    let step = (steps
+        .ask(AUTOMATIONS, AUTOMATIONS, call["arguments"].clone())
+        .await)
+        .map_err(|e| ("automation_refused", e))?;
+    // The daemon's clock for the call stood still while the gate weighed
+    // it, so this one does too.
+    let call = later(call, asked.elapsed());
+    let answered = answer(client, &call, me, store, socket).await;
+    if let Some(step) = step {
+        steps.ran(step, answered.is_err()).await;
+    }
+    answered
+}
+
 /// Answer a `desktop` call in the host, with the agent's gate judging what
 /// acts on the desktop.
 async fn desktop(client: &Arc<Client>, call: &Value) -> Result<Value, (&'static str, String)> {
@@ -1536,6 +1598,15 @@ async fn unreviewed(
 }
 
 /// The time a call has left before the daemon gives up on it.
+/// `call` with its time to answer moved `by` later.
+fn later(call: &Value, by: Duration) -> Value {
+    let mut call = call.clone();
+    if let Some(expires) = call["expires_ms"].as_u64() {
+        call["expires_ms"] = json!(expires.saturating_add(by.as_millis() as u64));
+    }
+    call
+}
+
 fn left(call: &Value) -> Duration {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1622,8 +1693,11 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         None => record.clone(),
     };
     let name = call["name"].as_str().unwrap_or_default();
-    // That bot, by its id, not one given its name since.
-    unreviewed(client, bot, &record["bot_id"], name).await?;
+    // That bot, by its id, not one given its name since. `automate` has
+    // seen to an automations call: a look needs no one to review it.
+    if name != AUTOMATIONS {
+        unreviewed(client, bot, &record["bot_id"], name).await?;
+    }
     // As the calling turn runs, which keeps its folder and model when the
     // bot's own change for a turn after it.
     let turn = call["turn"].as_i64().unwrap_or(0);
