@@ -1990,9 +1990,7 @@ impl Service {
                 .cloned()
                 .collect();
             if all || subs != lookout.subs {
-                lookout.updates.ended(&gone(&lookout.subs, &subs));
-                lookout.subs = subs;
-                lookout.counting();
+                lookout.resubscribed(subs);
                 lookout.roots(&self.records, &self.made);
                 lookout.rehear();
             }
@@ -3089,6 +3087,19 @@ impl Lookout {
                 self.keep();
             }
         }
+    }
+
+    /// Its subscriptions are now `subs`: what only those gone heard goes
+    /// with them, and one put in another's place under its name counts
+    /// afresh.
+    fn resubscribed(&mut self, subs: Vec<subs::Sub>) {
+        let gone = gone(&self.subs, &subs);
+        self.updates.ended(&gone);
+        if self.counts.keep(|name| !gone.iter().any(|g| g == name)) {
+            self.counts_dirty = true;
+        }
+        self.subs = subs;
+        self.counting();
     }
 
     /// Notes counted only for subscriptions it has that last so many,
@@ -4190,12 +4201,25 @@ mod tests {
         // A day on, what it told then is no longer counted.
         let day = 24 * 60 * 60 * 1000;
         assert_eq!(counts.of("chat", now + day).unwrap()["notes"], 0);
-        // One removed takes its counts along, and the file says so.
-        lookout.subs.retain(|sub| sub.name != "chat");
-        lookout.counting();
+        // One put in its own place under its name takes its counts along,
+        // as one removed does, and the file says so; the rest keep theirs.
+        let mut other = hears("chat");
+        other.sources = vec!["mail".into()];
+        let subs: Vec<subs::Sub> = (lookout.subs.iter())
+            .filter(|sub| sub.name != "chat")
+            .cloned()
+            .chain([other])
+            .collect();
+        lookout.resubscribed(subs);
         lookout.flush();
         held::written();
-        assert!(subs::counts(&store, "calc.lead").of("chat", now).is_none());
+        let counts = subs::counts(&store, "calc.lead");
+        assert!(counts.of("chat", now).is_none());
+        assert!(counts.of("tasks", now).is_some());
+        lookout.resubscribed(Vec::new());
+        lookout.flush();
+        held::written();
+        assert!(subs::counts(&store, "calc.lead").of("tasks", now).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

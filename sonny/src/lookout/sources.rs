@@ -984,7 +984,8 @@ pub fn recent_file(dir: &Path, source: &str) -> PathBuf {
 fn recent_line(event: &Event) -> String {
     let mut kept = event.to_json();
     if kept["fields"].to_string().len() > RECENT_EVENT_BYTES {
-        kept["fields"] = sample(&event.fields).unwrap_or_else(|| json!({"text": event.text}));
+        kept["fields"] = (sample(&event.fields).map(|sample| sample["fields"].clone()))
+            .unwrap_or_else(|| json!({"text": event.text}));
         kept["cut"] = json!(true);
     }
     kept.to_string()
@@ -1687,13 +1688,15 @@ mod tests {
         // An event too big is kept cut, and says so.
         let big = Event::parse(
             "ci",
-            &json!({"text": "x".repeat(RECENT_EVENT_BYTES)}).to_string(),
+            &json!({"text": "x".repeat(RECENT_EVENT_BYTES), "status": "failed"}).to_string(),
             now,
         )
         .unwrap();
         let kept: Value = serde_json::from_str(&recent_line(&big)).unwrap();
         assert_eq!(kept["cut"], true);
         assert!(kept.to_string().len() < RECENT_EVENT_BYTES);
+        // Its fields stay where a filter looks for them.
+        assert_eq!(kept["fields"]["status"], "failed");
         // At most so many events.
         let many: String = (0..RECENT_EVENTS + 10)
             .map(|n| recent_line(&event(&n.to_string(), now)) + "\n")

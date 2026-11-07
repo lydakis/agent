@@ -1116,11 +1116,13 @@ pub fn tried(store: &Path, add: &Value, sources: &[String]) -> Result<Value, Str
         let steer = event.steer
             || (sub.steer.as_ref()).is_some_and(|s| super::pattern::matches(s, &event.fields));
         steers += usize::from(steer);
-        let digest = match &sub.digest {
-            Some(_) => sub.digest_span(),
-            None => event.digest,
+        // Its own digest is one clock for all it hears; else each source
+        // keeps its own, as the lookout does.
+        let (digest, clock) = match &sub.digest {
+            Some(_) => (sub.digest_span(), ""),
+            None => (event.digest, event.source.as_str()),
         };
-        times.push((event.at_ms, steer, digest));
+        times.push((event.at_ms, steer, digest, clock));
         newest.push(event);
     }
     let examples: Vec<Value> = (newest.iter().rev().take(3))
@@ -1148,24 +1150,32 @@ pub fn tried(store: &Path, add: &Value, sources: &[String]) -> Result<Value, Str
 }
 
 /// About how many notes events heard at these times would be, each with
-/// whether it steers and the digest it waits for: a note goes once what
-/// came settles, no sooner than a digest after the note before, and a
-/// steer waits for no digest; what comes while one waits goes with it.
-fn notes(times: &[(u128, bool, Option<std::time::Duration>)]) -> usize {
+/// whether it steers, the digest it waits for and whose clock that digest
+/// counts on: a note goes once what came settles, no sooner than a digest
+/// after the note before on that clock, and a steer waits for no digest;
+/// what comes while one waits goes with it.
+fn notes(times: &[(u128, bool, Option<std::time::Duration>, &str)]) -> usize {
     let settle = super::SETTLE.as_millis();
-    let (mut notes, mut last, mut due): (usize, Option<u128>, Option<u128>) = (0, None, None);
-    for &(at, steer, digest) in times {
+    let mut last: std::collections::HashMap<&str, u128> = std::collections::HashMap::new();
+    let mut waiting: Vec<&str> = Vec::new();
+    let (mut notes, mut due): (usize, Option<u128>) = (0, None);
+    for &(at, steer, digest, clock) in times {
         if let Some(went) = due.filter(|due| *due < at) {
             notes += 1;
-            last = Some(went);
+            for clock in waiting.drain(..) {
+                last.insert(clock, went);
+            }
             due = None;
         }
         let window = match steer {
             true => 0,
             false => digest.map_or(0, |d| d.as_millis()),
         };
-        let goes = last.map_or(at, |told| at.max(told + window)) + settle;
+        let goes = last.get(clock).map_or(at, |told| at.max(told + window)) + settle;
         due = Some(due.map_or(goes, |due| due.min(goes)));
+        if !waiting.contains(&clock) {
+            waiting.push(clock);
+        }
     }
     notes + usize::from(due.is_some())
 }
@@ -1541,24 +1551,31 @@ mod tests {
         // As they come: a spell within the settle is one note.
         assert_eq!(
             notes(&[
-                (s(0), false, None),
-                (s(1), false, None),
-                (s(10), false, None)
+                (s(0), false, None, "a"),
+                (s(1), false, None, "a"),
+                (s(10), false, None, "a")
             ]),
             2
         );
         // A digest: the first at once, the rest gathered at its end.
         let digested = [
-            (s(0), false, hour),
-            (s(60), false, hour),
-            (s(120), false, hour),
+            (s(0), false, hour, "a"),
+            (s(60), false, hour, "a"),
+            (s(120), false, hour, "a"),
         ];
         assert_eq!(notes(&digested), 2);
+        // Three sources, each its own digest's clock: each first at once.
+        let three = [
+            (s(0), false, hour, "a"),
+            (s(60), false, hour, "b"),
+            (s(120), false, hour, "c"),
+        ];
+        assert_eq!(notes(&three), 3);
         // A steer goes at once and takes what waits along.
         let steered = [
-            (s(0), false, hour),
-            (s(60), false, hour),
-            (s(120), true, hour),
+            (s(0), false, hour, "a"),
+            (s(60), false, hour, "a"),
+            (s(120), true, hour, "a"),
         ];
         assert_eq!(notes(&steered), 2);
         assert_eq!(notes(&[]), 0);
