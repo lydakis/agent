@@ -104,7 +104,7 @@ pub fn names() -> Vec<String> {
 /// The sources the person set up, and the commons while agents have it:
 /// a source with no command is Sonny's own.
 pub fn configured() -> Result<Vec<Source>, String> {
-    let config = agent_client::config::load()?.sonny;
+    let config = crate::kept::config()?.sonny;
     let mut sources = config.sources;
     if config.commons {
         sources.push(Source {

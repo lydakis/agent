@@ -26,6 +26,12 @@ const GONE_AFTER: Duration = Duration::from_secs(30);
 /// it runs ended. The calls themselves it reads from the daemon.
 const KINDS: [&str; 2] = ["tool_started", "turn_finished"];
 
+/// How often the host's place in the stream is saved, when it moved: every
+/// tool call of every agent moves it, so saving each would write a file a
+/// call. The calls waiting are read from the daemon whenever the host
+/// starts, so starting again a moment back only reads a few events twice.
+const SAVE_EVERY: Duration = Duration::from_secs(1);
+
 /// `sonny tool-host`: one tool host for the store's daemon.
 pub fn run(args: &[String]) -> Result<(), String> {
     let (mut store, mut socket) = (None, None);
@@ -86,6 +92,7 @@ async fn serve(store: PathBuf, socket: PathBuf) -> Result<(), String> {
     }
     let server = Server::start(store.clone(), socket.clone());
     let mut cursor = saved(&store);
+    let mut kept = cursor;
     let mut started = true;
     let mut gone: Option<Instant> = None;
     loop {
@@ -104,15 +111,23 @@ async fn serve(store: PathBuf, socket: PathBuf) -> Result<(), String> {
             let follow = json!({"bot": "*", "after": cursor, "kinds": KINDS});
             match client.request("follow", follow).await {
                 Ok(_) => {
-                    while let Some(event) = events.recv().await {
-                        server.event(&event);
-                        if let Some(at) = event["cursor"].as_i64()
-                            && at > cursor
-                        {
-                            cursor = at;
-                            save(&store, cursor);
+                    let mut tick = tokio::time::interval(SAVE_EVERY);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tokio::select! {
+                            event = events.recv() => {
+                                let Some(event) = event else { break };
+                                server.event(&event);
+                                if let Some(at) = event["cursor"].as_i64()
+                                    && at > cursor
+                                {
+                                    cursor = at;
+                                }
+                            }
+                            _ = tick.tick() => keep(&store, cursor, &mut kept),
                         }
                     }
+                    keep(&store, cursor, &mut kept);
                     println!("{}", json!({"event": "disconnected", "cursor": cursor}));
                 }
                 Err(error) => println!(
@@ -145,6 +160,14 @@ fn saved(store: &Path) -> i64 {
     read(&format!(".{NAME}.cursor"))
         .or_else(|| read(".lookout.cursor"))
         .unwrap_or(0)
+}
+
+/// Save `cursor` unless it is what was `kept` last.
+fn keep(store: &Path, cursor: i64, kept: &mut i64) {
+    if cursor != *kept {
+        save(store, cursor);
+        *kept = cursor;
+    }
 }
 
 fn save(store: &Path, cursor: i64) {
@@ -479,6 +502,13 @@ mod tests {
         assert_eq!(saved(&store), 40);
         save(&store, 90);
         assert_eq!(saved(&store), 90);
+        // Saved only when it moved.
+        let mut kept = 90;
+        std::fs::remove_file(beside(&store, &format!(".{NAME}.cursor"))).unwrap();
+        keep(&store, 90, &mut kept);
+        assert_eq!(saved(&store), 40);
+        keep(&store, 95, &mut kept);
+        assert_eq!((saved(&store), kept), (95, 95));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

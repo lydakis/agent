@@ -25,14 +25,14 @@ pub struct Kept<T> {
 /// changes as an entry in it comes, goes or is renamed, which is how all
 /// that writes the files read here writes one: whole beside its place,
 /// then renamed there.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Stamp {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Stamp {
     modified: std::time::SystemTime,
     len: u64,
     inode: u64,
 }
 
-fn stamp(path: &Path) -> Option<Stamp> {
+pub fn stamp(path: &Path) -> Option<Stamp> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).ok()?;
     Some(Stamp {
@@ -47,6 +47,28 @@ fn stamp(path: &Path) -> Option<Stamp> {
 /// what was read under it is read again next time, as Git does with a
 /// racily clean index entry.
 const RACY: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl Stamp {
+    /// Whether what was read under this stamp may be kept: its change is
+    /// older than any the clock could confuse with a later one.
+    pub fn settled(&self) -> bool {
+        std::time::SystemTime::now()
+            .checked_sub(RACY)
+            .is_some_and(|settled| self.modified < settled)
+    }
+}
+
+/// `~/.agent/config.toml` as last read, read again only once it changed:
+/// for what looks at it on a timer, as the lookout does.
+pub fn config() -> Result<agent_client::config::Config, String> {
+    static KEPT: Slot<Result<agent_client::config::Config, String>> = Mutex::new(None);
+    let Some(path) = agent_client::config::path() else {
+        return agent_client::config::load();
+    };
+    read(&KEPT, "config", vec![path], || {
+        (agent_client::config::load(), None)
+    })
+}
 
 /// What `read` reads of `paths` for `key`, kept in `slot` from the last
 /// read while none of the paths changed since, and read again otherwise.
@@ -68,9 +90,7 @@ pub fn read<T: Clone>(
         return kept.value.clone();
     }
     let (value, until) = read();
-    let racy = std::time::SystemTime::now()
-        .checked_sub(RACY)
-        .is_none_or(|settled| stamps.iter().flatten().any(|s| s.modified >= settled));
+    let racy = !stamps.iter().flatten().all(Stamp::settled);
     *slot = (!racy).then(|| Kept {
         key: key.to_owned(),
         paths,
