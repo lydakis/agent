@@ -700,9 +700,11 @@ agent reads first rather than every fact; a second `start` before `finish` says 
 keeps the first. `cleanup finish` commits the cleanup and returns what it
 removed, added and changed. A cleanup that removed more than a quarter of
 the lasting facts, and more than two, is `loss_guard` (the `work` facts it
-started with are left out of both counts, since work under way ends): `finish` reverts it with a
-new commit, so memory is as it was at the start and the refused cleanup
-stays in history for the person to read. `changed` fails with `unchanged`
+started with are left out of both counts, since work under way ends): `finish` takes memory back
+to the start with a new commit, puts back what other agents saved or removed
+meanwhile, and the refused cleanup stays in history for the person to read.
+The refusal is written to `.cleanup` first, so a `finish` cut short is
+carried on by the next one rather than closed as a clean cleanup. `changed` fails with `unchanged`
 when the folder matches the last commit, which is what keeps the automation
 quiet.
 
