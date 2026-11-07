@@ -827,11 +827,26 @@ fn save(
     }
     note(Some(&text))?;
     write(&dir.join(INDEX), &index)?;
-    Ok(
-        json!({"saved": fact.name, "path": path, "replaced": before.is_some(),
-        "duplicate": duplicate, "index": dir.join(INDEX), "index_bytes": index.len(),
-        "facts": all.len()}),
-    )
+    let mut saved = json!({"saved": fact.name, "path": path, "replaced": before.is_some(),
+        "duplicate": duplicate, "index": dir.join(INDEX), "facts": all.len()});
+    // A fact a new agent will not see in its index's head is still saved,
+    // and the reply says so, rather than a size that reads as a cap.
+    if !in_head(&index, &fact.name) {
+        saved["past_head"] =
+            json!("saved; past the head of the index a new agent starts with, so search finds it");
+    }
+    Ok(saved)
+}
+
+/// Whether the fact `name` has its line in the head of `index` that a new
+/// agent starts with ([`head`]).
+fn in_head(index: &str, name: &str) -> bool {
+    if index.len() <= HEAD {
+        return true;
+    }
+    let head = head(index);
+    let line = format!("- {name} (");
+    head.lines().any(|shown| shown.starts_with(&line))
 }
 
 /// A folder's reads. Reads are bookkeeping, not memory: a record that is
@@ -898,9 +913,7 @@ fn remove(dir: &Path, name: &str, note: Note) -> Result<Value, String> {
     if all_reads.remove(name).is_some() {
         write(&dir.join(READS), &Value::Object(all_reads).to_string())?;
     }
-    Ok(
-        json!({"removed": name, "duplicate": duplicate, "index_bytes": index.len(), "facts": all.len()}),
-    )
+    Ok(json!({"removed": name, "duplicate": duplicate, "facts": all.len()}))
 }
 
 /// What is wrong in a folder, without changing it: the first file that is
@@ -1515,7 +1528,14 @@ fn schedule_args(script: &Path, args: &[String], kept: &Value) -> Result<Vec<Str
         "--name".into(),
         AGENT.into(),
         "--cron".into(),
-        cron.unwrap_or_else(|| "30 3 * * *".into()),
+        // Scheduled again, it keeps its time unless given one.
+        cron.or_else(|| {
+            kept["when"]
+                .as_str()?
+                .strip_prefix("cron ")
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "30 3 * * *".into()),
     ];
     let text = |value: &Value| value.as_str().map(str::to_owned);
     match (model, kept) {
@@ -1550,12 +1570,14 @@ fn schedule_args(script: &Path, args: &[String], kept: &Value) -> Result<Vec<Str
         "work".into(),
         "--replace".into(),
         "--".into(),
-        "Clean up memory as the memory-cleanup skill says.".into(),
+        CLEANUP_ASK.into(),
     ]);
     Ok(add)
 }
 
-const AGENT: &str = "memory-cleanup";
+pub const AGENT: &str = "memory-cleanup";
+/// What each run of the nightly cleanup is sent.
+pub const CLEANUP_ASK: &str = "Clean up memory as the memory-cleanup skill says.";
 
 fn schedule(home: &Path, args: &[String]) -> Result<Value, String> {
     let script = home.join(".agent/automation");
@@ -1755,7 +1777,8 @@ mod tests {
         assert!(fact.starts_with("---\nname: short-replies\ndescription: George wants one-line answers\ntype: feedback\nsource: George, 2026-10-10\nverified: "));
         assert!(fact.ends_with("---\n\nKeep replies short.\n"));
         let index = std::fs::read_to_string(root.join(INDEX)).unwrap();
-        assert_eq!(index.len(), saved["index_bytes"].as_u64().unwrap() as usize);
+        // In the head: nothing more to say.
+        assert!(saved.get("past_head").is_none() && saved.get("index_bytes").is_none());
         assert!(index.starts_with(&format!(
             "# Memory in {}\n\n- short-replies (feedback, verified ",
             root.display()
@@ -1769,7 +1792,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(again["duplicate"], true);
-        assert_eq!(again["index_bytes"], saved["index_bytes"]);
+        assert_eq!(again["facts"], saved["facts"]);
         // A save under the same name replaces the fact; the index follows.
         let changed = save_user(
             &root,
@@ -1844,16 +1867,25 @@ mod tests {
         // An index is never full: every save lands, and a new agent reads
         // its head, which says how many facts it leaves out.
         let n = 400;
+        let mut replies = Vec::new();
         for i in 0..n {
             let name = format!("fact-{i:03}");
-            save_user(
-                &root,
-                &name,
-                "a description of some length ".repeat(3).trim(),
-                "x",
-            )
-            .unwrap();
+            replies.push(
+                save_user(
+                    &root,
+                    &name,
+                    "a description of some length ".repeat(3).trim(),
+                    "x",
+                )
+                .unwrap(),
+            );
         }
+        // A save past the head says so, and only then.
+        assert!(replies[0].get("past_head").is_none());
+        assert_eq!(
+            replies[n - 1]["past_head"],
+            "saved; past the head of the index a new agent starts with, so search finds it"
+        );
         let index = std::fs::read_to_string(root.join(INDEX)).unwrap();
         assert!(index.len() > HEAD && index.contains(&format!("fact-{:03}", n - 1)));
         let top = head(&index);
@@ -3151,6 +3183,13 @@ mod tests {
                 "high"
             ])
         );
+        // Scheduled again with nothing, it keeps its time too, as an
+        // upgrade schedules one from before runs were fresh.
+        let timed = json!({"name": "memory-cleanup", "when": "cron 15 2 * * *",
+            "start": {"model": "anthropic/opus"}});
+        let same = line(&[], &timed).unwrap();
+        assert_eq!(same[3], "15 2 * * *");
+        assert!(same.contains(&"--fresh".to_owned()));
         // One scheduled to message the agent it started (`--bot`), as
         // scheduling again without a model did before, has no model to
         // keep: it is given one.

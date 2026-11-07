@@ -524,7 +524,11 @@ that hold a word, and `more`, how many it left out; grep-like matching,
 since lexical search does as well as embeddings on short literal facts and
 needs no index to keep. A save writes the fact and the
 index under the folder's lock, so two agents saving at once cannot leave
-an index that misses one. Saving a fact unchanged is `"duplicate": true`,
+an index that misses one. A save's reply names the fact, its file and the
+index, and the folder's fact count; when its line falls past the head a new
+agent starts with, `past_head` says so in words ("saved; past the head of
+the index a new agent starts with, so search finds it"), in place of the
+index's size, which had read as a cap. Saving a fact unchanged is `"duplicate": true`,
 and so is removing one already gone. A save in a folder holding a `.md`
 file that is not a valid fact is `memory_invalid`, naming it, and changes
 nothing, rather than writing an index that quietly leaves it out. `check`
@@ -650,9 +654,13 @@ Once scheduled it is the
 person's: removed with `~/.agent/automation rm memory-cleanup`, it stays
 removed, since `~/.agents/memory` being a repository says it was scheduled
 once, and `schedule` turns it on again. `schedule` again replaces the automation:
-without `--model` it keeps the model (and effort) it runs on, so moving the
-time is one call. A cleanup scheduled before 0.9.0 keeps its one agent
-until `schedule` runs again. The `memory-cleanup` skill
+without `--model` it keeps the model (and effort) it runs on, and without
+`--cron` its time, so moving the time is one call. A cleanup Sonny
+scheduled before 0.9.0 kept one agent across runs; the first Sonny of
+0.9.0 to open a lead schedules it again, fresh, keeping its model, effort
+and time (upgrade migration `cleanup-fresh`, retired at 0.11.0); one that
+messaged its agent and so names no model runs on the lead's. One the person
+renamed, sent other words, or removed is left as it is. The `memory-cleanup` skill
 ([SKILL.md](../sonny/skills/memory-cleanup/SKILL.md)) merges duplicates,
 drops superseded facts and dates relative ones, with `save` and `rm` only,
 and never removes a lasting fact for its age alone.
