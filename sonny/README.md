@@ -286,6 +286,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | A new lead's effort | `[sonny] lead_effort` | `effort` |
 | Each new task's model | (the lead's) | `threads_model` |
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
+| Each new task's speed (`standard`, `fast` or `ultrafast`) | `[sonny] task_speed` | `threads_speed` |
 | The approver's judge | `[judge] model`, `effort` | |
 | What `/side`'s copy may do | `[sonny] side_chat` (`fork`, the default, or `answer`) | |
 | The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
@@ -649,6 +650,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   price per token. The footer names the speed after the effort; a pick
   made while a turn runs applies when the lead is idle. A provider that
   serves standard alone, as Bedrock does for Claude, says so instead.
+  The tasks an agent starts on its own model run at its speed, as its
+  helpers do at theirs, unless `threads_speed` or `[sonny] task_speed`
+  names one; a task whose provider does not serve that speed starts at
+  standard, and the start says so.
 
   ![/fast: standard in effect, fast and ultrafast with what each costs](../docs/sonny/fast-mode-menu.png)
 - `/compact` asks first, then summarizes the lead's conversation before

@@ -14,6 +14,8 @@ struct Lab {
     /// The agent whose call the lookout runs: the lead, unless a test
     /// says another.
     bot: std::cell::RefCell<String>,
+    /// The model the calling agent runs, AGENT_MODEL, when a test sets it.
+    model: std::cell::RefCell<Option<String>>,
 }
 
 impl Lab {
@@ -32,8 +34,10 @@ impl Lab {
         std::fs::write(
             &agent,
             "#!/bin/sh\ncase \"$1\" in\n\
-             run) [ ! -e \"$AGENT_LOG.refuse\" ] || { cat \"$AGENT_LOG.refuse\" >&2; exit 1; }; for a in \"$@\"; do if [ \"$a\" = - ]; then cat; echo; else printf '%s\\n' \"$a\"; fi; done > \"$AGENT_LOG\"; [ -z \"$AGENT_FAIL\" ] || exit 1; echo '{\"handle\":\"h\"}';;\n\
+             run) [ ! -e \"$AGENT_LOG.refuse\" ] || { cat \"$AGENT_LOG.refuse\" >&2; exit 1; }; \
+             if [ -e \"$AGENT_LOG.slow\" ]; then for a in \"$@\"; do [ \"$a\" != --speed ] || { cat \"$AGENT_LOG.slow\" >&2; exit 1; }; done; fi; for a in \"$@\"; do if [ \"$a\" = - ]; then cat; echo; else printf '%s\\n' \"$a\"; fi; done > \"$AGENT_LOG\"; [ -z \"$AGENT_FAIL\" ] || exit 1; echo '{\"handle\":\"h\"}';;\n\
              ls) cat \"$AGENT_LOG.ls\" 2>/dev/null || echo '[]';;\n\
+             inspect) cat \"$AGENT_LOG.inspect\" 2>/dev/null || exit 1;;\n\
              rm) printf '%s\\n' \"$@\" > \"$AGENT_LOG.rm\";;\nesac\n",
         )
         .unwrap();
@@ -44,6 +48,7 @@ impl Lab {
             scratch,
             agent,
             bot: std::cell::RefCell::new("demo.lead".into()),
+            model: std::cell::RefCell::new(None),
         };
         for args in [
             &["init", "-q", "-b", "main"][..],
@@ -97,6 +102,10 @@ impl Lab {
         if fail {
             command.env("AGENT_FAIL", "1");
         }
+        match self.model.borrow().as_deref() {
+            Some(model) => command.env("AGENT_MODEL", model),
+            None => command.env_remove("AGENT_MODEL"),
+        };
         if stdin.is_some() {
             command.stdin(std::process::Stdio::piped());
         }
@@ -327,6 +336,38 @@ fn a_brief_that_names_the_lead_s_folder_names_the_task_s_copy() {
         &format!("edit {copy}/src/lib.rs and {copy}/src, keep {repo}2/x")
     );
     assert!(said.contains("2 times"), "{said}");
+}
+
+#[test]
+fn a_task_runs_at_its_lead_s_speed_or_standard_where_refused() {
+    let lab = Lab::new("speed");
+    *lab.model.borrow_mut() = Some("a/lead".into());
+    let log = lab.scratch.join("run.log");
+    let at = |suffix: &str| PathBuf::from(format!("{}.{suffix}", log.display()));
+    std::fs::write(
+        at("inspect"),
+        r#"{"name":"demo.lead","settings":{"speed":"fast"}}"#,
+    )
+    .unwrap();
+    let (ok, said) = lab.task(false, false);
+    assert!(ok, "{said}");
+    let ran = lab.ran();
+    let speed = ran.iter().position(|a| a == "--speed").expect("a speed");
+    assert_eq!(ran[speed + 1], "fast");
+    assert!(!said.contains("standard speed"), "{said}");
+    lab.remove(&lab.repo, true);
+    // A provider that does not serve it: the task starts at standard, and
+    // the start says why.
+    std::fs::write(
+        at("slow"),
+        r#"{"error":"invalid_speed","detail":"this provider serves anthropic at standard speed only","speeds":[]}"#,
+    )
+    .unwrap();
+    let (ok, said) = lab.task(false, false);
+    assert!(ok, "{said}");
+    assert!(!lab.ran().iter().any(|a| a == "--speed"));
+    assert!(said.contains("It runs at standard speed"), "{said}");
+    assert!(said.contains("standard speed only"), "{said}");
 }
 
 #[test]
