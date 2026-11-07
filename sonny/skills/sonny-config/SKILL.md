@@ -25,6 +25,11 @@ each setting is; what to set is the person's call.
 - `~/.agents/agents/NAME.md`: the roles and profiles (`lead`, `task`,
   `superlead`, the person's own); a project's `.agents/agents` comes first.
 - `~/.agents/skills/NAME/SKILL.md`: skills every agent reads.
+- `~/.local/state/sonny/agents/LEAD` (under `$XDG_STATE_HOME` when set):
+  each lead's state folder, `$SONNY_STATE` in its shell and its tasks'.
+  Sonny makes it; the lead, its tasks and the agents they make write it in
+  every permissions row that writes, and keep there what outlives a task,
+  such as a monitor's files. Settings and skills stay where they are above.
 - `[sonny.mcp_servers.NAME]` in the config: MCP servers, kept with
   `sonny mcp add|remove|list|import`.
 - `[sonny.sources.NAME]` in the config: news from outside for the lookout,

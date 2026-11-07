@@ -751,7 +751,13 @@ way `/react` does, and each note in the margin has its own `↩`.
   An agent that reaches the network reaches every Unix socket too, as
   Codex's full network does, so MCPX, Docker and ssh-agent just work; and
   every row that writes writes Sonny's zen folder too, so `sonny zen`
-  works from an agent's shell. One
+  works from an agent's shell, and the lead's state folder,
+  `~/.local/state/sonny/agents/LEAD` (under `$XDG_STATE_HOME` when set),
+  where the lead, its tasks and the agents they make keep what outlives a
+  task, such as a monitor's bookmarks or a tracker's lock. Sonny makes it
+  for the lead alone (mode 700) and names it in their shells as
+  `$SONNY_STATE`. `~/.agents`, your skills, roles and memory, stays
+  read-only to agents in every row that writes, as Codex keeps `.agents`. One
   kept off the network reaches none, since a program listening on a socket
   runs what it is asked outside the sandbox, as Docker's does: its row's
   `unix_sockets` names those it may reach, each a socket or a folder of

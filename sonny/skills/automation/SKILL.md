@@ -13,7 +13,9 @@ the job keeps its state in files in its folder and reads them each run.
 ## Setting one up
 
 Give the job its own agent and folder, created with `--agents` so it reads
-the folder's rules and skills, then add an automation for it with the
+the folder's rules and skills. Make the folder in your state folder,
+`"$SONNY_STATE"/jobs/NAME`: you, your tasks and the agents you make write
+it in every permissions row, and it outlives them. Then add an automation for it with the
 automations tool: `add` with `bot` NAME, `cron` 'MIN HOUR DAY MONTH WEEKDAY'
 and `message` MESSAGE. Automations need the system's scheduler to keep the time:
 launchd on macOS, systemd's user manager on Linux. Without one `add` is
@@ -114,7 +116,8 @@ for urgent items, such as a direct message to the person.
 
 Run it often and gate each run: `add` with `bot` NAME, `every` `10m`,
 `if` `cd FOLDER && ! ./quiet` and `message` MESSAGE. The `if` command runs
-in your own folder, hence the `cd`.
+in your own folder, hence the `cd`, and without `SONNY_STATE`, so FOLDER
+is the job folder's whole path.
 
 `every` runs at all hours. To check only in working hours, use `cron`
 instead, for example `*/10 8-18 * * 1-5` for every 10 minutes from 8:00 to

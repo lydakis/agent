@@ -84,6 +84,7 @@ mod snapshot;
 mod sound;
 mod stamp;
 mod started;
+mod state;
 mod status;
 mod suggest;
 mod switch;
@@ -755,8 +756,9 @@ async fn spread_pass(
             passed.waiting.push(name);
             continue;
         };
+        let named = name.clone();
         let walked = tokio::task::spawn_blocking(move || {
-            let fields = approvals::regate(&record, mode, &mut sandboxes);
+            let fields = approvals::regate(&record, mode, &named, &mut sandboxes);
             (fields, sandboxes)
         })
         .await;
@@ -1721,10 +1723,18 @@ async fn run() -> Result<(), String> {
         && let Some(mode) = app.mode.filter(|mode| *mode != "full")
         && !approvals::sandboxed_as(
             &bot,
-            &approvals::sandbox(mode, std::path::Path::new(&app.workspace)),
+            &approvals::sandbox(
+                mode,
+                std::path::Path::new(&app.workspace),
+                app.state.as_deref(),
+            ),
         )
     {
         app.gating = Some(mode);
+    }
+    // A lead's shell names its state folder, in every row.
+    if project.is_some() {
+        app.env = (app.state.as_deref()).and_then(|state| state::env(&bot, state));
     }
     // A bot made with no prompt-cache lifetime takes Sonny's, so an idle gap
     // of over five minutes no longer rereads it all; a chosen one stays.
@@ -1859,7 +1869,13 @@ async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), Str
     let instructions = project::as_task(&workspace, &info, &composed.text)?;
     let mut asked = json!({"bot": bot, "workspace": workspace, "model": model,
         "instructions": instructions, "request_id": unique("tui-create")});
-    made(client, &mut asked, &model, &workspace)?;
+    // The state folder of the agent whose shell runs this, else of the
+    // agent or person asking by name.
+    let owner = std::env::var("AGENT_BOT")
+        .ok()
+        .filter(|bot| !bot.is_empty());
+    let state = state::inherited().or_else(|| state::folder(owner.as_deref().unwrap_or(bot)));
+    made(client, &mut asked, &model, &workspace, state.as_deref())?;
     client
         .request("create", asked)
         .await
@@ -1877,6 +1893,7 @@ pub(crate) fn made(
     asked: &mut Value,
     model: &str,
     workspace: &Path,
+    state: Option<&str>,
 ) -> Result<(), String> {
     let config = agent_client::config::load()?;
     let declare = json!(declared::tools(served::Role::TASK));
@@ -1884,9 +1901,15 @@ pub(crate) fn made(
     asked["tools"] = json!(tools);
     asked["declare"] = declare.clone();
     asked["compaction_instructions"] = json!(agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS);
-    // Confined from the start, as the row it is made in confines it.
+    // Confined from the start, as the row it is made in confines it, and
+    // writing `state`, the state folder of the agent that makes it, or its
+    // own.
     let mode = approvals::default();
-    let mut settings = approvals::sandbox(mode, workspace);
+    let mut settings = approvals::sandbox(mode, workspace, state);
+    // Named in its shell too; one another bot makes takes its maker's.
+    if let Some(state) = &state {
+        settings.insert("env".into(), json!({state::VAR: state}));
+    }
     if let Some(ttl) = agent_client::policy::cache_ttl(model) {
         settings.insert("cache_ttl".into(), json!(ttl));
     }
@@ -3160,6 +3183,10 @@ struct App {
     declared: Value,
     /// Its permissions row, when it is one of Sonny's.
     mode: Option<&'static str>,
+    /// The state folder its sandbox writes, its lead's ([`state`]).
+    state: Option<String>,
+    /// Its `env` setting, waiting to name its state folder in its shell.
+    env: Option<Value>,
     /// `/permissions` or `/fast`, open over the composer.
     choosing: Option<(Choice, list::Picker)>,
     /// The rows `/permissions` lists, as the config had them when it opened.
@@ -4549,6 +4576,8 @@ impl App {
                 .collect(),
             declared: record["declared"].clone(),
             mode: approvals::mode(record),
+            state: state::of(record, bot),
+            env: None,
             choosing: None,
             rows: Vec::new(),
             reviewing: std::collections::HashSet::new(),
@@ -5000,6 +5029,7 @@ impl App {
             && self.declare.is_none()
             && self.cache.is_none()
             && self.pace.is_none()
+            && self.env.is_none()
         {
             return true;
         }
@@ -5009,6 +5039,7 @@ impl App {
         let (text, switch, gating) = (self.instruct.take(), self.switch.take(), self.gating.take());
         let cache = self.cache.take();
         let pace = self.pace.take();
+        let env = self.env.take();
         let mut declare = self.declare.take();
         // A bot that went without the tools Sonny gates, as its gate was
         // not Sonny's, has them with the mode the person picks.
@@ -5040,6 +5071,9 @@ impl App {
         if let Some(speed) = pace {
             settings.insert("speed".into(), json!(speed));
         }
+        if let Some(env) = &env {
+            settings.insert("env".into(), env.clone());
+        }
         if let (Some(mode), Value::Object(fields)) = (gating, &mut asked) {
             let declared = declare.as_ref().unwrap_or(&self.declared);
             fields.extend(approvals::gate(
@@ -5049,7 +5083,7 @@ impl App {
             // An agent's sandbox goes with its row, a lead's, a task's or
             // a side chat's, which the daemon holds within its agent's.
             let workspace = std::path::Path::new(&self.workspace);
-            settings.extend(approvals::sandbox(mode, workspace));
+            settings.extend(approvals::sandbox(mode, workspace, self.state.as_deref()));
         }
         if !settings.is_empty() {
             asked["settings"] = Value::Object(settings);
@@ -5102,6 +5136,7 @@ impl App {
                 self.declare = declare;
                 self.cache = cache;
                 self.pace = pace;
+                self.env = env;
                 return false;
             }
             Err(error) => {
