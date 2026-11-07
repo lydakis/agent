@@ -388,8 +388,8 @@ struct Read {
     turn: i64,
     news: Vec<(String, News)>,
     unheard: Vec<(Key, (Turn, bool))>,
-    /// Of those, the ones whose asker was read while the wait ran: their
-    /// end as `asked_by` would have told it.
+    /// Of those, the ones whose asker and reply were read while the wait
+    /// ran: their end as `asked_by` and `replied` would have told it.
     heard: Vec<(Key, Turn, bool)>,
     forwarding: Vec<(Key, Forward)>,
 }
@@ -1070,6 +1070,7 @@ impl Updates {
         self.replying.remove(&(name.to_owned(), turn));
         self.asker_unread(name, turn);
         let text = text.trim();
+        self.replied_held(&(name.to_owned(), turn), text);
         if !self.live {
             return;
         }
@@ -1095,6 +1096,30 @@ impl Updates {
             t.reply = Some(reply);
         } else if let Some(forwarding) = self.forwarding.get_mut(&(name.to_owned(), turn)) {
             forwarding.reply = Some(text.to_owned());
+        }
+    }
+
+    /// A reply read while a wait of the lead's holds its turn: kept with
+    /// it, for a wait that ends without handing it over. An automation's
+    /// run that went well and found no words is no news.
+    fn replied_held(&mut self, key: &Key, text: &str) {
+        let reply = (!text.is_empty()).then(|| quotable(text));
+        for read in self.waits.values_mut() {
+            (read.heard).retain(|(k, told, _)| k != key || reply.is_some() || !told.run());
+            for (_, told, _) in read.heard.iter_mut().filter(|(k, ..)| k == key) {
+                told.reply = reply.clone();
+            }
+            let Some(reply) = &reply else { continue };
+            for (_, news) in read.news.iter_mut().filter(|(name, _)| *name == key.0) {
+                for told in [&mut news.act, &mut news.theirs].into_iter().flatten() {
+                    if told.turn == key.1 {
+                        told.reply = Some(reply.clone());
+                    }
+                }
+            }
+            for (_, forward) in read.forwarding.iter_mut().filter(|(k, _)| k == key) {
+                forward.reply = Some(text.to_owned());
+            }
         }
     }
 
@@ -1506,15 +1531,9 @@ impl Updates {
                 self.unheard.entry(key).or_insert(held);
             }
         }
-        for (key, told, answered) in read.heard {
-            if !self.task(&key.0) {
-                continue;
-            }
-            if told.run() {
-                self.replying.insert(key.clone());
-                self.runs.insert(key, (told, answered));
-            } else {
-                let name = key.0.clone();
+        // Its reply was read with who asked, while the wait held it.
+        for ((name, _), told, answered) in read.heard {
+            if self.task(&name) {
                 self.put(&name, told, answered);
             }
         }

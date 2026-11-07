@@ -4001,30 +4001,39 @@ mod tests {
     #[test]
     fn who_asked_read_while_a_wait_held_the_turn_counts_when_the_wait_fails() {
         let mut lookout = seated("idle");
-        lookout.subs[0].filter = Some(json!({"by": ["you"]}));
+        lookout.subs[0].filter = Some(json!({"by": ["you", "automation"]}));
         let listed = lookout.updates.listed();
         lookout.sync(&listed);
-        let ended = ev("calc.fix", 4, "turn_finished", json!({"status": "failed"}));
-        lookout.event(&ended);
-        assert!(lookout.updates.asker_unknown("calc.fix", 4));
-        let handles = json!({"handles": ["turn:calc.fix/4"]}).to_string();
-        let wait = json!({"name": "wait", "call_id": "w1", "arguments": handles});
-        lookout.event(&ev("calc.lead", 7, "tool_started", wait));
-        // Who asked is read while the wait holds the turn, then the wait
-        // fails: the turn's end is news, as the filter hears it.
-        (lookout.updates).asked_by("calc.fix", 4, Some("calc.lead".into()), None);
-        lookout.updates.replied("calc.fix", 4, "");
-        assert!(!lookout.updates.news());
-        let failed = json!({"call_id": "w1", "failed": true});
-        lookout.event(&ev("calc.lead", 7, "tool_completed", failed));
-        lookout.updates.replied("calc.fix", 4, "");
-        let told = lookout.updates.take();
-        assert_eq!(told.items.len(), 1);
-        assert!(
-            told.items[0].text.contains("turn:calc.fix/4 failed"),
-            "{}",
-            told.items[0].text
-        );
+        // Who asked, and the reply, are read while a wait holds the turn,
+        // then the wait fails: the end is news, as the filter hears it,
+        // with its reply. An automation's run is news at once: its reply
+        // was read, and no other read comes.
+        let cases = [
+            (4, "failed", Some("calc.lead"), None, "it broke"),
+            (5, "completed", None, Some("automation"), "posted 2 items"),
+        ];
+        for (turn, status, from, origin, reply) in cases {
+            let ended = ev("calc.fix", turn, "turn_finished", json!({"status": status}));
+            lookout.event(&ended);
+            assert!(lookout.updates.asker_unknown("calc.fix", turn));
+            let handles = json!({"handles": [format!("turn:calc.fix/{turn}")]}).to_string();
+            let wait = json!({"name": "wait", "call_id": "w1", "arguments": handles});
+            lookout.event(&ev("calc.lead", 7, "tool_started", wait));
+            let (from, origin) = (from.map(str::to_owned), origin.map(str::to_owned));
+            (lookout.updates).asked_by("calc.fix", turn, from, origin);
+            lookout.updates.replied("calc.fix", turn, reply);
+            assert!(!lookout.updates.news());
+            let failed = json!({"call_id": "w1", "failed": true});
+            lookout.event(&ev("calc.lead", 7, "tool_completed", failed));
+            let told = lookout.updates.take();
+            assert_eq!(told.items.len(), 1);
+            let text = &told.items[0].text;
+            assert!(
+                text.contains(&format!("turn:calc.fix/{turn} {status}")),
+                "{text}"
+            );
+            assert!(text.contains(reply), "{text}");
+        }
     }
 
     #[test]
