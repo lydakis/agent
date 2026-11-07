@@ -175,7 +175,7 @@ class ConfinedTests(unittest.TestCase):
                                 ('automations', {'add': {'start': {'name': 'n', 'model': 'm'}, 'message': 'm'}}),
                                 ('new_project', {'folder': '/Users/me/x'}),
                                 ('run_in_pane', {'command': 'ls'}),
-                                ('goal', {}), ('browser', {})]:
+                                ('browser', {})]:
             self.assertFalse(role_eval.determinable(home, native(name, arguments)), (name, arguments))
         # Not a shell call, or not seen whole.
         self.assertFalse(role_eval.determinable(home, {'name': 'write', 'arguments': {'path': '/x', 'content': ''}}))

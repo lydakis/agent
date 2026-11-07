@@ -1289,7 +1289,7 @@ impl Standing {
             }
         }
         self.closes.extend(closes);
-        if crate::lookout::said_by_person(entry).is_some() {
+        if crate::reactions::said_by_person(entry).is_some() {
             let text = crate::text(&entry["item"]);
             match (answer_of(&text, None), split(&text)) {
                 (Some(answered), Some((_, answer))) => {

@@ -60,7 +60,7 @@
 //! sky_haiku_window = 10         # minutes of messages and tool calls that make an agent busiest
 //! sky_haiku_margin = 50         # how much busier, in percent, a challenger must be to take the title
 //! sky_haiku_hold = 10           # minutes the title is held before it can pass
-//! tool_processes = 8            # processes Sonny runs for agents at once in all: tool calls 3/4, goal checks 1/4; 0, the default, four times the CPUs
+//! tool_processes = 8            # processes Sonny runs for agents' tool calls at once in all; 0, the default, four times the CPUs
 //! lookout_waiting = 4096        # events from sources that wait for one agent, 1024 by default; past it newer ones are not kept, and its next note says so; 0 no limit
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
@@ -511,9 +511,8 @@ pub struct Sonny {
     /// thermostat's margin and hold, so it does not flicker.
     pub sky_haiku_margin: u64,
     pub sky_haiku_hold: u64,
-    /// The processes Sonny runs for agents at once in all: three quarters
-    /// for tool calls the tool host answers, a quarter for goal checks,
-    /// each at least one. 0 for four times the CPUs.
+    /// The processes Sonny runs for agents at once in all, for tool calls
+    /// the tool host answers. 0 for four times the CPUs.
     pub tool_processes: u64,
     /// How many events from sources wait for one agent at most: past it,
     /// newer ones are not kept, and its next note says how many, from
