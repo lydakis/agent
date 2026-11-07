@@ -783,9 +783,18 @@ way `/react` does, and each note in the margin has its own `↩`.
   tasks, or `waiting on its reviewer` while the approver weighs a call), **Idle**
   (its turn ended, stopped, or never started, with nothing open; a pull
   request its last reply linked shows on its row), and **Done** (marked
-  done). Idle and Done fold to their heading (`Idle · 3 ▸`) until a
-  click on it, or `i` and `d` with the keys in the pane, opens them, and
-  the same folds them again. As threads in a claude.ai project are
+  done). Each agent is one line: its mark, name, state and time, and at
+  its right edge, dim, what it tracks: what it follows (a source with an
+  `icon` in `[sonny.sources.NAME]` shows as that icon), its pull request
+  (`3 PRs · …#802` when its replies linked more), its background work
+  and its window. The picked agent, and every one that needs you, says
+  more under it: its model and profile, and its latest step. Idle shows
+  its newest eight and a `+5 more · i shows them` line for the rest; Done
+  folds to its heading (`Done · 3 ▸`). A click on either, or `i` and `d`
+  with the keys in the pane, opens them, and the same folds them again.
+  The helpers a task started fold under it (`▸ 2 helpers, 1 working`),
+  a helper that needs you listed under Needs you too; a click on that
+  line, or → on the picked task, opens them, and ← folds them. As threads in a claude.ai project are
   resolved, a task marks itself done with the `mark_done` tool once
   nothing is left to do in it, such as when its pull request merged or
   you dropped the work, and the lead can mark any of its tasks done the
@@ -1167,7 +1176,7 @@ turn of the task numbered after that one reopens it.
 
 ![A decision the lead asked with the ask tool, drawn where it asked it, its code, bold, math and links read as Markdown](../docs/sonny/ask-markdown.png)
 
-![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Done and the resolved count](../docs/sonny/status-groups.png)
+![/status with the lead first, then its tasks under Needs you, Working, Idle and Done, one line each, a picked task's two helpers open under it and pull requests at the right edge](../docs/sonny/status-groups.png)
 
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
 `[sonny]`, which `/config` shows: the chime (`chime`, on by default) and

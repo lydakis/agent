@@ -9952,7 +9952,10 @@ impl App {
         // on it does.
         if self.finding.is_none()
             && self.pane_keys
-            && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter)
+            && matches!(
+                key.code,
+                KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Right | KeyCode::Left
+            )
             && self.pane.as_ref().is_some_and(|pane| pane.is_card())
             && let Some(watch) = &self.watch
             && watch.background.is_none()
