@@ -755,7 +755,10 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 arguments["remove"].as_str(),
                 &crate::lookout::sources::names(),
             )
-            .map(|listed| listed.to_string())
+            .map(|mut listed| {
+                crate::lookout::sources::say_wants(&mut listed);
+                listed.to_string()
+            })
             .map_err(|e| ("subscription_refused", e))
         }
         name if name == crate::margin::TOOL => {
