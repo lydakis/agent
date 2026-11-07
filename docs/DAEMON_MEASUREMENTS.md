@@ -7571,24 +7571,25 @@ reads no state folder or setting); the rest stay within 6%.
 
 An `--if` an agent added runs through `agent sandbox --bot`: one `agent`
 process, one `lend` round trip, and, for a confined agent, the sandbox
-launch its own commands pay. Nothing changes on the daemon's turn path: the
-service holds one more map, of the shares sessions borrowed, empty unless a
-gate runs, and drops a session's entry when it closes. `lend` binds a bot's
-socket only when it was not listening, and keeps one share per bot per
-session however often it asks. A gate the person or Sonny added runs as
-before.
+launch its own commands pay. `lend` builds the policy as a turn does and
+the command's whole environment (the daemon's, some tens of variables),
+and binds the bot's socket only when it was not listening, keeping one
+share per bot per session however often it asks. Nothing changes on the
+turn path: the tool shell's environment comes from the same function, as
+the same steps in the same order, and the service holds one more map, of
+the shares sessions borrowed, empty unless a gate runs. A gate the person
+or Sonny added runs as before.
 
 Mean wall time of a gate of `sh -c true`, 50 runs each, release build on a
-4-core Linux cloud container (three runs: 1.2 to 1.6 ms for the person's,
-so the spread is about ±0.4 ms):
+4-core Linux cloud container, two runs each (the person's 1.4 and 1.5 ms):
 
 | Gate | Mean, ms |
 | --- | ---: |
 | The person's: `/bin/sh -c true` | 1.4 |
-| An unconfined agent's: `agent sandbox --bot` | 4.3 |
-| A read-only agent's: `agent sandbox --bot` (bubblewrap) | 12.0 |
-| `agent sandbox` with no bot or daemon (bubblewrap) | 10.8 |
+| An unconfined agent's: `agent sandbox --bot` | 4.7 |
+| A read-only agent's: `agent sandbox --bot` (bubblewrap) | 14.3 |
+| `agent sandbox` with no bot or daemon (bubblewrap) | 12.2 |
 
-So the lend costs about 1.5 ms over the sandbox's own launch, and a
-confined agent's gate about 11 ms over the person's, paid once per check:
-a gate that says no still costs no model call.
+So the lend costs about 2 ms over the sandbox's own launch, and a confined
+agent's gate about 13 ms over the person's, paid once per check: a gate
+that says no still costs no model call.
