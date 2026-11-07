@@ -1845,16 +1845,19 @@ fn row(places: &Places, name: &str) -> Value {
         return row;
     }
     match read_trigger(&path) {
-        Ok((t, _)) => {
-            let mut row = t.json(&state(places, &t));
-            row["ended"] = json!(false);
-            if t.at.is_some_and(|at| now() > at + SLACK) {
-                row["missed"] = json!(true);
-            }
-            row
-        }
+        Ok((t, _)) => live_row(&t, &state(places, &t)),
         Err(problem) => json!({"name": name, "ended": false, "problem": problem}),
     }
+}
+
+/// The row of `t`, under way, with what its fires left in `state`.
+fn live_row(t: &Trigger, state: &Value) -> Value {
+    let mut row = t.json(state);
+    row["ended"] = json!(false);
+    if t.at.is_some_and(|at| now() > at + SLACK) {
+        row["missed"] = json!(true);
+    }
+    row
 }
 
 /// Write a file whole beside its place, then rename it there.
@@ -3342,7 +3345,9 @@ fn own(places: &Places, name: &str, caller: &Caller) -> Option<Value> {
             }
         };
         let answers = t.reply_to.as_ref().is_some_and(|(_, to)| *to == id);
-        return (t.store_id == store && (messages || answers)).then(|| row(places, name));
+        // The row of what was checked, not of a file read again, which
+        // a replacement since could have made another's.
+        return (t.store_id == store && (messages || answers)).then(|| live_row(&t, &state));
     }
     // One that ended: what its last row recorded of whose it was.
     let row = one(places, name)?;
