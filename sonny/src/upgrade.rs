@@ -62,7 +62,7 @@ pub const STEPS: &[Step] = &[
         retire: "0.11.0",
     },
     // An automation's `if` an agent added runs in its sandbox; one added
-    // before runs as the person until added again (0.9.0).
+    // before, whose writer was not recorded, does not run until added again (0.9.0).
     Step {
         id: "agent-gates",
         text: include_str!("../upgrades/agent-gates.md"),

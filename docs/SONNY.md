@@ -196,7 +196,11 @@ through `agent sandbox --bot` (protocol 54): in its sandbox, with its
 variables (`$SONNY_STATE` too), reaching the daemon through its own socket,
 since an agent can rewrite what its gate runs; that agent gone, the check
 could not run (exit 125). One the person added, or Sonny (an ask's deadline,
-the memory cleanup), runs as the person. It answers as `test`
+the memory cleanup), runs as the person. The definition says which
+(`--if-by NAME --if-by-id ID`, or `--if-by-person`); one from before 0.9.0
+says neither and could be an agent's, so it does not run: each check fails,
+told once, until the automation is added again, but for Sonny's own two,
+known by their whole text. It answers as `test`
 and `grep -q` do: exit 0 sends, and exit 1 skips that fire and records
 nothing but, for `--commit`, that its commit was seen; any other exit, a
 signal or a command that is not there could not check, and fails the fire

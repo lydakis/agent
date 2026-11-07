@@ -392,6 +392,16 @@ pub enum Target {
     },
 }
 
+/// Who wrote a trigger's `--if`, and so where it runs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Writer {
+    /// The person, from their own terminal, or Sonny: it runs as the person.
+    Person,
+    /// An agent, pinned by id: it runs in that agent's sandbox, as its own
+    /// commands do, since the agent can rewrite what it runs.
+    Agent(String, i64),
+}
+
 /// One trigger, as its plist's arguments carry it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Trigger {
@@ -413,10 +423,9 @@ pub struct Trigger {
     pub reply_to: Option<(String, i64)>,
     /// `sh -c` this first; anything but exit 0 skips the fire.
     pub gate: Option<String>,
-    /// The agent that wrote `gate`, pinned by id: the gate runs in that
-    /// agent's sandbox, as its own commands do. None runs it as the person,
-    /// who added it, or Sonny, which did.
-    pub gate_by: Option<(String, i64)>,
+    /// Who wrote `gate`. None for one written before Sonny recorded it
+    /// (0.9.0), which runs only when it is one of Sonny's own.
+    pub gate_by: Option<Writer>,
     /// Ends once this many messages went out.
     pub runs: Option<u64>,
     /// The most tokens each fire's turn may spend.
@@ -502,9 +511,13 @@ impl Trigger {
         if let Some(gate) = &self.gate {
             pair("--if", gate.clone());
         }
-        if let Some((by, id)) = &self.gate_by {
-            pair("--if-by", by.clone());
-            pair("--if-by-id", id.to_string());
+        match &self.gate_by {
+            Some(Writer::Agent(by, id)) => {
+                pair("--if-by", by.clone());
+                pair("--if-by-id", id.to_string());
+            }
+            Some(Writer::Person) => pair("--if-by-person", "1".into()),
+            None => {}
         }
         if let Some(runs) = self.runs {
             pair("--runs", runs.to_string());
@@ -547,7 +560,7 @@ impl Trigger {
             let value = iter
                 .next()
                 .ok_or_else(|| bad(&format!("{flag} needs a value")))?;
-            const FLAGS: [&str; 27] = [
+            const FLAGS: [&str; 28] = [
                 "--name",
                 "--generation",
                 "--bot",
@@ -568,6 +581,7 @@ impl Trigger {
                 "--if",
                 "--if-by",
                 "--if-by-id",
+                "--if-by-person",
                 "--runs",
                 "--turn-budget-tokens",
                 "--budget-counts",
@@ -626,7 +640,12 @@ impl Trigger {
             dir: text("--dir").map(PathBuf::from),
             reply_to: pinned("--reply-to", "--reply-to-id")?,
             gate: text("--if"),
-            gate_by: pinned("--if-by", "--if-by-id")?,
+            gate_by: match (pinned("--if-by", "--if-by-id")?, text("--if-by-person")) {
+                (Some((by, id)), None) => Some(Writer::Agent(by, id)),
+                (None, Some(_)) => Some(Writer::Person),
+                (None, None) => None,
+                (Some(_), Some(_)) => return Err(bad("--if-by and --if-by-person")),
+            },
             runs: number("--runs")?.map(|n| n.max(1) as u64),
             turn_budget_tokens: number("--turn-budget-tokens")?.map(|n| n.max(1) as u64),
             budget_counts: text("--budget-counts"),
@@ -1456,18 +1475,74 @@ fn read_all(places: &Places) -> impl Iterator<Item = (String, Read)> {
         })
 }
 
-/// Whether every automation's `if` says whose it is, but Sonny's own (the
-/// memory cleanup's, an ask's deadline's), which run as the person: one
-/// added before gates named their agent runs as the person until it is
-/// added again (upgrade step `agent-gates`).
+/// Whether every automation's `if` runs: none was written before Sonny
+/// recorded whose it is, but Sonny's own (upgrade step `agent-gates`).
 pub fn no_gate_unowned() -> bool {
     let Ok(places) = Places::home() else {
         return true;
     };
-    triggers(&places).iter().all(|(trigger, _)| {
-        let sonnys = |gate: &str| trigger.name == "memory-cleanup" || gate.contains(" ask open ");
-        trigger.gate_by.is_some() || trigger.gate.as_deref().is_none_or(sonnys)
-    })
+    triggers(&places)
+        .iter()
+        .all(|(trigger, _)| trigger.gate_runs_as().is_ok())
+}
+
+impl Trigger {
+    /// The agent whose sandbox runs its `--if`, or None to run it as the
+    /// person. One written before Sonny recorded whose a gate is (0.9.0)
+    /// could be an agent's, so it runs nowhere, and the check fails, told
+    /// once to the agent, until the automation is added again; but for
+    /// Sonny's own, which it knows by their whole text: the memory
+    /// cleanup's `'~/.agent/memory' changed` and an ask's deadline's
+    /// `'SONNY' ask open 'BOT' TURN 'CALL'`.
+    fn gate_runs_as(&self) -> Result<Option<(&str, i64)>, String> {
+        match &self.gate_by {
+            Some(Writer::Agent(by, id)) => Ok(Some((by, *id))),
+            Some(Writer::Person) => Ok(None),
+            None if self
+                .gate
+                .as_deref()
+                .is_none_or(|gate| self.sonnys_gate(gate)) =>
+            {
+                Ok(None)
+            }
+            None => Err(
+                "--if: added before Sonny 0.9.0 recorded who wrote a gate, so it does not \
+                 run until the automation is added again (replace), which runs it in the sandbox \
+                 of the agent that adds it"
+                    .into(),
+            ),
+        }
+    }
+
+    /// Whether `gate` is one Sonny writes, word for word.
+    fn sonnys_gate(&self, gate: &str) -> bool {
+        let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"));
+        let cleanup = || {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            self.name == "memory-cleanup"
+                && home.is_some_and(|home| {
+                    gate == format!("{} changed", quote(&home.join(".agent/memory")))
+                })
+        };
+        /// What follows a quoted word with no quote in it.
+        fn word(text: &str) -> Option<&str> {
+            let text = text.strip_prefix('\'')?;
+            Some(&text[text.find('\'')? + 1..])
+        }
+        let ask = || {
+            let Some(sonny) = crate::skills::sonny_path() else {
+                return false;
+            };
+            (|| {
+                let rest = gate.strip_prefix(&format!("{} ask open ", quote(&sonny)))?;
+                let (turn, rest) = word(rest)?.strip_prefix(' ')?.split_once(' ')?;
+                (turn.bytes().all(|b| b.is_ascii_digit()) && !turn.is_empty()).then_some(())?;
+                word(rest).filter(|end| end.is_empty())
+            })()
+            .is_some()
+        };
+        cleanup() || ask()
+    }
 }
 
 fn triggers(places: &Places) -> Vec<(Trigger, PathBuf)> {
@@ -3596,10 +3671,11 @@ fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, 
         _ => None,
     };
     // A gate an agent wrote runs in its sandbox, as Codex runs what an
-    // agent wrote: one the person wrote runs as they do.
-    let gate_by = shell
-        .clone()
-        .filter(|_| agents_gate && asked.gate.is_some());
+    // agent wrote: one the person or Sonny wrote runs as the person.
+    let gate_by = asked.gate.as_ref().map(|_| match (&shell, agents_gate) {
+        (Some((bot, id)), true) => Writer::Agent(bot.clone(), *id),
+        _ => Writer::Person,
+    });
     let daemon = Daemon::current()?;
     if let Some(watch) = &asked.when.watch {
         // A watched file could be the store, which every send writes: one
@@ -3890,7 +3966,7 @@ const GATE_SAID: usize = 300;
 /// not run.
 fn gate(
     command: &str,
-    by: Option<&(String, i64)>,
+    by: Option<(&str, i64)>,
     dir: Option<&Path>,
     daemon: &Daemon,
 ) -> Result<Result<(), String>, String> {
@@ -5493,7 +5569,7 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         until_resumed(trigger);
     }
     let said = trigger.gate.as_deref().map(|c| {
-        let by = trigger.gate_by.as_ref();
+        let by = trigger.gate_runs_as()?;
         gate(c, by, trigger.dir.as_deref(), &trigger.daemon)
     });
     // A check that broke is told once, and that it works again once: an
@@ -6209,6 +6285,55 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn a_gate_runs_as_its_writer_and_one_from_before_only_when_sonny_wrote_it() {
+        let gated = |gate: &str, by: Option<Writer>| Trigger {
+            gate: Some(gate.into()),
+            gate_by: by,
+            ..trigger()
+        };
+        let agent = Writer::Agent("p.lead".into(), 7);
+        assert_eq!(
+            gated("x", Some(agent)).gate_runs_as(),
+            Ok(Some(("p.lead", 7)))
+        );
+        assert_eq!(gated("x", Some(Writer::Person)).gate_runs_as(), Ok(None));
+        assert_eq!(trigger().gate_runs_as(), Ok(None));
+        // From before: whoever wrote it, it does not run, and says why.
+        let unknown = gated("cd /w && ! ./quiet", None)
+            .gate_runs_as()
+            .unwrap_err();
+        assert!(unknown.contains("added again"), "{unknown}");
+        // But Sonny's own, word for word.
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let cleanup = format!("'{}' changed", home.join(".agent/memory").display());
+        let named = |gate: &str| Trigger {
+            name: "memory-cleanup".into(),
+            ..gated(gate, None)
+        };
+        assert_eq!(named(&cleanup).gate_runs_as(), Ok(None));
+        assert!(
+            named(&format!("{cleanup}; touch x"))
+                .gate_runs_as()
+                .is_err()
+        );
+        assert!(
+            gated(&cleanup, None).gate_runs_as().is_err(),
+            "another automation's"
+        );
+        let sonny = crate::skills::sonny_path().unwrap();
+        let ask = format!("'{}' ask open 'p.lead' 12 'call_1'", sonny.display());
+        assert_eq!(gated(&ask, None).gate_runs_as(), Ok(None));
+        for other in [
+            format!("{ask}; touch x"),
+            format!("'{}' ask open 'p.lead' 1x 'call_1'", sonny.display()),
+            format!("'{}' ask open 'p.lead' 12 'call_1'", "/w/sonny"),
+            format!("'{}' ask open 'p.lead' 12 'call'1'", sonny.display()),
+        ] {
+            assert!(gated(&other, None).gate_runs_as().is_err(), "{other}");
+        }
+    }
+
     /// Only `fire` runs it.
     fn fired() -> When {
         When {
@@ -6316,16 +6441,17 @@ pub(crate) mod tests {
             dir: Some("/r/sub dir".into()),
             reply_to: Some(("p.lead".into(), 7)),
             gate: Some("test -n \"$(git status --porcelain)\" -- x".into()),
-            gate_by: Some(("p.lead".into(), 7)),
+            gate_by: Some(Writer::Agent("p.lead".into(), 7)),
             runs: Some(3),
             turn_budget_tokens: Some(50_000),
             ..s.clone()
         };
         // The same gate written by another is another gate.
         let by_person = Trigger {
-            gate_by: None,
+            gate_by: Some(Writer::Person),
             ..full.clone()
         };
+        assert_eq!(Trigger::parse(&by_person.args()[1..]).unwrap(), by_person);
         assert_eq!(by_person.differs(&full), Some("if"));
         let watching = When {
             watch: Some("/r/50% done/.git/logs/HEAD".into()),

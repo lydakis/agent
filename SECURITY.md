@@ -265,8 +265,11 @@ approval gate as a call that leaves the sandbox would; `memory` and
   socket (`agent sandbox --bot`), as Codex runs whatever an agent wrote:
   a gate such as `cd FOLDER && ./quiet` runs a script the agent can
   rewrite, and runs it no further than the agent's own commands reach.
-  One the person or Sonny added runs as the person. Nothing of a trigger
-  runs between its fires. A goal's check command runs as the person.
+  One the person or Sonny added runs as the person. One added before
+  0.9.0, when Sonny did not record who wrote it, does not run until it is
+  added again, but for Sonny's own, which it knows by their whole text.
+  Nothing of a trigger runs between its fires. A goal's check command runs
+  as the person.
 - **Lookout sources** are commands the person sets up in `config.toml`,
   run with `sh -c` as the person outside any sandbox. A source runs its
   script again on every run, and starts again on an edit to a file its
@@ -340,9 +343,8 @@ is built.
 
 - A bot without a sandbox, and every daemon companion, trigger, lookout
   source, goal check, `.agents/setup` and MCP server, runs with the
-  person's full permissions; of a trigger's `if` commands, only one an
-  agent added runs in its sandbox, and one added before 0.9.0 runs as the
-  person until it is added again. A workspace snapshot or a worktree is not a
+  person's full permissions; of a trigger's `if` commands, one an agent
+  added runs in its sandbox. A workspace snapshot or a worktree is not a
   sandbox.
 - The sandbox confines commands, writes and edits, not reads: a confined
   bot can read any file the person can and send it to its model provider.

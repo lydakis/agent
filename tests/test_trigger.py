@@ -111,6 +111,11 @@ class TriggerFireTests(ModelFixture):
                       env=None, store_id=None, not_before=None, generation=None):
         # What a trigger's plist has launchd run.
         target = target or ['--bot', name, '--bot-id', str(self.bot_id(name))]
+        # A gate names who wrote it, as Sonny writes one now: the person,
+        # unless an agent is named.
+        if '--if' in extra and '--if-by' not in extra and '--unrecorded' not in extra:
+            extra = [*extra, '--if-by-person', '1']
+        extra = [arg for arg in extra if arg != '--unrecorded']
         args = [str(app), '--trigger-fire', '--name', name, *target,
                 '--generation', generation or str(time.time_ns()), '--when', when, *(['--at', str(at)] if at else []),
                 *extra, '--store', str(self.store), *(['--socket', str(socket)] if socket else []),
@@ -708,6 +713,12 @@ class TriggerFireTests(ModelFixture):
         no = self.fire('p.task', 'x', extra=['--if', '! touch escaped', '--dir', str(self.path)])
         self.assertEqual(no['checked']['gate'], 'no', no)
         self.assertTrue((self.path / 'escaped').exists())
+        # One from before Sonny recorded who wrote it runs nowhere.
+        (self.path / 'escaped').unlink()
+        old = self.fire('p.task', 'x', extra=['--if', 'touch escaped', '--dir', str(self.path), '--unrecorded'])
+        self.assertEqual(old['checked']['gate'], 'failed', old)
+        self.assertIn('added again', old['checked']['detail'])
+        self.assertFalse((self.path / 'escaped').exists())
 
     def test_a_gate_that_says_no_costs_no_turn(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
