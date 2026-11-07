@@ -67,8 +67,10 @@ const SHAPE_TOPICS: usize = 32;
 const DOWN_AFTER: u32 = 3;
 /// How often at most they hear again that it is still down.
 const DOWN_AGAIN: Duration = Duration::from_secs(24 * 60 * 60);
-/// The last lines of a failed run's stderr the down notice quotes.
+/// The last lines of a failed run's stderr the down notice quotes, and
+/// how long after the run ends its stderr is read for them.
 const DOWN_STDERR: usize = 5;
+const STDERR_WAIT: Duration = Duration::from_secs(1);
 /// The fields every event has, which the note says on its own.
 const OWN: [&str; 7] = ["text", "id", "topic", "from", "url", "steer", "told"];
 /// How the note to the subscriber starts, which Sonny shows folded.
@@ -375,6 +377,8 @@ pub struct Runner {
     unreadable: Option<String>,
     /// Tells Sonny's own sources to look now.
     poked: std::sync::Arc<tokio::sync::Notify>,
+    /// Each command source's runs as they went, kept across its restarts.
+    health: HashMap<String, Arc<Mutex<Health>>>,
 }
 
 impl Runner {
@@ -385,6 +389,7 @@ impl Runner {
             running: HashMap::new(),
             unreadable: None,
             poked: std::sync::Arc::new(tokio::sync::Notify::new()),
+            health: HashMap::new(),
         }
     }
 
@@ -417,6 +422,7 @@ impl Runner {
     /// them, as a service manager restarts a unit on its new binary.
     pub fn set(&mut self, sources: Vec<Source>) {
         let wanted: HashSet<&str> = sources.iter().map(|s| s.name.as_str()).collect();
+        self.health.retain(|name, _| wanted.contains(name.as_str()));
         self.running.retain(|name, (had, stamp, task)| {
             let keep = sources.contains(had) && wanted.contains(name.as_str());
             let changed = keep && stamp.changed();
@@ -466,7 +472,12 @@ impl Runner {
                     sent,
                     self.poked.clone(),
                 )),
-                false => tokio::spawn(run(source.clone(), every, dir, shape, sent)),
+                false => {
+                    // Its health outlasts a restart, so a source fixed by an
+                    // edit is heard to work again.
+                    let health = self.health.entry(source.name.clone()).or_default().clone();
+                    tokio::spawn(run(source.clone(), every, dir, (shape, health), sent))
+                }
             };
             println!(
                 "{}",
@@ -505,11 +516,9 @@ impl Stamp {
             ) {
                 (Some(rest), Some(home)) => home.join(rest),
                 _ if word.contains('/') => PathBuf::from(word),
-                _ if n == 0 => match on_path(word) {
-                    Some(path) => path,
-                    None => continue,
-                },
-                _ => continue,
+                _ if n == 0 => on_path(word).unwrap_or_else(|| PathBuf::from(word)),
+                // A file named from where the lookout runs, as `sh poll.sh`.
+                _ => PathBuf::from(word),
             };
             if path.is_file() && !files.contains(&path) {
                 files.push(path);
@@ -607,10 +616,15 @@ fn clock(ms: u128) -> String {
 
 /// Run a source's command again and again, sending each new event, until
 /// the task is aborted.
-async fn run(source: Source, every: Duration, dir: PathBuf, shape: PathBuf, sent: Sender<Said>) {
+async fn run(
+    source: Source,
+    every: Duration,
+    dir: PathBuf,
+    (shape, health): (PathBuf, Arc<Mutex<Health>>),
+    sent: Sender<Said>,
+) {
     let mut seen = Seen::default();
     let mut shape = Shape::read(shape);
-    let mut health = Health::default();
     loop {
         let _ = super::make_dir(&dir);
         let stderr = Arc::new(Mutex::new(VecDeque::new()));
@@ -640,7 +654,10 @@ async fn run(source: Source, every: Duration, dir: PathBuf, shape: PathBuf, sent
             .lock()
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default();
-        if let Some(told) = health.after(&source, failed, stderr, std::time::Instant::now())
+        let told = (health.lock().ok()).and_then(|mut health| {
+            health.after(&source, failed, stderr, std::time::Instant::now())
+        });
+        if let Some(told) = told
             && sent.send(Said::Event(Box::new(told))).await.is_err()
         {
             return;
@@ -785,7 +802,7 @@ async fn once(
         }
         Group(group)
     });
-    if let Some(stderr) = child.stderr.take() {
+    let reading = child.stderr.take().map(|stderr| {
         let name = source.name.clone();
         let tail = tail.clone();
         tokio::spawn(async move {
@@ -812,8 +829,8 @@ async fn once(
                     );
                 }
             }
-        });
-    }
+        })
+    });
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
@@ -838,7 +855,14 @@ async fn once(
             return Err("the lookout stopped".into());
         }
     }
-    child.wait().await.map_err(|e| e.to_string())
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+    // What it wrote to stderr last is read before the run is judged, so a
+    // down notice quotes it; a child it left behind holding stderr open
+    // keeps that from taking long.
+    if let Some(reading) = reading {
+        let _ = tokio::time::timeout(STDERR_WAIT, reading).await;
+    }
+    Ok(status)
 }
 
 /// What `next_line` read.
@@ -1795,6 +1819,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn a_source_down_then_fixed_by_an_edit_is_heard_to_work_again() {
+        let dir = std::env::temp_dir().join(format!("lookout-mended-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("poll.sh");
+        let (sent, mut got) = tokio::sync::mpsc::channel(16);
+        let mut runner = Runner::new(dir.join("state"), sent);
+        let source = Source {
+            name: "poll".into(),
+            command: format!("sh {}", script.display()),
+            every: Some("1h".into()),
+            digest: None,
+            steer: None,
+        };
+        // Each edit starts it again: three failed runs in a row.
+        let edit = |body: &str, n: u64| {
+            std::fs::write(&script, body).unwrap();
+            let at = std::time::SystemTime::now() + Duration::from_secs(10 * n);
+            (std::fs::File::options().write(true).open(&script).unwrap())
+                .set_modified(at)
+                .unwrap();
+        };
+        edit("echo boom >&2; exit 1\n", 0);
+        runner.set(vec![source.clone()]);
+        for n in 1..3 {
+            // Each run is over before the next edit stops it.
+            let failed = || runner.health["poll"].lock().unwrap().failed;
+            for _ in 0..500 {
+                if failed() == n {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(failed(), n);
+            edit("echo boom >&2; exit 1\n", u64::from(n));
+            runner.set(vec![source.clone()]);
+        }
+        let down = next_event(&mut got).await;
+        assert!(down.text.contains("is down"), "{}", down.text);
+        assert_eq!(down.fields["stderr"], json!(["boom"]));
+        // Fixed, it starts again and is heard to work.
+        edit("echo fine\n", 3);
+        runner.set(vec![source]);
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            texts.push(next_event(&mut got).await.text);
+        }
+        assert!(texts.iter().any(|t| t.contains("works again")), "{texts:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_command_s_files_are_the_paths_it_names_and_its_program() {
         let dir = std::env::temp_dir().join(format!("lookout-stamp-{}", std::process::id()));
@@ -1816,6 +1892,14 @@ mod tests {
         std::fs::remove_file(&script).unwrap();
         assert!(stamp.changed(), "a file gone is a change");
         assert_eq!(Stamp::of(""), Stamp::default());
+        // A file named from where the lookout runs, as `sh poll.sh`.
+        let here = Stamp::of("sh Cargo.toml");
+        assert!(
+            here.0
+                .iter()
+                .any(|(path, _)| path == Path::new("Cargo.toml")),
+            "{here:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
