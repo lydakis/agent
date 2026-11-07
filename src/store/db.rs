@@ -3343,10 +3343,10 @@ impl Database {
             let named = updating
                 .query_map(params![id, value], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<String>>>()?;
-            for name in named {
-                if !kin.contains(&name) {
-                    kin.push(name);
-                }
+            // Every inherited key reaches the same bots, all it made and
+            // theirs, so the first list names them all once.
+            if kin.is_empty() {
+                kin = named;
             }
         }
         tx.commit()?;
