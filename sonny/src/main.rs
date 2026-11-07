@@ -10283,13 +10283,16 @@ impl App {
                 );
                 let in_pane = if held { self.pane_mouse } else { over_pane };
                 // A count under the composer, or the agent a guess came
-                // from: what it opens.
-                if down
+                // from: what it opens; a right click on the agent, the
+                // other way to it, as on its name anywhere.
+                let right = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right));
+                if (down || right)
                     && let Some((_, _, opens)) = (self.opens_at.iter()).find(|(row, columns, _)| {
                         mouse.row == *row && columns.contains(&mouse.column)
                     })
+                    && let Some(opens) = clicked(opens, right)
                 {
-                    self.follow(&opens.clone());
+                    self.follow(&opens);
                     return true;
                 }
                 if !in_pane && self.composer_mouse(mouse) {
@@ -15319,6 +15322,17 @@ fn shimmer(text: &str, since: Duration) -> Vec<Span<'static>> {
 /// else `manual`.
 fn person_gate(call: &Value) -> &str {
     call["asked"][0]["tag"].as_str().unwrap_or("manual")
+}
+
+/// Where a click on `link` goes: the link itself, or with the `right`
+/// button the other way to an agent (its tab or a look beside), as a right
+/// click on its name in the conversation goes; anything else takes none.
+fn clicked(link: &str, right: bool) -> Option<String> {
+    match (right, link.strip_prefix(links::AGENT)) {
+        (false, _) => Some(link.to_owned()),
+        (true, Some(bot)) => Some(format!("{}other/{bot}", screen::BUTTON)),
+        (true, None) => None,
+    }
 }
 
 fn short(bot: &str, project: &str, lead: &str) -> String {
@@ -21907,6 +21921,22 @@ mod tests {
         assert!(app.pane.is_none());
         app.key(click(10 + counter.start)).await;
         assert!(app.pane.as_ref().is_some_and(pane::Pane::is_card));
+    }
+
+    #[test]
+    fn a_right_click_on_an_agent_goes_the_other_way_and_on_a_count_nowhere() {
+        // The agent a guess came from, as its name anywhere.
+        let agent = "sonny:agent/shop.fix";
+        assert_eq!(clicked(agent, false).as_deref(), Some(agent));
+        assert_eq!(
+            clicked(agent, true).as_deref(),
+            Some("sonny:other/shop.fix")
+        );
+        assert_eq!(
+            clicked("sonny:status", false).as_deref(),
+            Some("sonny:status")
+        );
+        assert_eq!(clicked("sonny:status", true), None);
     }
 
     #[test]
