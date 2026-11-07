@@ -688,16 +688,25 @@ fn answering_row(question: &str, place: &str, width: usize) -> Line<'static> {
     Line::from(format!("  answering “{cut}”{place}")).dim()
 }
 
-/// The person's message answering `ask`, by its call, so it answers that
-/// ask and no other asking the same: an option's number stands for the
-/// option.
-pub fn answer(ask: &Ask, typed: &str) -> String {
-    let picked = typed
+/// The option `typed` picks by its number, if it is one.
+fn option<'a>(ask: &'a Ask, typed: &str) -> Option<&'a Choice> {
+    typed
         .parse::<usize>()
         .ok()
         .and_then(|n| n.checked_sub(1))
         .and_then(|at| ask.options.get(at))
-        .map_or(typed, |choice| choice.label.as_str());
+}
+
+/// Whether `typed` is an option's number, a pick, rather than words.
+pub fn picks(ask: &Ask, typed: &str) -> bool {
+    option(ask, typed).is_some()
+}
+
+/// The person's message answering `ask`, by its call, so it answers that
+/// ask and no other asking the same: an option's number stands for the
+/// option.
+pub fn answer(ask: &Ask, typed: &str) -> String {
+    let picked = option(ask, typed).map_or(typed, |choice| choice.label.as_str());
     let covers =
         (ask.covers.as_ref()).map_or_else(String::new, |c| format!("{COVERS}{}", c.line()));
     format!(

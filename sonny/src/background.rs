@@ -334,6 +334,9 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         None if sent == 0 && last.is_null() => "not run yet".into(),
         None => format!("sent {sent}"),
     });
+    if let Some(until) = row["until"].as_str() {
+        facts.push(format!("until {until}"));
+    }
     if let Some(outcome) = last["outcome"].as_str().filter(|_| !gate_broke) {
         let ago = last["fired_ms"]
             .as_u64()

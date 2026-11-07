@@ -181,6 +181,21 @@ lookout nothing more: no event is built for the bots it watches.
 {"add": {"name": "migration", "tasks_of": ["shop.migrate"], "steer": {"status": ["failed"]}}}
 ```
 
+Subscriptions end as automations do, by one rule. `until`, as
+`"2026-11-08 18:00"` in local time, ends one then, as an automation's
+`--until`; `runs` ends one after it was told in that many notes, as an
+automation's `--runs` after that many messages, so `"runs": 1` is a
+one-shot alert. A note counts once it lands, however many events it
+tells, and the count outlasts a lookout restart. A subscription also ends
+with its bot: deleting a bot ends every subscription it held, and one
+that watched only bots by exact name, every one of them deleted now, and
+no source, ends too. Each end is a line in the lookout's log with why.
+
+```
+{"add": {"name": "deploy", "bots": ["ops.deploy"], "steer": {"status": ["failed"]}, "runs": 1}}
+{"add": {"name": "launch", "sources": ["slack:launch"], "until": "2026-11-08 18:00"}}
+```
+
 A call changes only the calling bot's own subscriptions. `add` under a
 name already taken does nothing when it says the same and is refused when
 it does not, so remove it first. Each subscriber's are one file,
