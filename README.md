@@ -278,9 +278,11 @@ goes in your shell profile. Tool shells never get the keys the daemon's
 providers use; as in Codex, `[shell_environment_policy]` with
 `ignore_default_excludes = false` also leaves out every variable named like
 `*KEY*`, `*SECRET*` or `*TOKEN*`, and `exclude` lists more. Bots search the web where their provider offers
-it, as Codex's do: OpenAI with an API key, Anthropic, and GPT on Bedrock. Every
+it, as Codex's do: OpenAI with an API key, Anthropic, and GPT on Bedrock Mantle. Every
 bot can also read a page with `web_fetch`, which the daemon runs itself. Put
-`web_search = "disabled"` in `config.toml` to leave both out of new bots.
+`web_search = "disabled"` in `config.toml` to leave both out of new bots, or
+`web_search_off = ["bedrock-openai/xai.*"]` to leave search out for models
+whose provider's search refuses them.
 A message one agent sends another reaches its model with a line naming the
 sender, so no agent takes it for yours; `senders = "hidden"` leaves that out.
 A note sent with `--delivery attach` rides on the bot's next call and goes as a

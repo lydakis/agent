@@ -369,6 +369,9 @@ mod tests {
             None,
         );
         assert_eq!(runtime.search("us.xai.grok-4.7"), Search::None);
+        // Nor does it take custom tools; OpenAI's own API does.
+        assert!(!runtime.grammars() && !bedrock_gpt.grammars());
+        assert!(provider(Family::Responses, "https://api.openai.com/v1", Some("k")).grammars());
         assert!(!runtime.searches());
         assert_eq!(
             tools(&runtime, "us.xai.grok-4.7", ECHO, true),

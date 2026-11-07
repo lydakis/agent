@@ -7,6 +7,7 @@
 //! model = "anthropic/claude-opus-5-5"  # a new agent's, with none named
 //! provider = "chatgpt"          # the daemon's, with no AGENT_PROVIDER; an edit applies to its next turns
 //! web_search = "disabled"       # "live", the default, lets new agents search and fetch
+//! web_search_off = ["bedrock-openai/xai.*"]  # models a new agent gets no search on, * and ? wildcards
 //! senders = "hidden"            # "shown", the default, labels what agents send
 //! attach_wait = "1d"            # how long an attached note waits for a call, the default; "0" as long as it takes
 //! hold = "5d"                   # how long a new agent's turn waits on a cause you can fix before it fails, the default; "0" fails at once
@@ -119,6 +120,11 @@ pub struct Config {
     /// and `web_fetch`, as Codex's `web_search` key says: `"live"`, the
     /// default, or `"disabled"`.
     pub web_search: WebSearch,
+    /// `web_search_off`: `PROVIDER/MODEL` patterns, `*` and `?` wildcards,
+    /// of models a new agent gets no search on though their provider
+    /// offers it, for a model the provider's hosted search refuses (Grok
+    /// on Bedrock Mantle). It still fetches pages.
+    pub web_search_off: Vec<String>,
     /// Whether a new agent's model reads what another agent or a client
     /// sent it with no line naming the sender: `senders = "hidden"`;
     /// `"shown"`, the default, names it.
@@ -410,6 +416,37 @@ impl ShellEnvironmentPolicy {
             .map(|pattern| (*pattern).to_owned());
         defaults.chain(self.exclude.iter().cloned()).collect()
     }
+}
+
+/// Whether `path` matches `pattern`: `*` any run of characters and `?`
+/// any one, in any ASCII case.
+pub fn matches(pattern: &str, path: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let path: Vec<char> = path.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let (mut p, mut n) = (0, 0);
+    // The last `*` seen, and where in the path its run ends so far.
+    let mut star: Option<(usize, usize)> = None;
+    while n < path.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                star = Some((p, n));
+                p += 1;
+            }
+            Some(&c) if c == '?' || c == path[n] => {
+                p += 1;
+                n += 1;
+            }
+            _ => match star {
+                Some((at, end)) => {
+                    star = Some((at, end + 1));
+                    p = at + 1;
+                    n = end + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == '*')
 }
 
 /// Codex's `web_search` modes this runtime serves. Codex's `cached`, an
@@ -1234,6 +1271,21 @@ fn parse(text: &str) -> Result<Config, String> {
                 "disabled" => WebSearch::Disabled,
                 other => return Err(format!("web_search is live or disabled, not {other}")),
             };
+            continue;
+        }
+        if name == "web_search_off" {
+            let patterns = value
+                .as_array()
+                .ok_or("web_search_off is a list of PROVIDER/MODEL patterns")?;
+            for pattern in patterns {
+                let pattern = pattern
+                    .as_str()
+                    .filter(|p| p.contains('/') && !p.contains(char::is_whitespace))
+                    .ok_or_else(|| {
+                        format!("web_search_off holds PROVIDER/MODEL patterns, * and ? wildcards, as \"bedrock-openai/xai.*\", not {pattern}")
+                    })?;
+                config.web_search_off.push(pattern.to_owned());
+            }
             continue;
         }
         if name == "senders" {
@@ -2335,6 +2387,23 @@ mod tests {
         );
         let off = parse("web_search = \"disabled\"").unwrap();
         assert_eq!(off.web_search, WebSearch::Disabled);
+        let named = parse("web_search_off = [\"bedrock-openai/xai.*\"]").unwrap();
+        assert_eq!(named.web_search_off, ["bedrock-openai/xai.*"]);
+        assert!(matches(
+            &named.web_search_off[0],
+            "bedrock-openai/xai.grok-4.6"
+        ));
+        assert!(!matches(
+            &named.web_search_off[0],
+            "bedrock-openai/openai.gpt-6-astra"
+        ));
+        for bad in [
+            "web_search_off = \"x/y\"",
+            "web_search_off = [\"grok\"]",
+            "web_search_off = [1]",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
         assert!(!config.hide_senders);
         assert_eq!(config.sonny.side_chat, SideChat::Fork);
         let answer = parse("[sonny]\nside_chat = \"answer\"").unwrap();

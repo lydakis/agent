@@ -2461,7 +2461,12 @@ pub(crate) fn made(
 ) -> Result<(), String> {
     let config = agent_client::config::load()?;
     let declare = json!(declared::tools(served::Role::TASK));
-    let tools = agent_client::default_tools(client.providers(), model, config.web_search);
+    let tools = agent_client::default_tools(
+        client.providers(),
+        model,
+        config.web_search,
+        &config.web_search_off,
+    );
     asked["tools"] = json!(tools);
     asked["declare"] = declare.clone();
     asked["compaction_instructions"] = json!(agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS);
