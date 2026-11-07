@@ -7252,3 +7252,36 @@ neither sends nor reads a take; the same measure at 10x100 moved +0.7%.
 | lifecycle | CPU, s | 1.235 | 1.185 | -4.0% |
 | lifecycle | p95 turn, ms | 584.283 | 579.215 | -0.9% |
 | lifecycle | peak RSS, MiB | 27.512 | 27.596 | +0.3% |
+
+## A turn's reply shaped by a JSON Schema (#722)
+
+`submit`'s `output_schema` (protocol 51, schema 81) is kept in one
+nullable `turns.output_schema` column. A turn without one stores NULL and
+reads one more column in the context query it already runs when it starts,
+so its store work is unchanged: no new statement, row or index. A judge
+turn sends its fixed schema, about 0.6 KB, with each model call, and gets
+no keep-warm refresh. The migration adds the column once at open.
+
+The Perf workflow's matched screen of this change against its base
+(`bench.perf_gate`, GitHub runner, head 61b4ab1 against main 8bd20e2):
+store work per turn is the same and the gate gave no warnings. Lifecycle
+CPU moved +7.7% while its p95 turn moved -11.5%, both inside the runner's
+spread, and the completion and footprint moves stay under 4%.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 30.77 | 30.917 | +0.5% |
+| admission | burst submit p99, ms | 4.285 | 4.221 | -1.5% |
+| completion | release to terminal p99, ms | 9.548 | 9.863 | +3.3% |
+| footprint | idle RSS, MiB | 20.389 | 20.355 | -0.2% |
+| footprint | per idle bot, KiB | 1.56 | 1.48 | -5.1% |
+| footprint | RSS after a turn each, MiB | 30.451 | 30.555 | +0.3% |
+| footprint | CPU per turn, ms | 0.893 | 0.927 | +3.8% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 8.435 | 8.685 | +3.0% |
+| sonny | lookout note p95 at 10x100, ms | 2879.0 | 3004.5 | +4.4% |
+| sonny | lookout note p95 at 100x10, ms | 2977.5 | 2901.0 | -2.6% |
+| sonny | quiet window CPU, ms/s | 3.335 | 3.035 | -9.0% |
+| sonny | sky replay CPU per 1k lines, ms | 10.17 | 9.34 | -8.2% |
+| lifecycle | CPU, s | 0.845 | 0.91 | +7.7% |
+| lifecycle | p95 turn, ms | 702.273 | 621.715 | -11.5% |
+| lifecycle | peak RSS, MiB | 27.988 | 27.758 | -0.8% |
