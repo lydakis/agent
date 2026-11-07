@@ -223,10 +223,9 @@ async fn tab(caller: &str, project: &str, name: &str) -> String {
         Some(_) => name.to_owned(),
         None => format!("{project}.{name}"),
     };
-    match crate::show(caller, &bot, None, None).await {
-        Ok(_) => String::new(),
-        Err(error) => format!("\n\nNo tab opened for it: {error}"),
-    }
+    crate::task_tab(caller, &bot)
+        .await
+        .unwrap_or_else(|error| format!("\n\nNo tab opened for it: {error}"))
 }
 
 fn remove() -> Value {
