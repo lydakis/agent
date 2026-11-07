@@ -386,6 +386,11 @@ pub struct Runner {
     poked: std::sync::Arc<tokio::sync::Notify>,
     /// What each command source keeps across its restarts.
     lasting: HashMap<String, Lasting>,
+    /// The sources last set, to start one again.
+    sources: Vec<Source>,
+    /// What subscriptions want of each source with `wants`, as its file
+    /// last said.
+    wants: HashMap<String, Value>,
 }
 
 /// What a command source keeps across a restart on an edited command:
@@ -406,6 +411,8 @@ impl Runner {
             unreadable: None,
             poked: std::sync::Arc::new(tokio::sync::Notify::new()),
             lasting: HashMap::new(),
+            sources: Vec::new(),
+            wants: HashMap::new(),
         }
     }
 
@@ -437,6 +444,7 @@ impl Runner {
     /// one whose command files changed since it started starts again on
     /// them, as a service manager restarts a unit on its new binary.
     pub fn set(&mut self, sources: Vec<Source>) {
+        self.sources = sources.clone();
         let wanted: HashSet<&str> = sources.iter().map(|s| s.name.as_str()).collect();
         self.lasting
             .retain(|name, _| wanted.contains(name.as_str()));
@@ -477,6 +485,18 @@ impl Runner {
                 continue;
             }
             let dir = self.dir.join(&source.name);
+            // What subscriptions want of it is on disk before it runs.
+            if let Some(field) = &source.wants {
+                let wants = (self.wants.get(&source.name).cloned())
+                    .unwrap_or_else(|| json!({"field": field, "all": false, "values": []}));
+                let _ = super::make_dir(&dir);
+                let file = wants_file(&dir);
+                let _ = super::write_moved(
+                    &file.with_extension("partial"),
+                    &file,
+                    &format!("{wants:#}\n"),
+                );
+            }
             let sent = self.sent.clone();
             let shape = shape_file(&self.dir, &source.name);
             let keeps = recent_file(&self.dir, &source.name);
@@ -509,6 +529,69 @@ impl Runner {
                 .insert(source.name.clone(), (source, stamp, task));
         }
     }
+}
+
+impl Runner {
+    /// What `subscribers`' subscriptions want of each source with
+    /// `wants` now: one whose wants changed has them written and starts
+    /// again on them, as one whose command changed does.
+    pub fn wanted_by(&mut self, subscribers: &HashMap<String, Vec<super::subs::Sub>>) {
+        let mut changed = Vec::new();
+        for source in &self.sources {
+            let Some(field) = &source.wants else {
+                continue;
+            };
+            let subs = subscribers.values().flatten();
+            let (all, values) = super::subs::wanted(subs, &source.name, field);
+            let wants = json!({"field": field, "all": all, "values": values});
+            if self.wants.get(&source.name) != Some(&wants) {
+                self.wants.insert(source.name.clone(), wants);
+                changed.push(source.name.clone());
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        for name in &changed {
+            if let Some((.., task)) = self.running.remove(name) {
+                task.abort();
+                println!(
+                    "{}",
+                    json!({"event": "source_stopped", "source": name, "why": "what its subscriptions want changed"})
+                );
+            }
+        }
+        self.set(self.sources.clone());
+    }
+}
+
+/// What a source with `wants` fetches, as a `subscriptions` answer says.
+pub const WANTS: &str = "A source with wants fetches only the values of that field that \
+    subscriptions' filters name, as {\"id\": [\"CR-12\"]}, or a topic as NAME:TOPIC when it \
+    wants topic; while one subscription names none, it fetches everything.";
+
+/// Mark each source a `subscriptions` answer lists that has `wants`, and
+/// say once what that means.
+pub fn say_wants(listed: &mut Value) {
+    let wants: HashMap<String, String> = (configured().unwrap_or_default().into_iter())
+        .filter_map(|source| Some((source.name, source.wants?)))
+        .collect();
+    let mut any = false;
+    for source in listed["sources"].as_array_mut().into_iter().flatten() {
+        if let Some(field) = source["name"].as_str().and_then(|name| wants.get(name)) {
+            source["wants"] = json!(field);
+            any = true;
+        }
+    }
+    if any {
+        listed["wants"] = json!(WANTS);
+    }
+}
+
+/// Where a source with `wants` reads what subscriptions want of it, as
+/// `SONNY_SOURCE_WANTS` names it: in its own folder.
+pub fn wants_file(dir: &Path) -> PathBuf {
+    dir.join(".wants.json")
 }
 
 impl Drop for Runner {
@@ -807,7 +890,12 @@ async fn once(
     shape: &mut Shape,
     tail: &Arc<Mutex<VecDeque<String>>>,
 ) -> Result<std::process::ExitStatus, String> {
-    let mut child = tokio::process::Command::new("sh")
+    let mut command = tokio::process::Command::new("sh");
+    // Only a source with `wants` is told where they are.
+    if source.wants.is_some() {
+        command.env("SONNY_SOURCE_WANTS", wants_file(dir));
+    }
+    let mut child = command
         .arg("-c")
         .arg(&source.command)
         .env("SONNY_SOURCE", &source.name)
@@ -1517,6 +1605,7 @@ mod tests {
             steer: None,
             watch: Vec::new(),
             icon: None,
+            wants: None,
         }
     }
 
@@ -1947,6 +2036,7 @@ mod tests {
             steer: None,
             watch: Vec::new(),
             icon: None,
+            wants: None,
         }]);
         let mut texts = Vec::new();
         while texts.len() < 3 {
@@ -1996,6 +2086,7 @@ mod tests {
             steer: None,
             watch: vec![script.display().to_string()],
             icon: None,
+            wants: None,
         };
         runner.set(vec![source.clone()]);
         assert_eq!(next_event(&mut got).await.text, "v1");
@@ -2041,6 +2132,7 @@ mod tests {
             steer: None,
             watch: vec![script.display().to_string()],
             icon: None,
+            wants: None,
         };
         // Each edit starts it again: three failed runs in a row.
         let edit = |body: &str, n: u64| {
@@ -2077,6 +2169,111 @@ mod tests {
         }
         assert!(texts.iter().any(|t| t.contains("works again")), "{texts:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_source_that_wants_a_field_reads_what_subscriptions_want_and_starts_again_on_a_change()
+     {
+        let dir = std::env::temp_dir().join(format!("lookout-wants-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sent, mut got) = tokio::sync::mpsc::channel(16);
+        let mut runner = Runner::new(dir.join("state"), sent);
+        // It prints what it was asked for, once an hour.
+        let source = Source {
+            name: "cr".into(),
+            command: "echo \"wants $(tr -d '\\n ' < \"$SONNY_SOURCE_WANTS\")\"".into(),
+            every: Some("1h".into()),
+            digest: None,
+            steer: None,
+            watch: Vec::new(),
+            icon: None,
+            wants: Some("id".into()),
+        };
+        runner.set(vec![source]);
+        let wants = |text: String| -> Value {
+            serde_json::from_str(text.strip_prefix("wants ").unwrap()).unwrap()
+        };
+        let first = wants(next_event(&mut got).await.text);
+        assert_eq!(first, json!({"field": "id", "all": false, "values": []}));
+        let sub = |name: &str, filter: Value| super::super::subs::Sub {
+            name: name.into(),
+            tasks_of: Vec::new(),
+            bots: Vec::new(),
+            sources: vec!["cr".into()],
+            filter: Some(filter),
+            digest: None,
+            steer: None,
+            owner: None,
+            until: None,
+            runs: None,
+            made: None,
+        };
+        let subscribers = HashMap::from([(
+            "shop.lead".to_owned(),
+            vec![sub("mine", json!({"id": ["CR-12", "CR-14"]}))],
+        )]);
+        runner.wanted_by(&subscribers);
+        let wanted = wants(next_event(&mut got).await.text);
+        assert_eq!(wanted["values"], json!(["CR-12", "CR-14"]));
+        // The same wants start nothing again.
+        runner.wanted_by(&subscribers);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), got.recv())
+                .await
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_subscriptions_want_of_a_field_is_the_values_their_filters_name() {
+        let sub = |sources: &[&str], filter: Option<Value>| super::super::subs::Sub {
+            name: "s".into(),
+            tasks_of: Vec::new(),
+            bots: Vec::new(),
+            sources: sources.iter().map(|s| (*s).to_owned()).collect(),
+            filter,
+            digest: None,
+            steer: None,
+            owner: None,
+            until: None,
+            runs: None,
+            made: None,
+        };
+        let wanted = |subs: &[super::super::subs::Sub], field: &str| {
+            super::super::subs::wanted(subs, "cr", field)
+        };
+        let ids = sub(&["cr"], Some(json!({"id": ["CR-12"], "author": ["ana"]})));
+        let or = sub(
+            &["cr"],
+            Some(json!({"$or": [{"id": ["CR-14"]}, {"id": ["CR-12", 7]}]})),
+        );
+        let other = sub(&["ci"], None);
+        assert_eq!(
+            wanted(&[ids.clone(), or.clone(), other], "id"),
+            (false, vec![json!("CR-12"), json!("CR-14"), json!(7)])
+        );
+        // A nested field, by its dotted name.
+        let repo = sub(&["cr"], Some(json!({"meta": {"repo": ["agent"]}})));
+        assert_eq!(wanted(&[repo], "meta.repo"), (false, vec![json!("agent")]));
+        // One that names no exact values wants everything.
+        let prefix = sub(&["cr"], Some(json!({"id": [{"prefix": "CR-"}]})));
+        let half = sub(
+            &["cr"],
+            Some(json!({"$or": [{"id": ["CR-1"]}, {"author": ["ana"]}]})),
+        );
+        let bare = sub(&["cr"], None);
+        for wants_all in [prefix, half, bare] {
+            assert!(wanted(&[ids.clone(), wants_all], "id").0);
+        }
+        // Topics, when the field is the topic.
+        let topics = sub(&["cr:billing", "cr:search"], None);
+        assert_eq!(
+            wanted(std::slice::from_ref(&topics), "topic"),
+            (false, vec![json!("billing"), json!("search")])
+        );
+        assert!(wanted(&[topics], "id").0);
     }
 
     #[test]

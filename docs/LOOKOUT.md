@@ -253,6 +253,36 @@ lookout (for your eng): "The source slack is down: …"`, and like any
 event from the source it waits for the source's digest. A source no
 longer needs code of its own to say that its reads fail.
 
+A source that cannot read everything, a code-review system with
+thousands of changes, say, can let the subscriptions say what to fetch.
+Its `wants` names a field of its events, as `id`, `meta.repo` or
+`topic`:
+
+```toml
+[sonny.sources.cr]
+command = "~/bin/cr-poll"
+wants = "id"
+```
+
+The lookout then writes, to the file `$SONNY_SOURCE_WANTS` names (in the
+source's folder), what the subscriptions to it want of that field: the
+exact values their filters name for it, every branch of an `$or`
+included, and for `topic` the topics named as `NAME:TOPIC` too. `all` is
+true while any subscription to it names no exact values, a `prefix` or a
+bare subscription say, so the command fetches everything:
+
+```
+{"field": "id", "all": false, "values": ["CR-12", "CR-14"]}
+```
+
+The file is written before the command first runs, and again whenever
+the subscriptions' wants change, which starts the command again on them,
+as an edited script does. So an agent that subscribes with
+`{"filter": {"id": ["CR-12"]}}` has the source fetch CR-12: the
+subscription is the setup, with no setup step that drifts from it. The
+`subscriptions` listing marks such a source with its `wants`, and says
+once what that means.
+
 Agents never set a source up; they subscribe to one by name, or to one
 of its topics as `NAME:TOPIC`:
 

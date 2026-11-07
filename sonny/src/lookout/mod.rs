@@ -1179,6 +1179,7 @@ impl Service {
                     if self.rewrote(&event) {
                         reread = Some(Instant::now());
                         self.runner.reload();
+                        self.runner.wanted_by(&self.subscribers);
                         self.reread(&client).await;
                         self.runner.poke();
                     }
@@ -1382,6 +1383,7 @@ impl Service {
                     if reread.is_none_or(|at| now >= at + REREAD) {
                         reread = Some(now);
                         self.runner.reload();
+                        self.runner.wanted_by(&self.subscribers);
                         self.waiting = waiting();
                         for lookout in self.lookouts.values_mut() {
                             lookout.waiting = self.waiting;
@@ -1646,6 +1648,7 @@ impl Service {
             self.write(&json!({"at_ms": now, "lead": name, "reloaded": true}));
         }
         self.subscribers = read;
+        self.runner.wanted_by(&self.subscribers);
         self.registry = watchers(&self.subscribers);
         let records: Vec<Value> = (self.subscribers.keys())
             .filter_map(|name| self.records.get(name).cloned())
@@ -5768,6 +5771,7 @@ mod tests {
             steer: None,
             watch: Vec::new(),
             icon: None,
+            wants: None,
         };
         let down = sources::Event::of_lookout(&source, "down", "down".into(), json!({}));
         // A topic of it, and a filter the notice never matches, hear it.
@@ -6506,6 +6510,7 @@ mod tests {
             steer: None,
             watch: Vec::new(),
             icon: None,
+            wants: None,
         }
     }
 

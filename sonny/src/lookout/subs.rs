@@ -529,6 +529,82 @@ pub fn matches(glob: &str, name: &str) -> bool {
     rest.is_empty()
 }
 
+/// What subscriptions want of `source`'s events by its `field`: whether
+/// one wants them all (it names the source and no exact values of the
+/// field), else the values their filters name for it, as `ci:main` names
+/// a topic. So a source that cannot read everything reads only these.
+pub fn wanted<'a>(
+    subs: impl IntoIterator<Item = &'a Sub>,
+    source: &str,
+    field: &str,
+) -> (bool, Vec<Value>) {
+    let path: Vec<&str> = field.split('.').collect();
+    let mut values: Vec<Value> = Vec::new();
+    let mut all = false;
+    for sub in subs {
+        let naming: Vec<Option<&str>> = (sub.sources.iter())
+            .map(|name| super::sources::named(name))
+            .filter(|(of, _)| *of == source)
+            .map(|(_, topic)| topic)
+            .collect();
+        if naming.is_empty() {
+            continue;
+        }
+        // Its filter names the values, for every topic it hears.
+        if let Some(filter) = &sub.filter {
+            let mut named = Vec::new();
+            if pinned(filter, &path, &mut named) {
+                values.extend(named);
+                continue;
+            }
+        }
+        // Else each topic it names is the value when the field is the topic.
+        match field == "topic" && naming.iter().all(Option::is_some) {
+            true => values.extend(naming.into_iter().flatten().map(|t| json!(t))),
+            false => all = true,
+        }
+    }
+    values.sort_by_key(Value::to_string);
+    values.dedup();
+    (all, values)
+}
+
+/// Whether `pattern` lets through only events whose field at `path` is one
+/// of exact values, which it adds to `values`: a list of plain values
+/// there, or every branch of its `$or` so.
+fn pinned(pattern: &Value, path: &[&str], values: &mut Vec<Value>) -> bool {
+    let mut at = pattern;
+    for part in path {
+        match at.get(part) {
+            Some(next) => at = next,
+            None => {
+                at = &Value::Null;
+                break;
+            }
+        }
+    }
+    if let Some(items) = at.as_array()
+        && !items.is_empty()
+        && items
+            .iter()
+            .all(|v| v.is_string() || v.is_number() || v.is_boolean())
+    {
+        values.extend(items.iter().cloned());
+        return true;
+    }
+    match pattern.get("$or").and_then(Value::as_array) {
+        Some(branches) if !branches.is_empty() => {
+            let mut named = Vec::new();
+            if branches.iter().all(|b| pinned(b, path, &mut named)) {
+                values.extend(named);
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// How far back a subscription's counts go, by the hour.
 const COUNTED_HOURS: u64 = 24;
 const HOUR_MS: u64 = 60 * 60 * 1000;
