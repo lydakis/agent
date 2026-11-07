@@ -126,8 +126,20 @@ pub struct Places {
 
 impl Places {
     pub fn home() -> Result<Self, String> {
+        /// The HOME whose folder was found moved: the record that says so
+        /// is not read again for each look at the folder, as a window
+        /// looks every ten seconds.
+        static MOVED_IN: std::sync::Mutex<Option<std::ffi::OsString>> = std::sync::Mutex::new(None);
         let home = std::env::var_os("HOME").ok_or("no HOME for automations")?;
-        Ok(Self::moved(Path::new(&home), false))
+        let mut moved = MOVED_IN.lock().unwrap_or_else(|p| p.into_inner());
+        if moved.as_ref() == Some(&home) {
+            return Ok(Self::under(Path::new(&home)));
+        }
+        let places = Self::moved(Path::new(&home), false);
+        if places.state == Self::under(Path::new(&home)).state {
+            *moved = Some(home);
+        }
+        Ok(places)
     }
     /// The places under `home`, with `~/.agent/triggers`, as the folder was
     /// named before 0.8.0, moved to its place first, and a restore's list
@@ -1768,13 +1780,23 @@ pub fn upcoming(places: &Places, store_id: &str, now: i64) -> Vec<Upcoming> {
 /// it is for: the one it messages, the one that added it to start that
 /// one, and the one its answers go to.
 pub fn on_store(places: &Places, store_id: &str) -> Vec<(Value, Vec<String>)> {
+    on_store_until(places, store_id).0
+}
+
+/// [`on_store`], and the first time, in seconds, at which what it says
+/// changes with time alone: a one-off's row that turns missed then.
+pub fn on_store_until(places: &Places, store_id: &str) -> (Vec<(Value, Vec<String>)>, Option<i64>) {
+    let now = now();
+    let mut until: Option<i64> = None;
     let mut found: Vec<(Value, Vec<String>)> = triggers(places)
         .into_iter()
         .filter(|(t, _)| t.store_id == store_id)
         .map(|(t, _)| {
             let mut row = t.json(&state(places, &t));
-            if t.at.is_some_and(|at| now() > at + SLACK) {
-                row["missed"] = json!(true);
+            match t.at.map(|at| at + SLACK) {
+                Some(missed) if now > missed => row["missed"] = json!(true),
+                Some(missed) => until = Some(until.map_or(missed + 1, |u| u.min(missed + 1))),
+                None => {}
             }
             let mut bots = vec![t.bot().to_owned()];
             // Whose it is, as an ended one's row says too: its failures
@@ -1823,7 +1845,7 @@ pub fn on_store(places: &Places, store_id: &str) -> Vec<(Value, Vec<String>)> {
         found.push((row, bots));
     }
     found.sort_by(|a, b| a.0["name"].as_str().cmp(&b.0["name"].as_str()));
-    found
+    (found, until)
 }
 
 /// One trigger's row, as `list` shows it; none when no trigger of that
@@ -2495,9 +2517,12 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, kept: &Kept) -> b
     // One that did not deliver ends only once why is on disk; else its
     // definition stays, listed. Its row stays whatever came of it: one that sent keeps
     // it until its turn is known to have ended well (`forget_done`), so a
-    // turn that fails after the send still shows.
+    // turn that fails after the send still shows. A one-off its `--if`
+    // said no to has nothing to say, as an ask's deadline once the ask
+    // was answered: it leaves nothing.
     if over && (sent || recorded.is_ok()) {
-        return retire(places, &trigger.name, true).map_or_else(log, |_| true);
+        let keep = !said_no(&json!({"once": trigger.at.is_some(), "last": outcome}));
+        return retire(places, &trigger.name, keep).map_or_else(log, |_| true);
     }
     recorded.is_ok()
 }
@@ -2934,7 +2959,7 @@ pub fn cleanup_by_default(lead: &Value, store: &Path, socket: &Path) {
 
 /// Where why Sonny could not schedule the nightly cleanup is kept, until
 /// it can.
-fn cleanup_unscheduled_path(home: &Path) -> PathBuf {
+pub(crate) fn cleanup_unscheduled_path(home: &Path) -> PathBuf {
     home.join(".agent/sonny/cleanup-not-scheduled.json")
 }
 
@@ -4067,7 +4092,7 @@ async fn deliver(
         Target::Bot { name, id } => (
             name.clone(),
             false,
-            sending(trigger, name, *id, prompt(), false, ask),
+            sending(trigger, name, *id, prompt(), ask),
             trigger.clone(),
         ),
         Target::Start {
@@ -4092,7 +4117,7 @@ async fn deliver(
             (
                 name.clone(),
                 started,
-                sending(trigger, name, id, prompt(), started, ask),
+                sending(trigger, name, id, prompt(), ask),
                 trigger.clone(),
             )
         }
@@ -4125,7 +4150,7 @@ async fn deliver(
                         }
                         prompt.push_str(&trigger.message);
                         let id = run.id.unwrap_or_default();
-                        let asking = sending(trigger, &run.bot, id, prompt, true, ask);
+                        let asking = sending(trigger, &run.bot, id, prompt, ask);
                         run.sent = Some(json!({"generation": trigger.generation,
                             "reply_to": trigger.reply_to, "submit": asking}));
                         kept.runs.running = Some(run.clone());
@@ -4157,24 +4182,12 @@ async fn deliver(
     reply(client, &sender, bot, outcome).await
 }
 
-/// The request a fire sends `bot` (`id`) with `prompt`. A new agent
-/// (`started`) is resting, so its first message never waits.
-fn sending(
-    trigger: &Trigger,
-    bot: &str,
-    id: i64,
-    prompt: String,
-    started: bool,
-    ask: Option<&Asked>,
-) -> Value {
-    let asked = ask.is_some_and(|a| a.kind.sends());
-    let delivery = if trigger.at.is_some() || asked || started {
-        "queue"
-    } else {
-        "reject"
-    };
+/// The request a fire sends `bot` (`id`) with `prompt`: a turn of its
+/// own, after whatever the agent is doing. Whether a repeating fire goes
+/// at all is [`submit`]'s to say.
+fn sending(trigger: &Trigger, bot: &str, id: i64, prompt: String, ask: Option<&Asked>) -> Value {
     json!({"bot": bot, "bot_id": id, "request_id": request_id(trigger, id, ask),
-        "prompt": prompt, "delivery": delivery, "origin": ORIGIN,
+        "prompt": prompt, "delivery": "queue", "origin": ORIGIN,
         "budget_tokens": trigger.turn_budget_tokens, "budget_counts": trigger.budget_counts})
 }
 
@@ -4436,8 +4449,10 @@ async fn shadow(
         stamp(now()),
         trigger.message
     );
+    // The copy is new and at rest, so its turn starts at once; one of its
+    // own, as a turn cap needs.
     let asking = json!({"bot": name, "bot_id": shadow, "request_id": request_id(trigger, shadow, ask),
-        "prompt": prompt, "delivery": "reject", "origin": ORIGIN,
+        "prompt": prompt, "delivery": "queue", "origin": ORIGIN,
         "budget_tokens": trigger.turn_budget_tokens, "budget_counts": trigger.budget_counts});
     let sent = json!({"store_id": trigger.store_id, "generation": trigger.generation,
         "reply_to": trigger.reply_to, "shadow_of": bot, "submit": asking});
@@ -4564,7 +4579,7 @@ async fn report(
             "submit",
             json!({"bot": to, "bot_id": to_id,
                 "request_id": format!("{}shadow.{to_id}.{id}.{turn}", sent_by(trigger)),
-                "prompt": prompt, "delivery": "queue", "from": {"bot": bot, "turn": turn}}),
+                "prompt": prompt, "delivery": "steer", "from": {"bot": bot, "turn": turn}}),
         )
         .await;
     let mut reply = match sent {
@@ -4635,21 +4650,19 @@ async fn submit(
     ask: Option<&Asked>,
 ) -> Value {
     let id = asking["bot_id"].as_i64().unwrap_or_default();
-    let mut submitted = client.request("submit", asking.clone()).await;
     // A repeating trigger's fire that finds its agent busy waits behind its
     // work, as anacron runs a missed job once: one fire of the trigger
-    // waits at a time, so a frequent one does not pile up.
-    let mut late = false;
-    if let Err(error) = &submitted
-        && matches!(error.code.as_str(), "bot_busy" | "active_agent_limit")
-        && asking["delivery"] == "reject"
-        && waiting_fire(client, trigger, bot).await == Some(false)
-    {
-        let mut queued = asking.clone();
-        queued["delivery"] = json!("queue");
-        submitted = client.request("submit", queued).await;
-        late = submitted.is_ok();
-    }
+    // waits at a time, so a frequent one does not pile up. A one-off, a
+    // fire asked for and a new agent's first message always go.
+    let repeating = trigger.at.is_none() && !started && !ask.is_some_and(|a| a.kind.sends());
+    let request = asking["request_id"].as_str().unwrap_or_default();
+    let submitted = match repeating && waiting_fire(client, trigger, bot, request).await {
+        true => Err(agent_client::Error::with(
+            "bot_busy",
+            "an earlier fire waits behind its work",
+        )),
+        false => client.request("submit", asking.clone()).await,
+    };
     let outcome = match submitted {
         Ok(turn) => {
             let mut sent = json!({"outcome": "sent", "turn": turn["turn"],
@@ -4657,7 +4670,8 @@ async fn submit(
             if started {
                 sent["started"] = json!(true);
             }
-            if late {
+            // Behind the agent's work, or waiting for room to run.
+            if matches!(turn["status"].as_str(), Some("queued" | "ready")) {
                 sent["late"] = json!(true);
             }
             // A `fire NAME` waiting for this one finds its turn in its
@@ -4901,42 +4915,57 @@ fn request_id(trigger: &Trigger, id: i64, ask: Option<&Asked>) -> String {
     }
 }
 
-/// Whether a fire of `trigger` already waits behind `bot`'s work; `None`
-/// when the agent's turns could not be read. Queued work starts in order,
-/// so nothing older than a turn that started still waits: the turns are
-/// read newest first, a page at a time, until one that started. Rows that
-/// never ran (a steer the running turn took in, a message cancelled while
-/// it waited, a note attached to the next turn) are passed over.
-async fn waiting_fire(client: &Client, trigger: &Trigger, bot: &str) -> Option<bool> {
+/// Whether another fire of `trigger` already waits behind `bot`'s work.
+/// Queued work starts in order, so nothing older than a turn that started
+/// still waits: the turns are read newest first, a page at a time, until
+/// one that started. Rows that never ran (a steer the running turn took
+/// in, a message cancelled while it waited, a note attached to the next
+/// turn) are passed over. `request` itself, sent before by an attempt cut
+/// short, is not another: sent again, it is the same turn. Turns that
+/// cannot be read hold no fire back, so a fire is never lost to a read.
+///
+/// Every repeating fire asks, so the first page is small: an agent at rest
+/// or at work is answered by its newest turn.
+async fn waiting_fire(client: &Client, trigger: &Trigger, bot: &str, request: &str) -> bool {
     let ours = sent_by(trigger);
     let mut before: Option<i64> = None;
+    let mut limit = 8;
     loop {
-        let mut page = json!({"bot": bot, "newest": true, "limit": 256});
+        let mut page = json!({"bot": bot, "newest": true, "limit": limit});
         if let Some(before) = before {
             page["before"] = json!(before);
         }
-        let read = client.request("turns", page).await.ok()?;
-        let turns = read["turns"].as_array()?;
+        let Ok(read) = client.request("turns", page).await else {
+            return false;
+        };
+        let Some(turns) = read["turns"].as_array() else {
+            return false;
+        };
         for turn in turns {
-            match turn["status"].as_str()? {
-                "running" | "waiting" | "paced" | "completed" | "failed" => return Some(false),
-                "queued" | "ready"
-                    if (turn["request_id"].as_str()).is_some_and(|id| id.starts_with(&ours)) =>
-                {
-                    return Some(true);
+            let id = turn["request_id"].as_str();
+            match turn["status"].as_str() {
+                Some("running" | "waiting" | "paced" | "completed" | "failed") | None => {
+                    return false;
+                }
+                Some("queued" | "ready") if id == Some(request) => return false,
+                Some("queued" | "ready") if id.is_some_and(|id| id.starts_with(&ours)) => {
+                    return true;
                 }
                 _ => {}
             }
         }
         match turns.last().and_then(|turn| turn["turn"].as_i64()) {
-            Some(oldest) if turns.len() == 256 => before = Some(oldest),
-            _ => return Some(false),
+            Some(oldest) if turns.len() == limit => before = Some(oldest),
+            _ => return false,
         }
+        limit = 256;
     }
 }
 
-/// With `--reply-to`, wait for the turn a fire sent and queue its answer
-/// to that agent; what came of it is the outcome's `reply`.
+/// With `--reply-to`, wait for the turn a fire sent and pass its answer
+/// to that agent as a steer, as the lookout tells a task's update: it
+/// joins the agent's running turn or starts one. What came of it is the
+/// outcome's `reply`.
 async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value) -> Value {
     let (Some((to, to_id)), Some(turn)) = (&trigger.reply_to, outcome["turn"].as_i64()) else {
         return outcome;
@@ -4978,7 +5007,7 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
             "submit",
             json!({"bot": to, "bot_id": to_id,
                 "request_id": format!("{}reply.{to_id}.{turn}", sent_by(trigger)),
-                "prompt": prompt, "delivery": "queue", "from": {"bot": bot, "turn": turn}}),
+                "prompt": prompt, "delivery": "steer", "from": {"bot": bot, "turn": turn}}),
         )
         .await;
     outcome["reply"] = match sent {
@@ -5045,23 +5074,36 @@ pub async fn ended(client: &Client, handles: Vec<String>) -> HashMap<String, Val
 /// unit until `reset-failed` and Kubernetes a finished Job until its TTL.
 /// Run by whoever asked the daemon how those turns ended. How many went.
 pub fn forget_done(places: &Places, store_id: &str, ended: &HashMap<String, Value>) -> usize {
-    let done = |name: &str| {
-        let row = read_json(&places.last(name))?;
-        let handle = sent(&row)?;
-        (row["name"] == name
+    forget_among(places, store_id, ended, &on_store(places, store_id))
+}
+
+/// [`forget_done`] among `rows`, as [`on_store`] read them: only those
+/// it finds done are read again, under the lock, before they go. A
+/// one-off whose `--if` said no goes too, nothing having come of it, as
+/// those an earlier Sonny kept do.
+pub fn forget_among(
+    places: &Places,
+    store_id: &str,
+    ended: &HashMap<String, Value>,
+    rows: &[(Value, Vec<String>)],
+) -> usize {
+    let done_row = |row: &Value, name: &str| {
+        row["name"] == name
             && row["store_id"] == store_id
-            && row["last"]["reply"]["outcome"] != "failed"
-            && ended_for(&row, ended)?["status"] == "completed"
-            && !places.job(name).exists())
-        .then_some(handle)
+            && (said_no(row)
+                || (sent(row).is_some()
+                    && row["last"]["reply"]["outcome"] != "failed"
+                    && ended_for(row, ended).is_some_and(|e| e["status"] == "completed")))
     };
-    let names: Vec<String> = (std::fs::read_dir(&places.state)
-        .into_iter()
-        .flatten()
-        .flatten())
-    .filter_map(|e| Some(e.file_name().to_str()?.strip_suffix(".json")?.to_owned()))
-    .filter(|name| valid_name(name).is_ok() && done(name).is_some())
-    .collect();
+    let done = |name: &str| {
+        read_json(&places.last(name)).is_some_and(|row| done_row(&row, name))
+            && !places.job(name).exists()
+    };
+    let names: Vec<&str> = (rows.iter())
+        .filter(|(row, _)| row["ended"] == true)
+        .filter_map(|(row, _)| row["name"].as_str().filter(|name| done_row(row, name)))
+        .filter(|name| valid_name(name).is_ok())
+        .collect();
     if names.is_empty() {
         return 0;
     }
@@ -5074,19 +5116,25 @@ pub fn forget_done(places: &Places, store_id: &str, ended: &HashMap<String, Valu
     // under the name has a job, or a row of its own.
     let mut gone = 0;
     for name in names {
-        if done(&name).is_none() {
+        if !done(name) {
             continue;
         }
-        match std::fs::remove_file(places.last(&name)) {
+        match std::fs::remove_file(places.last(name)) {
             Ok(()) => gone += 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => eprintln!(
                 "{}",
-                error_json(&format!("{}: {e}", places.last(&name).display()))
+                error_json(&format!("{}: {e}", places.last(name).display()))
             ),
         }
     }
     gone
+}
+
+/// Whether `row` is a one-off's whose `--if` said no at its time: it
+/// ended, and nothing came of it to tell.
+fn said_no(row: &Value) -> bool {
+    row["once"] == true && row["last"]["outcome"] == "declined"
 }
 
 /// `row`, its `last` taking how the turn its fire sent ended, from
@@ -7006,6 +7054,53 @@ pub(crate) mod tests {
         assert!(w.install(&cased).unwrap_err().starts_with("name_taken"));
         w.install(&odd).unwrap();
         assert_eq!(w.state(&odd.name), (true, false));
+    }
+
+    #[test]
+    fn a_one_off_its_check_said_no_to_leaves_nothing() {
+        let w = World::new("declined");
+        let one = once();
+        // As an ask's deadline finds the ask answered.
+        w.install(&one).unwrap();
+        w.settle(
+            &one,
+            json!({"outcome": "declined", "detail": "--if: exit status: 1"}),
+        );
+        assert_eq!(w.state(&one.name), (false, false));
+        assert!(!w.places.asks(&one.name).exists());
+        // One that did not deliver still says why.
+        w.install(&one).unwrap();
+        w.settle(&one, json!({"outcome": "skipped", "detail": "bot_busy"}));
+        assert_eq!(w.state(&one.name), (false, true));
+        // A repeating one its check said no to goes on, its row kept.
+        let s = trigger();
+        w.install(&s).unwrap();
+        w.settle(&s, json!({"outcome": "declined"}));
+        assert_eq!(w.state(&s.name), (true, true));
+    }
+
+    #[test]
+    fn rows_an_earlier_sonny_kept_of_one_offs_said_no_to_go() {
+        let w = World::new("declined-kept");
+        let one = once();
+        // As Sonny before kept it: the row stays, the definition gone.
+        w.install(&one).unwrap();
+        record_last(
+            &w.places,
+            &one,
+            &json!({"outcome": "declined", "detail": "--if: exit status: 1"}),
+            &Kept::default(),
+        )
+        .unwrap();
+        std::fs::remove_file(w.places.job(&one.name)).unwrap();
+        let none = HashMap::new();
+        // Another daemon's is not this one's to remove.
+        assert_eq!(forget_done(&w.places, "ffff", &none), 0);
+        assert_eq!(forget_done(&w.places, "00ab", &none), 1);
+        assert_eq!(w.state(&one.name), (false, false));
+        // Found among rows already read, a row gone since is no error.
+        let rows = on_store(&w.places, "00ab");
+        assert_eq!(forget_among(&w.places, "00ab", &none, &rows), 0);
     }
 
     #[test]

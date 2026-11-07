@@ -9,7 +9,7 @@
 use std::{
     io::Write,
     sync::{
-        OnceLock,
+        Arc, LazyLock, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -76,7 +76,7 @@ pub fn graphics() -> bool {
 /// size, else as it answered at start (Rex answers 8×16 for a block it has
 /// not laid out yet, and the real size once it has).
 pub fn cell() -> (u32, u32) {
-    if let Ok(size) = ratatui::crossterm::terminal::window_size()
+    if let Ok(size) = size()
         && size.columns > 0
         && size.rows > 0
         && size.width >= size.columns
@@ -100,7 +100,10 @@ pub async fn laid_out() {
     }
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if ratatui::crossterm::terminal::window_size().is_ok_and(|size| size.width > 0) {
+        // Read anew each time, as nothing here waits for the signal its
+        // resize sends.
+        resized();
+        if size().is_ok_and(|size| size.width > 0) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -150,6 +153,96 @@ pub fn detect() {
                 }
             }
         });
+    }
+}
+
+/// The window's size, in cells and in pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Size {
+    pub columns: u16,
+    pub rows: u16,
+    /// Its pixels, 0 by 0 where the terminal does not say them.
+    pub width: u16,
+    pub height: u16,
+}
+
+/// The window's size as last read, and whether it may have changed since.
+struct Kept {
+    size: Option<Size>,
+}
+
+impl Kept {
+    /// The size kept, read again with `read` when there is none yet or it
+    /// is `stale`. A read that fails keeps nothing, so the next reads again.
+    fn get(
+        &mut self,
+        stale: bool,
+        read: impl FnOnce() -> std::io::Result<Size>,
+    ) -> std::io::Result<Size> {
+        match self.size {
+            Some(size) if !stale => Ok(size),
+            _ => {
+                self.size = None;
+                let size = read()?;
+                self.size = Some(size);
+                Ok(size)
+            }
+        }
+    }
+}
+
+static KEPT: Mutex<Kept> = Mutex::new(Kept { size: None });
+
+/// Set when the window may have changed size since it was last read: by
+/// the kernel's SIGWINCH as it resizes the terminal, by SIGCONT as the
+/// process goes on after a stop (a resize meanwhile went to the shell),
+/// and by [`resized`]. None when the signals could not be watched: the
+/// size is then read every time.
+static STALE: LazyLock<Option<Arc<AtomicBool>>> = LazyLock::new(|| {
+    let stale = Arc::new(AtomicBool::new(true));
+    #[cfg(unix)]
+    for signal in [signal_hook::consts::SIGWINCH, signal_hook::consts::SIGCONT] {
+        signal_hook::flag::register(signal, Arc::clone(&stale)).ok()?;
+    }
+    Some(stale)
+});
+
+/// The window's size, read from the terminal only once it may have
+/// changed: crossterm opens /dev/tty for each read, and a frame took the
+/// size five times, ten frames a second, in every window.
+pub fn size() -> std::io::Result<Size> {
+    let mut kept = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Taken before the read, so a resize during it is read next time.
+    let stale = STALE
+        .as_ref()
+        .is_none_or(|stale| stale.swap(false, Ordering::AcqRel));
+    kept.get(stale, read_size)
+}
+
+/// The window may have changed size: the next [`size`] reads it. For
+/// what the signals do not cover, as a full repaint the person asked for.
+pub fn resized() {
+    if let Some(stale) = STALE.as_ref() {
+        stale.store(true, Ordering::Release);
+    }
+}
+
+/// The window's size as the terminal says it now: its cells and pixels
+/// with one ioctl, else its cells as crossterm finds them otherwise.
+fn read_size() -> std::io::Result<Size> {
+    use ratatui::crossterm::terminal;
+    match terminal::window_size() {
+        Ok(size) if size.columns > 0 && size.rows > 0 => Ok(Size {
+            columns: size.columns,
+            rows: size.rows,
+            width: size.width,
+            height: size.height,
+        }),
+        _ => terminal::size().map(|(columns, rows)| Size {
+            columns,
+            rows,
+            ..Size::default()
+        }),
     }
 }
 
@@ -325,6 +418,33 @@ pub fn copy(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_size_is_read_again_only_once_it_may_have_changed() {
+        let mut kept = Kept { size: None };
+        let reads = std::cell::Cell::new(0);
+        let read = |columns| {
+            let reads = &reads;
+            move || -> std::io::Result<Size> {
+                reads.set(reads.get() + 1);
+                Ok(Size {
+                    columns,
+                    rows: 24,
+                    ..Size::default()
+                })
+            }
+        };
+        // None yet: read, though nothing said it changed.
+        assert_eq!(kept.get(false, read(80)).unwrap().columns, 80);
+        assert_eq!(kept.get(false, read(100)).unwrap().columns, 80);
+        assert_eq!(reads.get(), 1);
+        assert_eq!(kept.get(true, read(100)).unwrap().columns, 100);
+        // A read that fails keeps nothing: the next one reads again.
+        let failed = kept.get(true, || Err(std::io::Error::other("no tty")));
+        assert!(failed.is_err());
+        assert_eq!(kept.get(false, read(90)).unwrap().columns, 90);
+        assert_eq!(reads.get(), 3);
+    }
 
     #[test]
     fn the_theme_answered_holds_again_once_back_on_its_background() {
