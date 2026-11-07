@@ -12628,6 +12628,10 @@ impl App {
                 }
             }
             Some(place) => {
+                // The brief is the person's words: it ends quiet as a
+                // message does, and the task, as ever, hears nothing of it.
+                quiet::spoke();
+                self.quiet = None;
                 self.start_new(&project, &dir, &profile, place, &making, brief)
                     .await
             }

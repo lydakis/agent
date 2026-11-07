@@ -269,6 +269,14 @@ fn start_at(file: &Path, away: Away) -> Result<(), String> {
     }
 }
 
+/// The person wrote words, to any agent and from any window or editor:
+/// they are here, and quiet ends for every agent, until they step away
+/// again. What it was, none if it was off.
+pub fn spoke() -> Option<Away> {
+    mark_present();
+    end()
+}
+
 /// End quiet, for every agent: what it was, none if it was off.
 pub fn end() -> Option<Away> {
     end_at(&away_file()?)

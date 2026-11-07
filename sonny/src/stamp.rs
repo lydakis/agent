@@ -58,10 +58,7 @@ pub fn now(prompt: &str, bot: &str) -> String {
 /// every agent, and a lead they write to first hears since when they were
 /// away.
 pub fn person(prompt: &str, bot: &str) -> String {
-    // Words are use, from a window or an editor alike: the lookout waits
-    // `quiet_after` from here before it starts quiet again.
-    crate::quiet::mark_present();
-    let clause = (crate::quiet::end())
+    let clause = (crate::quiet::spoke())
         .filter(|_| crate::project::is_lead(bot))
         .map(crate::quiet::back_clause);
     stamped_with(prompt, epoch_now(), clause.as_deref())
