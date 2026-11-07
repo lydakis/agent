@@ -2016,7 +2016,7 @@ pub(crate) fn held(path: &Path) -> bool {
     !taken && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
 }
 
-/// One line on the lookout for a subscriber, as `/status` shows it:
+/// One line on the lookout for a subscriber, as `/background` shows it:
 /// whether one runs and watches it, and today's notes.
 pub fn status(store: &std::path::Path, lead: &str) -> String {
     if !running(store) {

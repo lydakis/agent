@@ -309,6 +309,8 @@ pub struct Picks {
     pub threads: Option<ThreadPicks>,
     /// The person's `web_search`, for a coordinator its role gives no tools.
     pub web_search: crate::config::WebSearch,
+    /// The person's `web_search_off`, models it gets no search on.
+    pub web_search_off: Vec<String>,
     /// The person's fallback for each model, from their config.
     pub fallbacks: std::collections::BTreeMap<String, String>,
 }
@@ -412,7 +414,7 @@ pub async fn create(
         "instructions": instructions, "starts_line": true,
         "compaction_instructions": policy["compaction_instructions"],
         "tools": match &policy["tools"] {
-            Value::Null => json!(crate::default_tools(providers, model, picks.web_search)),
+            Value::Null => json!(crate::default_tools(providers, model, picks.web_search, &picks.web_search_off)),
             tools => tools.clone(),
         },
     });
@@ -577,6 +579,7 @@ mod tests {
                 in_project: true,
             }),
             web_search: Default::default(),
+            web_search_off: Vec::new(),
             fallbacks: [("alpha/one".into(), "alpha/two".into())].into(),
         };
         let made = make(&daemon, &dir, &policy, &picks).unwrap();
@@ -821,6 +824,7 @@ mod tests {
             effort: Some("max".into()),
             threads: None,
             web_search: Default::default(),
+            web_search_off: Vec::new(),
             fallbacks: [("alpha/one".into(), "alpha/two".into())].into(),
         };
         let made = make(&daemon, &dir, &json!({"instructions": "rules"}), &picks).unwrap();

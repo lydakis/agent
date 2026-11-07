@@ -1308,11 +1308,15 @@ impl Registry {
     pub fn encoded(
         &self,
         family: Family,
+        grammars: bool,
         names: &[String],
         declared: &[Declared],
         sandboxed: bool,
     ) -> Result<Arc<RawValue>> {
         let mut key = (family, names.join(","));
+        if grammars {
+            key.1.push_str("\0grammars");
+        }
         if sandboxed {
             key.1.push_str("\0sandboxed");
         }
@@ -1343,7 +1347,7 @@ impl Registry {
             }))
             .collect();
         let encoded: Arc<RawValue> = Arc::from(RawValue::from_string(serde_json::to_string(
-            &family.tools(&schemas),
+            &family.tools(&schemas, grammars),
         )?)?);
         let mut encodings = self.encodings.lock().unwrap();
         // Fleets share a few selections; a flood of distinct ones is served

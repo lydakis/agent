@@ -3,8 +3,10 @@
 //! `alpha/search`, as Codex's GPT-6 models search (openai/codex 154e873,
 //! codex-rs/ext/web-search): their "responses lite" mode refuses hosted
 //! tools. The ChatGPT plan refuses both.
-//! Bedrock's Responses endpoint hosts `web_search` for the GPT models it
-//! serves; Anthropic hosts its own server tool, which Bedrock does not.
+//! Bedrock Mantle's Responses endpoint hosts `web_search` for the GPT models
+//! it serves; runtime's OpenAI route takes no server-side tool (AWS's
+//! Responses API guide, read 2026-11-07), so it offers none. Anthropic hosts
+//! its own server tool, which Bedrock does not.
 //! Any other gateway offers none, and a bot there is refused the tool.
 use super::{Provider, connection_error, error_body, pace, refused, retry_after, sanitize_error};
 use crate::{Error, Result, codec::Family, fail_with};
@@ -102,9 +104,9 @@ impl Provider {
     pub fn search(&self, model: &str) -> Search {
         match self.family {
             Family::Responses if self.openai() => Search::Run,
-            // Bedrock serves indexed search only; asking for the live web
-            // takes a permission most roles lack.
-            Family::Responses if self.bedrock => {
+            // Mantle serves indexed search only; asking for the live web
+            // takes a permission most roles lack. Runtime serves none.
+            Family::Responses if self.mantle => {
                 Search::Hosted(r#"{"type":"web_search","external_web_access":false}"#)
             }
             Family::Responses => Search::None,
@@ -359,6 +361,21 @@ mod tests {
         assert_eq!(
             tools(&bedrock_gpt, "openai.gpt-6-sol", "[]", true),
             json!([{"type":"web_search","external_web_access":false}])
+        );
+        // Runtime's OpenAI route takes no server-side tool: no search.
+        let runtime = provider(
+            Family::Responses,
+            "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1",
+            None,
+        );
+        assert_eq!(runtime.search("us.xai.grok-4.7"), Search::None);
+        // Nor does it take custom tools; OpenAI's own API does.
+        assert!(!runtime.grammars() && !bedrock_gpt.grammars());
+        assert!(provider(Family::Responses, "https://api.openai.com/v1", Some("k")).grammars());
+        assert!(!runtime.searches());
+        assert_eq!(
+            tools(&runtime, "us.xai.grok-4.7", ECHO, true),
+            json!([{"type":"function","name":"echo"}])
         );
         let anthropic = provider(Family::Anthropic, "https://api.anthropic.com/v1", Some("k"));
         for (model, version) in [

@@ -1850,6 +1850,11 @@ class ModelListTests(ModelFixture):
         time.sleep(1)
         self.assertFalse(self.catalog.exists())
         self.assertEqual(getattr(self.model, 'listings', 0), 0)
+        # Nor does --discover through one: it refuses and writes nothing.
+        refused = self.agent('models', '--discover', *other, check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('another one', refused.stderr)
+        self.assertFalse(self.catalog.exists())
 
     def test_an_edit_to_the_config_s_providers_applies_without_a_restart(self):
         config = self.home / '.agent' / 'config.toml'

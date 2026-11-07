@@ -782,8 +782,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   the agent may retry it once; the retry is still reviewed, and the
   reviewer reads your words as consent. Codex calls this `/approve`.
 - `/status` shows the project's agents in the pane beside the
-  conversation. The lead comes first; its tasks
-  follow grouped by where they stand: **Needs you** (waiting on your
+  conversation, grouped by where they stand, the lead first in its group: **Needs you** (waiting on your
   approval, asking you a question, held on something only you can fix,
   such as a ChatGPT sign-in, or failed),
   **Working** (a turn running, queued, rate limited, waiting on other
@@ -791,16 +790,17 @@ way `/react` does, and each note in the margin has its own `↩`.
   (its turn ended, stopped, or never started, with nothing open; a pull
   request its last reply linked shows on its row), and **Done** (marked
   done). Each agent is one line: its mark, name, state and time, and at
-  its right edge, dim, what it tracks: what it follows (a source with an
+  its right edge, dim, its code reviews; one that needs you says what for
+  under it. That is all it shows as it opens; `m` shows more and hides it
+  again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
   `icon` in `[sonny.sources.NAME]` shows as that icon, as it does wherever
   Sonny names that source: `/background` and the "From your sources" row), the code reviews
   its turns opened or wait on, in any system, as the copy that checks
   each turn names them from its commands' output and reply (`3 reviews · CR-881`; a pull or merge request link its last
   reply holds shows before any is kept), its background work
-  and its window. The picked agent, and every one that needs you, says
-  more under it: its model and profile, and its latest step. Idle shows
-  its newest eight and a `+5 more · i shows them` line for the rest; Done
-  folds to its heading (`Done · 3 ▸`). A click on either, or `i` and `d`
+  and its window, and under the picked agent its model and profile, and
+  its latest step. Idle and Done fold to their headings (`Idle · 5 ▸`,
+  `Done · 3 ▸`). A click on either, or `i` and `d`
   with the keys in the pane, opens them, and the same folds them again.
   The helpers a task started fold under it (`▸ 2 helpers, 1 working`),
   a helper that needs you listed under Needs you too; a click on that
@@ -836,17 +836,15 @@ way `/react` does, and each note in the margin has its own `↩`.
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
 
-  Under the lookout's line, `/status` says what is wrong around the
-  agents: a companion of the daemon that keeps restarting (down and waiting
-  for its next start, or up for less than a minute after a restart), with a
-  red `✗`, how it exits and its log; and, muted, the skills agents are
-  offered whose front matter has no `description` or one that never says
-  when to use the skill, since that line is all an agent reads before it
-  opens one. Each Sonny start keeps the approver again on its own binary
+  Under its heading, `/status` says only what is broken around the
+  agents, each with a red `✗`: a companion of the daemon that keeps
+  restarting (down and waiting for its next start, or up for less than a
+  minute after a restart), with how it exits and its log, and turns held
+  on something only you can fix, with how to fix it. When all is well it
+  says nothing; the lookout's own line is in `/background`. Each Sonny start keeps the approver again on its own binary
   and build, with the judge it has, so an upgrade restarts it with the
   lookout and the tool host.
 
-  ![/status: a red ✗ notes-sync keeps restarting · exits 1 · 4 restarts, its log, then 2 skills to fix, muted](../docs/sonny/status-alerts.png)
 - `/background` (or `/automations`, `/lookout`) lists, in the pane beside the
   conversation, what runs for the project's agents with
   no one typing: the automations that wake them, with
@@ -1207,7 +1205,9 @@ turn of the task numbered after that one reopens it.
 
 ![A decision the lead asked with the ask tool, drawn where it asked it, its code, bold, math and links read as Markdown](../docs/sonny/ask-markdown.png)
 
-![/status with the lead first, then its tasks under Needs you, Working, Idle and Done, one line each, a picked task's two helpers open under it and code reviews at the right edge](../docs/sonny/status-groups.png)
+![/status as it opens: one task under Needs you saying what it asks, the lead and two tasks under Working with their times and code reviews at the right, a task's helper folded under it, Idle and Done folded to their headings](../docs/sonny/status-groups.png)
+
+![/status after m: what each agent tracks at the right edge, the picked task's model, profile and latest step under it, Idle opened](../docs/sonny/status-more.png)
 
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
 `[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
@@ -1301,8 +1301,8 @@ tells: Sonny's tools are answered by the tool host, `sonny tool-host`, the
 daemon's other companion, so a slow or crashing tool never holds up a
 lead's news. A Sonny that finds another build's lookout or tool host
 running, as one an upgrade left, stops it and starts its own, so its
-agents' new tools are answered. `/status` says when no tool host runs, as
-"tools not answered".
+agents' new tools are answered. `/background` says when no tool host runs, as
+"tools not answered", and `/status` names one that keeps restarting.
 
 The look follows Codex's TUI (openai/codex, `codex-rs/tui`): replies stream a line at a time, each message the bot sends its own block, as
 it keeps them (two in one answer no longer run together), a tool call is one `• Ran …` line with a
