@@ -341,9 +341,10 @@ pub struct Daemon {
 }
 
 /// The daemon's own socket for `socket`, which in a confined bot's shell
-/// on macOS is that bot's (`SOCKET.d/ID`, as the daemon opens them): what
-/// an automation keeps is reached outside every sandbox, after that socket
-/// stops listening, and only the daemon's own lends a gate its sandbox.
+/// on macOS is that bot's (`SOCKET.d/ID`, as the daemon opens them), the
+/// only one the shell itself reaches: what an automation keeps is reached
+/// outside every sandbox, after that socket stops listening, and only the
+/// daemon's own lends a gate its sandbox.
 fn public(socket: PathBuf) -> PathBuf {
     let own = || {
         socket.file_name()?.to_str()?.parse::<i64>().ok()?;
@@ -362,8 +363,7 @@ impl Daemon {
         let absolute = |p: PathBuf| std::path::absolute(&p).unwrap_or(p);
         let socket = std::env::var_os("AGENT_SOCKET")
             .map(PathBuf::from)
-            .map(absolute)
-            .map(public);
+            .map(absolute);
         let store = std::env::var_os("AGENT_STORE")
             .map(PathBuf::from)
             .map(absolute)
@@ -3833,7 +3833,11 @@ fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, 
         runs: asked.runs,
         turn_budget_tokens: asked.turn_budget_tokens,
         budget_counts: asked.budget_counts,
-        daemon,
+        // Kept as the fire, outside every sandbox, reaches it.
+        daemon: Daemon {
+            socket: daemon.socket.map(public),
+            ..daemon
+        },
         store_id,
         message: asked.message,
         shadow: asked.shadow,
