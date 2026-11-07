@@ -71,6 +71,13 @@ const DOWN_AGAIN: Duration = Duration::from_secs(24 * 60 * 60);
 /// how long after the run ends its stderr is read for them.
 const DOWN_STDERR: usize = 5;
 const STDERR_WAIT: Duration = Duration::from_secs(1);
+/// What a source printed lately is kept to test a filter on: this long
+/// back, at most this many events and bytes, an event's fields cut to
+/// this many bytes.
+pub const RECENT_SPAN: Duration = Duration::from_secs(24 * 60 * 60);
+const RECENT_EVENTS: usize = 2_000;
+const RECENT_BYTES: u64 = 4 * 1024 * 1024;
+const RECENT_EVENT_BYTES: usize = 16 * 1024;
 /// The fields every event has, which the note says on its own.
 const OWN: [&str; 7] = ["text", "id", "topic", "from", "url", "steer", "told"];
 /// How the note to the subscriber starts, which Sonny shows folded.
@@ -333,7 +340,7 @@ fn next_seq() -> u64 {
     SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-fn cut(text: &str, max: usize) -> String {
+pub fn cut(text: &str, max: usize) -> String {
     match text.char_indices().nth(max) {
         Some((at, _)) => format!("{}…", &text[..at]),
         None => text.to_owned(),
@@ -472,6 +479,7 @@ impl Runner {
             let dir = self.dir.join(&source.name);
             let sent = self.sent.clone();
             let shape = shape_file(&self.dir, &source.name);
+            let keeps = recent_file(&self.dir, &source.name);
             let stamp = Stamp::of(&source.watch);
             let task = match source.command.is_empty() {
                 true => tokio::spawn(own(
@@ -484,7 +492,13 @@ impl Runner {
                 )),
                 false => {
                     let lasting = self.lasting.entry(source.name.clone()).or_default().clone();
-                    tokio::spawn(run(source.clone(), every, dir, (shape, lasting), sent))
+                    tokio::spawn(run(
+                        source.clone(),
+                        every,
+                        dir,
+                        (shape, keeps, lasting),
+                        sent,
+                    ))
                 }
             };
             println!(
@@ -599,7 +613,7 @@ impl Health {
 }
 
 /// `ms` since the epoch in local time, as messages are stamped.
-fn clock(ms: u128) -> String {
+pub fn clock(ms: u128) -> String {
     crate::stamp::when((ms / 1000) as i64)
 }
 
@@ -609,12 +623,13 @@ async fn run(
     source: Source,
     every: Duration,
     dir: PathBuf,
-    (shape, Lasting { health, seen }): (PathBuf, Lasting),
+    (shape, keeps, Lasting { health, seen }): (PathBuf, PathBuf, Lasting),
     sent: Sender<Said>,
 ) {
     // Held while it runs: a restart's run takes it once this one is gone.
     let mut seen = seen.lock_owned().await;
     let mut shape = Shape::read(shape);
+    shape.keeps = Some(keeps);
     loop {
         let _ = super::make_dir(&dir);
         let stderr = Arc::new(Mutex::new(VecDeque::new()));
@@ -743,6 +758,7 @@ async fn emit(
     }
     shape.saw(&event.fields, event.topic.as_deref());
     let id = event.id.clone();
+    let kept = (shape.keeps.clone()).map(|file| (file, recent_line(&event)));
     if sent.send(Said::Event(Box::new(event))).await.is_err() {
         return false;
     }
@@ -750,6 +766,10 @@ async fn emit(
     // its ID unseen, so the run after it sends it again.
     if let Some(id) = id {
         seen.first(&id);
+    }
+    // Kept to test a filter on once it went, as subscribers heard it.
+    if let Some((file, line)) = kept {
+        shapes::append(file, line);
     }
     true
 }
@@ -953,6 +973,37 @@ pub fn shape_file(dir: &Path, source: &str) -> PathBuf {
     dir.join(".shapes").join(format!("{source}.json"))
 }
 
+/// Where it keeps what a source printed lately, one event a line, to test
+/// a filter on.
+pub fn recent_file(dir: &Path, source: &str) -> PathBuf {
+    dir.join(".recent").join(format!("{source}.jsonl"))
+}
+
+/// An event as kept to test filters on: whole, or with its fields cut as
+/// a shape's examples are when they are too big, which it then says.
+fn recent_line(event: &Event) -> String {
+    let mut kept = event.to_json();
+    if kept["fields"].to_string().len() > RECENT_EVENT_BYTES {
+        kept["fields"] = (sample(&event.fields).map(|sample| sample["fields"].clone()))
+            .unwrap_or_else(|| json!({"text": event.text}));
+        kept["cut"] = json!(true);
+    }
+    kept.to_string()
+}
+
+/// The events `source` printed since `since_ms`, oldest first, as kept.
+pub fn recent(store: &Path, source: &str, since_ms: u128) -> Vec<(Event, bool)> {
+    let file = recent_file(&super::beside(store, ".sources"), source);
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return Vec::new();
+    };
+    (text.lines())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|kept| Some((Event::from_json(&kept)?, kept["cut"] == true)))
+        .filter(|(event, _)| event.at_ms >= since_ms)
+        .collect()
+}
+
 /// What a source's events lately looked like: each field they had and
 /// its kinds, so an agent knows what it may filter on, and the last few
 /// events, cut, so one that hears them sees what they hold. Fields of an
@@ -978,6 +1029,9 @@ struct Shape {
     written_kinds: Vec<(String, Vec<&'static str>)>,
     /// It saw events since it last wrote.
     dirty: bool,
+    /// Where what its source printed is kept to test filters on: a
+    /// command's, never the commons', whose threads are their members'.
+    keeps: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1157,12 +1211,66 @@ fn sample(fields: &Value) -> Option<Value> {
 /// The one thread that writes shapes, off the lookout's runtime: what was
 /// handed over while it wrote waits, and the newest body for each file
 /// wins, so a source whose fields churn costs one write at a time.
+/// `lines` added to the end of `path`: how long it is now, none when it
+/// could not be written.
+fn add_lines(path: &Path, lines: &str) -> Option<u64> {
+    use std::io::Write;
+    let _ = super::make_dir(path.parent()?);
+    let mut file = (std::fs::OpenOptions::new().create(true).append(true))
+        .open(path)
+        .ok()?;
+    file.write_all(lines.as_bytes()).ok()?;
+    Some(file.metadata().ok()?.len())
+}
+
+/// Cut a file of what a source printed lately to what it keeps: the
+/// newest events within `RECENT_SPAN` of `now_ms`, at most `RECENT_EVENTS`
+/// of them and three quarters of `RECENT_BYTES`, so it is not cut again
+/// at once.
+fn trim(path: &Path, now_ms: u128) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let since = now_ms.saturating_sub(RECENT_SPAN.as_millis());
+    let fresh = |line: &&str| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|kept| kept["at_ms"].as_u64())
+            .is_some_and(|at| u128::from(at) >= since)
+    };
+    let (mut kept, mut bytes) = (Vec::new(), 0);
+    for line in text.lines().rev().take(RECENT_EVENTS) {
+        bytes += line.len() as u64 + 1;
+        if bytes > RECENT_BYTES * 3 / 4 || !fresh(&line) {
+            break;
+        }
+        kept.push(line);
+    }
+    kept.reverse();
+    let mut body = kept.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    if body.len() < text.len() {
+        let partial = path.with_extension("jsonl.partial");
+        let _ = super::write_moved(&partial, path, &body);
+    }
+}
+
 mod shapes {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock, mpsc};
+    use std::time::{Duration, Instant};
+
+    /// How often at most a file of what a source printed lately is cut to
+    /// what it keeps, short of its growing past its bytes.
+    const TRIM_EVERY: Duration = Duration::from_secs(60 * 60);
 
     enum Job {
         Write(PathBuf, String),
+        /// A line added to a file of what a source printed lately.
+        Append(PathBuf, String),
         #[cfg_attr(not(test), allow(dead_code))]
         Done(mpsc::Sender<()>),
     }
@@ -1172,8 +1280,10 @@ mod shapes {
         SENDER.get_or_init(|| {
             let (send, jobs) = mpsc::channel::<Job>();
             std::thread::spawn(move || {
+                let mut trimmed: HashMap<PathBuf, Instant> = HashMap::new();
                 while let Ok(job) = jobs.recv() {
                     let mut writes: Vec<(PathBuf, String)> = Vec::new();
+                    let mut appends: Vec<(PathBuf, String)> = Vec::new();
                     let mut done = Vec::new();
                     for job in std::iter::once(job).chain(jobs.try_iter()) {
                         match job {
@@ -1181,7 +1291,26 @@ mod shapes {
                                 writes.retain(|(had, _)| *had != path);
                                 writes.push((path, body));
                             }
+                            Job::Append(path, line) => {
+                                match appends.iter_mut().find(|(had, _)| *had == path) {
+                                    Some((_, lines)) => {
+                                        lines.push_str(&line);
+                                        lines.push('\n');
+                                    }
+                                    None => appends.push((path, line + "\n")),
+                                }
+                            }
                             Job::Done(tell) => done.push(tell),
+                        }
+                    }
+                    for (path, lines) in appends {
+                        let due = (trimmed.get(&path)).is_none_or(|at| at.elapsed() >= TRIM_EVERY);
+                        if super::add_lines(&path, &lines)
+                            .is_some_and(|len| len > super::RECENT_BYTES)
+                            || due
+                        {
+                            super::trim(&path, super::super::epoch_ms());
+                            trimmed.insert(path, Instant::now());
                         }
                     }
                     for (path, body) in writes {
@@ -1204,6 +1333,12 @@ mod shapes {
     pub fn write(path: PathBuf, body: String) {
         if let Ok(send) = sender().lock() {
             let _ = send.send(Job::Write(path, body));
+        }
+    }
+
+    pub fn append(path: PathBuf, line: String) {
+        if let Ok(send) = sender().lock() {
+            let _ = send.send(Job::Append(path, line));
         }
     }
 
@@ -1524,6 +1659,56 @@ mod tests {
         let plain = Event::parse("cr", "hello", 0).unwrap();
         assert_eq!(*plain.fields, json!({"text": "hello"}));
         assert_eq!(plain.others(), None);
+    }
+
+    #[test]
+    fn what_a_source_printed_lately_is_kept_a_day_and_cut_to_its_bounds() {
+        let dir = std::env::temp_dir().join(format!("lookout-recent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("state.sqlite");
+        let file = recent_file(&super::super::beside(&store, ".sources"), "ci");
+        let now = super::super::epoch_ms();
+        let event = |text: &str, at: u128| Event {
+            at_ms: at,
+            ..Event::parse("ci", &json!({"text": text}).to_string(), at).unwrap()
+        };
+        let day = RECENT_SPAN.as_millis();
+        let lines = [
+            recent_line(&event("old", now - day - 1)),
+            recent_line(&event("new", now - 1)),
+        ];
+        assert!(add_lines(&file, &(lines.join("\n") + "\n")).is_some());
+        // Read back, only what is within the day counts.
+        let read: Vec<String> = (recent(&store, "ci", now - day).into_iter())
+            .map(|(e, _)| e.text)
+            .collect();
+        assert_eq!(read, ["new"]);
+        // Cut, the file keeps only that.
+        trim(&file, now);
+        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 1);
+        // An event too big is kept cut, and says so.
+        let big = Event::parse(
+            "ci",
+            &json!({"text": "x".repeat(RECENT_EVENT_BYTES), "status": "failed"}).to_string(),
+            now,
+        )
+        .unwrap();
+        let kept: Value = serde_json::from_str(&recent_line(&big)).unwrap();
+        assert_eq!(kept["cut"], true);
+        assert!(kept.to_string().len() < RECENT_EVENT_BYTES);
+        // Its fields stay where a filter looks for them.
+        assert_eq!(kept["fields"]["status"], "failed");
+        // At most so many events.
+        let many: String = (0..RECENT_EVENTS + 10)
+            .map(|n| recent_line(&event(&n.to_string(), now)) + "\n")
+            .collect();
+        add_lines(&file, &many);
+        trim(&file, now);
+        let left = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(left.lines().count(), RECENT_EVENTS);
+        let newest: Value = serde_json::from_str(left.lines().last().unwrap()).unwrap();
+        assert_eq!(newest["text"], (RECENT_EVENTS + 9).to_string());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -212,6 +212,7 @@ impl News {
         fn kept(hold: &mut super::activity::Hold, gone: &[String]) -> bool {
             let heard = !hold.heard.is_empty();
             hold.heard.retain(|sub| !gone.contains(sub));
+            hold.steered.retain(|sub| !gone.contains(sub));
             hold.windows.retain(|(sub, _)| !gone.contains(sub));
             !heard || !hold.heard.is_empty()
         }
@@ -293,9 +294,19 @@ pub struct Told {
     seen: Option<HashMap<String, u64>>,
     /// The subscriptions with a digest whose news it tells.
     subs: Vec<String>,
-    /// The subscriptions that last so many notes whose news it tells:
-    /// once it lands, each has one note fewer to go.
-    pub counted: Vec<String>,
+    /// The subscriptions whose news it tells, each with how many tasks'
+    /// news: once it lands, they count it, and one that lasts so many
+    /// notes has one fewer to go.
+    pub heard: Vec<(String, u64)>,
+    /// The subscriptions whose `steer` matched news it tells.
+    pub steered: Vec<String>,
+}
+
+impl Told {
+    /// The subscriptions it steered for.
+    pub fn steered(&self) -> Vec<&str> {
+        self.steered.iter().map(String::as_str).collect()
+    }
 }
 
 pub struct Line {
@@ -319,6 +330,10 @@ pub struct Updates {
     /// bot one with a filter, a digest or `urgent` watches: none for the
     /// rest, whose news goes as it always did.
     pub rules: HashMap<String, Arc<[super::activity::Rule]>>,
+    /// The subscriptions that watch each bot whose news no rule gates,
+    /// by name, each set held once however many bots share it: what a
+    /// note told of such a bot counts for each.
+    pub hearers: HashMap<String, Arc<[String]>>,
     /// When a note last told news a subscription's digest held, which
     /// that digest counts from: its sources' and its bots' alike.
     pub told_subs: HashMap<String, Instant>,
@@ -494,6 +509,7 @@ impl Updates {
             lead: lead.to_owned(),
             memory,
             rules: HashMap::new(),
+            hearers: HashMap::new(),
             told_subs: HashMap::new(),
             flying: HashMap::new(),
             subscribers: Arc::default(),
@@ -1621,6 +1637,8 @@ impl Updates {
         let mut quoted = HashMap::new();
         let mut items: Vec<Line> = Vec::new();
         let mut sent = Vec::new();
+        // The tasks this note tells something of.
+        let mut telling: Vec<String> = Vec::new();
         // What does not fit in this note's bytes waits for the next.
         let mut later = held;
         let (mut bytes, mut quotes) = (0, 0);
@@ -1629,6 +1647,7 @@ impl Updates {
                 later.push((name, news));
                 continue;
             }
+            let before = items.len();
             let (mut kept, mut wait) = (Vec::new(), Vec::new());
             for message in std::mem::take(&mut news.said) {
                 let quote = usize::from(message.words.is_some());
@@ -1702,13 +1721,21 @@ impl Updates {
                 // Nothing more fits this note.
                 bytes = NOTE_BYTES;
             }
+            if items.len() > before {
+                telling.push(name.clone());
+            }
             sent.push((name, news));
         }
         self.tasks = later;
         // What each subscription with a digest heard goes now, however soon:
         // its digest counts from this note once it lands.
-        let (mut subs, mut counted): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
-        for (_, news) in &sent {
+        let mut subs: Vec<String> = Vec::new();
+        let mut heard: Vec<(String, u64)> = Vec::new();
+        let mut steered: Vec<String> = Vec::new();
+        for (name, news) in &sent {
+            // A task all of whose news waits for a later note told nothing:
+            // it counts, and spends a run, when that note goes.
+            let mut hearing: Vec<&String> = Vec::new();
             for hold in news.holds() {
                 for (sub, _) in &hold.windows {
                     if !subs.contains(sub) {
@@ -1716,9 +1743,29 @@ impl Updates {
                     }
                 }
                 for sub in &hold.heard {
-                    if !counted.contains(sub) {
-                        counted.push(sub.clone());
+                    if !hearing.contains(&sub) {
+                        hearing.push(sub);
                     }
+                }
+            }
+            if !telling.contains(name) {
+                continue;
+            }
+            // Each subscription whose `steer` matched what it tells
+            // steered, whether or not the note joins a turn.
+            let steering = (news.holds()).flat_map(|hold| &hold.steered);
+            for sub in steering.filter(|_| self.live) {
+                if !steered.contains(sub) {
+                    steered.push(sub.clone());
+                }
+            }
+            if hearing.is_empty() {
+                hearing.extend(self.hearers.get(name).into_iter().flat_map(|h| h.iter()));
+            }
+            for sub in hearing {
+                match heard.iter_mut().find(|(had, _)| had == sub) {
+                    Some((_, n)) => *n += 1,
+                    None => heard.push((sub.clone(), 1)),
                 }
             }
         }
@@ -1736,7 +1783,8 @@ impl Updates {
             sent,
             seen,
             subs,
-            counted,
+            heard,
+            steered,
         }
     }
 
@@ -2616,6 +2664,24 @@ mod tests {
             "{}",
             second.items[0].text
         );
+    }
+
+    #[test]
+    fn a_task_whose_news_all_waits_is_not_counted_as_told() {
+        let mut updates = fleet();
+        let tasks: Arc<[String]> = Arc::from(vec!["tasks".to_owned()]);
+        updates.hearers.insert("shop.fix".into(), tasks.clone());
+        updates.hearers.insert("shop.docs".into(), tasks);
+        for turn in 1..=NOTE_QUOTES as i64 {
+            updates.said("shop.fix", turn, "the person", Some(&format!("{turn}")));
+        }
+        updates.said("shop.docs", 1, "the person", Some("one more"));
+        let first = updates.take();
+        assert!(first.items.iter().all(|i| i.text.contains("shop.fix")));
+        assert_eq!(first.heard, [("tasks".to_owned(), 1)]);
+        updates.sent(first);
+        let second = updates.take();
+        assert_eq!(second.heard, [("tasks".to_owned(), 1)]);
     }
 
     #[test]

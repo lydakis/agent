@@ -259,7 +259,7 @@ fn subscriptions() -> Value {
                             "description": "Bots whose tasks it watches."},
                         "bots": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Bots it watches by name, * matching any run of characters; \
-                                another lead, which has subscriptions of its own, counts only where named as it is."},
+                                another lead counts only where named exactly."},
                         "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Sources it hears, by name, or NAME:TOPIC for one topic of it."},
                         "filter": {"type": "object",
@@ -269,8 +269,8 @@ fn subscriptions() -> Value {
                                 name, trigger), turn, status (completed, failed, stopped, interrupted), done, \
                                 theirs (the person asked for the turn themselves), text (the person's \
                                 words), question, options and id (a margin note's). An event pattern as \
-                                AWS EventBridge writes one. Each field the event must have maps to a list of values, \
-                                any of which will do, or to a pattern for a field that is an object; every field \
+                                AWS EventBridge writes one. Each field maps to a list of values, \
+                                any of which will do, or to a pattern for an object field; every field \
                                 must match, and a field that is a list matches when any item does. A value is a \
                                 string, number, boolean or null, or {\"prefix\": S}, {\"suffix\": S}, \
                                 {\"wildcard\": S} (* any run of characters), {\"equals-ignore-case\": S}, \
@@ -280,7 +280,7 @@ fn subscriptions() -> Value {
                         "digest": {"type": "string", "pattern": "^(0|[0-9]+[smh])$",
                             "description": "Tell what it hears at most once this long, as 15m or 1h, in place of \
                                 its sources' own digest. The person's words, a question to them and an approval only they can give \
-                                never wait for it."},
+                                never wait."},
                         "steer": {"type": "object",
                             "description": "What it hears that this matches, a pattern as filter's, goes at once, \
                                 past any digest, as the person's words do. As \
@@ -291,7 +291,8 @@ fn subscriptions() -> Value {
                     "required": ["name"],
                     "additionalProperties": false
                 },
-                "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."}
+                "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
+                "test": {"type": "boolean", "description": "What add would have heard of its sources' last day; adds nothing."}
             },
             "additionalProperties": false
         },
@@ -733,6 +734,19 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let caller_id = std::env::var("AGENT_BOT_ID")
                 .ok()
                 .and_then(|id| id.parse().ok());
+            if arguments["test"] == true {
+                let Some(add) = arguments.get("add") else {
+                    return Err(("subscription_refused", "test tries an add".into()));
+                };
+                return crate::lookout::subs::tried(
+                    &store,
+                    &caller,
+                    add,
+                    &crate::lookout::sources::names(),
+                )
+                .map(|tried| tried.to_string())
+                .map_err(|e| ("subscription_refused", e));
+            }
             crate::lookout::subs::change(
                 &store,
                 &caller,

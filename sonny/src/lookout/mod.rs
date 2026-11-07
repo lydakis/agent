@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 const WAKE_GAP: Duration = Duration::from_secs(120);
 /// How long news settles before its note goes, so turns that end together
 /// go in one note.
-const SETTLE: Duration = Duration::from_secs(2);
+pub(crate) const SETTLE: Duration = Duration::from_secs(2);
 /// How long a note waits for messages still being read.
 const SETTLE_MAX: Duration = Duration::from_secs(15);
 /// How often subscription files are read again.
@@ -1806,6 +1806,8 @@ impl Service {
         lookout.roots(&self.records, &self.made);
         let held = beside(&self.store, ".sources").join(".held");
         lookout.restore(held.join(format!("{lead}.json")));
+        lookout.counts = subs::counts(&self.store, lead);
+        lookout.counts_file = Some(subs::counts_file(&self.store, lead));
         lookout.counting();
         self.lookouts.insert(lead.to_owned(), lookout);
         // Said once a subscriber is watched, so `/status` shows it from
@@ -1863,9 +1865,7 @@ impl Service {
                 .cloned()
                 .collect();
             if all || subs != lookout.subs {
-                lookout.updates.ended(&gone(&lookout.subs, &subs));
-                lookout.subs = subs;
-                lookout.counting();
+                lookout.resubscribed(subs);
                 lookout.roots(&self.records, &self.made);
                 lookout.rehear();
             }
@@ -2186,6 +2186,11 @@ struct Lookout {
     /// Subscriptions whose `until` came before the files were read again,
     /// for the service to end.
     over: Vec<subs::Sub>,
+    /// What each subscription told lately, for the listing, written to
+    /// `counts_file` once a tick when it changed.
+    counts: subs::Counts,
+    counts_file: Option<PathBuf>,
+    counts_dirty: bool,
     /// Where what its sources said waits, untold, so a restart loses none
     /// of what a digest or a busy subscriber held.
     held: Option<PathBuf>,
@@ -2254,6 +2259,9 @@ impl Lookout {
             charged: Default::default(),
             ended: Vec::new(),
             over: Vec::new(),
+            counts: subs::Counts::default(),
+            counts_file: None,
+            counts_dirty: false,
             held: None,
             dirty: false,
             resend: Vec::new(),
@@ -2277,13 +2285,24 @@ impl Lookout {
         // What subscriptions with rules say of each bot they watch, worked
         // out here once rather than as each event comes; with none, none.
         self.updates.rules.clear();
-        if self.subs.iter().any(subs::Sub::rules) {
-            let rules: Vec<activity::Rule> = self.subs.iter().map(activity::Rule::of).collect();
-            for bot in &watched {
-                if let Some(rules) = self.rules_of(bot, &rules) {
-                    self.updates.rules.insert(bot.clone(), rules);
-                }
+        self.updates.hearers.clear();
+        let rules: Vec<activity::Rule> = match self.subs.iter().any(subs::Sub::rules) {
+            true => self.subs.iter().map(activity::Rule::of).collect(),
+            false => Vec::new(),
+        };
+        // Bots watched by the same subscriptions share one list of them.
+        let mut lists: HashMap<Vec<usize>, Arc<[String]>> = HashMap::new();
+        for bot in &watched {
+            if !rules.is_empty()
+                && let Some(rules) = self.rules_of(bot, &rules)
+            {
+                self.updates.rules.insert(bot.clone(), rules);
+                continue;
             }
+            let watching = self.watching(bot);
+            let names = (lists.entry(watching))
+                .or_insert_with_key(|n| n.iter().map(|&n| self.subs[n].name.clone()).collect());
+            self.updates.hearers.insert(bot.clone(), names.clone());
         }
         self.updates.watched = watched;
         // Another subscriber is a task here only where one names it as it is.
@@ -2302,25 +2321,39 @@ impl Lookout {
             false => self.updates.watched.remove(bot),
         };
         self.updates.rules.remove(bot);
-        if self.updates.watched.contains(bot) && self.subs.iter().any(subs::Sub::rules) {
+        self.updates.hearers.remove(bot);
+        if !self.updates.watched.contains(bot) {
+            return;
+        }
+        if self.subs.iter().any(subs::Sub::rules) {
             let rules: Vec<activity::Rule> = self.subs.iter().map(activity::Rule::of).collect();
             if let Some(rules) = self.rules_of(bot, &rules) {
                 self.updates.rules.insert(bot.to_owned(), rules);
+                return;
             }
         }
+        let names: Arc<[String]> = (self.watching(bot).into_iter())
+            .map(|n| self.subs[n].name.clone())
+            .collect();
+        self.updates.hearers.insert(bot.to_owned(), names);
     }
 
     /// What the subscriptions that watch `bot` say of its events, `rules`
     /// being each subscription's in order: none when none of them has a
     /// filter, a digest or `urgent`, so its news goes as it always went.
     fn rules_of(&self, bot: &str, rules: &[activity::Rule]) -> Option<Arc<[activity::Rule]>> {
-        let watching: Vec<usize> = (0..self.subs.len())
-            .filter(|&n| self.sub_watches(&self.subs[n], bot))
-            .collect();
+        let watching = self.watching(bot);
         if !watching.iter().any(|&n| self.subs[n].rules()) {
             return None;
         }
         Some(watching.into_iter().map(|n| rules[n].clone()).collect())
+    }
+
+    /// Its subscriptions that watch `bot`, by place.
+    fn watching(&self, bot: &str) -> Vec<usize> {
+        (0..self.subs.len())
+            .filter(|&n| self.sub_watches(&self.subs[n], bot))
+            .collect()
     }
 
     /// Lineage is kept up during the replay too, so tasks made earlier count.
@@ -2758,7 +2791,7 @@ impl Lookout {
         if !quotes.is_empty() {
             asked["quotes"] = json!(quotes);
         }
-        self.charged[0] = self.charges(told.counted.iter());
+        self.charged[0] = self.charges(told.heard.iter().map(|(name, _)| name));
         self.sending = Some((told, key, delivery));
         self.send(client, woken, asked, Answer::Noted);
     }
@@ -2829,6 +2862,7 @@ impl Lookout {
                         }
                         // The person's words a bounded note left out still cut in.
                         self.urgent &= self.updates.quoting();
+                        self.count(&key, &told.heard, &told.steered());
                         self.spend(0, &key);
                         self.updates.sent(told);
                         // When a subscription's digest last told is kept.
@@ -2844,6 +2878,7 @@ impl Lookout {
                     // The same news twice is one note.
                     Err(code) if code == "idempotency_conflict" => {
                         self.urgent &= self.updates.quoting();
+                        self.count(&key, &told.heard, &told.steered());
                         self.spend(0, &key);
                         self.updates.sent(told);
                     }
@@ -2884,6 +2919,31 @@ impl Lookout {
                     submitted => {
                         self.refused = None;
                         self.sourced(true);
+                        // Each subscription counts the events it heard, and
+                        // a steer for it: one it set off, or one the source
+                        // marked, which steers for every subscription.
+                        let mut heard: Vec<(String, u64)> = Vec::new();
+                        let mut steered: Vec<&str> = Vec::new();
+                        for one in &sent {
+                            for sub in &one.subs {
+                                match heard.iter_mut().find(|(had, _)| had == sub) {
+                                    Some((_, n)) => *n += 1,
+                                    None => heard.push((sub.clone(), 1)),
+                                }
+                                // Its source marked it, or this one's own
+                                // `steer` matched it, whichever set it off.
+                                let marked = one.event.steer && one.event.steer_by.is_none();
+                                let own = (self.subs.iter().find(|had| had.name == *sub))
+                                    .and_then(|had| had.steer.as_ref())
+                                    .is_some_and(|steer| {
+                                        pattern::matches(steer, &one.event.fields)
+                                    });
+                                if (marked || own) && !steered.contains(&sub.as_str()) {
+                                    steered.push(sub);
+                                }
+                            }
+                        }
+                        self.count(&key, &heard, &steered);
                         self.spend(1, &key);
                         self.unkept_sent = Unkept::default();
                         for heard in &sent {
@@ -2902,15 +2962,50 @@ impl Lookout {
         }
     }
 
+    /// Its subscriptions are now `subs`: what only those gone heard goes
+    /// with them, and one put in another's place under its name counts
+    /// afresh.
+    fn resubscribed(&mut self, subs: Vec<subs::Sub>) {
+        let gone = gone(&self.subs, &subs);
+        self.updates.ended(&gone);
+        // A note under way told what those gone heard: once it lands, it
+        // counts for none of them, nor for one put in another's place.
+        if let Some((told, ..)) = &mut self.sending {
+            told.heard.retain(|(name, _)| !gone.contains(name));
+            told.steered.retain(|name| !gone.contains(name));
+        }
+        if let Some((sent, ..)) = &mut self.sourcing {
+            for heard in sent {
+                heard.subs.retain(|name| !gone.contains(name));
+            }
+        }
+        self.subs = subs;
+        self.counting();
+    }
+
     /// Notes counted only for subscriptions it has that last so many,
     /// each under when it was added, so one removed and added again, even
-    /// in one call, starts its count afresh.
+    /// in one call, starts its count afresh; and counts only for those it
+    /// has, as they are, for this bot.
     fn counting(&mut self) {
         let subs = &self.subs;
         self.runs_told.retain(|counter, _| {
             subs.iter()
                 .any(|sub| sub.runs.is_some() && &sub.counter() == counter)
         });
+        let id = self.updates.lead_id();
+        let kept: Vec<(&str, String)> = (subs.iter())
+            .map(|sub| (sub.name.as_str(), sub.identity(id)))
+            .collect();
+        if (self.counts).keep(|name, of| kept.iter().any(|(n, o)| *n == name && o == of)) {
+            self.counts_dirty = true;
+        }
+    }
+
+    /// The identity its counts keep for its subscription named `name`.
+    fn of(&self, name: &str) -> Option<String> {
+        (self.subs.iter().find(|sub| sub.name == name))
+            .map(|sub| sub.identity(self.updates.lead_id()))
     }
 
     /// Whether a subscription's `until` came since the files were last
@@ -2942,6 +3037,22 @@ impl Lookout {
                     })
                 })
             })
+    }
+
+    /// A note that told what these subscriptions heard landed: each it
+    /// still has counts what it told, for the listing, once a note, by its
+    /// request: sent again, it counts no more.
+    fn count(&mut self, key: &[String], heard: &[(String, u64)], steered: &[&str]) {
+        let now = epoch_ms() as u64;
+        let request = format!("lookout-{}", digest(&key.join(",")));
+        for (name, n) in heard {
+            let Some(of) = self.of(name) else {
+                continue;
+            };
+            let steered = steered.contains(&name.as_str());
+            self.counts.told(name, &of, &request, *n, steered, now);
+            self.counts_dirty = true;
+        }
     }
 
     /// What a note telling these subscriptions' news charges: each that
@@ -3178,12 +3289,21 @@ impl Lookout {
         {
             held::write(path, body);
         }
+        if std::mem::take(&mut self.counts_dirty)
+            && let Some(path) = &self.counts_file
+        {
+            let body = (!self.counts.is_empty()).then(|| self.counts.to_json().to_string());
+            held::write(path.clone(), body.map(String::into_bytes));
+        }
     }
 
     /// The subscriber is gone or subscribed to nothing: what waited for it
     /// is no one's.
     fn unheld(&self) {
         if let Some(path) = &self.held {
+            held::write(path.clone(), None);
+        }
+        if let Some(path) = &self.counts_file {
             held::write(path.clone(), None);
         }
     }
@@ -3926,6 +4046,145 @@ mod tests {
         let told = lookout.updates.take_at(soon);
         lookout.updates.sent(told);
         assert!(lookout.updates.told_subs["tasks"] > first);
+    }
+
+    #[test]
+    fn each_subscription_counts_what_its_notes_told_and_the_listing_says_it() {
+        let dir = std::env::temp_dir().join(format!("sonny-counts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        // Task news no rule gates counts for the subscriptions watching it.
+        let mut lookout = seated("idle");
+        lookout.counts_file = Some(subs::counts_file(&store, "calc.lead"));
+        assert_eq!(&*lookout.updates.hearers["calc.fix"], ["tasks".to_owned()]);
+        ended(&mut lookout, 4, "completed");
+        let told = lookout.updates.take_at(Instant::now());
+        assert_eq!(told.heard, [("tasks".to_owned(), 1)]);
+        lookout.sending = Some((told, vec!["k".into()], "steer"));
+        lookout.answered(Answer::Noted(Ok(())));
+        // Sources' events count for each subscription that heard them, and
+        // a steer the source marked steers for each.
+        lookout.subs.push(hears("chat"));
+        let sent = vec![
+            sources::Heard {
+                event: slack("one", false),
+                subs: vec!["chat".into()],
+            },
+            sources::Heard {
+                event: slack("prod is down", true),
+                subs: vec!["chat".into()],
+            },
+        ];
+        lookout.sourcing = Some((sent, vec!["k".into()], "steer"));
+        lookout.answered(Answer::Sourced(Ok(())));
+        lookout.flush();
+        held::written();
+        let now = epoch_ms() as u64;
+        let counts = subs::counts(&store, "calc.lead");
+        let tasks = counts
+            .of("tasks", &lookout.of("tasks").unwrap_or_default(), now)
+            .unwrap();
+        assert_eq!(
+            (&tasks["heard"], &tasks["notes"], &tasks["steers"]),
+            (&json!(1), &json!(1), &json!(0))
+        );
+        let chat = counts
+            .of("chat", &lookout.of("chat").unwrap_or_default(), now)
+            .unwrap();
+        assert_eq!(
+            (&chat["heard"], &chat["notes"], &chat["steers"]),
+            (&json!(2), &json!(1), &json!(1))
+        );
+        // A day on, what it told then is no longer counted.
+        let day = 24 * 60 * 60 * 1000;
+        assert_eq!(
+            counts
+                .of("chat", &lookout.of("chat").unwrap_or_default(), now + day)
+                .unwrap()["notes"],
+            0
+        );
+        // One put in its own place under its name takes its counts along,
+        // as one removed does, and the file says so; the rest keep theirs.
+        let mut other = hears("chat");
+        other.sources = vec!["mail".into()];
+        let subs: Vec<subs::Sub> = (lookout.subs.iter())
+            .filter(|sub| sub.name != "chat")
+            .cloned()
+            .chain([other])
+            .collect();
+        // Put in its place while the lookout was stopped, the same.
+        let mut again = seated("idle");
+        again.subs = subs.clone();
+        again.counts = subs::counts(&store, "calc.lead");
+        again.counting();
+        assert!(
+            again
+                .counts
+                .of("chat", &again.of("chat").unwrap(), now)
+                .is_none()
+        );
+        assert!(
+            again
+                .counts
+                .of("tasks", &again.of("tasks").unwrap(), now)
+                .is_some()
+        );
+        lookout.resubscribed(subs);
+        lookout.flush();
+        held::written();
+        let counts = subs::counts(&store, "calc.lead");
+        assert!(
+            counts
+                .of("chat", &lookout.of("chat").unwrap_or_default(), now)
+                .is_none()
+        );
+        assert!(
+            counts
+                .of("tasks", &lookout.of("tasks").unwrap_or_default(), now)
+                .is_some()
+        );
+        lookout.resubscribed(Vec::new());
+        lookout.flush();
+        held::written();
+        assert!(subs::counts(&store, "calc.lead").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_subscription_whose_steer_matched_counts_it_and_a_note_counts_once() {
+        let mut lookout = seated("idle");
+        let down = Some(json!({"text": ["prod is down"]}));
+        let (mut chat, mut eng) = (hears("chat"), hears("eng"));
+        (chat.steer, eng.steer) = (down.clone(), down);
+        lookout.subs = vec![chat, eng];
+        // Its first steer only says why it cut in.
+        let mut event = slack("prod is down", true);
+        event.steer_by = Some("chat".into());
+        let sent = vec![sources::Heard {
+            event,
+            subs: vec!["chat".into(), "eng".into()],
+        }];
+        lookout.sourcing = Some((sent.clone(), vec!["k".into()], "steer"));
+        lookout.answered(Answer::Sourced(Ok(())));
+        let now = epoch_ms() as u64;
+        for name in ["chat", "eng"] {
+            let count = lookout
+                .counts
+                .of(name, &lookout.of(name).unwrap(), now)
+                .unwrap();
+            assert_eq!((&count["notes"], &count["steers"]), (&json!(1), &json!(1)));
+        }
+        // The same note again, its answer lost the first time, counts once.
+        lookout.sourcing = Some((sent, vec!["k".into()], "steer"));
+        lookout.answered(Answer::Sourced(Err("idempotency_conflict".into())));
+        assert_eq!(
+            lookout
+                .counts
+                .of("chat", &lookout.of("chat").unwrap_or_default(), now)
+                .unwrap()["notes"],
+            1
+        );
     }
 
     #[test]
@@ -5094,6 +5353,56 @@ mod tests {
         );
         assert!(service.hearing(&delta("calc.docs")).is_empty());
         assert!(!service.lookouts["calc.lead"].updates.has("calc.docs"));
+    }
+
+    #[tokio::test]
+    async fn every_subscription_steer_counts_though_its_note_joins_no_turn() {
+        let (client, _got) = submits().await;
+        let mut lookout = seated("idle");
+        (lookout.updates).seat(&json!({"name": "calc.docs", "bot_id": 3, "status": "idle",
+            "created_by": "calc.lead", "created_by_id": 1}));
+        for bot in ["calc.fix", "calc.docs"] {
+            lookout.globbed.insert(bot.to_owned());
+        }
+        let failed = Some(json!({"status": ["failed"]}));
+        let mut fixes = sub("fixes", &[], &["calc.fix"]);
+        fixes.steer = failed.clone();
+        let mut docs = sub("docs", &[], &["calc.docs"]);
+        docs.steer = failed;
+        lookout.subs = vec![fixes, docs.clone()];
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        for bot in ["calc.fix", "calc.docs"] {
+            let ask = json!({"from": {"bot": "calc.lead"}});
+            lookout.event(&ev(bot, 5, "accepted", ask));
+            lookout.event(&ev(bot, 5, "turn_finished", json!({"status": "failed"})));
+        }
+        let (woken, _woke) = tokio::sync::mpsc::channel(4);
+        lookout.wake(&client, &woken);
+        let (told, ..) = lookout.sending.as_ref().unwrap();
+        let mut steered = told.steered();
+        steered.sort_unstable();
+        assert_eq!(steered, ["docs", "fixes"]);
+        // One put in another's place while the note is under way counts
+        // nothing of it once it lands.
+        docs.steer = None;
+        let fixes = lookout.subs[0].clone();
+        lookout.resubscribed(vec![fixes, docs]);
+        lookout.answered(Answer::Noted(Ok(())));
+        let now = epoch_ms() as u64;
+        assert_eq!(
+            lookout
+                .counts
+                .of("fixes", &lookout.of("fixes").unwrap_or_default(), now)
+                .unwrap()["steers"],
+            1
+        );
+        assert!(
+            lookout
+                .counts
+                .of("docs", &lookout.of("docs").unwrap_or_default(), now)
+                .is_none()
+        );
     }
 
     #[tokio::test]
