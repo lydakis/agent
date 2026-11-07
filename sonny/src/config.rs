@@ -262,6 +262,12 @@ pub const SETTINGS: &[Setting] = &[
         default: "0",
     },
     Setting {
+        key: "sonny.quiet_after",
+        about: "how long no Sonny window is used, outside the hours in [sonny] hours, before Sonny goes quiet: agents work on, nothing rings, and they are told the person is away until the person writes again",
+        values: &[],
+        default: "30m",
+    },
+    Setting {
         key: "sonny.lookout_waiting",
         about: "events from your sources that wait for one agent while it is busy: past it, newer ones are not kept, and the agent's next note says how many, from where and when; 0 for no limit",
         values: &[],

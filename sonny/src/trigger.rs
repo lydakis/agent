@@ -3860,6 +3860,29 @@ fn baseline(places: &Places, trigger: &Trigger, seen: &Seen, fresh: bool) -> Res
     }
 }
 
+/// While the person is away, a line under a fire's own saying so, as
+/// the stamp on Sonny's other messages does ([`crate::quiet`]); nothing
+/// otherwise, and nothing to an agent but a lead: quiet is the leads'
+/// alone.
+fn away_line(target: &Target) -> String {
+    match target {
+        Target::Bot { name, .. } => away_to(name),
+        Target::Start { .. } => String::new(),
+    }
+}
+
+/// The away line for a prompt to `bot`, by name: as [`away_line`], for a
+/// result passed on to whoever the trigger replies to.
+fn away_to(bot: &str) -> String {
+    match crate::quiet::away().filter(|_| crate::project::is_lead(bot)) {
+        Some(away) => format!(
+            "[{}]\n",
+            crate::quiet::away_clause(away, &crate::quiet::schedule())
+        ),
+        None => String::new(),
+    }
+}
+
 /// `YYYY-MM-DD HH:MM`, local.
 fn stamp(epoch: i64) -> String {
     let t = local(epoch);
@@ -4228,9 +4251,10 @@ async fn deliver(
     }
     let prompt = || {
         format!(
-            "[automation {} · {} · {why}]\n{}",
+            "[automation {} · {} · {why}]\n{}{}",
             trigger.name,
             stamp(now()),
+            away_line(&trigger.target),
             trigger.message
         )
     };
@@ -4281,10 +4305,11 @@ async fn deliver(
                     Some(sent) => sent,
                     None => {
                         let mut prompt = format!(
-                            "[automation {} · run {} · {} · {why}]\n",
+                            "[automation {} · run {} · {} · {why}]\n{}",
                             trigger.name,
                             run.n,
-                            stamp(now())
+                            stamp(now()),
+                            away_line(&trigger.target)
                         );
                         if let Some(before) = before {
                             prompt.push_str(&format!(
@@ -5144,9 +5169,10 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
         ""
     };
     let prompt = format!(
-        "[automation {} · {} · {bot} turn {turn} {status}{cut}]\n{answer}",
+        "[automation {} · {} · {bot} turn {turn} {status}{cut}]\n{}{answer}",
         trigger.name,
-        stamp(now())
+        stamp(now()),
+        away_to(to)
     );
     let sent = client
         .request(
