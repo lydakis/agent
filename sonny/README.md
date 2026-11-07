@@ -295,6 +295,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
 | Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
+| Quiet outside your working hours | `[sonny] hours` (ranges in local time, as `["Mon-Fri 09:00-19:00"]`; unset, the default, no clock) and `quiet_after` (how long no window is used outside them before quiet starts, `30m` by default) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
@@ -1153,7 +1154,17 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`
-  leaves the agents working. Over SSH with no display and no `BROWSER`,
+  leaves the agents working.
+- Quiet: outside the hours in `[sonny] hours`, once no Sonny window has
+  been used for `quiet_after` (30 minutes), Sonny goes quiet. Agents keep
+  working; the line Sonny ends each message to a lead with tells it the
+  person is away and since when (tasks are untouched and report to their
+  lead as ever), nothing rings, and every footer says `quiet since
+  19:40`, or `quiet when you step away` while it waits for you. Your next
+  words to any agent end it for all of them, and that message tells a lead
+  you are back; a glance, a click on a question or 9:00 does not.
+  `/quiet` goes quiet now, any hour, and `/quiet off` ends it. Off unless
+  you set `hours` or write `/quiet`. Over SSH with no display and no `BROWSER`,
   what Sonny would open (a link, a file, the page) is copied instead, so
   it doesn't start on the remote machine's screen.
 
