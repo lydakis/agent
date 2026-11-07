@@ -621,11 +621,13 @@ class TriggerFireTests(ModelFixture):
         self.settle('p.task')
         self.assertEqual([t['budget_tokens'] for t in self.turns('p.task')], [None, 500])
 
-    def test_a_one_off_whose_gate_says_no_ends_saying_so(self):
+    def test_a_one_off_whose_gate_says_no_ends_leaving_nothing(self):
+        # As an ask's deadline once the ask was answered: nothing went, so
+        # nothing is left to list, its result included.
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         no = self.fire('p.task', 'x', at=int(time.time()), extra=['--if', 'exit 1', '--dir', str(self.path)])
         self.assertEqual(len(self.turns('p.task')), 1)
-        self.assertEqual(no['last']['outcome'], 'declined', no)
+        self.assertIsNone(no)
         self.assertFalse(job(self.home, 'p.task').exists())
 
     def test_a_gate_that_cannot_run_is_a_failed_fire(self):
