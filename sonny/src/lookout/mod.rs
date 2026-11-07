@@ -2998,7 +2998,7 @@ impl Lookout {
         {
             self.ask(client, woken, now);
         }
-        if self.sending.is_some() {
+        if self.sending.is_some() || self.last_runs_out(true) {
             return;
         }
         let Some(joins) = self.wake_due(now) else {
@@ -3188,6 +3188,25 @@ impl Lookout {
             subs.iter()
                 .any(|sub| &sub.name == name && sub.runs.is_some())
         });
+    }
+
+    /// Whether the note under way on the other path, the sources' for task
+    /// news (`tasks`) or the reverse, tells a subscription its last run:
+    /// this one waits for it to land, so a one-shot is never told twice.
+    fn last_runs_out(&self, tasks: bool) -> bool {
+        let flying: Vec<&String> = match tasks {
+            true => (self.sourcing.iter())
+                .flat_map(|(sent, ..)| sent.iter().flat_map(|heard| &heard.subs))
+                .collect(),
+            false => (self.sending.iter())
+                .flat_map(|(told, ..)| &told.counted)
+                .collect(),
+        };
+        flying.into_iter().any(|name| {
+            (self.subs.iter().find(|sub| &sub.name == name))
+                .and_then(|sub| sub.runs)
+                .is_some_and(|runs| self.runs_told.get(name).copied().unwrap_or(0) + 1 >= runs)
+        })
     }
 
     /// A note that told what these subscriptions heard landed: each that
@@ -3529,7 +3548,7 @@ impl Lookout {
         if self.updates.waited(now, since) {
             self.ask(client, woken, now);
         }
-        if self.sourcing.is_some() {
+        if self.sourcing.is_some() || self.last_runs_out(false) {
             return;
         }
         if self.refused(now) {
@@ -5870,6 +5889,19 @@ mod tests {
         again.spend(&["twice".into()]);
         assert_eq!(again.ended, ["twice"]);
         assert!(again.runs_told.is_empty());
+        // Its last note under way on one path holds the other back, so a
+        // one-shot is told once; one with notes to spare holds nothing.
+        again.ended.clear();
+        again.runs_told.clear();
+        let mut told = updates::Told::default();
+        told.counted = vec!["twice".into()];
+        again.sending = Some((told, Vec::new(), "steer"));
+        assert!(!again.last_runs_out(false), "two to go");
+        again.runs_told.insert("twice".into(), 1);
+        assert!(again.last_runs_out(false));
+        assert!(!again.last_runs_out(true), "nothing under way for sources");
+        again.sending = None;
+        assert!(!again.last_runs_out(false));
         // Removed and added again, it counts afresh.
         again.runs_told.insert("twice".into(), 1);
         again.subs.retain(|sub| sub.name != "twice");
