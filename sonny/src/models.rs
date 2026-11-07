@@ -23,13 +23,22 @@ impl Picker {
     /// model.
     pub fn new(listing: &Value, providers: &Value, current: &str, effort: Option<&str>) -> Self {
         let provider = current.split_once('/').map_or(current, |(p, _)| p);
-        let family = &providers[provider]["family"];
-        let mut names: Vec<&String> = providers
+        // The listing says each provider's family as the daemon binds it
+        // now, a provider added since this client connected included;
+        // `ready.providers` answers for a listing that does not.
+        let listed = &listing["providers"];
+        let family_of = |name: &str| match &listed[name]["family"] {
+            Value::Null => &providers[name]["family"],
+            family => family,
+        };
+        let family = family_of(provider);
+        let mut names: Vec<&String> = listed
             .as_object()
+            .filter(|all| all.values().any(|entry| !entry["family"].is_null()))
+            .or(providers.as_object())
             .map(|all| {
-                all.iter()
-                    .filter(|(_, binding)| binding["family"] == *family)
-                    .map(|(name, _)| name)
+                all.keys()
+                    .filter(|name| !family.is_null() && family_of(name) == family)
                     .collect()
             })
             .unwrap_or_default();
@@ -362,5 +371,18 @@ mod tests {
         assert_eq!(picker.effort(), None);
         picker.less();
         assert_eq!(picker.effort(), None);
+    }
+
+    #[test]
+    fn a_provider_added_after_connecting_is_offered_from_the_listing() {
+        // `ready.providers` as it was when this client connected.
+        let providers = json!({"openai": {"family": "responses"}});
+        let listing = json!({"providers": {
+            "openai": {"family": "responses", "models": [{"id": "gpt-6"}]},
+            "second": {"family": "responses", "models": [{"id": "gpt-6"}]},
+            "anthropic": {"family": "anthropic", "models": [{"id": "claude-opus-5-5"}]},
+        }});
+        let picker = Picker::new(&listing, &providers, "openai/gpt-6", None);
+        assert_eq!(picker.shown(), ["openai/gpt-6", "second/gpt-6"]);
     }
 }

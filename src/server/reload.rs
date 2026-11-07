@@ -43,6 +43,8 @@ pub struct Built {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub changed: Vec<String>,
+    /// What the in-use check covered, asked again just before the swap.
+    pub unusable: Vec<String>,
 }
 
 /// The specs the config file names now, as a client starting the daemon
@@ -198,37 +200,7 @@ async fn build(
     let mut unusable = removed.clone();
     unusable.extend(retyped);
     unusable.sort();
-    if !unusable.is_empty() {
-        let names = unusable.clone();
-        let agents = store
-            .op("bots_on_providers", move |db| db.bots_on_providers(&names))
-            .await?;
-        if !agents.is_empty() {
-            let shown: Vec<&str> = agents.iter().take(NAMED).map(String::as_str).collect();
-            let more = match agents.len() - shown.len() {
-                0 => String::new(),
-                more => format!(" and {more} more"),
-            };
-            return Err(Error {
-                code: "provider_in_use".into(),
-                detail: Some(format!(
-                    "{} still run on {}: {}{more}; move or remove them first",
-                    if agents.len() == 1 {
-                        "1 agent"
-                    } else {
-                        "agents"
-                    },
-                    unusable.join(", "),
-                    shown.join(", "),
-                )),
-                facts: match json!({"providers": unusable, "agents": shown, "count": agents.len()})
-                {
-                    Value::Object(facts) => Some(Box::new(facts)),
-                    _ => None,
-                },
-            });
-        }
-    }
+    unused(&store, &unusable).await?;
     Ok(Some(Built {
         specs,
         providers,
@@ -236,5 +208,44 @@ async fn build(
         added,
         removed,
         changed,
+        unusable,
     }))
+}
+
+/// Refuses with `provider_in_use`, naming them, while agents or unfinished
+/// turns still use any of `unusable`: providers a new set removes or binds
+/// to another API family.
+pub async fn unused(store: &Store, unusable: &[String]) -> Result<()> {
+    if unusable.is_empty() {
+        return Ok(());
+    }
+    let names = unusable.to_vec();
+    let agents = store
+        .op("bots_on_providers", move |db| db.bots_on_providers(&names))
+        .await?;
+    if agents.is_empty() {
+        return Ok(());
+    }
+    let shown: Vec<&str> = agents.iter().take(NAMED).map(String::as_str).collect();
+    let more = match agents.len() - shown.len() {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    Err(Error {
+        code: "provider_in_use".into(),
+        detail: Some(format!(
+            "{} still run on {}: {}{more}; move or remove them first",
+            if agents.len() == 1 {
+                "1 agent"
+            } else {
+                "agents"
+            },
+            unusable.join(", "),
+            shown.join(", "),
+        )),
+        facts: match json!({"providers": unusable, "agents": shown, "count": agents.len()}) {
+            Value::Object(facts) => Some(Box::new(facts)),
+            _ => None,
+        },
+    })
 }

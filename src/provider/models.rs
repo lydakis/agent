@@ -28,11 +28,22 @@ const KEPT: usize = 2 * crate::output::MAX_EVENT;
 /// as its JSON text, so what it holds is what it counts.
 #[derive(Default)]
 pub struct Listing(
-    tokio::sync::Mutex<Option<(Instant, Listed, usize)>>,
+    tokio::sync::Mutex<Option<(Instant, Listed, Held)>>,
     /// Each listed model's context window, from the last listing that
     /// answered: read per turn, so it is parsed once, as it arrives.
     std::sync::Mutex<std::collections::HashMap<String, u64>>,
 );
+
+/// The bytes a kept answer holds of its transport's `KEPT`, given back
+/// when it is replaced or the last provider sharing it is dropped, as a
+/// reload that rebinds a provider drops the old one.
+struct Held(Arc<super::Transport>, usize);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.listed.fetch_sub(self.1, Ordering::Relaxed);
+    }
+}
 
 /// A JSON array of `{id, name?, context_tokens?, output_tokens?}`.
 pub type Listed = Result<Arc<str>>;
@@ -51,9 +62,8 @@ impl Provider {
         {
             return listed.clone();
         }
-        if let Some((_, _, held)) = kept.take() {
-            self.transport.listed.fetch_sub(held, Ordering::Relaxed);
-        }
+        // An expired answer gives its bytes back as it goes.
+        kept.take();
         let listed: Listed = tokio::time::timeout(DEADLINE, self.list_models())
             .await
             .unwrap_or_else(|_| fail("provider_connection_timeout"))
@@ -98,7 +108,11 @@ impl Provider {
                 (kept + held <= KEPT).then_some(kept + held)
             });
         if room.is_ok() {
-            *kept = Some((Instant::now(), listed.clone(), held));
+            *kept = Some((
+                Instant::now(),
+                listed.clone(),
+                Held(self.transport.clone(), held),
+            ));
         }
         listed
     }
@@ -439,6 +453,13 @@ mod tests {
         // Asked again, the kept refusal answers and is not counted twice.
         assert_eq!(provider.models().await.unwrap_err(), refused);
         assert_eq!(transport.listed.load(Ordering::Relaxed), held);
+        // A provider dropped, as a reload drops one it rebinds, gives its
+        // kept answer's bytes back once its last clone goes.
+        let clone = provider.clone();
+        drop(provider);
+        assert_eq!(transport.listed.load(Ordering::Relaxed), held);
+        drop(clone);
+        assert_eq!(transport.listed.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

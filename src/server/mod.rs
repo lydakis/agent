@@ -2848,6 +2848,17 @@ impl Service {
         again: &mpsc::UnboundedSender<Result<Option<reload::Built>>>,
         models: Option<PathBuf>,
     ) -> Result<Option<serde_json::Map<String, Value>>> {
+        if self.reload.is_none() {
+            return Ok(None);
+        }
+        // Asked again in the run loop, after every admission already
+        // stored: one accepted while the set was built is counted too.
+        let built = match built {
+            Ok(Some(built)) => reload::unused(&self.store, &built.unusable)
+                .await
+                .map(|()| Some(built)),
+            other => other,
+        };
         let Some(reload) = self.reload.as_mut() else {
             return Ok(None);
         };
@@ -5383,8 +5394,19 @@ async fn provider_models(providers: Arc<HashMap<String, Provider>>) -> Result<Va
         4,
     ))
     .await;
-    fit_listings(names.into_iter().zip(listed), output::MAX_EVENT)
-        .map(|answer| json!({"providers": answer}))
+    // Each entry names its provider's API family, as `ready.providers`
+    // does, so a client connected before a reload added a provider can
+    // still tell which models its agent may switch to; room for that is
+    // held back from the listings.
+    const FAMILY: usize = 32;
+    let limit = output::MAX_EVENT.saturating_sub(FAMILY * names.len());
+    let mut answer = fit_listings(names.into_iter().zip(listed), limit)?;
+    for (name, entry) in answer.iter_mut() {
+        if let (Some(provider), Some(entry)) = (providers.get(name), entry.as_object_mut()) {
+            entry.insert("family".into(), json!(provider.family().name()));
+        }
+    }
+    Ok(json!({"providers": answer}))
 }
 
 /// The model list at `path`, brought up to date from every provider's

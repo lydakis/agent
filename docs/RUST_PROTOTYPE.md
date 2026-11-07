@@ -1411,7 +1411,8 @@ does not, and each is one op:
   10 seconds each and 15 for the whole request) and
   answers `providers.NAME.models` as `{id, name?, context_tokens?,
   output_tokens?}`, or `providers.NAME.error` for a provider that would not
-  list. It runs off the dispatch path, only when asked, under the same
+  list, each with `providers.NAME.family` as the daemon binds it now (a
+  provider a config reload added after the client connected included). It runs off the dispatch path, only when asked, under the same
   connection admission as a turn, and each provider keeps its answer, a
   refusal included, five minutes, while the listings (kept as their JSON
   text) and refusals kept across all providers stay within 2 MiB (past that
