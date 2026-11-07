@@ -943,7 +943,7 @@ async fn make(
                 .collect()
         }
     };
-    let declare = json!(crate::declared::tools(crate::served::Role::of(0)));
+    let declare = json!(crate::declared::tools(crate::served::Role::LEAD));
     let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
     let mut settings = crate::approvals::sandbox(mode, dir);
     let config = agent_client::config::load()?;

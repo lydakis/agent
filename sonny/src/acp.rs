@@ -1614,7 +1614,7 @@ async fn setup_lead(
     ) {
         asked["instructions"] = json!(text);
     }
-    let declare = declared::declare(&record, crate::served::Role::of(0));
+    let declare = declared::declare(&record, crate::served::Role::LEAD);
     if let Some(declare) = &declare {
         asked["declare"] = declare.clone();
     }

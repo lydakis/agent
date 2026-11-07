@@ -346,6 +346,7 @@ class ApprovalTests(ModelFixture):
             dict(child, bot='Deeper', workspace=str(self.path / 'kid'), declare=[dict(run, inherit=2)]),
             dict(child, bot='Endless', workspace=str(self.path / 'kid'), declare=[run]),
             dict(child, bot='Stepper', workspace=str(self.path / 'kid'), declare=[dict(run, steps=True)]),
+            dict(child, bot='Root', workspace=str(self.path / 'kid'), starts_line=True),
             dict(op='resume'),
         ]
         (self.path / 'requests.json').write_text(json.dumps(requests))
@@ -389,13 +390,15 @@ class ApprovalTests(ModelFixture):
         self.assertFalse(probed['borrowed'])
         (bots, configure, answer, shutdown, kid, out, liar, delete_alice, delete_kid, copy,
          ask, hand, tooled, away, again, src, twin, delete_src, twin_again, runner, deeper, endless, stepper,
-         resume) = probed['answers']
+         root, resume) = probed['answers']
         self.assertIn('Bob', [bot['name'] for bot in bots['result']['bots']])
         # Passed on as it has it, not as a tool whose steps alone are gated,
         # and no further down than it goes.
         self.assertIn('result', runner)
+        # Nor may it do what its socket isn't for, such as starting a line of
+        # its own, which would let it make bots without end.
         for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand, tooled, away, deeper,
-                        endless, stepper, resume):
+                        endless, stepper, root, resume):
             self.assertEqual(refused['error'], 'not_permitted', refused)
         # What it makes is its own and no less sandboxed.
         self.assertEqual((kid['result']['created_by'], kid['result']['settings']['sandbox']),

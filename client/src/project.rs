@@ -394,9 +394,10 @@ pub async fn create(
         "{}\n\n{rule}",
         policy["instructions"].as_str().unwrap_or_default()
     );
+    // A lead starts a line of its own, whoever asked for it.
     let mut params = json!({
         "bot": coordinator, "workspace": at, "model": model,
-        "instructions": instructions,
+        "instructions": instructions, "starts_line": true,
         "compaction_instructions": policy["compaction_instructions"],
         "tools": match &policy["tools"] {
             Value::Null => json!(crate::default_tools(providers, model, picks.web_search)),

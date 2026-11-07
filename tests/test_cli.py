@@ -1052,6 +1052,30 @@ class SocketAndCliTests(ModelFixture):
                     self.assertNotIn('result', control.request('inspect', bot='Child'))
         self.assertEqual(control.request('inspect', bot='Creator')['result']['head'], replacement['head'])
 
+    def test_a_bot_s_shell_makes_bots_no_deeper_than_the_daemon_lets_lines_go(self):
+        # The CLI starts the daemon with [daemon] depth, 2 unless set.
+        self.agent('run', *self.common, '--new', '--bot', 'Lead', 'hello')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+
+        def made_by(maker, name):
+            record = control.request('inspect', bot=maker)['result']
+            turn = control.request('turns', bot=maker)['result']['turns'][-1]['turn']
+            env = dict(clean_env(), AGENT_BOT=maker, AGENT_BOT_ID=str(record['bot_id']),
+                       AGENT_TURN=str(turn))
+            return subprocess.run([*self.base, 'run', *self.common, '--new', '--bot', name, 'hello'],
+                                  env=env, cwd=self.path, capture_output=True, text=True, timeout=15)
+
+        for maker, name, depth in (('Lead', 'Task', 1), ('Task', 'Helper', 2)):
+            made = made_by(maker, name)
+            self.assertEqual(made.returncode, 0, made.stderr)
+            self.assertEqual(control.request('inspect', bot=name)['result']['depth'], depth)
+        refused = made_by('Helper', 'Deeper')
+        self.assertNotEqual(refused.returncode, 0)
+        error = json.loads(refused.stderr.strip().splitlines()[-1])
+        self.assertEqual((error['error'], error['depth'], error['max_depth']), ('depth_limit', 3, 2), error)
+        self.assertEqual(control.request('inspect', bot='Deeper')['error'], 'bot_not_found')
+
     def test_large_shell_output_is_previewed_and_retained_as_an_artifact(self):
         run = self.agent('run', *self.common, '--new', '--bot', 'Bob',
                          'shell:head -c 1048576 /dev/zero | tr "\\0" y')
