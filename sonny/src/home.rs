@@ -380,7 +380,10 @@ fn walk_stamps(dir: &Path, at: &Path, hash: &mut impl std::hash::Hasher) -> Opti
             return None;
         }
         let path = at.join(&name);
-        (&path, meta.mode(), meta.len(), modified).hash(hash);
+        // The inode's change time too: a copy that keeps its source's time
+        // over a file of the same size changes nothing else.
+        let changed = (meta.ctime(), meta.ctime_nsec());
+        (&path, meta.mode(), meta.len(), modified, changed).hash(hash);
         if meta.file_type().is_symlink() {
             std::fs::read_link(entry.path()).ok()?.hash(hash);
         } else if meta.is_dir() {
@@ -1622,6 +1625,19 @@ mod tests {
         assert_eq!(sync(&one, None).unwrap()["unchanged"], true);
         write(&one.repo.join(".gitignore"), "memory/d0/\n");
         assert_eq!(sync(&one, None).unwrap()["unchanged"], Value::Null);
+        // And so is a file copied over with its time kept and the same
+        // size, which changes only its inode's change time.
+        settle(&one.home);
+        sync(&one, None).unwrap();
+        assert_eq!(sync(&one, None).unwrap()["unchanged"], true);
+        let fact = one.agents.join("memory/fact.md");
+        let kept = std::fs::metadata(&fact).unwrap().modified().unwrap();
+        std::fs::write(&fact, "FACT, REVISED").unwrap();
+        std::fs::File::open(&fact)
+            .unwrap()
+            .set_modified(kept)
+            .unwrap();
+        assert_eq!(sync(&one, None).unwrap()["committed"], true);
         // And so is a config whose permission was put right, which
         // changes neither its time nor its size.
         settle(&one.home);
