@@ -3,11 +3,15 @@
 //! the person can take. Once a turn of an agent of a Sonny project ends
 //! with words and no question open, the window of its project that sees it
 //! end asks a copy of the agent, with no tools, whether that reply waits on
-//! the person, and for what ([`spawn`]). The copy runs at once, so it reads
+//! the person, and for what ([`spawn`]). A task's reply goes to its lead, which
+//! hears every one and brings the person what needs them in its own reply,
+//! so a task's turn waits on the person only when it took in their own
+//! words, written in its window. The copy runs at once, so it reads
 //! the history while the provider's cache of the turn just ended is warm.
 //! The answer is kept beside the store, `STORE.waiting/BOT.json`, holding
 //! the turn it covers and, with a yes, what the person is waited on for
-//! ([`Mark`]). It is the window's own work, as only a window shows it: a
+//! ([`Mark`]), with the choices the reply offered them, which its card
+//! shows as options. It is the window's own work, as only a window shows it: a
 //! turn that ends with no window of its project open is not checked, and
 //! the daemon and its companions do nothing for it. Two windows that see
 //! one turn end ask one copy: the copy is named after the agent and turn,
@@ -39,38 +43,52 @@ pub const WAIT: Duration = Duration::from_secs(60);
 /// deleted.
 const EXPIRE: Duration = Duration::from_secs(180);
 /// The most of what the person is waited on for a mark keeps, in
-/// characters.
+/// characters, and of each choice's explanation.
 const FOR_CHARS: usize = 200;
+/// The most of a choice's label a mark keeps, in characters.
+const LABEL_CHARS: usize = 80;
+/// The most choices a mark keeps, as an ask offers at most four.
+const OPTIONS: usize = 4;
 /// What the copy is asked.
 const ASK: &str = "[A CHECK FROM SONNY, answered in JSON alone; nothing here reaches the person.] \
     Read your last reply as the person will. Does it leave something only they can give before \
     your work goes on: an answer, a decision, an approval, or a step for them to take? With one, \
     set waiting to true and say in `for` what they need to give, in a few plain words of theirs, \
-    such as \"which branch to deploy\". When your work goes on without them, or is finished, set \
-    waiting to false and `for` to \"\". In `reviews`, list each code review you opened, updated or wait \
+    such as \"which branch to deploy\". Where your reply offered them choices, put each in \
+    `options` as you would to the ask tool: a label of a few words and, in `explanation`, what \
+    picking it does, in one sentence; and in `recommended` the number of the one your reply \
+    recommends, from 1, or 0 for none. With no choices, such as a step for them to take, \
+    `options` is [] and `recommended` 0. When your work goes on without them, or is finished, set \
+    waiting to false, `for` to \"\", `options` to [] and `recommended` to 0. In `reviews`, list each code review you opened, updated or wait \
     on in your last turn, in its commands' output or your reply, in whatever system holds it, by a \
     short name such as \"o/r#7\", \"D1234\" or \"CR-881\", else its link; [] for none.";
 
 /// What a turn's reply left waiting on the person.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Mark {
     /// The turn whose reply it is: a later turn of the agent's lets it go.
     pub turn: i64,
     /// What the person is waited on for, in a few words.
     pub waiting_for: String,
+    /// The choices the reply offered them, as an ask's options: none for
+    /// a reply that offered none.
+    pub options: Vec<crate::asks::Choice>,
+    /// The option the reply recommended, from 0.
+    pub recommended: Option<usize>,
 }
 
 impl Mark {
-    /// The mark as the open question every surface shows: one with no
-    /// options, so words typed under it go to the agent.
+    /// The mark as the open question every surface shows: the choices the
+    /// reply offered as its options, a pick answering as on any card, and
+    /// with none, words typed under it going to the agent.
     pub fn ask(&self) -> crate::asks::Ask {
         crate::asks::Ask {
             id: crate::asks::id(self.turn, "waiting"),
             question: self.waiting_for.clone(),
             why: String::new(),
-            options: Vec::new(),
+            options: self.options.clone(),
             command: None,
-            recommended: None,
+            recommended: self.recommended,
             reason: String::new(),
             unanswered: None,
             deadline: None,
@@ -102,13 +120,44 @@ pub fn read(store: &Path, bot: &str) -> Option<Mark> {
     read_file(&file(store, bot))
 }
 
-/// The mark kept in `file`, if any.
+/// The mark kept in `file`, if any. One kept without `options` is 0.9.0's,
+/// which judged a task's turn its lead started too, and holds nothing.
 pub fn read_file(file: &Path) -> Option<Mark> {
     let kept: Value = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
+    kept["options"].as_array()?;
+    let (options, recommended) = choices(&kept["options"], &kept["recommended"]);
     Some(Mark {
         turn: kept["turn"].as_i64()?,
         waiting_for: kept["for"].as_str()?.to_owned(),
+        options,
+        recommended,
     })
+}
+
+/// The choices `options` holds, as the copy says them and a mark keeps
+/// them, each cut to a line, at most [`OPTIONS`]; and the one
+/// `recommended` names, from 1, as an index from 0.
+fn choices(options: &Value, recommended: &Value) -> (Vec<crate::asks::Choice>, Option<usize>) {
+    let line = |text: &Value, most: usize| -> String {
+        let text = text.as_str().unwrap_or("").split_whitespace();
+        text.collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(most)
+            .collect()
+    };
+    let options: Vec<crate::asks::Choice> = (options.as_array().into_iter().flatten())
+        .map(|option| crate::asks::Choice {
+            label: line(&option["label"], LABEL_CHARS),
+            explanation: line(&option["explanation"], FOR_CHARS),
+        })
+        .filter(|choice| !choice.label.is_empty())
+        .take(OPTIONS)
+        .collect();
+    let recommended = (recommended.as_u64())
+        .and_then(|n| (n as usize).checked_sub(1))
+        .filter(|at| *at < options.len());
+    (options, recommended)
 }
 
 /// Keep what `bot`'s turn `turn` was found to leave waiting: `mark`, or
@@ -120,7 +169,13 @@ pub fn keep(store: &Path, bot: &str, turn: i64, mark: Option<&Mark>) -> Result<(
             return Ok(());
         }
         let kept = match mark {
-            Some(mark) => json!({"turn": mark.turn, "for": mark.waiting_for}),
+            Some(mark) => {
+                let options: Vec<Value> = (mark.options.iter())
+                    .map(|c| json!({"label": c.label, "explanation": c.explanation}))
+                    .collect();
+                json!({"turn": mark.turn, "for": mark.waiting_for, "options": options,
+                    "recommended": mark.recommended.map(|at| at + 1)})
+            }
             None => json!({"turn": turn}),
         };
         replace(&file(store, bot), kept.to_string().as_bytes())
@@ -213,16 +268,27 @@ fn schema() -> Value {
         "properties": {
             "waiting": {"type": "boolean"},
             "for": {"type": "string"},
+            "options": {"type": "array", "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "explanation": {"type": "string"}
+                },
+                "required": ["label", "explanation"],
+                "additionalProperties": false
+            }},
+            "recommended": {"type": "integer"},
             "reviews": {"type": "array", "items": {"type": "string"}}
         },
-        "required": ["waiting", "for", "reviews"],
+        "required": ["waiting", "for", "options", "recommended", "reviews"],
         "additionalProperties": false
     })
 }
 
-/// What the copy's reply says the person is waited on for: none when it
-/// says nothing waits, or the reply is not the JSON asked for.
-pub fn answer(reply: &str) -> Option<Option<String>> {
+/// What the copy's reply says turn `turn`'s reply left the person: none
+/// when it says nothing waits; nothing at all when the reply is not the
+/// JSON asked for.
+pub fn answer(reply: &str, turn: i64) -> Option<Option<Mark>> {
     let said: Value = serde_json::from_str(reply.trim()).ok()?;
     let waiting = said["waiting"].as_bool()?;
     let what = said["for"]
@@ -234,9 +300,15 @@ pub fn answer(reply: &str) -> Option<Option<String>> {
         return Some(None);
     }
     let what: String = what.chars().take(FOR_CHARS).collect();
-    Some(Some(match what.is_empty() {
-        true => "an answer to its last reply".to_owned(),
-        false => what,
+    let (options, recommended) = choices(&said["options"], &said["recommended"]);
+    Some(Some(Mark {
+        turn,
+        waiting_for: match what.is_empty() {
+            true => "an answer to its last reply".to_owned(),
+            false => what,
+        },
+        options,
+        recommended,
     }))
 }
 
@@ -316,9 +388,8 @@ pub async fn checked(client: &Client, store: &Path, bot: &str, turn: i64) {
         && !answered(store, bot, turn)
         // What could not be checked, a second window's copy the
         // daemon refused among it, is left unmarked.
-        && let Ok(found) = waiting_for(client, store, bot, bot_id, turn).await
+        && let Ok(mark) = waiting_for(client, store, bot, bot_id, turn).await
     {
-        let mark = found.map(|waiting_for| Mark { turn, waiting_for });
         let _ = keep(store, bot, turn, mark.as_ref());
     }
     if let Ok(mut checking) = CHECKING.lock() {
@@ -330,14 +401,17 @@ pub async fn checked(client: &Client, store: &Path, bot: &str, turn: i64) {
 /// reviews its reply names are kept beside `store` ([`crate::reviews`]):
 /// nothing for a turn that ended without words; else what a copy of `bot`
 /// says, unless a question the ask tool put is open, which every surface
-/// reads itself.
+/// reads itself. A task's reply goes to its lead, who hears every one
+/// and takes to the person what needs them, in its own reply its own
+/// check reads; so a task's turn waits on the person only when the
+/// person's own words were among what it answered, written in its window.
 async fn waiting_for(
     client: &Client,
     store: &Path,
     bot: &str,
     bot_id: i64,
     turn: i64,
-) -> Result<Option<String>, String> {
+) -> Result<Option<Mark>, String> {
     let handle = format!("turn:{bot}/{turn}");
     let ended = client
         .request("wait", json!({"handles": [&handle], "timeout_ms": 0}))
@@ -351,12 +425,42 @@ async fn waiting_for(
     }
     let reply = self::check(client, bot, turn).await?;
     crate::reviews::note(store, bot, bot_id, turn, &reviews(&reply))?;
-    let waiting = answer(&reply)
+    let waiting = answer(&reply, turn)
         .ok_or_else(|| format!("the check's reply was not the JSON asked for: {reply}"))?;
+    if waiting.is_none() {
+        return Ok(None);
+    }
+    if !crate::project::is_lead(bot) && !heard_the_person(client, bot, turn).await? {
+        return Ok(None);
+    }
     let asked = crate::needs::scan(client, bot, Some(turn))
         .await
         .is_some_and(|seen| seen.ask.is_some());
     Ok(waiting.filter(|_| !asked))
+}
+
+/// Whether `bot`'s turn `turn` took in the person's own words: a message
+/// of theirs, not another agent's, the lookout's or an automation's.
+async fn heard_the_person(client: &Client, bot: &str, turn: i64) -> Result<bool, String> {
+    let page = client
+        .request(
+            "history_nodes",
+            json!({"bot": bot, "limit": TURN_END_NODES}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+        .filter(|node| node["turn"].as_i64() == Some(turn))
+        .filter_map(|node| node["node"].as_i64())
+        .collect();
+    let (items, short) = crate::needs::items(client, bot, &nodes).await;
+    if short && items.is_empty() {
+        return Err(format!("turn {turn} of {bot} could not be read"));
+    }
+    Ok(items.iter().any(|(_, item)| {
+        item["role"] == "user"
+            && !crate::transcript::relays(&crate::text(item), item["from"].as_str())
+    }))
 }
 
 /// Ask a copy of `bot`, with no tools, whether its turn `turn`'s reply
@@ -503,17 +607,55 @@ mod tests {
 
     #[test]
     fn the_copys_reply_says_what_the_person_is_waited_on_for() {
+        let mark = |waiting_for: &str| Mark {
+            turn: 7,
+            waiting_for: waiting_for.into(),
+            ..Mark::default()
+        };
         assert_eq!(
-            answer(r#"{"waiting": true, "for": "which  branch\nto deploy"}"#),
-            Some(Some("which branch to deploy".into()))
+            answer(r#"{"waiting": true, "for": "which  branch\nto deploy"}"#, 7),
+            Some(Some(mark("which branch to deploy")))
         );
-        assert_eq!(answer(r#"{"waiting": false, "for": ""}"#), Some(None));
+        assert_eq!(answer(r#"{"waiting": false, "for": ""}"#, 7), Some(None));
         assert_eq!(
-            answer(r#"{"waiting": true, "for": " "}"#),
-            Some(Some("an answer to its last reply".into()))
+            answer(r#"{"waiting": true, "for": " "}"#, 7),
+            Some(Some(mark("an answer to its last reply")))
         );
-        assert_eq!(answer("Yes, it waits."), None);
-        assert_eq!(answer(r#"{"for": "x"}"#), None);
+        assert_eq!(answer("Yes, it waits.", 7), None);
+        assert_eq!(answer(r#"{"for": "x"}"#, 7), None);
+    }
+
+    /// The choices a reply offered come onto its card as options, the
+    /// one it recommended marked, and are kept with the mark.
+    #[test]
+    fn the_choices_a_reply_offered_are_the_cards_options() {
+        let reply = r#"{"waiting": true, "for": "staging or prod",
+            "options": [{"label": "Staging", "explanation": "Deploy to staging first."},
+                {"label": "  ", "explanation": "dropped: no label"},
+                {"label": "Prod", "explanation": "Ship it\nnow."}],
+            "recommended": 2, "reviews": []}"#;
+        let mark = answer(reply, 3).unwrap().unwrap();
+        let ask = mark.ask();
+        let labels: Vec<&str> = ask.options.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["Staging", "Prod"]);
+        assert_eq!(ask.options[1].explanation, "Ship it now.");
+        assert_eq!(ask.recommended, Some(1));
+        assert_eq!(ask.question, "staging or prod");
+        // A pick answers it as any card's does.
+        assert!(crate::asks::answer(&ask, "2").ends_with("\n\nProd"));
+        // A recommendation past the options, or none, marks none.
+        let none = r#"{"waiting": true, "for": "x", "options": [], "recommended": 3}"#;
+        assert_eq!(answer(none, 3).unwrap().unwrap().recommended, None);
+        let store = std::env::temp_dir()
+            .join(format!("sonny-waiting-choices-{}", std::process::id()))
+            .join("store");
+        keep(&store, "calc.a", 3, Some(&mark)).unwrap();
+        assert_eq!(read(&store, "calc.a"), Some(mark));
+        // 0.9.0's mark, kept without choices, holds nothing.
+        let old = json!({"turn": 3, "for": "staging or prod"}).to_string();
+        std::fs::write(file(&store, "calc.a"), old).unwrap();
+        assert_eq!(read(&store, "calc.a"), None);
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
     }
 
     #[test]
@@ -524,6 +666,7 @@ mod tests {
         let mark = |turn: i64| Mark {
             turn,
             waiting_for: "which branch".into(),
+            ..Mark::default()
         };
         keep(&store, "calc.a", 4, Some(&mark(4))).unwrap();
         assert_eq!(read(&store, "calc.a"), Some(mark(4)));
@@ -567,6 +710,7 @@ mod tests {
         let mark = |w: &str| Mark {
             turn: 2,
             waiting_for: w.into(),
+            ..Mark::default()
         };
         keep(&store, "calc.a", 2, Some(&mark("a"))).unwrap();
         keep(&store, "calc.b", 2, Some(&mark("b"))).unwrap();
@@ -611,7 +755,19 @@ mod tests {
                 Some("wait") if handle == "turn:calc.quiet/3" => json!({"results": {handle:
                     {"status": "completed", "text": " "}}}),
                 Some("wait") => json!({"results": {handle: {"status": "completed",
-                    "text": r#"{"waiting": true, "for": "staging or prod", "reviews": ["CR-881"]}"#}}}),
+                    "text": r#"{"waiting": true, "for": "staging or prod", "reviews": ["CR-881"],
+                        "options": [{"label": "Staging", "explanation": "First."},
+                            {"label": "Prod", "explanation": "Now."}], "recommended": 1}"#}}}),
+                // calc.plan's turn 3 took in the person's words; calc.told's
+                // only its lead's, which hears its reply.
+                Some("history_items") => {
+                    let from = match request["bot"].as_str() {
+                        Some("calc.told") => json!({"bot": "calc.lead"}),
+                        _ => Value::Null,
+                    };
+                    json!({"items": [{"node": 11, "from": from, "item": {"type": "message",
+                        "role": "user", "content": [{"type": "input_text", "text": "Ship it."}]}}]})
+                }
                 // Turn 3 ended at node 12; a later turn began since.
                 Some("history_nodes") => json!({"nodes": [{"node": 14, "turn": 4},
                     {"node": 12, "turn": 3}, {"node": 11, "turn": 3}]}),
@@ -627,9 +783,37 @@ mod tests {
         let store = std::env::temp_dir()
             .join(format!("sonny-waiting-for-{}", std::process::id()))
             .join("store");
+        let staging = Mark {
+            turn: 3,
+            waiting_for: "staging or prod".into(),
+            recommended: Some(0),
+            options: vec![
+                crate::asks::Choice {
+                    label: "Staging".into(),
+                    explanation: "First.".into(),
+                },
+                crate::asks::Choice {
+                    label: "Prod".into(),
+                    explanation: "Now.".into(),
+                },
+            ],
+        };
         assert_eq!(
             waiting_for(&client, &store, "calc.plan", 5, 3).await,
-            Ok(Some("staging or prod".into()))
+            Ok(Some(staging.clone()))
+        );
+        // A task's turn its lead started replies to the lead, which takes
+        // to the person what needs them: nothing waits on them here, while
+        // the reviews it named are still kept.
+        assert_eq!(
+            waiting_for(&client, &store, "calc.told", 6, 3).await,
+            Ok(None)
+        );
+        assert_eq!(crate::reviews::read(&store, "calc.told", 6), ["CR-881"]);
+        // A lead's reply is the person's to read, whoever started its turn.
+        assert_eq!(
+            waiting_for(&client, &store, "calc.lead", 7, 3).await,
+            Ok(Some(staging))
         );
         // The review the copy says its reply named, in any system, is
         // kept for `/status`.
@@ -643,7 +827,7 @@ mod tests {
         let submit = requests.iter().find(|r| r["op"] == "submit").unwrap();
         assert_eq!(
             submit["output_schema"]["required"],
-            json!(["waiting", "for", "reviews"])
+            json!(["waiting", "for", "options", "recommended", "reviews"])
         );
         // It answers on the model and effort the turn ran on.
         assert_eq!(

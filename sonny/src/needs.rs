@@ -490,6 +490,7 @@ mod tests {
         let mark = crate::waiting::Mark {
             turn: 3,
             waiting_for: "which branch".into(),
+            ..Default::default()
         };
         let mut needs = Needs::default();
         needs.asked("calc.a", Some(mark.ask()));

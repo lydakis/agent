@@ -16861,6 +16861,7 @@ mod tests {
         let mark = waiting::Mark {
             turn: 3,
             waiting_for: "which branch to deploy".into(),
+            ..Default::default()
         };
         waiting::keep(&store, "shop.fix", 3, Some(&mark)).unwrap();
         let scope = background::Scope {
@@ -21753,6 +21754,7 @@ mod tests {
         let mark = waiting::Mark {
             turn: 3,
             waiting_for: "staging or prod".into(),
+            ..Default::default()
         };
         waiting::keep(&fleet.store, "calc.plan", 3, Some(&mark)).unwrap();
         fleet.rescan().await;

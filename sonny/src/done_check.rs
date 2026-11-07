@@ -500,6 +500,7 @@ mod tests {
         let mark = crate::waiting::Mark {
             turn: 9,
             waiting_for: "a branch".into(),
+            ..Default::default()
         };
         crate::waiting::keep(&store, "calc.web", 9, Some(&mark)).unwrap();
         assert!(!due(&store, ("calc.web", 1), 9, ended, now, hour));
