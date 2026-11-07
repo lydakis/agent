@@ -565,13 +565,7 @@ async fn read_status(
     let mut profiles: HashMap<String, Option<String>> = HashMap::new();
     // With other leads in the folder, their tasks are theirs: each
     // lead shows as a row of its own.
-    let shared = lead != format!("{project}.lead")
-        || (listed.iter()).any(|bot| {
-            let name = bot["name"].as_str().unwrap_or("");
-            name != lead && project::lead_project(name) == Some(project.as_str())
-        });
-    let mine = (shared && project::lead_project(&lead) == Some(project.as_str()))
-        .then(|| lineage_of(&listed, &lead, lead == format!("{project}.lead")));
+    let mine = owned(&listed, &project, &lead);
     // Side chats are not the project's agents.
     let mut kept = HashMap::new();
     for bot in &listed {
@@ -4180,6 +4174,19 @@ fn kin(
     }
 }
 
+/// With other leads in `project`'s folder, the bots among `listed` that
+/// are `lead`'s ([`lineage_of`]); none to tell apart, with it the only one.
+fn owned(listed: &[Value], project: &str, lead: &str) -> Option<std::collections::HashSet<String>> {
+    let first = lead == format!("{project}.lead");
+    let shared = !first
+        || (listed.iter()).any(|bot| {
+            let name = bot["name"].as_str().unwrap_or("");
+            name != lead && project::lead_project(name) == Some(project)
+        });
+    (shared && project::lead_project(lead) == Some(project))
+        .then(|| lineage_of(listed, lead, first))
+}
+
 /// The bots among `bots` (as `bots` lists them) that are `lead`'s: made by
 /// it or by one of its, or, for the folder's first lead, made by no agent
 /// at all; never another lead.
@@ -5517,8 +5524,7 @@ impl App {
                 }
                 _ = tick.tick() => {
                     if self.project.is_some() {
-                        let glob = self.scope().glob;
-                        self.done_sweep.look(&self.client, &self.store(), &glob);
+                        self.done_sweep.look(&self.client, &self.store(), self.scope());
                         // A task the check found done goes as one marked done does.
                         if let Some(fleet) = &mut self.fleet {
                             for task in self.done_sweep.done() {

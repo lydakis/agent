@@ -214,7 +214,7 @@ pub struct Sweep {
 
 impl Sweep {
     /// Look at the tasks matching `glob` in `store`, if it is time to.
-    pub fn look(&mut self, client: &Arc<Client>, store: &Path, glob: &str) {
+    pub fn look(&mut self, client: &Arc<Client>, store: &Path, scope: crate::background::Scope) {
         let now = Instant::now();
         if self.next.is_some_and(|at| now < at) {
             return;
@@ -228,10 +228,10 @@ impl Sweep {
             return;
         }
         self.next = Some(now + every(after));
-        let (client, store, glob) = (client.clone(), store.to_owned(), glob.to_owned());
+        let (client, store) = (client.clone(), store.to_owned());
         let (running, read, done) = (self.running.clone(), self.read.clone(), self.done.clone());
         tokio::spawn(async move {
-            sweep(&client, &store, &glob, after, (&read, &done)).await;
+            sweep(&client, &store, &scope, after, (&read, &done)).await;
             running.store(false, Ordering::Release);
         });
     }
@@ -246,19 +246,19 @@ impl Sweep {
     }
 }
 
-/// Ask each task matching `glob` that sits idle past `after` whether it
-/// is done, one at a time.
+/// Ask each of the lead's tasks in `scope` that sits idle past `after`
+/// whether it is done, one at a time.
 async fn sweep(
     client: &Client,
     store: &Path,
-    glob: &str,
+    scope: &crate::background::Scope,
     after: Duration,
     (read, done): (&Read, &Mutex<Vec<String>>),
 ) {
     let mut listed = Vec::new();
     let mut from: Option<String> = None;
     loop {
-        let mut asked = json!({"name": glob, "limit": 256});
+        let mut asked = json!({"name": scope.glob, "limit": 256});
         if let Some(from) = &from {
             asked["after"] = json!(from);
         }
@@ -271,6 +271,8 @@ async fn sweep(
             _ => break,
         }
     }
+    // With other leads in the folder, their tasks are theirs to ask.
+    let mine = crate::owned(&listed, &scope.project, &scope.lead);
     let now = crate::home::now_ms() as u64;
     let mut names = Vec::new();
     for bot in &listed {
@@ -285,6 +287,7 @@ async fn sweep(
         if crate::project::is_lead(name)
             || !bot["expire_ms"].is_null()
             || !bot["running_turn"].is_null()
+            || mine.as_ref().is_some_and(|mine| !mine.contains(name))
         {
             continue;
         }
@@ -322,8 +325,15 @@ async fn sweep(
             Some(seen) if !seen.itself && seen.ask.is_none() => {}
             _ => continue,
         }
-        if let Ok(answer) = ask(client, store, (name, bot_id), turn).await
-            && answer.done
+        // Its window closes only while the answer still covers it: no
+        // turn ran since the one asked about.
+        let Ok(answer) = ask(client, store, (name, bot_id), turn).await else {
+            continue;
+        };
+        if answer.done
+            && crate::last_ran(client, name, None).await.is_ok_and(|last| {
+                last["turn"].as_i64() == Some(turn) && last["status"] == "completed"
+            })
             && let Ok(mut done) = done.lock()
         {
             done.push(name.to_owned());
@@ -445,7 +455,8 @@ mod tests {
 
     /// A window's sweep asks the idle task past the threshold, through a
     /// tool-less copy, and only it: not the lead, a running task, one idle
-    /// too short a while, nor, on the next sweep, the one it asked.
+    /// too short a while, another lead's task, nor, on the next sweep, the
+    /// one it asked.
     #[tokio::test]
     async fn a_sweep_asks_each_task_idle_long_enough_once() {
         let asked = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -459,10 +470,13 @@ mod tests {
                     {"name": "calc.lead", "bot_id": 1, "head": 1, "running_turn": null, "expire_ms": null},
                     {"name": "calc.old", "bot_id": 2, "head": 2, "running_turn": null, "expire_ms": null},
                     {"name": "calc.new", "bot_id": 3, "head": 3, "running_turn": null, "expire_ms": null},
-                    {"name": "calc.busy", "bot_id": 4, "head": 4, "running_turn": 9, "expire_ms": null}]}),
+                    {"name": "calc.busy", "bot_id": 4, "head": 4, "running_turn": 9, "expire_ms": null},
+                    {"name": "calc.lead.ada", "bot_id": 5, "head": 5, "running_turn": null, "expire_ms": null},
+                    {"name": "calc.theirs", "bot_id": 6, "head": 6, "running_turn": null, "expire_ms": null,
+                        "created_by": "calc.lead.ada"}]}),
                 Some("turns") => {
                     let hours = match request["bot"].as_str() {
-                        Some("calc.old") => 9,
+                        Some("calc.old" | "calc.theirs") => 9,
                         _ => 1,
                     };
                     json!({"turns": [{"turn": 5, "status": "completed",
@@ -482,7 +496,8 @@ mod tests {
         let store = dir.join("state.sqlite");
         let (read, done) = (Mutex::new(HashMap::new()), Mutex::new(Vec::new()));
         let after = Duration::from_secs(8 * 3600);
-        sweep(&client, &store, "calc.*", after, (&read, &done)).await;
+        let scope = scope();
+        sweep(&client, &store, &scope, after, (&read, &done)).await;
         let forks: Vec<Value> = (asked.lock().unwrap().iter())
             .filter(|r| r["op"] == "fork")
             .cloned()
@@ -496,7 +511,7 @@ mod tests {
         assert_eq!(std::mem::take(&mut *done.lock().unwrap()), ["calc.old"]);
         // Asked once: the next sweep reads no turn again and asks no one.
         asked.lock().unwrap().clear();
-        sweep(&client, &store, "calc.*", after, (&read, &done)).await;
+        sweep(&client, &store, &scope, after, (&read, &done)).await;
         let again = asked.lock().unwrap().clone();
         assert!(
             !again
@@ -504,6 +519,55 @@ mod tests {
                 .any(|r| r["op"] == "fork" || r["op"] == "turns")
         );
         assert!(done.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scope() -> crate::background::Scope {
+        crate::background::Scope {
+            project: "calc".into(),
+            lead: "calc.lead".into(),
+            glob: "calc.*".into(),
+        }
+    }
+
+    /// A turn that ran while the copy answered keeps the task's window:
+    /// the yes covers only the turn asked about.
+    #[tokio::test]
+    async fn a_turn_run_while_the_check_answered_keeps_the_window() {
+        let forked = Arc::new(AtomicBool::new(false));
+        let seen = forked.clone();
+        let now = crate::home::now_ms() as u64;
+        let client = crate::tests::daemon_answering(move |request| {
+            match request["op"].as_str() {
+                Some("bots") => json!({"bots": [
+                    {"name": "calc.old", "bot_id": 2, "head": 2, "running_turn": null, "expire_ms": null}]}),
+                // Turn 6 ran once the copy was made.
+                Some("turns") if seen.load(Ordering::Acquire) => json!({"turns": [
+                    {"turn": 6, "status": "completed", "finished_ms": now}]}),
+                Some("turns") => json!({"turns": [{"turn": 5, "status": "completed",
+                    "finished_ms": now - 9 * 3_600_000}]}),
+                Some("history_nodes") => json!({"nodes": [{"node": 20, "turn": 5}]}),
+                Some("fork") => {
+                    seen.store(true, Ordering::Release);
+                    json!({"bot_id": 9})
+                }
+                Some("submit") => json!({"handle": "turn:copy/1", "turn": 1}),
+                Some("wait") => json!({"results": {"turn:copy/1": {"status": "completed",
+                    "text": r#"{"done": true, "why": "its pull request merged"}"#}}}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("sonny-sweep-ran-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("state.sqlite");
+        let (read, done) = (Mutex::new(HashMap::new()), Mutex::new(Vec::new()));
+        let after = Duration::from_secs(8 * 3600);
+        sweep(&client, &store, &scope(), after, (&read, &done)).await;
+        assert!(forked.load(Ordering::Acquire));
+        assert!(done.lock().unwrap().is_empty());
+        // Its mark covers turn 5 alone, so turn 6 leaves it open.
+        assert_eq!(crate::resolved::read(&store, "calc.old"), Some(5));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
