@@ -1075,10 +1075,12 @@ pub fn unheld(
 }
 
 /// A `subscriptions` call of `subscriber`'s: `add` one, as `to_json`
-/// writes it, or `remove` one by name, then list them all, with the
-/// `sources` the person set up. Adding one again changes nothing; one
-/// under a name in use that differs is refused with the field, and one
-/// naming a source there is not with the sources there are.
+/// writes it, or `remove` one by name, answered with that one alone, and
+/// for one added that hears sources, what it would have heard of their
+/// last day; with neither, list them all, with the `sources` the person
+/// set up. Adding one again changes nothing; one under a name in use that
+/// differs is refused with the field, and one naming a source there is
+/// not with the sources there are.
 pub fn change(
     store: &Path,
     subscriber: &str,
@@ -1108,6 +1110,10 @@ pub fn change(
         write(store, subscriber, &subs)?;
     }
     let mut said = json!({});
+    let changes = add.is_some() || remove.is_some();
+    // What it added is all a change lists, one removed being gone: the
+    // whole listing is for a call that changes nothing.
+    let mut changed: Vec<Sub> = Vec::new();
     if let Some(name) = remove {
         said["removed"] = json!(drop_named(store, subscriber, &mut subs, name)?);
     }
@@ -1136,9 +1142,19 @@ pub fn change(
         }
     }
     if let Some(sub) = add {
+        if !sub.sources.is_empty() {
+            let tried = preview(store, subscriber, &sub);
+            said["test"] = tried["test"].clone();
+            if !tried["examples"].is_null() {
+                said["examples"] = tried["examples"].clone();
+            }
+        }
         match subs.iter().find(|s| s.name == sub.name) {
             Some(had) => match had.differs(&sub) {
-                None => said["added"] = json!(false),
+                None => {
+                    changed.push(had.clone());
+                    said["added"] = json!(false)
+                }
                 Some(field) => {
                     return Err(format!(
                         "a subscription {} with another {field} is there; remove it first",
@@ -1147,16 +1163,21 @@ pub fn change(
                 }
             },
             None => {
+                changed.push(sub.clone());
                 subs.push(sub);
                 write(store, subscriber, &subs)?;
                 said["added"] = json!(true);
             }
         }
     }
+    let listed = match changes {
+        true => &changed,
+        false => &subs,
+    };
     // What each told lately, as the lookout counts it; when each was
     // added is the lookout's to count by, not the bot's to read.
     let (counts, now) = (counts(store, subscriber), super::epoch_ms() as u64);
-    said["subscriptions"] = (subs.iter())
+    let listing: Vec<Value> = (listed.iter())
         .map(|sub| {
             let mut listed = Sub {
                 made: None,
@@ -1169,8 +1190,16 @@ pub fn change(
             listed
         })
         .collect();
+    // One only removed lists nothing, rather than an empty list that
+    // would read as none left.
+    if !(changes && listing.is_empty()) {
+        said["subscriptions"] = json!(listing);
+    }
     // Whether what it lists is what the lookout listens for.
     said["lookout"] = taken(store, subscriber);
+    if changes {
+        return Ok(said);
+    }
     // Examples come only from events these subscriptions hear, and are
     // what sources printed, as a note from them is.
     let (listed, examples) = super::sources::listed(store, sources, &subs);
@@ -1214,7 +1243,12 @@ pub fn tried(
     add: &Value,
     sources: &[String],
 ) -> Result<Value, String> {
-    let sub = checked(add, sources)?;
+    Ok(preview(store, subscriber, &checked(add, sources)?))
+}
+
+/// What `sub` would have heard of its sources' last 24 hours, as `tried`
+/// answers it.
+fn preview(store: &Path, subscriber: &str, sub: &Sub) -> Value {
     let now = super::epoch_ms();
     let since = now.saturating_sub(super::sources::RECENT_SPAN.as_millis());
     let mut named: Vec<&str> = (sub.sources.iter())
@@ -1295,7 +1329,7 @@ pub fn tried(
         said["test"]["examples"] = json!(examples);
         said["examples"] = json!(super::sources::EXAMPLES);
     }
-    Ok(said)
+    said
 }
 
 /// One event a test heard, as the estimate of its notes sees it.
@@ -1758,6 +1792,25 @@ mod tests {
                 .unwrap_err()
                 .contains("no source")
         );
+        // Adding it answers with it and the same test, not every
+        // subscription and source; removing it, with that it went.
+        let added = change(&store, "shop.lead", None, Some(&add), None, &sources).unwrap();
+        assert_eq!(added["added"], true);
+        assert_eq!(added["subscriptions"].as_array().unwrap().len(), 1);
+        assert_eq!(added["subscriptions"][0]["name"], "red");
+        assert_eq!(added["test"]["heard"], 3, "{added}");
+        assert!(added["examples"].as_str().is_some());
+        assert!(added.get("sources").is_none(), "{added}");
+        let quiet = json!({"name": "quiet", "bots": ["ci.*"]});
+        let added = change(&store, "shop.lead", None, Some(&quiet), None, &sources).unwrap();
+        assert!(added.get("test").is_none(), "{added}");
+        let listed = change(&store, "shop.lead", None, None, None, &sources).unwrap();
+        assert_eq!(listed["subscriptions"].as_array().unwrap().len(), 2);
+        assert_eq!(listed["sources"][0]["name"], "ci");
+        let gone = change(&store, "shop.lead", None, None, Some("red"), &sources).unwrap();
+        assert_eq!(gone["removed"], true);
+        assert!(gone.get("subscriptions").is_none(), "{gone}");
+        assert!(gone.get("sources").is_none(), "{gone}");
         let _ = std::fs::remove_dir_all(dir(&store));
         let _ = std::fs::remove_dir_all(&sources_dir);
     }
@@ -1977,17 +2030,23 @@ mod tests {
             warned["unseen"],
             "no recent event of cr had path: the filter hears none until one does"
         );
+        // A change answers with what changed alone; the sources are
+        // listed with all the subscriptions, on a call that changes nothing.
+        assert_eq!(warned["subscriptions"].as_array().unwrap().len(), 1);
+        assert!(warned.get("sources").is_none(), "{warned}");
+        let whole = change(&store, "shop.lead", None, None, None, &sources).unwrap();
+        assert_eq!(whole["subscriptions"].as_array().unwrap().len(), 4);
         // Examples only from the newest event its subscriptions hear, the
         // billing one rather than the later one its filter leaves out, with
         // the outside-content warning.
-        let listed = &warned["sources"][0];
+        let listed = &whole["sources"][0];
         assert_eq!(listed["name"], "cr");
         assert_eq!(
             listed["fields"]["paths"],
             "list of strings, as [\"src/billing/a.rs\"]"
         );
         assert_eq!(listed["fields"]["meta.team"], "string, as \"core\"");
-        assert_eq!(warned["examples"], super::super::sources::EXAMPLES);
+        assert_eq!(whole["examples"], super::super::sources::EXAMPLES);
         // A caller hearing none of them sees each field's kinds alone.
         let other = change(&store, "ops.lead", None, None, None, &sources).unwrap();
         assert_eq!(other["sources"][0]["fields"]["paths"], "list of strings");
@@ -2027,7 +2086,8 @@ mod tests {
             "{none}"
         );
         let sources = ["mail".to_owned(), "slack".to_owned()];
-        let heard = change(&store, "shop.lead", None, Some(&slack), None, &sources).unwrap();
+        change(&store, "shop.lead", None, Some(&slack), None, &sources).unwrap();
+        let heard = change(&store, "shop.lead", None, None, None, &sources).unwrap();
         let names: Vec<&Value> = (heard["sources"].as_array().unwrap().iter())
             .map(|s| &s["name"])
             .collect();
@@ -2078,8 +2138,8 @@ mod tests {
         .unwrap();
         let gone = change(&store, &long, None, None, Some("x"), &[]).unwrap();
         assert_eq!(
-            (gone["removed"].clone(), gone["subscriptions"].clone()),
-            (json!(true), json!([]))
+            (gone["removed"].clone(), gone.get("subscriptions")),
+            (json!(true), None)
         );
         // Changes made at once all land.
         let threads: Vec<_> = (0..8)
