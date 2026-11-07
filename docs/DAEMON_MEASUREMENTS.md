@@ -3755,6 +3755,75 @@ Ignored artifacts: `.local/prompt_metadata_fix_probe.py`,
 `.local/prompt_metadata_fix_perf.py`, `.local/prompt-metadata-fix-perf.json`,
 and `.local/prompt-metadata-fix-perf.log`.
 
+## Prompt openings stored at write time
+
+Turn and history listings, compaction's span walk and the omitted-turns
+note built before every model call each ran
+`json_extract(CAST(item AS TEXT),'$.content[0].text')` on whole prompt
+items to show at most a few hundred characters (2,049 for compaction). On a
+rolling context, every model call listed up to 48 omitted turns that way,
+reading each prompt's overflow pages into the reader's page cache; with a
+reader per CPU each cache filled with old prompts. Each prompt node now
+keeps its opening (first 2,049 characters and the text's length) in
+`openings`, written in the transaction that adds the node, and every
+listing reads it. Schema 82 backfills stored prompts once: 20,000 prompts
+of 32 KiB (a 636 MiB store) took 1.2 s and added about 41 MiB, since an
+opening holds at most 2,049 characters and never more than its prompt.
+
+`bench.store_load` (one fixed trace: seeded bots, a Sky following every bot
+from cursor 0 and a second opening mid-burst, a burst, 15 s idle, a second
+burst, then a slow replay beside short reads), alternating `main` (be1a3bb)
+and this branch on one 4-CPU Linux box. 32 KiB prompts, a 128 KiB context
+window, 12 turns per live bot per burst; three runs each, medians:
+
+| Point | Measure | `main` | Openings |
+| --- | --- | ---: | ---: |
+| today (100 bots, 10 live) | Daemon CPU, whole run, s | 2.78 | 2.15 |
+| today | RSS after the first burst, MiB | 28.8 | 28.5 |
+| today | Peak RSS, MiB | 30.7 | 32.0 |
+| today | Short read p95 during the burst, ms | 3.26 | 2.96 |
+| heavy (100 bots, 50 live) | Daemon CPU, whole run, s | 11.70 | 8.80 |
+| heavy | RSS after the first burst, MiB | 33.1 | 32.8 |
+| heavy | Peak RSS, MiB | 37.4 | 39.1 |
+| heavy | Turn p95, ms | 222 | 207 |
+| heavy | Short read p95 during the burst, ms | 8.17 | 7.03 |
+| heavy | Short read p95 beside a full replay, ms | 6.68 | 3.75 |
+
+Per operation at the heavy point: a `turns` page ran 2.25 ms on `main` and
+0.79 ms here; `omitted_turns` 1.95 and 1.13 ms. The peak, in the replay
+phase at the end, sits about 1.5 MiB higher in every run here; the runs
+also served more short reads in the same time. The finding that started
+this (P1) used one reader per CPU on a 12-CPU machine and 64 KiB prompts,
+so the same trace with `--max-readers 12`, 32 live bots of 32, 30 turns per
+burst, 64 KiB prompts in a 256 KiB window; two runs each:
+
+| Measure | `main` | Openings |
+| --- | ---: | ---: |
+| Peak RSS, MiB | 65.8, 64.6 | 50.3, 50.8 |
+| RSS after the second burst, MiB | 54.6, 57.0 | 40.3, 37.3 |
+| Daemon CPU, whole run, s | 20.3, 20.7 | 14.0, 15.1 |
+| Turn p95, first burst, ms | 179, 163 | 176, 198 |
+| Short read p95 during the burst, ms | 12.5, 12.8 | 8.2, 9.1 |
+
+The AGENTS.md hot-path screen (`bench.admission_burst`, `bench.completion_burst`
+and `bench.lifecycle` at `--repeat 5`, `bench.footprint` at `--repeat 2`,
+two rounds alternating with `main` on the same box, compared by
+`bench.perf_gate`): store work per turn is the same, and nothing passes
+the gate's 15% warning.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 43.447 | 44.712 | +2.9% |
+| admission | burst submit p99, ms | 6.366 | 6.347 | -0.3% |
+| completion | release to terminal p99, ms | 13.144 | 13.938 | +6.0% |
+| footprint | idle RSS, MiB | 21.1 | 21.035 | -0.3% |
+| footprint | per idle bot, KiB | 1.488 | 1.474 | -0.9% |
+| footprint | RSS after a turn each, MiB | 30.205 | 30.582 | +1.2% |
+| footprint | CPU per turn, ms | 1.353 | 1.255 | -7.2% |
+| lifecycle | CPU, s | 1.185 | 1.19 | +0.4% |
+| lifecycle | p95 turn, ms | 587.629 | 586.522 | -0.2% |
+| lifecycle | peak RSS, MiB | 27.756 | 28.174 | +1.5% |
+
 ## Compaction cut foreign-key index
 
 Local synthetic SQLite screen, 2026-09-19. The query-plan audit exposed a
@@ -7423,3 +7492,39 @@ spread, and the completion and footprint moves stay under 4%.
 | lifecycle | CPU, s | 0.845 | 0.91 | +7.7% |
 | lifecycle | p95 turn, ms | 702.273 | 621.715 | -11.5% |
 | lifecycle | peak RSS, MiB | 27.988 | 27.758 | -0.8% |
+
+## A line's depth bound in the daemon (#774)
+
+Each bot keeps its `depth` (protocol 52, schema 83) in one `bots` column,
+so a create or fork checks the daemon's `max_depth` with no walk up the
+line: the creator lookup a create already ran, `creator_id`, became one
+cached statement that reads the creator's depth beside its id. A fork reads
+its source's depth from the row it already loads. No statement, row, index
+or store job is added to a turn, and a bot's row and its `created` and
+`forked` events carry one integer more. The migration fills every bot's
+depth once at open with one recursive query along its makers.
+
+The Perf workflow's matched screen of this change against its base
+(`bench.perf_gate`, GitHub runner, head 13b9d23 against main 9adf451):
+store work per turn is the same and the gate gave no warnings. Per idle bot
+moved +5.1% (1.53 to 1.61 KiB), inside the runner's spread for that
+measure (#722's screen moved it -5.1%), and every other daemon measure
+moved under 2%.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 39.89 | 39.995 | +0.3% |
+| admission | burst submit p99, ms | 6.766 | 6.752 | -0.2% |
+| completion | release to terminal p99, ms | 14.283 | 14.284 | +0.0% |
+| footprint | idle RSS, MiB | 15.092 | 14.881 | -1.4% |
+| footprint | per idle bot, KiB | 1.528 | 1.606 | +5.1% |
+| footprint | RSS after a turn each, MiB | 24.102 | 24.188 | +0.4% |
+| footprint | CPU per turn, ms | 1.323 | 1.327 | +0.3% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 10.935 | 10.75 | -1.7% |
+| sonny | lookout note p95 at 10x100, ms | 2425.5 | 2590.5 | +6.8% |
+| sonny | lookout note p95 at 100x10, ms | 2756.5 | 2665.0 | -3.3% |
+| sonny | quiet window CPU, ms/s | 4.1 | 4.12 | +0.5% |
+| sonny | sky replay CPU per 1k lines, ms | 12.27 | 12.52 | +2.0% |
+| lifecycle | CPU, s | 0.615 | 0.615 | +0.0% |
+| lifecycle | p95 turn, ms | 583.508 | 580.933 | -0.4% |
+| lifecycle | peak RSS, MiB | 22.521 | 22.418 | -0.5% |

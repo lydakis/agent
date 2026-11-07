@@ -489,6 +489,7 @@ keeps what it started with; the next start takes a change.
 | `--max-load` | The 1-minute load average at which new foreground and background commands wait while one of the daemon's is running, as make's `-l`: never while none is, so a loaded machine slows the fleet and never stops it, and `--max-processes` stays the bound behind it. One thread reads the load each second; waiters hold no slot, go in the order they came, and take a freed slot only if the gate still admits them. A call that would be refused (forbidden, asked about with no gate, an escape no gate allows) is answered at once, never held; a gated one waits for its verdict instead, so a denial comes back as soon as it is given, and one allowed starts then. A round's calls that run together are let in or held whole. A foreground command held past 1.5 s parks its turn before the call (or the batch it starts with) starts: one commit, `turn_waiting` with `{call_id, load: true, deadline_ms}` (also its view's `waiting_on`), no task, no active slot, and it survives restart. The gate's next admitting reading wakes every parked turn once the load falls, or the oldest alone on a loaded machine where none of the daemon's commands runs; a turn whose round has a later gated call is woken at that call's lapse too. A fraction is kept. Zero is no gate. Reported in `ready` as `limits.load`, `null` for none (protocol 44). | none (the agent CLI passes `cpus * 2`) |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count; a connection that sends no bytes at all, keepalives included, fails sooner, after 2 minutes. Whole seconds, `1s` to `24h`. `[daemon] stall_timeout` in `~/.agent/config.toml` sets it, as a duration such as `"15m"`. | `10m` |
+| `--max-depth` | How many generations below the bot that starts its line `create` and `fork` may make a bot (Codex's `agents.max_depth`). A bot made with no creator, or with `starts_line`, is at 0; one another bot creates is one below its creator; a fork its source makes stands where its source does, and one another bot makes is one below that bot. Each bot keeps its `depth`, so the check reads only its creator's row. Past the bound, `depth_limit`, with `depth` and `max_depth`, and nothing made; a resend of a keyed creation still answers with the bot it made. Zero is unbounded. Reported in `ready` as `limits.depth`, `null` for none (protocol 52). | none (the agent CLI passes `[daemon] depth`, 2 by default) |
 | `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
 
@@ -1661,7 +1662,11 @@ stale child-to-parent submissions after name reuse. The record, the `created` an
 carry both; the two events also carry the record's list fields (`id`,
 `provider`, `model`, `workspace`, `status`, `running_turn`), so a follower
 seats a new bot without a request per creation. Bots remain peers: the field is lineage for people and
-clients, never authority.
+clients, never authority. Each record, both events and `bots` pages also carry `depth`, the
+generations below the bot that starts the bot's line, which `--max-depth` bounds; `starts_line:
+true` on `create` makes a bot with a creator start a line of its own, at 0, and is refused on a
+sandboxed bot's own socket (`not_permitted`), since a confined bot that could start lines could make
+bots without end.
 
 `from: {bot, turn}` on `submit` says a bot's model wrote the prompt, in
 that turn; a prompt without it is a person's. The CLI sends it from
@@ -1963,7 +1968,8 @@ queued work as `bot_busy`. `stats` reports queued and ready turns together
 as `queued_turns`, a count the storage worker keeps at each transition
 and recounts at open, so admission and `stats` cost the store nothing.
 `agent run --delivery MODE` sets the field, defaulting
-to `AGENT_DELIVERY` in the client's environment, then `reject`; with
+to `AGENT_DELIVERY` in the client's environment, then `steer` (`queue`
+with `--workspace` or `--turn-budget-tokens`); with
 `--detach` a peer can hand a busy bot work or a mid-turn message without
 racing on `bot_busy`.
 

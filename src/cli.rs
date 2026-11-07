@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --max-load --stall-timeout --idle-exit";
+const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --max-load --max-depth --stall-timeout --idle-exit";
 
 struct Command {
     name: &'static str,
@@ -299,7 +299,7 @@ fn print_flags(flags: &str) {
             "--detach" => ("", "Submit and return a JSON turn handle immediately"),
             "--delivery" => (
                 "MODE",
-                "If the bot is busy: reject, queue, or steer; attach adds the message to its next model call without starting a turn; default AGENT_DELIVERY or reject",
+                "If the bot is busy: steer joins its running turn, queue runs after it, reject refuses; attach adds the message to its next model call without starting a turn; default AGENT_DELIVERY, else steer, or queue with --workspace or --turn-budget-tokens",
             ),
             "--attach-wait" => (
                 "DURATION",
@@ -397,6 +397,10 @@ fn print_flags(flags: &str) {
             "--max-load" => (
                 "LOAD",
                 "New commands wait while the 1-minute load average is this or more and one is running; 0 is no gate",
+            ),
+            "--max-depth" => (
+                "N",
+                "Most generations a new bot may be below the bot that starts its line; 0 is unbounded",
             ),
             "--max-output-tokens" => (
                 "N",

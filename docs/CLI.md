@@ -69,6 +69,11 @@ a formula of the machine, as `processes = "cpus * 64"` or
 daemon's to end, as `make -l` does, a turn held long parking until then.
 `stall_timeout = "15m"` sets how long a provider stream may send no
 content before it is retried (`--stall-timeout`, 10 minutes by default).
+`depth = 2`, the default for `--max-depth`, is how many generations below
+the bot that starts its line a new bot may be, as Codex's
+`agents.max_depth`: a bot run with no `AGENT_BOT` starts one, its children
+are at 1 and theirs at 2, and a `run --new` or `fork` deeper is refused as
+`depth_limit`; 0 is no end.
 A key it does not know, or a formula it cannot work out for this machine
 (one below 0 here included), is `config_invalid` when the file is read.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
@@ -118,9 +123,12 @@ tries its held turns at once.
   `--bot NAME`; a fork uses `--source NAME` and `--bot DESTINATION`.
 - `--all` selects all bots for `follow`; `--any` selects first-completion
   behavior for `wait`. `follow --all --bot NAME` is an error.
-- `run --delivery MODE` is `reject`, `queue`, `steer`, or `attach`: what the
+- `run --delivery MODE` is `steer`, `queue`, `attach`, or `reject`: what the
   submission does when the bot is busy. Without the flag, `AGENT_DELIVERY`
-  applies, then `reject`. `--turn N` with `steer` makes it strict: for that
+  applies, then `steer`, as a person's message to a busy bot does; with
+  `--workspace` or `--turn-budget-tokens`, which only a turn of its own
+  takes, `queue`. `reject` refuses a busy bot with `bot_busy`, for a
+  program that must start now or hear why. `--turn N` with `steer` makes it strict: for that
   running turn or `stale_turn`. The daemon has no default of its own: the client
   always sends the mode it resolved, so one person's preference never
   changes what a program's submission means. A blocking `run` with `queue`

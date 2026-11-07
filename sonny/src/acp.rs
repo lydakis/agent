@@ -950,12 +950,17 @@ impl Session {
         let Some(bound) = &state.bound else {
             return Err((FAILED, "the thread has no bot".into()));
         };
+        // As in Sonny's window: a steer, joining the running turn or one
+        // started meanwhile, else starting one; a move needs a turn of its
+        // own, which a steer may not be, so a prompt that moves the lead
+        // queues.
         let steer = state.running.is_some();
+        let moving = (!steer).then_some(bound.moving.as_ref()).flatten();
         let mut asked = json!({"bot": bound.bot, "bot_id": bound.bot_id,
             "request_id": crate::unique("acp"), "prompt": crate::stamp::now(&text),
-            "delivery": if steer { "steer" } else { "reject" },
+            "delivery": if moving.is_some() { "queue" } else { "steer" },
             "images": if images.is_empty() { Value::Null } else { json!(images) }});
-        if !steer && let Some(dir) = &bound.moving {
+        if let Some(dir) = moving {
             asked["workspace"] = json!(dir);
         }
         let client = bound.client.clone();
@@ -1617,7 +1622,7 @@ async fn setup_lead(
     ) {
         asked["instructions"] = json!(text);
     }
-    let declare = declared::declare(&record, crate::served::Role::of(0));
+    let declare = declared::declare(&record, crate::served::Role::LEAD);
     if let Some(declare) = &declare {
         asked["declare"] = declare.clone();
     }

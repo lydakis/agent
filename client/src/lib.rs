@@ -108,7 +108,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 51;
+pub const PROTOCOL: u64 = 52;
 /// How long the daemon holds a turn on a cause a person can fix before it
 /// fails with it, for a bot that sets no `hold_ms`: five days, as mail is
 /// retried (RFC 5321 suggests four to five) before it is returned.
@@ -256,6 +256,9 @@ pub struct Client {
     /// `ready.providers`: each binding's family and the efforts it takes.
     providers: Value,
     paused: Value,
+    /// `ready.limits.depth`: the most generations below the bot that
+    /// starts its line a bot may be made at; `None` for no bound.
+    max_depth: Option<u64>,
     /// Requests this client keeps in flight at once, when bounded.
     in_flight: std::sync::OnceLock<Semaphore>,
 }
@@ -330,6 +333,7 @@ impl Client {
         let identity = ready["store"]["identity"].as_str().map(str::to_owned);
         let providers = ready["providers"].clone();
         let paused = ready["paused"].clone();
+        let max_depth = ready["limits"]["depth"].as_u64();
         let pending: Pending = Arc::default();
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (events, receiver) = mpsc::channel(QUEUE);
@@ -399,6 +403,7 @@ impl Client {
                 identity,
                 providers,
                 paused,
+                max_depth,
                 in_flight: std::sync::OnceLock::new(),
             }),
             Events(receiver),
@@ -426,6 +431,12 @@ impl Client {
     /// The daemon's provider bindings as `ready` announced them.
     pub fn providers(&self) -> &Value {
         &self.providers
+    }
+
+    /// The most generations below the bot that starts its line the daemon
+    /// makes a bot at, as `ready` announced it; `None` for no bound.
+    pub fn max_depth(&self) -> Option<u64> {
+        self.max_depth
     }
 
     /// The pause that held the daemon as this client connected, or null;
@@ -576,6 +587,7 @@ mod tests {
             identity: None,
             providers: Value::Null,
             paused: Value::Null,
+            max_depth: None,
             in_flight: std::sync::OnceLock::new(),
         });
         let mut lines = BufReader::new(peer).lines();
@@ -609,6 +621,7 @@ mod tests {
             identity: None,
             providers: Value::Null,
             paused: Value::Null,
+            max_depth: None,
             in_flight: std::sync::OnceLock::new(),
         });
         client.bound(1);
@@ -652,6 +665,7 @@ mod tests {
             identity: None,
             providers: Value::Null,
             paused: Value::Null,
+            max_depth: None,
             in_flight: std::sync::OnceLock::new(),
         });
         let mut lines = BufReader::new(peer).lines();
@@ -693,6 +707,7 @@ mod tests {
             identity: None,
             providers: Value::Null,
             paused: Value::Null,
+            max_depth: None,
             in_flight: std::sync::OnceLock::new(),
         });
         let request = tokio::spawn({

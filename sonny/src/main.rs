@@ -39,6 +39,7 @@ mod home;
 mod html;
 mod image;
 mod js;
+mod kept;
 mod link;
 mod links;
 mod list;
@@ -106,7 +107,7 @@ mod zen;
 use agent_client::{Client, Events};
 use ratatui::{
     Terminal,
-    backend::{Backend, CrosstermBackend},
+    backend::Backend,
     crossterm::{
         event::{
             self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture,
@@ -155,6 +156,10 @@ const DRAW_ATTEMPTS: u32 = 30;
 /// The least time between two draws the daemon's events bring: 30 a
 /// second, Ink's default cap.
 const DRAW_EVERY: Duration = Duration::from_millis(33);
+/// The most time between two frames of a window where nothing moves: its
+/// clocks count seconds, and what it reads now and then (counts, tasks,
+/// the margin's files) shows within one.
+const IDLE_FRAME: Duration = Duration::from_secs(1);
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
 /// How much older history is drawn at a time as the view nears its top:
@@ -264,14 +269,16 @@ fn keys_apart(on: bool) {
     };
 }
 
-type Tui = Terminal<CrosstermBackend<frames::Screen>>;
+type Tui = Terminal<frames::Backend<frames::Screen>>;
 
 /// The whole screen cleared, and drawn whole at the next frame, without
 /// asking the terminal where its cursor is as `Terminal::clear` does to put
 /// it back: an answer late through a multiplexer or a slow link ends Sonny
 /// with "the cursor position could not be read", and nothing here needs
-/// the cursor kept.
+/// the cursor kept. The window's size is read anew for it, should a
+/// resize have gone unsaid.
 fn wipe<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    term::resized();
     let size = terminal.size()?;
     terminal.resize(Rect::new(0, 0, size.width, size.height))
 }
@@ -1257,6 +1264,7 @@ fn main() -> std::process::ExitCode {
     // knows.
     lookout::subs::at_start();
     haiku::at_start();
+    config::at_start();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         // The tool host runs this for each call of a tool Sonny answers.
@@ -1506,8 +1514,7 @@ async fn run() -> Result<(), String> {
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     keys_apart(true);
     own_screen(true);
-    let mut terminal =
-        Terminal::new(CrosstermBackend::new(frames::Screen)).map_err(|e| e.to_string())?;
+    let mut terminal = Terminal::new(frames::Backend::screen()).map_err(|e| e.to_string())?;
     // A side chat opens on its window's alternate screen, still drawn on.
     let _ = wipe(&mut terminal);
     let mut app = App::new(client, &name, &bot, options.clone());
@@ -1530,8 +1537,8 @@ async fn run() -> Result<(), String> {
     // tools, or none.
     if options.side.is_none() {
         app.role = match project {
-            Some(_) => served::Role::of(0),
-            None => declared::role(&app.client, &bot).await,
+            Some(_) => served::Role::LEAD,
+            None => declared::role(&bot),
         };
         app.declare = declared::declare(&bot, app.role);
     }
@@ -1795,7 +1802,7 @@ pub(crate) fn made(
     workspace: &Path,
 ) -> Result<(), String> {
     let config = agent_client::config::load()?;
-    let declare = json!(declared::tools(served::Role::of(1)));
+    let declare = json!(declared::tools(served::Role::TASK));
     let tools = agent_client::default_tools(client.providers(), model, config.web_search);
     asked["tools"] = json!(tools);
     asked["declare"] = declare.clone();
@@ -4348,7 +4355,7 @@ impl App {
             react_to: None,
             profile: Default::default(),
             declare: None,
-            role: served::Role::at(2, 2),
+            role: served::Role::TASK,
             bot_reactions: Vec::new(),
             react_calls: HashMap::new(),
             picked: reactions::Picked::default(),
@@ -4560,11 +4567,17 @@ impl App {
         // draws at once, so typing never waits on the cap.
         let mut drawn: Option<Instant> = None;
         let mut keyed = false;
+        // Something came that the screen may show: a frame is built only
+        // then, on a tick while something on it moves ([`App::moving`]),
+        // and once a second for what else time changes, so an idle window
+        // builds a frame a second, not ten.
+        let mut changed = true;
         loop {
             let due = drawn.is_none_or(|at| at.elapsed() >= DRAW_EVERY);
+            let wanted = keyed || changed || self.quit;
             let skipped = !(keyed || due || self.quit);
-            if !skipped {
-                keyed = false;
+            if wanted && !skipped {
+                (keyed, changed) = (false, false);
                 drawn = Some(Instant::now());
                 match self.draw(terminal) {
                     Ok(()) => failed_draws = 0,
@@ -4573,21 +4586,25 @@ impl App {
                     Err(_) if failed_draws < DRAW_ATTEMPTS => {
                         failed_draws += 1;
                         self.stale = true;
+                        changed = true;
                     }
                     Err(error) => return Err(error.to_string()),
                 }
             }
             // What came since the last draw waits for the next one, due
             // once the cap allows.
-            let undrawn = drawn.filter(|_| skipped);
+            let undrawn = drawn.filter(|_| wanted && skipped);
             if self.quit {
                 return Ok(());
             }
             tokio::select! {
-                event = events.recv(), if !self.down => match event {
-                    Some(event) => self.daemon(event).await,
-                    None => self.dropped(),
-                },
+                event = events.recv(), if !self.down => {
+                    changed = true;
+                    match event {
+                        Some(event) => self.daemon(event).await,
+                        None => self.dropped(),
+                    }
+                }
                 Some(key) = keys.recv() => {
                     keyed = true;
                     self.key(key).await
@@ -4603,6 +4620,7 @@ impl App {
                         None => std::future::pending().await,
                     }
                 } => {
+                    changed = true;
                     // What the layout's worker said, between the daemon's events.
                     let event = match news {
                         Ok(event) => event,
@@ -4648,8 +4666,11 @@ impl App {
                         self.fleet_said(said);
                     }
                 }
-                _ = tick.tick() => {}
-                _ = self.woken.notified() => {}
+                _ = tick.tick() => {
+                    changed |= self.moving()
+                        || drawn.is_none_or(|at| at.elapsed() >= IDLE_FRAME);
+                }
+                _ = self.woken.notified() => changed = true,
             }
             if self.picked_read.elapsed() > Duration::from_secs(1) {
                 self.picked_read = Instant::now();
@@ -8570,8 +8591,9 @@ impl App {
     }
 
     /// Count what runs for this agent in the background again, every ten
-    /// seconds, and what failed of what `/background` lists: files read,
-    /// and the daemon asked at once how the turns fires sent ended.
+    /// seconds, and what failed of what `/background` lists: files read
+    /// again only once they changed, and the daemon asked at once how the
+    /// turns fires sent ended.
     async fn count_behind(&mut self) {
         if self
             .behind
@@ -8596,10 +8618,10 @@ impl App {
         }
         // A trigger that ended goes once its last turn did well, also one
         // that ended after its turn did, as a `--reply-to` fire passing on
-        // the answer.
-        if !self.turns.is_empty()
-            && let (Some(store), Ok(places)) = (self.client.store(), trigger::Places::home())
-            && trigger::forget_done(&places, store, &self.turns) > 0
+        // the answer, and a one-off its `--if` said no to. Found among the
+        // rows as read: only those that go are read again.
+        if let Some(store) = self.client.store()
+            && background::forget_done(store, &self.turns) > 0
         {
             items = read(&self.turns);
         }
@@ -11439,13 +11461,16 @@ impl App {
         queue: bool,
         pictures: &[attach::Picture],
     ) -> Result<(), String> {
-        // A message to a busy bot joins its running turn, on that turn's model.
-        let delivery = match queue {
+        // A message to a busy bot joins its running turn, on that turn's
+        // model. One to a bot at rest starts a turn, as a steer too: if
+        // something else started one meanwhile, it joins that rather than
+        // being refused. A move needs a turn of its own, which a steer may
+        // not be, so a message that moves the lead queues.
+        let steer = !queue && (join || self.running.is_some());
+        let delivery = match queue || (!steer && self.move_to.is_some()) {
             true => "queue",
-            false if join || self.running.is_some() => "steer",
-            false => "reject",
+            false => "steer",
         };
-        let steer = delivery == "steer";
         let model = (!steer).then(|| self.turn_model.clone()).flatten();
         // A boost is the next turn's: a steer joins one running already.
         let effort = match steer || origin.is_some() {
@@ -11856,6 +11881,18 @@ impl App {
     /// The bot's reactions so far to the person's message, right under
     /// it, wherever it is: never a row of their own. A message no longer
     /// in the conversation, or not drawn yet, shows them once it is.
+    /// Whether something on the screen moves with time alone, so each
+    /// tick draws it: the running turn's shimmer and clock, a shell's
+    /// clock and output, a card beside (the sky, or one read again every
+    /// few seconds), a side chat, a count's pulse on its beats. Whatever
+    /// else changes comes with an event, which draws it.
+    fn moving(&self) -> bool {
+        self.running.is_some()
+            || self.shell.is_some()
+            || (self.pane.as_ref()).is_some_and(|pane| pane.is_card() || pane.program.is_some())
+            || self.needs_pulse.get().moving(Instant::now())
+    }
+
     /// Whether zen keeps what the running turn says out of view: the
     /// person did not start it.
     fn zen_hides(&self) -> bool {
@@ -12142,7 +12179,7 @@ impl App {
                 .request(
                     "submit",
                     json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
-                        "prompt": question, "delivery": "reject", "model": self.turn_model,
+                        "prompt": question, "delivery": "steer", "model": self.turn_model,
                         "images": attach::submitted(pictures)}),
                 )
                 .await
@@ -12661,10 +12698,10 @@ impl App {
             chat => chat,
         } as usize;
         self.width = width;
-        self.height = terminal.size()?.height as usize;
+        self.height = size.height as usize;
         let (composer_rows, (cursor_row, cursor_col)) = self.composer(width.min(measure()));
         // A short pane keeps the rows around the cursor, where typing goes on.
-        let room = (terminal.size()?.height as usize).saturating_sub(VIEWPORT as usize - 1);
+        let room = (size.height as usize).saturating_sub(VIEWPORT as usize - 1);
         // What is typed to answer a question has the question over it,
         // as a reply in a chat has what it replies to.
         let heading = self
@@ -16857,7 +16894,7 @@ mod tests {
         let shown: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert_eq!(shown, ["! echo hello", "  └ hello"]);
         let asked = sent.lock().unwrap()[0].clone();
-        assert_eq!(asked["delivery"], "reject");
+        assert_eq!(asked["delivery"], "steer");
         // Not the person's words: what it printed authorizes nothing.
         assert_eq!(asked["origin"], "shell");
         let prompt = asked["prompt"].as_str().unwrap();
@@ -16949,9 +16986,10 @@ mod tests {
             (&sent[2]["origin"], &sent[3]["origin"]),
             (&json!("shell"), &json!("shell"))
         );
+        // The first moves the lead, so it is a turn of its own, queued.
         assert_eq!(
             (&sent[2]["delivery"], &sent[3]["delivery"]),
-            (&json!("reject"), &json!("steer"))
+            (&json!("queue"), &json!("steer"))
         );
         assert_eq!(words_sent(&sent[4]), "and now?");
         assert_eq!(sent[4]["origin"], Value::Null);
@@ -17724,7 +17762,7 @@ mod tests {
         app.input.set("👍 ship it");
         app.submit().await;
         assert_eq!(words_sent(&sent.lock().unwrap()[3]), "👍 ship it");
-        assert_eq!(sent.lock().unwrap()[3]["delivery"], "reject");
+        assert_eq!(sent.lock().unwrap()[3]["delivery"], "steer");
     }
 
     #[tokio::test]
@@ -18111,7 +18149,7 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.declare = declared::declare(&json!({}), served::Role::at(2, 2));
+        app.declare = declared::declare(&json!({}), served::Role::TASK);
         app.running = Some(Running {
             turn: 1,
             started: Instant::now(),
@@ -18125,10 +18163,7 @@ mod tests {
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();
         assert_eq!(sent["op"], "configure");
-        assert_eq!(
-            sent["declare"],
-            json!(declared::tools(served::Role::at(2, 2)))
-        );
+        assert_eq!(sent["declare"], json!(declared::tools(served::Role::TASK)));
         assert!(app.declare.is_none());
     }
 
@@ -18398,7 +18433,7 @@ mod tests {
         app.tools = vec!["shell".into()];
         let custom = json!({"gates": [{"tag": "ci", "tools": ["shell"]}]});
         app.mode = approvals::mode(&custom);
-        app.declared = declared::declare(&custom, served::Role::at(0, 2)).unwrap();
+        app.declared = declared::declare(&custom, served::Role::LEAD).unwrap();
         app.gating = Some("ask");
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();
@@ -18744,9 +18779,9 @@ mod tests {
         let button = app.pressed.pop().unwrap();
         app.press(&button).await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[0], "• Messaged calc.old and calc.older ▸", "{rows:?}");
+        assert_eq!(rows[0], "• Steered calc.old and calc.older ▸", "{rows:?}");
         assert!(
-            rows.contains(&"• Messaged calc.add and calc.neg ▾".to_string()),
+            rows.contains(&"• Steered calc.add and calc.neg ▾".to_string()),
             "{rows:?}"
         );
     }
@@ -18771,7 +18806,7 @@ mod tests {
         start(&mut app, "calc.add");
         assert_eq!(
             drawn(&mut app),
-            ["› fix the three bugs", "", "• Messaged calc.add ▸"]
+            ["› fix the three bugs", "", "• Steered calc.add ▸"]
         );
         start(&mut app, "calc.neg");
         start(&mut app, "calc.div");
@@ -18780,7 +18815,7 @@ mod tests {
             [
                 "› fix the three bugs",
                 "",
-                "• Messaged calc.add, calc.neg and calc.div ▸"
+                "• Steered calc.add, calc.neg and calc.div ▸"
             ]
         );
         // A click on it opens it, and again folds it.
@@ -18788,15 +18823,15 @@ mod tests {
         let button = app.pressed.pop().unwrap();
         app.press(&button).await;
         let open = drawn(&mut app);
-        assert_eq!(open[2], "• Messaged calc.add, calc.neg and calc.div ▾");
+        assert_eq!(open[2], "• Steered calc.add, calc.neg and calc.div ▾");
         assert_eq!(
             open[3..],
             [
-                "• Messaged calc.add",
+                "• Steered calc.add",
                 "  └ Fix calc.add",
-                "• Messaged calc.neg",
+                "• Steered calc.neg",
                 "  └ Fix calc.neg",
-                "• Messaged calc.div",
+                "• Steered calc.div",
                 "  └ Fix calc.div"
             ]
         );
@@ -18821,11 +18856,11 @@ mod tests {
         let rows = drawn(&mut app);
         assert_eq!(
             rows[2],
-            "• Messaged calc.add, calc.neg, calc.div and calc.mul ▸"
+            "• Steered calc.add, calc.neg, calc.div and calc.mul ▸"
         );
         // Quiet rows one after another sit together.
         assert_eq!(rows[3], "• Removed calc.add");
-        assert_eq!(rows[7], "• Messaged calc.sub ▸");
+        assert_eq!(rows[7], "• Steered calc.sub ▸");
     }
 
     #[tokio::test]
@@ -20578,14 +20613,14 @@ mod tests {
         };
         start(&mut app, "calc.add");
         start(&mut app, "calc.neg");
-        assert_eq!(drawn(&mut app), ["• Messaged calc.add and calc.neg ▸"]);
+        assert_eq!(drawn(&mut app), ["• Steered calc.add and calc.neg ▸"]);
         let ctrl_o = event::KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
         app.key(Event::Key(ctrl_o)).await;
         let open = drawn(&mut app);
-        assert_eq!(open[0], "• Messaged calc.add and calc.neg ▾");
+        assert_eq!(open[0], "• Steered calc.add and calc.neg ▾");
         assert!(open.len() > 1, "{open:?}");
         app.key(Event::Key(ctrl_o)).await;
-        assert_eq!(drawn(&mut app), ["• Messaged calc.add and calc.neg ▸"]);
+        assert_eq!(drawn(&mut app), ["• Steered calc.add and calc.neg ▸"]);
     }
 
     #[tokio::test]

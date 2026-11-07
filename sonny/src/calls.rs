@@ -41,9 +41,9 @@ pub fn attempted(verb: &str) -> String {
         "Forked" => "fork",
         "Indexed" => "index",
         "Interrupted" => "interrupt",
+        "Left" => "leave",
         "Listed" => "list",
         "Looked" => "look",
-        "Messaged" => "message",
         "Moved" => "move",
         "Opened" => "open",
         "Pruned" => "prune",
@@ -246,6 +246,27 @@ fn dim(text: impl Into<String>) -> Line<'static> {
     Line::from(text.into()).dim()
 }
 
+/// What a message to an agent did, from what the daemon answered when it
+/// did not refuse, else from what it was sent as: it started a turn,
+/// joined the running one, waits behind the agent's work or for room to
+/// run, or is a note for the agent's next model call. Only `reject`
+/// refuses a busy agent, so a `bot_busy` was a turn that could not start.
+fn delivered(flag: Option<&str>, reply: Option<&Value>) -> &'static str {
+    let status = reply.and_then(|reply| reply["status"].as_str());
+    let busy = reply.is_some_and(|reply| reply["error"] == "bot_busy");
+    match (status, flag) {
+        (Some("running"), _) => "Started a turn for",
+        (Some("queued"), Some("steer") | None) => "Steered",
+        (Some("queued" | "ready"), _) => "Queued for",
+        (Some("attached"), _) => "Left a note for",
+        _ if busy => "Started a turn for",
+        (_, Some("queue")) => "Queued for",
+        (_, Some("attach")) => "Left a note for",
+        (_, Some("reject")) => "Started a turn for",
+        _ => "Steered",
+    }
+}
+
 /// Why a script refused, from the `{"error", "detail"}` it printed.
 fn refused(reply: &Value) -> Option<String> {
     let code = reply["error"].as_str()?;
@@ -416,11 +437,13 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
             if bot.is_none() {
                 said.what = "a new agent".into();
             }
-            said.verb = match (new, args.value(&["--delivery"])) {
-                (true, _) => "Started",
-                (false, Some("steer")) => "Steered",
-                (false, Some("queue")) => "Queued for",
-                _ => "Messaged",
+            // Unsaid, a run steers, or queues when it names a folder or a
+            // turn cap, as the agent CLI resolves it.
+            let own_turn = args.value(&["--workspace", "--turn-budget-tokens"]);
+            let flag = args.value(&["--delivery"]).or(own_turn.and(Some("queue")));
+            said.verb = match new {
+                true => "Started",
+                false => delivered(flag, reply.as_ref()),
             }
             .into();
             if let Some(reply) = &reply
@@ -1003,7 +1026,7 @@ mod tests {
         );
         assert_eq!(
             (said.verb.as_str(), said.what.as_str()),
-            ("Messaged", "calc.lead")
+            ("Steered", "calc.lead")
         );
         assert_eq!(text(&said.under[0]), "Done.");
         let said = said_or_none("\"$AGENT_BIN\" run --bot calc.x \"Run the tests\" 2>&1", "");
@@ -1044,6 +1067,56 @@ Keep the rest.'"#,
         );
         assert_eq!(verb(r#""$AGENT_BIN" ls --active"#), "Listed running agents");
         assert_eq!(verb(r#""$AGENT_BIN" ls"#), "Listed agents");
+    }
+
+    #[test]
+    fn a_message_reads_as_what_it_did_not_how_it_was_sent() {
+        let verb = |command: &str, output: &str| said(command, output, false).unwrap().verb;
+        let run =
+            |flags: &str| format!(r#""$AGENT_BIN" run --detach {flags} --bot calc.fix -- 'More'"#);
+        let replied =
+            |status: &str| format!(r#"{{"bot":"calc.fix","status":"{status}","turn":7}}"#);
+        // To an agent at rest, a message starts a turn, however it went.
+        for flags in [
+            "",
+            "--delivery steer",
+            "--delivery queue",
+            "--delivery reject",
+        ] {
+            assert_eq!(verb(&run(flags), &replied("running")), "Started a turn for");
+        }
+        // To one at work: a steer joins its turn, a queued message waits.
+        assert_eq!(verb(&run(""), &replied("queued")), "Steered");
+        assert_eq!(
+            verb(&run("--delivery=steer"), &replied("queued")),
+            "Steered"
+        );
+        assert_eq!(
+            verb(&run("--delivery queue"), &replied("queued")),
+            "Queued for"
+        );
+        // A folder or a turn cap queues unless it says otherwise.
+        let moved = r#""$AGENT_BIN" run --detach --workspace /x --bot calc.fix -- 'More'"#;
+        assert_eq!(verb(moved, &replied("queued")), "Queued for");
+        // Waiting for room to run.
+        assert_eq!(verb(&run(""), &replied("ready")), "Queued for");
+        assert_eq!(
+            verb(&run("--delivery attach"), &replied("attached")),
+            "Left a note for"
+        );
+        // Refused as busy: only a turn that had to start now is.
+        let busy = said(
+            &run("--delivery reject"),
+            r#"{"error":"bot_busy","detail":"turn 4 is running","running_turn":4}"#,
+            false,
+        )
+        .unwrap();
+        assert!(busy.failed);
+        assert_eq!(attempted(&busy.verb), "Couldn't start a turn for");
+        assert_eq!(attempted("Left a note for"), "Couldn't leave a note for");
+        // Nothing to read: as it was sent.
+        assert_eq!(verb(&run(""), ""), "Steered");
+        assert_eq!(verb(&run("--delivery queue"), ""), "Queued for");
     }
 
     #[test]

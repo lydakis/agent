@@ -234,6 +234,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut max_input_bytes = None;
     let mut max_readers = None;
     let mut max_load = None;
+    let mut max_depth = None;
     let mut idle_exit = None;
     let mut stall_timeout = None;
     let mut shell_excludes = Vec::new();
@@ -307,6 +308,12 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                 let load = cli::load(value)?;
                 max_load = (load > 0.0).then_some(load);
             }
+            "--max-depth" => {
+                let depth: u64 = value
+                    .parse()
+                    .map_err(|_| Error::with("usage", format!("{flag} needs an integer")))?;
+                max_depth = (depth > 0).then_some(depth);
+            }
             // `prepare` has checked each range.
             "--stall-timeout" => stall_timeout = Some(cli::duration_secs(flag, value)?),
             "--idle-exit" => {
@@ -344,5 +351,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         context_windows: std::sync::Arc::new(agent_runtime::provider::Windows::parse(windows)?),
         models,
         provider_config,
+        max_depth,
     })
 }

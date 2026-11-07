@@ -53,6 +53,7 @@ fn binding() -> Binding<'static> {
         settings: Default::default(),
         declared: None,
         request_id: None,
+        starts_line: false,
     }
 }
 /// Compaction planning as a turn runs it: a catch-up walk goes in pieces.
@@ -3389,6 +3390,47 @@ fn a_store_that_cannot_be_copied_is_not_migrated() {
         .unwrap();
     assert_eq!(at, 77);
     std::fs::remove_dir_all(folder).unwrap();
+}
+
+#[test]
+fn an_older_store_counts_each_bot_s_depth_along_its_makers() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema82-depth-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let mut maker: Option<Bot> = None;
+        for name in ["A", "B", "C", "D"] {
+            let mut b = binding();
+            b.created_by = maker.as_ref().map(|m| m.name.as_str());
+            b.created_by_id = maker.as_ref().map(|m| m.bot_id);
+            let (bot, _) = db.create(name, Some("/synthetic"), b).unwrap();
+            maker = Some(bot);
+        }
+        let b = db.inspect("B").unwrap();
+        let mut by_b = binding();
+        by_b.created_by = Some("B");
+        by_b.created_by_id = Some(b.bot_id);
+        db.create("Orphan", Some("/synthetic"), by_b).unwrap();
+        db.create("Solo", Some("/synthetic"), binding()).unwrap();
+        db.delete_bot("B").unwrap();
+    }
+    // A store from before schema 83 kept no depth.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE bots DROP COLUMN depth; PRAGMA user_version=82;")
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let depth = |name: &str| db.inspect(name).unwrap().depth;
+    // Counted from a bot with no maker, or whose maker is gone.
+    assert_eq!(
+        ["A", "C", "D", "Orphan", "Solo"].map(depth),
+        [0, 0, 1, 0, 0]
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -7065,6 +7107,114 @@ fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
 }
 
 #[test]
+fn a_bot_is_made_no_deeper_below_the_start_of_its_line_than_the_bound() {
+    let mut db = db();
+    db.set_max_depth(Some(2));
+    let by = |name: &'static str, bot: &Bot| {
+        let mut b = binding();
+        b.created_by = Some(name);
+        b.created_by_id = Some(bot.bot_id);
+        b
+    };
+    let fork_by = |name: &'static str, bot: &Bot| Fork {
+        created_by: Some(name),
+        created_by_id: Some(bot.bot_id),
+        ..Fork::default()
+    };
+    // No creator starts a line; each bot another makes is one below it.
+    let (lead, event) = db.create("Lead", Some("/synthetic"), binding()).unwrap();
+    assert_eq!(
+        (lead.depth, &event.unwrap()["data"]["depth"]),
+        (0, &json!(0))
+    );
+    let (task, _) = db
+        .create("Task", Some("/synthetic"), by("Lead", &lead))
+        .unwrap();
+    let (helper, _) = db
+        .create("Helper", Some("/synthetic"), by("Task", &task))
+        .unwrap();
+    assert_eq!((task.depth, helper.depth), (1, 2));
+    // Past the bound, a typed refusal with the facts, and nothing made.
+    let before = db.list(None, 64, None, false, None).unwrap();
+    let refused = db
+        .create("Deeper", Some("/synthetic"), by("Helper", &helper))
+        .unwrap_err();
+    assert_eq!(refused.code, "depth_limit");
+    assert_eq!(
+        refused.detail.as_deref(),
+        Some("Deeper would be 3 generations below the bot that starts its line; max_depth is 2")
+    );
+    let facts = refused.facts.as_deref().unwrap();
+    assert_eq!(
+        (&facts["depth"], &facts["max_depth"]),
+        (&json!(3), &json!(2))
+    );
+    assert_eq!(db.list(None, 64, None, false, None).unwrap(), before);
+    // A fork another makes is one below its maker, wherever its source is:
+    // a bot at the bound can't fork its way back up.
+    let refused = db
+        .fork("Lead", "Up", fork_by("Helper", &helper))
+        .unwrap_err();
+    assert_eq!(refused.code, "depth_limit");
+    let (twin, _) = db.fork("Helper", "Twin", fork_by("Lead", &lead)).unwrap();
+    assert_eq!(twin.depth, 1);
+    // One its source makes, a side copy, stands where its source does.
+    let (copy, event) = db
+        .fork("Helper", "Copy", fork_by("Helper", &helper))
+        .unwrap();
+    assert_eq!(
+        (copy.depth, &event.unwrap()["data"]["depth"]),
+        (2, &json!(2))
+    );
+    // One no bot makes starts a line.
+    let (theirs, _) = db.fork("Helper", "Theirs", Fork::default()).unwrap();
+    assert_eq!(theirs.depth, 0);
+    // A bot made to start a line is at 0 though another made it.
+    let mut fresh = by("Helper", &helper);
+    fresh.starts_line = true;
+    let (fresh, _) = db.create("Fresh", Some("/synthetic"), fresh).unwrap();
+    assert_eq!((fresh.depth, fresh.created_by_id), (0, Some(helper.bot_id)));
+    db.create("Below", Some("/synthetic"), by("Fresh", &fresh))
+        .unwrap();
+    // Listed and inspected with it.
+    let listed = db.list(None, 64, None, false, None).unwrap();
+    let depth_of = |name: &str| {
+        (listed["bots"].as_array().unwrap().iter())
+            .find(|bot| bot["name"] == name)
+            .map(|bot| bot["depth"].clone())
+    };
+    assert_eq!(depth_of("Helper"), Some(json!(2)));
+    assert_eq!(depth_of("Below"), Some(json!(1)));
+    assert_eq!(db.inspect("Below").unwrap().depth, 1);
+    // A keyed creation resent answers as before, whatever the bound is
+    // now, and one that names another mark is another request.
+    let keyed = |starts_line: bool| Binding {
+        request_id: Some("k"),
+        starts_line,
+        ..by("Task", &task)
+    };
+    db.create("Keyed", Some("/synthetic"), keyed(false))
+        .unwrap();
+    db.set_max_depth(Some(1));
+    assert_eq!(
+        db.create("Keyed", Some("/synthetic"), keyed(false))
+            .unwrap()
+            .1,
+        None
+    );
+    assert_eq!(
+        db.create("Keyed", Some("/synthetic"), keyed(true))
+            .unwrap_err()
+            .code,
+        "idempotency_conflict"
+    );
+    // With no bound, any depth.
+    db.set_max_depth(None);
+    db.create("Deeper", Some("/synthetic"), by("Helper", &helper))
+        .unwrap();
+}
+
+#[test]
 fn lineage_pins_the_creator_identity_so_a_reused_name_is_a_stranger() {
     let mut db = db();
     let (first_a, _) = db.create("A", Some("/synthetic"), binding()).unwrap();
@@ -10251,6 +10401,7 @@ fn schema_46_settings_keep_turns_as_prune_names_it() {
     let made = || Binding {
         settings: settings.clone(),
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     {
@@ -15152,6 +15303,7 @@ fn a_resent_keyed_creation_gets_its_bot_and_a_changed_one_names_the_field() {
     let mut db = db();
     let keyed = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     let (bob, event) = db.create("Bob", Some("/synthetic"), keyed()).unwrap();
@@ -15185,6 +15337,7 @@ fn a_resent_keyed_creation_gets_its_bot_and_a_changed_one_names_the_field() {
                 Some("/synthetic"),
                 Binding {
                     request_id,
+                    starts_line: false,
                     ..binding()
                 },
             )
@@ -15236,6 +15389,7 @@ fn a_resent_keyed_fork_gets_its_fork_wherever_the_source_moved() {
     // A bot created under the key is not a fork of it.
     let made = Binding {
         request_id: Some("branch"),
+        starts_line: false,
         ..binding()
     };
     db.create("Made", Some("/synthetic"), made).unwrap();
@@ -15271,6 +15425,7 @@ fn a_deleted_identity_is_gone_and_a_later_namesake_is_not() {
     // A keyed creation resent after its bot was deleted does not make it again.
     let keyed = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     let (kay, _) = db.create("Kay", Some("/synthetic"), keyed()).unwrap();
@@ -15299,6 +15454,7 @@ fn schema_43_bots_were_made_without_a_key() {
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let keyed = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     assert_eq!(
@@ -15457,6 +15613,7 @@ fn a_keyed_creation_resends_after_its_instructions_change() {
     let mut db = db();
     let made = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     let (bot, _) = db.create("Bob", None, made()).unwrap();
@@ -15480,6 +15637,7 @@ fn schema_48_creations_keep_the_instructions_they_were_sent_with() {
     let _ = std::fs::remove_file(&path);
     let made = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     {
@@ -16764,4 +16922,123 @@ fn held_rows(db: &Database) -> Vec<Value> {
         .as_array()
         .unwrap()
         .clone()
+}
+
+/// A store at `path` with three finished turns of Bob's: a short prompt, one
+/// past the size a turn shares its prompt node at, and a short one again.
+fn three_prompts(path: &std::path::Path) -> String {
+    let _ = std::fs::remove_file(path);
+    let long = format!("{}\nsecond line", "w".repeat(5000));
+    let mut db = Database::initialize(Connection::open(path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            &long,
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(turn, vec![assistant("r2")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    converse(&mut db, "Bob", 3);
+    long
+}
+
+/// What each listing says of Bob's prompts: the omitted-turns note before
+/// turn 3, the history listing, and the turn listing, previews and lengths.
+fn listed_prompts(db: &Database) -> Value {
+    let start: i64 = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["event"] == "accepted")
+        .unwrap()["data"]["node"]
+        .as_i64()
+        .unwrap();
+    let history = db.history_turns("Bob", 8).unwrap()["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| json!([t["turn"], t["prompt"], t["prompt_bytes"]]))
+        .collect::<Vec<_>>();
+    let turns = db.turns("Bob", 0, None, 8, false).unwrap()["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| json!([t["prompt_preview"], t["prompt_bytes"]]))
+        .collect::<Vec<_>>();
+    json!({"omitted": db.omitted_turns(start, 48).unwrap(), "history": history, "turns": turns})
+}
+
+#[test]
+fn listings_read_each_prompts_opening_never_its_item() {
+    let path = std::env::temp_dir().join(format!("agent-openings-{}.sqlite", std::process::id()));
+    let long = three_prompts(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let before = listed_prompts(&db);
+    let chars = long.chars().count();
+    assert_eq!(before["turns"][1], json!([long[..200], chars]));
+    assert_eq!(before["history"][1], json!([2, long[..200], chars]));
+    assert_eq!(before["omitted"][0][0], json!(2));
+    assert!(before["omitted"][0][1].as_str().unwrap().ends_with('…'));
+    // Prompt items that no longer parse: a listing that opened one fails.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE nodes SET item=zeroblob(70000) WHERE turn_seq IS NOT NULL
+                OR id IN (SELECT prompt_node FROM turns)",
+        )
+        .unwrap();
+    assert_eq!(listed_prompts(&db), before);
+    // A store from before openings gets every prompt's at open.
+    drop(db);
+    std::fs::remove_file(&path).unwrap();
+    three_prompts(&path);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE openings; PRAGMA user_version=78;")
+        .unwrap();
+    db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE nodes SET item=zeroblob(70000) WHERE turn_seq IS NOT NULL
+                OR id IN (SELECT prompt_node FROM turns)",
+        )
+        .unwrap();
+    assert_eq!(listed_prompts(&db), before);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_declined_prompt_is_noted_as_the_model_is_sent_it() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "something declined",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(turn, Some(&Error::new("provider_refusal")))
+        .unwrap();
+    converse(&mut db, "Bob", 2);
+    converse(&mut db, "Bob", 3);
+    let listed = listed_prompts(&db);
+    // The model hears of the note it is sent in the prompt's place; the
+    // person's listing keeps what they wrote.
+    assert_eq!(listed["omitted"][1], json!([1, "[Left out.]"]));
+    assert_eq!(listed["history"][2], json!([1, "[Left out.]", 11]));
+    assert_eq!(listed["turns"][0][0], json!("something declined"));
 }

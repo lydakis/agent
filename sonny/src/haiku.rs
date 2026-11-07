@@ -920,7 +920,7 @@ async fn ask(client: &Client, name: &str, id: &Value) -> Result<String, Failed> 
         .request(
             "submit",
             json!({"bot": name, "bot_id": id, "request_id": format!("{name}.1"),
-                "prompt": ASK, "delivery": "reject"}),
+                "prompt": ASK, "delivery": "steer"}),
         )
         .await
         .map_err(unreached)?;
