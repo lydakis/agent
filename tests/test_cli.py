@@ -1,5 +1,7 @@
 """The agent command: daemon startup, run/follow/ls, peers, and socket rendezvous."""
 import fcntl
+import shutil
+import sys
 import json
 import re
 import concurrent.futures
@@ -549,14 +551,14 @@ class SocketAndCliTests(ModelFixture):
     def test_daemon_limits_match_on_startup_and_attach_and_bots_keep_their_settings(self):
         flags = ['--idle-exit', '0', '--stall-timeout', '30s']
         self.agent('run', *self.common, *flags, '--context-bytes', '1024', '--context-items', '2',
-                   '--keep-warm', '0', '--cache-ttl', '1h', '--new', '--bot', 'Bob', 'hi')
+                   '--cache-ttl', '1h', '--new', '--bot', 'Bob', 'hi')
         self.agent('run', *self.again, *flags, '--bot', 'Bob', 'again')
         control = Connection(self.socket)
         self.addCleanup(control.close)
         settings = control.request('inspect', bot='Bob')['result']['settings']
         self.assertEqual((settings['context_bytes'], settings['context_items'], settings['compact_at'],
-                          settings['keep_warm'], settings['cache_ttl'], settings['max_output_tokens']),
-                         (1024, 2, 75, 0, '1h', None))
+                          settings['cache_ttl'], settings['max_output_tokens']),
+                         (1024, 2, 75, '1h', None))
         # The daemon checks each setting's range and creates nothing it refuses.
         small = self.agent('run', *self.common, '--context-bytes', '512', '--new', '--bot', 'Small', 'hi', check=False)
         self.assertEqual(small.returncode, 1)
@@ -568,7 +570,7 @@ class SocketAndCliTests(ModelFixture):
         refused = self.agent('stats', '--store', str(self.store), '--stall-timeout', '2m', check=False)
         self.assertIn('--stall-timeout: requested 2m but daemon has 30s', refused.stderr)
         # How a bot calls its model is chosen when it is made, not by the daemon.
-        for flag, value in (('--keep-warm', '4m'), ('--cache-ttl', '5m'), ('--max-output-tokens', '4096')):
+        for flag, value in (('--cache-ttl', '5m'), ('--max-output-tokens', '4096')):
             refused = self.agent('stats', '--store', str(self.store), flag, value, check=False)
             self.assertEqual(refused.returncode, 2)
             self.assertIn(f'does not accept {flag}', refused.stderr)
@@ -600,8 +602,6 @@ class SocketAndCliTests(ModelFixture):
             ('run', '--stall-timeout', '0', 'hi'),
             ('run', '--stall-timeout', '25h', 'hi'),
             ('run', '--stall-timeout', '30', 'hi'),
-            ('run', '--keep-warm', '5m', 'hi'),
-            ('run', '--keep-warm', '1500ms', 'hi'),
             ('wait', '--timeout-ms', '5', 'proc:1'),
             ('run', '--retain-turns', '2', 'hi'),
             ('run', '--cache-ttl', '2h', 'hi'),
@@ -854,7 +854,7 @@ class SocketAndCliTests(ModelFixture):
         self.assertTrue({'processes', 'active', 'connecting', 'connections', 'idle_exit_seconds'} <= set(ready['limits']))
         self.assertEqual(ready['limits']['stall_timeout_seconds'], 600)
         # How a bot calls its model is its own setting, not the daemon's.
-        self.assertFalse({'output_tokens', 'keep_warm_seconds', 'cache_ttl'} & set(ready['limits']))
+        self.assertFalse({'output_tokens', 'cache_ttl'} & set(ready['limits']))
         self.assertEqual(ready['limits']['connections'], -(-ready['limits']['active'] // 64))
 
     def test_burst_eviction_exits_client_and_replay_recovers_terminal_event(self):
@@ -1037,6 +1037,94 @@ class SocketAndCliTests(ModelFixture):
         # The daemon's own names stay its own.
         refused = control.request('configure', bot='Bob', settings={'env': {'AGENT_BOT': 'x'}})
         self.assertEqual(refused['error'], 'invalid_setting')
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_command_run_as_a_bot_has_its_sandbox_socket_and_variables(self):
+        self.agent('run', *self.common, '--new', '--bot', 'Reader', '--sandbox', 'read-only', 'hello')
+        self.agent('run', *self.common, '--new', '--bot', 'Free', 'hello')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        control.request('configure', bot='Reader', settings={'env': {'SONNY_STATE': '/state/Reader'}})
+        reader = control.request('inspect', bot='Reader')['result']
+        store = ['--store', str(self.store)]
+        check = ('printf "%s %s %s\n" "$SONNY_STATE" "$AGENT_BOT" "$AGENT_BOT_ID"; '
+                 '"$AGENT_BIN" ls > /dev/null && echo reached; '
+                 'touch written 2> /dev/null || echo confined; '
+                 '"$AGENT_BIN" sandbox --bot Reader -- true 2> /dev/null; echo "nested $?"; exit 3')
+        ran = self.agent('sandbox', *store, '--bot', 'Reader', '--bot-id', str(reader['bot_id']),
+                         '--', '/bin/sh', '-c', check, check=False)
+        # The command's own status, and what it saw: the bot's variables,
+        # the daemon through the bot's own socket, which lends nothing.
+        self.assertEqual(ran.returncode, 3, ran.stderr)
+        self.assertEqual(ran.stdout.split('\n')[:4],
+                         [f'/state/Reader Reader {reader["bot_id"]}', 'reached', 'confined', 'nested 125'])
+        self.assertFalse((self.path / 'written').exists())
+        # A bot whose commands run unconfined runs this one so too.
+        self.agent('sandbox', *store, '--bot', 'Free', '--', '/bin/sh', '-c', 'touch written')
+        self.assertTrue((self.path / 'written').exists())
+        # Another identity, or a bot that is not there, runs nothing.
+        for flags in (('--bot', 'Reader', '--bot-id', str(reader['bot_id'] + 100)), ('--bot', 'Nobody')):
+            refused = self.agent('sandbox', *store, *flags, '--', 'touch', 'refused', check=False)
+            self.assertEqual((refused.returncode, json.loads(refused.stderr)['error']),
+                             (125, 'bot_not_found'))
+        self.assertFalse((self.path / 'refused').exists())
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_command_run_as_a_bot_keeps_what_the_daemon_keeps_from_its_commands(self):
+        kept = self.path / 'kept'
+        kept.mkdir()
+        daemon = SocketClient(self.binary, self.store, self.url, 'shell',
+                              extra=['--protect-path', str(kept), '--shell-exclude', 'SECRET_*'],
+                              env={**clean_env(), 'SECRET_TOKEN': 'daemon'})
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Writer', workspace=str(self.path), settings={'sandbox': 'workspace-write'})
+        check = ('touch wrote; touch kept/x 2> /dev/null || echo kept; '
+                 'printf "[%s][%s]\n" "$SECRET_TOKEN" "$CALLER_ONLY"')
+        ran = subprocess.run([str(self.binary), 'sandbox', '--store', str(self.store), '--socket', str(daemon.socket_path),
+                              '--bot', 'Writer', '--', '/bin/sh', '-c', check],
+                             env={**clean_env(), 'SECRET_TOKEN': 'caller', 'CALLER_ONLY': 'caller'},
+                             capture_output=True, text=True, timeout=30, cwd=self.path)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        # It writes its folder but not what the daemon protects, and has the
+        # environment the bot's commands have: none of the daemon's withheld
+        # variables, nor the caller's.
+        self.assertEqual(ran.stdout.split('\n')[:2], ['kept', '[][]'])
+        self.assertTrue((self.path / 'wrote').exists())
+        self.assertFalse((kept / 'x').exists())
+
+    @unittest.skipUnless(shutil.which('bwrap'), 'placeholders are bubblewrap\'s')
+    def test_a_lent_sandbox_s_placeholders_stay_while_any_command_mounts_them(self):
+        daemon = SocketClient(self.binary, self.store, self.url, 'shell', extra=['--protect', '.codex'], env=clean_env())
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Writer', workspace=str(self.path), settings={'sandbox': 'workspace-write'})
+        sandbox = [str(self.binary), 'sandbox', '--store', str(self.store), '--socket', str(daemon.socket_path),
+                   '--bot', 'Writer', '--']
+        # A missing .codex is held as an empty placeholder while any command
+        # mounts it: the first to start ending first must not remove it from
+        # under a later one still running, which could then write there.
+        def started(name):
+            deadline = time.monotonic() + 15
+            while not (self.path / name).exists():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.05)
+        first = subprocess.Popen([*sandbox, '/bin/sh', '-c',
+                                  'touch first; while [ ! -e go ]; do sleep 0.05; done'],
+                                 env=clean_env(), cwd=self.path)
+        self.addCleanup(first.kill)
+        started('first')
+        later = subprocess.Popen([*sandbox, '/bin/sh', '-c',
+                                  'touch later; while [ ! -e done ]; do sleep 0.05; done; '
+                                  'mkdir -p .codex 2> /dev/null; touch .codex/x 2> /dev/null || echo kept'],
+                                 env=clean_env(), cwd=self.path, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(later.kill)
+        started('later')
+        (self.path / 'go').touch()
+        self.assertEqual(first.wait(timeout=30), 0)
+        (self.path / 'done').touch()
+        out, _ = later.communicate(timeout=30)
+        self.assertEqual(later.returncode, 0)
+        self.assertEqual(out.strip(), 'kept')
+        self.assertFalse((self.path / '.codex' / 'x').exists())
 
     def test_creator_identity_is_required_and_survives_daemon_restart(self):
         self.agent('run', *self.common, '--new', '--bot', 'Creator',

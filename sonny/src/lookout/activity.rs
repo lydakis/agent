@@ -10,7 +10,7 @@ use std::time::Duration;
 
 /// The fields a bot's events may have, as the `subscriptions` tool lists
 /// them for an agent to filter on.
-pub const FIELDS: [(&str, &str); 14] = [
+pub const FIELDS: [(&str, &str); 13] = [
     (
         "type",
         "string: message.written, turn.ended, approval.waiting, ask.posted, turn.silent or note.changed",
@@ -26,8 +26,7 @@ pub const FIELDS: [(&str, &str); 14] = [
         "status",
         "string, how a turn ended: completed, failed, stopped or interrupted",
     ),
-    ("resolved", "boolean, the turn resolved its task"),
-    ("goal", "string, how the task's goal ended with the turn"),
+    ("done", "boolean, the task marked itself done in the turn"),
     (
         "theirs",
         "boolean, the person asked for the turn in the task themselves",
@@ -79,6 +78,12 @@ pub struct Hold {
     /// is when it goes, and a note that tells it, however soon, starts
     /// each one's time again.
     pub windows: Vec<(String, Duration)>,
+    /// The subscriptions that heard it: a note that tells it counts for
+    /// each, toward the listing's counts and a `runs` end, and it is no
+    /// news once they all ended.
+    pub heard: Vec<String>,
+    /// Those of them whose `steer` matched it: it steers for each.
+    pub steered: Vec<String>,
 }
 
 impl Hold {
@@ -87,7 +92,7 @@ impl Hold {
     pub fn now() -> Hold {
         Hold {
             now: true,
-            windows: Vec::new(),
+            ..Hold::default()
         }
     }
 
@@ -99,6 +104,16 @@ impl Hold {
         for window in other.windows {
             if !self.windows.contains(&window) {
                 self.windows.push(window);
+            }
+        }
+        for sub in other.heard {
+            if !self.heard.contains(&sub) {
+                self.heard.push(sub);
+            }
+        }
+        for sub in other.steered {
+            if !self.steered.contains(&sub) {
+                self.steered.push(sub);
             }
         }
         self
@@ -124,19 +139,20 @@ pub fn hear(rules: &[Rule], event: &Value, skips: bool) -> Option<Heard> {
     hearing.peek()?;
     let mut hold = Hold {
         now: skips,
-        windows: Vec::new(),
+        ..Hold::default()
     };
     let mut urgent = None;
     for rule in hearing {
-        if urgent.is_none()
-            && (rule.urgent.as_deref()).is_some_and(|u| super::pattern::matches(u, event))
-        {
-            urgent = Some(rule.sub.clone());
+        // The first says why it cuts in; it steers for every one.
+        if (rule.urgent.as_deref()).is_some_and(|u| super::pattern::matches(u, event)) {
+            urgent.get_or_insert_with(|| rule.sub.clone());
+            hold.steered.push(rule.sub.clone());
         }
         match rule.digest {
             Some(digest) => hold.windows.push((rule.sub.clone(), digest)),
             None => hold.now = true,
         }
+        hold.heard.push(rule.sub.clone());
     }
     // What is urgent goes as it comes by its own mark, while it is still
     // to be told.
@@ -176,7 +192,10 @@ mod tests {
         assert_eq!(
             hear(&both, &event, false),
             Some(Heard {
-                hold: Hold::now(),
+                hold: Hold {
+                    heard: vec!["all".into()],
+                    ..Hold::now()
+                },
                 urgent: None
             })
         );
@@ -196,18 +215,25 @@ mod tests {
                 windows: vec![
                     ("hourly".into(), Duration::from_secs(3600)),
                     ("tenth".into(), Duration::from_secs(600))
-                ]
+                ],
+                heard: vec!["hourly".into(), "tenth".into()],
+                steered: Vec::new(),
             }
         );
         // What goes now still counts as told for the digests that heard it.
         let hourly_told = Hold {
             now: true,
             windows: vec![("hourly".into(), Duration::from_secs(3600))],
+            heard: vec!["hourly".into()],
+            steered: Vec::new(),
         };
         let plain = rule("plain", None, None, 0);
         assert_eq!(
             hear(&[hourly.clone(), plain], &event, false).unwrap().hold,
-            hourly_told
+            Hold {
+                heard: vec!["hourly".into(), "plain".into()],
+                ..hourly_told.clone()
+            }
         );
         assert_eq!(hear(&[hourly], &event, true).unwrap().hold, hourly_told);
     }
@@ -226,11 +252,18 @@ mod tests {
             Some(Heard {
                 hold: Hold {
                     now: false,
-                    windows: vec![("migration".into(), Duration::from_secs(3600))]
+                    windows: vec![("migration".into(), Duration::from_secs(3600))],
+                    heard: vec!["migration".into()],
+                    steered: vec!["migration".into()],
                 },
                 urgent: Some("migration".into())
             })
         );
+        // Another whose `steer` matched too steers as well; the first says why.
+        let also = rule("also", None, Some(json!({"status": ["failed"]})), 0);
+        let both = hear(&[rules[0].clone(), also], &event, false).unwrap();
+        assert_eq!(both.urgent.as_deref(), Some("migration"));
+        assert_eq!(both.hold.steered, ["migration", "also"]);
         let calm = json!({"type": "turn.ended", "bot": "calc.fix", "status": "completed"});
         assert_eq!(hear(&rules, &calm, false).unwrap().urgent, None);
     }
@@ -241,19 +274,37 @@ mod tests {
         let a = Hold {
             now: false,
             windows: vec![w("a", 50)],
+            ..Hold::default()
         };
         assert_eq!(Hold::default().merge(a.clone()), a);
         assert_eq!(
             a.clone().merge(Hold::now()),
             Hold {
                 now: true,
-                windows: vec![w("a", 50)]
+                windows: vec![w("a", 50)],
+                ..Hold::default()
             }
         );
         let b = Hold {
             now: false,
             windows: vec![w("b", 5), w("a", 50)],
+            heard: vec!["b".into()],
+            steered: vec!["b".into()],
         };
-        assert_eq!(a.merge(b).windows, [w("a", 50), w("b", 5)]);
+        let merged = a.merge(b);
+        assert_eq!(merged.windows, [w("a", 50), w("b", 5)]);
+        assert_eq!(
+            (&merged.heard, &merged.steered),
+            (&vec!["b".to_owned()], &vec!["b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_subscription_is_counted_where_it_hears() {
+        let event = json!({"type": "turn.ended", "bot": "calc.fix", "status": "failed"});
+        let once = rule("once", Some(json!({"status": ["failed"]})), None, 0);
+        let other = rule("other", Some(json!({"status": ["completed"]})), None, 0);
+        let heard = hear(&[once, other, rule("all", None, None, 0)], &event, false).unwrap();
+        assert_eq!(heard.hold.heard, ["once", "all"]);
     }
 }

@@ -72,7 +72,7 @@ pub fn role(record: &Value) -> Role {
 }
 
 /// Whether the bot `record` describes resolves itself: a lead made it, or
-/// another bot made it with `resolve_task`, as a task's own helper takes it.
+/// another bot made it with `mark_done`, as a task's own helper takes it.
 fn resolves(record: &Value) -> bool {
     let inherited = || {
         (record["declared"].as_array().into_iter().flatten())
@@ -102,10 +102,14 @@ pub fn declare(record: &Value, role: Role) -> Option<Value> {
             !(tool["name"].as_str()).is_some_and(|name| crate::served::GATED.contains(&name))
         });
     }
-    // The commons is Sonny's while it is off, too, so it gives way.
+    // The commons is Sonny's while it is off, too, so it gives way, and
+    // so does any tool Sonny answers that this build no longer declares.
     let mut names = tools(Role::ALL);
     names.push(crate::served::commons());
-    let sonnys = |other: &Value| names.iter().any(|tool| tool["name"] == other["name"]);
+    let sonnys = |other: &Value| {
+        other["answered_by"] == crate::served::TAG
+            || names.iter().any(|tool| tool["name"] == other["name"])
+    };
     if ours.iter().all(|tool| declared.contains(tool))
         && declared
             .iter()
@@ -306,6 +310,20 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_sonny_answered_that_this_build_dropped_goes_with_the_refresh() {
+        let mut old: Vec<Value> = tools(a_lead());
+        old.push(json!({"name": "goal", "parameters": {"type": "object"},
+            "answered_by": crate::served::TAG}));
+        old.push(json!({"name": "theirs", "result": "ok"}));
+        let fields = refresh(&json!({"name": "calc.lead", "bot_id": 7, "declared": old})).unwrap();
+        let names: Vec<&str> = (fields["declare"].as_array().unwrap().iter())
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(!names.contains(&"goal"));
+        assert!(names.contains(&"theirs"));
+    }
+
+    #[test]
     fn an_agent_declaring_nothing_takes_a_tasks_tools_gated_as_its_mode_gates() {
         let names = |fields: &Map<String, Value>| -> Vec<String> {
             (fields["declare"].as_array().unwrap().iter())
@@ -380,14 +398,14 @@ mod tests {
     }
 
     #[test]
-    fn a_lead_and_its_tasks_resolve_tasks() {
+    fn a_lead_and_its_tasks_mark_tasks_done() {
         let lead = declare(&json!({}), a_lead()).unwrap();
         assert_eq!(lead, Value::Array(tools(a_lead())));
         assert!(
             lead.as_array()
                 .unwrap()
                 .iter()
-                .any(|t| t["name"] == "resolve_task")
+                .any(|t| t["name"] == "mark_done")
         );
         assert_eq!(declare(&json!({"declared": lead}), a_lead()), None);
         // A bot no longer a lead gives it up, unless a lead made it: a
@@ -402,7 +420,7 @@ mod tests {
             own.as_array()
                 .unwrap()
                 .iter()
-                .any(|t| t["name"] == "resolve_task")
+                .any(|t| t["name"] == "mark_done")
         );
         let mut kept = task.clone();
         kept["declared"] = own;
@@ -414,7 +432,7 @@ mod tests {
             kept.as_array()
                 .unwrap()
                 .iter()
-                .any(|t| t["name"] == "resolve_task")
+                .any(|t| t["name"] == "mark_done")
         );
         // What a lead declares, a task it starts takes from its first turn.
         assert!(crate::resolved::tool().get("inherit").is_none());

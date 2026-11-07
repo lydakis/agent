@@ -411,13 +411,6 @@ fn parse(args: &[String]) -> Result<Options> {
                             .insert("approval_hold_ms".to_owned(), json!(ms));
                         options.settings_flags.push(flag.to_owned());
                     }
-                    "--keep-warm" => {
-                        let seconds = crate::cli::duration_secs(flag, &value)?;
-                        options
-                            .settings
-                            .insert("keep_warm".to_owned(), json!(seconds));
-                        options.settings_flags.push(flag.to_owned());
-                    }
                     "--sandbox" => {
                         if !matches!(
                             value.as_str(),
@@ -960,6 +953,30 @@ fn older_daemon(error: &Error) -> Option<i32> {
     (ready["pid"].as_u64())
         .and_then(|pid| i32::try_from(pid).ok())
         .filter(|pid| *pid > 1)
+}
+
+/// The daemon's lend of a bot's sandbox, for `agent sandbox --bot`: the
+/// policy and environment its commands get, and the connection whose life
+/// the bot's own socket listens for.
+pub struct Lent {
+    pub answer: Value,
+    _connection: Connection,
+}
+
+/// Ask the daemon `flags` name (`--store`, `--socket`, else as any command
+/// finds it) to lend bot `bot`'s sandbox, starting it as a command on a
+/// bot does.
+pub fn lend(flags: &[String], bot: &str, bot_id: Option<i64>) -> Result<Lent> {
+    let args: Vec<String> = std::iter::once("sandbox".to_owned())
+        .chain(flags.iter().cloned())
+        .collect();
+    let options = parse(&args)?;
+    let mut connection = ensure_daemon(&options)?;
+    let answer = connection.request("lend", json!({"bot": bot, "bot_id": bot_id}))?;
+    Ok(Lent {
+        answer,
+        _connection: connection,
+    })
 }
 
 fn connect_or_start(options: &Options) -> Result<Connection> {

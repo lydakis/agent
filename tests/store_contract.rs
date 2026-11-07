@@ -4731,7 +4731,6 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     let settings = Settings {
         context_bytes: Some(4096),
         keep_turns: Some(1),
-        keep_warm: Some(0),
         cache_ttl: Some(CacheTtl::Hour),
         speed: Some(agent_runtime::provider::Speed::Fast),
         ..Settings::default()
@@ -4752,7 +4751,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
-            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
+            "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
             "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{}})
     );
     // Retention follows the bot's own setting.
@@ -4838,10 +4837,6 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         },
         Settings {
             max_output_tokens: Some(0),
-            ..Settings::default()
-        },
-        Settings {
-            keep_warm: Some(300),
             ..Settings::default()
         },
     ] {
@@ -6680,34 +6675,33 @@ fn work_charges_what_a_request_sends_new_once_and_survives_a_restart() {
     round(&mut db, turn, "c", usage(1090, 10, "m"), 0);
     let (used, _, head) = work(&db);
     assert_eq!(used, 1105);
-    // A summary and a cache refresh re-read the history: their output
-    // alone, and what was read stays read.
+    // A summary re-reads the history: its output alone, and what was read
+    // stays read.
     db.compaction_usage(turn, Some(&usage(1100, 50, "m")))
         .unwrap();
-    db.keep_warm_usage(turn, &usage(1100, 1, "m")).unwrap();
-    assert_eq!(work(&db), (1156, head, head));
+    assert_eq!(work(&db), (1155, head, head));
     db.finish(turn, None).unwrap();
     drop(db);
     // A restart reads on from the same node.
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-    assert_eq!(work(&db), (1156, head, head));
+    assert_eq!(work(&db), (1155, head, head));
     let turn = begun(&mut db, "Bob", "r2");
     round(&mut db, turn, "d", usage(260, 10, "m"), 50);
     db.finish(turn, None).unwrap();
     let (used, read, head) = work(&db);
-    assert_eq!((used, read), (1216, head));
+    assert_eq!((used, read), (1215, head));
     let turns = db.turns("Bob", 0, None, 8, false).unwrap();
     let rows: Vec<i64> = (turns["turns"].as_array().unwrap().iter())
         .map(|t| t["work_tokens"].as_i64().unwrap())
         .collect();
-    assert_eq!(rows, [1156, 60]);
+    assert_eq!(rows, [1155, 60]);
     // Each usage event says what it charged.
     let events = db.events("Bob", 0, 256).unwrap();
     let charged: Vec<i64> = (events["events"].as_array().unwrap().iter())
         .filter(|e| e["event"] == "usage")
         .map(|e| e["data"]["work_tokens"].as_i64().unwrap())
         .collect();
-    assert_eq!(charged, [1010, 50, 35, 10, 50, 1, 60]);
+    assert_eq!(charged, [1010, 50, 35, 10, 50, 60]);
     // A fork's history is its source's: what the source's calls read is
     // read, through the checkpoint at most.
     let head = head.unwrap();

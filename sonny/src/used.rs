@@ -162,10 +162,35 @@ impl Marks {
             return;
         }
         self.last = Some(Instant::now());
-        let Some(file) = file(bot) else {
+        let file = file(bot);
+        // Any window used is the person present: quiet waits for them
+        // to step away (`crate::quiet`), on the same mark, as often.
+        tokio::task::spawn_blocking(move || {
+            if let Some(file) = file {
+                mark(&file);
+            }
+            crate::quiet::mark_present();
+        });
+    }
+}
+
+/// A window's presence marks, for what uses it without marking its agent
+/// (a scroll, a paste): the person is here all the same, so quiet waits
+/// ([`crate::quiet`]). Kept apart so the agent's own mark stays as it was.
+#[derive(Default)]
+pub struct Present {
+    last: Option<Instant>,
+}
+
+impl Present {
+    /// The person is here: `present` is marked off the screen's thread,
+    /// unless it was within [`EVERY`].
+    pub fn used(&mut self) {
+        if self.last.is_some_and(|last| last.elapsed() < EVERY) {
             return;
-        };
-        tokio::task::spawn_blocking(move || mark(&file));
+        }
+        self.last = Some(Instant::now());
+        tokio::task::spawn_blocking(crate::quiet::mark_present);
     }
 }
 

@@ -49,7 +49,7 @@ sandbox. For people, scripts and other harnesses, Sonny writes
 `sonny automation`:
 
 ```sh
-~/.agent/automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N [--budget-counts work]] [--shadow] -- MESSAGE
+~/.agent/automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] -- MESSAGE
   WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO
 ~/.agent/automation ls [--after NAME]
 ~/.agent/automation show NAME
@@ -190,7 +190,17 @@ saying so, and one whose BOT is gone (`bot_not_found`: pinned by id, it
 never comes back) ends the automation. `--if CMD` runs `sh -c CMD` in the folder
 `add` ran in, with the `PATH` `add` ran with and `AGENT_SOCKET` and
 `AGENT_STORE` naming the automation's daemon, before anything else, for up
-to 60 s, in its own process group, which ends with it. It answers as `test`
+to 60 s, in its own process group, which ends with it. One an agent added
+(its shell, or its automations tool) runs as that agent's commands do,
+through `agent sandbox --bot` (protocol 54): in its sandbox, with its
+variables (`$SONNY_STATE` too), reaching the daemon through its own socket,
+since an agent can rewrite what its gate runs; that agent gone, the check
+could not run (exit 125). One the person added, or Sonny (an ask's deadline,
+the memory cleanup), runs as the person. The definition says which
+(`--if-by NAME --if-by-id ID`, or `--if-by-person`); one from before 0.9.0
+says neither and could be an agent's, so it does not run: each check fails,
+told once, until the automation is added again, but for Sonny's own two,
+known by their whole text. It answers as `test`
 and `grep -q` do: exit 0 sends, and exit 1 skips that fire and records
 nothing but, for `--commit`, that its commit was seen; any other exit, a
 signal or a command that is not there could not check, and fails the fire
@@ -199,6 +209,9 @@ nothing to do costs one process and no model call. A one-off whose check
 says no ends, listed as not sent.
 `--runs N` ends the automation once N messages went out; a fire after that
 (its end could not unload it) only tries to end it again.
+`--until 'YYYY-MM-DD HH:MM'`, local time, ends it at that time: its first fire
+from then sends nothing and ends it, its row saying `last ended: its until
+came`. A subscription's `until` and `runs` end it the same way (LOOKOUT.md).
 `--turn-budget-tokens N` submits each message with that turn cap, so one
 runaway run ends at it, on a reply, instead of spending the agent's whole
 lifetime budget. The cap counts every request's input, the agent's history
@@ -293,7 +306,7 @@ can leave is listed and removable:
   one's name starts afresh.
 - **Firing** records its result and ends an automation that is over (a one-off,
   one whose agent, `--reply-to` agent or, for `--start`, adding agent is
-  gone, one that reached `--runs`), both under the lock
+  gone, one that reached `--runs` or its `--until`), both under the lock
   and only while the definition is still the one it fired for: an automation
   removed while its message went out is left as it now is. A one-off that
   delivered keeps its last result until its turn is known to have ended:
@@ -440,64 +453,6 @@ running a recurring job: keep bookmarks, a ledger and run records as files in
 its folder rather than trusting a compacted conversation for ids and times,
 report a source it could not read by name, re-check items right before
 posting, and record a post only once the destination confirms it.
-
-## Goals
-
-A goal keeps an agent working until a command says its work is done, with
-no judge and nothing in the daemon ([goals.rs](../sonny/src/lookout/goals.rs)).
-An agent sets one with the `goal` tool, on itself or on a task it made:
-`set {done_when, check, bot, budget_tokens, timeout_s}`, `blocked` WHY to
-give its own up, `clear` NAME, or nothing to list them. The check is a
-shell command (`cargo test`, `make lint`, `test -z "$(git status --short)"`)
-that exits 0 once done; the lookout runs it in the agent's folder, as the
-person and outside any sandbox like an automation's `if`, though without the
-provider keys an agent's shell goes without, so `set` waits for a verdict wherever the
-agent's other calls do (`/permissions`). Each goal is
-`STORE.lookout/goals/BOT.json`; setting the same goal again changes
-nothing.
-
-In a window, `/goal WHAT` sends the agent `/goal WHAT` as the person's
-message, and the goal tool's description asks it to set a goal on itself
-for it: like Codex's `/goal`, the agent picks the check. `/goal` shows the
-goals of the agent and its tasks, and `/goal clear` clears its own, as the
-tool would.
-
-Each time a turn of that agent completes, the lookout runs the check, for
-up to `timeout_s` (600 when left out, at most 3,600), killing its process
-group past that. While it fails, it queues the agent a turn (origin
-`goal`) with its exit code and the last 60 lines (8 KiB) it printed:
-
-```
-Your goal is not met yet: `cargo test` exits 101.
-...
-Keep working until the tests pass. When no way remains, give the goal up with the goal tool's blocked, saying why.
-```
-
-The goal ends, and its file goes, at the first of: the check exits 0; the
-agent's tokens since `set` reach `budget_tokens`; two turns in a row that
-the goal started call no tool, since the agent only answers and another
-turn would too; the agent calls `blocked`; or someone clears it or the
-agent is deleted. A turn that fails or is stopped ends nothing and starts
-nothing: the lead hears it as any turn. Its lead hears none of the turns
-the goal held until the last, told with how the goal ended (below). That
-line is the lookout's own words only: the agent's reason for giving up,
-and a check it set itself, are its text, which the lead reads in the turn
-or with `goal`.
-
-The roster and `/status` keep "it stopped" apart from "it did what was
-asked": a task whose turn completed while it has a goal reads `checking`,
-and the turn whose check passed reads `checked`, not `done`, until the
-task's next turn. How a goal ended, and by which turn, is noted in
-`STORE.lookout/goals/ended/BOT.json` before the goal itself goes, and the
-note goes with the agent. A lookout that restarts before the lead heard
-that turn reads how it ended from the note, so the lead still hears that
-it gave up or ran out of budget, not only that a turn completed.
-
-A turn that completes while the goal's check of an earlier one runs waits
-for that check, as a work queue keeps an item added again while it is
-processed: when the agent goes on in a newer turn, that turn is checked
-when it ends and the one that waited is plain news; else, as after a
-restart that replays two finished turns, the one that waited is checked.
 
 ## Memory
 
@@ -917,7 +872,7 @@ keep the index they were created with.
 
 ## Tool host
 
-The tools Sonny gives its agents (`start_task`, `memory`, `goal`,
+The tools Sonny gives its agents (`start_task`, `memory`,
 `automations`, `subscriptions`, the commons, `exec` and the rest whose
 `answered_by` is `sonny`) wait in the daemon until Sonny answers them
 ([served.rs](../sonny/src/served.rs)). The tool host answers them:

@@ -18,11 +18,7 @@ The lookout knows no leads. Sonny subscribes each lead to its tasks when it
 opens the lead's project, and that subscription is what makes a lead hear
 from them; a lead subscribes to more the same way. The lookout also
 answers the calls of the tools Sonny answers (`start_task`, `show_agent`
-and the rest, `sonny/src/served.rs`), and once its stream is live, keeps a
-task's worktree as each completed turn left it, for a task forked from
-that turn (`sonny/src/snapshot.rs`). That runs beside the stream, one at a
-time for each checkout, and asks the daemon only which bots are working
-now, to mark a snapshot late.
+and the rest, `sonny/src/served.rs`).
 
 ## One lookout a daemon
 
@@ -55,7 +51,7 @@ The lookout only watches and tells. The tools Sonny gives its agents are
 answered by another companion, `sonny-tool-host` (`sonny tool-host`; see
 SONNY.md, Sonny's tool host), so a tool that runs long, crashes or holds
 memory, as an MCP server can, never holds up a lead's news. The lookout
-follows those calls' starts and ends: when a `subscriptions` or `goal` call
+follows those calls' starts and ends: when a `subscriptions` or `commons` call
 ends, it reads its files again before the next event, which the stream
 puts after that end, rather than at its next reread.
 
@@ -178,9 +174,24 @@ lookout nothing more: no event is built for the bots it watches.
 
 ```
 {"add": {"name": "api", "bots": ["api.lead"],
-         "filter": {"type": ["turn.ended"], "$or": [{"status": ["failed"]}, {"resolved": [true]}]}}}
+         "filter": {"type": ["turn.ended"], "$or": [{"status": ["failed"]}, {"done": [true]}]}}}
 {"add": {"name": "leads", "bots": ["*.lead"], "digest": "1h"}}
 {"add": {"name": "migration", "tasks_of": ["shop.migrate"], "steer": {"status": ["failed"]}}}
+```
+
+Subscriptions end as automations do, by one rule. `until`, as
+`"2026-11-08 18:00"` in local time, ends one then, as an automation's
+`--until`; `runs` ends one after it was told in that many notes, as an
+automation's `--runs` after that many messages, so `"runs": 1` is a
+one-shot alert. A note counts once it lands, however many events it
+tells, and the count outlasts a lookout restart. A subscription also ends
+with its bot: deleting a bot ends every subscription it held, and one
+that watched only bots by exact name, every one of them deleted now, and
+no source, ends too. Each end is a line in the lookout's log with why.
+
+```
+{"add": {"name": "deploy", "bots": ["ops.deploy"], "steer": {"status": ["failed"]}, "runs": 1}}
+{"add": {"name": "launch", "sources": ["slack:launch"], "until": "2026-11-08 18:00"}}
 ```
 
 A call changes only the calling bot's own subscriptions. `add` under a
@@ -190,6 +201,15 @@ it does not, so remove it first. Each subscriber's are one file,
 seconds. Removing `tasks` stops a lead's lookout until Sonny next opens its
 project. `/background` in Sonny lists the project's agents' subscriptions,
 with their automations; `d` there removes one.
+
+Each subscription in the answer's list says under `lately` what it told
+in the last 24 hours, once it has told anything: the events and tasks'
+news its notes carried (`heard`), those notes (`notes`), how many of them
+steered for it, by its `steer` or the source's mark (`steers`), and when
+it last told (`last`). The lookout counts them by the hour as each note
+lands, in `STORE.lookout/.counts/BOT.json`, written with what it holds;
+a subscription removed takes its counts with it. So a flood shows as a
+subscription with many notes, without reading the log.
 
 ## Sources
 
@@ -357,6 +377,28 @@ subscribe to, not a post:
 A filter naming a field no recent event of its sources had is added, and
 the answer says so under `unseen`: it hears nothing until one does.
 
+To try a subscription before adding it, a call sends it as `add` with
+`"test": true`. Nothing is added; the answer's `test` says what it would
+have heard of its sources' last 24 hours: how many events there were
+(`events`), how many it hears by source, topic and filter (`heard`), how
+many of those steer, by the source's mark or the subscription's `steer`
+(`steers`), and about how many notes they would have been with its
+digest or its sources' (`notes`), with the newest 3 it hears as examples,
+outside content as the listing's are. For this the lookout keeps what
+each source's command printed in `STORE.sources/.recent/NAME.jsonl`, an
+event a line: a day of it, at most 2,000 events and 4 MiB, an event's
+fields cut as a shape's examples are past 16 KiB (`cut` then counts them,
+since a filter may misjudge a cut event). The same writer thread appends
+it and cuts it back once an hour or when it grows past its bytes. The
+commons is not kept, since its threads are their members'. What bots do
+is not kept either, so a subscription that watches bots says so under
+`untested`.
+
+```
+{"add": {"name": "red", "sources": ["ci:main"], "filter": {"status": ["failed"]}}, "test": true}
+→ {"test": {"since": "Fri 7 Nov 05:10", "events": 412, "heard": 9, "steers": 1, "notes": 9, "examples": […]}, "examples": "The fields' examples are…"}
+```
+
 What sources said goes in a note of its own, as a steer, once the news
 has settled 2 seconds, or at once for an event that steers. Joining a
 running turn, it ends "Act where something changes your work, then carry
@@ -407,9 +449,6 @@ those with subscriptions of their own:
 - a running turn that has printed nothing for 30 minutes, once per
   silence; a turn waiting on the person, on other turns or for a slot is
   not silent;
-- a task's turns its goal (SONNY.md) held, once the goal ends: only the
-  last, with how it ended (``turn:calc.fix/4 completed, asked by goal,
-  and met its goal: its check exits 0``);
 - turns the person asked for in a task themselves, listed apart as theirs;
 - what was saved to or removed from the person's and the project's memory,
   by path, less what the subscriber saved itself: the folders its own
@@ -428,7 +467,7 @@ is an event with a `type` and fields, as a source's are, and the
 | `type` | When | Fields beside `type`, `bot` (where), `maker` (who made that bot) and `turn` |
 | --- | --- | --- |
 | `message.written` | someone other than the subscriber writes in a watched bot | `by` (`person`, an agent's name, a program), `text` (the person's words) |
-| `turn.ended` | a turn that is news ends | `by` (who asked: `you`, `person`, an agent's name, `automation`), `status`, `resolved`, `goal`, `theirs` |
+| `turn.ended` | a turn that is news ends | `by` (who asked: `you`, `person`, an agent's name, `automation`), `status`, `done`, `theirs` |
 | `approval.waiting` | an approval only the person can give has waited | |
 | `ask.posted` | a task asked the person with `ask` | `question`, `options` |
 | `turn.silent` | a running turn printed nothing for 30 minutes | |

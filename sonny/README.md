@@ -99,13 +99,11 @@ Claude Code's agents take `isolation` each time.
 
 ![/new listing the profiles, then where a reviewer works, then its first message](../docs/sonny/new-agent.png)
 
-`/goal WHAT` asks the agent to set a goal
-on itself and work until WHAT is done (`/goal` shows goals, `/goal clear`
-clears its own; see [Goals](../docs/SONNY.md#goals)). `/zen FOCUS` asks the agent to talk with you about
+`/zen FOCUS` asks the agent to talk with you about
 that one thing and hold everything else back, and shows only your turns and
 its questions, in the middle of the window, under a footer of the focus and
 what needs you; it interrupts only with a question, and `/zen` again ends it
-and has the agent say what it held. Like a goal, the focus is the agent's to
+and has the agent say what it held. The focus is the agent's to
 read: a few hurried words are enough, and the footer shows the focus in its
 words. Asking in words ("let's go into zen on the receipts") works too.
 
@@ -298,6 +296,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
 | Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
+| Quiet outside your working hours | `[sonny] hours` (ranges in local time, as `["Mon-Fri 09:00-19:00"]`; unset, the default, no clock) and `quiet_after` (how long no window is used outside them before quiet starts, `30m` by default) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
@@ -368,7 +367,7 @@ first's calls open nothing anywhere and say nothing opened would be seen,
 while the Rex lead opens its tasks' tabs as before. With every window closed, the last one used still names the place. A
 project whose lead is in no multiplexer gets none, and its agents get no
 layout skill. A tab asked for stays until you or an agent close it, or the
-task is resolved. With `task_tabs = "every"`, a task's window
+task is marked done. With `task_tabs = "every"`, a task's window
 closes once its work is taken: its turn completed and the lead (or the task
 that started it) waited on it. One that failed, stopped or waits on you stays
 open, and a task given more work opens again; ask the lead to show one, or
@@ -781,17 +780,35 @@ way `/react` does, and each note in the margin has its own `↩`.
   approval, asking you a question, held on something only you can fix,
   such as a ChatGPT sign-in, or failed),
   **Working** (a turn running, queued, rate limited, waiting on other
-  tasks, or `waiting on its reviewer` while the approver weighs a call), **Ready for review** (finished, its last reply linking a pull
-  request), **Done** (finished or stopped with nothing open), and
-  **Resolved**. Done and Resolved fold to their heading (`Done · 3 ▸`)
-  until a click on it, or `d` and `r` with the keys in the pane, opens
-  them, and the same folds them again. As threads in a
-  claude.ai project do, a task resolves itself with the `resolve_task`
-  tool once nothing is left to do in it, such as when its pull request
-  merged or you dropped the work, and the lead can resolve any of its
-  tasks the same way; the lead hears when a task resolved itself, and the
-  task's window closes once its turn ends. New work sent to the task
-  reopens it. Each agent's
+  tasks, or `waiting on its reviewer` while the approver weighs a call), **Idle**
+  (its turn ended, stopped, or never started, with nothing open; a pull
+  request its last reply linked shows on its row), and **Done** (marked
+  done). Each agent is one line: its mark, name, state and time, and at
+  its right edge, dim, what it tracks: what it follows (a source with an
+  `icon` in `[sonny.sources.NAME]` shows as that icon), the code reviews
+  its turns opened or wait on, in any system, as the copy that checks
+  each turn names them from its commands' output and reply (`3 reviews · CR-881`; a pull or merge request link its last
+  reply holds shows before any is kept), its background work
+  and its window. The picked agent, and every one that needs you, says
+  more under it: its model and profile, and its latest step. Idle shows
+  its newest eight and a `+5 more · i shows them` line for the rest; Done
+  folds to its heading (`Done · 3 ▸`). A click on either, or `i` and `d`
+  with the keys in the pane, opens them, and the same folds them again.
+  The helpers a task started fold under it (`▸ 2 helpers, 1 working`),
+  a helper that needs you listed under Needs you too; a click on that
+  line, or → on the picked task, opens them, and ← folds them. As threads in a claude.ai project are
+  resolved, a task marks itself done with the `mark_done` tool once
+  nothing is left to do in it, such as when its pull request merged or
+  you dropped the work, and the lead can mark any of its tasks done the
+  same way; the lead hears when a task marked itself done, and the task's
+  window closes once its turn ends. New work sent to the task reopens it.
+  A task idle for `[sonny] task_done_check` hours (8 by default, 0
+  never) is asked by its lead's window, through a copy of it with no
+  tools, whether its work is done: a yes marks it done, its row saying
+  `marked done by the check at 14:02: its pull request merged`, and a no
+  says `checked at 14:02, work left: …` until its next turn; either way it
+  is not asked again until another of its turns ends. Leads are never
+  asked, and with no window of the project open nothing is. Each agent's
   time is how long its running turn has been at it, or how long its last
   turn took. Beside its model each agent names the profile it runs
   as, `lead` and `task` too, which the footer leaves out (it names a
@@ -884,8 +901,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   person, a schedule (whose tick flashes as it fires), a reply's note
   from the commons, task updates, a message that came back; the chat log
   names each so (`its sources → inbox`, `task updates → shop lead`). A commons invite flies from whoever started the
-  thread, a margin note you closed from you, and an agent's own goal only
-  pulses its star. It is a
+  thread, and a margin note you closed from you. It is a
   calm window to keep open and watch: dim lines join who made whom, and
   every pair that has ever talked keeps a dim curve, the last 96 pairs, past
   turns and live, denser and brighter the more the pair talked this hour. A
@@ -963,7 +979,7 @@ way `/react` does, and each note in the margin has its own `↩`.
 
   ![/sky with an agent scheduling another, its tick on the rim and what is next up](../docs/sonny/sky-schedules.gif)
 
-  ![/sky: a reviewer's no streaking red onto an agent, a hand-off yellow, a schedule's tick flashing as it fires, a goal pulsing a star](../docs/sonny/sky-origins.gif)
+  ![/sky: a reviewer's no streaking red onto an agent, a hand-off yellow, a schedule's tick flashing as it fires](../docs/sonny/sky-origins.gif)
 
   ![/sky with states and its chat log](../docs/sonny/sky-states.png)
 
@@ -1057,18 +1073,6 @@ way `/react` does, and each note in the margin has its own `↩`.
   work; the lead hears it as one of its line. A start deeper than the
   daemon allows is refused with the daemon's `depth_limit`, before any
   folder is made for it, and a task removes only agents of its own line.
-- **Forking a task with its files:** after each turn a task completes, the
-  lookout keeps its worktree's files as a commit beside the repository's
-  history (`refs/agent/snapshots/STORE/BOT_ID/TURN`, through an index of its
-  own, so no one's staging is touched; files git ignores are left out).
-  `start_task` with `from` (a task) and optionally `turn` (the number in
-  one of its turn handles, else its newest kept turn) forks that task at
-  that turn into a new worktree holding those files, on a branch from the
-  commit it was on, so the two never edit the same files. The fork keeps
-  its source's instructions, role, model and sandbox; the brief is its
-  next message. A snapshot taken while an agent was already working in
-  that folder again is marked late, and the start says so. `remove_task`
-  drops a task's snapshots.
 - **Decisions:** when the lead reaches a fork in the road, an
   architectural choice or a step that cannot be undone, it calls its `ask`
   tool with the question, why it asks, two to four options each with what
@@ -1097,7 +1101,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   answered (`✓` and the answer) or withdrawn (a muted `–` and why), and a
   settled card folds to its question and that row until a click on the
   question opens it. A pick of yours on a withdrawn card, or on one the
-  agent closed for you, still answers it. The lead does not wait on you blindly: each
+  agent closed for you, still answers it. Before it asks, an agent runs
+  `sonny ask list`: the newest 20 questions its lead's agents asked in the
+  last week, each with who asked it, when, what a yes covers, and where it stands (`--before NODE` for older
+  ones, `--all` for every agent, `--json`), so it goes with an answer you
+  already gave instead of asking again; the agent reads and decides, and
+  nothing matches wording. The lead does not wait on you blindly: each
   ask says what it does until you answer, and the card's last row says
   so. It goes on with the option it recommends at once when that can be
   undone (`Going with 2 meanwhile; another pick undoes it.`), goes on with
@@ -1146,18 +1155,29 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/copy` puts the last reply on the clipboard; `/open` opens the last
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`
-  leaves the agents working. Over SSH with no display and no `BROWSER`,
+  leaves the agents working.
+- Quiet: outside the hours in `[sonny] hours`, once no Sonny window has
+  been used for `quiet_after` (30 minutes), Sonny goes quiet. Agents keep
+  working; the line Sonny ends each message to a lead with tells it the
+  person is away and since when (tasks are untouched and report to their
+  lead as ever), nothing rings, and every footer says `quiet since
+  19:40`, or `quiet when you step away` while it waits for you. Your next
+  words to any agent end it for all of them, and that message tells a lead
+  you are back; a glance, a click on a question or 9:00 does not.
+  `/quiet` goes quiet now, any hour, and `/quiet off` ends it. Off unless
+  you set `hours` or write `/quiet`. Over SSH with no display and no `BROWSER`,
   what Sonny would open (a link, a file, the page) is copied instead, so
   it doesn't start on the remote machine's screen.
 
 Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
 person sees, as a checklist), `margin` (notes beside the conversation),
-`resolve_task`, `subscriptions`, `show_agent` and
+`mark_done`, `subscriptions`, `show_agent` and
 `run_in_pane`, `start_task` and `remove_task`; a lead's own, which its
 tasks never take, is `new_project`. The daemon shows them to
-the model and records each call: `react`, `plan`, `margin` and
-`resolve_task` run nothing, and the rest wait for Sonny's answer. Sonny's tool host answers
+the model and records each call: `plan` and `mark_done` run nothing,
+and the rest wait for Sonny's answer, a `react` naming another agent kept
+under the person's newest message there as it is answered. Sonny's tool host answers
 those, running each call in the calling agent's folder, so they work with
 every Sonny window closed; a call nobody answers in time ends as
 `tool_unserved`, and the agent goes on. All but `show_agent` wait for a
@@ -1170,8 +1190,8 @@ gate Sonny did not set, as another client's, goes without these until the
 person picks a row in `/permissions`. An agent of Sonny's reaches Sonny only through these tools: none
 of them has a command form. Sonny draws the calls, live and from history,
 and a call answered with an error reads as what it tried, `✗ Couldn't start fix`, with why under it. A task's own
-`resolve_task` is read from its history: its last turn resolved it. The
-lead's Sonny keeps each task the lead resolved beside the store
+`mark_done` is read from its history: its last turn marked it done. The
+lead's Sonny keeps each task the lead marked done beside the store
 (`state.sqlite.resolved/`), with the task's newest turn finished by then: a
 turn of the task numbered after that one reopens it.
 
@@ -1179,7 +1199,7 @@ turn of the task numbered after that one reopens it.
 
 ![A decision the lead asked with the ask tool, drawn where it asked it, its code, bold, math and links read as Markdown](../docs/sonny/ask-markdown.png)
 
-![/status with the lead first, then its tasks under Needs you, Working, Ready for review, Done and the resolved count](../docs/sonny/status-groups.png)
+![/status with the lead first, then its tasks under Needs you, Working, Idle and Done, one line each, a picked task's two helpers open under it and code reviews at the right edge](../docs/sonny/status-groups.png)
 
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
 `[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
@@ -1346,13 +1366,10 @@ failure.
 
 The tasks the lead starts show where it started them, as one roster for
 the tasks started together, each task with what it is doing now (starting,
-working, needs you, done, no reply, checking, checked, failed), read
+working, needs you, done, no reply, failed), read
 again every few seconds. A task whose model ended its turn with nothing to
 say did not fail, but did not reply either, so it reads `no reply`, not
-`done`, in the roster and in `/status`. A task with a goal reads `checking`
-once a turn ends, and `checked` once its goal's check passed.
-
-![A task whose goal's check passed beside one still checking and one only done](../docs/sonny/tasks-checked.png) A click
+`done`, in the roster and in `/status`. A click
 on a task goes to its own tab, where the lead laid it out in Rex, Herdr or
 cmux; a right click (or a click, with no tab) opens it in the pane: its own
 Sonny, live, to watch and to talk to, as a side chat is. `[sonny]
@@ -1525,8 +1542,21 @@ opens `/status`. Every surface reads what needs you one way: an agent
 needs you while a call of its waits on your approval (gated for you, or
 handed to you by the approver) or a question it asked you is still open,
 read from the daemon whole when Sonny starts or reconnects, so a restart
-loses neither, and kept current by its events after. The footer, the task
-tabs' names, `/status`, the started roster and `/sky` agree; and next to the model the agent's profile when it runs one
+loses neither, and kept current by its events after. A question left in a
+reply's words counts too: once an agent's turn ends with words and no
+question asked, the window of its project that sees it end has a copy of
+it, with no tools, say at once whether they wait on you and what for (one
+small call, its history read from the provider's cache of the turn just
+ended). It is the window's own work, so nothing runs for it while no
+window of the project is open. A yes is kept beside the store
+(`STORE.waiting/AGENT.json`) until the agent's next turn; its lead's
+window pins it as the task's question, where what you type goes to the
+task, and `/status` says `waits on you for: …`. `[sonny] needs_check = false`
+turns the check off. `sonny status [AGENT] [--json]` prints the project
+`/status` shows, as text or JSON, for an agent's shell or a script: AGENT
+is a lead, a task or a project, and an agent's own shell defaults to it.
+The footer, the task tabs' names, `/status`, `sonny status`, the started
+roster and `/sky` agree; and next to the model the agent's profile when it runs one
 that isn't its seat's own (`lead` for a lead, `task` for a task). The left
 of the footer says what you talk to and where (the permissions mark, the
 model as pickers name it, its effort, the folder and its branch), and the

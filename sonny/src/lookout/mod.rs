@@ -14,7 +14,6 @@
 //!
 //! A subscriber hears it all in one note, which starts "Task updates: ".
 pub(crate) mod activity;
-pub(crate) mod goals;
 pub(crate) mod pattern;
 pub(crate) mod sources;
 pub(crate) mod subs;
@@ -31,7 +30,7 @@ use std::time::{Duration, Instant};
 const WAKE_GAP: Duration = Duration::from_secs(120);
 /// How long news settles before its note goes, so turns that end together
 /// go in one note.
-const SETTLE: Duration = Duration::from_secs(2);
+pub(crate) const SETTLE: Duration = Duration::from_secs(2);
 /// How long a note waits for messages still being read.
 const SETTLE_MAX: Duration = Duration::from_secs(15);
 /// How often subscription files are read again.
@@ -58,7 +57,7 @@ const WAITING: usize = 1024;
 
 /// What `sonny.lookout_waiting` says now, 0 for no limit; and, read with
 /// it, the most notes a margin holds, the most of a task's notes its lead
-/// hears of at once. Settings that do not read keep the defaults.
+/// hears of at once, and the person's hours, for quiet. Settings that do not read keep the defaults.
 fn waiting() -> usize {
     let Ok(sonny) = agent_client::config::load().map(|config| config.sonny) else {
         crate::margin::set_limits(
@@ -68,6 +67,7 @@ fn waiting() -> usize {
         return WAITING;
     };
     crate::margin::set_limits(sonny.margin_notes, sonny.margin_note_lines);
+    crate::quiet::set_schedule(crate::quiet::Schedule::from(&sonny));
     usize::try_from(sonny.lookout_waiting).unwrap_or(usize::MAX)
 }
 
@@ -393,7 +393,7 @@ async fn tell_bounced(
     // Bounded whatever the names' lengths, as request ids are.
     let request_id = format!("bounce.{turn}.{}", digest(&format!("{bot}\n{turn}\n{to}")));
     let mut submit = json!({"bot": to, "request_id": request_id,
-        "prompt": crate::stamp::now(&prompt), "delivery": "attach", "origin": BOUNCE_ORIGIN,
+        "prompt": crate::stamp::now(&prompt, to), "delivery": "attach", "origin": BOUNCE_ORIGIN,
         "wait_ms": crate::trigger::attach_wait()});
     if let Some(id) = to_id {
         submit["bot_id"] = json!(id);
@@ -735,7 +735,6 @@ async fn serve(settings: Settings) -> Result<(), String> {
         waiting: waiting(),
         records: HashMap::new(),
         made: Made::default(),
-        working: HashMap::new(),
         subscribers: HashMap::new(),
         read_at: HashMap::new(),
         registry: Arc::default(),
@@ -746,7 +745,6 @@ async fn serve(settings: Settings) -> Result<(), String> {
         live: false,
         cursor: None,
         saved: None,
-        goals: goals::Goals::new(&settings.store, &settings.socket),
         fires: HashMap::new(),
         senders: HashMap::new(),
         resume: marks(&settings.store).0,
@@ -755,8 +753,6 @@ async fn serve(settings: Settings) -> Result<(), String> {
         in_flight: HashMap::new(),
         telling: HashMap::new(),
         bouncing: HashMap::new(),
-        reacting: HashMap::new(),
-        taken: HashMap::new(),
         watchers: HashMap::new(),
         started: true,
         rewriting: HashSet::new(),
@@ -772,7 +768,6 @@ async fn serve(settings: Settings) -> Result<(), String> {
         tokio::spawn(async move {
             term.recv().await;
             sources::stop();
-            goals::stop();
             std::process::exit(0);
         });
     }
@@ -857,9 +852,6 @@ struct Service {
     records: HashMap<String, Value>,
     /// Who made whom among `records`.
     made: Made,
-    /// The folder each turn under way works in, as it started: a bot may
-    /// move between turns.
-    working: HashMap<(String, i64), PathBuf>,
     /// Subscriptions by subscriber, as their files held them at the last
     /// read.
     subscribers: HashMap<String, Vec<subs::Sub>>,
@@ -884,8 +876,6 @@ struct Service {
     /// a lookout started again tells what came after it.
     cursor: Option<i64>,
     saved: Option<(i64, i64)>,
-    /// The agents' goals, whose turns it holds until their checks say.
-    goals: goals::Goals,
     /// Turns triggers' fires sent, by agent and turn, each with its
     /// trigger's generation: one that fails is told (`trigger::tell_failed`).
     fires: HashMap<(String, i64), String>,
@@ -893,8 +883,8 @@ struct Service {
     /// turn, for whom a turn that fails is a note (`bounced`).
     senders: HashMap<(String, i64), Vec<Sender>>,
     /// Failed fires' turns whose note is under way, by agent and turn: held
-    /// as a goal's check is, so a restart or a reconnect before the daemon
-    /// takes the note replays the turn and tells it again, not never.
+    /// so a restart or a reconnect before the daemon takes the note replays
+    /// the turn and tells it again, not never.
     telling: HashMap<(String, i64), Telling>,
     /// Bounces under way, by agent, turn and who is told: held as a failed
     /// fire's note is, so one the daemon has not taken is told again.
@@ -914,20 +904,13 @@ struct Service {
     /// record still in work: who asked, what the subscriber waits on and a
     /// task's resolving are replayed rather than lost.
     in_flight: HashMap<(String, i64), i64>,
-    /// Lead `react` calls naming another agent, by bot, turn and call,
-    /// until they end: the agent named, the emoji, whether it comes off,
-    /// and the newest message that agent had taken when the call began.
-    reacting: HashMap<Call, (String, String, bool, Option<i64>)>,
-    /// The newest message each bot took, by the stream: a reaction is on
-    /// what was there when it was made, not what came after.
-    taken: HashMap<String, i64>,
     /// Which lookouts hear each bot's events, by bot: its own, and those
     /// that watch it.
     watchers: HashMap<String, Vec<String>>,
     /// Not connected yet since it started: its stream starts again where
     /// the last lookout's would.
     started: bool,
-    /// The `subscriptions` and `goal` calls under way, by bot, turn and
+    /// The `subscriptions` and `commons` calls under way, by bot, turn and
     /// ID, whose end means the files the lookout reads changed.
     rewriting: HashSet<(String, i64, String)>,
 }
@@ -993,76 +976,9 @@ impl Made {
     }
 }
 
-/// A tool call: its bot, turn and id.
-type Call = (String, i64, String);
-
 /// Where a lookout's answers from the daemon go: its subscriber, its own
 /// number, and the answer.
 type Woken = tokio::sync::mpsc::Sender<(String, u64, Answer)>;
-
-/// The person's newest message in `bot`: one no agent or client sent,
-/// with words of theirs, not only tool results, and no reaction of theirs.
-/// Read newest first, as far back as a long turn of tool calls reaches;
-/// an error when the daemon did not answer.
-async fn newest_said(client: &Client, bot: &str, upto: Option<i64>) -> Result<Option<i64>, ()> {
-    const READ: usize = 2000;
-    let (mut from, mut read) = (Value::Null, 0);
-    while read < READ {
-        let page = client
-            .request(
-                "history_nodes",
-                json!({"bot": bot, "from": from, "limit": 200}),
-            )
-            .await
-            .map_err(drop)?;
-        let nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
-            .filter_map(|n| n["node"].as_i64())
-            .collect();
-        read += nodes.len();
-        let paged = nodes.is_empty();
-        // Newest first: what came after the bound is passed over.
-        let after = |node: &i64| upto.is_some_and(|upto| *node > upto);
-        let nodes: Vec<i64> = nodes.iter().copied().skip_while(after).collect();
-        let mut next = 0;
-        while next < nodes.len() {
-            let wanted = &nodes[next..(next + 100).min(nodes.len())];
-            let items = client
-                .request("history_items", json!({"bot": bot, "nodes": wanted}))
-                .await
-                .map_err(drop)?;
-            // Fewer than asked when they are large; at least one.
-            let items = items["items"].as_array().cloned().unwrap_or_default();
-            if items.is_empty() {
-                return Ok(None);
-            }
-            next += items.len();
-            if let Some(node) = items.iter().find_map(said_by_person) {
-                return Ok(Some(node));
-            }
-        }
-        from = page["next_from"].clone();
-        if from.is_null() || paged {
-            return Ok(None);
-        }
-    }
-    Ok(None)
-}
-
-/// The node of a history entry the person wrote: words of theirs, as an
-/// Anthropic tool result is a user message too.
-pub(crate) fn said_by_person(entry: &Value) -> Option<i64> {
-    let item = &entry["item"];
-    let words = crate::responses(item)
-        .into_iter()
-        .any(|said| said["role"] == "user" && !crate::text(&said).trim().is_empty());
-    (entry["from"].is_null()
-        && entry["origin"].is_null()
-        && entry["person"].is_null()
-        && words
-        && !crate::reactions::is_reaction(&crate::text(item)))
-    .then(|| entry["node"].as_i64())
-    .flatten()
-}
 
 /// Whether the bot listed under a name is another than the one seated.
 fn replaced(seated: &Value, listed: &Value) -> bool {
@@ -1123,23 +1039,14 @@ impl Service {
         from_sources: &mut tokio::sync::mpsc::Receiver<sources::Said>,
     ) {
         let readers = Readers::connect(&self.socket, client.clone()).await;
+        // Subscriptions written after this are left as they are: a bot
+        // made since, which the listing may miss, may have written them.
+        let listed_at = std::time::SystemTime::now();
         let (bots, complete) = listed(&client).await;
         self.records = (bots.iter())
             .filter_map(|b| Some((b["name"].as_str()?.to_owned(), b.clone())))
             .collect();
         self.made = Made::of(&self.records);
-        // Turns begun before the lookout watched, whose start it may not
-        // hear again.
-        crate::snapshot::running_now(
-            (bots.iter())
-                .filter(|b| b["status"] == "running")
-                .filter_map(|b| Some((b["name"].as_str()?, Path::new(b["workspace"].as_str()?)))),
-        );
-        for bot in &bots {
-            if let Some(name) = bot["name"].as_str() {
-                crate::snapshot::housed(name, Some(&crate::snapshot::writable(bot)));
-            }
-        }
         // Agents that posted in the commons before posting subscribed them
         // are subscribed to its threads, once, from a whole listing.
         if complete
@@ -1152,8 +1059,15 @@ impl Service {
             crate::commons::subscribe_posters(&home, &self.store, &names);
         }
         subs::steer_files(&self.store);
+        subs::goals_gone(&self.store);
+        crate::git::drop_snapshot_indexes(&self.store);
         let revisions = subs::revisions(&self.store);
         self.subscribers = subs::all(&self.store).into_iter().collect();
+        // Bots deleted while it was away: their subscriptions end now, as
+        // ones it hears deleted do. Only from a whole listing.
+        if complete && self.unheld(listed_at) {
+            self.subscribers = subs::all(&self.store).into_iter().collect();
+        }
         self.read_at.clear();
         subs::take(&mut self.read_at, &revisions, epoch_ms());
         subs::took(&self.store, &self.read_at);
@@ -1213,18 +1127,12 @@ impl Service {
             );
             return;
         }
-        // Goal checks a dropped connection left under way answer the old
-        // channel, never this one: none is under way here yet. Unbounded,
-        // as a goal's turn waits on its one settlement, which a full
-        // channel would drop: it holds a few per agent with a goal at most.
-        let (checked, mut settled) = tokio::sync::mpsc::unbounded_channel();
         for lookout in self.lookouts.values_mut() {
             // Reads a dropped connection left under way answer the old
             // channel, never this one.
             lookout.reading.clear();
             lookout.updates.replies_dropped();
         }
-        self.goals.reconnected();
         // Notes under way answer the old connection: the replay tells them
         // again.
         for telling in
@@ -1248,11 +1156,11 @@ impl Service {
         let mut tick = tokio::time::interval(SETTLE / 2);
         let mut reread: Option<Instant> = None;
         // Past the replay: a turn that ends now left its folder as it is.
-        let mut streaming = false;
         loop {
             // The lookouts whose news may have changed: those an event
             // reached, or all of them.
             let mut touched: Option<Vec<String>> = None;
+            let mut overdue: Vec<(String, Vec<subs::Sub>)> = Vec::new();
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else {
@@ -1265,35 +1173,25 @@ impl Service {
                         println!("{}", json!({"event": "lagged", "reason": event["reason"]}));
                     }
                     let event = whole_call(&client, event).await;
-                    if event["event"] == "configured" {
-                        self.configured(&client, &event).await;
-                        continue;
-                    }
-                    streaming |= event["event"] == "follow_live";
-                    self.snapshot(&event, streaming);
-                    // A `subscriptions`, `goal` or `commons` call the tool
+                    // A `subscriptions` or `commons` call the tool
                     // host answered counts from the next event on: its end
                     // is in the stream before any event that follows it.
                     if self.rewrote(&event) {
                         reread = Some(Instant::now());
-                        self.goals.reread();
                         self.runner.reload();
                         self.reread(&client).await;
                         self.runner.poke();
                     }
                     let cursor = event["cursor"].as_i64();
-                    // A call is read from the replay too, so one that ends
-                    // after the lookout last watched still lands.
                     let news =
                         live || cursor.is_some_and(|at| self.resume.is_some_and(|seen| at > seen));
-                    let held = self.picked(&client, &event, news).await;
                     // What happened since the lookout last watched live, as
                     // a task that ended while it was down, is news now.
                     if !live && cursor.is_some_and(|at| self.resume.is_some_and(|seen| at > seen)) {
                         live = true;
                         self.go_live();
                     }
-                    if live && !held && cursor > self.cursor {
+                    if live && cursor > self.cursor {
                         self.cursor = cursor;
                     }
                     if !live && self.resume.is_none() && cursor > self.replayed {
@@ -1314,16 +1212,25 @@ impl Service {
                         && let Some(name) = event["bot"].as_str()
                     {
                         self.in_flight.retain(|(bot, _), _| bot != name);
-                        if let Some(had) = self.records.remove(name) {
-                            self.made.remove(name, &had);
+                        let had = self.records.remove(name);
+                        if let Some(had) = &had {
+                            self.made.remove(name, had);
                         }
                         if let Some(lookout) = self.lookouts.remove(name) {
                             lookout.unheld();
                             self.index();
                         }
+                        // Only as news: what the replay shows from before the
+                        // lookout last watched it saw then.
+                        if news {
+                            let id = had.as_ref().and_then(|had| had["bot_id"].as_i64());
+                            // In force at once: a bot made again under the
+                            // name is never heard by what ended.
+                            if self.ended_with(name, id) {
+                                self.reread(&client).await;
+                            }
+                        }
                     }
-                    // A turn whose goal's check is to run is news only once
-                    // it says how the goal stands.
                     let bot_id = (event["bot"].as_str())
                         .and_then(|bot| self.records.get(bot))
                         .and_then(|record| record["bot_id"].as_i64());
@@ -1355,11 +1262,6 @@ impl Service {
                         .zip(event["turn"].as_i64())
                         .and_then(|(bot, turn)| self.in_flight.get(&(bot.to_owned(), turn)).copied());
                     let bounces = self.sent(&event, live);
-                    if let Some((bot, turn)) = self.goals.event(&event, bot_id, live, &client, &checked) {
-                        for lookout in self.lookouts.values_mut() {
-                            lookout.updates.goal_turn(&bot, turn);
-                        }
-                    }
                     // Each event goes to the lookouts that hear its bot,
                     // as an informer hands a change to the handlers that
                     // asked for its object; a bot made or deleted, to all.
@@ -1442,17 +1344,6 @@ impl Service {
                 Some(key) = bounce_taken.recv() => {
                     self.bouncing.remove(&key);
                 }
-                Some(settled) = settled.recv() => {
-                    let checking = self.goals.settled(&settled, &client, &checked);
-                    let goals::Settled { bot, turn, outcome, .. } = settled;
-                    let now = Instant::now();
-                    for lookout in self.lookouts.values_mut() {
-                        lookout.updates.goal_settled(&bot, turn, outcome.as_deref());
-                        if let Some(later) = checking {
-                            lookout.updates.goal_checking(&bot, later, now);
-                        }
-                    }
-                }
                 // What sources say is news once the stream is live; until
                 // then it waits in the channel.
                 Some(said) = from_sources.recv(), if self.live => {
@@ -1469,10 +1360,18 @@ impl Service {
                     touched = Some(vec![lead]);
                 }
                 Some((lead, id, answer)) = woke.recv() => {
+                    let mut ended = Vec::new();
                     if let Some(lookout) = self.lookouts.get_mut(&lead)
                         && lookout.id == id
                     {
                         lookout.answered(answer);
+                        ended = std::mem::take(&mut lookout.ended);
+                    }
+                    if !ended.is_empty() {
+                        for sub in &ended {
+                            self.end_sub(String::as_str(&lead), sub, "its runs were told");
+                        }
+                        self.reread(&client).await;
                     }
                     touched = Some(vec![lead]);
                 }
@@ -1482,7 +1381,6 @@ impl Service {
                     // What the person or a script wrote since, now and then.
                     if reread.is_none_or(|at| now >= at + REREAD) {
                         reread = Some(now);
-                        self.goals.reread();
                         self.runner.reload();
                         self.waiting = waiting();
                         for lookout in self.lookouts.values_mut() {
@@ -1518,6 +1416,20 @@ impl Service {
                 }
                 lookout.wake(&client, &woken);
                 lookout.wake_sources(&client, &woken);
+                let over = std::mem::take(&mut lookout.over);
+                if !over.is_empty() {
+                    overdue.push((name, over));
+                }
+            }
+            // Subscriptions whose `until` came between rereads end before
+            // any note tells what they heard.
+            if !overdue.is_empty() {
+                for (lead, over) in std::mem::take(&mut overdue) {
+                    for sub in &over {
+                        self.end_sub(&lead, sub, "its until came");
+                    }
+                }
+                self.reread(&client).await;
             }
         }
     }
@@ -1651,109 +1563,6 @@ impl Service {
         self.unheard(sent)
     }
 
-    /// A bot whose sandbox changed is read again before any later event,
-    /// so a snapshot knows each folder it may now write; one that cannot
-    /// be read may write any.
-    async fn configured(&mut self, client: &Client, event: &Value) {
-        let Some(bot) = event["bot"].as_str() else {
-            return;
-        };
-        let sandbox =
-            (event["changed"].as_array()).is_some_and(|c| c.iter().any(|f| f == "sandbox"));
-        let Some(record) = self.records.get_mut(bot).filter(|_| sandbox) else {
-            return;
-        };
-        let read =
-            (client.request("inspect", json!({"bot": bot, "bot_id": event["bot_id"]}))).await;
-        record["settings"] = match read {
-            Ok(read) => read["settings"].clone(),
-            Err(_) => json!({"writable": ["/"]}),
-        };
-        crate::snapshot::housed(bot, Some(&crate::snapshot::writable(record)));
-    }
-
-    /// Keep a task's worktree as a completed turn left it, for a task
-    /// forked from that turn (snapshot.rs); drop a deleted task's. Each
-    /// turn's start and end is noted however the stream stands, so a
-    /// snapshot knows of work in its checkout after its turn; snapshots
-    /// are taken only once `streaming`, so a replay never takes one of
-    /// files that changed since, but a deleted bot's are dropped either
-    /// way.
-    fn snapshot(&mut self, event: &Value, streaming: bool) {
-        let (Some(bot), Some(kind)) = (event["bot"].as_str(), event["event"].as_str()) else {
-            return;
-        };
-        let data = &event["data"];
-        let turn = event["turn"].as_i64();
-        let record = self.records.get(bot);
-        let (folder, ended) = match (kind, turn) {
-            ("accepted", Some(turn)) => {
-                if let Some(workspace) = data["workspace"].as_str() {
-                    let workspace = PathBuf::from(workspace);
-                    crate::snapshot::worked(&workspace);
-                    if let Some(record) = record {
-                        crate::snapshot::housed(bot, Some(&crate::snapshot::writable(record)));
-                    }
-                    crate::snapshot::running(bot, Some(&workspace));
-                    self.working.insert((bot.to_owned(), turn), workspace);
-                }
-                return;
-            }
-            ("turn_finished", Some(turn)) => {
-                // A turn begun before the lookout watched worked where its
-                // bot is.
-                let folder = (self.working.remove(&(bot.to_owned(), turn)))
-                    .or_else(|| record?["workspace"].as_str().map(PathBuf::from));
-                crate::snapshot::running(bot, None);
-                let Some(folder) = folder else { return };
-                let ended = crate::snapshot::worked(&folder);
-                (folder, ended)
-            }
-            ("deleted", _) => {
-                crate::snapshot::running(bot, None);
-                crate::snapshot::housed(bot, None);
-                self.working.retain(|(name, _), _| name != bot);
-                let Some(folder) = record.and_then(|r| r["workspace"].as_str()) else {
-                    return;
-                };
-                (PathBuf::from(folder), 0)
-            }
-            _ => return,
-        };
-        let Some(bot_id) = record.and_then(|r| r["bot_id"].as_i64()) else {
-            return;
-        };
-        // Only a task's own worktree: what forks from, and no one else's.
-        // A deletion replayed is still dropped, as no snapshot comes after.
-        if !(streaming || kind == "deleted") || !crate::task::in_worktree(&folder) {
-            return;
-        }
-        let refs = crate::snapshot::refs(&self.store);
-        match kind {
-            "turn_finished" if data["status"] == "completed" => {
-                let (Some(turn), Some(checkpoint)) = (turn, data["checkpoint"].as_i64()) else {
-                    return;
-                };
-                let done = crate::snapshot::Completed {
-                    refs,
-                    indexes: crate::snapshot::indexes(&self.store),
-                    workspace: folder,
-                    bot_id,
-                    turn,
-                    checkpoint,
-                    ended,
-                };
-                tokio::spawn(crate::snapshot::after_turn(done));
-            }
-            // A task's own folder may be gone, and `remove_task` drops its
-            // snapshots once it is.
-            "deleted" => {
-                tokio::spawn(crate::snapshot::deleted(refs, folder, bot_id));
-            }
-            _ => {}
-        }
-    }
-
     /// The lookouts an event reaches: those that hear its bot, or every
     /// one for a bot made or deleted, which may change what each watches,
     /// and for what concerns no bot.
@@ -1809,7 +1618,17 @@ impl Service {
     /// watched, and each lookout watches what its file says.
     async fn reread(&mut self, client: &Client) {
         let revisions = subs::revisions(&self.store);
-        let read: HashMap<String, Vec<subs::Sub>> = subs::all(&self.store).into_iter().collect();
+        let mut read: HashMap<String, Vec<subs::Sub>> =
+            subs::all(&self.store).into_iter().collect();
+        // A subscription whose `until` came ends, as an automation does.
+        let now_s = (epoch_ms() / 1000) as i64;
+        for (subscriber, subs) in read.iter_mut() {
+            for sub in subs.iter().filter(|sub| sub.over(now_s)) {
+                self.end_sub(subscriber, sub, "its until came");
+            }
+            subs.retain(|sub| !sub.over(now_s));
+        }
+        read.retain(|_, subs| !subs.is_empty());
         // Every revision read is kept, one that changes nothing and a
         // file that went included, so the listing knows it was taken.
         let now = epoch_ms();
@@ -1837,29 +1656,67 @@ impl Service {
         self.resubscribe(false);
     }
 
-    /// A lead's `react` call naming one of its project's agents: once it
-    /// succeeds as news, its reaction kept under the person's newest message
-    /// there, for that agent's window to draw. Whether it waits on the
-    /// daemon still, so the event is read again after a restart.
-    async fn picked(&mut self, client: &Client, event: &Value, news: bool) -> bool {
-        let Some((by, bot, id, emoji, remove, upto)) = self.reacted(event, news) else {
-            return false;
-        };
-        let store = std::fs::canonicalize(&self.store).unwrap_or_else(|_| self.store.clone());
-        let key = crate::reactions::key(&store, id);
-        match newest_said(client, &bot, upto).await {
-            Ok(node) => {
-                if let Some(node) = node {
-                    let _ = crate::reactions::Picked::apply(&key, node, &by, &emoji, remove);
-                }
-                false
+    /// End `subscriber`'s subscription `name`, as it says `why`, in its
+    /// file and the log; the next read of the files stops it.
+    fn end_sub(&self, subscriber: &str, sub: &subs::Sub, why: &str) {
+        let removed = subs::end(&self.store, subscriber, sub);
+        self.write(
+            &json!({"at_ms": epoch_ms(), "lead": subscriber, "ended": sub.name, "why": why,
+            "removed": removed.as_ref().is_ok_and(|r| *r), "error": removed.err()}),
+        );
+    }
+
+    /// Subscribers no bot now listed holds, as after deletes the lookout
+    /// was away for: what they held ends. Whether any did.
+    fn unheld(&self, listed: std::time::SystemTime) -> bool {
+        let mut any = false;
+        for name in self.subscribers.keys() {
+            let live = (self.records.get(name)).and_then(|bot| bot["bot_id"].as_i64());
+            let ended = subs::unheld(&self.store, name, live, listed);
+            if ended.as_ref().is_ok_and(|n| *n > 0) || ended.is_err() {
+                any = true;
+                self.write(&json!({"at_ms": epoch_ms(), "lead": name, "ended": "all",
+                    "why": "its subscriber was deleted", "error": ended.err()}));
             }
-            Err(()) => true,
         }
+        any
+    }
+
+    /// A bot was deleted: the subscriptions it held end with it, and so
+    /// does any that watched only bots by their names, every one of them
+    /// gone now, and no source or maker's tasks.
+    /// Whether any ended.
+    fn ended_with(&self, gone: &str, id: Option<i64>) -> bool {
+        let mut any = false;
+        if self.subscribers.contains_key(gone) {
+            let forgot = subs::forget(&self.store, gone, id);
+            if forgot.as_ref().is_ok_and(|n| *n > 0) || forgot.is_err() {
+                any = true;
+                self.write(&json!({"at_ms": epoch_ms(), "lead": gone, "ended": "all",
+                    "why": "its subscriber was deleted", "error": forgot.err()}));
+            }
+        }
+        for (subscriber, subs) in &self.subscribers {
+            for sub in subs {
+                // A maker's tasks outlive it: one that watches them stays.
+                let names: Vec<&String> = sub.bots.iter().collect();
+                let watched_gone = names.iter().any(|name| *name == gone)
+                    && sub.sources.is_empty()
+                    && sub.tasks_of.is_empty()
+                    && names
+                        .iter()
+                        .all(|name| !name.contains('*') && !self.records.contains_key(*name));
+                if watched_gone && subscriber != gone {
+                    self.end_sub(subscriber, sub, "every bot it watched was deleted");
+                    any = true;
+                }
+            }
+        }
+        any
     }
 
     /// Whether `event` ends a call of Sonny's that wrote files the lookout
-    /// reads, a `subscriptions`, `goal` or `commons` call (posting
+    /// reads, a `subscriptions` or `commons` call (posting
     /// subscribes), which the tool host answers. A turn that ends forgets the calls it left under way.
     fn rewrote(&mut self, event: &Value) -> bool {
         let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) else {
@@ -1877,7 +1734,6 @@ impl Service {
             Some("tool_started")
                 if data["answered_by"] == crate::served::TAG
                     && (data["name"] == crate::served::SUBSCRIPTIONS
-                        || data["name"] == crate::served::GOAL
                         || data["name"] == crate::served::COMMONS) =>
             {
                 self.rewriting.insert(call());
@@ -1889,66 +1745,6 @@ impl Service {
                 false
             }
             _ => false,
-        }
-    }
-
-    /// The project a bot is in: the longest start of its name whose lead
-    /// the daemon lists.
-    fn project<'a>(&self, bot: &'a str) -> Option<&'a str> {
-        (bot.match_indices('.').rev())
-            .map(|(at, _)| &bot[..at])
-            .find(|start| self.records.contains_key(&format!("{start}.lead")))
-    }
-
-    /// A targeted `react` call that ended well as news: who called, the
-    /// agent named and its id, the emoji, whether it comes off, and the
-    /// newest message that agent had taken when the call began.
-    fn reacted(
-        &mut self,
-        event: &Value,
-        news: bool,
-    ) -> Option<(String, String, i64, String, bool, Option<i64>)> {
-        let data = &event["data"];
-        let by = event["bot"].as_str()?;
-        if let (Some("accepted" | "steered"), Some(node)) =
-            (event["event"].as_str(), data["node"].as_i64())
-        {
-            self.taken.insert(by.to_owned(), node);
-            return None;
-        }
-        let call = (
-            by.to_owned(),
-            event["turn"].as_i64()?,
-            data["call_id"].as_str()?.to_owned(),
-        );
-        match event["event"].as_str() {
-            Some("tool_started") if data["name"] == crate::reactions::TOOL => {
-                let arguments = (data["arguments"].as_str())
-                    .and_then(|a| serde_json::from_str::<Value>(a).ok())?;
-                let bot = crate::reactions::target(&arguments)?.to_owned();
-                let (emoji, remove) = crate::reactions::call(&arguments)?;
-                let upto = self.taken.get(&bot).copied();
-                self.reacting.insert(call, (bot, emoji, remove, upto));
-                None
-            }
-            // The daemon refuses a call that does not fit, or that the bot
-            // may not make.
-            Some("tool_completed") => {
-                let (bot, emoji, remove, upto) = self.reacting.remove(&call)?;
-                if !news || data["failed"] == true || data["denied"] == true {
-                    return None;
-                }
-                let id = (self.records.get(&bot))
-                    .filter(|_| {
-                        bot != by
-                            && self
-                                .project(&bot)
-                                .is_some_and(|p| self.project(by) == Some(p))
-                    })
-                    .and_then(|record| record["bot_id"].as_i64())?;
-                Some((by.to_owned(), bot, id, emoji, remove, upto))
-            }
-            _ => None,
         }
     }
 
@@ -2010,6 +1806,9 @@ impl Service {
         lookout.roots(&self.records, &self.made);
         let held = beside(&self.store, ".sources").join(".held");
         lookout.restore(held.join(format!("{lead}.json")));
+        lookout.counts = subs::counts(&self.store, lead);
+        lookout.counts_file = Some(subs::counts_file(&self.store, lead));
+        lookout.counting();
         self.lookouts.insert(lead.to_owned(), lookout);
         // Said once a subscriber is watched, so `/status` shows it from
         // the start.
@@ -2066,7 +1865,7 @@ impl Service {
                 .cloned()
                 .collect();
             if all || subs != lookout.subs {
-                lookout.subs = subs;
+                lookout.resubscribed(subs);
                 lookout.roots(&self.records, &self.made);
                 lookout.rehear();
             }
@@ -2088,7 +1887,7 @@ impl Service {
     }
 
     /// Up to just before the oldest news a lookout has not told, the
-    /// oldest turn whose goal's check runs, or the oldest failed fire whose
+    /// or the oldest failed fire whose
     /// note is under way, which a restart or a reconnect
     /// takes up again: news only in memory, or a read or check a dropped
     /// connection cut short, is told or run again, not lost.
@@ -2099,7 +1898,6 @@ impl Service {
             }
         }
         let floor = (self.lookouts.values().filter_map(|l| l.from))
-            .chain(self.goals.floor())
             .chain(
                 (self.telling.values().chain(self.bouncing.values()))
                     .filter_map(|telling| telling.ended),
@@ -2121,11 +1919,20 @@ impl Service {
         if self.saved == Some((cursor, replay)) {
             return;
         }
+        // What the lookouts hold goes to disk first, the runs a note spent
+        // with it: the stream never starts again past news whose spending
+        // a crash lost.
+        for lookout in self.lookouts.values_mut() {
+            lookout.flush();
+        }
         let path = cursor_path(&self.store);
         let partial = path.with_extension(format!("cursor.{}.partial", std::process::id()));
-        if write_moved(&partial, &path, &format!("{cursor} {replay}")).is_ok() {
-            self.saved = Some((cursor, replay));
-        }
+        self.saved = Some((cursor, replay));
+        held::then(move |written| {
+            if written {
+                let _ = write_moved(&partial, &path, &format!("{cursor} {replay}"));
+            }
+        });
     }
 
     /// Just before the oldest turn under way that a lookout hears, or
@@ -2157,17 +1964,15 @@ fn cursor_path(store: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// The events a lookout reads, of every bot: what bots there are and
-/// what each may write, how their turns start, wait and end, the tools
-/// they call, and each model call's usage, which says a quiet turn still
-/// works. The text a model streams, most of all events, is no one's news
-/// here.
 /// The most fires' turns noted at once.
 const FIRES: usize = 4096;
 
-const KINDS: [&str; 14] = [
+/// The events a lookout reads, of every bot: what bots there are, how
+/// their turns start, wait and end, the tools they call, and each model
+/// call's usage, which says a quiet turn still works. The text a model
+/// streams, most of all events, is no one's news here.
+const KINDS: [&str; 13] = [
     "created",
-    "configured",
     "forked",
     "deleted",
     "accepted",
@@ -2367,6 +2172,25 @@ struct Lookout {
     /// When a note last told the subscriber each source, which a source's
     /// digest counts from.
     told_sources: HashMap<String, Instant>,
+    /// The notes, by request, that told what each subscription that lasts
+    /// so many (`runs`) heard, under `Sub::counter`, kept with what its
+    /// sources hold: a note sent again after a restart is one note.
+    runs_told: HashMap<String, Vec<String>>,
+    /// The subscriptions that last so many whose news the note on its way
+    /// on each path tells, by `Sub::counter` as they were when it went: one
+    /// replaced meanwhile is not charged for it. Tasks' path, then sources'.
+    charged: [Vec<String>; 2],
+    /// Subscriptions whose notes ran out, for the service to end, as they
+    /// were read: one put in its place since stays.
+    ended: Vec<subs::Sub>,
+    /// Subscriptions whose `until` came before the files were read again,
+    /// for the service to end.
+    over: Vec<subs::Sub>,
+    /// What each subscription told lately, for the listing, written to
+    /// `counts_file` once a tick when it changed.
+    counts: subs::Counts,
+    counts_file: Option<PathBuf>,
+    counts_dirty: bool,
     /// Where what its sources said waits, untold, so a restart loses none
     /// of what a digest or a busy subscriber held.
     held: Option<PathBuf>,
@@ -2431,6 +2255,13 @@ impl Lookout {
             unkept_sent: Unkept::default(),
             heard_since: None,
             told_sources: HashMap::new(),
+            runs_told: HashMap::new(),
+            charged: Default::default(),
+            ended: Vec::new(),
+            over: Vec::new(),
+            counts: subs::Counts::default(),
+            counts_file: None,
+            counts_dirty: false,
             held: None,
             dirty: false,
             resend: Vec::new(),
@@ -2454,13 +2285,24 @@ impl Lookout {
         // What subscriptions with rules say of each bot they watch, worked
         // out here once rather than as each event comes; with none, none.
         self.updates.rules.clear();
-        if self.subs.iter().any(subs::Sub::rules) {
-            let rules: Vec<activity::Rule> = self.subs.iter().map(activity::Rule::of).collect();
-            for bot in &watched {
-                if let Some(rules) = self.rules_of(bot, &rules) {
-                    self.updates.rules.insert(bot.clone(), rules);
-                }
+        self.updates.hearers.clear();
+        let rules: Vec<activity::Rule> = match self.subs.iter().any(subs::Sub::rules) {
+            true => self.subs.iter().map(activity::Rule::of).collect(),
+            false => Vec::new(),
+        };
+        // Bots watched by the same subscriptions share one list of them.
+        let mut lists: HashMap<Vec<usize>, Arc<[String]>> = HashMap::new();
+        for bot in &watched {
+            if !rules.is_empty()
+                && let Some(rules) = self.rules_of(bot, &rules)
+            {
+                self.updates.rules.insert(bot.clone(), rules);
+                continue;
             }
+            let watching = self.watching(bot);
+            let names = (lists.entry(watching))
+                .or_insert_with_key(|n| n.iter().map(|&n| self.subs[n].name.clone()).collect());
+            self.updates.hearers.insert(bot.clone(), names.clone());
         }
         self.updates.watched = watched;
         // Another subscriber is a task here only where one names it as it is.
@@ -2479,25 +2321,39 @@ impl Lookout {
             false => self.updates.watched.remove(bot),
         };
         self.updates.rules.remove(bot);
-        if self.updates.watched.contains(bot) && self.subs.iter().any(subs::Sub::rules) {
+        self.updates.hearers.remove(bot);
+        if !self.updates.watched.contains(bot) {
+            return;
+        }
+        if self.subs.iter().any(subs::Sub::rules) {
             let rules: Vec<activity::Rule> = self.subs.iter().map(activity::Rule::of).collect();
             if let Some(rules) = self.rules_of(bot, &rules) {
                 self.updates.rules.insert(bot.to_owned(), rules);
+                return;
             }
         }
+        let names: Arc<[String]> = (self.watching(bot).into_iter())
+            .map(|n| self.subs[n].name.clone())
+            .collect();
+        self.updates.hearers.insert(bot.to_owned(), names);
     }
 
     /// What the subscriptions that watch `bot` say of its events, `rules`
     /// being each subscription's in order: none when none of them has a
     /// filter, a digest or `urgent`, so its news goes as it always went.
     fn rules_of(&self, bot: &str, rules: &[activity::Rule]) -> Option<Arc<[activity::Rule]>> {
-        let watching: Vec<usize> = (0..self.subs.len())
-            .filter(|&n| self.sub_watches(&self.subs[n], bot))
-            .collect();
+        let watching = self.watching(bot);
         if !watching.iter().any(|&n| self.subs[n].rules()) {
             return None;
         }
         Some(watching.into_iter().map(|n| rules[n].clone()).collect())
+    }
+
+    /// Its subscriptions that watch `bot`, by place.
+    fn watching(&self, bot: &str) -> Vec<usize> {
+        (0..self.subs.len())
+            .filter(|&n| self.sub_watches(&self.subs[n], bot))
+            .collect()
     }
 
     /// Lineage is kept up during the replay too, so tasks made earlier count.
@@ -2573,12 +2429,11 @@ impl Lookout {
     /// Who wrote a turn, as the note names them; `None` for the
     /// subscriber, whose words are no news to it.
     fn author(&self, data: &Value) -> Option<String> {
-        // A lookout's own note to a lead another subscriber watches, a
-        // goal's next turn, an automation's run, or the daemon telling a
-        // bot its background command ended: how the turn ends alone is news
-        // (an automation's run that went well and said nothing is none).
-        if (data["request_id"].as_str())
-            .is_some_and(|id| id.starts_with("lookout-") || id.starts_with(goals::REQUEST))
+        // A lookout's own note to a lead another subscriber watches, an
+        // automation's run, or the daemon telling a bot its background
+        // command ended: how the turn ends alone is news (an automation's
+        // run that went well and said nothing is none).
+        if (data["request_id"].as_str()).is_some_and(|id| id.starts_with("lookout-"))
             || (data["origin"]
                 .as_str()
                 .is_some_and(|origin| crate::trigger::sent_it(origin) || origin == "background")
@@ -2876,12 +2731,11 @@ impl Lookout {
     }
 
     /// Whether anything it heard is not told yet: messages to read or
-    /// being read, a turn held on a trigger or its goal's check, news, or
+    /// being read, a turn held on a trigger, news, or
     /// a note the daemon has not answered.
     fn untold(&self) -> bool {
         !self.due.is_empty()
             || !self.reading.is_empty()
-            || self.updates.goal_pending()
             || self.updates.holding()
             || self.updates.waiting()
             || self.updates.news()
@@ -2904,7 +2758,7 @@ impl Lookout {
         {
             self.ask(client, woken, now);
         }
-        if self.sending.is_some() {
+        if self.sending.is_some() || self.last_runs_out(true) || self.overdue() {
             return;
         }
         let Some(joins) = self.wake_due(now) else {
@@ -2924,7 +2778,7 @@ impl Lookout {
             self.updates.unsent(told);
             return;
         }
-        let prompt = crate::stamp::now(&note(&told, steer.as_ref()));
+        let prompt = crate::stamp::now(&note(&told, steer.as_ref()), &self.lead);
         let key: Vec<String> = told.items.iter().map(|line| line.key.clone()).collect();
         let request_id = format!("lookout-{}", digest(&key.join(",")));
         let delivery = "steer";
@@ -2937,6 +2791,7 @@ impl Lookout {
         if !quotes.is_empty() {
             asked["quotes"] = json!(quotes);
         }
+        self.charged[0] = self.charges(told.heard.iter().map(|(name, _)| name));
         self.sending = Some((told, key, delivery));
         self.send(client, woken, asked, Answer::Noted);
     }
@@ -3007,6 +2862,8 @@ impl Lookout {
                         }
                         // The person's words a bounded note left out still cut in.
                         self.urgent &= self.updates.quoting();
+                        self.count(&key, &told.heard, &told.steered());
+                        self.spend(0, &key);
                         self.updates.sent(told);
                         // When a subscription's digest last told is kept.
                         if !self.updates.told_subs.is_empty() {
@@ -3021,6 +2878,8 @@ impl Lookout {
                     // The same news twice is one note.
                     Err(code) if code == "idempotency_conflict" => {
                         self.urgent &= self.updates.quoting();
+                        self.count(&key, &told.heard, &told.steered());
+                        self.spend(0, &key);
                         self.updates.sent(told);
                     }
                     Err(code) => {
@@ -3060,6 +2919,32 @@ impl Lookout {
                     submitted => {
                         self.refused = None;
                         self.sourced(true);
+                        // Each subscription counts the events it heard, and
+                        // a steer for it: one it set off, or one the source
+                        // marked, which steers for every subscription.
+                        let mut heard: Vec<(String, u64)> = Vec::new();
+                        let mut steered: Vec<&str> = Vec::new();
+                        for one in &sent {
+                            for sub in &one.subs {
+                                match heard.iter_mut().find(|(had, _)| had == sub) {
+                                    Some((_, n)) => *n += 1,
+                                    None => heard.push((sub.clone(), 1)),
+                                }
+                                // Its source marked it, or this one's own
+                                // `steer` matched it, whichever set it off.
+                                let marked = one.event.steer && one.event.steer_by.is_none();
+                                let own = (self.subs.iter().find(|had| had.name == *sub))
+                                    .and_then(|had| had.steer.as_ref())
+                                    .is_some_and(|steer| {
+                                        pattern::matches(steer, &one.event.fields)
+                                    });
+                                if (marked || own) && !steered.contains(&sub.as_str()) {
+                                    steered.push(sub);
+                                }
+                            }
+                        }
+                        self.count(&key, &heard, &steered);
+                        self.spend(1, &key);
                         self.unkept_sent = Unkept::default();
                         for heard in &sent {
                             self.told_sources.insert(heard.event.source.clone(), now);
@@ -3074,6 +2959,151 @@ impl Lookout {
                 self.heard_since = (!self.heard.is_empty()).then_some(now);
                 self.keep();
             }
+        }
+    }
+
+    /// Its subscriptions are now `subs`: what only those gone heard goes
+    /// with them, and one put in another's place under its name counts
+    /// afresh.
+    fn resubscribed(&mut self, subs: Vec<subs::Sub>) {
+        let gone = gone(&self.subs, &subs);
+        self.updates.ended(&gone);
+        // A note under way told what those gone heard: once it lands, it
+        // counts for none of them, nor for one put in another's place.
+        if let Some((told, ..)) = &mut self.sending {
+            told.heard.retain(|(name, _)| !gone.contains(name));
+            told.steered.retain(|name| !gone.contains(name));
+        }
+        if let Some((sent, ..)) = &mut self.sourcing {
+            for heard in sent {
+                heard.subs.retain(|name| !gone.contains(name));
+            }
+        }
+        self.subs = subs;
+        self.counting();
+    }
+
+    /// Notes counted only for subscriptions it has that last so many,
+    /// each under when it was added, so one removed and added again, even
+    /// in one call, starts its count afresh; and counts only for those it
+    /// has, as they are, for this bot.
+    fn counting(&mut self) {
+        let subs = &self.subs;
+        self.runs_told.retain(|counter, _| {
+            subs.iter()
+                .any(|sub| sub.runs.is_some() && &sub.counter() == counter)
+        });
+        let id = self.updates.lead_id();
+        let kept: Vec<(&str, String)> = (subs.iter())
+            .map(|sub| (sub.name.as_str(), sub.identity(id)))
+            .collect();
+        if (self.counts).keep(|name, of| kept.iter().any(|(n, o)| *n == name && o == of)) {
+            self.counts_dirty = true;
+        }
+    }
+
+    /// The identity its counts keep for its subscription named `name`.
+    fn of(&self, name: &str) -> Option<String> {
+        (self.subs.iter().find(|sub| sub.name == name))
+            .map(|sub| sub.identity(self.updates.lead_id()))
+    }
+
+    /// Whether a subscription's `until` came since the files were last
+    /// read: it goes to `over`, to end before any note is sent.
+    fn overdue(&mut self) -> bool {
+        let now = (epoch_ms() / 1000) as i64;
+        for sub in self.subs.iter().filter(|sub| sub.over(now)) {
+            if !self.over.contains(sub) {
+                self.over.push(sub.clone());
+            }
+        }
+        !self.over.is_empty()
+    }
+
+    /// Whether the note under way on the other path, the sources' for task
+    /// news (`tasks`) or the reverse, tells a subscription its last run:
+    /// this one waits for it to land, so a one-shot is never told twice.
+    fn last_runs_out(&self, tasks: bool) -> bool {
+        let flying = match tasks {
+            true => self.sourcing.is_some(),
+            false => self.sending.is_some(),
+        };
+        let other = &self.charged[usize::from(tasks)];
+        flying
+            && other.iter().any(|counter| {
+                (self.subs.iter().find(|sub| &sub.counter() == counter)).is_some_and(|sub| {
+                    sub.runs.is_some_and(|runs| {
+                        self.runs_told.get(counter).map_or(0, Vec::len) as u64 + 1 >= runs
+                    })
+                })
+            })
+    }
+
+    /// A note that told what these subscriptions heard landed: each it
+    /// still has counts what it told, for the listing, once a note, by its
+    /// request: sent again, it counts no more.
+    fn count(&mut self, key: &[String], heard: &[(String, u64)], steered: &[&str]) {
+        let now = epoch_ms() as u64;
+        let request = format!("lookout-{}", digest(&key.join(",")));
+        for (name, n) in heard {
+            let Some(of) = self.of(name) else {
+                continue;
+            };
+            let steered = steered.contains(&name.as_str());
+            self.counts.told(name, &of, &request, *n, steered, now);
+            self.counts_dirty = true;
+        }
+    }
+
+    /// What a note telling these subscriptions' news charges: each that
+    /// lasts so many, by its `Sub::counter`.
+    fn charges<'a>(&self, names: impl Iterator<Item = &'a String>) -> Vec<String> {
+        let mut charges: Vec<String> = Vec::new();
+        for name in names {
+            let Some(sub) = self
+                .subs
+                .iter()
+                .find(|sub| &sub.name == name && sub.runs.is_some())
+            else {
+                continue;
+            };
+            let counter = sub.counter();
+            if !charges.contains(&counter) {
+                charges.push(counter);
+            }
+        }
+        charges
+    }
+
+    /// The note on `path` (0 tasks', 1 sources') landed, under `key`:
+    /// each subscription it charged that lasts so many notes has one fewer
+    /// to go, once however often that note is sent, and one with none left
+    /// ends, as an automation does after its `--runs`.
+    fn spend(&mut self, path: usize, key: &[String]) {
+        let request = format!("lookout-{}", digest(&key.join(",")));
+        let mut spent = false;
+        for counter in std::mem::take(&mut self.charged[path]) {
+            let Some(sub) = self.subs.iter().find(|sub| sub.counter() == counter) else {
+                continue;
+            };
+            let (Some(runs), sub) = (sub.runs, sub.clone()) else {
+                continue;
+            };
+            let told = self.runs_told.entry(counter.clone()).or_default();
+            if told.contains(&request) {
+                continue;
+            }
+            spent = true;
+            told.push(request.clone());
+            if told.len() as u64 >= runs {
+                self.runs_told.remove(&counter);
+                if !self.ended.contains(&sub) {
+                    self.ended.push(sub);
+                }
+            }
+        }
+        if spent {
+            self.keep();
         }
     }
 
@@ -3220,6 +3250,7 @@ impl Lookout {
             && sending.is_empty()
             && self.told_sources.is_empty()
             && told_subs.is_empty()
+            && self.runs_told.is_empty()
         {
             return Some((path, None));
         }
@@ -3239,6 +3270,9 @@ impl Lookout {
         if !told_subs.is_empty() {
             body["told_subs"] = json!(at_ms(told_subs));
         }
+        if !self.runs_told.is_empty() {
+            body["runs_told"] = json!(self.runs_told);
+        }
         if unkept.count > 0 {
             body["unkept"] = unkept.to_json();
         }
@@ -3255,12 +3289,21 @@ impl Lookout {
         {
             held::write(path, body);
         }
+        if std::mem::take(&mut self.counts_dirty)
+            && let Some(path) = &self.counts_file
+        {
+            let body = (!self.counts.is_empty()).then(|| self.counts.to_json().to_string());
+            held::write(path.clone(), body.map(String::into_bytes));
+        }
     }
 
     /// The subscriber is gone or subscribed to nothing: what waited for it
     /// is no one's.
     fn unheld(&self) {
         if let Some(path) = &self.held {
+            held::write(path.clone(), None);
+        }
+        if let Some(path) = &self.counts_file {
             held::write(path.clone(), None);
         }
     }
@@ -3289,6 +3332,14 @@ impl Lookout {
         };
         self.told_sources.extend(read("told"));
         self.updates.told_subs.extend(read("told_subs"));
+        self.runs_told
+            .extend(
+                (kept["runs_told"].as_object().into_iter().flatten()).map(|(sub, told)| {
+                    let told = (told.as_array().into_iter().flatten())
+                        .filter_map(|request| request.as_str().map(str::to_owned));
+                    (sub.clone(), told.collect())
+                }),
+            );
         let heard = |key: &str| -> Vec<sources::Heard> {
             (kept[key].as_array().into_iter().flatten())
                 .filter_map(sources::Event::from_json)
@@ -3381,7 +3432,7 @@ impl Lookout {
         if self.updates.waited(now, since) {
             self.ask(client, woken, now);
         }
-        if self.sourcing.is_some() {
+        if self.sourcing.is_some() || self.last_runs_out(false) || self.overdue() {
             return;
         }
         if self.refused(now) {
@@ -3444,7 +3495,7 @@ impl Lookout {
             .collect();
         let request_id = format!("lookout-{}", digest(&key.join(",")));
         let delivery = "steer";
-        let prompt = crate::stamp::now(&prompt);
+        let prompt = crate::stamp::now(&prompt, &self.lead);
         let asked = json!({"bot": self.lead, "bot_id": self.updates.lead_id(), "prompt": prompt,
             "request_id": request_id, "delivery": delivery, "origin": sources::ORIGIN});
         self.heard_since = None;
@@ -3458,6 +3509,7 @@ impl Lookout {
         }
         self.updates.fly(&subs);
         self.sourced_subs = subs;
+        self.charged[1] = self.charges(sent.iter().flat_map(|heard| &heard.subs));
         self.sourcing = Some((sent, key, delivery));
         self.keep();
         self.send(client, woken, asked, Answer::Sourced);
@@ -3571,6 +3623,16 @@ mod held {
         });
         told.recv().unwrap_or(false)
     }
+}
+
+/// The subscriptions of `had` that `now` no longer holds, by name: one
+/// put in another's place under its name ends the one before, so what
+/// that heard is not the new one's to tell.
+fn gone(had: &[subs::Sub], now: &[subs::Sub]) -> Vec<String> {
+    (had.iter())
+        .filter(|had| !now.contains(had))
+        .map(|had| had.name.clone())
+        .collect()
 }
 
 fn epoch_ms() -> u128 {
@@ -3757,6 +3819,9 @@ mod tests {
             digest: None,
             steer: None,
             owner: None,
+            until: None,
+            runs: None,
+            made: None,
         }
     }
 
@@ -3984,6 +4049,145 @@ mod tests {
     }
 
     #[test]
+    fn each_subscription_counts_what_its_notes_told_and_the_listing_says_it() {
+        let dir = std::env::temp_dir().join(format!("sonny-counts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        // Task news no rule gates counts for the subscriptions watching it.
+        let mut lookout = seated("idle");
+        lookout.counts_file = Some(subs::counts_file(&store, "calc.lead"));
+        assert_eq!(&*lookout.updates.hearers["calc.fix"], ["tasks".to_owned()]);
+        ended(&mut lookout, 4, "completed");
+        let told = lookout.updates.take_at(Instant::now());
+        assert_eq!(told.heard, [("tasks".to_owned(), 1)]);
+        lookout.sending = Some((told, vec!["k".into()], "steer"));
+        lookout.answered(Answer::Noted(Ok(())));
+        // Sources' events count for each subscription that heard them, and
+        // a steer the source marked steers for each.
+        lookout.subs.push(hears("chat"));
+        let sent = vec![
+            sources::Heard {
+                event: slack("one", false),
+                subs: vec!["chat".into()],
+            },
+            sources::Heard {
+                event: slack("prod is down", true),
+                subs: vec!["chat".into()],
+            },
+        ];
+        lookout.sourcing = Some((sent, vec!["k".into()], "steer"));
+        lookout.answered(Answer::Sourced(Ok(())));
+        lookout.flush();
+        held::written();
+        let now = epoch_ms() as u64;
+        let counts = subs::counts(&store, "calc.lead");
+        let tasks = counts
+            .of("tasks", &lookout.of("tasks").unwrap_or_default(), now)
+            .unwrap();
+        assert_eq!(
+            (&tasks["heard"], &tasks["notes"], &tasks["steers"]),
+            (&json!(1), &json!(1), &json!(0))
+        );
+        let chat = counts
+            .of("chat", &lookout.of("chat").unwrap_or_default(), now)
+            .unwrap();
+        assert_eq!(
+            (&chat["heard"], &chat["notes"], &chat["steers"]),
+            (&json!(2), &json!(1), &json!(1))
+        );
+        // A day on, what it told then is no longer counted.
+        let day = 24 * 60 * 60 * 1000;
+        assert_eq!(
+            counts
+                .of("chat", &lookout.of("chat").unwrap_or_default(), now + day)
+                .unwrap()["notes"],
+            0
+        );
+        // One put in its own place under its name takes its counts along,
+        // as one removed does, and the file says so; the rest keep theirs.
+        let mut other = hears("chat");
+        other.sources = vec!["mail".into()];
+        let subs: Vec<subs::Sub> = (lookout.subs.iter())
+            .filter(|sub| sub.name != "chat")
+            .cloned()
+            .chain([other])
+            .collect();
+        // Put in its place while the lookout was stopped, the same.
+        let mut again = seated("idle");
+        again.subs = subs.clone();
+        again.counts = subs::counts(&store, "calc.lead");
+        again.counting();
+        assert!(
+            again
+                .counts
+                .of("chat", &again.of("chat").unwrap(), now)
+                .is_none()
+        );
+        assert!(
+            again
+                .counts
+                .of("tasks", &again.of("tasks").unwrap(), now)
+                .is_some()
+        );
+        lookout.resubscribed(subs);
+        lookout.flush();
+        held::written();
+        let counts = subs::counts(&store, "calc.lead");
+        assert!(
+            counts
+                .of("chat", &lookout.of("chat").unwrap_or_default(), now)
+                .is_none()
+        );
+        assert!(
+            counts
+                .of("tasks", &lookout.of("tasks").unwrap_or_default(), now)
+                .is_some()
+        );
+        lookout.resubscribed(Vec::new());
+        lookout.flush();
+        held::written();
+        assert!(subs::counts(&store, "calc.lead").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_subscription_whose_steer_matched_counts_it_and_a_note_counts_once() {
+        let mut lookout = seated("idle");
+        let down = Some(json!({"text": ["prod is down"]}));
+        let (mut chat, mut eng) = (hears("chat"), hears("eng"));
+        (chat.steer, eng.steer) = (down.clone(), down);
+        lookout.subs = vec![chat, eng];
+        // Its first steer only says why it cut in.
+        let mut event = slack("prod is down", true);
+        event.steer_by = Some("chat".into());
+        let sent = vec![sources::Heard {
+            event,
+            subs: vec!["chat".into(), "eng".into()],
+        }];
+        lookout.sourcing = Some((sent.clone(), vec!["k".into()], "steer"));
+        lookout.answered(Answer::Sourced(Ok(())));
+        let now = epoch_ms() as u64;
+        for name in ["chat", "eng"] {
+            let count = lookout
+                .counts
+                .of(name, &lookout.of(name).unwrap(), now)
+                .unwrap();
+            assert_eq!((&count["notes"], &count["steers"]), (&json!(1), &json!(1)));
+        }
+        // The same note again, its answer lost the first time, counts once.
+        lookout.sourcing = Some((sent, vec!["k".into()], "steer"));
+        lookout.answered(Answer::Sourced(Err("idempotency_conflict".into())));
+        assert_eq!(
+            lookout
+                .counts
+                .of("chat", &lookout.of("chat").unwrap_or_default(), now)
+                .unwrap()["notes"],
+            1
+        );
+    }
+
+    #[test]
     fn what_a_subscription_marks_urgent_cuts_in_and_says_why() {
         let mut lookout = seated("running");
         lookout.subs[0].steer = Some(json!({"status": ["failed"]}));
@@ -4132,6 +4336,30 @@ mod tests {
         let told = lookout.updates.take();
         assert!(told.items.iter().all(|l| !l.text.contains("failed")));
         assert_eq!(lookout.updates.urgent(), Some("tasks"));
+    }
+
+    #[test]
+    fn news_only_an_ended_subscription_heard_goes_with_it() {
+        let mut lookout = seated("idle");
+        lookout.subs[0].digest = Some("1h".into());
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        let now = Instant::now();
+        ended(&mut lookout, 4, "completed");
+        let told = lookout.updates.take_at(now);
+        lookout.updates.sent(told);
+        // Held by the digest, then the subscription ends: no note tells it.
+        ended(&mut lookout, 5, "completed");
+        assert!(lookout.updates.news());
+        lookout.updates.ended(&["other".into()]);
+        assert!(lookout.updates.news(), "another's end leaves it");
+        // Put in its own place under its name, it ended all the same.
+        let mut again = lookout.subs[0].clone();
+        assert!(gone(&lookout.subs, &[again.clone()]).is_empty());
+        again.made = Some(1);
+        assert_eq!(gone(&lookout.subs, &[again]), ["tasks"]);
+        lookout.updates.ended(&["tasks".into()]);
+        assert!(!lookout.updates.news());
     }
 
     #[test]
@@ -4767,7 +4995,7 @@ mod tests {
             (json!({"type": ["turn.ended"], "status": ["failed"]}), false),
             (json!({"type": ["turn.ended"], "by": ["you"]}), false),
             (json!({"type": ["turn.ended"], "by": ["person"]}), true),
-            (json!({"type": ["turn.ended"], "resolved": [false]}), false),
+            (json!({"type": ["turn.ended"], "done": [false]}), false),
         ] {
             let mut lookout = seated("idle");
             lookout.subs[0].filter = Some(filter);
@@ -4887,7 +5115,6 @@ mod tests {
                     .map(|r| (r["name"].as_str().unwrap().to_owned(), r.clone()))
                     .collect(),
             ),
-            working: HashMap::new(),
             subscribers: HashMap::new(),
             read_at: HashMap::new(),
             registry: Arc::default(),
@@ -4904,118 +5131,12 @@ mod tests {
             in_flight: HashMap::new(),
             telling: HashMap::new(),
             bouncing: HashMap::new(),
-            reacting: HashMap::new(),
-            taken: HashMap::new(),
             watchers: HashMap::new(),
             started: false,
             rewriting: HashSet::new(),
-            goals: goals::Goals::new(Path::new("/nonexistent"), Path::new("")),
             fires: HashMap::new(),
             senders: HashMap::new(),
         }
-    }
-
-    #[test]
-    fn a_lead_s_reaction_in_a_task_lands_once_its_own_call_ends_well_as_news() {
-        let record = |name: &str, id: i64, by: Option<&str>| json!({"name": name, "bot_id": id, "created_by": by});
-        let mut service = service(
-            PathBuf::new(),
-            &[
-                record("calc.lead", 1, None),
-                record("calc.speed", 2, Some("calc.lead")),
-                record("ws.lead", 3, None),
-                record("ws.fix", 4, Some("ws.lead")),
-                record("ws.web.lead", 5, None),
-                record("ws.web.fix", 6, Some("ws.web.lead")),
-            ],
-        );
-        let started = |bot: &str, arguments: Value| {
-            json!({"event": "tool_started", "bot": bot, "turn": 3, "data": {"call_id": "c1",
-                "name": crate::reactions::TOOL, "arguments": arguments.to_string()}})
-        };
-        let ended = |bot: &str, failed: bool| {
-            json!({"event": "tool_completed", "bot": bot, "turn": 3,
-                "data": {"call_id": "c1", "failed": failed}})
-        };
-        let eyes = json!({"emoji": "👀", "bot": "calc.speed"});
-        let took = |node: i64| json!({"event": "accepted", "bot": "calc.speed", "turn": 2, "data": {"node": node}});
-        service.reacted(&took(9), true);
-        // Another bot's call of the same id leaves the lead's waiting.
-        assert!(
-            service
-                .reacted(&started("calc.lead", eyes.clone()), true)
-                .is_none()
-        );
-        // What the person wrote there after the lead reacted is not what it
-        // reacted to.
-        service.reacted(&took(12), true);
-        assert!(service.reacted(&ended("calc.speed", false), true).is_none());
-        assert_eq!(
-            service.reacted(&ended("calc.lead", false), true),
-            Some((
-                "calc.lead".into(),
-                "calc.speed".into(),
-                2,
-                "👀".into(),
-                false,
-                Some(9)
-            ))
-        );
-        // A refused call, or one that ended before the lookout last watched.
-        service.reacted(&started("calc.lead", eyes.clone()), true);
-        assert!(service.reacted(&ended("calc.lead", true), true).is_none());
-        service.reacted(&started("calc.lead", eyes), false);
-        assert!(service.reacted(&ended("calc.lead", false), false).is_none());
-        // Not on itself, nor outside its project.
-        service.reacted(
-            &started("calc.lead", json!({"emoji": "👀", "bot": "calc.lead"})),
-            true,
-        );
-        assert!(service.reacted(&ended("calc.lead", false), true).is_none());
-        // A project inside another is a project of its own.
-        let across = |by: &str, bot: &str, service: &mut Service| {
-            service.reacted(&started(by, json!({"emoji": "👀", "bot": bot})), true);
-            service
-                .reacted(&ended(by, false), true)
-                .map(|landed| landed.2)
-        };
-        assert_eq!(across("ws.web.lead", "ws.fix", &mut service), None);
-        assert_eq!(across("ws.lead", "ws.web.fix", &mut service), None);
-        assert_eq!(across("ws.web.lead", "ws.web.fix", &mut service), Some(6));
-        assert_eq!(across("ws.lead", "ws.fix", &mut service), Some(4));
-        assert!(service.reacting.is_empty());
-    }
-
-    #[test]
-    fn a_lead_s_reaction_lands_on_words_the_person_wrote() {
-        let said = |item: Value, extra: Value| {
-            let mut entry = json!({"node": 7, "item": item});
-            entry
-                .as_object_mut()
-                .unwrap()
-                .extend(extra.as_object().unwrap().clone());
-            said_by_person(&entry)
-        };
-        let words =
-            json!({"role": "user", "content": [{"type": "input_text", "text": "add color"}]});
-        assert_eq!(said(words.clone(), json!({})), Some(7));
-        // An Anthropic tool result is a user message with no words of theirs.
-        let result = json!({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]});
-        assert_eq!(said(result, json!({})), None);
-        // Another agent's prompt, or a client's, is not the person's.
-        assert_eq!(
-            said(words.clone(), json!({"from": {"bot": "calc.lead"}})),
-            None
-        );
-        assert_eq!(said(words, json!({"origin": "lookout"})), None);
-        assert_eq!(
-            said(
-                json!({"role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}),
-                json!({})
-            ),
-            None
-        );
     }
 
     #[test]
@@ -5235,6 +5356,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_subscription_steer_counts_though_its_note_joins_no_turn() {
+        let (client, _got) = submits().await;
+        let mut lookout = seated("idle");
+        (lookout.updates).seat(&json!({"name": "calc.docs", "bot_id": 3, "status": "idle",
+            "created_by": "calc.lead", "created_by_id": 1}));
+        for bot in ["calc.fix", "calc.docs"] {
+            lookout.globbed.insert(bot.to_owned());
+        }
+        let failed = Some(json!({"status": ["failed"]}));
+        let mut fixes = sub("fixes", &[], &["calc.fix"]);
+        fixes.steer = failed.clone();
+        let mut docs = sub("docs", &[], &["calc.docs"]);
+        docs.steer = failed;
+        lookout.subs = vec![fixes, docs.clone()];
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        for bot in ["calc.fix", "calc.docs"] {
+            let ask = json!({"from": {"bot": "calc.lead"}});
+            lookout.event(&ev(bot, 5, "accepted", ask));
+            lookout.event(&ev(bot, 5, "turn_finished", json!({"status": "failed"})));
+        }
+        let (woken, _woke) = tokio::sync::mpsc::channel(4);
+        lookout.wake(&client, &woken);
+        let (told, ..) = lookout.sending.as_ref().unwrap();
+        let mut steered = told.steered();
+        steered.sort_unstable();
+        assert_eq!(steered, ["docs", "fixes"]);
+        // One put in another's place while the note is under way counts
+        // nothing of it once it lands.
+        docs.steer = None;
+        let fixes = lookout.subs[0].clone();
+        lookout.resubscribed(vec![fixes, docs]);
+        lookout.answered(Answer::Noted(Ok(())));
+        let now = epoch_ms() as u64;
+        assert_eq!(
+            lookout
+                .counts
+                .of("fixes", &lookout.of("fixes").unwrap_or_default(), now)
+                .unwrap()["steers"],
+            1
+        );
+        assert!(
+            lookout
+                .counts
+                .of("docs", &lookout.of("docs").unwrap_or_default(), now)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn a_note_goes_beside_the_stream_and_one_lost_with_the_connection_is_news_again() {
         let (client, mut got) = submits().await;
         let mut lookout = seated("idle");
@@ -5299,12 +5470,12 @@ mod tests {
         };
         assert!(!service.rewrote(&started("subscriptions", "a")));
         assert!(!service.rewrote(&started("memory", "b")));
-        assert!(!service.rewrote(&event("tool_started", "c", json!({"name": "goal"}))));
+        assert!(!service.rewrote(&event("tool_started", "c", json!({"name": "memory"}))));
         assert!(!service.rewrote(&event("tool_completed", "b", json!({}))));
         assert!(service.rewrote(&event("tool_completed", "a", json!({}))));
         assert!(!service.rewrote(&event("tool_completed", "a", json!({}))));
         // A turn that ends forgets a call it never ended.
-        assert!(!service.rewrote(&started("goal", "d")));
+        assert!(!service.rewrote(&started("subscriptions", "d")));
         assert!(!service.rewrote(&event("turn_finished", "", json!({}))));
         assert!(service.rewriting.is_empty());
         // Posting in the commons subscribes the poster.
@@ -5337,10 +5508,12 @@ mod tests {
         service.in_flight.insert(("calc.fix".into(), 7), 40);
         service.in_flight.insert(("calc.docs".into(), 9), 60);
         service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(90), Some(39)));
         // Nothing under way: it starts again where its news ended.
         service.in_flight.clear();
         service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(90), Some(90)));
         // A failed fire whose note is under way is told again from its
         // start: its end is news and its start names its trigger.
@@ -5351,10 +5524,12 @@ mod tests {
         };
         service.telling.insert(("calc.fix".into(), 7), telling);
         service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(49), Some(29)));
         // The daemon took it: nothing holds the stream.
         service.telling.clear();
         service.save_cursor();
+        held::written();
         assert_eq!(marks(&store), (Some(90), Some(90)));
         std::fs::write(cursor_path(&store), "12").unwrap();
         assert_eq!(marks(&store), (Some(12), Some(12)));
@@ -5592,6 +5767,7 @@ mod tests {
             digest: None,
             steer: None,
             watch: Vec::new(),
+            icon: None,
         };
         let down = sources::Event::of_lookout(&source, "down", "down".into(), json!({}));
         // A topic of it, and a filter the notice never matches, hear it.
@@ -5784,6 +5960,174 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_subscription_that_lasts_so_many_notes_ends_after_them_across_a_restart() {
+        let dir = std::env::temp_dir().join(format!("sonny-runs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("calc.lead.json");
+        let made = || {
+            let mut lookout = lookout();
+            let mut twice = hears("twice");
+            twice.runs = Some(2);
+            twice.made = Some(7);
+            lookout.subs.push(twice);
+            lookout.subs.push(hears("always"));
+            (lookout.updates).seat(&json!({"name": "calc.lead", "bot_id": 1, "status": "idle"}));
+            lookout.restore(path.clone());
+            lookout.counting();
+            lookout
+        };
+        let names =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+        let key = |k: &str| vec![k.to_owned()];
+        let mut lookout = made();
+        // One that lasts is never charged; one note told is one spent.
+        lookout.charged[1] = lookout.charges(names(&["always", "twice"]).iter());
+        assert_eq!(lookout.charged[1], ["twice@7"]);
+        lookout.spend(1, &key("a"));
+        assert_eq!(lookout.runs_told["twice@7"].len(), 1);
+        assert!(lookout.ended.is_empty());
+        lookout.flush();
+        held::written();
+        // Watched again, it has one note to go. The same note sent again
+        // after the restart is that one note, not another.
+        let mut again = made();
+        assert_eq!(again.runs_told["twice@7"].len(), 1);
+        again.charged[0] = again.charges(names(&["twice"]).iter());
+        again.spend(0, &key("a"));
+        assert!(again.ended.is_empty());
+        again.charged[0] = again.charges(names(&["twice"]).iter());
+        again.spend(0, &key("b"));
+        assert_eq!(again.ended[0].name, "twice");
+        assert!(again.runs_told.is_empty());
+        // Its last note under way on one path holds the other back, so a
+        // one-shot is told once; one with notes to spare holds nothing.
+        again.ended.clear();
+        let told = updates::Told::default();
+        again.charged[0] = again.charges(names(&["twice"]).iter());
+        again.sending = Some((told, Vec::new(), "steer"));
+        assert!(!again.last_runs_out(false), "two to go");
+        again
+            .runs_told
+            .insert("twice@7".into(), vec!["lookout-a".into()]);
+        assert!(again.last_runs_out(false));
+        assert!(!again.last_runs_out(true), "nothing under way for sources");
+        again.sending = None;
+        assert!(!again.last_runs_out(false), "nothing under way for tasks");
+        // One whose `until` came before the files are read again holds
+        // every note back until the service ends it.
+        assert!(!again.overdue());
+        let mut late = hears("late");
+        late.until = Some("2020-01-01 00:00".into());
+        again.subs.push(late);
+        assert!(again.overdue());
+        assert_eq!(again.over[0].name, "late");
+        // Replaced while its note is on the way, even in one call, the new
+        // one is not charged for it and counts afresh.
+        again.charged[1] = again.charges(names(&["twice"]).iter());
+        let twice = again
+            .subs
+            .iter_mut()
+            .find(|sub| sub.name == "twice")
+            .unwrap();
+        twice.made = Some(8);
+        again.counting();
+        assert!(again.runs_told.is_empty());
+        again.spend(1, &key("c"));
+        assert!(again.runs_told.is_empty() && again.ended.is_empty());
+        again
+            .runs_told
+            .insert("twice@8".into(), vec!["lookout-d".into()]);
+        again.subs.retain(|sub| sub.name != "twice");
+        again.counting();
+        assert!(again.runs_told.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deleted_bot_ends_its_subscriptions_and_those_that_watched_only_it() {
+        let dir = std::env::temp_dir().join(format!("sonny-ended-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let add = |subscriber: &str, owner: i64, sub: Value| {
+            subs::change(
+                &store,
+                subscriber,
+                Some(owner),
+                Some(&sub),
+                None,
+                &["ci".into()],
+            )
+            .unwrap();
+        };
+        add(
+            "shop.fix",
+            2,
+            json!({"name": "mine", "bots": ["shop.lead"]}),
+        );
+        add(
+            "shop.lead",
+            1,
+            json!({"name": "fix", "tasks_of": ["shop.fix"]}),
+        );
+        add(
+            "shop.lead",
+            1,
+            json!({"name": "both", "bots": ["shop.fix", "shop.docs"]}),
+        );
+        add("shop.lead", 1, json!({"name": "glob", "bots": ["shop.*"]}));
+        add(
+            "shop.lead",
+            1,
+            json!({"name": "ci", "bots": ["shop.fix"], "sources": ["ci"]}),
+        );
+        let lead = json!({"name": "shop.lead", "bot_id": 1});
+        let docs = json!({"name": "shop.docs", "bot_id": 3});
+        let mut service = service(store.clone(), &[lead, docs]);
+        service.subscribers = subs::all(&store).into_iter().collect();
+        assert!(service.ended_with("shop.fix", Some(2)));
+        assert!(subs::read(&store, "shop.fix").is_empty());
+        let names = |store: &Path| -> Vec<String> {
+            subs::read(store, "shop.lead")
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        };
+        // One bot of two still there, a glob, a source, or the tasks a
+        // maker made, which outlive it, keeps it.
+        assert_eq!(names(&store), ["fix", "both", "glob", "ci"]);
+        service.records.remove("shop.docs");
+        service.subscribers = subs::all(&store).into_iter().collect();
+        assert!(service.ended_with("shop.docs", Some(3)));
+        assert_eq!(names(&store), ["fix", "glob", "ci"]);
+        // Nothing left that it ends: the files are not read again for it.
+        service.subscribers = subs::all(&store).into_iter().collect();
+        assert!(!service.ended_with("shop.docs", Some(3)));
+        // A delete the lookout was away for: a subscriber no longer listed
+        // ends whole, and one still listed keeps what its bot holds.
+        add(
+            "shop.gone",
+            4,
+            json!({"name": "old", "bots": ["shop.lead"]}),
+        );
+        service.subscribers = subs::all(&store).into_iter().collect();
+        let after = std::time::SystemTime::now() + Duration::from_secs(5);
+        assert!(service.unheld(after));
+        assert!(subs::read(&store, "shop.gone").is_empty());
+        assert_eq!(names(&store), ["fix", "glob", "ci"]);
+        service.subscribers = subs::all(&store).into_iter().collect();
+        assert!(!service.unheld(after), "nothing more");
+        // A file written since the listing is left: a bot made since may
+        // have written it.
+        add("shop.new", 5, json!({"name": "new", "bots": ["shop.lead"]}));
+        service.subscribers = subs::all(&store).into_iter().collect();
+        let before = std::time::SystemTime::now() - Duration::from_secs(5);
+        assert!(!service.unheld(before));
+        assert_eq!(subs::read(&store, "shop.new").len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn a_digest_tells_its_source_at_most_once_a_while() {
         let (client, mut got) = submits().await;
@@ -5900,76 +6244,6 @@ mod tests {
             }
         });
         (Client::connect(&socket).await.unwrap().0, got)
-    }
-
-    /// A daemon that greets and answers each request with `answer`.
-    async fn answering(answer: Value) -> Arc<Client> {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "lookout-answering-{}-{}",
-            std::process::id(),
-            STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("agent.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
-            let mut lines = BufReader::new(read).lines();
-            write
-                .write_all(format!("{ready}\n").as_bytes())
-                .await
-                .unwrap();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let asked: Value = serde_json::from_str(&line).unwrap();
-                let mut answer = answer.clone();
-                answer["id"] = asked["id"].clone();
-                write
-                    .write_all(format!("{answer}\n").as_bytes())
-                    .await
-                    .unwrap();
-            }
-        });
-        Client::connect(&socket).await.unwrap().0
-    }
-
-    #[tokio::test]
-    async fn a_folder_a_bot_may_write_once_its_sandbox_changes_is_housed() {
-        let dir = std::env::temp_dir().join(format!("lookout-configured-{}", std::process::id()));
-        let (workspace, added) = (dir.join("work"), dir.join("added"));
-        for at in [&workspace, &added] {
-            std::fs::create_dir_all(at).unwrap();
-        }
-        let record = json!({"name": "c.wide", "bot_id": 3, "workspace": workspace});
-        let mut service = service(PathBuf::new(), std::slice::from_ref(&record));
-        crate::snapshot::housed("c.wide", Some(&crate::snapshot::writable(&record)));
-        let inside = added.join("store.snapshot-indexes");
-        // Held, if at all, by the folder every sandbox may write.
-        let by_added = || crate::snapshot::housing(&inside) == std::fs::canonicalize(&added).ok();
-        assert!(!by_added());
-        let changed = |what: &str| json!({"event": "configured", "bot": "c.wide", "bot_id": 3, "changed": [what]});
-        let settings = json!({"result": {"settings": {"writable": [added]}}});
-        let client = answering(settings).await;
-        // Another change leaves what it may write as it was.
-        service.configured(&client, &changed("model")).await;
-        assert!(!by_added());
-        service.configured(&client, &changed("sandbox")).await;
-        assert!(by_added());
-        // Unread, it may write anything.
-        let elsewhere = Path::new("/nonexistent/lookout-configured");
-        let refused = answering(json!({"error": "bot_not_found"})).await;
-        service.configured(&refused, &changed("sandbox")).await;
-        assert_eq!(
-            crate::snapshot::housing(elsewhere),
-            Some(PathBuf::from("/"))
-        );
-        crate::snapshot::housed("c.wide", None);
-        assert_eq!(crate::snapshot::housing(elsewhere), None);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// `wake_sources`, and what the daemon answered it, if it sent.
@@ -6231,6 +6505,7 @@ mod tests {
             digest: None,
             steer: None,
             watch: Vec::new(),
+            icon: None,
         }
     }
 

@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --quiet-background --hold --unix-socket --outputs",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --hide-senders --quiet-background --hold --unix-socket --outputs",
         startup: true,
     },
     Command {
@@ -218,9 +218,9 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "sandbox",
-        about: "Run a command in a sandbox: read-only, or writing only the folders named",
-        usage: "sandbox [--writable PATH]... -- COMMAND [ARGS...]",
-        flags: "--writable",
+        about: "Run a command in a sandbox: read-only, writing only the folders named, or as one of a bot's commands",
+        usage: "sandbox [--writable PATH]... [--bot NAME [--bot-id ID]] -- COMMAND [ARGS...]",
+        flags: "--writable --bot --bot-id",
         settings: "",
         startup: false,
     },
@@ -410,13 +410,9 @@ fn print_flags(flags: &str) {
                 "DURATION",
                 "Retry a provider stream with no content this long; default 10m",
             ),
-            "--keep-warm" => (
-                "DURATION",
-                "A new bot refreshes its idle Anthropic prompt cache during a tool call after this long; default 4m, 0 disables",
-            ),
             "--cache-ttl" => (
                 "5m|1h",
-                "A new bot's Anthropic prompt-cache lifetime; 1h bills writes at 2x input and sends no refresh; default 5m",
+                "A new bot's Anthropic prompt-cache lifetime; 1h bills writes at 2x input; default 5m",
             ),
             "--speed" => (
                 "standard|fast|ultrafast",
@@ -614,7 +610,6 @@ const DURATIONS: &[(&str, u64, u64, bool, &str)] = &[
         true,
         "in whole seconds; 0 disables",
     ),
-    ("--keep-warm", 0, 299_000, true, "below 5m; 0 disables"),
 ];
 
 /// A duration flag's value in milliseconds: digits and a unit (`ms`, `s`,
@@ -914,8 +909,8 @@ mod tests {
         ] {
             assert_eq!(ms(refused), None, "{refused}");
         }
-        assert_eq!(duration_secs("--keep-warm", "4m").ok(), Some(240));
-        assert!(duration_secs("--keep-warm", "1500ms").is_err());
+        assert_eq!(duration_secs("--idle-exit", "4m").ok(), Some(240));
+        assert!(duration_secs("--idle-exit", "1500ms").is_err());
     }
 
     #[test]
@@ -959,7 +954,14 @@ mod tests {
         );
         assert!(prepare(words(&["sandbox", "--writable", "/a"])).is_err());
         assert!(prepare(words(&["sandbox", "--"])).is_err());
-        assert!(prepare(words(&["sandbox", "--bot", "x", "--", "ls"])).is_err());
+        assert!(prepare(words(&["sandbox", "--bot", "x", "--", "ls"])).is_ok());
+        assert!(
+            prepare(words(&[
+                "sandbox", "--bot", "x", "--bot-id", "3", "--", "ls"
+            ]))
+            .is_ok()
+        );
+        assert!(prepare(words(&["sandbox", "--model", "m", "--", "ls"])).is_err());
         // With the network off, it reaches no socket, the daemon's least.
         assert!(prepare(words(&["sandbox", "--network", "--", "ls"])).is_err());
     }

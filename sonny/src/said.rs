@@ -86,7 +86,7 @@ pub async fn said(
                 }
                 let project = turns.get(&turn).and_then(|t| t.project.clone());
                 let written = entry["written_ms"].as_i64();
-                let later = match crate::lookout::said_by_person(entry) {
+                let later = match crate::reactions::said_by_person(entry) {
                     Some(node) => {
                         let text = cut(crate::text(&entry["item"]));
                         let message =

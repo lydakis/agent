@@ -1,14 +1,18 @@
 //! `/status`: the project's agents on one card, read from the daemon and
 //! Rex with no model call. The lead comes first; its tasks follow grouped
 //! by where they stand, as a thread list is: what needs the person, what
-//! works, what waits for review, what sits idle, and, folded away, what the
-//! lead marked resolved. Each row says what the agent is doing, for how
-//! long, on which model and profile, its latest step, where it is in Rex, and what
-//! runs for it in the background.
+//! works, what sits idle, and, folded away, what is marked done. Each row
+//! is one line: what the agent is doing and for how long, and at the right
+//! what it follows, its code reviews, what runs for it in the background
+//! and where its window is. The picked one says its model, profile and
+//! latest step, and one that needs the person what for. A task's own
+//! helpers fold under it.
 use ratatui::{
     style::{Color, Stylize},
     text::{Line, Span},
 };
+use std::collections::HashMap;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Default)]
 pub struct Row {
@@ -35,6 +39,10 @@ pub struct Row {
     /// What runs for it with no one typing, as `/background` counts it:
     /// `↻ 2 triggers`, or empty.
     pub background: String,
+    /// The icons of the sources it follows, `[sonny.sources.NAME] icon`.
+    pub follows: String,
+    /// The agent that made it, when one did.
+    pub maker: String,
     pub group: Group,
 }
 
@@ -45,48 +53,63 @@ pub enum Group {
     NeedsYou,
     /// A turn running, queued, rate limited, or waiting on other tasks.
     Working,
-    /// Finished with a pull request for someone to review.
-    Review,
-    /// Finished, stopped, or never started, with nothing open.
+    /// Its turn ended, stopped, or never started, with nothing open; a
+    /// pull request it opened shows on its row.
     #[default]
+    Idle,
+    /// Marked done, by itself, its lead or the person: nothing left to do,
+    /// until new work reopens it.
     Done,
-    /// Marked resolved: nothing left to do, until new work reopens it.
-    Resolved,
 }
 
 impl Group {
+    /// The group as a word for scripts: `needs_you`, `working`, `idle`,
+    /// `done`.
+    pub fn key(self) -> &'static str {
+        match self {
+            Group::NeedsYou => "needs_you",
+            Group::Working => "working",
+            Group::Idle => "idle",
+            Group::Done => "done",
+        }
+    }
+
     fn heading(self) -> &'static str {
         match self {
             Group::NeedsYou => "Needs you",
             Group::Working => "Working",
-            Group::Review => "Ready for review",
+            Group::Idle => "Idle",
             Group::Done => "Done",
-            Group::Resolved => "Resolved",
         }
     }
 }
 
 /// Where a task stands: `state` as `/status` names it, whether a turn
-/// runs, whether it has a question open for the person or a pull request
-/// in its last reply, and whether it is marked resolved, which only a
-/// task with no turn running can be.
-pub fn group(state: &str, running: bool, asking: bool, pr: bool, resolved: bool) -> Group {
+/// runs, whether it has a question open for the person, and whether it is
+/// marked done, which only a task with no turn running can be.
+pub fn group(state: &str, running: bool, asking: bool, done: bool) -> Group {
     match state {
-        _ if resolved && !running => Group::Resolved,
+        _ if done && !running => Group::Done,
         "needs you" | "failed" => Group::NeedsYou,
         // Held on a cause the person can fix: theirs to set right.
         _ if state.starts_with(HELD) => Group::NeedsYou,
         _ if asking => Group::NeedsYou,
         _ if running => Group::Working,
-        "done" | crate::started::CHECKED if pr => Group::Review,
-        _ => Group::Done,
+        _ => Group::Idle,
     }
 }
 
 /// The pull request `text` links last, as `owner/repo#N`: a GitHub pull
 /// or a GitLab merge request.
 pub fn pull_request(text: &str) -> Option<String> {
-    text.split(|c: char| c.is_whitespace() || "()<>[]\"'`".contains(c))
+    pull_requests(text).pop()
+}
+
+/// Every pull request `text` links, in its order, each once at its last.
+pub fn pull_requests(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for pr in text
+        .split(|c: char| c.is_whitespace() || "()<>[]\"'`".contains(c))
         .filter_map(|word| {
             let rest = word
                 .strip_prefix("https://")
@@ -101,16 +124,20 @@ pub fn pull_request(text: &str) -> Option<String> {
             let digits: String = number.chars().take_while(char::is_ascii_digit).collect();
             (!digits.is_empty() && !repo.is_empty()).then(|| format!("{repo}#{digits}"))
         })
-        .next_back()
+    {
+        found.retain(|seen| *seen != pr);
+        found.push(pr);
+    }
+    found
 }
 
 /// The mark and colour a state reads with.
 pub fn mark(state: &str) -> Span<'static> {
     match state {
-        "working" | crate::started::CHECKING => Span::raw("● ").fg(Color::Cyan),
+        "working" => Span::raw("● ").fg(Color::Cyan),
         "needs you" => Span::raw("? ").fg(Color::Yellow).bold(),
-        "done" | "completed" => Span::raw("✓ ").fg(Color::Green),
-        crate::started::CHECKED => Span::raw("✓ ").fg(Color::Green),
+        crate::started::IDLE | "completed" => Span::raw("✓ ").fg(Color::Green),
+        crate::started::DONE => Span::raw("✓ ").dim(),
         crate::started::QUIET => Span::raw("✓ ").dim(),
         "failed" => Span::raw("✗ ").fg(Color::Red),
         s if s.starts_with("waiting") || s == "queued" || s == "rate limited" => {
@@ -142,82 +169,168 @@ pub fn plain_line(text: &str) -> String {
     String::new()
 }
 
-/// The groups `/status` folds to their heading until opened: those the
-/// person has nothing to do for, and a click or a key opens.
-pub const FOLDS: [Group; 2] = [Group::Done, Group::Resolved];
+/// The groups `/status` shuts until opened: Done folds to its heading,
+/// and Idle shows its newest [`IDLE_SHOWN`] with a line for the rest.
+pub const FOLDS: [Group; 2] = [Group::Idle, Group::Done];
+
+/// How many idle agents `/status` shows before a line for the rest, as
+/// many as a picker's rows.
+pub const IDLE_SHOWN: usize = 8;
+
+/// Which rows `/status` says more of than their one line: the picked one,
+/// with every row that needs the person saying what it waits for; or every
+/// row, for `sonny status`'s text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Details<'a> {
+    Picked(Option<&'a str>),
+    All,
+}
 
 /// What `/status` shows of a project: the lead, then its tasks by group,
-/// done and resolved ones folded to their heading unless `open` holds
-/// their group; the line each agent's rows start on, with its bot, for a
-/// click there to open it; and the heading of each group that folds, for
-/// a click there to open or fold it.
+/// one line each, a task's own helpers folded under it; Done folded to its
+/// heading and Idle to its newest few unless `open` holds their group, and
+/// helpers unless `helpers` holds their task. The line each agent's row is
+/// on, with its bot, for a click there to open it; each fold's line, for a
+/// click to open or shut its group; and each helpers line, with its task.
 pub struct Card {
     pub lines: Vec<Line<'static>>,
     pub named: Vec<(usize, String)>,
     pub folds: Vec<(usize, Group)>,
+    pub helpers: Vec<(usize, String)>,
 }
 
 /// See [`Card`].
-pub fn card(project: &str, rows: &[Row], width: usize, open: &[Group]) -> Card {
+pub fn card(
+    project: &str,
+    rows: &[Row],
+    width: usize,
+    open: &[Group],
+    details: Details,
+    helpers: &[String],
+) -> Card {
     let mut named = Vec::new();
     let mut folds = Vec::new();
+    let mut toggles = Vec::new();
     let tasks: Vec<&Row> = rows.iter().filter(|r| r.name != "lead").collect();
+    // A task's own helpers fold under the task the lead's line started:
+    // each row by the top of its line of makers among the tasks.
+    let by_bot: HashMap<&str, &Row> = tasks.iter().map(|r| (r.bot.as_str(), *r)).collect();
+    let top = |row: &Row| -> Option<String> {
+        let mut at = row;
+        let mut seen = 0;
+        while let Some(maker) = by_bot.get(at.maker.as_str()) {
+            at = maker;
+            seen += 1;
+            // A ring of makers leads to no task.
+            if seen > by_bot.len() {
+                return None;
+            }
+        }
+        (at.bot != row.bot).then(|| at.bot.clone())
+    };
+    let mut under: HashMap<String, Vec<&Row>> = HashMap::new();
+    let mut listed: Vec<&Row> = Vec::new();
+    for row in &tasks {
+        match top(row) {
+            // One that needs the person is listed there too.
+            Some(parent) => {
+                if row.group == Group::NeedsYou {
+                    listed.push(row);
+                }
+                under.entry(parent).or_default().push(row);
+            }
+            None => listed.push(row),
+        }
+    }
     let count = |group: Group| tasks.iter().filter(|r| r.group == group).count();
     let mut head = format!(
         "{project} · {} task{}",
         tasks.len(),
         if tasks.len() == 1 { "" } else { "s" }
     );
-    for (group, said) in [
-        (Group::NeedsYou, "need you"),
-        (Group::Working, "working"),
-        (Group::Review, "to review"),
-    ] {
+    for (group, said) in [(Group::NeedsYou, "need you"), (Group::Working, "working")] {
         if count(group) > 0 {
             head.push_str(&format!(" · {} {said}", count(group)));
         }
     }
     let mut out = vec![Line::from(head).bold()];
+    let shown = |row: &Row| match details {
+        Details::All => true,
+        Details::Picked(picked) => picked == Some(row.bot.as_str()),
+    };
     for row in rows.iter().filter(|r| r.name == "lead") {
         named.push((out.len(), row.bot.clone()));
-        out.extend(row_lines(row, width));
+        out.extend(row_lines(row, width, "", shown(row)));
     }
-    for group in [
-        Group::NeedsYou,
-        Group::Working,
-        Group::Review,
-        Group::Done,
-        Group::Resolved,
-    ] {
-        let n = count(group);
-        if n == 0 {
+    for group in [Group::NeedsYou, Group::Working, Group::Idle, Group::Done] {
+        let in_group: Vec<&&Row> = listed.iter().filter(|r| r.group == group).collect();
+        if in_group.is_empty() {
             continue;
         }
         out.push(Line::default());
+        let n = in_group.len();
+        let opened = open.contains(&group);
         let mut heading = vec![
             Span::raw(group.heading()).bold(),
             Span::raw(format!(" · {n}")).dim(),
         ];
-        // A group with nothing for the person folds to its heading, as
-        // a fold of calls does: ▸ shut, ▾ open.
-        let shut = FOLDS.contains(&group) && !open.contains(&group);
-        if FOLDS.contains(&group) {
+        // Done folds to its heading, as a fold of calls does: ▸ shut, ▾
+        // open; Idle past its few, ▾ while all of it shows.
+        let folding = match group {
+            Group::Done => true,
+            Group::Idle => n > IDLE_SHOWN,
+            _ => false,
+        };
+        let shut = folding && !opened;
+        if folding && (group == Group::Done || opened) {
             folds.push((out.len(), group));
             heading.push(Span::raw(if shut { " ▸" } else { " ▾" }).dim());
         }
         out.push(Line::from(heading));
-        if shut {
-            continue;
-        }
-        for row in tasks.iter().filter(|r| r.group == group) {
+        let showing = match (group, shut) {
+            (Group::Done, true) => 0,
+            (Group::Idle, true) => IDLE_SHOWN,
+            _ => n,
+        };
+        for row in in_group.iter().take(showing) {
             named.push((out.len(), row.bot.clone()));
-            out.extend(row_lines(row, width));
+            out.extend(row_lines(row, width, "", shown(row)));
+            // A helper listed with what needs the person shows alone.
+            let Some(helped) = under.get(&row.bot).filter(|_| top(row).is_none()) else {
+                continue;
+            };
+            let unfolded = helpers.contains(&row.bot);
+            let mut said = format!(
+                "{} {} helper{}",
+                if unfolded { "▾" } else { "▸" },
+                helped.len(),
+                if helped.len() == 1 { "" } else { "s" }
+            );
+            for (state, word) in [(Group::NeedsYou, "need you"), (Group::Working, "working")] {
+                let k = helped.iter().filter(|h| h.group == state).count();
+                if k > 0 {
+                    said.push_str(&format!(", {k} {word}"));
+                }
+            }
+            toggles.push((out.len(), row.bot.clone()));
+            out.push(Line::from(vec![Span::raw("   "), Span::raw(said).dim()]));
+            if unfolded {
+                for helper in helped {
+                    named.push((out.len(), helper.bot.clone()));
+                    out.extend(row_lines(helper, width, "  ", shown(helper)));
+                }
+            }
+        }
+        if group == Group::Idle && showing < n {
+            folds.push((out.len(), group));
+            out.push(Line::from(format!(" +{} more · i shows them", n - showing)).dim());
         }
     }
     Card {
         lines: out,
         named,
         folds,
+        helpers: toggles,
     }
 }
 
@@ -412,9 +525,12 @@ pub fn alert_lines(alert: &Alert, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// One agent's lines: its mark, name, state and time; its model, profile,
-/// place and pull request; its latest step.
-fn row_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
+/// One agent's lines, after `indent`: its mark, name, state and time,
+/// and at the right what it is followed by, its code reviews, what runs
+/// for it and where its window is; under it, with `details` or while it
+/// waits on the person, its latest step, and with `details` its model and
+/// profile too.
+fn row_lines(row: &Row, width: usize, indent: &str, details: bool) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     // How long the running turn has been at it, or the last one took.
     let time = match row.seconds {
@@ -423,12 +539,11 @@ fn row_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
         None => String::new(),
     };
     let mark = match row.group {
-        Group::Resolved => Span::raw("✓ ").dim(),
-        Group::Review => Span::raw("◆ ").fg(Color::Blue),
+        Group::Done => Span::raw("✓ ").dim(),
         _ => mark(&row.state),
     };
     let mut spans = vec![
-        Span::raw(" "),
+        Span::raw(format!(" {indent}")),
         mark,
         // In the agents' color: a click opens it.
         Span::raw(row.name.clone()).bold().fg(Color::Blue),
@@ -437,46 +552,58 @@ fn row_lines(row: &Row, width: usize) -> Vec<Line<'static>> {
     if !time.is_empty() {
         spans.push(Span::raw(format!(" · {time}")).dim());
     }
-    out.extend(crate::transcript::wrap(
-        Line::from(spans),
-        width,
-        Span::raw(""),
-        Span::raw("   "),
-    ));
-    let model = match row.model.as_str() {
-        "" => String::new(),
-        id => crate::models::named(id),
-    };
-    let profile = match row.profile.as_str() {
-        "" => String::new(),
-        name => format!("{name} profile"),
-    };
-    let facts: Vec<&str> = [
-        model.as_str(),
-        profile.as_str(),
-        row.place.as_str(),
+    let trackers: Vec<&str> = [
+        row.follows.as_str(),
         row.pr.as_str(),
         row.background.as_str(),
+        row.place.as_str(),
     ]
     .into_iter()
     .filter(|f| !f.is_empty())
     .collect();
-    if !facts.is_empty() {
-        let line = Line::from(facts.join(" · ")).dim();
-        out.extend(crate::transcript::wrap(
-            line,
-            width,
-            Span::raw("   "),
-            Span::raw("   "),
-        ));
+    let left: usize = spans.iter().map(|s| s.content.width()).sum();
+    let right = trackers.join(" · ");
+    let room = width.saturating_sub(left + 2);
+    if !right.is_empty() && room > 0 {
+        // At the right edge, as far as it fits: what is followed and the
+        // code reviews first.
+        let right = crate::transcript::cut(&right, room);
+        let gap = width.saturating_sub(left + right.width()).max(2);
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::raw(right).dim());
     }
-    if !row.latest.is_empty() {
+    out.push(Line::from(spans));
+    let pad = format!("   {indent}");
+    if details {
+        let model = match row.model.as_str() {
+            "" => String::new(),
+            id => crate::models::named(id),
+        };
+        let profile = match row.profile.as_str() {
+            "" => String::new(),
+            name => format!("{name} profile"),
+        };
+        let facts: Vec<&str> = [model.as_str(), profile.as_str()]
+            .into_iter()
+            .filter(|f| !f.is_empty())
+            .collect();
+        if !facts.is_empty() {
+            let line = Line::from(facts.join(" · ")).dim();
+            out.extend(crate::transcript::wrap(
+                line,
+                width,
+                Span::raw(pad.clone()),
+                Span::raw(pad.clone()),
+            ));
+        }
+    }
+    if !row.latest.is_empty() && (details || row.group == Group::NeedsYou) {
         // The agent's words, read as the Markdown they are.
         let line = Line::from(crate::transcript::inline(&row.latest, Default::default())).dim();
         out.extend(crate::transcript::capped(
             line,
             width,
-            Span::raw("   └ ").dim(),
+            Span::raw(format!("{pad}└ ")).dim(),
             1,
         ));
     }
@@ -575,7 +702,7 @@ mod tests {
             "usage limit reached · 6000 agents waiting: api and 5999 more"
         );
         assert_eq!(
-            group("held: ChatGPT sign-in", true, false, false, false),
+            group("held: ChatGPT sign-in", true, false, false),
             Group::NeedsYou
         );
     }
@@ -621,24 +748,16 @@ mod tests {
 
     #[test]
     fn tasks_are_grouped_by_where_they_stand() {
-        assert_eq!(group("working", true, false, false, false), Group::Working);
-        assert_eq!(
-            group("waiting on fix", true, false, false, true),
-            Group::Working
-        );
-        assert_eq!(
-            group("needs you", true, false, false, false),
-            Group::NeedsYou
-        );
+        assert_eq!(group("working", true, false, false), Group::Working);
+        assert_eq!(group("waiting on fix", true, false, true), Group::Working);
+        assert_eq!(group("needs you", true, false, false), Group::NeedsYou);
         // A question asked ends the turn; it still needs the person.
-        assert_eq!(group("done", false, true, true, false), Group::NeedsYou);
-        assert_eq!(group("failed", false, false, false, false), Group::NeedsYou);
-        assert_eq!(group("done", false, false, true, false), Group::Review);
-        // A goal's check passed: the pull request still waits on review.
-        assert_eq!(group("checked", false, false, true, false), Group::Review);
-        assert_eq!(group("stopped", false, false, true, false), Group::Done);
-        assert_eq!(group("done", false, false, false, false), Group::Done);
-        assert_eq!(group("failed", false, true, true, true), Group::Resolved);
+        assert_eq!(group("idle", false, true, false), Group::NeedsYou);
+        assert_eq!(group("failed", false, false, false), Group::NeedsYou);
+        // A pull request shows on the row, not as a group of its own.
+        assert_eq!(group("idle", false, false, false), Group::Idle);
+        assert_eq!(group("stopped", false, false, false), Group::Idle);
+        assert_eq!(group("failed", false, true, true), Group::Done);
     }
 
     #[test]
@@ -659,107 +778,170 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_card_puts_the_lead_first_and_groups_its_tasks() {
-        let row = |name: &str, state: &str, group: Group| Row {
+    fn row(name: &str, state: &str, group: Group) -> Row {
+        Row {
             name: name.into(),
             bot: format!("calc.{name}"),
             state: state.into(),
-            running: matches!(group, Group::Working | Group::NeedsYou),
+            running: matches!(group, Group::Working),
             seconds: Some(42),
             model: "chatgpt/gpt-6.1-sol".into(),
-            place: "tab 1".into(),
             group,
+            maker: "calc.lead".into(),
             ..Row::default()
-        };
-        let rows = [
-            Row {
-                profile: "superlead".into(),
-                ..row("lead", "working", Group::Working)
-            },
-            row("zero", "needs you", Group::NeedsYou),
-            Row {
-                profile: "task".into(),
-                pr: "o/r#9".into(),
-                background: "↻ 1 automation".into(),
-                ..row("equal", "done", Group::Review)
-            },
-            row("old", "done", Group::Resolved),
-        ];
-        let text = |open: &[Group]| -> Vec<String> {
-            card("calc", &rows, 100, open)
-                .lines
-                .iter()
-                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-                .collect()
-        };
-        let folded = text(&[]);
-        assert_eq!(folded[0], "calc · 3 tasks · 1 need you · 1 to review");
-        assert_eq!(folded[1], " ● lead working · 42s");
-        // The profile is said even when it is the seat's own.
-        assert_eq!(
-            folded[2],
-            "   GPT 6.1 Sol · chatgpt · superlead profile · tab 1"
-        );
-        assert_eq!(folded[4], "Needs you · 1");
-        assert_eq!(folded[5], " ? zero needs you · 42s");
-        assert_eq!(folded[8], "Ready for review · 1");
-        assert_eq!(folded[9], " ◆ equal done · took 42s");
-        assert_eq!(
-            folded[10],
-            "   GPT 6.1 Sol · chatgpt · task profile · tab 1 · o/r#9 · ↻ 1 automation"
-        );
-        assert_eq!(folded.last().unwrap(), "Resolved · 1 ▸");
-        let card_of = card("calc", &rows, 100, &[]);
-        let named: Vec<(usize, &str)> = (card_of.named.iter())
-            .map(|(at, n)| (*at, n.as_str()))
-            .collect();
-        assert_eq!(
-            named,
-            [(1, "calc.lead"), (5, "calc.zero"), (9, "calc.equal")]
-        );
-        assert_eq!(card_of.folds, [(folded.len() - 1, Group::Resolved)]);
-        let shown = text(&[Group::Resolved]);
-        assert_eq!(shown[shown.len() - 3], "Resolved · 1 ▾");
-        assert_eq!(shown[shown.len() - 2], " ✓ old done · took 42s");
+        }
+    }
+
+    fn text(card: &Card) -> Vec<String> {
+        (card.lines.iter())
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
     }
 
     #[test]
-    fn done_tasks_fold_to_their_heading_until_opened() {
-        let row = |name: &str, group: Group| Row {
-            name: name.into(),
-            bot: format!("calc.{name}"),
-            state: "done".into(),
-            seconds: Some(42),
-            group,
-            ..Row::default()
+    fn each_agent_is_one_line_and_the_picked_one_says_more() {
+        let rows = [
+            Row {
+                profile: "superlead".into(),
+                place: "tab 1".into(),
+                ..row("lead", "working", Group::Working)
+            },
+            Row {
+                latest: "asks: staging or prod?".into(),
+                ..row("zero", "needs you", Group::NeedsYou)
+            },
+            Row {
+                profile: "task".into(),
+                pr: "2 reviews · o/r#9".into(),
+                follows: "▲".into(),
+                background: "↻ 1 automation".into(),
+                place: "tab 2".into(),
+                latest: "Opened the pull request.".into(),
+                ..row("equal", "idle", Group::Idle)
+            },
+            row("old", "done", Group::Done),
+        ];
+        let plain = card("calc", &rows, 80, &[], Details::Picked(None), &[]);
+        let lines = text(&plain);
+        assert_eq!(lines[0], "calc · 3 tasks · 1 need you");
+        assert_eq!(
+            lines[1].trim_end(),
+            " ● lead working · 42s                                                      tab 1"
+        );
+        assert_eq!(lines[1].width(), 80);
+        assert_eq!(lines[3], "Needs you · 1");
+        // What it waits for shows whether picked or not.
+        assert_eq!(lines[4], " ? zero needs you · took 42s");
+        assert_eq!(lines[5], "   └ asks: staging or prod?");
+        assert_eq!(lines[7], "Idle · 1");
+        assert_eq!(
+            lines[8],
+            " ✓ equal idle · took 42s          ▲ · 2 reviews · o/r#9 · ↻ 1 automation · tab 2"
+        );
+        assert_eq!(lines[10], "Done · 1 ▸");
+        assert_eq!(lines.len(), 11);
+        assert_eq!(plain.folds, [(10, Group::Done)]);
+        // Picked, its model, profile and latest step show under it.
+        let picked = card(
+            "calc",
+            &rows,
+            80,
+            &[],
+            Details::Picked(Some("calc.equal")),
+            &[],
+        );
+        let lines = text(&picked);
+        assert_eq!(lines[9], "   GPT 6.1 Sol · chatgpt · task profile");
+        assert_eq!(lines[10], "   └ Opened the pull request.");
+        let named: Vec<&str> = picked.named.iter().map(|(_, b)| b.as_str()).collect();
+        assert_eq!(named, ["calc.lead", "calc.zero", "calc.equal"]);
+        let opened = card(
+            "calc",
+            &rows,
+            80,
+            &[Group::Done],
+            Details::Picked(None),
+            &[],
+        );
+        let lines = text(&opened);
+        assert_eq!(lines[lines.len() - 2], "Done · 1 ▾");
+        assert_eq!(lines[lines.len() - 1], " ✓ old done · took 42s");
+    }
+
+    #[test]
+    fn idle_shows_its_newest_few_and_a_line_for_the_rest() {
+        let rows: Vec<Row> = (0..11)
+            .map(|n| row(&format!("t{n}"), "idle", Group::Idle))
+            .collect();
+        let shut = card("calc", &rows, 80, &[], Details::Picked(None), &[]);
+        let lines = text(&shut);
+        assert_eq!(lines[2], "Idle · 11");
+        assert_eq!(lines[3 + IDLE_SHOWN], " +3 more · i shows them");
+        assert_eq!(shut.named.len(), IDLE_SHOWN);
+        assert_eq!(shut.folds, [(3 + IDLE_SHOWN, Group::Idle)]);
+        let open = card(
+            "calc",
+            &rows,
+            80,
+            &[Group::Idle],
+            Details::Picked(None),
+            &[],
+        );
+        let lines = text(&open);
+        assert_eq!(lines[2], "Idle · 11 ▾");
+        assert_eq!(open.named.len(), 11);
+        assert_eq!(open.folds, [(2, Group::Idle)]);
+    }
+
+    #[test]
+    fn a_tasks_own_helpers_fold_under_it() {
+        let helper = |name: &str, state: &str, group: Group, maker: &str| Row {
+            maker: format!("calc.{maker}"),
+            ..row(name, state, group)
         };
         let rows = [
-            row("lead", Group::Done),
-            Row {
-                running: true,
-                state: "working".into(),
-                ..row("busy", Group::Working)
-            },
-            row("one", Group::Done),
-            row("two", Group::Done),
+            row("fix", "working", Group::Working),
+            helper("review", "working", Group::Working, "fix"),
+            helper("tests", "idle", Group::Idle, "fix"),
+            // Its helper's helper is the task's too.
+            helper("lint", "idle", Group::Idle, "tests"),
+            // One that needs the person is listed with what needs them.
+            helper("ask", "needs you", Group::NeedsYou, "fix"),
         ];
-        let text = |card: &Card| -> Vec<String> {
-            (card.lines.iter())
-                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-                .collect()
-        };
-        let shut = card("calc", &rows, 100, &[]);
+        let shut = card("calc", &rows, 80, &[], Details::Picked(None), &[]);
         let lines = text(&shut);
-        assert_eq!(lines.last().unwrap(), "Done · 2 ▸");
-        assert!(!lines.iter().any(|line| line.contains("one done")));
-        let heading = lines.len() - 1;
-        assert_eq!(shut.folds, [(heading, Group::Done)]);
-        assert!(shut.named.iter().all(|(_, bot)| bot != "calc.one"));
-        let open = card("calc", &rows, 100, &[Group::Done]);
+        assert_eq!(lines[2], "Needs you · 1");
+        assert_eq!(lines[3], " ? ask needs you · took 42s");
+        assert_eq!(lines[5], "Working · 1");
+        assert_eq!(lines[6], " ● fix working · 42s");
+        assert_eq!(lines[7], "   ▸ 4 helpers, 1 need you, 1 working");
+        assert_eq!(lines.len(), 8);
+        assert_eq!(shut.helpers, [(7, "calc.fix".to_owned())]);
+        let open = card(
+            "calc",
+            &rows,
+            80,
+            &[],
+            Details::Picked(None),
+            &["calc.fix".to_owned()],
+        );
         let lines = text(&open);
-        assert_eq!(lines[heading], "Done · 2 ▾");
-        assert!(lines.iter().any(|line| line.contains("one done")));
-        assert_eq!(open.folds, [(heading, Group::Done)]);
+        assert_eq!(lines[7], "   ▾ 4 helpers, 1 need you, 1 working");
+        assert_eq!(lines[8], "   ● review working · 42s");
+        assert_eq!(lines[9], "   ✓ tests idle · took 42s");
+        assert_eq!(lines[10], "   ✓ lint idle · took 42s");
+        assert_eq!(lines[11], "   ? ask needs you · took 42s");
+        let named: Vec<&str> = open.named.iter().map(|(_, b)| b.as_str()).collect();
+        assert_eq!(
+            named,
+            [
+                "calc.ask",
+                "calc.fix",
+                "calc.review",
+                "calc.tests",
+                "calc.lint",
+                "calc.ask"
+            ]
+        );
     }
 }

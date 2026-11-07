@@ -2693,6 +2693,54 @@ fn shell_path() -> &'static str {
     })
 }
 
+/// What a bot's command's environment changes from the daemon's own: the
+/// names taken out (the credentials the daemon holds and withholds), then
+/// what is set, the later winning: `environment`, the caller's and the
+/// bot's, last.
+pub fn shell_environment<'a>(
+    registry: &'a Registry,
+    environment: &'a [(String, String)],
+) -> (Vec<String>, impl Iterator<Item = (&'a str, &'a str)>) {
+    let mut removed = registry.credentials.names();
+    // A set AGENT_PARENT names this bot's creator and nothing else; a root
+    // bot must not pass on one the daemon itself was started with. Likewise
+    // a set AGENT_EFFORT is this bot's own level.
+    removed.extend(["AGENT_PARENT", "AGENT_PARENT_ID", "AGENT_EFFORT"].map(String::from));
+    // No command has a terminal: plain output and no pager, as other
+    // harnesses run commands. AI_AGENT tells tools an agent runs them, as
+    // fx sets it. What the caller or bot sets still wins.
+    let set = [
+        ("AI_AGENT", "agent"),
+        ("TERM", "dumb"),
+        ("NO_COLOR", "1"),
+        ("PAGER", "cat"),
+        ("GIT_PAGER", "cat"),
+        ("GH_PAGER", "cat"),
+    ]
+    .into_iter()
+    .chain(
+        (registry.environment.iter().chain(environment))
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    );
+    (removed, set)
+}
+
+/// A bot's command's whole environment: the daemon's own as
+/// [`shell_environment`] changes it, for a command run as the bot outside
+/// a turn (`lend`). A variable that is not UTF-8 is left out.
+pub fn shell_environment_whole(
+    registry: &Registry,
+    environment: &[(String, String)],
+) -> std::collections::BTreeMap<String, String> {
+    let (removed, set) = shell_environment(registry, environment);
+    let mut whole: std::collections::BTreeMap<String, String> = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(name, _)| !removed.contains(name))
+        .collect();
+    whole.extend(set.map(|(name, value)| (name.to_owned(), value.to_owned())));
+    whole
+}
+
 /// `shell_path() -c command` in the workspace, with the registry's
 /// environment and none of the credentials the daemon holds.
 #[cfg(unix)]
@@ -2712,29 +2760,11 @@ fn sh(
             process
         }
     };
-    for name in registry.credentials.names() {
+    let (removed, set) = shell_environment(registry, environment);
+    for name in removed {
         process.env_remove(name);
     }
-    // A set AGENT_PARENT names this bot's creator and nothing else; a root
-    // bot must not pass on one the daemon itself was started with.
-    process.env_remove("AGENT_PARENT");
-    process.env_remove("AGENT_PARENT_ID");
-    // Likewise a set AGENT_EFFORT is this bot's own level.
-    process.env_remove("AGENT_EFFORT");
-    // No command has a terminal: plain output and no pager, as other
-    // harnesses run commands. AI_AGENT tells tools an agent runs them, as
-    // fx sets it. What the caller or bot sets still wins.
-    for (name, value) in [
-        ("AI_AGENT", "agent"),
-        ("TERM", "dumb"),
-        ("NO_COLOR", "1"),
-        ("PAGER", "cat"),
-        ("GIT_PAGER", "cat"),
-        ("GH_PAGER", "cat"),
-    ] {
-        process.env(name, value);
-    }
-    for (name, value) in registry.environment.iter().chain(environment) {
+    for (name, value) in set {
         process.env(name, value);
     }
     // A sandboxed command reaches the daemon through its bot's own socket.

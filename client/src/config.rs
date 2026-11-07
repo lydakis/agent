@@ -48,6 +48,8 @@
 //! margin_note_lines = 20         # the most lines a note's Markdown runs to, 12 by default; past it the note is refused
 //! agent_opens = "beside"        # a click on an agent's name: "tab", the default, or "beside"
 //! suggest = false               # no guess at the next message, on by default
+//! needs_check = false           # no copy says whether a reply waits on you, on by default
+//! task_done_check = 24          # hours a task sits idle before a copy says whether it is done, 8 by default; 0 never
 //! commons = false               # agents go without the commons, on by default
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
@@ -60,10 +62,12 @@
 //! sky_haiku_window = 10         # minutes of messages and tool calls that make an agent busiest
 //! sky_haiku_margin = 50         # how much busier, in percent, a challenger must be to take the title
 //! sky_haiku_hold = 10           # minutes the title is held before it can pass
-//! tool_processes = 8            # processes Sonny runs for agents at once in all: tool calls 3/4, goal checks 1/4; 0, the default, four times the CPUs
+//! tool_processes = 8            # processes Sonny runs for agents' tool calls at once in all; 0, the default, four times the CPUs
 //! lookout_waiting = 4096        # events from sources that wait for one agent, 1024 by default; past it newer ones are not kept, and its next note says so; 0 no limit
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
+//! hours = ["Mon-Fri 09:00-19:00"]  # the person's working hours, local; outside them Sonny goes quiet once no window is used for quiet_after. Unset, the default: quiet only with /quiet
+//! quiet_after = "30m"           # how long no Sonny window is used, outside hours, before quiet starts; 30m by default
 //!
 //! [sonny.permissions.strict]    # a /permissions row of the person's own, as Codex's profiles
 //! description = "Offline, commits ask"
@@ -88,6 +92,7 @@
 //! digest = "15m"                # a subscriber hears it at most this often; unset, as it comes
 //! steer = { from = ["boss"] }   # what cuts into a busy subscriber's turn, as a filter is written
 //! watch = ["~/bin/slack-poll"]  # files whose edit starts it again on them; unset, none
+//! icon = "▲"                    # one character /status shows on the row of each agent that follows it
 //! [sonny.sources.commons]       # Sonny's own source: the commons threads an agent posted in
 //! digest = "15m"                # the default; 0 at once. Takes digest and steer alone
 //! ```
@@ -468,6 +473,12 @@ pub struct Sonny {
     /// Whether a copy of the agent guesses the person's next message after
     /// a turn they started, shown in the empty composer for Tab to take.
     pub suggest: bool,
+    /// Whether, once an agent's turn ends with words and no question open,
+    /// a copy of it says whether they wait on the person.
+    pub needs_check: bool,
+    /// Hours a task sits idle before a copy of it, with no tools, says
+    /// whether its work is done, which marks it done; 0 never.
+    pub task_done_check: u64,
     /// Whether the daemon starts when the machine does, for a box whose
     /// agents keep working after a restart. Sonny keeps the job.
     pub start_at_boot: bool,
@@ -509,9 +520,8 @@ pub struct Sonny {
     /// thermostat's margin and hold, so it does not flicker.
     pub sky_haiku_margin: u64,
     pub sky_haiku_hold: u64,
-    /// The processes Sonny runs for agents at once in all: three quarters
-    /// for tool calls the tool host answers, a quarter for goal checks,
-    /// each at least one. 0 for four times the CPUs.
+    /// The processes Sonny runs for agents at once in all, for tool calls
+    /// the tool host answers. 0 for four times the CPUs.
     pub tool_processes: u64,
     /// How many events from sources wait for one agent at most: past it,
     /// newer ones are not kept, and its next note says how many, from
@@ -525,6 +535,103 @@ pub struct Sonny {
     /// The hosts this machine is linked to over SSH, by name, whose agents
     /// may use this machine's browser, MCP servers and opens.
     pub links: BTreeMap<String, Link>,
+    /// The person's working hours, local time: outside them, once no
+    /// window has been used for `quiet_after`, Sonny goes quiet. None, the
+    /// default, is no clock: quiet starts only when the person asks.
+    pub hours: Vec<Hours>,
+    /// How long no Sonny window is used, outside `hours`, before quiet
+    /// starts, in seconds.
+    pub quiet_after: u64,
+}
+
+/// One range of `[sonny] hours`, as `"Mon-Fri 09:00-19:00"`: the days it
+/// starts on, Sunday first, and its start and end in minutes from local
+/// midnight. An end at or before the start runs past midnight into the
+/// next day, as `"Fri 22:00-02:00"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hours {
+    pub days: [bool; 7],
+    pub start: u16,
+    pub end: u16,
+}
+
+/// How long no window is used, outside hours, before quiet starts, unless
+/// `quiet_after` says otherwise: long enough for a break, short enough
+/// that an evening's replies do not pile up.
+pub const QUIET_AFTER: u64 = 30 * 60;
+
+/// The days `hours` names, as the time stamp writes them.
+pub const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// A range of `[sonny] hours` read: one day or a run of days (`Mon-Fri`,
+/// `Fri-Mon` going round the week), a space, then `HH:MM-HH:MM`.
+pub fn hours(text: &str) -> Result<Hours, String> {
+    let bad = || {
+        format!(
+            "sonny.hours takes ranges as \"Mon-Fri 09:00-19:00\" or \"Sat 10:00-12:00\", not {text:?}"
+        )
+    };
+    let (days, times) = text.trim().split_once(' ').ok_or_else(bad)?;
+    let day = |name: &str| DAYS.iter().position(|day| *day == name).ok_or_else(bad);
+    let (first, last) = match days.split_once('-') {
+        Some((first, last)) => (day(first)?, day(last)?),
+        None => (day(days)?, day(days)?),
+    };
+    let mut on = [false; 7];
+    let mut at = first;
+    loop {
+        on[at] = true;
+        if at == last {
+            break;
+        }
+        at = (at + 1) % 7;
+    }
+    let minute = |time: &str| -> Result<u16, String> {
+        let (hour, minute) = time.split_once(':').ok_or_else(bad)?;
+        let digits = |s: &str| s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit());
+        if !digits(hour) || !digits(minute) {
+            return Err(bad());
+        }
+        let (hour, minute): (u16, u16) = (
+            hour.parse().map_err(|_| bad())?,
+            minute.parse().map_err(|_| bad())?,
+        );
+        match (hour, minute) {
+            (24, 0) => Ok(24 * 60),
+            (0..=23, 0..=59) => Ok(hour * 60 + minute),
+            _ => Err(bad()),
+        }
+    };
+    let (start, end) = times.trim().split_once('-').ok_or_else(bad)?;
+    let (start, end) = (minute(start)?, minute(end)?);
+    if start == 24 * 60 || start == end {
+        return Err(bad());
+    }
+    Ok(Hours {
+        days: on,
+        start,
+        end,
+    })
+}
+
+impl std::fmt::Display for Hours {
+    /// As the config writes it: `Mon-Fri 09:00-19:00`. The days are one
+    /// run, as `hours` reads them; all seven read as Mon-Sun.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let first = (0..7)
+            .find(|&day| self.days[day] && !self.days[(day + 6) % 7])
+            .unwrap_or(1);
+        let mut last = first;
+        while self.days[(last + 1) % 7] && (last + 1) % 7 != first {
+            last = (last + 1) % 7;
+        }
+        let days = match first == last {
+            true => DAYS[first].to_owned(),
+            false => format!("{}-{}", DAYS[first], DAYS[last]),
+        };
+        let time = |minutes: u16| format!("{:02}:{:02}", minutes / 60, minutes % 60);
+        write!(f, "{days} {}-{}", time(self.start), time(self.end))
+    }
 }
 
 /// A link, `[sonny.links.NAME]`: this machine dials `host` over SSH and
@@ -612,6 +719,8 @@ impl Default for Sonny {
             mcp_servers: BTreeMap::new(),
             side_chat: SideChat::default(),
             suggest: true,
+            needs_check: true,
+            task_done_check: 8,
             commons: true,
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
@@ -638,6 +747,8 @@ impl Default for Sonny {
             sources: Vec::new(),
             browser_confirm: BROWSER_CONFIRM.map(str::to_owned).to_vec(),
             links: BTreeMap::new(),
+            hours: Vec::new(),
+            quiet_after: QUIET_AFTER,
         }
     }
 }
@@ -740,6 +851,9 @@ pub struct Source {
     /// Files whose change starts it again on them, as a service manager
     /// restarts a unit on its new binary: each from `/` or `~/`.
     pub watch: Vec<String>,
+    /// One character cell `/status` shows on the row of each agent that
+    /// follows it.
+    pub icon: Option<String>,
 }
 
 /// An MCP server, under Codex's key names for `[mcp_servers.NAME]`: a
@@ -1244,6 +1358,8 @@ fn parse(text: &str) -> Result<Config, String> {
                 "margin_note_lines",
                 "agent_opens",
                 "suggest",
+                "needs_check",
+                "task_done_check",
                 "start_at_boot",
                 "commons",
                 "commons_invites",
@@ -1262,6 +1378,8 @@ fn parse(text: &str) -> Result<Config, String> {
                 "unsandboxed",
                 "default_permissions",
                 "browser_confirm",
+                "hours",
+                "quiet_after",
             ],
             _ => return Err(format!("unknown table [{name}]")),
         };
@@ -1325,6 +1443,7 @@ fn parse(text: &str) -> Result<Config, String> {
             if let Some(switch) = match key.as_str() {
                 "chime" => Some(&mut config.sonny.chime),
                 "suggest" => Some(&mut config.sonny.suggest),
+                "needs_check" => Some(&mut config.sonny.needs_check),
                 "commons" => Some(&mut config.sonny.commons),
                 "verbose" => Some(&mut config.sonny.verbose),
                 "start_at_boot" => Some(&mut config.sonny.start_at_boot),
@@ -1349,6 +1468,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
                 "ask_wait_minutes" => Some(&mut config.sonny.ask_wait_minutes),
                 "task_windows" => Some(&mut config.sonny.task_windows),
+                "task_done_check" => Some(&mut config.sonny.task_done_check),
                 "sky_haiku_daily" => Some(&mut config.sonny.sky_haiku_daily),
                 "sky_haiku_keep" => Some(&mut config.sonny.sky_haiku_keep),
                 "sky_haiku_window" => Some(&mut config.sonny.sky_haiku_window),
@@ -1400,6 +1520,28 @@ fn parse(text: &str) -> Result<Config, String> {
                         _ => Err(invalid()),
                     })
                     .collect::<Result<_, _>>()?;
+                continue;
+            }
+            if (name.as_str(), key.as_str()) == ("sonny", "hours") {
+                let invalid = || {
+                    format!("{name}.{key} must be a list of ranges, as [\"Mon-Fri 09:00-19:00\"]")
+                };
+                let ranges = value.as_array().ok_or_else(invalid)?;
+                config.sonny.hours = ranges
+                    .iter()
+                    .map(|range| hours(range.as_str().ok_or_else(invalid)?))
+                    .collect::<Result<_, _>>()?;
+                continue;
+            }
+            if (name.as_str(), key.as_str()) == ("sonny", "quiet_after") {
+                let text = string(&format!("{name}.{key}"), value)?;
+                config.sonny.quiet_after = span("sonny.quiet_after", &text)?;
+                if config.sonny.quiet_after == 0 {
+                    return Err(format!(
+                        "{name}.{key} is how long no window is used before quiet starts, \
+                         as 30m; more than 0"
+                    ));
+                }
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "unsandboxed") {
@@ -1596,6 +1738,7 @@ fn commons_source() -> Source {
         digest: Some(COMMONS_DIGEST.into()),
         steer: None,
         watch: Vec::new(),
+        icon: None,
     }
 }
 
@@ -1622,6 +1765,7 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
         let mut digest = None;
         let mut steer = None;
         let mut watch = Vec::new();
+        let mut icon = None;
         let own = name == COMMONS_SOURCE;
         for (field, value) in fields {
             match field.as_str() {
@@ -1638,6 +1782,16 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
                     let value = string(&key(field), value)?;
                     span(&key(field), &value)?;
                     digest = Some(value);
+                }
+                "icon" => {
+                    let value = string(&key(field), value)?;
+                    if value.chars().count() != 1 || value.chars().any(char::is_control) {
+                        return Err(format!(
+                            "{} is one character, as \"▲\", not {value:?}",
+                            key(field)
+                        ));
+                    }
+                    icon = Some(value);
                 }
                 "steer" => {
                     if !value.is_table() {
@@ -1666,6 +1820,7 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
         if own {
             commons.digest = digest.or(commons.digest);
             commons.steer = steer;
+            commons.icon = icon;
             continue;
         }
         sources.push(Source {
@@ -1675,6 +1830,7 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
             digest,
             steer,
             watch,
+            icon,
         });
     }
     Ok((sources, commons))
@@ -1887,6 +2043,45 @@ mod tests {
         let config = parse("[sonny.links.box]\nhost = \"box\"\ncalls = 2\n").unwrap();
         assert_eq!(config.sonny.links["box"].calls, Some(2));
         assert!(parse("[sonny.links.box]\nhost = \"box\"\ncalls = 0\n").is_err());
+    }
+
+    #[test]
+    fn hours_are_runs_of_days_with_a_time_range_and_none_is_no_clock() {
+        assert_eq!(parse("").unwrap().sonny.hours, Vec::new());
+        assert_eq!(parse("").unwrap().sonny.quiet_after, QUIET_AFTER);
+        let week = hours("Mon-Fri 09:00-19:00").unwrap();
+        assert_eq!(week.days, [false, true, true, true, true, true, false]);
+        assert_eq!((week.start, week.end), (9 * 60, 19 * 60));
+        assert_eq!(week.to_string(), "Mon-Fri 09:00-19:00");
+        // Round the week, and past midnight.
+        let late = hours("Fri-Mon 22:00-02:00").unwrap();
+        assert_eq!(late.days, [true, true, false, false, false, true, true]);
+        assert_eq!(late.to_string(), "Fri-Mon 22:00-02:00");
+        assert_eq!(
+            hours("Sat 10:00-24:00").unwrap().to_string(),
+            "Sat 10:00-24:00"
+        );
+        assert_eq!(
+            hours("Sun-Sat 00:00-24:00").unwrap().to_string(),
+            "Mon-Sun 00:00-24:00"
+        );
+        for bad in [
+            "Mon-Fri",
+            "Monday 09:00-17:00",
+            "Mon 9:00-17:00",
+            "Mon 09:00-09:00",
+            "Mon 24:00-01:00",
+            "Mon 09:60-10:00",
+            "Mon 09:00",
+        ] {
+            assert!(hours(bad).is_err(), "{bad}");
+        }
+        let config = parse("[sonny]\nhours = [\"Mon-Fri 09:00-19:00\", \"Sat 10:00-12:00\"]\nquiet_after = \"45m\"\n").unwrap();
+        assert_eq!(config.sonny.hours.len(), 2);
+        assert_eq!(config.sonny.quiet_after, 45 * 60);
+        assert!(parse("[sonny]\nhours = \"Mon-Fri 09:00-19:00\"\n").is_err());
+        assert!(parse("[sonny]\nhours = [\"weekdays\"]\n").is_err());
+        assert!(parse("[sonny]\nquiet_after = \"0\"\n").is_err());
     }
 
     #[test]

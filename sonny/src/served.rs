@@ -31,7 +31,6 @@ pub const SUBSCRIPTIONS: &str = "subscriptions";
 pub const AUTOMATIONS: &str = "automations";
 pub const MEMORY: &str = "memory";
 pub const COMMONS: &str = "commons";
-pub const GOAL: &str = "goal";
 pub const EXEC: &str = crate::exec::NAME;
 pub const BROWSER: &str = crate::browser::NAME;
 pub const DESKTOP: &str = crate::desktop::NAME;
@@ -42,9 +41,8 @@ pub const DESKTOP: &str = crate::desktop::NAME;
 /// drop work, a subscription sends other bots' words to the subscriber's
 /// judge, a trigger is a job that runs as the person, its `if`
 /// command outside any sandbox, a script calls MCP servers, which run
-/// as the person too, and so does a goal's check, the browser and the
-/// desktop.
-pub const GATED: [&str; 10] = [
+/// as the person too, and so do the browser and the desktop.
+pub const GATED: [&str; 9] = [
     START,
     REMOVE,
     PROJECT,
@@ -52,7 +50,6 @@ pub const GATED: [&str; 10] = [
     RUN,
     AUTOMATIONS,
     EXEC,
-    GOAL,
     BROWSER,
     DESKTOP,
 ];
@@ -95,7 +92,6 @@ pub fn tools(role: Role) -> Vec<Value> {
     if crate::commons::on() {
         tools.push(commons());
     }
-    tools.push(crate::lookout::goals::tool(GOAL, TAG));
     tools.extend(crate::exec::tool());
     tools.extend(crate::browser::tool());
     tools.extend(crate::desktop::tool());
@@ -147,15 +143,6 @@ fn start() -> Value {
                         without one, the project's threads_model, else yours."},
                 "effort": {"type": "string", "minLength": 1,
                     "description": "The task's effort level, when the work calls for one."},
-                "from": {"type": "string", "minLength": 1,
-                    "description": "Another task to fork instead of starting afresh, to try another way \
-                        from where it was: the new task gets its conversation up to a turn it completed \
-                        and its files as they were then, in a worktree of its own, and keeps its role, \
-                        model and effort, so name none of those. Setup never runs on its files, which a \
-                        task wrote. The brief is its next message."},
-                "turn": {"type": "integer", "minimum": 1,
-                    "description": "With from, the turn to fork after: the number in its turn handle. \
-                        Without it, the newest turn whose files were kept."},
                 "reason": {"type": "string", "minLength": 1,
                     "description": "Why this is work none of your tasks still there should take, when you \
                         have any: a task given more work keeps what it learned. Without it, a start while \
@@ -259,9 +246,8 @@ fn subscriptions() -> Value {
             source as NAME:TOPIC, or only those its filter matches. The commons is a source too, each thread \
             a topic: posting in a thread subscribes you to it as commons.THREAD, and removing that leaves it. \
             Add steer yourself for what you own; a filter or a digest only when the person asks for one: \
-            what a filter leaves out you never hear, and a digest makes you late. Add one, or remove one by \
-            name; with neither, or after either, the result lists them all, with \
-            the sources there are and the fields their events lately had, to filter on.",
+            what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name; \
+            the result lists them all, with the sources there are and their events' recent fields.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -273,18 +259,18 @@ fn subscriptions() -> Value {
                             "description": "Bots whose tasks it watches."},
                         "bots": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Bots it watches by name, * matching any run of characters; \
-                                another lead, which has subscriptions of its own, counts only where named as it is."},
+                                another lead counts only where named exactly."},
                         "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Sources it hears, by name: every event each says, unless filtered; or NAME:TOPIC, one topic of it."},
+                            "description": "Sources it hears, by name, or NAME:TOPIC for one topic of it."},
                         "filter": {"type": "object",
                             "description": "Only the events this matches are heard, its sources' and its bots' \
                                 alike. A bot's events have type (message.written, turn.ended, approval.waiting, \
                                 ask.posted, turn.silent, note.changed), bot, maker, by (you, person, an agent's \
-                                name, trigger), turn, status (completed, failed, stopped, interrupted), resolved, \
-                                goal, theirs (the person asked for the turn themselves), text (the person's \
+                                name, trigger), turn, status (completed, failed, stopped, interrupted), done, \
+                                theirs (the person asked for the turn themselves), text (the person's \
                                 words), question, options and id (a margin note's). An event pattern as \
-                                AWS EventBridge writes one. Each field the event must have maps to a list of values, \
-                                any of which will do, or to a pattern for a field that is an object; every field \
+                                AWS EventBridge writes one. Each field maps to a list of values, \
+                                any of which will do, or to a pattern for an object field; every field \
                                 must match, and a field that is a list matches when any item does. A value is a \
                                 string, number, boolean or null, or {\"prefix\": S}, {\"suffix\": S}, \
                                 {\"wildcard\": S} (* any run of characters), {\"equals-ignore-case\": S}, \
@@ -293,18 +279,20 @@ fn subscriptions() -> Value {
                                 As {\"paths\": [{\"prefix\": \"src/billing/\"}], \"author\": [{\"anything-but\": \"me\"}]}."},
                         "digest": {"type": "string", "pattern": "^(0|[0-9]+[smh])$",
                             "description": "Tell what it hears at most once this long, as 15m or 1h, in place of \
-                                its sources' own digest: the first after a quiet spell at once, the rest in one \
-                                note. The person's words, a question to them and an approval only they can give \
-                                never wait for it."},
+                                its sources' own digest. The person's words, a question to them and an approval only they can give \
+                                never wait."},
                         "steer": {"type": "object",
-                            "description": "What it hears that this matches, a pattern as filter's, is a steer: \
-                                it goes at once and waits for no digest, as the person's words do. As \
-                                {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."}
+                            "description": "What it hears that this matches, a pattern as filter's, goes at once, \
+                                past any digest, as the person's words do. As \
+                                {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."},
+                        "until": {"type": "string", "description": "Ends it at YYYY-MM-DD HH:MM."},
+                        "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N notes."}
                     },
                     "required": ["name"],
                     "additionalProperties": false
                 },
-                "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."}
+                "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
+                "test": {"type": "boolean", "description": "What add would have heard of its sources' last day; adds nothing."}
             },
             "additionalProperties": false
         },
@@ -365,6 +353,7 @@ fn automations() -> Value {
                             "description": "A shell command run in your folder first; it runs only when that \
                                 exits 0, so a check that finds nothing costs no turn."},
                         "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N messages."},
+                        "until": {"type": "string", "description": "Ends it at YYYY-MM-DD HH:MM."},
                         "turn_budget_tokens": {"type": "integer", "minimum": 1,
                             "description": "A cap on the tokens of each turn a run starts, counting every request's \
                                 input with the agent's history, so a cap below that history ends every run on \
@@ -636,11 +625,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 ));
             }
             // Work that one of the starter's tasks may hold already goes to
-            // it, unless the starter says why it is separate; a fork is a
-            // second try beside its source by its nature.
-            if text("from").is_none()
-                && text("reason").is_none_or(|reason| reason.trim().is_empty())
-            {
+            // it, unless the starter says why it is separate.
+            if text("reason").is_none_or(|reason| reason.trim().is_empty()) {
                 let there = crate::task::still_there(&line.project, &caller);
                 if !there.is_empty() {
                     let listed: Vec<String> = (there.iter())
@@ -666,8 +652,6 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 own_folder: arguments["own_folder"] == true,
                 here: false,
                 folder: text("folder"),
-                from: text("from"),
-                turn: arguments["turn"].as_i64(),
                 // A task's own helper builds on its work.
                 builds_on: (!line.lead).then(|| caller.clone()),
                 env: Vec::new(),
@@ -750,6 +734,19 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let caller_id = std::env::var("AGENT_BOT_ID")
                 .ok()
                 .and_then(|id| id.parse().ok());
+            if arguments["test"] == true {
+                let Some(add) = arguments.get("add") else {
+                    return Err(("subscription_refused", "test tries an add".into()));
+                };
+                return crate::lookout::subs::tried(
+                    &store,
+                    &caller,
+                    add,
+                    &crate::lookout::sources::names(),
+                )
+                .map(|tried| tried.to_string())
+                .map_err(|e| ("subscription_refused", e));
+            }
             crate::lookout::subs::change(
                 &store,
                 &caller,
@@ -760,16 +757,6 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             )
             .map(|listed| listed.to_string())
             .map_err(|e| ("subscription_refused", e))
-        }
-        GOAL => {
-            let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
-            let (client, _events) = Client::connect(&socket)
-                .await
-                .map_err(|e| ("goal_refused", e.to_string()))?;
-            crate::lookout::goals::call(&store, &client, &caller, arguments)
-                .await
-                .map(|said| said.to_string())
-                .map_err(|e| ("goal_refused", e))
         }
         name if name == crate::margin::TOOL => {
             let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
@@ -1259,6 +1246,16 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                                 Some(EXEC) => script(&hub, &client, &call).await,
                                 Some(BROWSER) => browse(&client, &call).await,
                                 Some(DESKTOP) => desktop(&client, &call).await,
+                                // Light, and answered as it is taken, so it
+                                // lands on what the person had written then.
+                                Some(crate::reactions::TOOL) => crate::reactions::answer(
+                                    &client,
+                                    &store,
+                                    &str_of(&call["bot"]),
+                                    &call["arguments"],
+                                )
+                                .await
+                                .map(Value::String),
                                 Some(AUTOMATIONS) => automate(&client, &call, &me, &store, &socket)
                                     .await
                                     .map(Value::String),
@@ -1835,18 +1832,15 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     // A place among the processes Sonny runs for agents, within the call's
     // time: held until its process is done.
     let owner = str_of(&caller["name"]);
-    let _place = tokio::time::timeout(
-        left(call),
-        crate::budget::processes(crate::budget::Companion::ToolHost).admit(&owner),
-    )
-    .await
-    .map_err(|_| {
-        (
-            "tool_unserved",
-            "ran out of time waiting for one of Sonny's processes (sonny.tool_processes)"
-                .to_owned(),
-        )
-    })?;
+    let _place = tokio::time::timeout(left(call), crate::budget::processes().admit(&owner))
+        .await
+        .map_err(|_| {
+            (
+                "tool_unserved",
+                "ran out of time waiting for one of Sonny's processes (sonny.tool_processes)"
+                    .to_owned(),
+            )
+        })?;
     let mut child = command
         .spawn()
         .map_err(|e| ("tool_failed", format!("{}: {e}", me.display())))?;
@@ -2598,7 +2592,7 @@ mod tests {
                 .filter(|name| name != EXEC && name != BROWSER && name != DESKTOP)
                 .collect()
         };
-        let every = [SUBSCRIPTIONS, SHOW, RUN, AUTOMATIONS, MEMORY, COMMONS, GOAL];
+        let every = [SUBSCRIPTIONS, SHOW, RUN, AUTOMATIONS, MEMORY, COMMONS];
         // Every agent starts and removes tasks; the daemon bounds how deep.
         let mut task = vec![START, REMOVE];
         task.extend(every);

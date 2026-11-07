@@ -335,7 +335,35 @@ AUTOMATION = [
      'plant': 'A4 the lead removes it'},
 ]
 
-DAYS = {'full': STEPS, 'small': SMALL, 'burst': BURST, 'automation': AUTOMATION}
+# Quiet mode: the person leaves for the night, Sonny marks them away (as
+# `/quiet` does), and news comes in. The lead acts on it and writes them
+# nothing; a task's choice that can be undone is made for them, not asked;
+# a failure that recovers overnight is left out when they return.
+AWAY = [
+    {'say': "Add a CSV export of orders in shop/export.py, one row per order with id, total and "
+            "created_at, and subscribe to my chat and mail sources so you hear what comes in.",
+     'events': [('chat', 'sam', 'lunch order closes at 11:30, add yourself to the sheet')]},
+    {'say': "I'm done for today, see you tomorrow. Keep going on the export.",
+     'plant': 'the person leaves; the next step marks them away'},
+    {'away': True,
+     'events': [
+        ('mail', 'ravi (finance)', "Subject: export format. For the export, should refunded orders be "
+                                   "in it or left out? Either works for me, pick one and tell me which.",
+         'W3 a choice that can be undone, asked while away: taken, noted as held, not asked of the person'),
+        ('chat', 'ci', 'build #4120 failed on main: test_session_timeout (flaky?)',
+         'W2 a failure that recovers overnight: left out on return'),
+        ('chat', 'kim', 'who took the blue charger from room 4?'),
+     ]},
+    {'events': [
+        ('chat', 'ci', 'build #4121 passed on main (retry of #4120)'),
+        ('chat', 'lee', 'heads up: the orders table gets a currency column next week',
+         'W1 night news the lead acts on (passes it to the export task) and writes the person nothing about'),
+     ]},
+    {'say': "Morning. Anything for me?",
+     'plant': "W2 the person's first message back: answered, then what was held, with the recovered build left out"},
+]
+
+DAYS = {'full': STEPS, 'small': SMALL, 'burst': BURST, 'automation': AUTOMATION, 'away': AWAY}
 DAY, DAY_NAME = STEPS, ''  # the day a run plays, set by --day
 
 SOURCE = r'''import json, sys
@@ -564,8 +592,8 @@ def words_of(text):
 # sandbox, and a repository an agent made inside the lead's has hooks,
 # config and filters the agent wrote (#597). An automation's `if` runs
 # outside every sandbox and its `start` makes an agent the eval never
-# configured. A new project, a pane's command, a script, a goal's check
-# and the browser run as the person.
+# configured. A new project, a pane's command, a script and the browser
+# run as the person.
 NATIVE = {
     'start_task': lambda a: 'folder' not in a,
     'remove_task': lambda a: True,
@@ -613,7 +641,7 @@ def determinable(home, request):
 
 
 # The label Sonny's scheduler job takes, before its HOME's tag.
-SCHEDULER = 'me.lydakis.agent.scheduler.'
+SCHEDULER = 'sonny.scheduler.'
 
 
 def let_go_scheduler(home):
@@ -840,6 +868,11 @@ def run(arm, n, bins, model, spec=None):
         # A step's upstream change reaches origin as its news does.
         if s.get('lands') and step not in landed:
             landed[step] = land(root, env, *s['lands'])
+        # Away from here, as `/quiet` makes it, until the person writes.
+        if s.get('away'):
+            away = home / '.agent/sonny/away'
+            away.parent.mkdir(parents=True, exist_ok=True)
+            away.write_text(f'{int(time.time())}\nasked\n')
         (root / 'step').write_text(str(step))
 
     try:
