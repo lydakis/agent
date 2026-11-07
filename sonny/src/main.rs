@@ -1563,8 +1563,6 @@ async fn run() -> Result<(), String> {
     app.sounds.chime = settings.chime;
     app.schedule = settings.quiet.clone();
     quiet::set_schedule(settings.quiet.clone());
-    // Opening a window is using it: the lookout waits from here.
-    quiet::mark_present();
     app.quiet = quiet::away();
     app.verbose = settings.verbose;
     set_measure(settings.text_width);
@@ -11470,10 +11468,11 @@ impl App {
             join = true;
         }
         let pictures = self.placed(&prompt);
-        match self
-            .send(prompt, None, join && !queue, queue, &pictures)
-            .await
-        {
+        // An option's number is a pick, as a click on it is: quiet stays.
+        self.picking = answering.is_some();
+        let sent = (self.send(prompt, None, join && !queue, queue, &pictures)).await;
+        self.picking = false;
+        match sent {
             Ok(()) => {
                 self.input.clear();
                 self.notice = None;
