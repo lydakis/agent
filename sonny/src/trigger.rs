@@ -4000,7 +4000,19 @@ async fn start(client: &Client, trigger: &Trigger, run: Option<&Run>) -> Result<
     // the person's chat, mail and the like as one they open does), gated
     // and sandboxed as `auto` confines them. A call the judge doubts waits
     // in `/approvals` for the person, as any agent's does.
-    crate::made(client, &mut asked, model, dir)?;
+    // The state folder of the agent that added it, as that agent has it
+    // (its lead's, for a task), else its own.
+    let state = match by {
+        Some((bot, id)) => match client
+            .request("inspect", json!({"bot": bot, "bot_id": id}))
+            .await
+        {
+            Ok(record) => crate::state::of(&record, bot),
+            Err(_) => crate::state::folder(bot),
+        },
+        None => crate::state::folder(name),
+    };
+    crate::made(client, &mut asked, model, dir, state.as_deref())?;
     let made = client.request("create", asked).await.map_err(coded)?;
     made["bot_id"]
         .as_i64()
@@ -4128,6 +4140,7 @@ async fn adopt(client: &Client, name: &str, id: i64) {
         && let Some(fields) = crate::approvals::regate(
             &record,
             crate::approvals::default(),
+            name,
             &mut Default::default(),
         )
     {

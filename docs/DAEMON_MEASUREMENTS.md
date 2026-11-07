@@ -7528,3 +7528,41 @@ moved under 2%.
 | lifecycle | CPU, s | 0.615 | 0.615 | +0.0% |
 | lifecycle | p95 turn, ms | 583.508 | 580.933 | -0.4% |
 | lifecycle | peak RSS, MiB | 22.521 | 22.418 | -0.5% |
+
+## A bot's `env` setting (#771)
+
+A bot's `env` setting (protocol 53) is a `BTreeMap` in its settings,
+empty unless a client sets one. A turn's shell environment starts from it:
+an empty map adds no allocation, and one variable, as Sonny sets on a lead,
+adds one name and value copy per turn beside the `AGENT_*` entries the turn
+already builds. A bot carries an empty map, 24 bytes, until it has one.
+Configuring `env` or `rules` writes the bot's kin in the same recursive
+update as before, and the names it returns are taken once, so the work is
+linear in the bots it reaches. Nothing new runs on submit or in the store
+per turn.
+
+The Perf workflow's matched screen of this change against its base
+(`bench.perf_gate`, GitHub runner, head 0c40eb7 against main dbea88d):
+store work per turn is the same and the gate passed. Lifecycle p95 turn
+moved +8.4% while its CPU moved -1.2%, and footprint idle RSS +5.8% while
+per idle bot moved -13.5%, both inside the runner's spread. Sonny's sky
+replay peak RSS moved +11.5% on a path this change does not touch (the sky
+reads no state folder or setting); the rest stay within 6%.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 31.477 | 30.609 | -2.8% |
+| admission | burst submit p99, ms | 4.451 | 4.401 | -1.1% |
+| completion | release to terminal p99, ms | 9.762 | 9.733 | -0.3% |
+| footprint | idle RSS, MiB | 14.477 | 15.318 | +5.8% |
+| footprint | per idle bot, KiB | 1.804 | 1.56 | -13.5% |
+| footprint | RSS after a turn each, MiB | 25.436 | 26.801 | +5.4% |
+| footprint | CPU per turn, ms | 0.91 | 0.91 | -0.1% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 8.06 | 8.185 | +1.6% |
+| sonny | lookout note p95 at 100x10, ms | 2542.0 | 2398.0 | -5.7% |
+| sonny | quiet window CPU, ms/s | 3.3 | 3.435 | +4.1% |
+| sonny | sky replay CPU per 1k lines, ms | 9.8 | 9.46 | -3.5% |
+| sonny | sky replay RSS, MiB | 76.45 | 85.25 | +11.5% |
+| lifecycle | CPU, s | 0.43 | 0.425 | -1.2% |
+| lifecycle | p95 turn, ms | 666.913 | 723.258 | +8.4% |
+| lifecycle | peak RSS, MiB | 22.945 | 23.43 | +2.1% |

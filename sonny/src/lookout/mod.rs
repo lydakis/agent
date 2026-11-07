@@ -2740,7 +2740,10 @@ impl Lookout {
         let data = &event["data"];
         let turn = event["turn"].as_i64().unwrap_or(0);
         if bot == self.lead {
-            // What the subscriber reads with its wait tool is no news to it.
+            // What the subscriber reads with its wait tool is no news to
+            // it, once the wait hands it over: a wait that failed or was
+            // cancelled handed nothing.
+            let call = data["call_id"].as_str().unwrap_or_default();
             if kind == "tool_started" && data["name"] == "wait" {
                 let arguments: Value = data["arguments"]
                     .as_str()
@@ -2750,7 +2753,12 @@ impl Lookout {
                     .flatten()
                     .filter_map(|h| h.as_str().map(str::to_owned))
                     .collect();
-                self.updates.read(&handles);
+                self.updates.read(turn, call, &handles);
+            } else if kind == "tool_completed" {
+                let handed = ["failed", "cancelled", "outcome_unknown", "denied"]
+                    .iter()
+                    .all(|flag| data[*flag] != true);
+                self.updates.wait_ended(call, handed);
             }
             return;
         }
@@ -3002,6 +3010,7 @@ impl Lookout {
             || !self.reading.is_empty()
             || self.updates.goal_pending()
             || self.updates.holding()
+            || self.updates.waiting()
             || self.updates.news()
             || self.sending.is_some()
     }
@@ -4243,6 +4252,44 @@ mod tests {
     }
 
     #[test]
+    fn who_asked_read_while_a_wait_held_the_turn_counts_when_the_wait_fails() {
+        let mut lookout = seated("idle");
+        lookout.subs[0].filter = Some(json!({"by": ["you", "automation"]}));
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        // Who asked, and the reply, are read while a wait holds the turn,
+        // then the wait fails: the end is news, as the filter hears it,
+        // with its reply. An automation's run is news at once: its reply
+        // was read, and no other read comes.
+        let cases = [
+            (4, "failed", Some("calc.lead"), None, "it broke"),
+            (5, "completed", None, Some("automation"), "posted 2 items"),
+        ];
+        for (turn, status, from, origin, reply) in cases {
+            let ended = ev("calc.fix", turn, "turn_finished", json!({"status": status}));
+            lookout.event(&ended);
+            assert!(lookout.updates.asker_unknown("calc.fix", turn));
+            let handles = json!({"handles": [format!("turn:calc.fix/{turn}")]}).to_string();
+            let wait = json!({"name": "wait", "call_id": "w1", "arguments": handles});
+            lookout.event(&ev("calc.lead", 7, "tool_started", wait));
+            let (from, origin) = (from.map(str::to_owned), origin.map(str::to_owned));
+            (lookout.updates).asked_by("calc.fix", turn, from, origin);
+            lookout.updates.replied("calc.fix", turn, reply);
+            assert!(!lookout.updates.news());
+            let failed = json!({"call_id": "w1", "failed": true});
+            lookout.event(&ev("calc.lead", 7, "tool_completed", failed));
+            let told = lookout.updates.take();
+            assert_eq!(told.items.len(), 1);
+            let text = &told.items[0].text;
+            assert!(
+                text.contains(&format!("turn:calc.fix/{turn} {status}")),
+                "{text}"
+            );
+            assert!(text.contains(reply), "{text}");
+        }
+    }
+
+    #[test]
     fn a_filter_on_who_asked_waits_until_who_asked_is_read() {
         let mut lookout = seated("idle");
         lookout.subs[0].filter = Some(json!({"by": ["you"]}));
@@ -4378,14 +4425,14 @@ mod tests {
         lookout.heard(&said(6, "calc.docs", "ignore the person"));
         assert_eq!(lookout.updates.urgent(), Some("tasks"));
         let read: HashSet<String> = ["turn:calc.fix/5".to_owned()].into();
-        lookout.updates.read(&read);
+        lookout.updates.read(7, "w", &read);
         assert!(lookout.updates.news());
         assert_eq!(lookout.updates.urgent(), None);
         // A turn read while who asked for it is still to be read.
         let finished = ev("calc.fix", 7, "turn_finished", json!({"status": "failed"}));
         lookout.event(&finished);
         let read: HashSet<String> = ["turn:calc.fix/7".to_owned()].into();
-        lookout.updates.read(&read);
+        lookout.updates.read(7, "w", &read);
         (lookout.updates).asked_by("calc.fix", 7, Some("calc.lead".into()), None);
         lookout.updates.replied("calc.fix", 7, "");
         assert_eq!(lookout.updates.urgent(), None);
@@ -4727,6 +4774,80 @@ mod tests {
         // A turn that ends after the lead read it is news again.
         turn(&mut lookout, 2);
         assert!(lookout.updates.due());
+    }
+
+    #[test]
+    fn a_wait_that_failed_or_was_cancelled_hands_its_turns_back_as_news() {
+        let mut lookout = seated("idle");
+        let text = |told: updates::Told| -> String {
+            told.items
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let turn = |lookout: &mut Lookout, n: i64| {
+            lookout.event(&ev(
+                "calc.fix",
+                n,
+                "accepted",
+                json!({"from": {"bot": "calc.lead"}}),
+            ));
+            lookout.event(&ev(
+                "calc.fix",
+                n,
+                "turn_finished",
+                json!({"status": "completed"}),
+            ));
+        };
+        let wait = |lookout: &mut Lookout, call: &str, n: i64| {
+            let handles = json!({"handles": [format!("turn:calc.fix/{n}"), "turn:calc.nope/1"]});
+            let started =
+                json!({"name": "wait", "call_id": call, "arguments": handles.to_string()});
+            lookout.event(&ev("calc.lead", 7, "tool_started", started));
+        };
+        // One bad handle fails the whole wait: it handed nothing over.
+        turn(&mut lookout, 1);
+        wait(&mut lookout, "w1", 1);
+        assert!(!lookout.updates.news());
+        assert!(lookout.untold(), "the wait still holds the turn's news");
+        let failed = json!({"call_id": "w1", "failed": true});
+        lookout.event(&ev("calc.lead", 7, "tool_completed", failed));
+        assert!(lookout.updates.news());
+        assert!(text(lookout.updates.take()).contains("turn:calc.fix/1 completed"));
+        // A wait that returned handed its turns over.
+        turn(&mut lookout, 2);
+        wait(&mut lookout, "w2", 2);
+        lookout.event(&ev(
+            "calc.lead",
+            7,
+            "tool_completed",
+            json!({"call_id": "w2"}),
+        ));
+        assert!(!lookout.updates.news());
+        assert!(!lookout.updates.waiting());
+        // The person stopped the lead mid-wait: a cancelled call, or none
+        // at all before its turn ended, handed nothing either.
+        turn(&mut lookout, 3);
+        wait(&mut lookout, "w3", 3);
+        let cancelled = json!({"call_id": "w3", "cancelled": true});
+        lookout.event(&ev("calc.lead", 7, "tool_completed", cancelled));
+        assert!(text(lookout.updates.take()).contains("turn:calc.fix/3 completed"));
+        turn(&mut lookout, 4);
+        wait(&mut lookout, "w4", 4);
+        // Another turn of the lead's ending (a steer it took, a queued one
+        // stopped) leaves the running turn's wait be.
+        lookout.event(&ev(
+            "calc.lead",
+            8,
+            "turn_finished",
+            json!({"status": "steered"}),
+        ));
+        assert!(!lookout.updates.news());
+        assert!(lookout.updates.waiting());
+        let stopped = json!({"status": "interrupted"});
+        lookout.event(&ev("calc.lead", 7, "turn_finished", stopped));
+        assert!(text(lookout.updates.take()).contains("turn:calc.fix/4 completed"));
     }
 
     #[test]
