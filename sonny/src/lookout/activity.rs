@@ -10,7 +10,7 @@ use std::time::Duration;
 
 /// The fields a bot's events may have, as the `subscriptions` tool lists
 /// them for an agent to filter on.
-pub const FIELDS: [(&str, &str); 14] = [
+pub const FIELDS: [(&str, &str); 13] = [
     (
         "type",
         "string: message.written, turn.ended, approval.waiting, ask.posted, turn.silent or note.changed",
@@ -27,7 +27,6 @@ pub const FIELDS: [(&str, &str); 14] = [
         "string, how a turn ended: completed, failed, stopped or interrupted",
     ),
     ("done", "boolean, the task marked itself done in the turn"),
-    ("goal", "string, how the task's goal ended with the turn"),
     (
         "theirs",
         "boolean, the person asked for the turn in the task themselves",

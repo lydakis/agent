@@ -48,19 +48,9 @@ pub const DONE: &str = "done";
 /// failure, and not a reply either.
 pub const QUIET: &str = "no reply";
 
-/// The state of a task whose turn ended while it has a goal that turn did
-/// not meet yet: its check runs, or it works on.
-pub const CHECKING: &str = "checking";
-
-/// The state of a task whose turn ended and met its goal: its check passed.
-pub const CHECKED: &str = "checked";
-
 /// Whether a task in `state` waits on nothing more of its own.
 pub fn settled(state: &str) -> bool {
-    matches!(
-        state,
-        IDLE | DONE | QUIET | CHECKED | "failed" | "stopped" | "removed"
-    )
+    matches!(state, IDLE | DONE | QUIET | "failed" | "stopped" | "removed")
 }
 
 /// A state's mark and its color.
@@ -68,7 +58,6 @@ fn sign(state: &str) -> Span<'static> {
     match state {
         IDLE => Span::raw("✓").fg(Color::Green),
         DONE => Span::raw("✓").dim(),
-        CHECKED => Span::raw("✓").fg(Color::Green),
         QUIET => Span::raw("✓").dim(),
         "failed" => Span::raw("✗").fg(Color::Red),
         "needs you" => Span::raw("?").fg(Color::Yellow).bold(),

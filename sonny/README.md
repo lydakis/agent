@@ -99,13 +99,11 @@ Claude Code's agents take `isolation` each time.
 
 ![/new listing the profiles, then where a reviewer works, then its first message](../docs/sonny/new-agent.png)
 
-`/goal WHAT` asks the agent to set a goal
-on itself and work until WHAT is done (`/goal` shows goals, `/goal clear`
-clears its own; see [Goals](../docs/SONNY.md#goals)). `/zen FOCUS` asks the agent to talk with you about
+`/zen FOCUS` asks the agent to talk with you about
 that one thing and hold everything else back, and shows only your turns and
 its questions, in the middle of the window, under a footer of the focus and
 what needs you; it interrupts only with a question, and `/zen` again ends it
-and has the agent say what it held. Like a goal, the focus is the agent's to
+and has the agent say what it held. The focus is the agent's to
 read: a few hurried words are enough, and the footer shows the focus in its
 words. Asking in words ("let's go into zen on the receipts") works too.
 
@@ -894,8 +892,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   person, a schedule (whose tick flashes as it fires), a reply's note
   from the commons, task updates, a message that came back; the chat log
   names each so (`its sources → inbox`, `task updates → shop lead`). A commons invite flies from whoever started the
-  thread, a margin note you closed from you, and an agent's own goal only
-  pulses its star. It is a
+  thread, and a margin note you closed from you. It is a
   calm window to keep open and watch: dim lines join who made whom, and
   every pair that has ever talked keeps a dim curve, the last 96 pairs, past
   turns and live, denser and brighter the more the pair talked this hour. A
@@ -973,7 +970,7 @@ way `/react` does, and each note in the margin has its own `↩`.
 
   ![/sky with an agent scheduling another, its tick on the rim and what is next up](../docs/sonny/sky-schedules.gif)
 
-  ![/sky: a reviewer's no streaking red onto an agent, a hand-off yellow, a schedule's tick flashing as it fires, a goal pulsing a star](../docs/sonny/sky-origins.gif)
+  ![/sky: a reviewer's no streaking red onto an agent, a hand-off yellow, a schedule's tick flashing as it fires](../docs/sonny/sky-origins.gif)
 
   ![/sky with states and its chat log](../docs/sonny/sky-states.png)
 
@@ -1166,8 +1163,9 @@ person sees, as a checklist), `margin` (notes beside the conversation),
 `mark_done`, `subscriptions`, `show_agent` and
 `run_in_pane`, `start_task` and `remove_task`; a lead's own, which its
 tasks never take, is `new_project`. The daemon shows them to
-the model and records each call: `react`, `plan`, `margin` and
-`mark_done` run nothing, and the rest wait for Sonny's answer. Sonny's tool host answers
+the model and records each call: `plan` and `mark_done` run nothing,
+and the rest wait for Sonny's answer, a `react` naming another agent kept
+under the person's newest message there as it is answered. Sonny's tool host answers
 those, running each call in the calling agent's folder, so they work with
 every Sonny window closed; a call nobody answers in time ends as
 `tool_unserved`, and the agent goes on. All but `show_agent` wait for a
@@ -1356,13 +1354,10 @@ failure.
 
 The tasks the lead starts show where it started them, as one roster for
 the tasks started together, each task with what it is doing now (starting,
-working, needs you, done, no reply, checking, checked, failed), read
+working, needs you, done, no reply, failed), read
 again every few seconds. A task whose model ended its turn with nothing to
 say did not fail, but did not reply either, so it reads `no reply`, not
-`done`, in the roster and in `/status`. A task with a goal reads `checking`
-once a turn ends, and `checked` once its goal's check passed.
-
-![A task whose goal's check passed beside one still checking and one only done](../docs/sonny/tasks-checked.png) A click
+`done`, in the roster and in `/status`. A click
 on a task goes to its own tab, where the lead laid it out in Rex, Herdr or
 cmux; a right click (or a click, with no tab) opens it in the pane: its own
 Sonny, live, to watch and to talk to, as a side chat is. `[sonny]

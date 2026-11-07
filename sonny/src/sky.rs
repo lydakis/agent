@@ -1971,17 +1971,6 @@ impl View {
                     }
                 }
                 let origin = data["origin"].as_str().unwrap_or("");
-                // An agent's goal asks it to go on: its own loop, so its
-                // star pulses, and nothing flies.
-                if live && origin == "goal" && from != End::Person {
-                    let agent = &mut self.agents[at];
-                    // Cooled to now first, as a message's heat is.
-                    agent.heat = agent.warmth(now) + 1.0;
-                    (agent.lit, agent.heated, agent.flash) = (Some(now), Some(now), None);
-                    let said = format!("{} keeps at its goal", self.short(at));
-                    self.say(now, said, None, &[at]);
-                    return;
-                }
                 // A schedule woke it: in from the edge, its tick flashing.
                 if live && crate::trigger::sent_it(origin) {
                     self.agents[at].fired = Some(now);
@@ -6632,7 +6621,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn what_comes_in_comes_from_who_sent_it_and_a_goal_flies_nowhere() {
+    async fn what_comes_in_comes_from_who_sent_it() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![
             json!({"name": "shop.lead"}),
@@ -6641,7 +6630,7 @@ mod tests {
         .unwrap();
         send.send(Feed::Ready).unwrap();
         view.drain();
-        let (lead, login) = (view.index["shop.lead"], view.index["shop.login"]);
+        let lead = view.index["shop.lead"];
         // A margin note closed: the person's.
         assert_eq!(view.sender(&json!({"origin": "margin"}), lead), End::Person);
         // Task updates name no task: what they quote is the person's
@@ -6662,12 +6651,6 @@ mod tests {
         );
         assert_eq!(commons_invite("commons.release-notes.4.woken"), None);
         assert_eq!(commons_invite("lookout-abc"), None);
-        // A goal: the star pulses, nothing flies, the log says so.
-        send.send(Feed::Live(
-            json!({"event": "accepted", "bot": "shop.login", "turn": 1,
-            "data": {"origin": "goal"}}),
-        ))
-        .unwrap();
         // A schedule: in from the edge, its tick flashing.
         send.send(Feed::Live(
             json!({"event": "accepted", "bot": "shop.lead", "turn": 1,
@@ -6675,15 +6658,11 @@ mod tests {
         ))
         .unwrap();
         view.drain();
-        assert!(view.agents[login].heated.is_some());
         let froms: Vec<End> = view.sparks.iter().map(|s| s.from).collect();
         assert_eq!(froms, [End::Rim(lead)]);
         assert!(view.agents[lead].fired.is_some());
         let logged: Vec<&str> = view.ticker.iter().map(|n| n.text.as_str()).collect();
-        assert_eq!(
-            logged,
-            ["login keeps at its goal", "an automation → shop lead"]
-        );
+        assert_eq!(logged, ["an automation → shop lead"]);
     }
 
     #[tokio::test]

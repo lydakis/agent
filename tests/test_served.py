@@ -65,7 +65,7 @@ class ServedToolTests(ModelFixture):
         return self.companion('tool-host', 'serving', **extra)
 
     def lookout(self, **extra):
-        """The lookout, which tells leads and checks goals."""
+        """The lookout, which tells leads."""
         return self.companion('lookout', 'watching', **extra)
 
     def call(self, bot, name, arguments, wait=5, **submit):
@@ -711,23 +711,6 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
             time.sleep(.2)
         self.fail(f'{bot} heard nothing saying {having!r}')
 
-    def goal_watch(self):
-        """calc.fix, calc.lead's task with the goal tool, watched by its
-        lead, which hears its turns; the host serving them, and the lookout
-        checking the goal: the lookout's process."""
-        lead = self.daemon.request('create', bot='calc.lead', workspace=str(self.path),
-                                   model='openai/synthetic-model', instructions='Lead.',
-                                   declare=[declared('goal')])['result']
-        self.daemon.request('create', bot='calc.fix', workspace=str(self.path), model='openai/synthetic-model',
-                            instructions='Task.', declare=[declared('goal')], created_by='calc.lead',
-                            created_by_id=lead['bot_id'])
-        folder = self.path / 'state.sqlite.lookout'
-        folder.mkdir(exist_ok=True)
-        watch = {'name': 'tasks', 'tasks_of': [], 'bots': ['calc.fix'], 'on': ['said', 'ended'], 'updates': True}
-        (folder / 'calc.lead.json').write_text(json.dumps({'subscriptions': [watch]}))
-        self.host()
-        return self.lookout()
-
     def lines_of(self, path, at_least, timeout=30):
         """The lines of `path` once it has `at_least` of them."""
         deadline = time.monotonic() + timeout
@@ -735,158 +718,6 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
             self.assertLess(time.monotonic(), deadline, f'{path.name} has fewer than {at_least} lines')
             time.sleep(.05)
         return path.read_text().splitlines()
-
-    def goal_run(self, check):
-        """calc.fix sets itself a goal with `check`: the lead's note once
-        the goal ends, and the prompts of calc.fix's turns."""
-        self.goal_watch()
-        set_ = json.loads(self.call('calc.fix', 'goal', {'set': {'done_when': 'the flag exists', 'check': check}}))
-        self.assertIn('goal', set_, set_)
-        self.assertEqual(set_['goal']['check'], check)
-        note = self.note_for('calc.lead', 'its goal')
-        prompts = [self.daemon.request('prompts', bot='calc.fix', turn=t['turn'])['result']['prompts'][0]['text']
-                   for t in self.daemon.request('turns', bot='calc.fix')['result']['turns']]
-        return note, prompts
-
-    def test_a_goal_keeps_its_agent_working_until_its_check_passes(self):
-        # Fails once, leaving the flag that passes it the next time.
-        note, prompts = self.goal_run('test -f flag || { touch flag; echo not yet; exit 1; }')
-        self.assertEqual(len(prompts), 2, prompts)
-        self.assertTrue(prompts[1].startswith('Your goal is not met yet: `test -f flag'), prompts[1])
-        self.assertIn('exits 1.\n```\nnot yet\n```\nKeep working until the flag exists.', prompts[1])
-        # The lead hears the turn that met it, and nothing of the one before.
-        self.assertIn('- calc.fix: turn:calc.fix/2 completed, asked by goal, and met its goal:', note)
-        self.assertNotIn('calc.fix/1', note)
-        self.assertFalse((self.path / 'state.sqlite.lookout/goals/calc.fix.json').exists())
-
-    def test_a_goal_whose_agent_only_answers_stops(self):
-        note, prompts = self.goal_run('false')
-        # The turn that set it called the tool; two that only answered end it.
-        self.assertEqual(len(prompts), 3, prompts)
-        self.assertIn('turn:calc.fix/3 completed, asked by goal, and stopped pursuing its goal: 2 turns in a row',
-                      note)
-        self.assertIn('its check still exits 1', note)
-
-    def test_a_goal_its_lead_sets_counts_from_the_task_turn_that_ends_next(self):
-        self.goal_watch()
-        ran = self.path / 'ran'
-        set_ = json.loads(self.call('calc.lead', 'goal', {'set': {'bot': 'calc.fix', 'done_when': 'it ran',
-                                                                    'check': f'echo . >> {ran}'}}))
-        self.assertEqual(set_['goal']['bot'], 'calc.fix', set_)
-        # Ends at once, well before the lookout reads its goals again.
-        turn = self.daemon.request('submit', bot='calc.fix', request_id='work', prompt='Work.')['result']['turn']
-        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        note = self.note_for('calc.lead', 'its goal')
-        self.assertIn(f'- calc.fix: turn:calc.fix/{turn} completed, asked by the person, and met its goal:', note)
-        self.assertEqual(len(ran.read_text().splitlines()), 1)
-
-    def test_a_turn_that_ends_while_its_goal_is_checked_starts_no_other_check(self):
-        self.goal_watch()
-        runs = self.path / 'runs'
-        # Slow, and passing the second time it runs.
-        check = f'echo . >> {runs}; sleep 2; test $(wc -l < {runs}) -ge 2'
-        self.call('calc.fix', 'goal', {'set': {'done_when': 'it ran twice', 'check': check}})
-        self.lines_of(runs, 1)
-        # The person writes in while it runs; the turn ends before it does.
-        turn = self.daemon.request('submit', bot='calc.fix', request_id='more', prompt='More.')['result']['turn']
-        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        note = self.note_for('calc.lead', 'its goal')
-        self.assertIn('asked by goal, and met its goal:', note)
-        # One check for the turn that set it, one for the goal's own turn.
-        self.assertEqual(len(runs.read_text().splitlines()), 2)
-
-    def test_a_goal_checked_when_its_lookout_gives_way_is_checked_by_the_next(self):
-        old = self.goal_watch()
-        runs = self.path / 'runs'
-        check = f'echo . >> {runs}; sleep 30; exit 1'
-        self.call('calc.fix', 'goal', {'set': {'done_when': 'it ran again', 'check': check}})
-        self.lines_of(runs, 1)
-        # The cursor it keeps stays before the turn's end, which waits on
-        # the check.
-        [ended] = [e['cursor'] for e in self.daemon.request('events', bot='calc.fix', after=0, limit=256)
-                   ['result']['events'] if e['event'] == 'turn_finished']
-        saved = self.lines_of(self.path / 'state.sqlite.lookout.cursor', 1)
-        self.assertLess(int(saved[0].split()[0]), ended)
-        # Another build's lookout takes over, stopping this one's check.
-        (self.path / 'state.sqlite.lookout.sonny').write_text('0.0.1 1')
-        (self.path / 'state.sqlite.lookout/goals/calc.fix.json').write_text(json.dumps(dict(
-            json.loads((self.path / 'state.sqlite.lookout/goals/calc.fix.json').read_text()),
-            check=f'echo . >> {runs}')))
-        self.lookout()
-        old.wait(timeout=10)
-        # The turn that set it is checked again, and now passes.
-        note = self.note_for('calc.lead', 'its goal')
-        self.assertIn('- calc.fix: turn:calc.fix/1 completed, asked by the person, and met its goal:', note)
-        self.assertEqual(len(self.lines_of(runs, 2)), 2)
-
-    def test_a_goal_no_one_watches_is_checked_again_after_a_restart(self):
-        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
-                            instructions='Lead.', declare=[declared('goal')])
-        self.host()
-        old = self.lookout()
-        runs = self.path / 'runs'
-        self.call('calc.lead', 'goal', {'set': {'done_when': 'it ran again', 'check': f'echo . >> {runs}; sleep 30'}})
-        self.lines_of(runs, 1)
-        [ended] = [e['cursor'] for e in self.daemon.request('events', bot='calc.lead', after=0, limit=256)
-                   ['result']['events'] if e['event'] == 'turn_finished']
-        # Past a save of the cursor, which stays before the turn's end
-        # though no subscriber holds it.
-        time.sleep(1.5)
-        saved = self.lines_of(self.path / 'state.sqlite.lookout.cursor', 1)
-        self.assertLess(int(saved[0].split()[0]), ended)
-        old.kill()
-        old.wait(timeout=10)
-        self.lookout()
-        self.assertEqual(len(self.lines_of(runs, 2)), 2)
-
-    def goal_down(self, **goal):
-        """calc.fix and its lead with no lookout running, `goal` on disk as
-        the goal tool writes it, and the cursor a lookout that went down
-        just now left: what happens next is news to the one that starts."""
-        old = self.goal_watch()
-        old.kill()
-        old.wait(timeout=10)
-        fix = self.daemon.request('inspect', bot='calc.fix')['result']
-        folder = self.path / 'state.sqlite.lookout/goals'
-        folder.mkdir(parents=True, exist_ok=True)
-        if 'check' in goal:
-            (folder / 'calc.fix.json').write_text(json.dumps(dict(
-                bot='calc.fix', bot_id=fix['bot_id'], done_when='it ran twice', workspace=str(self.path),
-                set_by='calc.lead', set_ms=1, timeout_s=60, **goal)))
-        at = max(e['cursor'] for bot in ('calc.lead', 'calc.fix')
-                 for e in self.daemon.request('events', bot=bot, after=0, limit=256)['result']['events'])
-        (self.path / 'state.sqlite.lookout.cursor').write_text(f'{at} {at}')
-        return fix
-
-    def test_two_goal_turns_that_ended_while_the_lookout_was_down_are_both_checked(self):
-        runs = self.path / 'runs'
-        self.goal_down(check=f'echo . >> {runs}; test $(wc -l < {runs}) -ge 2')
-        first = self.daemon.request('submit', bot='calc.fix', request_id='work', prompt='Work.')['result']['turn']
-        self.assertEqual(self.daemon.finished(first)['data']['status'], 'completed')
-        # The turn the first check goes on in, made before the lookout went
-        # down: its request ID is the one the check asks for again.
-        second = self.daemon.request('submit', bot='calc.fix', request_id=f'goal-calc.fix-{first}', prompt='More.',
-                                     origin='goal')['result']['turn']
-        self.assertEqual(self.daemon.finished(second)['data']['status'], 'completed')
-        self.lookout()
-        note = self.note_for('calc.lead', 'its goal')
-        self.assertIn(f'- calc.fix: turn:calc.fix/{second} completed, asked by goal, and met its goal:', note)
-        self.assertEqual(len(self.lines_of(runs, 2)), 2)
-
-    def test_how_a_goal_ended_reaches_the_lead_after_a_restart(self):
-        fix = self.goal_down()
-        turn = self.daemon.request('submit', bot='calc.fix', request_id='work', prompt='Work.')['result']['turn']
-        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        # The goal ended with that turn, and the lookout went down before
-        # its lead heard.
-        ended = self.path / 'state.sqlite.lookout/goals/ended'
-        ended.mkdir(parents=True)
-        (ended / 'calc.fix.json').write_text(json.dumps(dict(
-            turn=turn, bot_id=fix['bot_id'], check='false', met=False,
-            outcome=', and gave up its goal, saying why in that turn')))
-        self.lookout()
-        note = self.note_for('calc.lead', 'its goal')
-        self.assertIn(f'- calc.fix: turn:calc.fix/{turn} completed, asked by the person, and gave up its goal', note)
 
     def test_a_sandboxed_agent_no_one_reviews_sees_its_automations_and_adds_none(self):
         made = self.daemon.request('create', bot='calc.lead', workspace=str(self.path),

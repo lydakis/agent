@@ -31,7 +31,6 @@ pub const SUBSCRIPTIONS: &str = "subscriptions";
 pub const AUTOMATIONS: &str = "automations";
 pub const MEMORY: &str = "memory";
 pub const COMMONS: &str = "commons";
-pub const GOAL: &str = "goal";
 pub const EXEC: &str = crate::exec::NAME;
 pub const BROWSER: &str = crate::browser::NAME;
 pub const DESKTOP: &str = crate::desktop::NAME;
@@ -42,9 +41,8 @@ pub const DESKTOP: &str = crate::desktop::NAME;
 /// drop work, a subscription sends other bots' words to the subscriber's
 /// judge, a trigger is a job that runs as the person, its `if`
 /// command outside any sandbox, a script calls MCP servers, which run
-/// as the person too, and so does a goal's check, the browser and the
-/// desktop.
-pub const GATED: [&str; 10] = [
+/// as the person too, and so do the browser and the desktop.
+pub const GATED: [&str; 9] = [
     START,
     REMOVE,
     PROJECT,
@@ -52,7 +50,6 @@ pub const GATED: [&str; 10] = [
     RUN,
     AUTOMATIONS,
     EXEC,
-    GOAL,
     BROWSER,
     DESKTOP,
 ];
@@ -95,7 +92,6 @@ pub fn tools(role: Role) -> Vec<Value> {
     if crate::commons::on() {
         tools.push(commons());
     }
-    tools.push(crate::lookout::goals::tool(GOAL, TAG));
     tools.extend(crate::exec::tool());
     tools.extend(crate::browser::tool());
     tools.extend(crate::desktop::tool());
@@ -281,7 +277,7 @@ fn subscriptions() -> Value {
                                 alike. A bot's events have type (message.written, turn.ended, approval.waiting, \
                                 ask.posted, turn.silent, note.changed), bot, maker, by (you, person, an agent's \
                                 name, trigger), turn, status (completed, failed, stopped, interrupted), done, \
-                                goal, waiting_for, theirs (the person asked for the turn themselves), text (the person's \
+                                theirs (the person asked for the turn themselves), text (the person's \
                                 words), question, options and id (a margin note's). An event pattern as \
                                 AWS EventBridge writes one. Each field the event must have maps to a list of values, \
                                 any of which will do, or to a pattern for a field that is an object; every field \
@@ -760,16 +756,6 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             )
             .map(|listed| listed.to_string())
             .map_err(|e| ("subscription_refused", e))
-        }
-        GOAL => {
-            let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
-            let (client, _events) = Client::connect(&socket)
-                .await
-                .map_err(|e| ("goal_refused", e.to_string()))?;
-            crate::lookout::goals::call(&store, &client, &caller, arguments)
-                .await
-                .map(|said| said.to_string())
-                .map_err(|e| ("goal_refused", e))
         }
         name if name == crate::margin::TOOL => {
             let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
@@ -1259,6 +1245,16 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                                 Some(EXEC) => script(&hub, &client, &call).await,
                                 Some(BROWSER) => browse(&client, &call).await,
                                 Some(DESKTOP) => desktop(&client, &call).await,
+                                // Light, and answered as it is taken, so it
+                                // lands on what the person had written then.
+                                Some(crate::reactions::TOOL) => crate::reactions::answer(
+                                    &client,
+                                    &store,
+                                    &str_of(&call["bot"]),
+                                    &call["arguments"],
+                                )
+                                .await
+                                .map(Value::String),
                                 Some(AUTOMATIONS) => automate(&client, &call, &me, &store, &socket)
                                     .await
                                     .map(Value::String),
@@ -1835,18 +1831,15 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     // A place among the processes Sonny runs for agents, within the call's
     // time: held until its process is done.
     let owner = str_of(&caller["name"]);
-    let _place = tokio::time::timeout(
-        left(call),
-        crate::budget::processes(crate::budget::Companion::ToolHost).admit(&owner),
-    )
-    .await
-    .map_err(|_| {
-        (
-            "tool_unserved",
-            "ran out of time waiting for one of Sonny's processes (sonny.tool_processes)"
-                .to_owned(),
-        )
-    })?;
+    let _place = tokio::time::timeout(left(call), crate::budget::processes().admit(&owner))
+        .await
+        .map_err(|_| {
+            (
+                "tool_unserved",
+                "ran out of time waiting for one of Sonny's processes (sonny.tool_processes)"
+                    .to_owned(),
+            )
+        })?;
     let mut child = command
         .spawn()
         .map_err(|e| ("tool_failed", format!("{}: {e}", me.display())))?;
@@ -2598,7 +2591,7 @@ mod tests {
                 .filter(|name| name != EXEC && name != BROWSER && name != DESKTOP)
                 .collect()
         };
-        let every = [SUBSCRIPTIONS, SHOW, RUN, AUTOMATIONS, MEMORY, COMMONS, GOAL];
+        let every = [SUBSCRIPTIONS, SHOW, RUN, AUTOMATIONS, MEMORY, COMMONS];
         // Every agent starts and removes tasks; the daemon bounds how deep.
         let mut task = vec![START, REMOVE];
         task.extend(every);

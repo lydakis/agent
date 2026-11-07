@@ -102,10 +102,14 @@ pub fn declare(record: &Value, role: Role) -> Option<Value> {
             !(tool["name"].as_str()).is_some_and(|name| crate::served::GATED.contains(&name))
         });
     }
-    // The commons is Sonny's while it is off, too, so it gives way.
+    // The commons is Sonny's while it is off, too, so it gives way, and
+    // so does any tool Sonny answers that this build no longer declares.
     let mut names = tools(Role::ALL);
     names.push(crate::served::commons());
-    let sonnys = |other: &Value| names.iter().any(|tool| tool["name"] == other["name"]);
+    let sonnys = |other: &Value| {
+        other["answered_by"] == crate::served::TAG
+            || names.iter().any(|tool| tool["name"] == other["name"])
+    };
     if ours.iter().all(|tool| declared.contains(tool))
         && declared
             .iter()
@@ -303,6 +307,20 @@ mod tests {
         let approve = fields["approve"].as_array().unwrap();
         assert!(approve.iter().any(|tool| tool == "shell"));
         assert!(approve.iter().any(|tool| tool == crate::served::RUN));
+    }
+
+    #[test]
+    fn a_tool_sonny_answered_that_this_build_dropped_goes_with_the_refresh() {
+        let mut old: Vec<Value> = tools(a_lead());
+        old.push(json!({"name": "goal", "parameters": {"type": "object"},
+            "answered_by": crate::served::TAG}));
+        old.push(json!({"name": "theirs", "result": "ok"}));
+        let fields = refresh(&json!({"name": "calc.lead", "bot_id": 7, "declared": old})).unwrap();
+        let names: Vec<&str> = (fields["declare"].as_array().unwrap().iter())
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(!names.contains(&"goal"));
+        assert!(names.contains(&"theirs"));
     }
 
     #[test]

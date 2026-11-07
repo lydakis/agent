@@ -263,7 +263,7 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "sonny.tool_processes",
-        about: "processes Sonny runs for agents at once in all: the tool host's tool calls take three quarters, the lookout's goal checks a quarter, each at least one, and each agent at most half of either; 0 for four times the CPUs",
+        about: "processes Sonny runs for agents' tool calls at once in all, each agent at most half; 0 for four times the CPUs",
         values: &[],
         default: "0",
     },

@@ -134,11 +134,10 @@ pub fn pull_requests(text: &str) -> Vec<String> {
 /// The mark and colour a state reads with.
 pub fn mark(state: &str) -> Span<'static> {
     match state {
-        "working" | crate::started::CHECKING => Span::raw("● ").fg(Color::Cyan),
+        "working" => Span::raw("● ").fg(Color::Cyan),
         "needs you" => Span::raw("? ").fg(Color::Yellow).bold(),
         crate::started::IDLE | "completed" => Span::raw("✓ ").fg(Color::Green),
         crate::started::DONE => Span::raw("✓ ").dim(),
-        crate::started::CHECKED => Span::raw("✓ ").fg(Color::Green),
         crate::started::QUIET => Span::raw("✓ ").dim(),
         "failed" => Span::raw("✗ ").fg(Color::Red),
         s if s.starts_with("waiting") || s == "queued" || s == "rate limited" => {
@@ -757,7 +756,6 @@ mod tests {
         assert_eq!(group("failed", false, false, false), Group::NeedsYou);
         // A pull request shows on the row, not as a group of its own.
         assert_eq!(group("idle", false, false, false), Group::Idle);
-        assert_eq!(group("checked", false, false, false), Group::Idle);
         assert_eq!(group("stopped", false, false, false), Group::Idle);
         assert_eq!(group("failed", false, true, true), Group::Done);
     }
