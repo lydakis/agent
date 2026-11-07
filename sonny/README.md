@@ -289,7 +289,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's speed (`standard`, `fast` or `ultrafast`) | `[sonny] task_speed` | `threads_speed` |
 | The approver's judge | `[judge] model`, `effort` | |
 | What `/side`'s copy may do | `[sonny] side_chat` (`fork`, the default, or `answer`) | |
-| The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
+| The chime, the agent's steps, and every tool call drawn | `[sonny] chime`, `steps`, `verbose` (true or false) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
@@ -626,7 +626,7 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
   with its value or what its default is, over the composer. ↑/↓ picks
   one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `senders`, `side_chat`, `chime`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
+  `senders`, `side_chat`, `chime`, `steps`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
   `start_at_boot`) through them
   and its default; Enter types one that takes a name (`model`, `provider`,
   `judge.model`, the profiles), empty for its default; ⌫
@@ -1210,7 +1210,7 @@ turn of the task numbered after that one reopens it.
 
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
 `[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
-the view (`verbose`, off by default), besides the efforts and the side chat
+the view (`steps` and `verbose`, both off by default), besides the efforts and the side chat
 above. `/config` lists the keys under their table's name, a value set in
 the file plain and a default muted, so what you changed stands out.
 
@@ -1311,7 +1311,20 @@ writing. The steps on the way, calls and what
 the bot said before each, are dim; the reply stays bright, under the
 turn's `Worked for …` line.
 
-The view is clean by default: the bot's words, and only the calls that
+By default the conversation is words only: what you said and what the
+agent said back, its questions, and a turn that failed. Nothing between
+them is drawn: no calls, no news from tasks, no messages between agents,
+no notes put in the margin, no `Worked for …` line. The plan shows in the
+margin. A message you send while the agent works waits with a mark by its
+arrow, no words: `›↪` a steer, which goes in when the call under way ends,
+and `›⋯` a queued message, for after the turn. `[sonny] steps = true`
+brings back the steps, the view below, and `/verbose` draws every call.
+
+![Words only: a lead asked to check the work, its words as two tasks report in, and nothing between](../docs/sonny/words-only.png)
+
+![A steer and a queued message waiting while the agent works, each a mark by its arrow](../docs/sonny/waiting-marks.png)
+
+With steps, the view is clean: the bot's words, and only the calls that
 move the work on, said as what they did (a task started, steered or
 waited for, a question to you, the plan, memory, an automation, a window
 opened). Commands, reads and edits are left out: agents are people you
