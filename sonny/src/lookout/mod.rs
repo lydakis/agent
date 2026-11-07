@@ -2169,11 +2169,7 @@ impl Service {
                 .cloned()
                 .collect();
             if all || subs != lookout.subs {
-                let gone: Vec<String> = (lookout.subs.iter())
-                    .filter(|had| !subs.iter().any(|sub| sub.name == had.name))
-                    .map(|had| had.name.clone())
-                    .collect();
-                lookout.updates.ended(&gone);
+                lookout.updates.ended(&gone(&lookout.subs, &subs));
                 lookout.subs = subs;
                 lookout.counting();
                 lookout.roots(&self.records, &self.made);
@@ -3811,6 +3807,16 @@ mod held {
     }
 }
 
+/// The subscriptions of `had` that `now` no longer holds, by name: one
+/// put in another's place under its name ends the one before, so what
+/// that heard is not the new one's to tell.
+fn gone(had: &[subs::Sub], now: &[subs::Sub]) -> Vec<String> {
+    (had.iter())
+        .filter(|had| !now.contains(had))
+        .map(|had| had.name.clone())
+        .collect()
+}
+
 fn epoch_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4390,6 +4396,11 @@ mod tests {
         assert!(lookout.updates.news());
         lookout.updates.ended(&["other".into()]);
         assert!(lookout.updates.news(), "another's end leaves it");
+        // Put in its own place under its name, it ended all the same.
+        let mut again = lookout.subs[0].clone();
+        assert!(gone(&lookout.subs, &[again.clone()]).is_empty());
+        again.made = Some(1);
+        assert_eq!(gone(&lookout.subs, &[again]), ["tasks"]);
         lookout.updates.ended(&["tasks".into()]);
         assert!(!lookout.updates.news());
     }
