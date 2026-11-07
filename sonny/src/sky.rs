@@ -204,7 +204,7 @@ enum Feed {
     /// that ended unsure of them.
     Scans(mpsc::UnboundedSender<(String, Option<i64>)>),
     /// An agent's history read for its questions: none when it could not be.
-    Asked(String, Option<crate::needs::Seen>),
+    Asked(String, Option<Box<crate::needs::Seen>>),
     Live(Value),
     /// An agent's model, read again after it was configured.
     Model(String, String),
@@ -311,6 +311,9 @@ struct Agent {
     /// When it was last lit.
     lit: Option<Instant>,
     twinkle: Option<(Instant, Color, Work)>,
+    /// When it last came to need the person, live: its name's `?` beats
+    /// a few times from then, as the footer's count does.
+    asked: Option<Instant>,
     /// A commons post's ripple: when, and how far it spreads.
     ripple: Option<(Instant, f32)>,
     /// When one of its schedules last woke it: its tick flashes.
@@ -348,6 +351,13 @@ struct Agent {
 }
 
 impl Agent {
+    /// Whether its `?` is on a beat `now`: it needs the person and came
+    /// to a moment ago, so the mark beats a few times and then holds.
+    fn beats(&self, now: Instant) -> bool {
+        self.state() == Some(State::NeedsYou)
+            && (self.asked).is_some_and(|at| crate::look::beat(now.saturating_duration_since(at)))
+    }
+
     /// Its model, as `m` colours it: by name and provider, so one
     /// model's ids from one provider, as two Bedrock regions', share a
     /// colour.
@@ -1109,7 +1119,7 @@ impl View {
                         && !self.agents[at].waits.unsure(&name)
                     {
                         let running = self.agents[at].running.is_some();
-                        let ask = seen.open(&self.resolved, &name, running);
+                        let ask = (*seen).open(&self.resolved, &name, running);
                         self.agents[at].waits.asked(&name, ask);
                     }
                 }
@@ -1876,6 +1886,9 @@ impl View {
         let waiting = self.agents[at].state() == Some(State::NeedsYou);
         if own && live {
             self.agents[at].waits.event(event);
+            if !waiting && self.agents[at].state() == Some(State::NeedsYou) {
+                self.agents[at].asked = Some(now);
+            }
         }
         match event["event"].as_str().unwrap_or("") {
             kind @ ("queued" | "accepted" | "steered") => {
@@ -3182,10 +3195,16 @@ impl View {
             let agent = &self.agents[at];
             // The mark says what the colour does: `? ` for an agent that
             // needs you, `✗ ` for one that failed. Bold while it works.
+            // A `?` new since a moment ago beats, reversed, then holds.
             let mark = match agent.state() {
                 Some(state @ (State::NeedsYou | State::Failed)) => {
                     let (mark, color, _) = state.mark();
-                    Some((mark, Style::default().fg(color).bold()))
+                    let style = Style::default().fg(color).bold();
+                    let style = match agent.beats(now) {
+                        true => style.reversed(),
+                        false => style,
+                    };
+                    Some((mark, style))
                 }
                 _ => None,
             };
@@ -3631,10 +3650,14 @@ impl View {
                 g if g > 0.08 => Span::raw("•"),
                 _ => Span::raw("·").dim(),
             };
+            // The same beat as in the sky for a `?` just raised.
             let mark = match agent.state() {
                 Some(state) => {
                     let (mark, color, _) = state.mark();
-                    Span::raw(mark).fg(color)
+                    match agent.beats(now) {
+                        true => Span::raw(mark).fg(color).reversed(),
+                        false => Span::raw(mark).fg(color),
+                    }
                 }
                 None => Span::raw(" "),
             };
@@ -4227,9 +4250,10 @@ impl Ink {
     }
 }
 
-/// The two ends a working star breathes between: the theme's text and the
-/// text taken further from the background, toward white on a dark theme
-/// and black on a light one. Where the theme's colours are not known, or
+/// The two ends a working star breathes between: muted text, as the theme
+/// draws it, and the text taken further from the background, toward white
+/// on a dark theme and black on a light one; wide enough apart to see from
+/// the corner of the eye (F12), smooth and slow, so it never blinks. Where the theme's colours are not known, or
 /// with `NO_COLOR`, the star holds still in bold: a breath stepped through
 /// bold and plain would blink, the most distracting motion there is.
 struct Shade(Option<(crate::term::Rgb, crate::term::Rgb)>);
@@ -4239,13 +4263,16 @@ impl Shade {
         let theme = crate::term::theme();
         Shade(
             match (crate::look::no_color(), theme.foreground, theme.background) {
-                (false, Some(foreground), Some(_)) => {
+                (false, Some(foreground), Some(background)) => {
                     let far = if crate::term::light() {
                         (0, 0, 0)
                     } else {
                         (255, 255, 255)
                     };
-                    Some((foreground, crate::look::blend(far, foreground, 0.6)))
+                    Some((
+                        crate::look::muted(foreground, background),
+                        crate::look::blend(far, foreground, 0.6),
+                    ))
                 }
                 _ => None,
             },
@@ -4779,7 +4806,7 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
     tokio::spawn(async move {
         while let Some((bot, turn)) = asked.recv().await {
             let seen = crate::needs::scan(&reader, &bot, turn).await;
-            if told.send(Feed::Asked(bot, seen)).is_err() {
+            if told.send(Feed::Asked(bot, seen.map(Box::new))).is_err() {
                 return;
             }
         }
@@ -7498,6 +7525,24 @@ mod tests {
         let shown = text(&view.card(100, 40));
         assert!(shown.contains("? shop lead"), "{shown}");
         assert!(shown.contains("✗ cart"), "{shown}");
+        // A `?` just raised beats reversed, then holds still.
+        // The compact list a small pane draws beats the same.
+        let beating = |view: &mut View, cols: usize, rows: usize| {
+            (view
+                .card(cols, rows)
+                .iter()
+                .flat_map(|line| line.spans.iter()))
+            .filter(|span| span.content.contains('?'))
+            .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .count()
+        };
+        assert_eq!(beating(&mut view, 100, 40), 2);
+        assert_eq!(beating(&mut view, 50, 20), 2);
+        for agent in &mut view.agents {
+            agent.asked = agent.asked.map(|at| at - Duration::from_secs(2));
+        }
+        assert_eq!(beating(&mut view, 100, 40), 0);
+        assert_eq!(beating(&mut view, 50, 20), 0);
         assert_eq!(
             text(&[view.footer(100)]),
             "  3 agents · ? 2 need you · ● 0 working · ✗ 1 failed · 3 messages in the last minute"
@@ -7538,21 +7583,24 @@ mod tests {
         ]))
         .unwrap();
         let seen = |turn: i64| crate::needs::Seen {
-            ask: Some("q1".into()),
+            ask: crate::asks::call(
+                &crate::asks::id(2, "q1"),
+                &json!({"question": "q1", "options": [{"label": "a"}]}),
+            ),
             itself: false,
             turn: Some(turn),
         };
         // Its lead resolved the cart past the turn that asked; the login
         // still asks, as does the cart once a later turn reopens it.
-        send.send(Feed::Asked("shop.cart".into(), Some(seen(4))))
+        send.send(Feed::Asked("shop.cart".into(), Some(Box::new(seen(4)))))
             .unwrap();
-        send.send(Feed::Asked("shop.login".into(), Some(seen(4))))
+        send.send(Feed::Asked("shop.login".into(), Some(Box::new(seen(4)))))
             .unwrap();
         view.drain();
         let state = |view: &View, name: &str| view.agents[view.index[name]].state();
         assert_ne!(state(&view, "shop.cart"), Some(State::NeedsYou));
         assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
-        send.send(Feed::Asked("shop.cart".into(), Some(seen(6))))
+        send.send(Feed::Asked("shop.cart".into(), Some(Box::new(seen(6)))))
             .unwrap();
         view.drain();
         assert_eq!(state(&view, "shop.cart"), Some(State::NeedsYou));

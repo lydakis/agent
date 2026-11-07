@@ -1325,6 +1325,37 @@ Clippy, formatting, and diff checks passed. Regressions verify completed and
 pending CLI polls, mixed tool results, pending process handles, waiter cleanup,
 and a request whose pacing reservation ends while its stream remains active.
 
+## Foreground commands in the running count (#716)
+
+`stats.running_processes` counted only the store's running process rows, so
+a bot's foreground command, holding a process slot, showed as nothing
+running. The registry now keeps one counter of foreground commands holding
+a slot (one atomic add when the slot is taken, one subtract when the
+command ends), and another of those a steer moved to the background, which
+the store counts as a process of their own from then on; `stats` adds the
+difference. Each foreground command pays two relaxed atomic operations, and
+a lifted one two more; nothing is read or written in the store.
+
+The Perf workflow's matched screen, base `main` against this branch at
+65d224b (the counter before lifted commands were taken out of it, which
+adds work only to a lift), on a GitHub runner:
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 39.774 | 38.834 | -2.4% |
+| Burst submit p99, ms | 6.392 | 6.478 | +1.3% |
+| Release to terminal p99, ms | 13.994 | 13.9 | -0.7% |
+| Idle RSS, MiB | 20.814 | 20.883 | +0.3% |
+| Per idle bot, KiB | 1.526 | 1.484 | -2.8% |
+| RSS after a turn each, MiB | 29.186 | 29.504 | +1.1% |
+| Daemon CPU per turn, ms | 1.278 | 1.264 | -1.1% |
+| Lifecycle CPU, s | 1.17 | 1.17 | -0.0% |
+| Lifecycle p95 turn, ms | 581.848 | 579.764 | -0.4% |
+| Lifecycle peak RSS, MiB | 26.795 | 27.488 | +2.6% |
+
+Nothing moved past noise, and the gate counted no more store work per
+turn. Sonny's rows moved within their noise.
+
 ## Background admission bound
 
 Observed 2026-09-18 on the same Darwin arm64 host, external power, Rust
@@ -2338,6 +2369,27 @@ Clippy, formatting, and diff checks passed. The new burst regression failed
 with the cap and now admits 128 requests without waiting for any headers.
 The caller-selected startup-bound test again starts cold, without a warmup;
 pacing, retry, interruption, and restart tests continue to pass.
+
+## One TLS setup for every connection shard (A2)
+
+`agent serve` to its bound socket, release build, a fresh HOME, no SSL
+environment variables, default limits (64 HTTP/2 shards), median of 7 on
+a Linux cloud box:
+
+| Build | Median | Fastest |
+| --- | ---: | ---: |
+| `main` | 215 ms | 164 ms |
+| One shared TLS setup | 17 ms | 16 ms |
+
+Each shard's client used to build its own TLS setup, and each build read
+the system's root certificates again (248 files under `/etc/ssl/certs`).
+The shards and the websocket path now share one `rustls` setup with the
+platform verifier, so the certificates load once. Nothing on a turn's
+path changes; requests verify as before. With one shard
+(`--max-active 64`) start was already about 24 ms, which the shared setup
+now matches at any shard count. On macOS the platform verifier asks the
+Security framework instead of reading files; that cost per client was
+not measured here.
 
 ## Storage counters by operation
 
@@ -5897,6 +5949,36 @@ Store jobs per turn did not change (7.5 on both), and nothing passed the
 gate's 15%. The steps path itself is not measured: it runs once per step a
 client asks about, one store job to decide it and one to record its end.
 
+## Command rules a running turn takes at its next round (#759)
+
+Each model round now takes rules given since the last one: one uncontended
+`std::sync::Mutex` lock on the turn's slot for them, and one more with an
+`Arc` clone where a call is ruled. A rules change looks up each running
+turn it reaches in the active map, by the names the store's recursive
+update of the bot's kin returns, so nothing is walked twice and no round
+pays for a change it does not see.
+
+The Perf workflow's matched screen, base `main` against this branch at
+cc23489, on a GitHub runner:
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 25.821 | 25.868 | +0.2% |
+| Burst submit p99, ms | 3.211 | 3.147 | -2.0% |
+| Release to terminal p99, ms | 7.335 | 7.423 | +1.2% |
+| Idle RSS, MiB | 20.791 | 20.383 | -2.0% |
+| Per idle bot, KiB | 1.534 | 1.562 | +1.8% |
+| RSS after a turn each, MiB | 29.916 | 29.758 | -0.5% |
+| Daemon CPU per turn, ms | 0.695 | 0.682 | -1.8% |
+| Lifecycle CPU, s | 0.75 | 0.67 | -10.7% |
+| Lifecycle p95 turn, ms | 661.748 | 573.666 | -13.3% |
+| Lifecycle peak RSS, MiB | 27.533 | 26.877 | -2.4% |
+
+Nothing moved past noise, and the gate counted no more store work per
+turn. Sonny's code is not touched; its lookout CPU at 10x1 read 6.25 then
+12.5 ms, the smallest of its screens, while the larger ones moved within
+their noise.
+
 ## A session's queue is bounded by bytes, not 64 messages (#425)
 
 A session's output channel is now unbounded, and its 2 MiB budget, at 64
@@ -7252,3 +7334,92 @@ neither sends nor reads a take; the same measure at 10x100 moved +0.7%.
 | lifecycle | CPU, s | 1.235 | 1.185 | -4.0% |
 | lifecycle | p95 turn, ms | 584.283 | 579.215 | -0.9% |
 | lifecycle | peak RSS, MiB | 27.512 | 27.596 | +0.3% |
+
+
+## Budgets count work (#729)
+
+Each model call's usage commit now also adds the call's work to the turn
+and the bot and stores the node its calls have read through (`bots.work`,
+`work_read`; `turns.work`), as more columns in the two cached UPDATEs
+that already recorded its usage, with no new statement and no new store
+job. A turn's finish returns its `limited` column from the UPDATE that
+already ends it. The check for a spent budget is arithmetic on the bot the
+turn already holds.
+
+The first screen of this branch showed daemon CPU per turn in
+`bench.footprint` up about 20% (median 1.28 ms on `main` against 1.57 on
+the head, over eight runs each, interleaved). Store work per turn was the
+same (7.4 jobs), so the cost was in a statement: the finish had moved from
+a cached statement to `query_row` on a `format!`ed one, which SQLite parsed
+again on every turn. Cached again, sixteen interleaved runs read 1.434 ms
+on `main` and 1.454 on the head.
+
+The Perf workflow's matched screen (`bench.perf_gate`), base `main`
+(be1a3bb) against the head with that fix, two alternating rounds on one
+4-CPU Linux box:
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 51.211 | 59.876 | +16.9% |
+| Burst submit p99, ms | 7.931 | 9.541 | +20.3% |
+| Release to terminal p99, ms | 21.146 | 14.682 | -30.6% |
+| Idle RSS, MiB | 21.062 | 21.188 | +0.6% |
+| Per idle bot, KiB | 1.436 | 1.384 | -3.6% |
+| RSS after a turn each, MiB | 29.217 | 29.236 | +0.1% |
+| Daemon CPU per turn, ms | 1.542 | 1.487 | -3.6% |
+| Lifecycle CPU, s | 2.065 | 1.42 | -31.2% |
+| Lifecycle p95 turn, ms | 667.749 | 601.482 | -9.9% |
+| Lifecycle peak RSS, MiB | 27.822 | 27.82 | -0.0% |
+
+Store work per turn is identical on both sides, and the gate flags
+nothing. The box is noisy at these sizes: the admission rows moved the
+other way in the first screen (lone submit CPU -2.8%, burst p99 +3.0%),
+and lone submit CPU ran 41–58 ms on `main` and 40–73 on the head across
+both, a submit path this change does not touch.
+
+A review found that measuring a call's new input as the request's growth over
+the previous call (input less what that one sent and got back) hides new
+material when the request also shrinks: an elision that drops 50K of old
+results in the call that adds a 10K result reads as no growth. The measure
+now counts the items each request sends past the node the bot's calls have
+read through, from the end of the window the turn already holds: a walk over
+the new items only (typically the prompt or a round's tool results), integer
+adds on sizes the window already carries, no store read and no history
+scan, then one multiply and divide for their share of the reported input.
+The usage UPDATE writes one column (`work_read`) where it wrote two
+(`carried`, `carried_model`), and the bot row reads one fewer. Per call that
+is O(new items) at one bot or at thousands, the same order as appending
+those items; the Perf workflow's screen of the head is checked before merge.
+
+## A turn's reply shaped by a JSON Schema (#722)
+
+`submit`'s `output_schema` (protocol 51, schema 81) is kept in one
+nullable `turns.output_schema` column. A turn without one stores NULL and
+reads one more column in the context query it already runs when it starts,
+so its store work is unchanged: no new statement, row or index. A judge
+turn sends its fixed schema, about 0.6 KB, with each model call, and gets
+no keep-warm refresh. The migration adds the column once at open.
+
+The Perf workflow's matched screen of this change against its base
+(`bench.perf_gate`, GitHub runner, head 61b4ab1 against main 8bd20e2):
+store work per turn is the same and the gate gave no warnings. Lifecycle
+CPU moved +7.7% while its p95 turn moved -11.5%, both inside the runner's
+spread, and the completion and footprint moves stay under 4%.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 30.77 | 30.917 | +0.5% |
+| admission | burst submit p99, ms | 4.285 | 4.221 | -1.5% |
+| completion | release to terminal p99, ms | 9.548 | 9.863 | +3.3% |
+| footprint | idle RSS, MiB | 20.389 | 20.355 | -0.2% |
+| footprint | per idle bot, KiB | 1.56 | 1.48 | -5.1% |
+| footprint | RSS after a turn each, MiB | 30.451 | 30.555 | +0.3% |
+| footprint | CPU per turn, ms | 0.893 | 0.927 | +3.8% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 8.435 | 8.685 | +3.0% |
+| sonny | lookout note p95 at 10x100, ms | 2879.0 | 3004.5 | +4.4% |
+| sonny | lookout note p95 at 100x10, ms | 2977.5 | 2901.0 | -2.6% |
+| sonny | quiet window CPU, ms/s | 3.335 | 3.035 | -9.0% |
+| sonny | sky replay CPU per 1k lines, ms | 10.17 | 9.34 | -8.2% |
+| lifecycle | CPU, s | 0.845 | 0.91 | +7.7% |
+| lifecycle | p95 turn, ms | 702.273 | 621.715 | -11.5% |
+| lifecycle | peak RSS, MiB | 27.988 | 27.758 | -0.8% |

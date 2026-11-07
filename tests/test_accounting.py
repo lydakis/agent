@@ -19,80 +19,107 @@ ROOT = Path(__file__).resolve().parent.parent
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class AccountingTests(ModelFixture):
-    def test_failed_attempt_usage_limits_retries_and_later_tool_rounds(self):
+    def test_failed_attempt_usage_counts_and_a_spent_budget_retries_without_tools(self):
         client = self.client('echo')
-        # Each attempt reports 110 tokens. Check before the retry, after a
-        # successful tool call, and allow completion with sufficient budget.
-        for budget, calls, status in ((100, 1, 'failed'), (220, 2, 'failed'), (330, 3, 'completed')):
+        # The first attempt fails and reports 100 in, 10 out: the bot's first
+        # call, all of it new. Its retry re-reads what it sent and is charged
+        # its output; a call after it, its output and its share for the
+        # tool's result it sends new. A budget that attempt spent sends the retry without
+        # tool calls, and the turn ends on its reply; one the retry leaves
+        # room in lets the turn run as asked.
+        for budget, calls, limit in ((100, 2, 'budget'), (220, 3, None)):
             with self.subTest(budget=budget):
                 prior_calls = self.model.requests.qsize()
                 bot = f'Budget{budget}'
-                client.request('create', bot=bot, workspace=str(self.path), budget_tokens=budget)
+                client.request('create', bot=bot, workspace=str(self.path), budget_tokens=budget,
+                               budget_counts='work')
                 turn = client.request('submit', bot=bot, request_id='run',
                                       prompt=f'tool:billed-retry:{budget}')['result']['turn']
                 data = client.finished(turn)['data']
-                self.assertEqual(data['status'], status)
-                if status == 'failed':
-                    self.assertEqual(data['error'], 'budget_exhausted')
+                self.assertEqual((data['status'], data.get('limit')), ('completed', limit))
                 row = client.request('turns', bot=bot)['result']['turns'][0]
                 self.assertEqual((row['model_rounds'], row['input_tokens'], row['output_tokens']),
                                  (calls, calls * 100, calls * 10))
-                self.assertEqual(row['retries'], int(calls > 1))
+                work = row['work_tokens']
+                if calls == 2:
+                    self.assertEqual(work, 120)
+                else:
+                    self.assertTrue(130 < work < 220, work)
+                self.assertEqual(row['retries'], 1)
                 self.assertEqual(self.model.requests.qsize() - prior_calls, calls)
-                self.assertEqual(client.request('inspect', bot=bot)['result']['tokens_used'], calls * 110)
+                bot_row = client.request('inspect', bot=bot)['result']
+                self.assertEqual((bot_row['tokens_used'], bot_row['work_tokens']), (calls * 110, work))
                 self.assertEqual(client.request('stats')['result']['tokens']['input_tokens'],
                                  (prior_calls + calls) * 100)
                 page = client.request('events', bot=bot, after=0, limit=256)['result']['events']
-                self.assertEqual(sum(e['event'] == 'tool_completed' for e in page), int(calls > 1))
+                self.assertEqual(sum(e['event'] == 'tool_completed' for e in page), int(budget > 100))
 
     def tool_output(self, client, bot, call_id):
         events = client.request('events', bot=bot, after=0, limit=256)['result']['events']
         node = [e for e in events if e['event'] == 'tool_completed' and e['data']['call_id'] == call_id][-1]['data']['node']
         return node_item(client, bot, node)['result']['output']
 
-    def test_budget_refuses_submissions_and_stops_turns_before_the_next_call(self):
+    def test_budget_refuses_submissions_and_ends_turns_on_a_reply(self):
         client = self.client('echo,shell,wait')
         self.assertEqual(client.request('create', bot='Zero', workspace=str(self.path), budget_tokens=0)['error'],
                          'invalid_budget')
-        # Each synthetic call costs 110 tokens; a 200-token budget allows one call
-        # per turn and refuses the third turn outright.
-        bot = client.request('create', bot='Bob', workspace=str(self.path), budget_tokens=200)['result']
-        self.assertEqual((bot['budget_tokens'], bot['tokens_used']), (200, 0))
+        self.assertEqual(client.request('create', bot='Odd', workspace=str(self.path),
+                                        budget_counts='work')['error'], 'invalid_budget')
+        # Each synthetic call sends 100 and writes 10. Counting work, the
+        # bot's first call is all new; a later one is charged its output and
+        # the share of its request it sends new (a prompt, a tool's result),
+        # the history it sends again free.
+        bot = client.request('create', bot='Bob', workspace=str(self.path), budget_tokens=115,
+                             budget_counts='work')['result']
+        self.assertEqual((bot['budget_tokens'], bot['budget_counts'], bot['tokens_used'], bot['work_tokens']),
+                         (115, 'work', 0, 0))
         first = client.request('submit', bot='Bob', request_id='1', prompt='hello')['result']['turn']
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
-        self.assertEqual(client.request('inspect', bot='Bob')['result']['tokens_used'], 110)
-        # A tool turn needs two calls: the second is refused before it starts,
-        # so the tool ran, but the turn fails without an uncertain tool.
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['work_tokens'], 110)
+        # A tool turn's first call spends the budget: its tool runs, and the
+        # call after goes without tool calls, so the turn ends on a reply,
+        # completed at its budget rather than failing.
         second = client.request('submit', bot='Bob', request_id='2', prompt='tool:x')['result']['turn']
-        end = client.finished(second)
-        self.assertEqual((end['data']['status'], end['data']['error']), ('failed', 'budget_exhausted'))
-        self.assertIn('220 of 200', end['data']['detail'])
-        # The end carries the refusal's facts, as a reply does.
-        self.assertEqual((end['data']['budget_tokens'], end['data']['tokens_used']), (200, 220))
-        self.assertEqual(client.request('submit', bot='Bob', request_id='3', prompt='again')['error'], 'budget_exhausted')
+        end = client.finished(second)['data']
+        self.assertEqual((end['status'], end['error'], end['limit']), ('completed', None, 'budget'))
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        self.assertEqual(sum(e['event'] == 'tool_completed' and e['turn'] == second for e in events), 1)
+        refused = client.request('submit', bot='Bob', request_id='3', prompt='again')
+        self.assertEqual(refused['error'], 'budget_exhausted')
+        work = refused['work_tokens']
+        self.assertTrue(130 < work < 200, work)
+        self.assertIn(f'{work} of 115 tokens of work done', refused['detail'])
+        self.assertEqual(refused['budget_counts'], 'work')
         listing = client.request('turns', bot='Bob')['result']
-        self.assertEqual([t['status'] for t in listing['turns']], ['completed', 'failed'])
-        # Turn 2 made one call (100 in, 10 out) before the check refused the second.
-        self.assertEqual([t['input_tokens'] for t in listing['turns']], [100, 100])
-        self.assertEqual([t['model_rounds'] for t in listing['turns']], [1, 1])
+        self.assertEqual([t['status'] for t in listing['turns']], ['completed', 'completed'])
+        self.assertEqual([t.get('limit') for t in listing['turns']], [None, 'budget'])
+        self.assertEqual([t['input_tokens'] for t in listing['turns']], [100, 200])
+        self.assertEqual([t['work_tokens'] for t in listing['turns']], [110, work - 110])
+        self.assertEqual([t['model_rounds'] for t in listing['turns']], [1, 2])
         self.assertTrue(all(t['started_ms'] <= t['finished_ms'] for t in listing['turns']))
         self.assertEqual(listing['turns'][0]['workspace'], str(self.path.resolve()))
         self.assertEqual(listing['turns'][0]['model'], 'openai/synthetic-model')
-        # Forks carry their own budget, not the parent's usage.
+        # Forks carry their own budget, not the parent's work.
         checkpoint = [e for e in client.request('events', bot='Bob', after=0, limit=256)['result']['events']
                       if e['event'] == 'turn_finished'][0]['data']['checkpoint']
-        fork = client.request('fork', source='Bob', checkpoint=checkpoint, bot='Fork', budget_tokens=500)['result']
-        self.assertEqual((fork['budget_tokens'], fork['tokens_used']), (500, 0))
+        fork = client.request('fork', source='Bob', checkpoint=checkpoint, bot='Fork', budget_tokens=500,
+                              budget_counts='work')['result']
+        self.assertEqual((fork['budget_tokens'], fork['budget_counts'], fork['tokens_used'], fork['work_tokens']),
+                         (500, 'work', 0, 0))
         free = client.request('fork', source='Bob', checkpoint=checkpoint, bot='Free')['result']
-        self.assertIsNone(free['budget_tokens'])
-        # A resumed task reloads the durable total rather than resetting its budget.
-        client.request('create', bot='Parked', workspace=str(self.path), budget_tokens=110)
+        self.assertEqual((free['budget_tokens'], free['budget_counts']), (None, 'tokens'))
+        # A resumed task reloads the durable work rather than resetting it:
+        # the call after its wait is its last.
+        client.request('create', bot='Parked', workspace=str(self.path), budget_tokens=110,
+                       budget_counts='work')
         parked = client.request('submit', bot='Parked', request_id='park', prompt='wait:proc:999999')['result']['turn']
-        self.assertEqual(client.finished(parked)['data']['error'], 'budget_exhausted')
+        end = client.finished(parked)['data']
+        self.assertEqual((end['status'], end['limit']), ('completed', 'budget'))
         row = client.request('turns', bot='Parked')['result']['turns'][0]
-        self.assertEqual((row['input_tokens'], row['output_tokens'], row['model_rounds']), (100, 10, 1))
+        self.assertEqual(row['model_rounds'], 2)
+        self.assertTrue(120 < row['work_tokens'] < 200, row)
 
-    def test_a_turns_own_cap_stops_it_before_the_next_call(self):
+    def test_a_turns_own_cap_ends_it_on_a_reply(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
         submit = lambda key, prompt, **more: client.request(
@@ -101,31 +128,75 @@ class AccountingTests(ModelFixture):
         self.assertEqual(submit('huge', 'hello', budget_tokens=2**63)['error'], 'invalid_budget')
         self.assertEqual(submit('steer', 'hello', budget_tokens=10, delivery='steer')['error'],
                          'invalid_delivery')
-        # Each synthetic call costs 110 tokens. A turn capped at 110 makes one
-        # call; its tool still runs, and the turn fails before the second.
+        # The bot's first call, 110 tokens, spends a cap of 110: its tool
+        # still runs, and the turn ends on the reply after it.
         capped = submit('capped', 'tool:x', budget_tokens=110)['result']['turn']
         end = client.finished(capped)['data']
-        self.assertEqual((end['status'], end['error']), ('failed', 'turn_budget_exhausted'))
-        self.assertEqual((end['turn_budget_tokens'], end['turn_tokens_used']), (110, 110))
+        self.assertEqual((end['status'], end['limit']), ('completed', 'turn_budget'))
         self.assertEqual(submit('capped', 'tool:x', budget_tokens=220)['error'], 'idempotency_conflict')
-        # The cap is the turn's: the bot's own count is past it, and the next
-        # turn, capped or not, starts from its own zero.
-        self.assertEqual(client.request('inspect', bot='Bob')['result']['tokens_used'], 110)
+        # The cap is the turn's: the next turn, capped or not, starts from
+        # its own zero.
+        bot = client.request('inspect', bot='Bob')['result']
+        self.assertEqual(bot['tokens_used'], 220)
+        self.assertTrue(120 < bot['work_tokens'] < 200, bot)
         for key, more in (('free', {}), ('roomy', {'budget_tokens': 220})):
             turn = submit(key, 'tool:x', **more)['result']['turn']
-            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            end = client.finished(turn)['data']
+            self.assertEqual((end['status'], end.get('limit')), ('completed', None))
         listing = client.request('turns', bot='Bob')['result']['turns']
         self.assertEqual([t['budget_tokens'] for t in listing], [110, None, 220])
-        self.assertEqual([t['model_rounds'] for t in listing], [1, 2, 2])
-        # A turn that resumes after parking counts what it spent before.
-        parked = submit('park', 'wait:proc:999999', budget_tokens=110)['result']['turn']
+        self.assertEqual([t['model_rounds'] for t in listing], [2, 2, 2])
+        work = [t['work_tokens'] for t in listing]
+        self.assertEqual(work[0], bot['work_tokens'])
+        self.assertTrue(all(20 < w < 100 for w in work[1:]), work)
+        # A turn that resumes after parking counts what it did before: its
+        # first call spent its cap, so the call after its wait is its last.
+        parked = submit('park', 'wait:proc:999999', budget_tokens=10)['result']['turn']
         end = client.finished(parked)['data']
-        self.assertEqual((end['error'], end['turn_tokens_used']), ('turn_budget_exhausted', 110))
+        self.assertEqual((end['status'], end['limit']), ('completed', 'turn_budget'))
         # Under both caps the bot's own is named: it outlasts the turn.
         client.request('create', bot='Both', workspace=str(self.path), budget_tokens=110)
         both = client.request('submit', bot='Both', request_id='1', prompt='tool:x',
                               budget_tokens=110)['result']['turn']
-        self.assertEqual(client.finished(both)['data']['error'], 'budget_exhausted')
+        self.assertEqual(client.finished(both)['data']['limit'], 'budget')
+        # A cap spent before the turn's first call fails it: there is
+        # nothing to report.
+        self.assertEqual(client.request('submit', bot='Both', request_id='2', prompt='hello')['error'],
+                         'budget_exhausted')
+
+    def test_a_history_past_a_turns_cap_still_answers_it_cold(self):
+        # The provider counts a request by its size, and caches nothing: a
+        # bot whose history is many times a turn's cap, its cache long gone,
+        # gets a message under that cap. Counting work, the turn is charged
+        # what it adds, the message and the reply, not the history it sends
+        # again; counting tokens, the default, the history spends the cap.
+        self.model.bytes_per_token = 4
+        # A reply as short as the ten tokens the provider reports for it.
+        self.model.reply_text = 'noted'
+        client = self.client('echo')
+        client.request('create', bot='Elder', workspace=str(self.path))
+        for i in range(4):
+            turn = client.request('submit', bot='Elder', request_id=f'h{i}',
+                                  prompt='history ' + 'x' * 40_000)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        history = client.request('turns', bot='Elder', after=0, limit=8)['result']['turns'][-1]
+        self.assertGreater(history['input_tokens'], 40_000)
+        invited = client.request('submit', bot='Elder', request_id='invite', prompt='tool:what do you think?',
+                                 budget_tokens=10_000, budget_counts='work')['result']['turn']
+        end = client.finished(invited)['data']
+        self.assertEqual((end['status'], end.get('limit')), ('completed', None))
+        row = client.request('turns', bot='Elder', after=invited - 1, limit=1)['result']['turns'][0]
+        # Two calls, each sending the whole history; charged a few hundred.
+        self.assertEqual(row['model_rounds'], 2)
+        self.assertGreater(row['input_tokens'], 80_000)
+        self.assertLess(row['work_tokens'], 1_000)
+        self.assertEqual(row['budget_counts'], 'work')
+        counted = client.request('submit', bot='Elder', request_id='counted', prompt='tool:and now?',
+                                 budget_tokens=10_000)['result']['turn']
+        end = client.finished(counted)['data']
+        self.assertEqual((end['status'], end.get('limit')), ('completed', 'turn_budget'))
+        row = client.request('turns', bot='Elder', after=counted - 1, limit=1)['result']['turns'][0]
+        self.assertEqual(row['budget_counts'], 'tokens')
 
     def test_cache_hits_are_recorded_per_turn_per_bot_and_per_daemon(self):
         client = self.client()

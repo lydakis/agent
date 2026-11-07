@@ -100,11 +100,13 @@ const EARNS_FOR: i64 = 7 * 86_400;
 /// How long an invite may take to reach an agent before it counts as
 /// given back, in seconds: one whose sender was stopped never settles.
 const SENDING_FOR: i64 = 5 * 60;
-/// The tokens an invite pays for in its thread, from `[sonny]
+/// The tokens of work an invite pays for in its thread, from `[sonny]
 /// commons_invite_tokens`: the turn it starts, and the turns a reply there
-/// starts for the invited agent while any are left, each capped at what
-/// is. Once they are spent, a reply joins the agent's next model call, as
-/// for any poster.
+/// starts for the invited agent while any are left. A turn started runs to
+/// its own end, under the agent's round limit and none of the invite's, so
+/// a reply is never cut short; what it did counts toward the next. Once
+/// they are spent, a reply joins the agent's next model call, as for any
+/// poster.
 fn invite_tokens() -> u64 {
     settings().1
 }
@@ -221,7 +223,7 @@ pub fn call(
         let text = reply["text"].as_str().unwrap_or_default();
         return add(&dir, thread, &entry(author, author_id, model, text, reply)?);
     }
-    list(&dir, from, LIST_BYTES, &mut Summaries::new())
+    list(&dir, from, LIST_BYTES, &mut Summaries::new(), &sent(&dir))
 }
 
 fn valid_name(name: &str) -> Result<(), String> {
@@ -609,8 +611,8 @@ fn paid(dir: &Path, thread: &str, bot: &str, turn: i64) {
 }
 
 /// What is left of an invite that paid for `turns` of `bot`; none when a
-/// turn cannot be read. A turn not yet finished holds its whole cap, which
-/// it may still spend, so a reply meanwhile joins it rather than funding
+/// turn cannot be read. A turn not yet finished holds all of it, which it
+/// may still spend, so a reply meanwhile joins it rather than funding
 /// another.
 async fn left(client: &agent_client::Client, bot: &str, turns: &[i64], pays: u64) -> u64 {
     let mut spent = 0;
@@ -624,8 +626,9 @@ async fn left(client: &agent_client::Client, bot: &str, turns: &[i64], pays: u64
         else {
             return 0;
         };
-        let used =
-            row["input_tokens"].as_u64().unwrap_or(0) + row["output_tokens"].as_u64().unwrap_or(0);
+        // Its work, as the daemon counts budgets: what it added, not the
+        // history each of its calls sent again.
+        let used = row["work_tokens"].as_u64().unwrap_or(0);
         let holds = match row["finished_ms"].is_null() {
             true => row["budget_tokens"].as_u64().unwrap_or(u64::MAX).max(used),
             false => used,
@@ -790,8 +793,7 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
             let bot = pool.swap_remove(draw() % pool.len());
             let note = invited_note(thread, title, author, ticket);
             let submit = json!({"bot": bot, "prompt": note, "delivery": "queue",
-                "origin": ORIGIN, "request_id": format!("commons.invite.{thread}"),
-                "budget_tokens": pays(ticket)});
+                "origin": ORIGIN, "request_id": format!("commons.invite.{thread}")});
             if let Ok(started) = client.request("submit", submit).await
                 && let Some(turn) = started["turn"].as_i64()
             {
@@ -1023,11 +1025,18 @@ fn summary(name: &str, path: &Path) -> Option<Value> {
 }
 
 /// The threads from the `from`th newest, as many as `bytes` holds, with
-/// `next` where the rest start; `known` keeps what each read found.
-fn list(dir: &Path, from: usize, bytes: usize, known: &mut Summaries) -> Result<Value, String> {
+/// `next` where the rest start; `known` keeps what each read found, and
+/// `sent` is the week's invites, read once by the caller.
+fn list(
+    dir: &Path,
+    from: usize,
+    bytes: usize,
+    known: &mut Summaries,
+    sent: &[Value],
+) -> Result<Value, String> {
     let entries = match std::fs::read_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(json!({"dir": dir, "threads": [], "invites": budget(&[], agents(dir))}));
+            return Ok(json!({"dir": dir, "threads": [], "invites": budget(sent, agents(dir))}));
         }
         entries => entries.map_err(|e| format!("commons_failed: {}: {e}", dir.display()))?,
     };
@@ -1072,7 +1081,7 @@ fn list(dir: &Path, from: usize, bytes: usize, known: &mut Summaries) -> Result<
     }
     let next = from + shown.len();
     let mut listed = json!({"dir": dir, "threads": shown,
-        "invites": budget(&sent(dir), agents(dir))});
+        "invites": budget(sent, agents(dir))});
     if next < of {
         listed["next"] = json!(next);
         listed["of"] = json!(of);
@@ -1094,7 +1103,7 @@ pub fn told(replied: &Value, author: &str) -> String {
 
 /// Wakes each of `tell` whose invite to the thread has tokens left with
 /// the reply `replied`, while it still listens to the thread: the note
-/// starts its turn, capped at what is left. The rest hear of it through
+/// starts its turn, which runs to its own end. The rest hear of it through
 /// their subscription to the thread, as the lookout tells the commons
 /// source (`news`), and one that removed it hears of it no more. The ones
 /// woken.
@@ -1131,8 +1140,7 @@ pub async fn tell(home: &Path, replied: &Value, author: &str, tell: &Value) -> V
             continue;
         }
         let mut submit = json!({"bot": bot, "prompt": note, "delivery": "queue",
-            "origin": ORIGIN, "request_id": format!("{request}.woken"),
-            "budget_tokens": left});
+            "origin": ORIGIN, "request_id": format!("{request}.woken")});
         if told_one["bot_id"].is_i64() {
             submit["bot_id"] = told_one["bot_id"].clone();
         }
@@ -1381,6 +1389,8 @@ pub struct View {
     open_stamp: Option<(u64, std::time::SystemTime)>,
     /// What the listing last read of each thread.
     known: Summaries,
+    /// The golden tickets the week's invites held, each one agent's.
+    golden: usize,
     notice: Option<String>,
 }
 
@@ -1401,6 +1411,7 @@ impl View {
             open: None,
             open_stamp: None,
             known: Summaries::new(),
+            golden: 0,
             notice: None,
         };
         view.reload();
@@ -1410,10 +1421,16 @@ impl View {
     /// Read it all again, the pick kept on the same thread where it still is.
     pub fn reload(&mut self) {
         let picked = self.picked().map(str::to_owned);
-        match list(&self.dir, 0, usize::MAX, &mut self.known) {
+        // The invites file is read once for the budget and the golden
+        // tickets both.
+        let sent = sent(&self.dir);
+        match list(&self.dir, 0, usize::MAX, &mut self.known, &sent) {
             Ok(listed) => {
                 self.threads = listed["threads"].as_array().cloned().unwrap_or_default();
                 self.invites = listed["invites"].clone();
+                self.golden = (sent.iter())
+                    .filter(|invite| !invite["bot"].is_null() && invite["golden"] == true)
+                    .count();
             }
             Err(error) => self.notice = Some(error),
         }
@@ -1508,12 +1525,14 @@ impl View {
             ))
             .bold(),
             Span::raw(format!(
-                " · {} of {} invited today, {} invites each · {} of {} answered this week",
+                " · {} of {} invited today, {} invites each · {} of {} answered this week · {} golden ticket{}",
                 invites("today"),
                 invites("a_day"),
                 invites("reach"),
                 invites("answered"),
                 invites("this_week"),
+                self.golden,
+                if self.golden == 1 { "" } else { "s" },
             ))
             .dim(),
         ])];
@@ -1535,17 +1554,28 @@ impl View {
                 at = out.len();
             }
             let text = |key: &str| thread[key].as_str().unwrap_or_default().to_owned();
+            // A picked title is reversed on every row it wraps to, each a
+            // cell past its last word, which the wrap leaves room for so
+            // the band never spills onto a row of its own.
             let title = Span::raw(text("title")).bold();
-            let mut first = crate::transcript::wrap(
+            let mut rows = crate::transcript::wrap(
                 Line::from(vec![Span::raw("  "), title]),
-                width,
+                width.saturating_sub(1),
                 Span::raw(""),
                 Span::raw("  "),
             );
-            if picked && let Some(row) = first.first_mut() {
-                crate::list::pick(row);
+            if picked {
+                for row in &mut rows {
+                    // The space a wrap leaves after its last word, which
+                    // the band's own cell stands for.
+                    if let Some(last) = row.spans.last_mut() {
+                        let kept = last.content.trim_end().len();
+                        last.content.to_mut().truncate(kept);
+                    }
+                    crate::list::pick(row);
+                }
             }
-            out.extend(first);
+            out.extend(rows);
             let posts = thread["posts"].as_u64().unwrap_or(0);
             let mut facts = vec![
                 format!("{posts} post{}", if posts == 1 { "" } else { "s" }),
@@ -1995,6 +2025,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[tokio::test]
+    async fn an_allowance_over_several_wakes_counts_their_work_not_the_history_they_resent() {
+        // An agent with a 1.4M history, woken three times on one invite:
+        // each turn sent that history again, and each did 30K of work. A
+        // 1M invite has 910K left, where its usage would have spent it on
+        // the first wake. One still running, with no cap of its own, holds
+        // the rest: a reply meanwhile joins it.
+        let client = crate::tests::daemon_answering(|asked| {
+            let turn = asked["before"].as_i64().unwrap_or(1) - 1;
+            let finished = match turn {
+                4 => Value::Null,
+                _ => json!(1),
+            };
+            json!({"turns": [{"turn": turn, "input_tokens": 1_400_000, "output_tokens": 5_000,
+                "work_tokens": 30_000, "budget_tokens": null, "finished_ms": finished}]})
+        })
+        .await;
+        assert_eq!(left(&client, "a", &[1, 2, 3], 1_000_000).await, 910_000);
+        assert_eq!(left(&client, "a", &[1, 2, 3, 4], 1_000_000).await, 0);
+    }
+
     #[test]
     fn a_golden_ticket_pays_twice_and_says_the_time_is_the_agent_s() {
         assert_eq!(pays(true), 2 * pays(false));
@@ -2147,7 +2198,7 @@ mod tests {
         assert!(empty.iter().any(|l| l == "No thread yet."));
         // An empty commons counts its invites as 0, never null.
         let counts = format!(
-            "0 of {} invited today, {} invites each · 0 of 0 answered this week",
+            "0 of {} invited today, {} invites each · 0 of 0 answered this week · 0 golden tickets",
             invites_a_day(0),
             reach(0, 0, invites_a_day(0) as usize)
         );
@@ -2188,6 +2239,75 @@ mod tests {
         assert_eq!(view.key(KeyEvent::from(KeyCode::Esc)), Key::Stay);
         assert!(!view.reading());
         assert_eq!(view.key(KeyEvent::from(KeyCode::Esc)), Key::Close);
+    }
+
+    #[test]
+    fn a_picked_title_is_reversed_on_every_row_and_fits_its_width() {
+        let home = &home("picked_title");
+        let title = "A rather long title about how refunds round across every region we sell in";
+        call(
+            home,
+            "a.x",
+            None,
+            None,
+            &json!({"post": {"name": "long", "title": title, "text": "first"}}),
+        )
+        .unwrap();
+        let view = View::open(home);
+        for width in 30..=80 {
+            let (lines, at) = view.card(width);
+            for line in &lines[at..] {
+                let words: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                if !words.trim().is_empty()
+                    && line.spans.iter().any(|s| {
+                        s.style
+                            .add_modifier
+                            .contains(ratatui::style::Modifier::BOLD)
+                    })
+                {
+                    // A row of the title: reversed, and within the card.
+                    assert!(
+                        line.width() <= width,
+                        "{} in {width}: {words:?}",
+                        line.width()
+                    );
+                    assert!(
+                        line.spans.iter().any(|s| s
+                            .style
+                            .add_modifier
+                            .contains(ratatui::style::Modifier::REVERSED)),
+                        "{words:?} in {width}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_view_counts_the_golden_tickets_the_week_sent() {
+        let home = &home("golden_count");
+        call(
+            home,
+            "a.x",
+            None,
+            None,
+            &json!({"post": {"name": "t", "title": "T", "text": "x"}}),
+        )
+        .unwrap();
+        let dir = dir(home);
+        // One agent held the golden ticket, one a plain invite, and a
+        // thread still sending holds no agent's yet.
+        let sent = [
+            json!({"thread": "t", "at": now(), "bot": "b.y", "golden": true, "turns": []}),
+            json!({"thread": "t", "at": now(), "bot": "c.z", "golden": false, "turns": []}),
+            json!({"thread": "u", "at": now(), "golden": true, "reach": 3}),
+        ];
+        assert!(keep(&dir, &sent, 2));
+        let view = View::open(home);
+        let head: String = (view.card(200).0[0].spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(head.ends_with(" · 1 golden ticket"), "{head}");
     }
 
     #[test]
