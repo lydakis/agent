@@ -7593,3 +7593,10 @@ Mean wall time of a gate of `sh -c true`, 50 runs each, release build on a
 So the lend costs about 2 ms over the sandbox's own launch, and a confined
 agent's gate about 13 ms over the person's, paid once per check: a gate
 that says no still costs no model call.
+
+The Perf workflow's matched screen (base `main`, head 3515a11) shows no
+change past noise on any daemon or Sonny measure, as nothing on the turn
+path changed: lone submit CPU 31.1 → 30.8 ms, burst submit p99 4.54 →
+4.52 ms, release to terminal p99 9.73 → 9.92 ms, idle RSS 15.2 → 15.3 MiB,
+CPU per turn 0.92 → 0.92 ms, lifecycle p95 turn 697 → 714 ms, the quiet
+window 1.54 → 1.34 ms/s.
