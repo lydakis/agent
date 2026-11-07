@@ -39,6 +39,12 @@ fn span(setting: &Setting) -> bool {
         && agent_client::config::span(setting.key, setting.default).is_ok()
 }
 
+/// Whether a setting is `[sonny] hours`: a list in the file, typed as its
+/// runs joined with a comma.
+fn hours(setting: &Setting) -> bool {
+    setting.key == "sonny.hours"
+}
+
 /// The rows `/config` takes with room for all: the blank one, a heading
 /// for each table, and the settings.
 pub fn height() -> usize {
@@ -166,6 +172,12 @@ pub const SETTINGS: &[Setting] = &[
         default: "tab",
     },
     Setting {
+        key: "sonny.needs_check",
+        about: "once an agent's turn ends with words and no question asked, a copy of it with no tools says whether they wait on you, and it counts as needing you; one small call, read from the warm cache",
+        values: SWITCH,
+        default: "true",
+    },
+    Setting {
         key: "sonny.suggest",
         about: "after a turn you started, a copy of the agent guesses your next message for Tab to take; one small call",
         values: SWITCH,
@@ -260,6 +272,12 @@ pub const SETTINGS: &[Setting] = &[
         about: "processes Sonny runs for agents' tool calls at once in all, each agent at most half; 0 for four times the CPUs",
         values: &[],
         default: "0",
+    },
+    Setting {
+        key: "sonny.hours",
+        about: "your working hours, local time; set, Sonny goes quiet once they end and no window is used for quiet_after; unset, it keeps no clock and goes quiet only on /quiet",
+        values: &[],
+        default: "none",
     },
     Setting {
         key: "sonny.quiet_after",
@@ -396,6 +414,9 @@ pub fn skill() -> String {
         .iter()
         .map(|setting| {
             let values = match setting.values {
+                [] if hours(setting) => {
+                    "day runs, each with a time range, as `Mon-Fri 09:00-19:00`, more joined with a comma".to_owned()
+                }
                 [] if number(setting) => "a whole number".to_owned(),
                 [] if span(setting) => "a span, as `30s`, `15m` or `1h`".to_owned(),
                 [] => "a name".to_owned(),
@@ -464,6 +485,12 @@ impl View {
                 let first = table.get(path.next().unwrap_or_default());
                 let value = path.try_fold(first, |at, key| Some(at?.get(key))).flatten();
                 value.and_then(|v| match v {
+                    toml::Value::Array(runs) => Some(
+                        (runs.iter())
+                            .filter_map(toml::Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
                     toml::Value::Boolean(on) => Some(on.to_string()),
                     toml::Value::Integer(n) => Some(n.to_string()),
                     v => v.as_str().map(str::to_owned),
@@ -477,6 +504,13 @@ impl View {
     fn write(&mut self, value: Option<String>) {
         let setting = &SETTINGS[self.pick];
         let value = value.map(|value| match (setting.values == SWITCH, number(setting)) {
+            _ if hours(setting) => toml::Value::Array(
+                (value.split(','))
+                    .map(str::trim)
+                    .filter(|run| !run.is_empty())
+                    .map(|run| toml::Value::String(run.to_owned()))
+                    .collect(),
+            ),
             (true, _) => toml::Value::Boolean(value == "true"),
             (_, true) => value
                 .parse()
@@ -743,6 +777,7 @@ mod tests {
         for (at, setting) in SETTINGS.iter().enumerate() {
             view.pick = at;
             let named = match (number(setting), span(setting)) {
+                _ if hours(setting) => "Mon-Fri 09:00-19:00, Sat 10:00-14:00",
                 // Wide enough for a text width.
                 (true, _) => "70",
                 (_, true) => "15m",

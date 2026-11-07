@@ -310,8 +310,7 @@ it; `served_model`, the model the provider named in its response, which can
 differ from the one requested (a dated snapshot, a reroute, and after a
 fallback the last attempt's); `context_window`, the model's context window
 in tokens on a model round's event, so a client can say how full the
-conversation is; a prompt-cache refresh's event carries
-`purpose: "keep_warm"` and is not a model round), and the store keeps running
+conversation is), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
 `input_tokens`, `cached_input_tokens`). Both report `cache_hit`, the share of
@@ -332,8 +331,8 @@ again, warm in the provider's cache or cold, is free, and what joins it (a
 prompt, a steer, a tool's result) is charged once, on the call that first
 sends it, however much the request lost meanwhile to an elision, a compaction
 or a window moving on: what leaves a request never hides what joins it.
-Output is charged when it is made; sending it back is free. A summary or a
-prompt-cache refresh re-reads the history and is charged its output alone. A
+Output is charged when it is made; sending it back is free. A summary
+re-reads the history and is charged its output alone. A
 failed or incomplete call is charged as a call, the history it sent read
 through, its output not accepted, so its retry sends nothing new. A fork's
 history is its source's: what the source's calls read of it is read, through
@@ -362,9 +361,7 @@ turn (`turns` lists `budget_tokens` and, with one, `budget_counts`), so a
 resumed turn counts what it did before parking, and a resend naming another
 cap or measure is an `idempotency_conflict`. A steer joins a turn that already has its cap:
 `budget_tokens` with `delivery: "steer"` is `invalid_delivery`. A summary
-held beside a call counts toward both caps, in the measure each counts. A
-prompt-cache refresh spends the tokens it re-reads and no work, so it stops
-at a cap on tokens and goes on under one on work.
+held beside a call counts toward both caps, in the measure each counts.
 
 A budget ends a turn as the round limit does: its last call goes with the
 tools shown and no call allowed, so the turn ends on a reply rather than
@@ -389,9 +386,7 @@ each of the turn's model calls asks its provider for structured output,
 `text.format` with a strict `json_schema` for Responses (the ChatGPT plan
 included) and `output_config.format` with a `json_schema` beside the
 effort for Anthropic and Bedrock. The tools stay callable, so a turn may
-look before it answers; a summary is free text and asks for none, and its
-calls' caches are not refreshed, since `max_tokens: 0` refuses a structured
-output. The daemon checks
+look before it answers; a summary is free text and asks for none. The daemon checks
 only that it is an object of at most 64 KiB as JSON
 (`invalid_output_schema`): which schemas a model takes is its provider's to
 say, as a failed call. It is stored on the turn (`turns.output_schema`,
@@ -507,8 +502,8 @@ different context windows or output limits. These were daemon flags before
 schema 40; a bot from before then takes the defaults. A value its provider's
 family refuses, such as an Anthropic output bound below 2,048, is refused at
 `create` with that provider's error. A turn calls through the shared provider,
-or through a copy shaped by the bot's own output bound, cache lifetime and
-keep-warm when it sets any of them.
+or through a copy shaped by the bot's own output bound and cache lifetime
+when it sets either.
 
 | Setting (flag) | Meaning | Default |
 | --- | --- | --- |
@@ -522,8 +517,7 @@ keep-warm when it sets any of them.
 | `keep_turns` (`--keep-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)), and a terminal read waits live for its output before its turn parks. 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
-| `keep_warm` (`--keep-warm`) | Seconds an Anthropic prompt cache may sit unread while a turn runs a tool before it is refreshed (see [keeping the cache warm](#keeping-the-anthropic-cache-warm)). Below 300; 0 never refreshes. | 240 |
-| `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on every cache marker of a request: the instructions', the request's own, and the pinned compaction summary's and note's, since the API refuses a longer lifetime after a shorter one. `1h` bills each write at twice the input rate instead of 1.25 times and sends no refreshes. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. A bot whose summarizer or fallback is such a model keeps five minutes on every call, since those calls carry the same pinned blocks. `inspect` reports a lifetime never set as `null`, so a client's own default can tell it from `5m` someone chose. | unset (`5m`) |
+| `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on every cache marker of a request: the instructions', the request's own, and the pinned compaction summary's and note's, since the API refuses a longer lifetime after a shorter one. `1h` bills each write at twice the input rate instead of 1.25 times. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. A bot whose summarizer or fallback is such a model keeps five minutes on every call, since those calls carry the same pinned blocks. `inspect` reports a lifetime never set as `null`, so a client's own default can tell it from `5m` someone chose. | unset (`5m`) |
 | `speed` (`--speed`) | The tier the bot's own model's calls are served at: `standard`, `fast` or `ultrafast`, each faster one at a higher price per token. The Claude API serves `fast`, its fast mode (sent as `speed` with the `fast-mode-2026-02-01` beta; Opus 4.8 and later, twice the price, its own rate limit, so its own pool, which learns `anthropic-fast-input-tokens-*` and `anthropic-fast-output-tokens-*`); Bedrock serves Claude at standard only. OpenAI's API and the ChatGPT plan serve `fast` (sent as `service_tier: priority`) and `ultrafast`; Bedrock serves GPT models `ultrafast` alone (OpenAI's fast-mode guide and Bedrock's GPT-6.1 Sol and GPT-6 Astra cards, read 2026-10-30). A tier the binding does not serve is refused `invalid_speed` with its `speeds`; which models take one is the provider's to say, and a call on one that does not fails there. Switching it misses the prompt cache once. Calls on another model (a `compaction_model`, a fallback) go at standard. `inspect` reports `standard` when unset. | `standard` |
 | `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
@@ -821,65 +815,21 @@ suspect.
 Empty instructions omit the system block, since empty text
 cannot carry an Anthropic cache breakpoint; automatic caching remains enabled.
 
-### Keeping the Anthropic cache warm
+### The Anthropic cache lifetime
 
 Anthropic's default prompt cache lives five minutes from its last read, and a
 foreground tool call may run ten. On 2026-09-25 a Sonnet 5 bot idle for eight
 minutes between two calls read only its 2.3k-token system and tools prefix
 from cache; the 6.8k-token conversation was written again at 1.25 times the
 input rate. The one-hour cache read all 9.0k, but it bills every write at
-twice the input rate, idle or not. The daemon keeps the five-minute cache and
-refreshes it instead. While a turn's call streams its reply or a tool runs,
-once that call's cache has gone the bot's `keep_warm` seconds unread (240
-by default), it sends that call's request again with `max_tokens: 0` and
-`stream: false`. That request generates nothing, bills a cache read, and
-restarts the cache's lifetime. It repeats until the reply and then the tool
-finish. The lifetime is counted from when the call, or the last refresh, was
-sent, so a call still waiting for its pool or startup admission is not
-refreshed. Refreshing during the reply matters because a long one outlives the
-cache on its own: in the 2026-09-25 Sonnet 5 rerun, six replies of 32k to
-86k output tokens each took longer than five minutes, and the refresh sent
-when the next tool started found the prefix gone and wrote it again. Each
-refresh runs as a task of its own: one still unanswered when the reply ends
-carries into the tool that follows. When the tool ends, the next model round
-starts, or the turn ends or is interrupted, one not yet sent is dropped at no
-cost, and one already sent is answered, so its cost is recorded and counts
-toward the bot's budget before another call. A summary's call is not
-refreshed.
-Nothing else in the request differs, since the cache is keyed on everything it
-renders. A refresh is paced and admitted like a call, but gives up waiting
-for its pool and startup admission once the cache it would refresh has
-expired, and after 30 seconds in any case. Usage is read per attempt, as for
-a call. A refused
-refresh publishes a non-durable `keep_warm_failed` event and ends refreshes
-until the next model call, which pays the write it would have paid anyway.
-
-Anthropic's
-[prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-guidance, read 2026-09-25 through Anthropic's API skill rather than the live
-page, documents the `max_tokens: 0` request under pre-warming. It recommends
-this keep-alive over the one-hour cache for five-to-sixty-minute gaps only on
-Claude Fable 5.1 and Mythos 5.1, whose cache reads are nearly free (0.025
-times the input rate on Fable 5.1). For other models, it picks the one-hour
-cache for such gaps. Refreshing those models too is this runtime's inference,
-not Anthropic's advice. During a streaming reply or a running tool the next
-model call is certain, so each refresh costs a 0.1-times read of the
-conversation where expiry costs a 1.25-times rewrite; a ten-minute tool takes
-at most two. Whether it also
-beats the one-hour cache, which covers parked waits and gaps between turns
-but bills every write at twice the input rate, is not measured; a bot's
-`cache_ttl` of `1h` (`--cache-ttl 1h`) selects it for that comparison. Its writes are recorded apart, from
-Anthropic's per-lifetime split or, when a report has none, as the request
-asked. The guidance
-also lists the requests `max_tokens: 0` rejects: streaming, budgeted thinking
-(`thinking.type: "enabled"`), structured outputs, and forced tool choice. So
-older models with thinking on, and a turn whose reply follows an
-`output_schema`, are not refreshed. Bedrock is also left out
-until the same request is verified there. Refreshes cover foreground tool
-calls only: a turn parked on `wait` has no live task to send them, and a bot
-between turns may never be called again. The Responses cache needs none: the
-ChatGPT backend still read 7.4k of 7.7k tokens after a 20-minute gap, and it
-refuses `prompt_cache_retention: "24h"` with a 400.
+twice the input rate, idle or not. A bot chooses with `cache_ttl`; Sonny and
+the CLI's policy give Claude bots `1h`, which also covers parked waits and
+gaps between turns. The daemon sends no request to keep a cache alive: a
+cache that lapses is written again by the next call. Writes are recorded by
+lifetime, from Anthropic's per-lifetime split or, when a report has none, as
+the request asked. The Responses cache needs no lifetime: the ChatGPT backend
+still read 7.4k of 7.7k tokens after a 20-minute gap, and it refuses
+`prompt_cache_retention: "24h"` with a 400.
 
 A bot created with `--fallback PROVIDER/MODEL` (`create.fallback`, a known
 provider's model in the bot's family, inherited by its forks) sends a request
@@ -1179,8 +1129,7 @@ daemon has since started again and the turn goes on; the first's
 `tool_completed` says `outcome_unknown`, the second's `cancelled`, as a pause
 says them. A call waiting for its verdict as the drain begins does not
 start, even if allowed then, and a model call that failed sends no retry:
-the turn parks, and its retry count starts over when it continues. No
-prompt-cache refresh goes out during a drain either. The time the daemon
+the turn parks, and its retry count starts over when it continues. The time the daemon
 was down is not counted in `paced_ms`. A client's `wait` still open is
 answered as its deadline would answer it, the parked turn reported pending
 as it stands. Background commands and terminals end with the daemon as
@@ -1559,7 +1508,7 @@ Protocol 23 adds `usage`, what bots' turns spent, also a read on the reader
 connection: one grouped statement over `turns`, so one snapshot. `name` keeps
 the bots a `bots` GLOB would (absent is every bot), and `since_ms` the turns
 started at or after it (absent or 0 is all of them); a turn counts wholly where
-it started, compaction and keep-warm calls included, since they are recorded on
+it started, compaction calls included, since they are recorded on
 it. The answer has the totals (`turns`, `input_tokens`, `cached_input_tokens`,
 `output_tokens`; cached is part of input), `bots` with the `limit` (1 to 256,
 default 64) that spent most input plus output first and `other_bots` summing
@@ -1897,8 +1846,7 @@ the turn's id and handle at once, and `wait`, `turns`, and
   provider now bound to another family, with `provider_family_mismatch`.
   Admission counts the comma the request puts before each item. A steer
   joins only a turn that can call again: after a summary or a final
-  reply that spent the budget or the last round, counting a cache
-  refresh the reply left in flight, it stays queued. One still queued
+  reply that spent the budget or the last round, it stays queued. One still queued
   when the turn ends starts as its own turn when the line moves (a
   strict steer, which names that turn, fails with `stale_turn`).
   Usage comes from cumulative byte and depth totals at the head and the parent
@@ -2221,8 +2169,7 @@ restart. The last
 of them, a retry included when a billed failure made it the last, goes with the bot's tools shown but `tool_choice` `none` (both
 families), so the model must answer in words, and the turn ends on that reply
 instead of failing with its work done and unreported; a live
-`tool_calls_withheld` event (`reason: "tool_round_limit"`) marks it. That call
-sends no keep-warm refresh, and on Anthropic, where `tool_choice` is part of
+`tool_calls_withheld` event (`reason: "tool_round_limit"`) marks it. On Anthropic, where `tool_choice` is part of
 the cached prefix, it rewrites the message cache once. A model that calls a
 tool anyway has those calls run, as any committed plan's, and the turn then
 fails `tool_round_limit`.
@@ -2847,6 +2794,32 @@ where an agent may have written: git runs a repository's hooks and the
 programs its config names (an fsmonitor, a filter) even to list its files,
 so a repository an agent made would run what it left there as the person.
 Sonny runs its own git in such places this way (#597).
+
+`agent sandbox --bot NAME [--bot-id ID] -- COMMAND [ARGS...]` runs one
+command as one of that bot's own commands runs, for a client running a
+command a bot wrote outside its turns, as Codex runs whatever an agent wrote
+in its sandbox: Sonny's automation gates (`--if`) that an agent added.
+One `lend` request (protocol 54), `{"op":"lend","bot":NAME,"bot_id":ID?}`,
+answers `{bot, bot_id, policy, env}`: the sandbox the daemon builds for the
+bot's commands (null for a bot whose commands run unconfined), held by
+the daemon for as long as the session that asked lasts as one of the bot's
+own commands is: its capped socket open, and its placeholders for missing
+protected folders counted with those of the daemon's own commands, so
+neither removes one the other's sandbox still mounts. With it comes the
+whole environment its commands get: the daemon's own, without the
+credentials it holds or the variables `--shell-exclude` withholds, with its
+`AGENT_*` variables, the bot's `env` setting, `AGENT_BOT`, `AGENT_BOT_ID` and
+`AGENT_SOCKET` reaching the daemon through that socket. The command runs in
+that policy with that environment in place of the caller's, so it keeps
+everything the daemon keeps from the bot (`--protect-path`, `--wall`, its
+store) and nothing of the caller's environment reaches it. Only a session
+outside every sandbox may lend (`not_permitted`), so a confined command
+cannot reach another bot's socket; `bot_id` that is not the bot's is
+`bot_not_found`. The lend costs one round trip and, for a bot whose socket
+was not listening, one bind.
+`agent sandbox` exits as its command does, or 125 when it
+could not run it (a usage error, no sandbox here, the bot not found), as
+`env` and `timeout` do, with the error on stderr.
 
 ### Command rules
 
@@ -3575,8 +3548,7 @@ those two may bill: each sending at most the view, the tools and both
 instructions at a token to a byte, and generating at most the summarizer's
 output bound; with no known output bound (a Responses provider without
 `max_output_tokens`), a budgeted bot's summary does not run beside. A summary beside the call that an interrupt cancels still adds its
-retries and pacing to the turn's. A refresh does not keep warm the view of
-a call whose summary has written its replacement.
+retries and pacing to the turn's.
 Otherwise, and at a turn's start or as a parked turn resumes, when the
 cache the copy reads may have lapsed, the summary goes before the call. A
 summary beside the turn uses its own connection rather than the bot's

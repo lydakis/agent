@@ -7566,3 +7566,38 @@ reads no state folder or setting); the rest stay within 6%.
 | lifecycle | CPU, s | 0.43 | 0.425 | -1.2% |
 | lifecycle | p95 turn, ms | 666.913 | 723.258 | +8.4% |
 | lifecycle | peak RSS, MiB | 22.945 | 23.43 | +2.1% |
+
+## An automation gate in its agent's sandbox (#783)
+
+An `--if` an agent added runs through `agent sandbox --bot`: one `agent`
+process, one `lend` round trip, and, for a confined agent, the sandbox
+launch its own commands pay. `lend` builds the policy as a turn does and
+the command's whole environment (the daemon's, some tens of variables),
+and binds the bot's socket only when it was not listening, holding it
+and the sandbox's placeholders, as for one of the bot's commands, until
+the session closes. Nothing changes on the
+turn path: the tool shell's environment comes from the same function, as
+the same steps in the same order, and the service holds one more map, of
+the shares sessions borrowed, empty unless a gate runs. A gate the person
+or Sonny added runs as before.
+
+Mean wall time of a gate of `sh -c true`, 50 runs each, release build on a
+4-core Linux cloud container, two runs each (the person's 1.4 and 1.5 ms):
+
+| Gate | Mean, ms |
+| --- | ---: |
+| The person's: `/bin/sh -c true` | 1.4 |
+| An unconfined agent's: `agent sandbox --bot` | 4.7 |
+| A read-only agent's: `agent sandbox --bot` (bubblewrap) | 14.3 |
+| `agent sandbox` with no bot or daemon (bubblewrap) | 12.2 |
+
+So the lend costs about 2 ms over the sandbox's own launch, and a confined
+agent's gate about 13 ms over the person's, paid once per check: a gate
+that says no still costs no model call.
+
+The Perf workflow's matched screen (base `main`, head 3515a11) shows no
+change past noise on any daemon or Sonny measure, as nothing on the turn
+path changed: lone submit CPU 31.1 → 30.8 ms, burst submit p99 4.54 →
+4.52 ms, release to terminal p99 9.73 → 9.92 ms, idle RSS 15.2 → 15.3 MiB,
+CPU per turn 0.92 → 0.92 ms, lifecycle p95 turn 697 → 714 ms, the quiet
+window 1.54 → 1.34 ms/s.

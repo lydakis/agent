@@ -367,15 +367,6 @@ impl Reservation<'_> {
             output: usage.output_tokens,
         });
     }
-    /// Final accounting for a call that asked for no output, such as a
-    /// cache refresh, which says nothing of what the pool's calls write.
-    /// Its cache read is no sample of what the pool's calls read either.
-    pub fn settle_refresh(self, usage: &Usage, family: super::Family) {
-        self.settle_cost(Cost {
-            input: counted(usage, family),
-            output: usage.output_tokens,
-        });
-    }
     fn settle_cost(mut self, actual: Cost) {
         debug_assert!(self.dispatched);
         self.actual = actual.dims();
@@ -962,15 +953,6 @@ mod tests {
         );
         assert_eq!(pace.output_estimate(512, 4096), 2000);
         assert!(sent(&pace, 0).await.is_ok());
-        // A cache refresh writes nothing and says nothing of what calls
-        // write.
-        for _ in 0..32 {
-            sent(&pace, 1)
-                .await
-                .unwrap()
-                .settle_refresh(&Usage::default(), crate::codec::Family::Anthropic);
-        }
-        assert_eq!(pace.output_estimate(512, 4096), 2000);
         // Beside its output, a call never asks for more than the total
         // limit: its input estimate yields.
         pace.seed(

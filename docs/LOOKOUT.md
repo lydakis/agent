@@ -16,11 +16,9 @@ it.
 
 The lookout knows no leads. Sonny subscribes each lead to its tasks when it
 opens the lead's project, and that subscription is what makes a lead hear
-from them; a lead subscribes to more the same way. Once its stream is
-live, the lookout also keeps a task's worktree as each completed turn left it, for a task forked from
-that turn (`sonny/src/snapshot.rs`). That runs beside the stream, one at a
-time for each checkout, and asks the daemon only which bots are working
-now, to mark a snapshot late.
+from them; a lead subscribes to more the same way. The lookout also
+answers the calls of the tools Sonny answers (`start_task`, `show_agent`
+and the rest, `sonny/src/served.rs`).
 
 ## One lookout a daemon
 
@@ -176,7 +174,7 @@ lookout nothing more: no event is built for the bots it watches.
 
 ```
 {"add": {"name": "api", "bots": ["api.lead"],
-         "filter": {"type": ["turn.ended"], "$or": [{"status": ["failed"]}, {"resolved": [true]}]}}}
+         "filter": {"type": ["turn.ended"], "$or": [{"status": ["failed"]}, {"done": [true]}]}}}
 {"add": {"name": "leads", "bots": ["*.lead"], "digest": "1h"}}
 {"add": {"name": "migration", "tasks_of": ["shop.migrate"], "steer": {"status": ["failed"]}}}
 ```
@@ -469,7 +467,7 @@ is an event with a `type` and fields, as a source's are, and the
 | `type` | When | Fields beside `type`, `bot` (where), `maker` (who made that bot) and `turn` |
 | --- | --- | --- |
 | `message.written` | someone other than the subscriber writes in a watched bot | `by` (`person`, an agent's name, a program), `text` (the person's words) |
-| `turn.ended` | a turn that is news ends | `by` (who asked: `you`, `person`, an agent's name, `automation`), `status`, `resolved`, `theirs` |
+| `turn.ended` | a turn that is news ends | `by` (who asked: `you`, `person`, an agent's name, `automation`), `status`, `done`, `theirs` |
 | `approval.waiting` | an approval only the person can give has waited | |
 | `ask.posted` | a task asked the person with `ask` | `question`, `options` |
 | `turn.silent` | a running turn printed nothing for 30 minutes | |

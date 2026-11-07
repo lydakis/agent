@@ -146,7 +146,7 @@ class Agent(BaseInstalledAgent):
     @staticmethod
     @override
     def name() -> str:
-        return 'lydakis-agent'
+        return 'agent-runtime'
 
     @override
     def get_version_command(self) -> str | None:
@@ -266,7 +266,7 @@ class Agent(BaseInstalledAgent):
                     await self.exec_as_agent(environment, command=self._finish_command(),
                                              env=self._env())
             except Exception as error:  # bookkeeping never replaces the trial's outcome
-                self.logger.warning(f'lydakis-agent bookkeeping failed: {error}')
+                self.logger.warning(f'agent-runtime bookkeeping failed: {error}')
 
     @override
     def populate_context_post_run(self, context: AgentContext) -> None:

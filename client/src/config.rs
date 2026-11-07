@@ -48,6 +48,7 @@
 //! margin_note_lines = 20         # the most lines a note's Markdown runs to, 12 by default; past it the note is refused
 //! agent_opens = "beside"        # a click on an agent's name: "tab", the default, or "beside"
 //! suggest = false               # no guess at the next message, on by default
+//! needs_check = false           # no copy says whether a reply waits on you, on by default
 //! commons = false               # agents go without the commons, on by default
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
 //! commons_invite_tokens = 1000000  # what an invite pays for in its thread
@@ -90,6 +91,7 @@
 //! digest = "15m"                # a subscriber hears it at most this often; unset, as it comes
 //! steer = { from = ["boss"] }   # what cuts into a busy subscriber's turn, as a filter is written
 //! watch = ["~/bin/slack-poll"]  # files whose edit starts it again on them; unset, none
+//! icon = "▲"                    # one character /status shows on the row of each agent that follows it
 //! [sonny.sources.commons]       # Sonny's own source: the commons threads an agent posted in
 //! digest = "15m"                # the default; 0 at once. Takes digest and steer alone
 //! ```
@@ -470,6 +472,9 @@ pub struct Sonny {
     /// Whether a copy of the agent guesses the person's next message after
     /// a turn they started, shown in the empty composer for Tab to take.
     pub suggest: bool,
+    /// Whether, once an agent's turn ends with words and no question open,
+    /// a copy of it says whether they wait on the person.
+    pub needs_check: bool,
     /// Whether the daemon starts when the machine does, for a box whose
     /// agents keep working after a restart. Sonny keeps the job.
     pub start_at_boot: bool,
@@ -710,6 +715,7 @@ impl Default for Sonny {
             mcp_servers: BTreeMap::new(),
             side_chat: SideChat::default(),
             suggest: true,
+            needs_check: true,
             commons: true,
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
@@ -840,6 +846,9 @@ pub struct Source {
     /// Files whose change starts it again on them, as a service manager
     /// restarts a unit on its new binary: each from `/` or `~/`.
     pub watch: Vec<String>,
+    /// One character cell `/status` shows on the row of each agent that
+    /// follows it.
+    pub icon: Option<String>,
 }
 
 /// An MCP server, under Codex's key names for `[mcp_servers.NAME]`: a
@@ -1344,6 +1353,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "margin_note_lines",
                 "agent_opens",
                 "suggest",
+                "needs_check",
                 "start_at_boot",
                 "commons",
                 "commons_invites",
@@ -1427,6 +1437,7 @@ fn parse(text: &str) -> Result<Config, String> {
             if let Some(switch) = match key.as_str() {
                 "chime" => Some(&mut config.sonny.chime),
                 "suggest" => Some(&mut config.sonny.suggest),
+                "needs_check" => Some(&mut config.sonny.needs_check),
                 "commons" => Some(&mut config.sonny.commons),
                 "verbose" => Some(&mut config.sonny.verbose),
                 "start_at_boot" => Some(&mut config.sonny.start_at_boot),
@@ -1720,6 +1731,7 @@ fn commons_source() -> Source {
         digest: Some(COMMONS_DIGEST.into()),
         steer: None,
         watch: Vec::new(),
+        icon: None,
     }
 }
 
@@ -1746,6 +1758,7 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
         let mut digest = None;
         let mut steer = None;
         let mut watch = Vec::new();
+        let mut icon = None;
         let own = name == COMMONS_SOURCE;
         for (field, value) in fields {
             match field.as_str() {
@@ -1762,6 +1775,16 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
                     let value = string(&key(field), value)?;
                     span(&key(field), &value)?;
                     digest = Some(value);
+                }
+                "icon" => {
+                    let value = string(&key(field), value)?;
+                    if value.chars().count() != 1 || value.chars().any(char::is_control) {
+                        return Err(format!(
+                            "{} is one character, as \"▲\", not {value:?}",
+                            key(field)
+                        ));
+                    }
+                    icon = Some(value);
                 }
                 "steer" => {
                     if !value.is_table() {
@@ -1790,6 +1813,7 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
         if own {
             commons.digest = digest.or(commons.digest);
             commons.steer = steer;
+            commons.icon = icon;
             continue;
         }
         sources.push(Source {
@@ -1799,6 +1823,7 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
             digest,
             steer,
             watch,
+            icon,
         });
     }
     Ok((sources, commons))

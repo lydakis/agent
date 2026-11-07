@@ -190,7 +190,17 @@ saying so, and one whose BOT is gone (`bot_not_found`: pinned by id, it
 never comes back) ends the automation. `--if CMD` runs `sh -c CMD` in the folder
 `add` ran in, with the `PATH` `add` ran with and `AGENT_SOCKET` and
 `AGENT_STORE` naming the automation's daemon, before anything else, for up
-to 60 s, in its own process group, which ends with it. It answers as `test`
+to 60 s, in its own process group, which ends with it. One an agent added
+(its shell, or its automations tool) runs as that agent's commands do,
+through `agent sandbox --bot` (protocol 54): in its sandbox, with its
+variables (`$SONNY_STATE` too), reaching the daemon through its own socket,
+since an agent can rewrite what its gate runs; that agent gone, the check
+could not run (exit 125). One the person added, or Sonny (an ask's deadline,
+the memory cleanup), runs as the person. The definition says which
+(`--if-by NAME --if-by-id ID`, or `--if-by-person`); one from before 0.9.0
+says neither and could be an agent's, so it does not run: each check fails,
+told once, until the automation is added again, but for Sonny's own two,
+known by their whole text. It answers as `test`
 and `grep -q` do: exit 0 sends, and exit 1 skips that fire and records
 nothing but, for `--commit`, that its commit was seen; any other exit, a
 signal or a command that is not there could not check, and fails the fire

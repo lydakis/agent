@@ -111,6 +111,11 @@ class TriggerFireTests(ModelFixture):
                       env=None, store_id=None, not_before=None, generation=None):
         # What a trigger's plist has launchd run.
         target = target or ['--bot', name, '--bot-id', str(self.bot_id(name))]
+        # A gate names who wrote it, as Sonny writes one now: the person,
+        # unless an agent is named.
+        if '--if' in extra and '--if-by' not in extra and '--unrecorded' not in extra:
+            extra = [*extra, '--if-by-person', '1']
+        extra = [arg for arg in extra if arg != '--unrecorded']
         args = [str(app), '--trigger-fire', '--name', name, *target,
                 '--generation', generation or str(time.time_ns()), '--when', when, *(['--at', str(at)] if at else []),
                 *extra, '--store', str(self.store), *(['--socket', str(socket)] if socket else []),
@@ -681,6 +686,39 @@ class TriggerFireTests(ModelFixture):
             self.assertTrue(ran.exists())
         finally:
             connection.close()
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_gate_an_agent_wrote_runs_in_its_sandbox(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', '--sandbox', 'read-only', 'hello')
+        connection = Connection(str(self.store) + '.sock')
+        try:
+            connection.request('configure', bot='p.task', settings={'env': {'SONNY_STATE': '/state/p'}})
+        finally:
+            connection.close()
+        bot_id = str(self.bot_id('p.task'))
+        escape = 'test "$SONNY_STATE" = /state/p && ! touch escaped 2> /dev/null'
+        by = lambda id: ['--if', escape, '--if-by', 'p.task', '--if-by-id', id, '--dir', str(self.path)]
+        env = {'AGENT_BIN': str(self.binary)}
+        # The agent's: its variables, and its sandbox, which writes nothing.
+        sent = self.fire('p.task', 'x', extra=by(bot_id), env=env)
+        self.assertEqual((sent['last']['outcome'], sent['checked']['gate']), ('sent', 'go'), sent)
+        self.assertFalse((self.path / 'escaped').exists())
+        self.settle('p.task')
+        # Another agent's identity runs nothing: the check could not run.
+        gone = self.fire('p.task', 'x', extra=by(str(int(bot_id) + 100)), env=env)
+        self.assertEqual(gone['checked']['gate'], 'failed', gone)
+        self.assertIn('125', gone['checked']['detail'])
+        self.assertIn('bot_not_found', gone['checked']['detail'])
+        # The person's runs as the person.
+        no = self.fire('p.task', 'x', extra=['--if', '! touch escaped', '--dir', str(self.path)])
+        self.assertEqual(no['checked']['gate'], 'no', no)
+        self.assertTrue((self.path / 'escaped').exists())
+        # One from before Sonny recorded who wrote it runs nowhere.
+        (self.path / 'escaped').unlink()
+        old = self.fire('p.task', 'x', extra=['--if', 'touch escaped', '--dir', str(self.path), '--unrecorded'])
+        self.assertEqual(old['checked']['gate'], 'failed', old)
+        self.assertIn('added again', old['checked']['detail'])
+        self.assertFalse((self.path / 'escaped').exists())
 
     def test_a_gate_that_says_no_costs_no_turn(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')

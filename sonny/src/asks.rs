@@ -298,8 +298,9 @@ pub fn tool() -> Value {
         "name": TOOL,
         "description": "Put a decision in front of the person: a fork in the road, an architectural \
             choice, or a step that cannot be undone, where their pick changes what you build. Sonny \
-            shows it where you ask it; say what each option does to their goal. Ask once, one \
-            decision per call, and do not repeat it in your reply. When their pick approves an \
+            shows it where you ask it; say what each option does to their goal. Check `sonny ask \
+            list` first: an answer there may settle yours. Ask once, one decision per call, and do \
+            not repeat it in your reply. When their pick approves an \
             action, say what in covers: their yes covers that action, target and revision alone, so \
             a new target or revision needs a new ask. \
             Their answer, a pick or words typed for it, comes as their next message, starting \
@@ -313,8 +314,7 @@ pub fn tool() -> Value {
             undone waits, and so does an ask you are unsure of or one they said to wait on. Sonny \
             wakes you at the deadline unless they answered or wrote to you since; that wake is \
             Sonny's, never their answer, so it allows nothing that needs their own words. If they \
-            pick another option after you went ahead, undo what you did and follow their pick. \
-            Meanwhile do work that does not depend on the answer, or end your turn. A step only \
+            pick another option after you went ahead, undo what you did and follow their pick. A step only \
             the person can take, such as a sign-in or a command needing their own terminal, is an \
             ask too: no options, put the exact line to run in command, what it unblocks in why, and \
             wait; their next message says how it went. Any other question with nothing to choose \
@@ -1158,14 +1158,18 @@ fn set_deadline(
         quote(call)
     );
     let at = crate::trigger::local(deadline);
-    let add = json!({"add": {
-        "name": trigger_name(bot, turn, call),
-        "at": format!("{}-{:02}-{:02} {:02}:{:02}", at.year, at.month, at.day, at.hour, at.minute),
-        "if": gate,
-        "message": fire(&ask.question, plan, label),
-    }});
-    // An add looks at no one's automations.
-    crate::trigger::tool(&add, &crate::trigger::Caller::default()).map(|_| ())
+    let at = format!(
+        "{}-{:02}-{:02} {:02}:{:02}",
+        at.year, at.month, at.day, at.hour, at.minute
+    );
+    // Sonny wrote its gate: it runs as Sonny's own.
+    crate::trigger::add_sonnys(
+        &trigger_name(bot, turn, call),
+        &at,
+        &gate,
+        &fire(&ask.question, plan, label),
+    )
+    .map(|_| ())
 }
 
 /// The whole minute `minutes` from `now`, never before it, as a one-off
@@ -1262,7 +1266,28 @@ impl Standing {
         turn: i64,
         call: &str,
     ) -> Option<Option<(Ask, State)>> {
+        let items = self.read(at, entry);
+        if at != turn {
+            return None;
+        }
+        let (made, _) = (items.iter())
+            .find(|(item, _)| item["type"] == "function_call" && item["call_id"] == call)?;
+        let asked = id(turn, call);
+        let ask = (made["arguments"].as_str())
+            .and_then(|a| serde_json::from_str::<Value>(a).ok())
+            .and_then(|arguments| self::call(&asked, &arguments));
+        Some(ask.map(|ask| {
+            let state = self.state(&asked);
+            (ask, state)
+        }))
+    }
+
+    /// Takes in what `entry`, of turn `at`, says of the asks before it:
+    /// answers, closes, results and the person's own words. Its calls,
+    /// each with whether it was taken.
+    fn read(&mut self, at: i64, entry: &Value) -> Vec<(Value, bool)> {
         let items = crate::responses(&entry["item"]);
+        let mut read = Vec::with_capacity(items.len());
         let wanted = |of: &str| self.wanted.as_deref().is_none_or(|wanted| wanted == of);
         // An entry's results first, as they come after its calls.
         self.taken.extend(
@@ -1280,6 +1305,7 @@ impl Standing {
             let was_taken = (self.taken.iter().position(|taken| *taken == made))
                 .map(|at| self.taken.swap_remove(at))
                 .is_some();
+            read.push((item.clone(), was_taken));
             if let Some((closed, state)) = closed_by(item)
                 && self.skip.as_ref() != Some(&made)
                 && was_taken
@@ -1306,19 +1332,7 @@ impl Standing {
                 _ => {}
             }
         }
-        if at != turn {
-            return None;
-        }
-        let made = (items.iter())
-            .find(|item| item["type"] == "function_call" && item["call_id"] == call)?;
-        let asked = id(turn, call);
-        let ask = (made["arguments"].as_str())
-            .and_then(|a| serde_json::from_str::<Value>(a).ok())
-            .and_then(|arguments| self::call(&asked, &arguments));
-        Some(ask.map(|ask| {
-            let state = self.state(&asked);
-            (ask, state)
-        }))
+        read
     }
 
     /// Where ask `asked` stands by what was read after it. The person's
@@ -1334,6 +1348,28 @@ impl Standing {
             None if self.moved_on => State::Aside,
             None => State::Open,
         }
+    }
+}
+
+/// Every question one agent's history put, read newest first as
+/// [`Standing`] reads one: each where it stands by what came after it.
+#[derive(Default)]
+pub struct Asked(Standing);
+
+impl Asked {
+    /// The asks `entry`, of turn `at`, put, each with where it stands; an
+    /// ask the tool refused, or has not taken yet, put none.
+    pub fn entry(&mut self, at: i64, entry: &Value) -> Vec<(Ask, State)> {
+        let items = self.0.read(at, entry);
+        (items.iter())
+            .filter(|(item, taken)| *taken && item["name"] == TOOL)
+            .filter_map(|(item, _)| {
+                let asked = id(at, item["call_id"].as_str()?);
+                let arguments = serde_json::from_str::<Value>(item["arguments"].as_str()?).ok()?;
+                let ask = self::call(&asked, &arguments)?;
+                Some((ask, self.0.state(&asked)))
+            })
+            .collect()
     }
 }
 
@@ -2078,6 +2114,51 @@ mod tests {
         // Only a whole ID, and one of the two outcomes.
         assert_eq!(read(closing_call("a1", "withdrawn", None, "x")), None);
         assert_eq!(read(closing_call("ask:2/a1", "maybe", None, "x")), None);
+    }
+
+    #[test]
+    fn every_ask_in_a_history_reads_with_where_it_stands() {
+        let entry = |node: i64, item: &Value| json!({"node": node, "item": item});
+        let asking = |call: &str| {
+            json!({"type": "function_call", "name": TOOL, "call_id": call,
+                "arguments": asked("wait").to_string()})
+        };
+        let refused = json!({"type": "function_call_output", "call_id": "a3", "failed": true,
+            "output": "invalid_arguments"});
+        let ask = call(&id(2, "a1"), &asked("wait")).unwrap();
+        let person = |text: &str| {
+            json!({"node": 9, "from": null, "origin": null,
+            "item": {"role": "user", "content": [{"type": "input_text", "text": text}]}})
+        };
+        let taken = |call: &str| {
+            json!({"type": "function_call_output", "call_id": call,
+                "output": json!({"id": call}).to_string()})
+        };
+        // Newest first: a fourth not taken yet and a refused third, which
+        // put nothing yet; words past the second, an answer to the first.
+        let entries = [
+            (6, entry(11, &asking("a4"))),
+            (5, entry(9, &refused)),
+            (5, entry(8, &asking("a3"))),
+            (4, person("something else")),
+            (3, entry(5, &taken("a2"))),
+            (3, entry(4, &asking("a2"))),
+            (3, person(&answer(&ask, "yes"))),
+            (2, entry(2, &taken("a1"))),
+            (2, entry(1, &asking("a1"))),
+        ];
+        let mut reading = Asked::default();
+        let found: Vec<(String, State)> = (entries.iter())
+            .flat_map(|(at, entry)| reading.entry(*at, entry))
+            .map(|(ask, state)| (ask.id, state))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("ask:3/a2".to_owned(), State::Aside),
+                ("ask:2/a1".to_owned(), State::Answered("yes".into()))
+            ]
+        );
     }
 
     #[test]

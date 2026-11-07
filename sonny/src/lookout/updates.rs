@@ -68,7 +68,7 @@ struct Turn {
     count: u32,
     /// Which call waits on approval, or which silence: each its own news.
     which: Option<String>,
-    /// The turn resolved the task, with the task's own `resolve_task`.
+    /// The turn resolved the task, with the task's own `mark_done`.
     resolved: bool,
     /// What the task replied, ending the turn.
     reply: Option<String>,
@@ -444,7 +444,7 @@ fn turn_event(t: &Turn, theirs: bool) -> Value {
     let mut event = json!({"type": kind, "turn": t.turn, "theirs": theirs});
     if kind == "turn.ended" {
         event["status"] = json!(t.status);
-        event["resolved"] = json!(t.resolved);
+        event["done"] = json!(t.resolved);
     }
     if let Some(by) = &t.by {
         event["by"] = json!(by_field(by));
@@ -1966,7 +1966,7 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
         text.push_str(&format!(", asked by {by}"));
     }
     if t.resolved {
-        text.push_str(", and resolved itself");
+        text.push_str(", and marked itself done");
     }
     if t.count > 1 {
         text.push_str(&format!(
@@ -2230,12 +2230,12 @@ mod tests {
     }
 
     #[test]
-    fn a_task_that_resolved_itself_says_so() {
+    fn a_task_that_marked_itself_done_says_so() {
         let mut updates = fleet();
         let now = Instant::now();
         let lead = json!({"from": {"bot": "shop.lead"}});
         updates.event(&ev("shop.fix", Some(5), "accepted", lead.clone()), now);
-        let resolve = |call: &str, arguments: &str| json!({"name": "resolve_task", "call_id": call, "arguments": arguments});
+        let resolve = |call: &str, arguments: &str| json!({"name": "mark_done", "call_id": call, "arguments": arguments});
         // Resolving another task is the lead's to do, not a task's.
         for (call, arguments) in [("c1", "{}"), ("c2", "{\"task\":\"docs\"}")] {
             updates.event(
@@ -2271,7 +2271,7 @@ mod tests {
         turn(&mut updates, "shop.docs", 6, lead, "completed");
         assert_eq!(
             text(&updates.take()),
-            "- shop.fix: turn:shop.fix/5 completed, asked by you, and resolved itself, \
+            "- shop.fix: turn:shop.fix/5 completed, asked by you, and marked itself done, \
              and 1 earlier since turn:shop.fix/5\n\
              - shop.docs: turn:shop.docs/6 completed, asked by you"
         );

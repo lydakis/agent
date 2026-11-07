@@ -94,6 +94,24 @@ Its output sits under `.local/role-eval/<model>/small/`. Score:
 
 and note the step's `took` in timeline.json, the seconds it kept agents busy.
 
+## The away day
+
+`--day away` runs quiet mode. The person asks for the export and leaves for
+the night, and the eval marks them away as `/quiet` does, by writing
+`~/.agent/sonny/away` in the run's HOME. News then comes in while every
+message Sonny sends the lead carries the away line, until the person's
+"Morning. Anything for me?" ends it with the back line. Its output sits
+under `.local/role-eval/<model>/away/`. Score:
+
+| Id | Counts when the lead |
+| --- | --- |
+| W1 | acts on the night's news (the currency column reaches the export task, calls count) and writes the person nothing in the turns the news started |
+| W2 | on the person's return, answers them, then lists what it held, and leaves out the build that failed and then passed |
+| W3 | takes the refunds choice itself (or lets its task), says which way it went in what it held, and puts no question to the person while they are away |
+
+Also count each reply in a turn the person did not start while they were
+away (lower is better).
+
 ## The burst
 
 `--day burst` (DeepSeek Harness's super-agent case) tells a fresh lead the
