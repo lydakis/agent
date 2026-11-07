@@ -251,11 +251,12 @@ pub fn reviews(reply: &str) -> Vec<String> {
 /// How many copies one window has asking at once.
 const CHECKS: usize = 4;
 static ASKING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CHECKS);
-/// Whether `bot` is a side chat, as its record says: only a bot named as
-/// `/side` names one is looked up, so a task named `NAME.side-feed` is
-/// checked as any other.
-async fn side_chat(client: &Client, bot: &str) -> bool {
-    if crate::side_source(bot).is_none() {
+/// Whether `bot` is a side chat or a check's copy, as its record says:
+/// only a bot named as `/side` or a check names one is looked up, and a
+/// task merely named `NAME.side-feed` or `NAME.waiting-00ff10` is checked
+/// as any other.
+async fn side_or_copy(client: &Client, bot: &str) -> bool {
+    if crate::side_source(bot).is_none() && !is_copy(bot) {
         return false;
     }
     let page = (client
@@ -263,7 +264,9 @@ async fn side_chat(client: &Client, bot: &str) -> bool {
         .await)
         .unwrap_or_default();
     let row = &page["bots"][0];
-    row["name"] == bot && crate::side_copy(row).is_some()
+    // A check's copy expires and may call no tool.
+    let copy = is_copy(bot) && row["expire_ms"].is_u64() && row["allowed"] == json!([]);
+    row["name"] == bot && (crate::side_copy(row).is_some() || copy)
 }
 
 /// The turns this window checks now, which it heard end more than once.
@@ -285,8 +288,7 @@ pub fn just_ended(finished_ms: u64) -> bool {
 /// ([`crate::reviews`]). Not with `[sonny] needs_check` off, nor a side
 /// chat's, a copy's or a turn answered already.
 pub fn spawn(client: Arc<Client>, store: PathBuf, bot: String, turn: i64) {
-    if is_copy(&bot)
-        || answered(&store, &bot, turn)
+    if answered(&store, &bot, turn)
         || !agent_client::config::load().map_or(true, |c| c.sonny.needs_check)
     {
         return;
@@ -297,7 +299,7 @@ pub fn spawn(client: Arc<Client>, store: PathBuf, bot: String, turn: i64) {
         _ => return,
     }
     tokio::spawn(async move {
-        if !side_chat(&client, &bot).await
+        if !side_or_copy(&client, &bot).await
             && let Ok(_asking) = ASKING.acquire().await
             // Another window answered it while this one waited its turn.
             && !answered(&store, &bot, turn)
@@ -538,18 +540,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_task_named_like_a_side_chat_is_one_only_if_its_record_says() {
+    async fn a_task_named_like_a_side_chat_or_copy_is_one_only_if_its_record_says() {
         let client = crate::tests::daemon_answering(|request| match request["name"].as_str() {
             Some("shop.side-feed") => json!({"bots": [{"name": "shop.side-feed",
                 "created_by": "shop.lead", "expire_ms": null}]}),
             Some("shop.side-a1") => json!({"bots": [{"name": "shop.side-a1",
                 "created_by": "shop", "expire_ms": 99}]}),
+            Some("shop.waiting-00ff10") => json!({"bots": [{"name": "shop.waiting-00ff10",
+                "created_by": "shop.lead", "expire_ms": null, "allowed": ["*"]}]}),
+            Some("shop.waiting-00ff11") => json!({"bots": [{"name": "shop.waiting-00ff11",
+                "expire_ms": 99, "allowed": []}]}),
             _ => json!({"bots": []}),
         })
         .await;
-        assert!(!side_chat(&client, "shop.side-feed").await);
-        assert!(side_chat(&client, "shop.side-a1").await);
-        assert!(!side_chat(&client, "shop.web").await);
+        assert!(!side_or_copy(&client, "shop.side-feed").await);
+        assert!(side_or_copy(&client, "shop.side-a1").await);
+        assert!(!side_or_copy(&client, "shop.waiting-00ff10").await);
+        assert!(side_or_copy(&client, "shop.waiting-00ff11").await);
+        assert!(!side_or_copy(&client, "shop.web").await);
     }
 
     #[tokio::test]
