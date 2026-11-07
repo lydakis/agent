@@ -1729,6 +1729,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             bindings: bindings.clone(),
             building: false,
             again: false,
+            refreshing: None,
             last: Value::Null,
         })
     });
@@ -1905,7 +1906,10 @@ pub async fn run(config: Configuration) -> Result<()> {
     service.retry_held(None).await?;
     service.holds_due().await?;
     if let Some(path) = config.models.clone() {
-        tokio::spawn(refresh_models(service.providers.clone(), path));
+        let refreshing = tokio::spawn(refresh_models(service.providers.clone(), path));
+        if let Some(reload) = service.reload.as_mut() {
+            reload.refreshing = Some(refreshing.abort_handle());
+        }
     }
     // The providers' config file, watched by the kernel: nothing runs
     // until it changes.
@@ -1914,6 +1918,17 @@ pub async fn run(config: Configuration) -> Result<()> {
         .as_ref()
         .and_then(|reload| file_watch::watch(&reload.config));
     let (reloaded_sender, mut reloaded) = mpsc::unbounded_channel();
+    // An edit made while the daemon started, before the watch, is read
+    // once now; a file that names the set already bound binds nothing.
+    if provider_changes.is_some()
+        && let Some(reload) = service.reload.as_mut()
+    {
+        reload.start(
+            service.providers.clone(),
+            service.store.clone(),
+            reloaded_sender.clone(),
+        );
+    }
     let idle_exit = config
         .idle_exit
         .filter(|_| config.socket.is_some())
@@ -2823,9 +2838,6 @@ impl Service {
             Err(error) => Err(error),
         }
     }
-    /// Try every held turn again now, or only `bot`'s, as the person may
-    /// have fixed what held them: those parked on a call wake, and those
-    /// held in line go to the dispatcher. Returns how many.
     /// A finished reload build: an applied set is swapped in for the turns
     /// that start from now on, held turns are tried again (a provider they
     /// waited on may be back), and the model list is refreshed from the
@@ -2853,12 +2865,20 @@ impl Service {
         if applied.is_some() {
             self.retry_held(None).await?;
             if let Some(path) = models {
-                tokio::spawn(refresh_models(self.providers.clone(), path));
+                let refreshing = tokio::spawn(refresh_models(self.providers.clone(), path));
+                if let Some(reload) = self.reload.as_mut()
+                    && let Some(older) = reload.refreshing.replace(refreshing.abort_handle())
+                {
+                    older.abort();
+                }
             }
         }
         Ok(applied)
     }
 
+    /// Try every held turn again now, or only `bot`'s, as the person may
+    /// have fixed what held them: those parked on a call wake, and those
+    /// held in line go to the dispatcher. Returns how many.
     async fn retry_held(&mut self, bot: Option<String>) -> Result<usize> {
         let (parked, lined) = self
             .store

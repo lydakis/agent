@@ -425,8 +425,9 @@ the providers they started with. A provider whose spec is unchanged is kept
 as it was, with its pacing, connections and keys. A file that does not
 parse, a spec that does not bind (a key variable the daemon was not started
 with, say), and the removal of a provider an agent's model, fallback or
-compaction model, or an unfinished turn's own model, still names
-(`provider_in_use`, naming them) are refused
+compaction model, or an unfinished turn's own model, still names, or that
+binds such a provider to another API family (`provider_in_use`, naming
+them), are refused
 whole, and the old set stays. `stats.provider_reload` says what the last
 change came to (`applied` with `added`, `removed` and `changed`, or
 `refused` with its error); new sessions' `ready.providers` show the set in
@@ -496,8 +497,9 @@ refusal, so it can run again after a login. Once the file exists the merge
 is three-way, against what refreshes put in the file
 (`~/.agent/models.listed`): a model a provider newly lists is added after
 that provider's last line while the file stays within its limit, one it
-stopped listing is removed (and added again if it comes back), and every
-other line (the person's own models, notes, comments, and the absence of
+added and the provider stopped listing is removed (and added again if it
+comes back), and every other line (the person's own models, even ones a
+provider lists, notes, comments, and the absence of
 lines they deleted, even through a time the provider stopped listing them)
 is kept byte for byte. One refresh of the folder runs at a time, and the
 file is compared just before it is replaced, so an edit saved meanwhile is

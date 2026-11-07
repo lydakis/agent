@@ -1759,6 +1759,12 @@ class ModelListTests(ModelFixture):
         self.assertEqual(broken['provider_reload']['status'], 'refused')
         self.assertEqual(sorted(broken['providers']), ['openai', 'second'])
 
+        # Binding Bob's provider to another API family is refused like a removal.
+        config.write_text(f'provider = "openai=anthropic,{base} second=responses,{self.url}"\n')
+        retyped = settled(lambda s: s['provider_reload']['error'] == 'provider_in_use')
+        self.assertIn('Bob', retyped['provider_reload']['detail'])
+        self.assertEqual(retyped['provider_reload']['facts']['providers'], ['openai'])
+
         # A changed spec binds that provider again; the turn after uses it.
         config.write_text(f'provider = "openai=responses,{self.url} second=responses,{base}/elsewhere/v1"\n')
         changed = settled(lambda s: s['provider_reload']['status'] == 'applied')

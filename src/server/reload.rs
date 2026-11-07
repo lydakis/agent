@@ -5,7 +5,8 @@
 //! start after the swap use the new ones. A binding whose spec is unchanged
 //! is kept as it is, with its pacing, sockets, keys and listings. An edit
 //! that does not parse or bind, or that removes a provider agents still
-//! name, is refused whole and the old set stays. Nothing runs between
+//! name or binds it to another API family, is refused whole and the old
+//! set stays. Nothing runs between
 //! changes: the file is watched by the kernel (`file_watch`).
 use super::{Binder, ProviderSpec};
 use agent_runtime::{Error, Result, provider::Provider, store::Store};
@@ -27,6 +28,9 @@ pub struct Reload {
     /// again while it ran.
     pub building: bool,
     pub again: bool,
+    /// The model list refresh the last set started, cancelled when a newer
+    /// set starts its own, so a slow listing never lands over a newer one.
+    pub refreshing: Option<tokio::task::AbortHandle>,
     /// The last reload's outcome, for `stats`.
     pub last: Value,
 }
@@ -148,6 +152,9 @@ async fn build(
     let mut providers = HashMap::new();
     let mut new_bindings = serde_json::Map::new();
     let (mut added, mut changed) = (Vec::new(), Vec::new());
+    // Names kept but bound to another API family: what was stored for
+    // their agents is no longer theirs to send, as if they were removed.
+    let mut retyped = Vec::new();
     let aws_start = agent_runtime::provider::aws::Start::new();
     for spec in &parsed {
         let kept = (was.get(&spec.name).is_some_and(|text| **text == spec.spec))
@@ -171,6 +178,12 @@ async fn build(
                 })?
             }
         };
+        if current
+            .get(&spec.name)
+            .is_some_and(|was| was.family() != provider.family())
+        {
+            retyped.push(spec.name.clone());
+        }
         if providers.insert(spec.name.clone(), provider).is_some() {
             return Err(Error::with("duplicate_provider", spec.name.as_str()));
         }
@@ -182,8 +195,11 @@ async fn build(
         .cloned()
         .collect();
     removed.sort();
-    if !removed.is_empty() {
-        let names = removed.clone();
+    let mut unusable = removed.clone();
+    unusable.extend(retyped);
+    unusable.sort();
+    if !unusable.is_empty() {
+        let names = unusable.clone();
         let agents = store
             .op("bots_on_providers", move |db| db.bots_on_providers(&names))
             .await?;
@@ -202,10 +218,11 @@ async fn build(
                     } else {
                         "agents"
                     },
-                    removed.join(", "),
+                    unusable.join(", "),
                     shown.join(", "),
                 )),
-                facts: match json!({"providers": removed, "agents": shown, "count": agents.len()}) {
+                facts: match json!({"providers": unusable, "agents": shown, "count": agents.len()})
+                {
                     Value::Object(facts) => Some(Box::new(facts)),
                     _ => None,
                 },

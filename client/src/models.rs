@@ -504,9 +504,9 @@ fn write_record(path: &Path, text: &str) -> Result<(), Error> {
     }
 }
 
-/// A merge: the list's new text, what it added and removed, and every id
-/// the answering providers list now that the new text holds (`listed`) or
-/// that was left out of it (`offered`).
+/// A merge: the list's new text, what it added and removed, the refresh's
+/// own ids the answering providers list now that the new text holds
+/// (`listed`), and new ones left out of it for its size (`offered`).
 #[derive(Default)]
 struct Merged {
     text: String,
@@ -548,7 +548,9 @@ fn merge(
                 merged.removed.push(id.to_owned());
                 continue;
             }
-            if now.is_some_and(|now| now.contains(id)) {
+            // Still the refresh's own line: one the person wrote stays
+            // theirs, kept whatever the provider lists.
+            if record.contains(id) && now.is_some_and(|now| now.contains(id)) {
                 merged.listed.insert(id.to_owned());
             }
         } else if answered.iter().any(|(name, _)| failure_note(line, name)) {
@@ -1073,6 +1075,30 @@ mod tests {
             .filter(|name| name.starts_with('.'))
             .collect();
         assert!(left.is_empty(), "{left:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_line_the_person_wrote_stays_when_the_provider_stops_listing_it() {
+        let dir = temp("theirs");
+        let list = dir.join("models");
+        refreshed_in(
+            &dir,
+            json!({"providers":{"openai":{"models":[{"id":"a"}]}}}),
+        );
+        // Their own line, for a model the provider also lists for a while.
+        let text = std::fs::read_to_string(&list).unwrap() + "openai/mine  # by hand\n";
+        std::fs::write(&list, &text).unwrap();
+        refreshed_in(
+            &dir,
+            json!({"providers":{"openai":{"models":[{"id":"a"},{"id":"mine"}]}}}),
+        );
+        let gone = refreshed_in(
+            &dir,
+            json!({"providers":{"openai":{"models":[{"id":"a"}]}}}),
+        );
+        assert!(gone.removed.is_empty(), "{gone:?}");
+        assert_eq!(std::fs::read_to_string(&list).unwrap(), text);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
