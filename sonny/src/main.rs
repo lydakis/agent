@@ -12238,20 +12238,19 @@ impl App {
         if let (Some(id), Some(head)) = (forked["bot_id"].as_i64(), forked["head"].as_i64()) {
             margin::start_at(&self.options.store, id, head);
         }
-        // A question is the person's words: it ends quiet as a message does.
+        // The question is the person's words: stamped, it ends quiet as a
+        // message does. On the model this window's turns run on, whose
+        // cache is warm.
         if !question.is_empty() {
             self.quiet = None;
-            quiet::mark_present();
-            quiet::end();
         }
-        // On the model this window's turns run on, whose cache is warm.
         if !question.is_empty()
             && let Err(error) = self
                 .client
                 .request(
                     "submit",
                     json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
-                        "prompt": question, "delivery": "steer", "model": self.turn_model,
+                        "prompt": stamp::person(&question), "delivery": "steer", "model": self.turn_model,
                         "images": attach::submitted(pictures)}),
                 )
                 .await
