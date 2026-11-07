@@ -1261,6 +1261,7 @@ impl Service {
             // The lookouts whose news may have changed: those an event
             // reached, or all of them.
             let mut touched: Option<Vec<String>> = None;
+            let mut overdue: Vec<(String, Vec<String>)> = Vec::new();
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else {
@@ -1541,6 +1542,20 @@ impl Service {
                 }
                 lookout.wake(&client, &woken);
                 lookout.wake_sources(&client, &woken);
+                let over = std::mem::take(&mut lookout.over);
+                if !over.is_empty() {
+                    overdue.push((name, over));
+                }
+            }
+            // Subscriptions whose `until` came between rereads end before
+            // any note tells what they heard.
+            if !overdue.is_empty() {
+                for (lead, over) in std::mem::take(&mut overdue) {
+                    for name in &over {
+                        self.end_sub(&lead, name, "its until came");
+                    }
+                }
+                self.reread(&client).await;
             }
         }
     }
@@ -1902,7 +1917,7 @@ impl Service {
 
     /// A bot was deleted: the subscriptions it held end with it, and so
     /// does any that watched only bots by their names, every one of them
-    /// gone now, and no source.
+    /// gone now, and no source or maker's tasks.
     fn ended_with(&self, gone: &str, id: Option<i64>) {
         if self.subscribers.contains_key(gone) {
             let forgot = subs::forget(&self.store, gone, id);
@@ -1913,9 +1928,11 @@ impl Service {
         }
         for (subscriber, subs) in &self.subscribers {
             for sub in subs {
-                let names: Vec<&String> = sub.bots.iter().chain(&sub.tasks_of).collect();
+                // A maker's tasks outlive it: one that watches them stays.
+                let names: Vec<&String> = sub.bots.iter().collect();
                 let watched_gone = names.iter().any(|name| *name == gone)
                     && sub.sources.is_empty()
+                    && sub.tasks_of.is_empty()
                     && names
                         .iter()
                         .all(|name| !name.contains('*') && !self.records.contains_key(*name));
@@ -2468,6 +2485,9 @@ struct Lookout {
     runs_told: HashMap<String, u64>,
     /// Subscriptions whose notes ran out, for the service to end.
     ended: Vec<String>,
+    /// Subscriptions whose `until` came before the files were read again,
+    /// for the service to end.
+    over: Vec<String>,
     /// Where what its sources said waits, untold, so a restart loses none
     /// of what a digest or a busy subscriber held.
     held: Option<PathBuf>,
@@ -2534,6 +2554,7 @@ impl Lookout {
             told_sources: HashMap::new(),
             runs_told: HashMap::new(),
             ended: Vec::new(),
+            over: Vec::new(),
             held: None,
             dirty: false,
             resend: Vec::new(),
@@ -2998,7 +3019,7 @@ impl Lookout {
         {
             self.ask(client, woken, now);
         }
-        if self.sending.is_some() || self.last_runs_out(true) {
+        if self.sending.is_some() || self.last_runs_out(true) || self.overdue() {
             return;
         }
         let Some(joins) = self.wake_due(now) else {
@@ -3188,6 +3209,18 @@ impl Lookout {
             subs.iter()
                 .any(|sub| &sub.name == name && sub.runs.is_some())
         });
+    }
+
+    /// Whether a subscription's `until` came since the files were last
+    /// read: it goes to `over`, to end before any note is sent.
+    fn overdue(&mut self) -> bool {
+        let now = (epoch_ms() / 1000) as i64;
+        for sub in self.subs.iter().filter(|sub| sub.over(now)) {
+            if !self.over.contains(&sub.name) {
+                self.over.push(sub.name.clone());
+            }
+        }
+        !self.over.is_empty()
     }
 
     /// Whether the note under way on the other path, the sources' for task
@@ -3548,7 +3581,7 @@ impl Lookout {
         if self.updates.waited(now, since) {
             self.ask(client, woken, now);
         }
-        if self.sourcing.is_some() || self.last_runs_out(false) {
+        if self.sourcing.is_some() || self.last_runs_out(false) || self.overdue() {
             return;
         }
         if self.refused(now) {
@@ -5902,6 +5935,14 @@ mod tests {
         assert!(!again.last_runs_out(true), "nothing under way for sources");
         again.sending = None;
         assert!(!again.last_runs_out(false));
+        // One whose `until` came before the files are read again holds
+        // every note back until the service ends it.
+        assert!(!again.overdue());
+        let mut late = hears("late");
+        late.until = Some("2020-01-01 00:00".into());
+        again.subs.push(late);
+        assert!(again.overdue());
+        assert_eq!(again.over, ["late"]);
         // Removed and added again, it counts afresh.
         again.runs_told.insert("twice".into(), 1);
         again.subs.retain(|sub| sub.name != "twice");
@@ -5960,12 +6001,13 @@ mod tests {
                 .map(|s| s.name)
                 .collect()
         };
-        // One bot of two still there, a glob, or a source keeps it.
-        assert_eq!(names(&store), ["both", "glob", "ci"]);
+        // One bot of two still there, a glob, a source, or the tasks a
+        // maker made, which outlive it, keeps it.
+        assert_eq!(names(&store), ["fix", "both", "glob", "ci"]);
         service.records.remove("shop.docs");
         service.subscribers = subs::all(&store).into_iter().collect();
         service.ended_with("shop.docs", Some(3));
-        assert_eq!(names(&store), ["glob", "ci"]);
+        assert_eq!(names(&store), ["fix", "glob", "ci"]);
         // A delete the lookout was away for: a subscriber no longer listed
         // ends whole, and one still listed keeps what its bot holds.
         add(
@@ -5977,7 +6019,7 @@ mod tests {
         let after = std::time::SystemTime::now() + Duration::from_secs(5);
         assert!(service.unheld(after));
         assert!(subs::read(&store, "shop.gone").is_empty());
-        assert_eq!(names(&store), ["glob", "ci"]);
+        assert_eq!(names(&store), ["fix", "glob", "ci"]);
         service.subscribers = subs::all(&store).into_iter().collect();
         assert!(!service.unheld(after), "nothing more");
         // A file written since the listing is left: a bot made since may
