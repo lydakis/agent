@@ -21,6 +21,7 @@ pub fn tools(role: Role) -> Vec<Value> {
     let mut tools = vec![
         crate::reactions::tool(),
         crate::asks::tool(),
+        crate::asks::close_tool(),
         crate::plan::tool(),
         crate::margin::tool(),
     ];
@@ -259,7 +260,9 @@ mod tests {
             a_lead(),
         )
         .unwrap();
-        assert!(serde_json::to_vec(&lead).unwrap().len() <= DECLARED_BYTES / 2);
+        // Sonny's own take at most three fifths of the daemon's budget,
+        // the rest left to the agent's.
+        assert!(serde_json::to_vec(&lead).unwrap().len() <= DECLARED_BYTES * 3 / 5);
         let wanted = declare(&json!({"declared": [other]}), a_helper()).unwrap();
         let mut all = vec![other];
         all.extend(tools(a_helper()));

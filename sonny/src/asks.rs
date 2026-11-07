@@ -3,11 +3,14 @@
 //! conversation where it was asked: why it is asked, each option with what
 //! picking it means, the one the lead recommends and why, and what the
 //! agent does while nobody answers. A pick (a click on an option, or its
-//! number typed) answers it, and goes to the lead as their next message.
-//! Words the person types are their own, never framed as an answer: they
-//! may be meant for anything, and the agent reads whether they answer, as
-//! a reply under a card in a chat is read. The open questions are read
-//! from the history Sonny replays: its `ask` calls not yet answered.
+//! number typed) answers it, and so do words typed while it is in focus in
+//! the composer, the row over them naming it: either goes to the lead as
+//! their next message, once. Words written after Esc are the person's own,
+//! never framed as an answer, and set the question aside: the agent reads
+//! whether they answer it, as a reply under a card in a chat is read, and
+//! closes it with [`CLOSE`] once it knows. A card says which of these it
+//! is in ([`State`]). The open questions are read from the history Sonny
+//! replays: its `ask` calls not yet answered nor closed.
 //!
 //! Silence counts as a yes only where the agent says a step can be undone,
 //! as an Apache project's lazy consensus passes what is easy to revert once
@@ -29,11 +32,16 @@ use unicode_width::UnicodeWidthStr;
 
 /// The name of the tool the lead asks with.
 pub const TOOL: &str = "ask";
+/// The name of the tool an agent closes a question of its own with.
+pub const CLOSE: &str = "close_ask";
 /// Options are picked by one digit.
 const OPTIONS: usize = 9;
 /// The mark a decision starts with, and the bar down its left side.
 const GLYPH: &str = "? ";
 const BAR: &str = "┃ ";
+/// The marks an answered question and a withdrawn one start with.
+const TICK: &str = "✓ ";
+const DASH: &str = "– ";
 /// The longest wait an agent may set: a week.
 const MAX_MINUTES: u64 = 7 * 24 * 60;
 /// How much of the question a fire's message quotes, in characters.
@@ -80,6 +88,68 @@ impl Ask {
             None => self.id.clone(),
         }
     }
+}
+
+/// Where a question stands, as its card says it: one of open, set aside,
+/// answered or withdrawn, answered either by the person or, from their
+/// words, by the agent's own record.
+#[derive(Clone, Debug, PartialEq)]
+pub enum State {
+    /// It waits on the person.
+    Open,
+    /// The person wrote words of their own past it: out of the composer
+    /// and the count, a pick still answering it.
+    Aside,
+    /// The person answered it: the option they picked, or their words.
+    Answered(String),
+    /// The agent recorded that the person's words answered it, going with
+    /// an option (from 0) or none, and its note of what they said. Its
+    /// record, never their answer: a pick still answers it.
+    Recorded { option: Option<usize>, note: String },
+    /// The agent took it back as no longer needed, and why.
+    Withdrawn(String),
+}
+
+impl State {
+    /// Whether it is answered or closed: its card folds, and it waits on
+    /// nobody.
+    pub fn settled(&self) -> bool {
+        !matches!(self, Self::Open | Self::Aside)
+    }
+
+    /// Whether a pick on its card still answers it: anything but the
+    /// person's own answer, which the daemon takes once.
+    pub fn takes_a_pick(&self) -> bool {
+        !matches!(self, Self::Answered(_))
+    }
+}
+
+/// What a `close_ask` call with `arguments` closes: the ask it names, as
+/// [`id`] names it, and the state it leaves it in.
+pub fn closing(arguments: &Value) -> Option<(String, State)> {
+    let asked = arguments["id"].as_str()?.trim();
+    if !well_formed(asked) {
+        return None;
+    }
+    let note = tidy(arguments["note"].as_str()).replace('\n', " ");
+    let state = match arguments["outcome"].as_str()? {
+        "answered" => State::Recorded {
+            option: (arguments["option"].as_u64()).and_then(|n| (n as usize).checked_sub(1)),
+            note,
+        },
+        "withdrawn" => State::Withdrawn(note),
+        _ => return None,
+    };
+    Some((asked.to_owned(), state))
+}
+
+/// The ask a history `item` closes, when it is a `close_ask` call.
+pub fn closed_by(item: &Value) -> Option<(String, State)> {
+    if item["type"] != "function_call" || item["name"] != CLOSE {
+        return None;
+    }
+    let arguments = serde_json::from_str::<Value>(item["arguments"].as_str()?).ok()?;
+    closing(&arguments)
 }
 
 /// A task whose question a lead's window shows: the agent its answer goes
@@ -217,9 +287,11 @@ pub fn tool() -> Value {
             they answer. Options without what they mean are useless to the person, so say what each \
             one does to their goal. Ask once, one decision per call, and do not repeat it in your \
             reply. When their pick approves an action, say in covers what: their yes covers that \
-            action, target and revision alone, so a new target or revision needs a new ask. A pick comes as their next message, starting \"You \
-            asked\", the ask's ID, your question and what it covers; words they write instead come as they wrote them, so read whether they \
-            answer it. Say in if_unanswered what you do until then. go_now goes on with the option \
+            action, target and revision alone, so a new target or revision needs a new ask. Their answer, a \
+            pick or words typed for it, comes as their next message, starting \"You asked\", the ask's \
+            ID, your question and what it covers; other words come as written: once they answer it, \
+            or it no longer matters, close it with close_ask. Say in if_unanswered what you do until \
+            then. go_now goes on with the option \
             you recommend at once, for a step you can undo once they have seen it. go_later goes \
             on with it once the wait passes with no word from them, for a step you can undo but \
             would rather they saw first. wait does nothing they have not picked: anything that goes \
@@ -281,6 +353,31 @@ pub fn tool() -> Value {
                         left out, the person's setting."}
             },
             "required": ["question", "why", "if_unanswered"],
+            "additionalProperties": false
+        },
+        "answered_by": crate::served::TAG,
+        "expire_ms": 60 * 1000
+    })
+}
+
+/// The `close_ask` tool as Sonny declares it on a bot, answered by its
+/// tool host, which checks the ask is the agent's and still waits.
+pub fn close_tool() -> Value {
+    json!({
+        "name": CLOSE,
+        "description": "Close a question you asked once it no longer waits on the person; its card \
+            shows the outcome and your note. answered: their words answered it, here or passed on \
+            to you, with the option you go with. withdrawn: it no longer matters. A pick of theirs \
+            later still answers it.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "The ID ask gave."},
+                "outcome": {"type": "string", "enum": ["answered", "withdrawn"]},
+                "option": {"type": "integer", "minimum": 1},
+                "note": {"type": "string", "description": "One line: what they said, or why."}
+            },
+            "required": ["id", "outcome", "note"],
             "additionalProperties": false
         },
         "answered_by": crate::served::TAG,
@@ -404,6 +501,12 @@ pub fn open(items: &[Value]) -> Option<Ask> {
                 true => refused.push(at.clone()),
                 false => results.push((at.clone(), crate::output(item).0)),
             }
+        }
+        // The agent closed it, as an answer would.
+        if let Some((closed, _)) = closed_by(item)
+            && !refused.contains(&at)
+        {
+            answers.push(closed);
         }
         if item["type"] == "function_call"
             && item["name"] == TOOL
@@ -573,21 +676,6 @@ fn answering_row(question: &str, place: &str, width: usize) -> Line<'static> {
     Line::from(format!("  answering “{cut}”{place}")).dim()
 }
 
-/// `asks` without the one `text` answers; whether it was there.
-pub fn close(asks: &mut Vec<Ask>, text: &str, from: Option<&str>) -> bool {
-    // A task's question is answered in the task's conversation, not here.
-    let at = answer_of(text, from)
-        .and_then(|call| (asks.iter()).position(|ask| ask.id == call && ask.task.is_none()));
-    at.map(|at| asks.remove(at)).is_some()
-}
-
-/// Whether what is typed picks one of `ask`'s options: its number alone.
-/// Only a pick answers a question from the composer; words are the
-/// person's own.
-pub fn picks(ask: &Ask, typed: &str) -> bool {
-    (typed.trim().parse::<usize>()).is_ok_and(|n| (1..=ask.options.len()).contains(&n))
-}
-
 /// The person's message answering `ask`, by its call, so it answers that
 /// ask and no other asking the same: an option's number stands for the
 /// option.
@@ -617,14 +705,20 @@ pub struct Card {
     /// drawn narrower than it was laid: the bar, then room to the text,
     /// so the bar goes on down however the rows wrap.
     pub hangs: Vec<Line<'static>>,
+    /// The rows the question is on, a click on which brings it to the
+    /// composer, or opens or folds a settled card.
+    pub question: std::ops::Range<usize>,
 }
 
 /// The decision as it is drawn where it was asked: the question, why,
 /// each option by number with what it means, and the recommendation.
 /// A `?` in yellow, what needs the person, starts it, and a muted bar
 /// down its left side sets it apart from the replies around it, as a
-/// callout's does: a shape of its own without color too.
-pub fn card(ask: &Ask, width: usize) -> Card {
+/// callout's does: a shape of its own without color too. Where it
+/// stands, when not open, is its last row; set aside, the `?` is muted;
+/// answered it starts with a `✓`, withdrawn with a `–`, and `folded`
+/// it is the question and that row alone.
+pub fn card(ask: &Ask, state: &State, folded: bool, width: usize) -> Card {
     // Prose reads at most so wide, as a reply does, labels too.
     let width = width.min(crate::measure());
     let mut options = Vec::new();
@@ -637,8 +731,8 @@ pub fn card(ask: &Ask, width: usize) -> Card {
         let mut markdown = crate::transcript::Markdown::default();
         let rows = crate::transcript::markdown(&mut markdown, text, width, (first, rest));
         rows.into_iter().map(move |mut row| {
-            for span in
-                (row.spans.iter_mut()).filter(|span| ![BAR, GLYPH].contains(&&*span.content))
+            for span in (row.spans.iter_mut())
+                .filter(|span| ![BAR, GLYPH, TICK, DASH].contains(&&*span.content))
             {
                 span.style = style.patch(span.style);
             }
@@ -648,12 +742,50 @@ pub fn card(ask: &Ask, width: usize) -> Card {
     };
     let mut rows: Vec<(Line<'static>, Line<'static>)> = Vec::new();
     let spacer = || (Line::from(indent()), Line::from(indent()));
+    // What needs the person in yellow and bold; what no longer does
+    // muted, a settled question at the text's own weight.
+    let (glyph, weight) = match state {
+        State::Open => (
+            Span::raw(GLYPH).fg(Color::Yellow).bold(),
+            Style::new().bold(),
+        ),
+        State::Aside => (Span::raw(GLYPH).dim(), Style::new().bold()),
+        State::Answered(_) | State::Recorded { .. } => {
+            (Span::raw(TICK).fg(Color::Green), Style::new())
+        }
+        State::Withdrawn(_) => (Span::raw(DASH).dim(), Style::new()),
+    };
     rows.extend(markdown(
         &ask.question,
-        Line::from(Span::raw(GLYPH).fg(Color::Yellow).bold()),
+        Line::from(glyph),
         Line::from(indent()),
-        Style::new().bold(),
+        weight,
     ));
+    let question = 0..rows.len();
+    // Where it stands, under the rest, muted, what was answered at the
+    // text's own weight.
+    let stands = |rows: &mut Vec<(Line<'static>, Line<'static>)>| {
+        if let Some(spans) = stands(ask, state) {
+            let wrapped = crate::transcript::wrap_lines(
+                Line::from(spans),
+                width,
+                Line::from(indent()),
+                Line::from(indent()),
+            );
+            rows.extend(wrapped.into_iter().map(|row| (row, Line::from(indent()))));
+        }
+    };
+    if folded && state.settled() {
+        stands(&mut rows);
+        let (rows, hangs) = rows.into_iter().unzip();
+        return Card {
+            rows,
+            options,
+            command: 0..0,
+            hangs,
+            question,
+        };
+    }
     rows.extend(markdown(
         &ask.why,
         Line::from(indent()),
@@ -721,8 +853,14 @@ pub fn card(ask: &Ask, width: usize) -> Card {
         ));
     }
     // What happens while nobody answers, under the recommendation it
-    // follows, muted as the reason is, the time at the text's own weight.
-    if let Some(meanwhile) = meanwhile(ask, now()) {
+    // follows, muted as the reason is, the time at the text's own weight:
+    // only while it is open, past which nothing fires.
+    if *state != State::Open {
+        if ask.reason.is_empty() || ask.recommended.is_none() {
+            rows.push(spacer());
+        }
+        stands(&mut rows);
+    } else if let Some(meanwhile) = meanwhile(ask, now()) {
         if ask.reason.is_empty() {
             rows.push(spacer());
         }
@@ -741,6 +879,54 @@ pub fn card(ask: &Ask, width: usize) -> Card {
         options,
         command,
         hangs,
+        question,
+    }
+}
+
+/// Where a question stands, as the last row of its card says it: muted
+/// words, what was answered or noted at the text's own weight; none while
+/// it is open.
+fn stands(ask: &Ask, state: &State) -> Option<Vec<Span<'static>>> {
+    let muted = |text: &str| Span::raw(text.to_owned()).dim();
+    let plain = |text: &str| Span::raw(first_line(text));
+    let noted = |label: &str, note: &str| match note.is_empty() {
+        true => vec![muted(label)],
+        false => vec![muted(&format!("{label} · ")), plain(note)],
+    };
+    Some(match state {
+        State::Open => return None,
+        State::Aside => vec![muted(
+            "Set aside: you wrote past it. A pick still answers it.",
+        )],
+        State::Answered(answer) => vec![muted("Answered · "), plain(answer)],
+        State::Recorded { option, note } => {
+            let label = "Answered in your words";
+            match option.and_then(|at| ask.options.get(at)) {
+                Some(choice) => {
+                    let mut spans = vec![
+                        muted(&format!("{label} · going with ")),
+                        plain(&choice.label),
+                    ];
+                    if !note.is_empty() {
+                        spans.extend([muted(" · "), plain(note)]);
+                    }
+                    spans
+                }
+                None => noted(label, note),
+            }
+        }
+        State::Withdrawn(note) => noted("Withdrawn", note),
+    })
+}
+
+/// The first line of `text` with words, trimmed, and `…` after it when
+/// more follow.
+fn first_line(text: &str) -> String {
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next().unwrap_or_default().to_owned();
+    match lines.next() {
+        Some(_) => format!("{first} …"),
+        None => first,
     }
 }
 
@@ -919,8 +1105,8 @@ pub fn served(arguments: &Value, bot: &str, turn: i64, call: &str) -> Result<Str
             .to_owned(),
     };
     Ok(
-        json!({"if_unanswered": plan.name(), "deadline_s": deadline, "deadline": when,
-        "deadline_error": unset, "next": next})
+        json!({"id": ask.id, "if_unanswered": plan.name(), "deadline_s": deadline,
+        "deadline": when, "deadline_error": unset, "next": next})
         .to_string(),
     )
 }
@@ -1016,44 +1202,197 @@ fn fire(question: &str, plan: Unanswered, label: &str) -> String {
     }
 }
 
-/// Whether the ask `asked` by call `call` is still open, read from the
-/// agent's history newest first, one entry at a time, as [`open`] reads
-/// it: answered by the person, or set aside by words of their own after
-/// it, it is settled. `None` while the entries read have not reached the
-/// call.
+/// Where an ask stands, read from its agent's history newest first, one
+/// entry at a time, back to the call that asked it, as [`open`] reads it:
+/// answered by the person, closed by the agent, set aside by words of the
+/// person's own after it, or open.
 #[derive(Default)]
-struct Reading {
-    /// The asks the person answered after the call, so far.
-    answers: Vec<String>,
+struct Standing {
+    /// The person's answers after the call, by ask, newest first.
+    answers: Vec<(String, String)>,
+    /// The agent's closes after it, by ask, newest first, with the turn
+    /// and call each was made as.
+    closes: Vec<((i64, Value), String, State)>,
+    /// The calls refused or failed, by turn and call: a close refused
+    /// closed nothing.
+    refused: Vec<(i64, Value)>,
+    /// The person wrote words of their own after it.
+    moved_on: bool,
+    /// A call not to count, by turn and call: the close being answered.
+    skip: Option<(i64, Value)>,
 }
 
-impl Reading {
+impl Standing {
     /// Reads `entry`, of turn `at`, newest first, for ask `call` of turn
-    /// `turn`: whether it is open once its call is reached. A provider's
-    /// call IDs are unique only within a turn, so another turn's call of
-    /// the same ID is not the ask, and the reading goes on past it.
-    fn entry(&mut self, at: i64, entry: &Value, turn: i64, call: &str) -> Option<bool> {
+    /// `turn`: once the call is reached, the ask it put, if it put one,
+    /// and where it stands. A provider's call IDs are unique only within
+    /// a turn, so another turn's call of the same ID is not the ask, and
+    /// the reading goes on past it.
+    fn entry(
+        &mut self,
+        at: i64,
+        entry: &Value,
+        turn: i64,
+        call: &str,
+    ) -> Option<Option<(Ask, State)>> {
+        let items = crate::responses(&entry["item"]);
+        for item in &items {
+            let made = (at, item["call_id"].clone());
+            if item["type"] == "function_call_output"
+                && (item["failed"] == true || crate::reactions::refused(item))
+            {
+                self.refused.push(made.clone());
+            }
+            if let Some((closed, state)) = closed_by(item)
+                && self.skip.as_ref() != Some(&made)
+            {
+                self.closes.push((made, closed, state));
+            }
+        }
         if crate::lookout::said_by_person(entry).is_some() {
             let text = crate::text(&entry["item"]);
-            match answer_of(&text, None) {
-                Some(answered) => self.answers.push(answered.to_owned()),
-                None if moves_on(&text, entry["from"].as_str()) => return Some(false),
-                None => {}
+            match (answer_of(&text, None), split(&text)) {
+                (Some(answered), Some((_, answer))) => {
+                    self.answers
+                        .push((answered.to_owned(), answer.trim().to_owned()));
+                }
+                _ if moves_on(&text, entry["from"].as_str()) => self.moved_on = true,
+                _ => {}
             }
         }
         if at != turn {
             return None;
         }
-        let made = crate::responses(&entry["item"])
-            .into_iter()
+        let made = (items.iter())
             .find(|item| item["type"] == "function_call" && item["call_id"] == call)?;
-        let asks = (made["arguments"].as_str())
-            .and_then(|a| serde_json::from_str::<Value>(a).ok())
-            .and_then(|arguments| self::call("", &arguments))
-            .is_some();
         let asked = id(turn, call);
-        Some(asks && !self.answers.contains(&asked))
+        let ask = (made["arguments"].as_str())
+            .and_then(|a| serde_json::from_str::<Value>(a).ok())
+            .and_then(|arguments| self::call(&asked, &arguments));
+        Some(ask.map(|ask| {
+            let state = self.state(&asked);
+            (ask, state)
+        }))
     }
+
+    /// Where ask `asked` stands by what was read after it. The person's
+    /// first answer counts, as the daemon takes only the first, over any
+    /// close; then the agent's first close that was not refused.
+    fn state(&self, asked: &str) -> State {
+        if let Some((_, answer)) = (self.answers.iter().rev()).find(|(of, _)| of == asked) {
+            return State::Answered(answer.clone());
+        }
+        let closed = (self.closes.iter().rev())
+            .find(|(made, of, _)| of == asked && !self.refused.contains(made));
+        match closed {
+            Some((.., state)) => state.clone(),
+            None if self.moved_on => State::Aside,
+            None => State::Open,
+        }
+    }
+}
+
+/// Whether the ask `asked` by call `call` is still open, read as
+/// [`Standing`] reads it, stopping at the person's own words past it.
+/// `None` while the entries read have not reached the call.
+#[derive(Default)]
+struct Reading(Standing);
+
+impl Reading {
+    fn entry(&mut self, at: i64, entry: &Value, turn: i64, call: &str) -> Option<bool> {
+        let found = self.0.entry(at, entry, turn, call);
+        if self.0.moved_on {
+            return Some(false);
+        }
+        found.map(|found| found.is_some_and(|(_, state)| state == State::Open))
+    }
+}
+
+/// Where ask `call` of `bot`'s turn `turn` stands, read from its history:
+/// none when that call put no question. A close made as call `skip`, the
+/// one being answered, is not counted.
+pub async fn standing(
+    client: &agent_client::Client,
+    bot: &str,
+    turn: i64,
+    call: &str,
+    skip: Option<(i64, &str)>,
+) -> agent_client::Result<Option<(Ask, State)>> {
+    let mut reading = Standing {
+        skip: skip.map(|(turn, call)| (turn, json!(call))),
+        ..Standing::default()
+    };
+    let mut found = None;
+    crate::said::walk(client, bot, turn, |at, entry| {
+        found = reading.entry(at, entry, turn, call);
+        found.is_some()
+    })
+    .await?;
+    Ok(found.flatten())
+}
+
+/// Sonny's answer to a `close_ask` call by `bot`: the ask closed, once it
+/// is the agent's and nobody answered it, its deadline let go. The
+/// person's own answer stands: a question they answered is not closed.
+pub async fn served_close(
+    arguments: &Value,
+    bot: &str,
+    this: Option<(i64, &str)>,
+) -> Result<String, String> {
+    let (asked, state) = closing(arguments).ok_or(
+        "invalid_arguments: the ask's ID as ask gave it (ask:TURN/CALL), and outcome answered or \
+         withdrawn",
+    )?;
+    if matches!(&state, State::Recorded { note, .. } | State::Withdrawn(note) if note.is_empty()) {
+        return Err("invalid_arguments: a line in note for the card".into());
+    }
+    let (turn, call) = (asked.strip_prefix("ask:"))
+        .and_then(|rest| rest.split_once('/'))
+        .and_then(|(turn, call)| Some((turn.parse::<i64>().ok()?, call.to_owned())))
+        .ok_or("invalid_arguments: the ask's ID as ask gave it (ask:TURN/CALL)")?;
+    let daemon = crate::trigger::Daemon::current()?;
+    let socket = daemon.socket()?;
+    let client = crate::trigger::connect(&socket, &daemon).await?;
+    let found = standing(&client, bot, turn, &call, this)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some((ask, now)) = found else {
+        return Err(format!("ask_not_found: {asked} is no question of yours"));
+    };
+    match now {
+        State::Answered(answer) => {
+            return Err(format!(
+                "answered: the person answered it themselves (\"{}\"), and their answer stands",
+                crate::transcript::cut(answer.lines().next().unwrap_or(""), QUOTED)
+            ));
+        }
+        State::Recorded { .. } | State::Withdrawn(_) => {
+            return Err(format!("closed: {asked} is closed already"));
+        }
+        State::Open | State::Aside => {}
+    }
+    if let State::Recorded {
+        option: Some(at), ..
+    } = state
+        && at >= ask.options.len()
+    {
+        return Err(format!(
+            "invalid_arguments: option is a number from 1 to {}",
+            ask.options.len()
+        ));
+    }
+    // Its deadline goes with it: nothing to fire, nothing left on disk.
+    let name = trigger_name(bot, &call);
+    let _ =
+        tokio::task::spawn_blocking(move || crate::trigger::tool(&json!({"remove": name}))).await;
+    let outcome = match state {
+        State::Withdrawn(_) => "withdrawn",
+        _ => "answered",
+    };
+    Ok(json!({"closed": asked, "outcome": outcome,
+        "next": "Closed: its card shows the outcome and your note. A pick of theirs on it later \
+            still answers it; follow that pick if it comes."})
+    .to_string())
 }
 
 /// Whether the ask is still open, read from the daemon this shell reaches.
@@ -1119,12 +1458,14 @@ pub fn hint(ask: &Ask, at: usize, of: usize, width: usize) -> Vec<Span<'static>>
     if of > 1 {
         keys.push("↑↓ switch".into());
     }
-    keys.push("esc set aside".into());
+    keys.push("esc write instead".into());
     let keys = keys.join(" · ");
+    // Words answer it too: typed, or for a step of the person's, how it
+    // went.
     let words = match ask.options.len() {
         0 if ask.command.is_some() => " say how it went ·",
         0 => " type your answer ·",
-        _ => "",
+        _ => " type or",
     };
     let place = place(at, of);
     // A task's question, pinned in its lead's window, by whose it is.
@@ -1160,6 +1501,15 @@ pub fn answering_typed(ask: &Ask, at: usize, of: usize, width: usize) -> Line<'s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `asks` without the one `text` answers, as a window lets go of it
+    /// ([`answer_of`]); whether it was there. A task's question is
+    /// answered in the task's conversation, not here.
+    fn close(asks: &mut Vec<Ask>, text: &str, from: Option<&str>) -> bool {
+        let at = answer_of(text, from)
+            .and_then(|call| (asks.iter()).position(|ask| ask.id == call && ask.task.is_none()));
+        at.map(|at| asks.remove(at)).is_some()
+    }
 
     fn keep_api() -> Value {
         json!({
@@ -1241,7 +1591,7 @@ mod tests {
     #[test]
     fn the_decision_reads_as_question_why_options_and_recommendation() {
         let ask = call("c1", &keep_api()).unwrap();
-        let Card { rows, options, .. } = card(&ask, 60);
+        let Card { rows, options, .. } = card(&ask, &State::Open, false, 60);
         let shown: Vec<String> = rows.iter().map(|row| row.to_string()).collect();
         assert_eq!(
             shown,
@@ -1260,7 +1610,7 @@ mod tests {
         // Where a click picks each option.
         assert_eq!(options, [3, 5]);
         // Narrow, each part wraps under its own indent.
-        let narrow: Vec<String> = card(&ask, 30)
+        let narrow: Vec<String> = card(&ask, &State::Open, false, 30)
             .rows
             .iter()
             .map(|row| row.to_string().trim_end().to_owned())
@@ -1300,7 +1650,7 @@ mod tests {
         let covers = ask.covers.clone().unwrap();
         assert_eq!(covers.line(), "publish · lydakis/agent#12 · at 3f2a9c1");
         // Under the why, muted, as the why is.
-        let rows = card(&ask, 60).rows;
+        let rows = card(&ask, &State::Open, false, 60).rows;
         assert_eq!(
             rows[2].to_string(),
             "┃ Covers: publish · lydakis/agent#12 · at 3f2a9c1"
@@ -1352,7 +1702,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let shown: Vec<String> = card(&ask, 80)
+        let shown: Vec<String> = card(&ask, &State::Open, false, 80)
             .rows
             .iter()
             .map(|row| row.to_string())
@@ -1363,7 +1713,7 @@ mod tests {
             "┃    Runs n² checks, see the plan (https://x.dev)."
         );
         // The question stays bold, past what its words make bold.
-        let question = &card(&ask, 80).rows[0];
+        let question = &card(&ask, &State::Open, false, 80).rows[0];
         let words = question
             .spans
             .iter()
@@ -1386,11 +1736,11 @@ mod tests {
         let ask = call("c1", &keep_api()).unwrap();
         assert_eq!(
             text(&hint(&ask, 0, 1, 80)),
-            "Answer “Keep the old API?”: 1–2 pick · esc set aside"
+            "Answer “Keep the old API?”: type or 1–2 pick · esc write instead"
         );
         assert_eq!(
-            text(&hint(&ask, 1, 2, 80)),
-            "Answer “Keep the old API?” (2 of 2): 1–2 pick · ↑↓ switch · esc set aside"
+            text(&hint(&ask, 1, 2, 100)),
+            "Answer “Keep the old API?” (2 of 2): type or 1–2 pick · ↑↓ switch · esc write instead"
         );
         assert!(text(&hint(&ask, 0, 1, 50)).contains('…'));
         // The question muted, the keys in the one grammar.
@@ -1410,7 +1760,7 @@ mod tests {
         let open = call("c2", &json!({"question": "Why?"})).unwrap();
         assert_eq!(
             text(&hint(&open, 0, 1, 80)),
-            "Answer “Why?”: type your answer · esc set aside"
+            "Answer “Why?”: type your answer · esc write instead"
         );
         // Over what is typed, the row the sent answer will have.
         assert_eq!(
@@ -1565,7 +1915,7 @@ mod tests {
     /// The card's rows as a screen draws them at `width`, laid at `made`.
     fn drawn(ask: &Ask, made: usize, width: u16) -> Vec<String> {
         use ratatui::{buffer::Buffer, layout::Rect};
-        let card = card(ask, made);
+        let card = card(ask, &State::Open, false, made);
         let mut screen = crate::screen::Screen::default();
         let marks = (card.hangs.into_iter().enumerate())
             .map(|(row, hang)| (row, crate::screen::Mark::Hangs(hang)))
@@ -1629,6 +1979,176 @@ mod tests {
         let mut arguments = keep_api();
         arguments["if_unanswered"] = json!(plan);
         arguments
+    }
+
+    fn closing_call(id: &str, outcome: &str, option: Option<u64>, note: &str) -> Value {
+        let mut arguments = json!({"id": id, "outcome": outcome, "note": note});
+        if let Some(option) = option {
+            arguments["option"] = json!(option);
+        }
+        json!({"type": "function_call", "name": CLOSE, "call_id": "k1",
+            "arguments": arguments.to_string()})
+    }
+
+    #[test]
+    fn a_close_names_its_ask_whole_and_what_it_leaves() {
+        let tool = close_tool();
+        assert_eq!(tool["answered_by"], crate::served::TAG);
+        assert_eq!(tool["name"], CLOSE);
+        let read = |item: Value| closed_by(&item);
+        assert_eq!(
+            read(closing_call(
+                "ask:2/a1",
+                "answered",
+                Some(2),
+                "drop it\nnobody uses 0.3"
+            )),
+            Some((
+                "ask:2/a1".into(),
+                State::Recorded {
+                    option: Some(1),
+                    note: "drop it nobody uses 0.3".into()
+                }
+            ))
+        );
+        assert_eq!(
+            read(closing_call(
+                "ask:2/a1",
+                "withdrawn",
+                None,
+                "settled in #812"
+            )),
+            Some((
+                "ask:2/a1".into(),
+                State::Withdrawn("settled in #812".into())
+            ))
+        );
+        // Only a whole ID, and one of the two outcomes.
+        assert_eq!(read(closing_call("a1", "withdrawn", None, "x")), None);
+        assert_eq!(read(closing_call("ask:2/a1", "maybe", None, "x")), None);
+    }
+
+    #[test]
+    fn an_agents_close_settles_its_ask_for_every_reader() {
+        let asking = json!({"type": "function_call", "name": TOOL, "call_id": "a1", "turn": 2,
+            "arguments": asked("wait").to_string()});
+        let mut closed = closing_call("ask:2/a1", "withdrawn", None, "no longer needed");
+        closed["turn"] = json!(3);
+        // The window's open questions and needs.
+        assert!(open(std::slice::from_ref(&asking)).is_some());
+        assert!(open(&[closed.clone(), asking.clone()]).is_none());
+        // Refused, it closed nothing.
+        let refused = json!({"type": "function_call_output", "call_id": "k1", "turn": 3,
+            "failed": true, "output": "closed already"});
+        assert!(open(&[refused.clone(), closed.clone(), asking.clone()]).is_some());
+        // The deadline, and where it stands.
+        let entry = |node: i64, item: &Value| json!({"node": node, "item": item});
+        let person = |text: &str| {
+            json!({"node": 9, "from": null, "origin": null,
+            "item": {"role": "user", "content": [{"type": "input_text", "text": text}]}})
+        };
+        let stands = |entries: &[(i64, Value)]| {
+            let mut reading = Standing::default();
+            entries
+                .iter()
+                .find_map(|(at, entry)| reading.entry(*at, entry, 2, "a1"))
+                .flatten()
+                .map(|(_, state)| state)
+        };
+        let open_one = (2, entry(1, &asking));
+        assert_eq!(stands(std::slice::from_ref(&open_one)), Some(State::Open));
+        let closing = (3, entry(5, &closed));
+        assert_eq!(
+            stands(&[closing.clone(), open_one.clone()]),
+            Some(State::Withdrawn("no longer needed".into()))
+        );
+        let mut reading = Reading::default();
+        assert_eq!(
+            [closing.clone(), open_one.clone()]
+                .iter()
+                .find_map(|(at, entry)| reading.entry(*at, entry, 2, "a1")),
+            Some(false)
+        );
+        assert_eq!(
+            stands(&[(3, entry(6, &refused)), closing.clone(), open_one.clone()]),
+            Some(State::Open)
+        );
+        // The person's words past it set it aside; their answer stands
+        // over any close.
+        assert_eq!(
+            stands(&[(4, person("hold on")), open_one.clone()]),
+            Some(State::Aside)
+        );
+        let ask = call(&id(2, "a1"), &asked("wait")).unwrap();
+        assert_eq!(
+            stands(&[(4, person(&answer(&ask, "talk later"))), closing, open_one]),
+            Some(State::Answered("talk later".into()))
+        );
+    }
+
+    #[test]
+    fn a_card_says_where_its_question_stands_and_folds_once_settled() {
+        let ask = call(&id(1, "c1"), &asked("wait")).unwrap();
+        let shown = |state: &State, folded: bool| -> Vec<String> {
+            card(&ask, state, folded, 80)
+                .rows
+                .iter()
+                .map(|row| row.to_string())
+                .collect()
+        };
+        // Open, as before: the yellow mark, what happens meanwhile.
+        let open = card(&ask, &State::Open, true, 80);
+        assert_eq!(open.rows[0].to_string(), "? Keep the old API?");
+        let mark = |card: &Card| {
+            let row = &card.rows[0];
+            let span = row.spans.iter().find(|span| span.content == GLYPH).unwrap();
+            row.style.patch(span.style)
+        };
+        assert_eq!(mark(&open).fg, Some(Color::Yellow));
+        assert!(
+            shown(&State::Open, true)
+                .last()
+                .unwrap()
+                .contains("Waits for your pick")
+        );
+        assert_eq!(open.question, 0..1);
+        // Set aside: whole, muted, a pick still answering it.
+        let aside = card(&ask, &State::Aside, true, 80);
+        assert!(
+            mark(&aside)
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM)
+        );
+        assert_ne!(mark(&aside).fg, Some(Color::Yellow));
+        assert_eq!(aside.options.len(), 2);
+        assert_eq!(
+            shown(&State::Aside, true).last().unwrap(),
+            "┃ Set aside: you wrote past it. A pick still answers it."
+        );
+        // Answered: two rows folded, whole once opened.
+        let answered = State::Answered("Drop it\nmore".into());
+        assert_eq!(
+            shown(&answered, true),
+            ["✓ Keep the old API?", "┃ Answered · Drop it …"]
+        );
+        let whole = shown(&answered, false);
+        assert!(whole.len() > 2 && whole.last().unwrap() == "┃ Answered · Drop it …");
+        assert!(!whole.iter().any(|row| row.contains("Waits for")));
+        // Recorded by the agent, and withdrawn.
+        let recorded = State::Recorded {
+            option: Some(1),
+            note: "said so in chat".into(),
+        };
+        assert_eq!(
+            shown(&recorded, true)[1],
+            "┃ Answered in your words · going with Drop it · said so in chat"
+        );
+        let withdrawn = State::Withdrawn("settled elsewhere".into());
+        assert_eq!(
+            shown(&withdrawn, true),
+            ["– Keep the old API?", "┃ Withdrawn · settled elsewhere"]
+        );
+        assert!(withdrawn.takes_a_pick() && !answered.takes_a_pick());
     }
 
     #[test]
@@ -1718,7 +2238,12 @@ mod tests {
         // An ask from before agents said draws no such row.
         assert_eq!(meanwhile(&call("c", &keep_api()).unwrap(), now), None);
         // On the card, under the reason, barred.
-        let card = card(&settled(call("c", &asked("go_now")).unwrap(), ""), 60);
+        let card = card(
+            &settled(call("c", &asked("go_now")).unwrap(), ""),
+            &State::Open,
+            false,
+            60,
+        );
         let shown: Vec<String> = card.rows.iter().map(|row| row.to_string()).collect();
         assert_eq!(
             shown[shown.len() - 2..],
@@ -1775,7 +2300,7 @@ mod tests {
             .collect();
         assert_eq!(
             hint,
-            "Answer “Sign in to the package registry”: say how it went · esc set aside"
+            "Answer “Sign in to the package registry”: say how it went · esc write instead"
         );
     }
 
@@ -1783,7 +2308,7 @@ mod tests {
     fn the_card_shows_the_line_to_run_where_a_click_copies_it() {
         let mut ask = call("c9", &sign_in()).unwrap();
         ask.deadline = None;
-        let card = card(&ask, 60);
+        let card = card(&ask, &State::Open, false, 60);
         let shown: Vec<String> = (card.rows.iter())
             .map(|row| row.to_string().trim_end().to_owned())
             .collect();
@@ -1831,7 +2356,7 @@ mod tests {
             ask.command.as_deref(),
             Some("cat <<'EOF' > notes.txt\nfirst  \n\nsecond\nEOF")
         );
-        let card = card(&ask, 60);
+        let card = card(&ask, &State::Open, false, 60);
         let shown: Vec<String> = card.rows[card.command.clone()]
             .iter()
             .map(|row| row.to_string())

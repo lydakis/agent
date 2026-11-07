@@ -826,6 +826,20 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             }
             Ok(said.to_string())
         }
+        crate::asks::CLOSE => {
+            // The bot whose history holds the ask: a side chat's own.
+            let asker = std::env::var("AGENT_CALL_BOT").unwrap_or(caller);
+            // This call is in the history it reads: it closes nothing yet.
+            let (call, turn) = (
+                std::env::var("AGENT_CALL").ok(),
+                std::env::var("AGENT_TURN"),
+            );
+            let turn = turn.ok().and_then(|t| t.parse::<i64>().ok());
+            let this = turn.zip(call.as_deref());
+            crate::asks::served_close(arguments, &asker, this)
+                .await
+                .map_err(|e| ("ask_close_refused", e))
+        }
         crate::asks::TOOL => {
             // A deadline is a trigger, whose add runs on a runtime of its own.
             // Its card is in the history of the bot that asked, a side chat
