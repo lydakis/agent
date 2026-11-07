@@ -391,6 +391,8 @@ async fn task_tab(caller: &str, bot: &str) -> Result<String, String> {
     let (socket, project, chain) = agents_project(caller).await?;
     let me = named::me().map_err(|e| e.to_string())?;
     let mut layout = mux::for_agent(&socket, &project, &chain, None)?;
+    // What it closes or holds back for room, the lead's own layout reads.
+    layout.keep_aside(used::aside());
     let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
     let mut bots = Vec::new();
     let mut after = Value::Null;
