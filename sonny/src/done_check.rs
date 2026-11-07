@@ -356,10 +356,12 @@ async fn sweep(
             }
             known.needs = crate::waiting::answered(store, name, turn) || resolved();
         }
-        // Not yet idle long enough reads nothing on disk.
+        // Not yet idle long enough reads nothing on disk; and none is
+        // asked whether it is done before what it left the person is kept,
+        // as a question in its words alone is no idle work.
         let idle =
             after.filter(|after| now.saturating_sub(known.ended) >= after.as_millis() as u64);
-        if let Some(after) = idle.filter(|_| !known.asked) {
+        if let Some(after) = idle.filter(|_| !known.asked && (known.needs || !needs)) {
             let when = (known.ended, now, after);
             known.asked = asked(client, store, (name, bot_id), turn, when, done).await;
         }
@@ -650,6 +652,62 @@ mod tests {
         assert!(done.lock().unwrap().is_empty());
         // Its mark covers turn 5 alone, so turn 6 leaves it open.
         assert_eq!(crate::resolved::read(&store, "calc.late"), Some(5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A task whose needs-you check could not be kept is not asked
+    /// whether it is done: a yes would set aside a question left in its
+    /// words.
+    #[tokio::test]
+    async fn no_done_check_before_the_needs_check_is_kept() {
+        let now = crate::home::now_ms() as u64;
+        let copies = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let made = copies.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            match request["op"].as_str() {
+                Some("bots") if request["limit"] == 1 => json!({"bots": [
+                    {"name": "calc.q", "bot_id": 2, "expire_ms": null}]}),
+                Some("bots") => json!({"bots": [
+                    {"name": "calc.q", "bot_id": 2, "head": 2, "running_turn": null, "expire_ms": null}]}),
+                Some("turns") => json!({"turns": [{"turn": 5, "status": "completed",
+                    "finished_ms": now - 9 * 3_600_000}]}),
+                Some("history_nodes") => json!({"nodes": [{"node": 20, "turn": 5}]}),
+                Some("history_items") => json!({"items": []}),
+                Some("fork") => {
+                    made.fetch_add(1, Ordering::Relaxed);
+                    json!({"bot_id": 9})
+                }
+                Some("submit") => json!({"handle": "turn:copy/1", "turn": 1}),
+                // Its reply has words; the needs-you copy answers no JSON,
+                // where a done-check copy would say it is done.
+                Some("wait") => {
+                    let copy = match made.load(Ordering::Relaxed) {
+                        1 => "not JSON",
+                        _ => r#"{"done": true, "why": "merged"}"#,
+                    };
+                    json!({"results": {
+                        "turn:calc.q/5": {"status": "completed", "text": "Deploy to staging or prod?"},
+                        "turn:copy/1": {"status": "completed", "text": copy}}})
+                }
+                _ => json!({}),
+            }
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("sonny-sweep-needs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("state.sqlite");
+        let (read, done) = (Mutex::new(HashMap::new()), Mutex::new(Vec::new()));
+        let after = (Some(Duration::from_secs(8 * 3600)), true);
+        sweep(&client, &store, &scope(), after, (&read, &done)).await;
+        assert!(
+            crate::waiting::due(&store, "calc.q", 5),
+            "tried again next sweep"
+        );
+        assert!(
+            super::read(&store, "calc.q", 2).is_none(),
+            "not asked whether done"
+        );
+        assert!(crate::resolved::read(&store, "calc.q").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
