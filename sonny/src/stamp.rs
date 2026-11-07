@@ -43,20 +43,27 @@ fn epoch_now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// `prompt`, stamped now, saying the person is away while they are.
-pub fn now(prompt: &str) -> String {
-    let clause =
-        crate::quiet::away().map(|away| crate::quiet::away_clause(away, &crate::quiet::schedule()));
+/// `prompt` to `bot`, stamped now: to a lead, saying the person is away
+/// while they are. Quiet is the leads' alone; tasks work and report to
+/// them as ever.
+pub fn now(prompt: &str, bot: &str) -> String {
+    let clause = (crate::project::is_lead(bot))
+        .then(crate::quiet::away)
+        .flatten()
+        .map(|away| crate::quiet::away_clause(away, &crate::quiet::schedule()));
     stamped_with(prompt, epoch_now(), clause.as_deref())
 }
 
-/// The person's own words, stamped now: they end quiet for every agent,
-/// and the first message back says since when they were away.
-pub fn person(prompt: &str) -> String {
+/// The person's own words to `bot`, stamped now: they end quiet for
+/// every agent, and a lead they write to first hears since when they were
+/// away.
+pub fn person(prompt: &str, bot: &str) -> String {
     // Words are use, from a window or an editor alike: the lookout waits
     // `quiet_after` from here before it starts quiet again.
     crate::quiet::mark_present();
-    let clause = crate::quiet::end().map(crate::quiet::back_clause);
+    let clause = (crate::quiet::end())
+        .filter(|_| crate::project::is_lead(bot))
+        .map(crate::quiet::back_clause);
     stamped_with(prompt, epoch_now(), clause.as_deref())
 }
 

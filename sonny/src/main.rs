@@ -11540,10 +11540,10 @@ impl App {
         let sent = match origin {
             // The person's words end quiet, here and in every window.
             // A pick on a question card or an approved retry leaves quiet on.
-            None if self.picking => stamp::now(&prompt),
+            None if self.picking => stamp::now(&prompt, &self.bot),
             None => {
                 self.quiet = None;
-                stamp::person(&prompt)
+                stamp::person(&prompt, &self.bot)
             }
             Some(_) => prompt.clone(),
         };
@@ -11615,10 +11615,10 @@ impl App {
         };
         // Words the person typed end quiet; a pick leaves it on.
         let stamped = match picked {
-            true => stamp::now(prompt),
+            true => stamp::now(prompt, &task.bot),
             false => {
                 self.quiet = None;
-                stamp::person(prompt)
+                stamp::person(prompt, &task.bot)
             }
         };
         let submitted = json!({"bot": task.bot, "prompt": stamped,
@@ -12250,7 +12250,7 @@ impl App {
                 .request(
                     "submit",
                     json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
-                        "prompt": stamp::person(&question), "delivery": "steer", "model": self.turn_model,
+                        "prompt": stamp::person(&question, &name), "delivery": "steer", "model": self.turn_model,
                         "images": attach::submitted(pictures)}),
                 )
                 .await

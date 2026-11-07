@@ -949,7 +949,7 @@ impl Session {
         let steer = state.running.is_some();
         let moving = (!steer).then_some(bound.moving.as_ref()).flatten();
         let mut asked = json!({"bot": bound.bot, "bot_id": bound.bot_id,
-            "request_id": crate::unique("acp"), "prompt": crate::stamp::person(&text),
+            "request_id": crate::unique("acp"), "prompt": crate::stamp::person(&text, &bound.bot),
             "delivery": if moving.is_some() { "queue" } else { "steer" },
             "images": if images.is_empty() { Value::Null } else { json!(images) }});
         if let Some(dir) = moving {

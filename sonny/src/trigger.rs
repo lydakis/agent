@@ -3733,9 +3733,11 @@ fn baseline(places: &Places, trigger: &Trigger, seen: &Seen, fresh: bool) -> Res
 
 /// While the person is away, a line under a fire's own saying so, as
 /// the stamp on Sonny's other messages does ([`crate::quiet`]); nothing
-/// otherwise.
-fn away_line() -> String {
-    match crate::quiet::away() {
+/// otherwise, and nothing to an agent but a lead: quiet is the leads'
+/// alone.
+fn away_line(target: &Target) -> String {
+    let lead = matches!(target, Target::Bot { name, .. } if crate::project::is_lead(name));
+    match crate::quiet::away().filter(|_| lead) {
         Some(away) => format!(
             "[{}]\n",
             crate::quiet::away_clause(away, &crate::quiet::schedule())
@@ -4098,7 +4100,7 @@ async fn deliver(
             "[automation {} · {} · {why}]\n{}{}",
             trigger.name,
             stamp(now()),
-            away_line(),
+            away_line(&trigger.target),
             trigger.message
         )
     };
@@ -4153,7 +4155,7 @@ async fn deliver(
                             trigger.name,
                             run.n,
                             stamp(now()),
-                            away_line()
+                            away_line(&trigger.target)
                         );
                         if let Some(before) = before {
                             prompt.push_str(&format!(

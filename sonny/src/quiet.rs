@@ -17,8 +17,9 @@
 //! A glance, a scroll or a focus keeps quiet from starting but does not end
 //! it: opening the laptop at night should not wake every lead. The clock
 //! never ends it either, so the morning brings no flood before the person
-//! writes. Agents learn it from the line Sonny ends each message with
-//! ([`crate::stamp`]): a fact, as the time is.
+//! writes. Leads learn it from the line Sonny ends each message to them
+//! with ([`crate::stamp`]): a fact, as the time is. Tasks never hear it:
+//! they work and report to their lead as ever.
 use agent_client::config::{DAYS, Hours};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

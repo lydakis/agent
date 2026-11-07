@@ -1123,11 +1123,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   leaves the agents working.
 - Quiet: outside the hours in `[sonny] hours`, once no Sonny window has
   been used for `quiet_after` (30 minutes), Sonny goes quiet. Agents keep
-  working; the line Sonny ends each message with tells them the person is
-  away and since when, nothing rings, and every footer says `quiet since
+  working; the line Sonny ends each message to a lead with tells it the
+  person is away and since when (tasks are untouched and report to their
+  lead as ever), nothing rings, and every footer says `quiet since
   19:40`, or `quiet when you step away` while it waits for you. Your next
-  words to any agent end it for all of them, and that message tells the
-  agent you are back; a glance, a click on a question or 9:00 does not.
+  words to any agent end it for all of them, and that message tells a lead
+  you are back; a glance, a click on a question or 9:00 does not.
   `/quiet` goes quiet now, any hour, and `/quiet off` ends it. Off unless
   you set `hours` or write `/quiet`. Over SSH with no display and no `BROWSER`,
   what Sonny would open (a link, a file, the page) is copied instead, so
