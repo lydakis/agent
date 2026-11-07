@@ -11407,13 +11407,16 @@ impl App {
         queue: bool,
         pictures: &[attach::Picture],
     ) -> Result<(), String> {
-        // A message to a busy bot joins its running turn, on that turn's model.
-        let delivery = match queue {
+        // A message to a busy bot joins its running turn, on that turn's
+        // model. One to a bot at rest starts a turn, as a steer too: if
+        // something else started one meanwhile, it joins that rather than
+        // being refused. A move needs a turn of its own, which a steer may
+        // not be, so a message that moves the lead queues.
+        let steer = !queue && (join || self.running.is_some());
+        let delivery = match queue || (!steer && self.move_to.is_some()) {
             true => "queue",
-            false if join || self.running.is_some() => "steer",
-            false => "reject",
+            false => "steer",
         };
-        let steer = delivery == "steer";
         let model = (!steer).then(|| self.turn_model.clone()).flatten();
         // A boost is the next turn's: a steer joins one running already.
         let effort = match steer || origin.is_some() {
@@ -12104,7 +12107,7 @@ impl App {
                 .request(
                     "submit",
                     json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
-                        "prompt": question, "delivery": "reject", "model": self.turn_model,
+                        "prompt": question, "delivery": "steer", "model": self.turn_model,
                         "images": attach::submitted(pictures)}),
                 )
                 .await
@@ -16818,7 +16821,7 @@ mod tests {
         let shown: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
         assert_eq!(shown, ["! echo hello", "  └ hello"]);
         let asked = sent.lock().unwrap()[0].clone();
-        assert_eq!(asked["delivery"], "reject");
+        assert_eq!(asked["delivery"], "steer");
         // Not the person's words: what it printed authorizes nothing.
         assert_eq!(asked["origin"], "shell");
         let prompt = asked["prompt"].as_str().unwrap();
@@ -16910,9 +16913,10 @@ mod tests {
             (&sent[2]["origin"], &sent[3]["origin"]),
             (&json!("shell"), &json!("shell"))
         );
+        // The first moves the lead, so it is a turn of its own, queued.
         assert_eq!(
             (&sent[2]["delivery"], &sent[3]["delivery"]),
-            (&json!("reject"), &json!("steer"))
+            (&json!("queue"), &json!("steer"))
         );
         assert_eq!(words_sent(&sent[4]), "and now?");
         assert_eq!(sent[4]["origin"], Value::Null);
@@ -17684,7 +17688,7 @@ mod tests {
         app.input.set("👍 ship it");
         app.submit().await;
         assert_eq!(words_sent(&sent.lock().unwrap()[3]), "👍 ship it");
-        assert_eq!(sent.lock().unwrap()[3]["delivery"], "reject");
+        assert_eq!(sent.lock().unwrap()[3]["delivery"], "steer");
     }
 
     #[tokio::test]
@@ -18668,9 +18672,9 @@ mod tests {
         let button = app.pressed.pop().unwrap();
         app.press(&button).await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[0], "• Messaged calc.old and calc.older ▸", "{rows:?}");
+        assert_eq!(rows[0], "• Steered calc.old and calc.older ▸", "{rows:?}");
         assert!(
-            rows.contains(&"• Messaged calc.add and calc.neg ▾".to_string()),
+            rows.contains(&"• Steered calc.add and calc.neg ▾".to_string()),
             "{rows:?}"
         );
     }
@@ -18695,7 +18699,7 @@ mod tests {
         start(&mut app, "calc.add");
         assert_eq!(
             drawn(&mut app),
-            ["› fix the three bugs", "", "• Messaged calc.add ▸"]
+            ["› fix the three bugs", "", "• Steered calc.add ▸"]
         );
         start(&mut app, "calc.neg");
         start(&mut app, "calc.div");
@@ -18704,7 +18708,7 @@ mod tests {
             [
                 "› fix the three bugs",
                 "",
-                "• Messaged calc.add, calc.neg and calc.div ▸"
+                "• Steered calc.add, calc.neg and calc.div ▸"
             ]
         );
         // A click on it opens it, and again folds it.
@@ -18712,15 +18716,15 @@ mod tests {
         let button = app.pressed.pop().unwrap();
         app.press(&button).await;
         let open = drawn(&mut app);
-        assert_eq!(open[2], "• Messaged calc.add, calc.neg and calc.div ▾");
+        assert_eq!(open[2], "• Steered calc.add, calc.neg and calc.div ▾");
         assert_eq!(
             open[3..],
             [
-                "• Messaged calc.add",
+                "• Steered calc.add",
                 "  └ Fix calc.add",
-                "• Messaged calc.neg",
+                "• Steered calc.neg",
                 "  └ Fix calc.neg",
-                "• Messaged calc.div",
+                "• Steered calc.div",
                 "  └ Fix calc.div"
             ]
         );
@@ -18745,11 +18749,11 @@ mod tests {
         let rows = drawn(&mut app);
         assert_eq!(
             rows[2],
-            "• Messaged calc.add, calc.neg, calc.div and calc.mul ▸"
+            "• Steered calc.add, calc.neg, calc.div and calc.mul ▸"
         );
         // Quiet rows one after another sit together.
         assert_eq!(rows[3], "• Removed calc.add");
-        assert_eq!(rows[7], "• Messaged calc.sub ▸");
+        assert_eq!(rows[7], "• Steered calc.sub ▸");
     }
 
     #[tokio::test]
@@ -20489,14 +20493,14 @@ mod tests {
         };
         start(&mut app, "calc.add");
         start(&mut app, "calc.neg");
-        assert_eq!(drawn(&mut app), ["• Messaged calc.add and calc.neg ▸"]);
+        assert_eq!(drawn(&mut app), ["• Steered calc.add and calc.neg ▸"]);
         let ctrl_o = event::KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
         app.key(Event::Key(ctrl_o)).await;
         let open = drawn(&mut app);
-        assert_eq!(open[0], "• Messaged calc.add and calc.neg ▾");
+        assert_eq!(open[0], "• Steered calc.add and calc.neg ▾");
         assert!(open.len() > 1, "{open:?}");
         app.key(Event::Key(ctrl_o)).await;
-        assert_eq!(drawn(&mut app), ["• Messaged calc.add and calc.neg ▸"]);
+        assert_eq!(drawn(&mut app), ["• Steered calc.add and calc.neg ▸"]);
     }
 
     #[tokio::test]

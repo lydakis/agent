@@ -1255,7 +1255,7 @@ the bot said before each, are dim; the reply stays bright, under the
 turn's `Worked for …` line.
 
 The view is clean by default: the bot's words, and only the calls that
-move the work on, said as what they did (a task started, messaged or
+move the work on, said as what they did (a task started, steered or
 waited for, a question to you, the plan, memory, an automation, a window
 opened). Commands, reads and edits are left out: agents are people you
 talk to, and the clean view shows what they say and what reaches you, not
@@ -1263,12 +1263,18 @@ the work inside their turn. `/verbose` draws every
 call, the conversation so far included, and is kept with the other
 settings; `/verbose` again goes back to clean.
 
-Some rows are buttons. A call that starts, messages, steers, queues for,
-waits for or changes agents is one row that says what it did and to whom
-(`• Steered calc.neg ▸`), never what it said: a click opens it to the
-message it sent or what came back, and folds it again. Calls of one kind
-in a row, such as three tasks messaged one after another, fold into one
-such row (`• Messaged calc.add, calc.neg and calc.div ▸`). A question the
+Some rows are buttons. A call that starts, messages, waits for or
+changes agents is one row that says what it did and to whom, never what
+it said: a click opens it to the message it sent or what came back, and
+folds it again. A message says what came of it, not the flag it was sent
+with: `• Started a turn for calc.neg` when the agent was at rest,
+`• Steered calc.neg` when it joins the turn at work, `• Queued for calc.neg`
+when it waits behind that work or for room to run, `• Left a note for
+calc.neg` when it goes with the agent's next model call, and `✗ Couldn't
+start a turn for calc.neg` with why when the agent was busy and the
+message had to start now. Calls of one kind in a row, such as three tasks
+steered one after another, fold into one such row (`• Steered calc.add,
+calc.neg and calc.div ▸`). A question the
 agent asks you lists its options, and a click on one answers with it.
 Ctrl+O opens every row that folds, and folds them all again once all are
 open.
