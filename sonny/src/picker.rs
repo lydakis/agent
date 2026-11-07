@@ -241,7 +241,7 @@ fn draw(title: &str, rows: &[Row], list: &mut List, hint: Hint, drawn: usize) ->
     // line cut to its width, and rows enough for its height with the
     // title, the hint and the line after them.
     let (columns, height) =
-        ratatui::crossterm::terminal::size().map_or((80, 24), |(c, r)| (c as usize, r as usize));
+        crate::term::size().map_or((80, 24), |s| (s.columns as usize, s.rows as usize));
     let fit = SHOWN.min(height.saturating_sub(3)).max(1);
     if list.marked < list.top {
         list.top = list.marked;

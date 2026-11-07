@@ -291,7 +291,7 @@ fn subscriptions() -> Value {
         "description": "Your subscriptions in the person's lookout, which watches agents for you and tells you \
             what happens in them in a note starting \"Task updates\": every message someone other than you \
             writes in them, the person's quoted, and how each turn ends, by the handle your wait tool reads. \
-            The person's own words cut into your running turn; the rest waits until your turn ends. Each \
+            Each note joins your running turn, or starts one. Each \
             watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
             sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
             \"From your sources\": every event, at once when the source says it steers, or one topic of a \
@@ -338,7 +338,7 @@ fn subscriptions() -> Value {
                                 never wait for it."},
                         "steer": {"type": "object",
                             "description": "What it hears that this matches, a pattern as filter's, is a steer: \
-                                it cuts into your running turn and waits for no digest, as the person's words do. As \
+                                it goes at once and waits for no digest, as the person's words do. As \
                                 {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."}
                     },
                     "required": ["name"],
@@ -786,6 +786,17 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .await
                 .map(|said| said.to_string())
                 .map_err(|e| ("goal_refused", e))
+        }
+        name if name == crate::margin::TOOL => {
+            let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
+            let (client, _events) = Client::connect(&socket)
+                .await
+                .map_err(|e| ("margin_unread", e.to_string()))?;
+            // The margin is the conversation's whose turn called it, a side
+            // chat's its own.
+            let bot = std::env::var("AGENT_CALL_BOT").unwrap_or(caller);
+            let call = std::env::var("AGENT_CALL").unwrap_or_default();
+            crate::margin::answer(&client, &store, &bot, (&call, arguments)).await
         }
         MEMORY if arguments["said"] == true => crate::said::read(arguments["since_ms"].as_i64())
             .await
@@ -1847,7 +1858,7 @@ pub fn stop() {
 
 /// The error codes `sonny tool` answers with, as static names.
 fn code(said: &str) -> &'static str {
-    const CODES: [&str; 16] = [
+    const CODES: [&str; 19] = [
         "not_in_folder",
         "no_caller",
         "invalid_arguments",
@@ -1862,6 +1873,9 @@ fn code(said: &str) -> &'static str {
         "subscription_refused",
         "automation_refused",
         "memory_refused",
+        "margin_full",
+        "margin_note_too_long",
+        "margin_unread",
         "unknown_tool",
         "tool_failed",
     ];
@@ -2572,6 +2586,7 @@ mod tests {
         assert_eq!(parts.as_array().unwrap().len(), 4);
         assert_eq!(code("task_not_started"), "task_not_started");
         assert_eq!(code("tasks_exist"), "tasks_exist");
+        assert_eq!(code("margin_full"), "margin_full");
         assert_eq!(code("Anything Else"), "tool_failed");
     }
 }

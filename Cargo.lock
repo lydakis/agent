@@ -3804,6 +3804,7 @@ dependencies = [
  "sha2",
  "shell-words",
  "shlex",
+ "signal-hook",
  "similar",
  "starlark",
  "syntect",

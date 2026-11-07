@@ -1957,7 +1957,8 @@ queued work as `bot_busy`. `stats` reports queued and ready turns together
 as `queued_turns`, a count the storage worker keeps at each transition
 and recounts at open, so admission and `stats` cost the store nothing.
 `agent run --delivery MODE` sets the field, defaulting
-to `AGENT_DELIVERY` in the client's environment, then `reject`; with
+to `AGENT_DELIVERY` in the client's environment, then `steer` (`queue`
+with `--workspace` or `--turn-budget-tokens`); with
 `--detach` a peer can hand a busy bot work or a mid-turn message without
 racing on `bot_busy`.
 

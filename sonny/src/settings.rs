@@ -19,6 +19,8 @@ pub struct Settings {
     pub agent_opens: agent_client::config::AgentOpens,
     /// The most notes a margin holds.
     pub margin_notes: u64,
+    /// The most lines a margin note runs to.
+    pub margin_note_lines: u64,
 }
 
 impl Default for Settings {
@@ -41,6 +43,7 @@ impl Settings {
             margin_opens: sonny.margin_opens,
             agent_opens: sonny.agent_opens,
             margin_notes: sonny.margin_notes,
+            margin_note_lines: sonny.margin_note_lines,
         }
     }
 

@@ -292,7 +292,8 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
-| The most notes a margin holds | `[sonny] margin_notes` (20 by default, at least 1; past it the oldest goes) | |
+| The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
+| The most lines a margin note runs to | `[sonny] margin_note_lines` (12 by default, at least 1, counted in the note's text; a longer one is refused, and the agent told to show a file instead) | |
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
 | Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
@@ -683,6 +684,14 @@ way `/react` does, and each note in the margin has its own `↩`.
   access`, `⏸ ask me`, `⊘ read only`. Full access's mark is in the text's
   own weight rather than muted (no hue: yellow is for what needs you),
   and on a narrow window the mark stays when the word goes.
+
+  A pick reaches the agent and every agent it made, and those they made,
+  and any it makes later takes its row too. A muted line under the rows
+  says so before you pick, with the count, as in `Reaches tally lead, its
+  2 agents and any new ones; 1 is busy and switches when its turn ends`:
+  an agent in a turn keeps its old permissions until the turn ends.
+
+  ![/permissions with the line under its rows: Reaches tally lead, its agent and any new ones; 1 is busy and switches when its turn ends](../docs/sonny/permissions-reach.png)
 
   ![/permissions: Sonny's four rows, then one of the config's](../docs/sonny/permissions.png)
 
@@ -1233,15 +1242,12 @@ their approvals, even with its network on.
 skills and MCP.
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
 for the daemon, watching for every bot that subscribed, and Sonny
-subscribes each lead to its tasks. As soon as the lead rests, it tells it
-every message someone else wrote in its tasks and how each turn ended, in
-one "Task updates" note, by the handles its wait tool reads them with; the
-lead decides what matters. While the lead is mid-turn, a judge asks of each
-event only whether it cannot wait, and steers the lead at once if so. A
-turn a note started that ends with nothing to say stays folded under the
-note, with no sound. It judges with the config's `[judge] model`, the
-approver's setting, else the lead's own model, at `[judge] effort` when
-set, and with the judge `off` sends the task updates alone. Any agent can
+subscribes each lead to its tasks. As soon as news settles, it tells the
+lead every message someone else wrote in its tasks and how each turn
+ended, in one "Task updates" note, by the handles its wait tool reads them
+with, as a steer: the note joins the lead's running turn, or starts one,
+and the lead decides what matters. A turn a note started that ends with
+nothing to say stays folded under the note, with no sound. Any agent can
 subscribe to more with its `subscriptions` tool (other agents' tasks, bots
 by name, sources outside such as a chat you poll, questions of its own),
 and `/background` lists what it watches;
@@ -1262,7 +1268,7 @@ the bot said before each, are dim; the reply stays bright, under the
 turn's `Worked for …` line.
 
 The view is clean by default: the bot's words, and only the calls that
-move the work on, said as what they did (a task started, messaged or
+move the work on, said as what they did (a task started, steered or
 waited for, a question to you, the plan, memory, an automation, a window
 opened). Commands, reads and edits are left out: agents are people you
 talk to, and the clean view shows what they say and what reaches you, not
@@ -1270,12 +1276,18 @@ the work inside their turn. `/verbose` draws every
 call, the conversation so far included, and is kept with the other
 settings; `/verbose` again goes back to clean.
 
-Some rows are buttons. A call that starts, messages, steers, queues for,
-waits for or changes agents is one row that says what it did and to whom
-(`• Steered calc.neg ▸`), never what it said: a click opens it to the
-message it sent or what came back, and folds it again. Calls of one kind
-in a row, such as three tasks messaged one after another, fold into one
-such row (`• Messaged calc.add, calc.neg and calc.div ▸`). A question the
+Some rows are buttons. A call that starts, messages, waits for or
+changes agents is one row that says what it did and to whom, never what
+it said: a click opens it to the message it sent or what came back, and
+folds it again. A message says what came of it, not the flag it was sent
+with: `• Started a turn for calc.neg` when the agent was at rest,
+`• Steered calc.neg` when it joins the turn at work, `• Queued for calc.neg`
+when it waits behind that work or for room to run, `• Left a note for
+calc.neg` when it goes with the agent's next model call, and `✗ Couldn't
+start a turn for calc.neg` with why when the agent was busy and the
+message had to start now. Calls of one kind in a row, such as three tasks
+steered one after another, fold into one such row (`• Steered calc.add,
+calc.neg and calc.div ▸`). A question the
 agent asks you lists its options, and a click on one answers with it.
 Ctrl+O opens every row that folds, and folds them all again once all are
 open.

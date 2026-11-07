@@ -1763,7 +1763,16 @@ fn run(options: &Options) -> Result<i32> {
         .iter()
         .map(|path| image(path))
         .collect::<Result<Vec<_>>>()?;
-    let delivery = options.delivery.as_deref().unwrap_or("reject");
+    // Unsaid, a message steers: it joins the running turn at its next
+    // round, or starts one, as the person's own words do. A folder or a
+    // turn cap belongs to a turn of its own, which a steer may not be, so
+    // with either it queues instead.
+    let delivery = options.delivery.as_deref().unwrap_or(
+        match options.workspace.is_some() || options.turn_budget_tokens.is_some() {
+            true => "queue",
+            false => "steer",
+        },
+    );
     if options.attach_wait_ms.is_some() && delivery != "attach" {
         return fail_with("usage", "--attach-wait needs --delivery attach");
     }

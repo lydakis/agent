@@ -12,6 +12,9 @@ use unicode_width::UnicodeWidthStr;
 /// Rows shown at most, as Codex's `MAX_POPUP_ROWS`.
 pub const ROWS: usize = 8;
 
+/// Where a row's name starts, past the mark of the one in effect.
+pub const INDENT: usize = 4;
+
 /// One row: its name, what it is (muted), whether it is in effect, and
 /// where in its name the letters typed are.
 pub struct Item {

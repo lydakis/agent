@@ -10,10 +10,24 @@ pub struct Place {
 }
 
 pub fn read(dir: &Path) -> Place {
+    /// The place last read, read again once `HEAD` changes, which git
+    /// writes whole beside it and renames there.
+    static KEPT: crate::kept::Slot<Place> = crate::kept::Slot::new(None);
     let Some(git) = git_dir(dir) else {
         return Place::default();
     };
-    let head = std::fs::read_to_string(git.join("HEAD")).unwrap_or_default();
+    let head = git.join("HEAD");
+    crate::kept::read(&KEPT, &dir.to_string_lossy(), vec![head.clone()], || {
+        let place = from_head(dir, &head);
+        // What git said for a `HEAD` this cannot read is asked again.
+        let until = place.1.then_some(i64::MIN);
+        (place.0, until)
+    })
+}
+
+/// The place `HEAD` says, and whether git was asked instead.
+fn from_head(dir: &Path, head: &Path) -> (Place, bool) {
+    let head = std::fs::read_to_string(head).unwrap_or_default();
     let head = head.trim();
     let branch = match head.strip_prefix("ref: ") {
         // A reftable store keeps a stand-in here, and git knows the rest.
@@ -22,8 +36,8 @@ pub fn read(dir: &Path) -> Place {
         None => is_commit(head).then(|| head[..7].to_owned()),
     };
     match branch {
-        Some(_) => Place { branch },
-        None => asked(dir),
+        Some(_) => (Place { branch }, false),
+        None => (asked(dir), true),
     }
 }
 

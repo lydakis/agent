@@ -170,8 +170,8 @@ that carries on one cut short changes it as its own. `--fresh` and
 `--fresh` starts its agents over.
 
 **What else.** `--reply-to BOT` keeps the fire's process until the turn it
-sent ends (the daemon's `wait`, up to a day), then queues that turn's
-answer to BOT, pinned by id; the scheduler starts no second fire of the automation
+sent ends (the daemon's `wait`, up to a day), then steers that turn's
+answer to BOT, pinned by id, as the lookout tells a task's update; the scheduler starts no second fire of the automation
 meanwhile, so a repeating one skips the times that turn spans. The fire's
 request id then ends `.to.ID`, BOT's id, so the lookout does not also tell
 that agent of the turn as a task update, unless that answer has not
@@ -255,10 +255,12 @@ rewritten to the lineage when Sonny next opens on that store. When it fires, Son
 runs with `--trigger-fire` and those arguments. It connects to
 the daemon, and when none answers and the store is known, starts one for it
 on that socket as Sonny does, with the `agent` Sonny finds and the login shell's environment and
-`~/.agent/env`. A repeating automation submits with `delivery: reject`: a bot
-that is working, or has work waiting, skips that fire rather than having it
-cut in or pile up. A one-off, and a fire `run` asked for, submits with
-`delivery: queue`, so a working bot gets it after its turn. A one-off's
+`~/.agent/env`. A fire submits with `delivery: queue`, so a working bot gets
+it after its turn and never has it cut in. A repeating automation first
+looks for one of its own fires still waiting behind the bot's work: if one
+is, it skips that fire (`bot_busy`) rather than let fires pile up, as
+anacron runs a missed job once; a fire that waits is `late`. A one-off, and
+a fire `run` asked for, always goes. A one-off's
 calendar entry has no year, so a fire more than two days before its time
 does nothing (the slack keeps a one-off whose Mac changed time zone since,
 since the scheduler follows the new zone's clock), and one more than half a year
@@ -297,7 +299,9 @@ can leave is listed and removable:
   gone, the daemon unreachable, `missed`) loses its definition but keeps
   its last result, so `ls` lists it as not delivered, and why,
   until it is removed. When that result cannot be written, the definition
-  stays, listed, rather than ending with no trace.
+  stays, listed, rather than ending with no trace. A one-off its `--if`
+  says no to at its time leaves nothing, its result included: nothing came
+  of it to tell, as an ask's deadline once the ask was answered.
 - **Removing** deletes the definition, the queue and the state file, so it
   reaches an ended row and a live automation alike. A fire of it that runs
   meanwhile runs to its end, and records nothing, as for an automation removed
