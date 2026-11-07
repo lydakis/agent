@@ -2543,7 +2543,8 @@ cannot build an invisible backlog behind the process bound. The operating
 system counts processes; it never sees this line, which is why the daemon
 counts it (one counter, one comparison per accepted command). `stats` reports
 it as `queued_processes`, a subset of `running_processes`, which counts every
-accepted command whose result is not yet recorded. stdout and stderr are each
+accepted background command whose result is not yet recorded and every
+foreground command running now. stdout and stderr are each
 retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
 the `artifact` operation, or written to the bot's `outputs` folder (see

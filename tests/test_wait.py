@@ -412,7 +412,7 @@ class WaitTests(ModelFixture):
     def test_a_steer_moves_a_running_command_to_the_background(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep 1.5; printf done')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep 3; printf done')['result']['turn']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
         done = client.finished(steer['turn'])['data']
@@ -420,6 +420,10 @@ class WaitTests(ModelFixture):
         # Moved to the background before it ended, not waited out.
         lifted = self.tool_output(client, 'Bob', 'lift-1')
         self.assertEqual((lifted['background'], lifted['steered']), (True, True))
+        # Running still, and counted once: as the process it is now.
+        handle = lifted['handle']
+        self.assertEqual(client.request('wait', handles=[handle], timeout_ms=0)['result']['pending'], [handle])
+        self.assertEqual(client.request('stats')['result']['running_processes'], 1)
         # Nothing was killed: the command finished and its output arrived
         # on the handle.
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')

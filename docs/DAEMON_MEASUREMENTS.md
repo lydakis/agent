@@ -1325,6 +1325,37 @@ Clippy, formatting, and diff checks passed. Regressions verify completed and
 pending CLI polls, mixed tool results, pending process handles, waiter cleanup,
 and a request whose pacing reservation ends while its stream remains active.
 
+## Foreground commands in the running count (#716)
+
+`stats.running_processes` counted only the store's running process rows, so
+a bot's foreground command, holding a process slot, showed as nothing
+running. The registry now keeps one counter of foreground commands holding
+a slot (one atomic add when the slot is taken, one subtract when the
+command ends), and another of those a steer moved to the background, which
+the store counts as a process of their own from then on; `stats` adds the
+difference. Each foreground command pays two relaxed atomic operations, and
+a lifted one two more; nothing is read or written in the store.
+
+The Perf workflow's matched screen, base `main` against this branch at
+65d224b (the counter before lifted commands were taken out of it, which
+adds work only to a lift), on a GitHub runner:
+
+| Measure | Base | Head | Change |
+| --- | ---: | ---: | ---: |
+| Lone submit CPU, ms | 39.774 | 38.834 | -2.4% |
+| Burst submit p99, ms | 6.392 | 6.478 | +1.3% |
+| Release to terminal p99, ms | 13.994 | 13.9 | -0.7% |
+| Idle RSS, MiB | 20.814 | 20.883 | +0.3% |
+| Per idle bot, KiB | 1.526 | 1.484 | -2.8% |
+| RSS after a turn each, MiB | 29.186 | 29.504 | +1.1% |
+| Daemon CPU per turn, ms | 1.278 | 1.264 | -1.1% |
+| Lifecycle CPU, s | 1.17 | 1.17 | -0.0% |
+| Lifecycle p95 turn, ms | 581.848 | 579.764 | -0.4% |
+| Lifecycle peak RSS, MiB | 26.795 | 27.488 | +2.6% |
+
+Nothing moved past noise, and the gate counted no more store work per
+turn. Sonny's rows moved within their noise.
+
 ## Background admission bound
 
 Observed 2026-09-18 on the same Darwin arm64 host, external power, Rust

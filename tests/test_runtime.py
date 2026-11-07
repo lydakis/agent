@@ -1917,6 +1917,20 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(output['pause']['reason'], 'the loop is sending mail')
         self.assertEqual(marker.read_text(), 'x\n')
 
+    def test_running_processes_counts_a_foreground_command(self):
+        client = self.client('shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='fg', prompt='shell:sleep 1.5')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
+        deadline = time.monotonic() + 2
+        while not client.request('stats')['result']['running_processes'] and time.monotonic() < deadline:
+            time.sleep(.05)
+        stats = client.request('stats')['result']
+        self.assertEqual((stats['running_processes'], stats['process_limit'] > 0), (1, True))
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(client.request('stats')['result']['running_processes'], 0)
+
     def test_a_pause_ends_the_background_commands_agents_started(self):
         self.model.background_timeout_ms = 30000
         client = self.client('shell')
