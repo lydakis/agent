@@ -759,18 +759,6 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             .map(|listed| listed.to_string())
             .map_err(|e| ("subscription_refused", e))
         }
-        // One on the caller's own messages is the call itself: nothing to
-        // read or keep.
-        name if name == crate::reactions::TOOL && crate::reactions::target(arguments).is_none() => {
-            Ok("Done.".to_owned())
-        }
-        name if name == crate::reactions::TOOL => {
-            let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
-            let (client, _events) = Client::connect(&socket)
-                .await
-                .map_err(|e| ("react_unread", e.to_string()))?;
-            crate::reactions::answer(&client, &store, &caller, arguments).await
-        }
         name if name == crate::margin::TOOL => {
             let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
             let (client, _events) = Client::connect(&socket)
@@ -1245,6 +1233,16 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                                 Some(EXEC) => script(&hub, &client, &call).await,
                                 Some(BROWSER) => browse(&client, &call).await,
                                 Some(DESKTOP) => desktop(&client, &call).await,
+                                // Light, and answered as it is taken, so it
+                                // lands on what the person had written then.
+                                Some(crate::reactions::TOOL) => crate::reactions::answer(
+                                    &client,
+                                    &store,
+                                    &str_of(&call["bot"]),
+                                    &call["arguments"],
+                                )
+                                .await
+                                .map(Value::String),
                                 Some(AUTOMATIONS) => automate(&client, &call, &me, &store, &socket)
                                     .await
                                     .map(Value::String),

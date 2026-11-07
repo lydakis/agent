@@ -304,7 +304,8 @@ impl Picked {
 /// is kept under the person's newest message there as the call is made,
 /// for `bot`'s window to draw. Which message it is for is a fact of that
 /// moment, so it is kept where the call lands, and no one watches the
-/// stream for it. Only within one project, never on itself: a project
+/// stream for it: Sonny's tool host answers it itself, as it takes it,
+/// one at a time. Only within one project, never on itself: a project
 /// inside another is one of its own. One on the caller's own messages is
 /// the call itself, which its window draws.
 pub async fn answer(
@@ -316,6 +317,9 @@ pub async fn answer(
     let (Some((emoji, remove)), Some(bot)) = (call(arguments), target(arguments)) else {
         return Ok("Done.".to_owned());
     };
+    // One at a time: each rewrites the file the last one wrote.
+    static WRITING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _writing = WRITING.lock().await;
     let Some((id, node)) = picks(client, by, bot)
         .await
         .map_err(|e| ("react_unread", e))?
