@@ -86,6 +86,7 @@
 //! every = "1m"                  # how long after it exits it runs again
 //! digest = "15m"                # a subscriber hears it at most this often; unset, as it comes
 //! steer = { from = ["boss"] }   # what cuts into a busy subscriber's turn, as a filter is written
+//! watch = ["~/bin/slack-poll"]  # files whose edit starts it again on them; unset, none
 //! [sonny.sources.commons]       # Sonny's own source: the commons threads an agent posted in
 //! digest = "15m"                # the default; 0 at once. Takes digest and steer alone
 //! ```
@@ -722,6 +723,9 @@ pub struct Source {
     /// An event pattern, as a subscription's filter is written: an event
     /// it matches steers, as one the command marks so does.
     pub steer: Option<serde_json::Value>,
+    /// Files whose change starts it again on them, as a service manager
+    /// restarts a unit on its new binary: each from `/` or `~/`.
+    pub watch: Vec<String>,
 }
 
 /// An MCP server, under Codex's key names for `[mcp_servers.NAME]`: a
@@ -1562,6 +1566,7 @@ fn commons_source() -> Source {
         every: None,
         digest: Some(COMMONS_DIGEST.into()),
         steer: None,
+        watch: Vec::new(),
     }
 }
 
@@ -1587,10 +1592,11 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
         let mut every = None;
         let mut digest = None;
         let mut steer = None;
+        let mut watch = Vec::new();
         let own = name == COMMONS_SOURCE;
         for (field, value) in fields {
             match field.as_str() {
-                "command" | "every" if own => {
+                "command" | "every" | "watch" if own => {
                     return Err(format!(
                         "{}: the commons is a source of Sonny's own, which takes digest and steer alone; \
                          name yours another way",
@@ -1613,6 +1619,18 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
                     }
                     steer = Some(serde_json::to_value(value).map_err(|e| e.to_string())?);
                 }
+                "watch" => {
+                    let paths = (value.as_array()).ok_or_else(|| {
+                        format!("{} is a list of files, as [\"~/bin/poll\"]", key(field))
+                    })?;
+                    for path in paths {
+                        let path = string(&key(field), path)?;
+                        if !(path.starts_with('/') || path.starts_with("~/")) {
+                            return Err(format!("{}: {path:?} is a file from / or ~/", key(field)));
+                        }
+                        watch.push(path);
+                    }
+                }
                 _ => return Err(format!("unknown key {}", key(field))),
             }
         }
@@ -1627,6 +1645,7 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
             every,
             digest,
             steer,
+            watch,
         });
     }
     Ok((sources, commons))
@@ -2365,6 +2384,16 @@ mod tests {
             Some(serde_json::json!({"from": ["boss"], "text": [{"prefix": "[prod]"}]}))
         );
         assert_eq!(config.sonny.sources[0].steer, None);
+        // Only the files it names are watched; unset, none.
+        let watched = parse(
+            "[sonny.sources.slack]\ncommand = \"python3 ~/bin/poll.py --cursor state.json\"\nwatch = [\"~/bin/poll.py\", \"/opt/poll/lib.py\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            watched.sonny.sources[0].watch,
+            ["~/bin/poll.py", "/opt/poll/lib.py"]
+        );
+        assert!(config.sonny.sources[0].watch.is_empty());
         // The commons is a source of Sonny's own, set as any other.
         assert_eq!(config.sonny.commons_source.digest.as_deref(), Some("15m"));
         let commons =
@@ -2402,6 +2431,18 @@ mod tests {
             (
                 "[sonny.sources.commons]\ncommand = \"x\"",
                 "sonny.sources.commons.command: the commons is a source of Sonny's own, which takes digest and steer alone; name yours another way",
+            ),
+            (
+                "[sonny.sources.slack]\ncommand = \"x\"\nwatch = \"poll.py\"",
+                "sonny.sources.slack.watch is a list of files, as [\"~/bin/poll\"]",
+            ),
+            (
+                "[sonny.sources.slack]\ncommand = \"x\"\nwatch = [\"poll.py\"]",
+                "sonny.sources.slack.watch: \"poll.py\" is a file from / or ~/",
+            ),
+            (
+                "[sonny.sources.commons]\nwatch = [\"~/x\"]",
+                "sonny.sources.commons.watch: the commons is a source of Sonny's own, which takes digest and steer alone; name yours another way",
             ),
             (
                 "[sonny.sources.commons]\ndigest = \"an hour\"",

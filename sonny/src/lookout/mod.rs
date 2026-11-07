@@ -5470,6 +5470,7 @@ mod tests {
             every: None,
             digest: None,
             steer: None,
+            watch: Vec::new(),
         };
         let down = sources::Event::of_lookout(&source, "down", "down".into(), json!({}));
         // A topic of it, and a filter the notice never matches, hear it.
@@ -6108,6 +6109,7 @@ mod tests {
             every: Some("1h".into()),
             digest: None,
             steer: None,
+            watch: Vec::new(),
         }
     }
 

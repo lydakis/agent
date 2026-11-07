@@ -472,7 +472,7 @@ impl Runner {
             let dir = self.dir.join(&source.name);
             let sent = self.sent.clone();
             let shape = shape_file(&self.dir, &source.name);
-            let stamp = Stamp::of(&source.command);
+            let stamp = Stamp::of(&source.watch);
             let task = match source.command.is_empty() {
                 true => tokio::spawn(own(
                     source.clone(),
@@ -505,49 +505,31 @@ impl Drop for Runner {
     }
 }
 
-/// The files a source's command names, each with when it last changed:
-/// every word that is a path to a file, `~` and `$HOME` read as the home
-/// folder, and the first word as `PATH` finds it, so an edited script or
-/// a program upgraded in place starts again.
+/// The files a source watches, each with when it last changed: an edit
+/// starts it again on them, as a service manager restarts a unit on its
+/// new binary. Only the files its settings list, `~/` read as the home
+/// folder: a cursor the command writes is no reason to start again.
 #[derive(Debug, Default, PartialEq)]
 struct Stamp(Vec<(PathBuf, Option<std::time::SystemTime>)>);
 
 impl Stamp {
-    fn of(command: &str) -> Stamp {
+    fn of(watch: &[String]) -> Stamp {
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        let mut files: Vec<PathBuf> = Vec::new();
-        // Words as the shell splits them, so a quoted path with spaces is
-        // one word.
-        let words = shlex::split(command).unwrap_or_else(|| {
-            (command.split_whitespace())
-                .map(|word| word.trim_matches(|c| c == '"' || c == '\'').to_owned())
-                .collect()
-        });
-        for (n, word) in words.iter().enumerate() {
-            let word = word.as_str();
-            let path = match (
-                word.strip_prefix("~/").or(word.strip_prefix("$HOME/")),
-                &home,
-            ) {
-                (Some(rest), Some(home)) => home.join(rest),
-                _ if word.contains('/') => PathBuf::from(word),
-                _ if n == 0 => on_path(word).unwrap_or_else(|| PathBuf::from(word)),
-                // A file named from where the lookout runs, as `sh poll.sh`.
-                _ => PathBuf::from(word),
-            };
-            if path.is_file() && !files.contains(&path) {
-                files.push(path);
-            }
-        }
+        let path = |file: &String| match (file.strip_prefix("~/"), &home) {
+            (Some(rest), Some(home)) => home.join(rest),
+            _ => PathBuf::from(file),
+        };
         Stamp(
-            files
-                .into_iter()
-                .map(|path| (path.clone(), modified(&path)))
+            (watch.iter().map(path))
+                .map(|path| {
+                    let at = modified(&path);
+                    (path, at)
+                })
                 .collect(),
         )
     }
 
-    /// Whether a file it names changed, or went, since.
+    /// Whether a file it watches changed, came or went, since.
     fn changed(&self) -> bool {
         (self.0.iter()).any(|(path, at)| modified(path) != *at)
     }
@@ -555,14 +537,6 @@ impl Stamp {
 
 fn modified(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-/// Where `PATH` finds `program`.
-fn on_path(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
 }
 
 /// Whether a source works, run by run: after `DOWN_AFTER` failed runs in
@@ -1401,6 +1375,7 @@ mod tests {
             every: every.map(str::to_owned),
             digest: None,
             steer: None,
+            watch: Vec::new(),
         }
     }
 
@@ -1779,6 +1754,7 @@ mod tests {
             every: Some("1s".into()),
             digest: Some("5m".into()),
             steer: None,
+            watch: Vec::new(),
         }]);
         let mut texts = Vec::new();
         while texts.len() < 3 {
@@ -1826,6 +1802,7 @@ mod tests {
             every: Some("1h".into()),
             digest: None,
             steer: None,
+            watch: vec![script.display().to_string()],
         };
         runner.set(vec![source.clone()]);
         assert_eq!(next_event(&mut got).await.text, "v1");
@@ -1869,6 +1846,7 @@ mod tests {
             every: Some("1h".into()),
             digest: None,
             steer: None,
+            watch: vec![script.display().to_string()],
         };
         // Each edit starts it again: three failed runs in a row.
         let edit = |body: &str, n: u64| {
@@ -1908,43 +1886,35 @@ mod tests {
     }
 
     #[test]
-    fn a_command_s_files_are_the_paths_it_names_and_its_program() {
+    fn a_source_watches_only_the_files_its_settings_list() {
         let dir = std::env::temp_dir().join(format!("lookout-stamp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("poll.py");
+        let script = dir.join("my polls").join("poll.py");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
         std::fs::write(&script, "print('hi')\n").unwrap();
-        let stamp = Stamp::of(&format!(
-            "python3 '{}' --since {}",
-            script.display(),
-            dir.display()
-        ));
-        let files: Vec<&PathBuf> = stamp.0.iter().map(|(path, _)| path).collect();
-        // The script, and the program `PATH` finds when there is one; a
-        // folder or a plain word is no file.
-        assert!(files.contains(&&script), "{files:?}");
-        assert!(!files.contains(&&dir));
+        let later = dir.join("lib.py");
+        let stamp = Stamp::of(&[script.display().to_string(), later.display().to_string()]);
+        assert_eq!(
+            stamp.0.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            [&script, &later]
+        );
         assert!(!stamp.changed());
+        // A cursor the command writes beside its script is not watched.
+        std::fs::write(dir.join("my polls").join("state.json"), "{}").unwrap();
+        assert!(!stamp.changed());
+        // A listed file that comes is a change, as is one that goes.
+        std::fs::write(&later, "").unwrap();
+        assert!(stamp.changed());
+        let stamp = Stamp::of(&[script.display().to_string()]);
         std::fs::remove_file(&script).unwrap();
         assert!(stamp.changed(), "a file gone is a change");
-        assert_eq!(Stamp::of(""), Stamp::default());
-        // A quoted path with spaces is one word.
-        let spaced = dir.join("my polls").join("poll.sh");
-        std::fs::create_dir_all(spaced.parent().unwrap()).unwrap();
-        std::fs::write(&spaced, "echo hi\n").unwrap();
-        let quoted = Stamp::of(&format!("sh \"{}\"", spaced.display()));
-        assert!(
-            quoted.0.iter().any(|(path, _)| *path == spaced),
-            "{quoted:?}"
-        );
-        // A file named from where the lookout runs, as `sh poll.sh`.
-        let here = Stamp::of("sh Cargo.toml");
-        assert!(
-            here.0
-                .iter()
-                .any(|(path, _)| path == Path::new("Cargo.toml")),
-            "{here:?}"
-        );
+        // Unset, nothing is watched.
+        assert_eq!(Stamp::of(&[]), Stamp::default());
+        if let Some(home) = std::env::var_os("HOME") {
+            let mine = Stamp::of(&["~/poll.py".to_owned()]);
+            assert_eq!(mine.0[0].0, PathBuf::from(home).join("poll.py"));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
