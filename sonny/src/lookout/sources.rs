@@ -485,17 +485,27 @@ impl Runner {
                 continue;
             }
             let dir = self.dir.join(&source.name);
-            // What subscriptions want of it is on disk before it runs.
+            // What subscriptions want of it is on disk before it runs; one
+            // not written leaves it stopped, to try again at the next reread.
             if let Some(field) = &source.wants {
                 let wants = (self.wants.get(&source.name).cloned())
                     .unwrap_or_else(|| json!({"field": field, "all": false, "values": []}));
-                let _ = super::make_dir(&dir);
                 let file = wants_file(&dir);
-                let _ = super::write_moved(
-                    &file.with_extension("partial"),
-                    &file,
-                    &format!("{wants:#}\n"),
-                );
+                let written = super::make_dir(&dir).and_then(|()| {
+                    super::write_moved(
+                        &file.with_extension("partial"),
+                        &file,
+                        &format!("{wants:#}\n"),
+                    )
+                });
+                if let Err(e) = written {
+                    println!(
+                        "{}",
+                        json!({"event": "source_refused", "source": source.name,
+                            "why": format!("{} was not written: {e}", file.display())})
+                    );
+                    continue;
+                }
             }
             let sent = self.sent.clone();
             let shape = shape_file(&self.dir, &source.name);
@@ -2226,6 +2236,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn a_source_whose_wants_are_not_written_waits_to_start_until_they_are() {
+        let dir = std::env::temp_dir().join(format!("lookout-unwritten-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        // A file where its folder goes: its wants cannot be written.
+        std::fs::write(dir.join("state").join("cr"), "").unwrap();
+        let (sent, _got) = tokio::sync::mpsc::channel(16);
+        let mut runner = Runner::new(dir.join("state"), sent);
+        let source = Source {
+            name: "cr".into(),
+            command: "true".into(),
+            every: Some("1h".into()),
+            digest: None,
+            steer: None,
+            watch: Vec::new(),
+            icon: None,
+            wants: Some("id".into()),
+        };
+        runner.set(vec![source.clone()]);
+        assert!(!runner.running.contains_key("cr"));
+        // The next reread starts it, once they are.
+        std::fs::remove_file(dir.join("state").join("cr")).unwrap();
+        runner.set(vec![source]);
+        assert!(runner.running.contains_key("cr"));
+        assert!(wants_file(&dir.join("state").join("cr")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn what_subscriptions_want_of_a_field_is_the_values_their_filters_name() {
         let sub = |sources: &[&str], filter: Option<Value>| super::super::subs::Sub {
@@ -2257,6 +2296,15 @@ mod tests {
         // A nested field, by its dotted name.
         let repo = sub(&["cr"], Some(json!({"meta": {"repo": ["agent"]}})));
         assert_eq!(wanted(&[repo], "meta.repo"), (false, vec![json!("agent")]));
+        // An `$or` along the path, its branches naming the rest.
+        let nested = sub(
+            &["cr"],
+            Some(json!({"meta": {"$or": [{"repo": ["agent"]}, {"repo": ["client"]}]}})),
+        );
+        assert_eq!(
+            wanted(&[nested], "meta.repo"),
+            (false, vec![json!("agent"), json!("client")])
+        );
         // One that names no exact values wants everything.
         let prefix = sub(&["cr"], Some(json!({"id": [{"prefix": "CR-"}]})));
         let half = sub(

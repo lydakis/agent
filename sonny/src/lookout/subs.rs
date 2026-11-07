@@ -573,24 +573,22 @@ pub fn wanted<'a>(
 /// of exact values, which it adds to `values`: a list of plain values
 /// there, or every branch of its `$or` so.
 fn pinned(pattern: &Value, path: &[&str], values: &mut Vec<Value>) -> bool {
-    let mut at = pattern;
-    for part in path {
-        match at.get(part) {
-            Some(next) => at = next,
-            None => {
-                at = &Value::Null;
-                break;
+    match path.split_first() {
+        // Down the path, through every `$or` along it.
+        Some((part, rest)) => {
+            if (pattern.get(part)).is_some_and(|next| pinned(next, rest, values)) {
+                return true;
             }
         }
-    }
-    if let Some(items) = at.as_array()
-        && !items.is_empty()
-        && items
-            .iter()
-            .all(|v| v.is_string() || v.is_number() || v.is_boolean())
-    {
-        values.extend(items.iter().cloned());
-        return true;
+        None => {
+            if let Some(items) = pattern.as_array()
+                && !items.is_empty()
+                && (items.iter()).all(|v| v.is_string() || v.is_number() || v.is_boolean())
+            {
+                values.extend(items.iter().cloned());
+                return true;
+            }
+        }
     }
     match pattern.get("$or").and_then(Value::as_array) {
         Some(branches) if !branches.is_empty() => {
