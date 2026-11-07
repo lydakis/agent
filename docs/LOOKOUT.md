@@ -16,10 +16,8 @@ it.
 
 The lookout knows no leads. Sonny subscribes each lead to its tasks when it
 opens the lead's project, and that subscription is what makes a lead hear
-from them; a lead subscribes to more the same way. The lookout also
-answers the calls of the tools Sonny answers (`start_task`, `show_agent`
-and the rest, `sonny/src/served.rs`), and once its stream is live, keeps a
-task's worktree as each completed turn left it, for a task forked from
+from them; a lead subscribes to more the same way. Once its stream is
+live, the lookout also keeps a task's worktree as each completed turn left it, for a task forked from
 that turn (`sonny/src/snapshot.rs`). That runs beside the stream, one at a
 time for each checkout, and asks the daemon only which bots are working
 now, to mark a snapshot late.
@@ -55,7 +53,7 @@ The lookout only watches and tells. The tools Sonny gives its agents are
 answered by another companion, `sonny-tool-host` (`sonny tool-host`; see
 SONNY.md, Sonny's tool host), so a tool that runs long, crashes or holds
 memory, as an MCP server can, never holds up a lead's news. The lookout
-follows those calls' starts and ends: when a `subscriptions` or `goal` call
+follows those calls' starts and ends: when a `subscriptions` or `commons` call
 ends, it reads its files again before the next event, which the stream
 puts after that end, rather than at its next reread.
 
@@ -422,9 +420,6 @@ those with subscriptions of their own:
 - a running turn that has printed nothing for 30 minutes, once per
   silence; a turn waiting on the person, on other turns or for a slot is
   not silent;
-- a task's turns its goal (SONNY.md) held, once the goal ends: only the
-  last, with how it ended (``turn:calc.fix/4 completed, asked by goal,
-  and met its goal: its check exits 0``);
 - turns the person asked for in a task themselves, listed apart as theirs;
 - what was saved to or removed from the person's and the project's memory,
   by path, less what the subscriber saved itself: the folders its own
@@ -443,7 +438,7 @@ is an event with a `type` and fields, as a source's are, and the
 | `type` | When | Fields beside `type`, `bot` (where), `maker` (who made that bot) and `turn` |
 | --- | --- | --- |
 | `message.written` | someone other than the subscriber writes in a watched bot | `by` (`person`, an agent's name, a program), `text` (the person's words) |
-| `turn.ended` | a turn that is news ends | `by` (who asked: `you`, `person`, an agent's name, `automation`), `status`, `resolved`, `goal`, `theirs` |
+| `turn.ended` | a turn that is news ends | `by` (who asked: `you`, `person`, an agent's name, `automation`), `status`, `resolved`, `theirs` |
 | `approval.waiting` | an approval only the person can give has waited | |
 | `ask.posted` | a task asked the person with `ask` | `question`, `options` |
 | `turn.silent` | a running turn printed nothing for 30 minutes | |

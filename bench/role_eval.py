@@ -564,8 +564,8 @@ def words_of(text):
 # sandbox, and a repository an agent made inside the lead's has hooks,
 # config and filters the agent wrote (#597). An automation's `if` runs
 # outside every sandbox and its `start` makes an agent the eval never
-# configured. A new project, a pane's command, a script, a goal's check
-# and the browser run as the person.
+# configured. A new project, a pane's command, a script and the browser
+# run as the person.
 NATIVE = {
     'start_task': lambda a: 'folder' not in a,
     'remove_task': lambda a: True,

@@ -302,6 +302,24 @@ pub fn steer_files(store: &Path) {
     crate::upgrade::once(Path::new(&record), STEER, || files_steer(store));
 }
 
+/// Goals are gone (0.9.0): what the lookout kept of them goes with them.
+pub const GOALS_GONE: &str = "lookout-goals-gone";
+
+/// `STORE.lookout/goals`, the goals and how each ended, removed once for
+/// the store.
+pub fn goals_gone(store: &Path) {
+    let mut record = store.as_os_str().to_owned();
+    record.push(".migrated");
+    crate::upgrade::once(
+        Path::new(&record),
+        GOALS_GONE,
+        || match std::fs::remove_dir_all(dir(store).join("goals")) {
+            Ok(()) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        },
+    );
+}
+
 /// The config at `path` with `urgent` under a source named `steer`, and
 /// `[sonny] commons_digest` moved to `[sonny.sources.commons] digest`,
 /// each line kept as the person wrote it otherwise. Whether it is done:
@@ -1071,6 +1089,27 @@ mod tests {
         );
         // One the lines can't move is left for the config's own error.
         assert_eq!(steers("sonny.sources.ci.urgent = \"*\"\n"), Err(()));
+    }
+
+    #[test]
+    fn the_goals_folder_goes_once_and_subscriptions_stay() {
+        let store = std::env::temp_dir().join(format!("sonny-goals-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let mut record = store.as_os_str().to_owned();
+        record.push(".migrated");
+        let _ = std::fs::remove_file(&record);
+        std::fs::create_dir_all(dir(&store).join("goals/ended")).unwrap();
+        std::fs::write(dir(&store).join("goals/ended/a.x.json"), "{}").unwrap();
+        std::fs::write(dir(&store).join("a.x.json"), "{\"subscriptions\": []}").unwrap();
+        goals_gone(&store);
+        assert!(!dir(&store).join("goals").exists());
+        assert!(dir(&store).join("a.x.json").exists());
+        // Done, it never runs again; and a store with none is done too.
+        assert_eq!(crate::upgrade::lines(Path::new(&record)), [GOALS_GONE]);
+        goals_gone(&store);
+        assert_eq!(crate::upgrade::lines(Path::new(&record)), [GOALS_GONE]);
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let _ = std::fs::remove_file(&record);
     }
 
     #[test]
