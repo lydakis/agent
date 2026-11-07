@@ -392,12 +392,19 @@ fn walk_stamps(dir: &Path, at: &Path, hash: &mut impl std::hash::Hasher) -> Opti
 
 /// The home's stamp with its copy's, as a sync record keeps them: the
 /// copy's index and HEAD, which git changes when anyone adds, commits or
-/// moves in it, here or by hand.
+/// moves in it, here or by hand; its own ignore rules, which say what a
+/// sync leaves out; and its config, which names where it pushes.
 fn stamps(home: &u64, places: &Places) -> Value {
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
-    for file in ["index", "HEAD"] {
-        crate::kept::stamp(&places.repo.join(".git").join(file)).hash(&mut hash);
+    for file in [
+        ".git/index",
+        ".git/HEAD",
+        ".git/config",
+        ".git/info/exclude",
+        ".gitignore",
+    ] {
+        crate::kept::stamp(&places.repo.join(file)).hash(&mut hash);
     }
     json!(format!("{home:016x}-{:016x}", hash.finish()))
 }
@@ -1606,6 +1613,12 @@ mod tests {
         sync(&one, None).unwrap();
         assert_eq!(sync(&one, None).unwrap()["unchanged"], true);
         sh(&one.repo, &["rm", "--quiet", "--cached", "config.toml"]);
+        assert_eq!(sync(&one, None).unwrap()["unchanged"], Value::Null);
+        // And so are the copy's own ignore rules, changed by hand.
+        settle(&one.home);
+        sync(&one, None).unwrap();
+        assert_eq!(sync(&one, None).unwrap()["unchanged"], true);
+        write(&one.repo.join(".gitignore"), "memory/d0/\n");
         assert_eq!(sync(&one, None).unwrap()["unchanged"], Value::Null);
         // And a sync that failed is followed by a whole one.
         settle(&one.home);

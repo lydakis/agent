@@ -65,9 +65,25 @@ pub fn config() -> Result<agent_client::config::Config, String> {
     let Some(path) = agent_client::config::path() else {
         return agent_client::config::load();
     };
-    read(&KEPT, "config", vec![path], || {
+    read_ok(&KEPT, "config", vec![path], || {
         (agent_client::config::load(), None)
     })
+}
+
+/// As [`read`], keeping only what read well: what could not be read is
+/// read again next time, as a permission put right changes none of what a
+/// stamp holds.
+pub fn read_ok<T: Clone, E: Clone>(
+    slot: &Slot<Result<T, E>>,
+    key: &str,
+    paths: Vec<PathBuf>,
+    load: impl FnOnce() -> (Result<T, E>, Option<i64>),
+) -> Result<T, E> {
+    let value = read(slot, key, paths, load);
+    if value.is_err() {
+        *slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+    value
 }
 
 /// What `read` reads of `paths` for `key`, kept in `slot` from the last
@@ -109,6 +125,47 @@ fn now_s() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_config_that_could_not_be_read_is_read_again() {
+        let home = std::env::temp_dir().join(format!("kept-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let path = home.join(".agent/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A folder where the file goes reads as an error, as an unreadable
+        // file does, and its stamp stays as it is once settled.
+        std::fs::create_dir(&path).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        let slot: Slot<Result<u8, String>> = Mutex::new(None);
+        let load = || match std::fs::read_to_string(&path) {
+            Ok(_) => (Ok(1), None),
+            Err(e) => (Err(e.to_string()), None),
+        };
+        assert!(read_ok(&slot, "c", vec![path.clone()], load).is_err());
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "nothing kept of a failed read"
+        );
+        // Put right with its stamp unchanged, it reads well at once.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        assert_eq!(read_ok(&slot, "c", vec![path.clone()], load), Ok(1));
+        assert_eq!(
+            read_ok(&slot, "c", vec![path.clone()], || (Ok(2), None)),
+            Ok(1)
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn files_are_read_again_only_once_their_folder_changes() {
