@@ -41,6 +41,7 @@
 //! task_profile = "worker"       # what every other agent is told, not task
 //! side_chat = "answer"          # calls no tool; "fork", the default, may do anything its agent may
 //! chime = false                 # rings when work ends or waits, the default
+//! steps = true                  # the agent's steps between what is said; words only by default
 //! verbose = true                # every tool call drawn, not the clean view
 //! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
@@ -453,6 +454,10 @@ pub struct Sonny {
     pub side_chat: SideChat,
     /// Whether finished and waiting work rings. Notifications show either way.
     pub chime: bool,
+    /// Whether the conversation shows the agent's steps between what is
+    /// said (calls, news in, messages between agents, how long a turn
+    /// took), or only the person's words and the agent's (the default).
+    pub steps: bool,
     /// Whether every tool call is drawn, or only the bot's words and the
     /// calls that move the work on (the clean view, the default).
     pub verbose: bool,
@@ -738,6 +743,7 @@ impl Default for Sonny {
             tool_processes: 0,
             lookout_waiting: 1024,
             chime: true,
+            steps: false,
             verbose: false,
             text_width: TEXT_WIDTH,
             start_at_boot: false,
@@ -1356,6 +1362,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "task_profile",
                 "side_chat",
                 "chime",
+                "steps",
                 "verbose",
                 "text_width",
                 "margin_opens",
@@ -1450,6 +1457,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "suggest" => Some(&mut config.sonny.suggest),
                 "needs_check" => Some(&mut config.sonny.needs_check),
                 "commons" => Some(&mut config.sonny.commons),
+                "steps" => Some(&mut config.sonny.steps),
                 "verbose" => Some(&mut config.sonny.verbose),
                 "start_at_boot" => Some(&mut config.sonny.start_at_boot),
                 "sky_haikus" => Some(&mut config.sonny.sky_haikus),

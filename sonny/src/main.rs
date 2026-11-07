@@ -140,6 +140,10 @@ use std::{
 use transcript::Markdown;
 use unicode_width::UnicodeWidthStr;
 
+/// The mark by a waiting message's arrow: queued for the turn's end.
+const QUEUED: char = '⋯';
+/// The mark by a waiting steer's arrow: it goes into the turn under way.
+const STEERING: char = '↪';
 /// Rows kept at the bottom: the reply's unfinished line, the status, a
 /// blank row, the composer between a row of its band above and below, and
 /// the footer.
@@ -2184,6 +2188,7 @@ async fn run() -> Result<(), String> {
     quiet::set_schedule(settings.quiet.clone());
     app.quiet = quiet::arm();
     app.verbose = settings.verbose;
+    app.words_only = !settings.steps;
     set_measure(settings.text_width);
     margin::set_limits(settings.margin_notes, settings.margin_note_lines);
     app.zen = zen::focus(app.reactions_key.as_deref());
@@ -3846,6 +3851,11 @@ struct App {
     /// Every call drawn, rather than the clean view of the bot's words and
     /// the calls that move the work on.
     verbose: bool,
+    /// Only what the person said and the agent's words, its questions and
+    /// what failed: none of the steps between (`[sonny] steps`, off).
+    words_only: bool,
+    /// The newest plan the words-only view was told, for the margin.
+    plan_told: Option<u64>,
     /// The focus the agent is in zen on: only the person's turns and the
     /// agent's questions are drawn, the conversation alone in the middle.
     zen: Option<String>,
@@ -5330,6 +5340,8 @@ impl App {
             opening_all: false,
             woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
+            words_only: false,
+            plan_told: None,
             zen: None,
             elsewhere: false,
             instruct: None,
@@ -6191,6 +6203,7 @@ impl App {
         self.stacked = None;
         self.plans.clear();
         self.plan_full = None;
+        self.plan_told = None;
         self.refold = true;
         self.tasks.clear();
         self.starting = None;
@@ -6501,8 +6514,15 @@ impl App {
         output: &str,
         failed: bool,
     ) {
-        // In zen the agent's questions are all of its calls drawn.
-        if self.zen.is_some() && name != asks::TOOL {
+        // Words only, the agent's questions are all of its calls drawn,
+        // and its plan is the margin's alone.
+        if self.words() && name != asks::TOOL {
+            if name == plan::TOOL
+                && !failed
+                && let Some(steps) = plan::steps(arguments)
+            {
+                self.tell_plan(steps);
+            }
             return;
         }
         if name == margin::TOOL {
@@ -7297,6 +7317,15 @@ impl App {
     /// was set when the margin is not `beside` the conversation; every
     /// other plan call a row of how far it had got.
     fn fold_plan(&mut self, beside: bool) {
+        // Words only, the margin shows the newest plan told; none here.
+        if self.words() {
+            let told = self.plan_told;
+            self.plans.retain(|at, _| Some(*at) == told);
+            let steps = told.and_then(|at| self.plans.get(&at)).cloned();
+            self.margin.set_plan(steps.as_deref().unwrap_or_default());
+            self.plan_full = None;
+            return;
+        }
         // The plans the conversation holds, in its order: a plan call's
         // own row, or the newest of those a cluster gathered.
         let mut held: Vec<u64> = Vec::new();
@@ -7357,6 +7386,19 @@ impl App {
         }
     }
 
+    /// A plan the agent told, words only: the margin's, the newest drawn
+    /// in order, live or in the newest page; an older page tells none.
+    fn tell_plan(&mut self, steps: Vec<String>) {
+        if self.newer.is_some() {
+            return;
+        }
+        let at = self.plan_count;
+        self.plan_count += 1;
+        self.plans.insert(at, steps);
+        self.plan_told = Some(at);
+        self.refold = true;
+    }
+
     /// A `margin` call applied as it starts, so a note shows while the
     /// agent works, and the margin scrolled to it.
     fn note_call(&mut self, call: &str, arguments: &Value, turn: Option<i64>) {
@@ -7410,16 +7452,17 @@ impl App {
     ) {
         let attached = attached && transcript::relays(said, from);
         if attached {
-            if self.zen.is_none() {
+            if !self.words() {
                 self.land_relayed(node, said, from, (person, true));
             }
             return;
         }
         // Reactions from here on answer this one.
         self.bot_reactions.clear();
-        // Words between agents are one quiet row a click opens; none in zen.
+        // Words between agents are one quiet row a click opens; none
+        // words only.
         if transcript::relays(said, from) {
-            if self.zen.is_none() {
+            if !self.words() {
                 self.land_relayed(node, said, from, (person, false));
             }
         } else {
@@ -8581,7 +8624,7 @@ impl App {
                             Some(reason) => {
                                 // It never ran: nothing it would have done follows.
                                 failed = true;
-                                if self.zen.is_none() {
+                                if !self.words() {
                                     self.commit_denied(&name, &arguments, &reason);
                                 }
                             }
@@ -8684,7 +8727,19 @@ impl App {
             .staged
             .iter()
             .flat_map(|(turn, prompt)| {
-                let mut shown: Vec<Line<'static>> = match user_shell::read(prompt) {
+                // What it waits for, a mark by its arrow and no words: a
+                // queued message the turn's end, a steer the end of the
+                // call under way, however long that runs.
+                let waits = match () {
+                    _ if self.queued.contains(turn) => Some(QUEUED),
+                    _ if self.steering.contains(turn) && self.running.is_some() => Some(STEERING),
+                    _ => None,
+                };
+                let (first, rest) = match waits {
+                    Some(mark) => (format!("›{mark} "), "   "),
+                    None => ("› ".to_owned(), "  "),
+                };
+                let shown: Vec<Line<'static>> = match user_shell::read(prompt) {
                     Some(ran) => user_shell::header(&ran.command, width, true),
                     None => {
                         // An answer shows as itself, under the question it answers.
@@ -8697,29 +8752,21 @@ impl App {
                         asked
                             .into_iter()
                             .chain(prompt.split('\n').enumerate().flat_map(|(at, line)| {
-                                let lead = if at == 0 { "› " } else { "  " };
+                                let lead = if at == 0 {
+                                    first.clone()
+                                } else {
+                                    rest.to_owned()
+                                };
                                 transcript::wrap(
                                     Line::from(line.to_owned()).dim(),
                                     width,
                                     Span::raw(lead).dim(),
-                                    Span::raw("  "),
+                                    Span::raw(rest),
                                 )
                             }))
                             .collect()
                     }
                 };
-                // What it waits for, as the person who sent it would ask:
-                // a queued message the turn's end, a steer the end of the
-                // call under way, however long that runs.
-                if self.queued.contains(turn) {
-                    shown.push(Line::from("  queued for after this turn").dim().italic());
-                } else if self.steering.contains(turn) && self.running.is_some() {
-                    shown.push(
-                        Line::from("  steer waiting for the current call to end")
-                            .dim()
-                            .italic(),
-                    );
-                }
                 std::iter::once(Line::default()).chain(shown)
             })
             .collect();
@@ -9350,7 +9397,7 @@ impl App {
                 if data["denied"] == true {
                     // It never ran: nothing it would have done follows.
                     shown.1 = true;
-                    if self.zen.is_none() {
+                    if !self.words() {
                         self.commit_denied(&name, &arguments, &reason);
                     }
                     // The approver's, not the person's: `/retry` may
@@ -9514,6 +9561,10 @@ impl App {
                     _ if (only_reacted || quiet) && ended => {}
                     // In zen a turn the person did not start ends unseen.
                     _ if self.zen_hides() => {}
+                    // Words only, one that ended well ends on its words: how
+                    // long it took is no word of the agent's.
+                    Some(live) if ended && self.words() => self.write_words(live, Words::Reply),
+                    None if ended && self.words() => {}
                     Some(live) if !live.spilled && !live.rows.is_empty() && ended => {
                         self.commit(vec![line]);
                         self.write_words(Live { gap: true, ..live }, Words::Reply);
@@ -11560,8 +11611,9 @@ impl App {
             self.margin_opens = settings.margin_opens;
             self.agent_opens = settings.agent_opens;
             margin::set_limits(settings.margin_notes, settings.margin_note_lines);
-            if self.verbose != settings.verbose {
+            if self.verbose != settings.verbose || self.words_only == settings.steps {
                 self.verbose = settings.verbose;
+                self.words_only = !settings.steps;
                 self.repaint = true;
             }
             if set_measure(settings.text_width) {
@@ -12276,9 +12328,10 @@ impl App {
                     self.verbose = settings.verbose;
                     // What is already drawn is drawn again in the new view.
                     self.repaint = true;
-                    match self.verbose {
-                        true => "verbose: every tool call",
-                        false => "clean: replies, tasks, questions and the plan",
+                    match (self.verbose, self.words_only) {
+                        (true, _) => "verbose: every tool call",
+                        (false, true) => "words only: what you said and what came back",
+                        (false, false) => "steps: replies, tasks, questions and the plan",
                     }
                     .to_owned()
                 }
@@ -13164,6 +13217,12 @@ impl App {
 
     /// Whether zen keeps what the running turn says out of view: the
     /// person did not start it.
+    /// Whether only words are drawn: the person's, the agent's, its
+    /// questions and what failed, as in zen, every turn's words still.
+    fn words(&self) -> bool {
+        self.zen.is_some() || (self.words_only && !self.verbose)
+    }
+
     fn zen_hides(&self) -> bool {
         self.zen.is_some() && self.elsewhere
     }
@@ -18422,10 +18481,11 @@ mod tests {
             app.submit().await;
         }
         assert_eq!(staged(&app), [2, 3]);
+        let rows: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
         assert_eq!(
-            app.staged_rows(80).len(),
-            7,
-            "each with a blank row above and what it waits for"
+            rows,
+            ["", "›↪ steer one", "", "›↪ steer two", ""],
+            "each with a blank row above, a mark for what it waits for"
         );
         // Turn 1 takes in the first; its own turn ends as steered.
         app.daemon(turn_event("turn_finished", 2, json!({"status": "steered"})))
@@ -18775,6 +18835,78 @@ mod tests {
             rows[line + 1..],
             [("".into(), false), ("• Done.".into(), false)]
         );
+    }
+
+    #[tokio::test]
+    async fn words_only_draws_what_was_said_and_none_of_the_steps() {
+        let client = daemon_answering(|asked| {
+            let item = match asked["nodes"][0].as_i64() {
+                Some(3) => json!({"type": "function_call_output", "call_id": "c1", "output": "a"}),
+                Some(4) => json!({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done."}]}),
+                _ => return json!({}),
+            };
+            json!({"items": [{"node": asked["nodes"][0], "item": item}]})
+        })
+        .await;
+        let mut app = app(client);
+        app.words_only = true;
+        app.any_history = true;
+        app.width = 120;
+        let rows = |app: &App| -> Vec<String> {
+            (app.pending.iter())
+                .map(|line| line.to_string())
+                .filter(|row| !row.trim().is_empty())
+                .collect()
+        };
+        app.commit(vec![Line::from("› check on the tasks")]);
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        // News in, a plan, a send, a call: none of them a row.
+        let updates = "Task updates: what happened in your tasks since you last heard.\n\
+            - calc.neg: turn:calc.neg/3 completed";
+        app.land(5, (updates, ""), (None, false, false), false);
+        let plan = json!({"steps": ["[x] Read", "[>] Fix", "[ ] Test"]});
+        app.commit_call("p1", Some(1), "plan", &plan, "Plan set.", false);
+        let steer = json!({"command":
+            r#""$AGENT_BIN" run --detach --delivery steer --bot calc.neg -- 'Check div too.'"#});
+        app.commit_call("c0", Some(1), "shell", &steer, "turn:calc.neg/4", false);
+        app.daemon(turn_event(
+            "tool_started",
+            1,
+            json!({"call_id": "c1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}),
+        ))
+        .await;
+        app.daemon(turn_event(
+            "tool_completed",
+            1,
+            json!({"call_id": "c1", "node": 3}),
+        ))
+        .await;
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 1, "text": "Done."});
+        app.daemon(said).await;
+        app.daemon(turn_event("message", 1, json!({"node": 4})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        // What was asked and what came back, and how long it took no row.
+        assert_eq!(rows(&app), ["› check on the tasks", "• Done."]);
+        // The plan is the margin's still.
+        app.fold_notes(true);
+        let margin = app.margin.lines(60, std::path::Path::new("/"), None).0;
+        let margin: Vec<String> = margin.iter().map(|l| l.to_string()).collect();
+        assert!(margin.iter().any(|r| r.contains("Plan  1/3")), "{margin:?}");
+        // And never in the conversation, the margin beside it or not.
+        app.fold_notes(false);
+        assert_eq!(rows(&app), ["› check on the tasks", "• Done."]);
+        // A turn that failed still says so.
+        app.daemon(turn_event("accepted", 2, json!({}))).await;
+        app.daemon(turn_event("turn_finished", 2, json!({"status": "failed"})))
+            .await;
+        assert_eq!(rows(&app)[2], "failed for 0s");
     }
 
     #[tokio::test]
@@ -19631,10 +19763,7 @@ mod tests {
         assert!(app.move_to.is_none());
         assert_eq!(app.yours, Some(2));
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
-        assert_eq!(
-            staged,
-            ["", "› after this", "  queued for after this turn", ""]
-        );
+        assert_eq!(staged, ["", "›⋯ after this", ""]);
         // Enter still steers.
         app.input.set("now");
         app.key(enter()).await;
@@ -19642,19 +19771,14 @@ mod tests {
         assert_eq!(steer["delivery"], "steer");
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
         assert_eq!(
-            staged[3..],
-            [
-                "",
-                "› now",
-                "  steer waiting for the current call to end",
-                ""
-            ],
-            "a steer says what it waits for, as a queued message does"
+            staged[2..],
+            ["", "›↪ now", ""],
+            "a steer marks what it waits for, as a queued message does"
         );
         // Sent with no turn running, a message waits for nothing.
         app.running = None;
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
-        assert_eq!(staged[3..], ["", "› now", ""]);
+        assert_eq!(staged[2..], ["", "› now", ""]);
         // Once its turn starts it is no longer waiting.
         app.daemon(turn_event("turn_finished", 3, json!({}))).await;
         app.daemon(turn_event("accepted", 2, json!({}))).await;

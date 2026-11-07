@@ -7,6 +7,9 @@
 pub struct Settings {
     /// Whether finished and waiting work rings. Notifications show either way.
     pub chime: bool,
+    /// Whether the agent's steps between what is said are drawn, or only
+    /// the person's words and the agent's (the default).
+    pub steps: bool,
     /// Whether every tool call is drawn, or only the bot's words and the
     /// calls that move the work on (the clean view, the default).
     pub verbose: bool,
@@ -41,6 +44,7 @@ impl Settings {
     fn from(sonny: agent_client::config::Sonny) -> Self {
         Settings {
             chime: sonny.chime,
+            steps: sonny.steps,
             verbose: sonny.verbose,
             text_width: sonny.text_width,
             margin_opens: sonny.margin_opens,

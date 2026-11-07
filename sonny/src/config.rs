@@ -136,6 +136,12 @@ pub const SETTINGS: &[Setting] = &[
         default: "true",
     },
     Setting {
+        key: "sonny.steps",
+        about: "the agent's steps between what is said (calls, news in, messages between agents, how long a turn took), or only your words and the agent's",
+        values: SWITCH,
+        default: "false",
+    },
+    Setting {
         key: "sonny.verbose",
         about: "every tool call drawn, or the clean view: replies, tasks, questions and the plan",
         values: SWITCH,
