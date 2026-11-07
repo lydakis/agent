@@ -49,7 +49,7 @@ sandbox. For people, scripts and other harnesses, Sonny writes
 `sonny automation`:
 
 ```sh
-~/.agent/automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N [--budget-counts work]] [--shadow] -- MESSAGE
+~/.agent/automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] -- MESSAGE
   WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO
 ~/.agent/automation ls [--after NAME]
 ~/.agent/automation show NAME
@@ -199,6 +199,9 @@ nothing to do costs one process and no model call. A one-off whose check
 says no ends, listed as not sent.
 `--runs N` ends the automation once N messages went out; a fire after that
 (its end could not unload it) only tries to end it again.
+`--until 'YYYY-MM-DD HH:MM'`, local time, ends it at that time: its first fire
+from then sends nothing and ends it, its row saying `last ended: its until
+came`. A subscription's `until` and `runs` end it the same way (LOOKOUT.md).
 `--turn-budget-tokens N` submits each message with that turn cap, so one
 runaway run ends at it, on a reply, instead of spending the agent's whole
 lifetime budget. The cap counts every request's input, the agent's history
@@ -293,7 +296,7 @@ can leave is listed and removable:
   one's name starts afresh.
 - **Firing** records its result and ends an automation that is over (a one-off,
   one whose agent, `--reply-to` agent or, for `--start`, adding agent is
-  gone, one that reached `--runs`), both under the lock
+  gone, one that reached `--runs` or its `--until`), both under the lock
   and only while the definition is still the one it fired for: an automation
   removed while its message went out is left as it now is. A one-off that
   delivered keeps its last result until its turn is known to have ended:

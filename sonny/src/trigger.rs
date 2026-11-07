@@ -74,7 +74,7 @@ const REPLY_WAIT_MS: u64 = 86_400_000;
 /// How long `fire` waits for launchd's run of the job to say what came of
 /// it: its gate's whole time, and then some for the send.
 const FIRE_WAIT: Duration = Duration::from_secs(90);
-pub const USAGE: &str = "usage: automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL] [--fresh]] [--reply-to BOT] [--if CMD] [--runs N] [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--replace] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only run runs it\n       automation ls [--after NAME]\n       automation show NAME\n       automation run NAME\n       automation rm NAME";
+pub const USAGE: &str = "usage: automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL] [--fresh]] [--reply-to BOT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--replace] -- MESSAGE\n         WHEN: --every N{m,h,d} | --in N{m,h} | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO; none: only run runs it\n       automation ls [--after NAME]\n       automation show NAME\n       automation run NAME\n       automation rm NAME";
 
 /// The system's own scheduler, which keeps Sonny's one job.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -415,6 +415,8 @@ pub struct Trigger {
     pub gate: Option<String>,
     /// Ends once this many messages went out.
     pub runs: Option<u64>,
+    /// Ends at this time, seconds since the epoch, sending nothing more.
+    pub until: Option<i64>,
     /// The most tokens each fire's turn may spend.
     pub turn_budget_tokens: Option<u64>,
     /// What that cap counts, `tokens` or `work`; none is the daemon's
@@ -501,6 +503,9 @@ impl Trigger {
         if let Some(runs) = self.runs {
             pair("--runs", runs.to_string());
         }
+        if let Some(until) = self.until {
+            pair("--until", until.to_string());
+        }
         if let Some(tokens) = self.turn_budget_tokens {
             pair("--turn-budget-tokens", tokens.to_string());
         }
@@ -539,7 +544,7 @@ impl Trigger {
             let value = iter
                 .next()
                 .ok_or_else(|| bad(&format!("{flag} needs a value")))?;
-            const FLAGS: [&str; 25] = [
+            const FLAGS: [&str; 26] = [
                 "--name",
                 "--generation",
                 "--bot",
@@ -559,6 +564,7 @@ impl Trigger {
                 "--reply-to-id",
                 "--if",
                 "--runs",
+                "--until",
                 "--turn-budget-tokens",
                 "--budget-counts",
                 "--file",
@@ -617,6 +623,7 @@ impl Trigger {
             reply_to: pinned("--reply-to", "--reply-to-id")?,
             gate: text("--if"),
             runs: number("--runs")?.map(|n| n.max(1) as u64),
+            until: number("--until")?,
             turn_budget_tokens: number("--turn-budget-tokens")?.map(|n| n.max(1) as u64),
             budget_counts: text("--budget-counts"),
             file: text("--file").map(PathBuf::from),
@@ -653,6 +660,7 @@ impl Trigger {
         json!({"name": self.name, "generation": self.generation, "when": self.when,
             "bot": self.bot(), "bot_id": bot_id, "start": start, "by": by,
             "reply_to": self.reply_to.as_ref().map(|r| &r.0), "if": self.gate, "runs": self.runs,
+            "until": self.until.map(until_text),
             "turn_budget_tokens": self.turn_budget_tokens, "budget_counts": self.budget_counts,
             "sent": state["sent"].as_u64().unwrap_or(0), "message": self.message,
             "once": self.at.is_some(), "shadow": self.shadow, "last": state["last"],
@@ -675,6 +683,7 @@ impl Trigger {
             ("reply_to", self.reply_to == other.reply_to),
             ("if", self.gate == other.gate),
             ("runs", self.runs == other.runs),
+            ("until", self.until == other.until),
             (
                 "turn_budget_tokens",
                 self.turn_budget_tokens == other.turn_budget_tokens,
@@ -912,8 +921,9 @@ pub fn after(value: &str, now: i64) -> Result<When, String> {
     once(epoch + (60 - epoch.rem_euclid(60)) % 60, now)
 }
 
-/// `--at 'YYYY-MM-DD HH:MM'`, local time.
-pub fn at(value: &str, now: i64) -> Result<When, String> {
+/// `YYYY-MM-DD HH:MM` in local time, as `--at` and `--until` and a
+/// subscription's `until` are written, in seconds since the epoch.
+pub fn moment(value: &str) -> Result<i64, String> {
     let bad = || format!("invalid_at: {value}: YYYY-MM-DD HH:MM");
     let (date, time) = value.trim().split_once([' ', 'T']).ok_or_else(bad)?;
     let parts =
@@ -932,8 +942,21 @@ pub fn at(value: &str, now: i64) -> Result<When, String> {
         hour: small(hour, 23)?,
         minute: small(minute, 59)?,
     };
-    let epoch = epoch_of(wanted).ok_or_else(bad)?;
-    once(epoch, now)
+    epoch_of(wanted).ok_or_else(bad)
+}
+
+/// `epoch` as `--until` and `--at` are written, in local time.
+pub(crate) fn until_text(epoch: i64) -> String {
+    let local = local(epoch);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        local.year, local.month, local.day, local.hour, local.minute
+    )
+}
+
+/// `--at 'YYYY-MM-DD HH:MM'`, local time.
+pub fn at(value: &str, now: i64) -> Result<When, String> {
+    once(moment(value)?, now)
 }
 
 /// One cron field: `*`, or values, ranges and steps separated by commas.
@@ -1528,7 +1551,8 @@ impl Trigger {
         };
         json!({"name": self.name, "when": self.when, "bot": self.bot(), "start": start,
             "by": by, "reply_to": self.reply_to.as_ref().map(|(to, _)| to), "if": self.gate,
-            "runs": self.runs, "turn_budget_tokens": self.turn_budget_tokens,
+            "runs": self.runs, "until": self.until.map(until_text),
+            "turn_budget_tokens": self.turn_budget_tokens,
             "budget_counts": self.budget_counts, "once": self.at.is_some(), "commit": self.commit, "file": self.file,
             "dir": self.dir, "shadow": self.shadow, "message": self.message})
     }
@@ -2516,6 +2540,7 @@ fn settle(places: &Places, trigger: &Trigger, outcome: &Value, kept: &Kept) -> b
     }
     let over = trigger.at.is_some()
         || outcome["outcome"] == "gone"
+        || outcome["outcome"] == "ended"
         || outcome["gone"] == true
         || outcome["reply"]["gone"] == true
         || trigger.runs.is_some_and(|runs| kept.sent >= runs);
@@ -2714,6 +2739,7 @@ struct Add {
     reply_to: Option<String>,
     gate: Option<String>,
     runs: Option<u64>,
+    until: Option<i64>,
     turn_budget_tokens: Option<u64>,
     budget_counts: Option<String>,
     shadow: bool,
@@ -2768,6 +2794,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
             | "--reply-to"
             | "--if"
             | "--runs"
+            | "--until"
             | "--turn-budget-tokens"
             | "--budget-counts" => {
                 if v.insert(flag.clone(), value.clone()).is_some() {
@@ -2815,6 +2842,17 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
     };
     let runs = counted("--runs")?;
     let turn_budget_tokens = counted("--turn-budget-tokens")?;
+    // As `--at` is written, and a time to come.
+    let until = match take("--until") {
+        Some(until) => {
+            let at = moment(&until).map_err(|e| bad(e.replacen("invalid_at", "--until", 1)))?;
+            if at <= now {
+                return Err(bad(format!("--until {until} has passed")));
+            }
+            Some(at)
+        }
+        None => None,
+    };
     let budget_counts = take("--budget-counts");
     match (&budget_counts, turn_budget_tokens) {
         (Some(counts), Some(_)) if counts == "tokens" || counts == "work" => {}
@@ -2857,6 +2895,7 @@ fn parse_add(args: &[String], now: i64) -> Result<Add, String> {
         reply_to: take("--reply-to"),
         gate,
         runs,
+        until,
         turn_budget_tokens,
         budget_counts,
         shadow,
@@ -3430,6 +3469,7 @@ fn add_args(asked: &Value) -> Vec<String> {
         ("bot", "--bot"),
         ("reply_to", "--reply-to"),
         ("if", "--if"),
+        ("until", "--until"),
     ] {
         if let Some(value) = asked[key].as_str() {
             args.extend([flag.to_owned(), value.to_owned()]);
@@ -3681,6 +3721,7 @@ fn add(places: &Places, args: &[String]) -> Result<Value, String> {
         reply_to,
         gate: asked.gate,
         runs: asked.runs,
+        until: asked.until,
         turn_budget_tokens: asked.turn_budget_tokens,
         budget_counts: asked.budget_counts,
         daemon,
@@ -5360,6 +5401,13 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     if trigger.runs.is_some_and(|runs| kept.sent >= runs) {
         return ends(places, trigger, true);
     }
+    // Its `--until` came: it ends now, sending nothing, as a subscription's
+    // `until` ends it, and its row says why.
+    if trigger.until.is_some_and(|until| now >= until) {
+        let ended = json!({"outcome": "ended", "detail": "its until came"});
+        settle(places, trigger, &ended, &kept);
+        return;
+    }
     if !asked {
         // A one-off's calendar entry has no year: the same date a year early
         // is not its time. A day's slack keeps its time when the Mac's time
@@ -5714,7 +5762,7 @@ pub(crate) mod tests {
             list[0],
             json!({"name": "p.digest", "when": "every 30m", "bot": "p.digest",
                 "start": {"model": "openai/gpt", "effort": "low"}, "by": "p.lead",
-                "reply_to": null, "if": "test -s inbox", "runs": null,
+                "reply_to": null, "if": "test -s inbox", "runs": null, "until": null,
                 "turn_budget_tokens": null, "budget_counts": null, "once": false, "commit": null,
                 "file": null,
                 "dir": "/work/p", "shadow": false, "message": digest.message}),
@@ -6112,6 +6160,7 @@ pub(crate) mod tests {
             reply_to: None,
             gate: None,
             runs: None,
+            until: None,
             turn_budget_tokens: None,
             budget_counts: None,
             file: None,
@@ -8241,6 +8290,42 @@ pub(crate) mod tests {
         assert_eq!(
             parse_add(&add_args(&work), now).unwrap().budget_counts,
             None
+        );
+        // `until` is a time to come, as a subscription's is.
+        let until = json!({"every": "30m", "until": "2026-10-01 09:00", "message": "go"});
+        assert_eq!(
+            parse_add(&add_args(&until), now).unwrap().until,
+            moment("2026-10-01 09:00").ok()
+        );
+        let past = json!({"every": "30m", "until": "2026-09-28 09:00", "message": "go"});
+        let refused = parse_add(&add_args(&past), now).unwrap_err();
+        assert!(
+            refused.contains("--until 2026-09-28 09:00 has passed"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn an_automation_ends_at_its_until_sending_nothing() {
+        let w = World::new("until");
+        let s = Trigger {
+            until: Some(now() - 60),
+            ..trigger()
+        };
+        w.install(&s).unwrap();
+        assert_eq!(w.state(&s.name), (true, false));
+        fire(&w.places, &s, None);
+        assert_eq!(w.state(&s.name), (false, true));
+        let last = &w.rows()[0]["last"];
+        assert_eq!(
+            (&last["outcome"], &last["detail"]),
+            (&json!("ended"), &json!("its until came"))
+        );
+        // Its program says it, and its row says when.
+        assert_eq!(Trigger::parse(&s.args()[1..]).unwrap(), s);
+        assert_eq!(
+            s.json(&json!({}))["until"],
+            json!(until_text(s.until.unwrap()))
         );
     }
 

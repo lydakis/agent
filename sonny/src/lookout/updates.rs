@@ -273,6 +273,9 @@ pub struct Told {
     seen: Option<HashMap<String, u64>>,
     /// The subscriptions with a digest whose news it tells.
     subs: Vec<String>,
+    /// The subscriptions that last so many notes whose news it tells:
+    /// once it lands, each has one note fewer to go.
+    pub counted: Vec<String>,
 }
 
 pub struct Line {
@@ -1621,11 +1624,18 @@ impl Updates {
         self.tasks = later;
         // What each subscription with a digest heard goes now, however soon:
         // its digest counts from this note once it lands.
-        let mut subs: Vec<String> = Vec::new();
+        let (mut subs, mut counted): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
         for (_, news) in &sent {
-            for (sub, _) in news.holds().flat_map(|hold| &hold.windows) {
-                if !subs.contains(sub) {
-                    subs.push(sub.clone());
+            for hold in news.holds() {
+                for (sub, _) in &hold.windows {
+                    if !subs.contains(sub) {
+                        subs.push(sub.clone());
+                    }
+                }
+                for sub in &hold.counted {
+                    if !counted.contains(sub) {
+                        counted.push(sub.clone());
+                    }
                 }
             }
         }
@@ -1643,6 +1653,7 @@ impl Updates {
             sent,
             seen,
             subs,
+            counted,
         }
     }
 

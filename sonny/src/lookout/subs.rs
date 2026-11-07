@@ -32,6 +32,12 @@ pub struct Sub {
     /// The bot it was made for, by ID, when Sonny made it on the bot's
     /// behalf: another bot that takes the name does not hold it.
     pub owner: Option<i64>,
+    /// When it ends, as `YYYY-MM-DD HH:MM` in local time, as an
+    /// automation's `--at` is written.
+    pub until: Option<String>,
+    /// How many notes telling what it heard it lasts, as an automation's
+    /// `--runs` counts messages.
+    pub runs: Option<u64>,
 }
 
 impl Sub {
@@ -53,6 +59,8 @@ impl Sub {
             digest: None,
             steer: None,
             owner: None,
+            until: None,
+            runs: None,
         }
     }
 
@@ -69,6 +77,8 @@ impl Sub {
             digest: None,
             steer: None,
             owner,
+            until: None,
+            runs: None,
         }
     }
 
@@ -119,13 +129,33 @@ impl Sub {
         if let Some(steer) = &self.steer {
             out["steer"] = steer.clone();
         }
+        if let Some(until) = &self.until {
+            out["until"] = json!(until);
+        }
+        if let Some(runs) = self.runs {
+            out["runs"] = json!(runs);
+        }
         out
     }
 
-    /// Whether it says more than what it watches: a filter, a digest or
-    /// what steers. One that says none costs the lookout nothing more.
+    /// Whether it says more than what it watches: a filter, a digest,
+    /// what steers, or how many notes it lasts, which counts what it
+    /// heard. One that says none costs the lookout nothing more.
     pub fn rules(&self) -> bool {
-        self.filter.is_some() || self.digest.is_some() || self.steer.is_some()
+        self.filter.is_some()
+            || self.digest.is_some()
+            || self.steer.is_some()
+            || self.runs.is_some()
+    }
+
+    /// When it ends, in seconds since the epoch; none when it lasts.
+    pub fn ends_at(&self) -> Option<i64> {
+        crate::trigger::moment(self.until.as_deref()?).ok()
+    }
+
+    /// Whether it has ended by `now`, seconds since the epoch.
+    pub fn over(&self, now: i64) -> bool {
+        self.ends_at().is_some_and(|at| at <= now)
     }
 
     /// Its digest as a span; none unset or `0`.
@@ -166,6 +196,12 @@ impl Sub {
                 .filter(|steer| !steer.is_null() && super::pattern::check(steer).is_ok())
                 .cloned(),
             owner: value["bot_id"].as_i64(),
+            // An end that does not read never comes; how many notes, at
+            // least one.
+            until: (value["until"].as_str())
+                .filter(|at| crate::trigger::moment(at).is_ok())
+                .map(str::to_owned),
+            runs: value["runs"].as_u64().map(|n| n.max(1)),
         })
     }
 
@@ -187,8 +223,17 @@ impl Sub {
             Some(steer) => format!(", steers when {steer}"),
             None => String::new(),
         };
+        let until = match &self.until {
+            Some(until) => format!(", until {until}"),
+            None => String::new(),
+        };
+        let runs = match self.runs {
+            Some(1) => ", for 1 note".to_owned(),
+            Some(runs) => format!(", for {runs} notes"),
+            None => String::new(),
+        };
         format!(
-            "{} · {}{filter}{digest}{steer}",
+            "{} · {}{filter}{digest}{steer}{until}{runs}",
             self.name,
             watched.join(", ")
         )
@@ -203,6 +248,8 @@ impl Sub {
             ("filter", self.filter != other.filter),
             ("digest", self.digest != other.digest),
             ("steer", self.steer != other.steer),
+            ("until", self.until != other.until),
+            ("runs", self.runs != other.runs),
         ]
         .into_iter()
         .find_map(|(field, differs)| differs.then_some(field))
@@ -707,6 +754,19 @@ fn drop_named(
     Ok(subs.len() < before)
 }
 
+/// End the subscriptions the deleted bot of `id` held as `subscriber`:
+/// all of them, but one held by another bot of the name. How many ended.
+pub fn forget(store: &Path, subscriber: &str, id: Option<i64>) -> Result<usize, String> {
+    let _held = held(store)?;
+    let mut subs = read_whole(store, subscriber)?;
+    let before = subs.len();
+    subs.retain(|sub| sub.owner.is_some_and(|owner| Some(owner) != id));
+    if subs.len() < before {
+        write(store, subscriber, &subs)?;
+    }
+    Ok(before - subs.len())
+}
+
 /// A `subscriptions` call of `subscriber`'s: `add` one, as `to_json`
 /// writes it, or `remove` one by name, then list them all, with the
 /// `sources` the person set up. Adding one again changes nothing; one
@@ -874,6 +934,26 @@ fn parse(value: &Value) -> Result<Sub, String> {
             Some(steer.clone())
         }
     };
+    // As an automation's `--at`: a time to come.
+    let until = match value.get("until") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(until)) => {
+            let at = crate::trigger::moment(until)?;
+            if at <= super::epoch_ms() as i64 / 1000 {
+                return Err(format!("until {until} has passed"));
+            }
+            Some(until.trim().to_owned())
+        }
+        Some(_) => return Err("until is YYYY-MM-DD HH:MM".into()),
+    };
+    let runs = match value.get("runs") {
+        None | Some(Value::Null) => None,
+        Some(runs) => Some(
+            (runs.as_u64())
+                .filter(|n| *n >= 1)
+                .ok_or("runs is a whole number, 1 or more")?,
+        ),
+    };
     let sub = Sub {
         name: name.to_owned(),
         tasks_of: strings("tasks_of"),
@@ -883,6 +963,8 @@ fn parse(value: &Value) -> Result<Sub, String> {
         digest,
         steer,
         owner: None,
+        until,
+        runs,
     };
     if sub.tasks_of.is_empty() && sub.bots.is_empty() && sub.sources.is_empty() {
         return Err("a subscription watches tasks_of a bot, bots by name or sources".into());
@@ -1000,6 +1082,49 @@ mod tests {
         assert_eq!(again["subscriptions"].as_array().unwrap().len(), 1);
         assert_eq!(again["subscriptions"][0]["sources"], json!(["github:8"]));
         assert_eq!(again["subscriptions"][0]["bot_id"], 2);
+        let _ = std::fs::remove_dir_all(dir(&store));
+    }
+
+    #[test]
+    fn a_subscription_ends_at_its_until_after_its_runs_or_with_its_bot() {
+        let store = std::env::temp_dir().join(format!("subs-end-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let now = super::super::epoch_ms() as i64 / 1000;
+        let soon = crate::trigger::until_text(now + 3600);
+        let once = json!({"name": "deploy", "bots": ["a"], "until": soon, "runs": 1});
+        let added = change(&store, "shop.lead", Some(1), Some(&once), None, &[]).unwrap();
+        assert_eq!(added["subscriptions"][0]["until"], json!(soon));
+        assert_eq!(added["subscriptions"][0]["runs"], 1);
+        let sub = &read(&store, "shop.lead")[0];
+        assert_eq!(Sub::from_json(&sub.to_json()).as_ref(), Some(sub));
+        assert!(sub.rules());
+        assert!(!sub.over(now) && sub.over(now + 3600));
+        assert!(sub.describe().contains(&soon), "{}", sub.describe());
+        // A time gone, or no notes at all, is refused.
+        let past = crate::trigger::until_text(now - 120);
+        let refused = change(
+            &store,
+            "shop.lead",
+            Some(1),
+            Some(&json!({"name": "late", "bots": ["a"], "until": past})),
+            None,
+            &[],
+        );
+        assert!(refused.unwrap_err().contains("has passed"));
+        let none = json!({"name": "none", "bots": ["a"], "runs": 0});
+        assert!(
+            change(&store, "shop.lead", Some(1), Some(&none), None, &[])
+                .unwrap_err()
+                .contains("runs")
+        );
+        // The bot of ID 1 deleted: its subscriptions go, but those a later
+        // bot of the name holds stay.
+        assert_eq!(forget(&store, "shop.lead", Some(1)), Ok(1));
+        assert!(read(&store, "shop.lead").is_empty());
+        let theirs = json!({"name": "theirs", "bots": ["b"]});
+        change(&store, "shop.lead", Some(2), Some(&theirs), None, &[]).unwrap();
+        assert_eq!(forget(&store, "shop.lead", Some(1)), Ok(0));
+        assert_eq!(read(&store, "shop.lead")[0].name, "theirs");
         let _ = std::fs::remove_dir_all(dir(&store));
     }
 

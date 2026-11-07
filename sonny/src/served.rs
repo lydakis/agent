@@ -259,9 +259,8 @@ fn subscriptions() -> Value {
             source as NAME:TOPIC, or only those its filter matches. The commons is a source too, each thread \
             a topic: posting in a thread subscribes you to it as commons.THREAD, and removing that leaves it. \
             Add steer yourself for what you own; a filter or a digest only when the person asks for one: \
-            what a filter leaves out you never hear, and a digest makes you late. Add one, or remove one by \
-            name; with neither, or after either, the result lists them all, with \
-            the sources there are and the fields their events lately had, to filter on. Adding one again \
+            what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name; \
+            the result lists them all, with the sources there are and their events' recent fields. Adding one again \
             changes nothing; one by a name in use that differs is refused with the field, so remove it first.",
         "parameters": {
             "type": "object",
@@ -276,7 +275,7 @@ fn subscriptions() -> Value {
                             "description": "Bots it watches by name, * matching any run of characters; \
                                 another lead, which has subscriptions of its own, counts only where named as it is."},
                         "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Sources it hears, by name: every event each says, unless filtered; or NAME:TOPIC, one topic of it."},
+                            "description": "Sources it hears, by name, or NAME:TOPIC for one topic of it."},
                         "filter": {"type": "object",
                             "description": "Only the events this matches are heard, its sources' and its bots' \
                                 alike. A bot's events have type (message.written, turn.ended, approval.waiting, \
@@ -294,13 +293,14 @@ fn subscriptions() -> Value {
                                 As {\"paths\": [{\"prefix\": \"src/billing/\"}], \"author\": [{\"anything-but\": \"me\"}]}."},
                         "digest": {"type": "string", "pattern": "^(0|[0-9]+[smh])$",
                             "description": "Tell what it hears at most once this long, as 15m or 1h, in place of \
-                                its sources' own digest: the first after a quiet spell at once, the rest in one \
-                                note. The person's words, a question to them and an approval only they can give \
+                                its sources' own digest. The person's words, a question to them and an approval only they can give \
                                 never wait for it."},
                         "steer": {"type": "object",
-                            "description": "What it hears that this matches, a pattern as filter's, is a steer: \
-                                it goes at once and waits for no digest, as the person's words do. As \
-                                {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."}
+                            "description": "What it hears that this matches, a pattern as filter's, goes at once, \
+                                past any digest, as the person's words do. As \
+                                {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."},
+                        "until": {"type": "string", "description": "Ends it at YYYY-MM-DD HH:MM."},
+                        "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N notes."}
                     },
                     "required": ["name"],
                     "additionalProperties": false
@@ -366,6 +366,7 @@ fn automations() -> Value {
                             "description": "A shell command run in your folder first; it runs only when that \
                                 exits 0, so a check that finds nothing costs no turn."},
                         "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N messages."},
+                        "until": {"type": "string", "description": "Ends it at YYYY-MM-DD HH:MM."},
                         "turn_budget_tokens": {"type": "integer", "minimum": 1,
                             "description": "A cap on the tokens of each turn a run starts, counting every request's \
                                 input with the agent's history, so a cap below that history ends every run on \

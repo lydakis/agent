@@ -1314,12 +1314,19 @@ impl Service {
                         && let Some(name) = event["bot"].as_str()
                     {
                         self.in_flight.retain(|(bot, _), _| bot != name);
-                        if let Some(had) = self.records.remove(name) {
-                            self.made.remove(name, &had);
+                        let had = self.records.remove(name);
+                        if let Some(had) = &had {
+                            self.made.remove(name, had);
                         }
                         if let Some(lookout) = self.lookouts.remove(name) {
                             lookout.unheld();
                             self.index();
+                        }
+                        // Only as news: what the replay shows from before the
+                        // lookout last watched it saw then.
+                        if news {
+                            let id = had.as_ref().and_then(|had| had["bot_id"].as_i64());
+                            self.ended_with(name, id);
                         }
                     }
                     // A turn whose goal's check is to run is news only once
@@ -1469,10 +1476,18 @@ impl Service {
                     touched = Some(vec![lead]);
                 }
                 Some((lead, id, answer)) = woke.recv() => {
+                    let mut ended = Vec::new();
                     if let Some(lookout) = self.lookouts.get_mut(&lead)
                         && lookout.id == id
                     {
                         lookout.answered(answer);
+                        ended = std::mem::take(&mut lookout.ended);
+                    }
+                    if !ended.is_empty() {
+                        for name in &ended {
+                            self.end_sub(String::as_str(&lead), name, "its runs were told");
+                        }
+                        self.reread(&client).await;
                     }
                     touched = Some(vec![lead]);
                 }
@@ -1809,7 +1824,21 @@ impl Service {
     /// watched, and each lookout watches what its file says.
     async fn reread(&mut self, client: &Client) {
         let revisions = subs::revisions(&self.store);
-        let read: HashMap<String, Vec<subs::Sub>> = subs::all(&self.store).into_iter().collect();
+        let mut read: HashMap<String, Vec<subs::Sub>> =
+            subs::all(&self.store).into_iter().collect();
+        // A subscription whose `until` came ends, as an automation does.
+        let now_s = (epoch_ms() / 1000) as i64;
+        for (subscriber, subs) in read.iter_mut() {
+            let over: Vec<String> = (subs.iter())
+                .filter(|sub| sub.over(now_s))
+                .map(|sub| sub.name.clone())
+                .collect();
+            for name in &over {
+                self.end_sub(subscriber, name, "its until came");
+            }
+            subs.retain(|sub| !over.contains(&sub.name));
+        }
+        read.retain(|_, subs| !subs.is_empty());
         // Every revision read is kept, one that changes nothing and a
         // file that went included, so the listing knows it was taken.
         let now = epoch_ms();
@@ -1835,6 +1864,42 @@ impl Service {
             self.seat(client, &record).await;
         }
         self.resubscribe(false);
+    }
+
+    /// End `subscriber`'s subscription `name`, as it says `why`, in its
+    /// file and the log; the next read of the files stops it.
+    fn end_sub(&self, subscriber: &str, name: &str, why: &str) {
+        let removed = subs::remove(&self.store, subscriber, name);
+        self.write(
+            &json!({"at_ms": epoch_ms(), "lead": subscriber, "ended": name, "why": why,
+            "removed": removed.as_ref().is_ok_and(|r| *r), "error": removed.err()}),
+        );
+    }
+
+    /// A bot was deleted: the subscriptions it held end with it, and so
+    /// does any that watched only bots by their names, every one of them
+    /// gone now, and no source.
+    fn ended_with(&self, gone: &str, id: Option<i64>) {
+        if self.subscribers.contains_key(gone) {
+            let forgot = subs::forget(&self.store, gone, id);
+            if forgot.as_ref().is_ok_and(|n| *n > 0) || forgot.is_err() {
+                self.write(&json!({"at_ms": epoch_ms(), "lead": gone, "ended": "all",
+                    "why": "its subscriber was deleted", "error": forgot.err()}));
+            }
+        }
+        for (subscriber, subs) in &self.subscribers {
+            for sub in subs {
+                let names: Vec<&String> = sub.bots.iter().chain(&sub.tasks_of).collect();
+                let watched_gone = names.iter().any(|name| *name == gone)
+                    && sub.sources.is_empty()
+                    && names
+                        .iter()
+                        .all(|name| !name.contains('*') && !self.records.contains_key(*name));
+                if watched_gone && subscriber != gone {
+                    self.end_sub(subscriber, &sub.name, "every bot it watched was deleted");
+                }
+            }
+        }
     }
 
     /// A lead's `react` call naming one of its project's agents: once it
@@ -2010,6 +2075,7 @@ impl Service {
         lookout.roots(&self.records, &self.made);
         let held = beside(&self.store, ".sources").join(".held");
         lookout.restore(held.join(format!("{lead}.json")));
+        lookout.counting();
         self.lookouts.insert(lead.to_owned(), lookout);
         // Said once a subscriber is watched, so `/status` shows it from
         // the start.
@@ -2067,6 +2133,7 @@ impl Service {
                 .collect();
             if all || subs != lookout.subs {
                 lookout.subs = subs;
+                lookout.counting();
                 lookout.roots(&self.records, &self.made);
                 lookout.rehear();
             }
@@ -2367,6 +2434,11 @@ struct Lookout {
     /// When a note last told the subscriber each source, which a source's
     /// digest counts from.
     told_sources: HashMap<String, Instant>,
+    /// How many notes told what each subscription that lasts so many
+    /// (`runs`) heard, kept with what its sources hold.
+    runs_told: HashMap<String, u64>,
+    /// Subscriptions whose notes ran out, for the service to end.
+    ended: Vec<String>,
     /// Where what its sources said waits, untold, so a restart loses none
     /// of what a digest or a busy subscriber held.
     held: Option<PathBuf>,
@@ -2431,6 +2503,8 @@ impl Lookout {
             unkept_sent: Unkept::default(),
             heard_since: None,
             told_sources: HashMap::new(),
+            runs_told: HashMap::new(),
+            ended: Vec::new(),
             held: None,
             dirty: false,
             resend: Vec::new(),
@@ -2998,6 +3072,7 @@ impl Lookout {
                         }
                         // The person's words a bounded note left out still cut in.
                         self.urgent &= self.updates.quoting();
+                        self.spend(&told.counted);
                         self.updates.sent(told);
                         // When a subscription's digest last told is kept.
                         if !self.updates.told_subs.is_empty() {
@@ -3012,6 +3087,7 @@ impl Lookout {
                     // The same news twice is one note.
                     Err(code) if code == "idempotency_conflict" => {
                         self.urgent &= self.updates.quoting();
+                        self.spend(&told.counted);
                         self.updates.sent(told);
                     }
                     Err(code) => {
@@ -3051,6 +3127,13 @@ impl Lookout {
                     submitted => {
                         self.refused = None;
                         self.sourced(true);
+                        let mut counted: Vec<String> = Vec::new();
+                        for sub in sent.iter().flat_map(|heard| &heard.subs) {
+                            if !counted.contains(sub) {
+                                counted.push(sub.clone());
+                            }
+                        }
+                        self.spend(&counted);
                         self.unkept_sent = Unkept::default();
                         for heard in &sent {
                             self.told_sources.insert(heard.event.source.clone(), now);
@@ -3065,6 +3148,43 @@ impl Lookout {
                 self.heard_since = (!self.heard.is_empty()).then_some(now);
                 self.keep();
             }
+        }
+    }
+
+    /// Notes counted only for subscriptions it has that last so many,
+    /// so one removed and added again starts its count afresh.
+    fn counting(&mut self) {
+        let subs = &self.subs;
+        self.runs_told.retain(|name, _| {
+            subs.iter()
+                .any(|sub| &sub.name == name && sub.runs.is_some())
+        });
+    }
+
+    /// A note that told what these subscriptions heard landed: each that
+    /// lasts so many notes has one fewer to go, and one with none left
+    /// ends, as an automation does after its `--runs`.
+    fn spend(&mut self, counted: &[String]) {
+        let mut spent = false;
+        for name in counted {
+            let Some(runs) = (self.subs.iter())
+                .find(|sub| &sub.name == name)
+                .and_then(|s| s.runs)
+            else {
+                continue;
+            };
+            spent = true;
+            let told = self.runs_told.entry(name.clone()).or_default();
+            *told += 1;
+            if *told >= runs {
+                self.runs_told.remove(name);
+                if !self.ended.contains(name) {
+                    self.ended.push(name.clone());
+                }
+            }
+        }
+        if spent {
+            self.keep();
         }
     }
 
@@ -3211,6 +3331,7 @@ impl Lookout {
             && sending.is_empty()
             && self.told_sources.is_empty()
             && told_subs.is_empty()
+            && self.runs_told.is_empty()
         {
             return Some((path, None));
         }
@@ -3229,6 +3350,9 @@ impl Lookout {
         // reads as it did before there were any.
         if !told_subs.is_empty() {
             body["told_subs"] = json!(at_ms(told_subs));
+        }
+        if !self.runs_told.is_empty() {
+            body["runs_told"] = json!(self.runs_told);
         }
         if unkept.count > 0 {
             body["unkept"] = unkept.to_json();
@@ -3280,6 +3404,10 @@ impl Lookout {
         };
         self.told_sources.extend(read("told"));
         self.updates.told_subs.extend(read("told_subs"));
+        self.runs_told.extend(
+            (kept["runs_told"].as_object().into_iter().flatten())
+                .filter_map(|(sub, told)| Some((sub.clone(), told.as_u64()?))),
+        );
         let heard = |key: &str| -> Vec<sources::Heard> {
             (kept[key].as_array().into_iter().flatten())
                 .filter_map(sources::Event::from_json)
@@ -3748,6 +3876,8 @@ mod tests {
             digest: None,
             steer: None,
             owner: None,
+            until: None,
+            runs: None,
         }
     }
 
@@ -5660,6 +5790,102 @@ mod tests {
         held::written();
         assert!(other.heard.is_empty());
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_subscription_that_lasts_so_many_notes_ends_after_them_across_a_restart() {
+        let dir = std::env::temp_dir().join(format!("sonny-runs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("calc.lead.json");
+        let made = || {
+            let mut lookout = lookout();
+            let mut twice = hears("twice");
+            twice.runs = Some(2);
+            lookout.subs.push(twice);
+            lookout.subs.push(hears("always"));
+            (lookout.updates).seat(&json!({"name": "calc.lead", "bot_id": 1, "status": "idle"}));
+            lookout.restore(path.clone());
+            lookout.counting();
+            lookout
+        };
+        let mut lookout = made();
+        // One that lasts is never counted; one note told is one spent.
+        lookout.spend(&["always".into(), "twice".into()]);
+        assert_eq!(lookout.runs_told, HashMap::from([("twice".to_owned(), 1)]));
+        assert!(lookout.ended.is_empty());
+        lookout.flush();
+        held::written();
+        // Watched again, it has one note to go, and ends after it.
+        let mut again = made();
+        assert_eq!(again.runs_told["twice"], 1);
+        again.spend(&["twice".into()]);
+        assert_eq!(again.ended, ["twice"]);
+        assert!(again.runs_told.is_empty());
+        // Removed and added again, it counts afresh.
+        again.runs_told.insert("twice".into(), 1);
+        again.subs.retain(|sub| sub.name != "twice");
+        again.counting();
+        assert!(again.runs_told.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deleted_bot_ends_its_subscriptions_and_those_that_watched_only_it() {
+        let dir = std::env::temp_dir().join(format!("sonny-ended-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        let add = |subscriber: &str, owner: i64, sub: Value| {
+            subs::change(
+                &store,
+                subscriber,
+                Some(owner),
+                Some(&sub),
+                None,
+                &["ci".into()],
+            )
+            .unwrap();
+        };
+        add(
+            "shop.fix",
+            2,
+            json!({"name": "mine", "bots": ["shop.lead"]}),
+        );
+        add(
+            "shop.lead",
+            1,
+            json!({"name": "fix", "tasks_of": ["shop.fix"]}),
+        );
+        add(
+            "shop.lead",
+            1,
+            json!({"name": "both", "bots": ["shop.fix", "shop.docs"]}),
+        );
+        add("shop.lead", 1, json!({"name": "glob", "bots": ["shop.*"]}));
+        add(
+            "shop.lead",
+            1,
+            json!({"name": "ci", "bots": ["shop.fix"], "sources": ["ci"]}),
+        );
+        let lead = json!({"name": "shop.lead", "bot_id": 1});
+        let docs = json!({"name": "shop.docs", "bot_id": 3});
+        let mut service = service(store.clone(), &[lead, docs]);
+        service.subscribers = subs::all(&store).into_iter().collect();
+        service.ended_with("shop.fix", Some(2));
+        assert!(subs::read(&store, "shop.fix").is_empty());
+        let names = |store: &Path| -> Vec<String> {
+            subs::read(store, "shop.lead")
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        };
+        // One bot of two still there, a glob, or a source keeps it.
+        assert_eq!(names(&store), ["both", "glob", "ci"]);
+        service.records.remove("shop.docs");
+        service.subscribers = subs::all(&store).into_iter().collect();
+        service.ended_with("shop.docs", Some(3));
+        assert_eq!(names(&store), ["glob", "ci"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

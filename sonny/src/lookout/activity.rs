@@ -52,6 +52,8 @@ pub struct Rule {
     pub filter: Option<Arc<Value>>,
     pub urgent: Option<Arc<Value>>,
     pub digest: Option<Duration>,
+    /// It lasts so many notes (`runs`), so what it heard is counted.
+    pub counts: bool,
 }
 
 impl Rule {
@@ -61,6 +63,7 @@ impl Rule {
             filter: sub.filter.clone().map(Arc::new),
             urgent: sub.steer.clone().map(Arc::new),
             digest: sub.digest_span(),
+            counts: sub.runs.is_some(),
         }
     }
 }
@@ -79,6 +82,9 @@ pub struct Hold {
     /// is when it goes, and a note that tells it, however soon, starts
     /// each one's time again.
     pub windows: Vec<(String, Duration)>,
+    /// Subscriptions that last so many notes and heard it: a note that
+    /// tells it counts one for each.
+    pub counted: Vec<String>,
 }
 
 impl Hold {
@@ -87,7 +93,7 @@ impl Hold {
     pub fn now() -> Hold {
         Hold {
             now: true,
-            windows: Vec::new(),
+            ..Hold::default()
         }
     }
 
@@ -99,6 +105,11 @@ impl Hold {
         for window in other.windows {
             if !self.windows.contains(&window) {
                 self.windows.push(window);
+            }
+        }
+        for sub in other.counted {
+            if !self.counted.contains(&sub) {
+                self.counted.push(sub);
             }
         }
         self
@@ -124,7 +135,7 @@ pub fn hear(rules: &[Rule], event: &Value, skips: bool) -> Option<Heard> {
     hearing.peek()?;
     let mut hold = Hold {
         now: skips,
-        windows: Vec::new(),
+        ..Hold::default()
     };
     let mut urgent = None;
     for rule in hearing {
@@ -136,6 +147,9 @@ pub fn hear(rules: &[Rule], event: &Value, skips: bool) -> Option<Heard> {
         match rule.digest {
             Some(digest) => hold.windows.push((rule.sub.clone(), digest)),
             None => hold.now = true,
+        }
+        if rule.counts {
+            hold.counted.push(rule.sub.clone());
         }
     }
     // What is urgent goes as it comes by its own mark, while it is still
@@ -154,6 +168,7 @@ mod tests {
             filter: filter.map(Arc::new),
             urgent: urgent.map(Arc::new),
             digest: (digest > 0).then(|| Duration::from_secs(digest)),
+            counts: false,
         }
     }
 
@@ -196,13 +211,15 @@ mod tests {
                 windows: vec![
                     ("hourly".into(), Duration::from_secs(3600)),
                     ("tenth".into(), Duration::from_secs(600))
-                ]
+                ],
+                ..Hold::default()
             }
         );
         // What goes now still counts as told for the digests that heard it.
         let hourly_told = Hold {
             now: true,
             windows: vec![("hourly".into(), Duration::from_secs(3600))],
+            ..Hold::default()
         };
         let plain = rule("plain", None, None, 0);
         assert_eq!(
@@ -226,7 +243,8 @@ mod tests {
             Some(Heard {
                 hold: Hold {
                     now: false,
-                    windows: vec![("migration".into(), Duration::from_secs(3600))]
+                    windows: vec![("migration".into(), Duration::from_secs(3600))],
+                    ..Hold::default()
                 },
                 urgent: Some("migration".into())
             })
@@ -241,19 +259,35 @@ mod tests {
         let a = Hold {
             now: false,
             windows: vec![w("a", 50)],
+            ..Hold::default()
         };
         assert_eq!(Hold::default().merge(a.clone()), a);
         assert_eq!(
             a.clone().merge(Hold::now()),
             Hold {
                 now: true,
-                windows: vec![w("a", 50)]
+                windows: vec![w("a", 50)],
+                ..Hold::default()
             }
         );
         let b = Hold {
             now: false,
             windows: vec![w("b", 5), w("a", 50)],
+            counted: vec!["b".into()],
         };
-        assert_eq!(a.merge(b).windows, [w("a", 50), w("b", 5)]);
+        let merged = a.merge(b);
+        assert_eq!(merged.windows, [w("a", 50), w("b", 5)]);
+        assert_eq!(merged.counted, ["b"]);
+    }
+
+    #[test]
+    fn a_subscription_that_lasts_so_many_notes_is_counted_where_it_hears() {
+        let event = json!({"type": "turn.ended", "bot": "calc.fix", "status": "failed"});
+        let mut once = rule("once", Some(json!({"status": ["failed"]})), None, 0);
+        once.counts = true;
+        let mut other = rule("other", Some(json!({"status": ["completed"]})), None, 0);
+        other.counts = true;
+        let heard = hear(&[once, other, rule("all", None, None, 0)], &event, false).unwrap();
+        assert_eq!(heard.hold.counted, ["once"]);
     }
 }
