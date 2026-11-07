@@ -11637,8 +11637,8 @@ impl App {
         self.reread_watched().await;
     }
 
-    /// The tasks' questions set aside or reopened here, read again from
-    /// their tasks once a task's history moved on: answered or closed
+    /// The tasks' questions not yet answered by the person, read again
+    /// from their tasks once a task's history moved on: answered or closed
     /// there, so they read here too; still open or set aside, they stay.
     /// Each task is looked at once every few seconds, one request each,
     /// and a question read only when its task wrote since.
@@ -11672,14 +11672,19 @@ impl App {
                     continue;
                 };
                 let call = ask.id.split_once('/').map_or("", |(_, call)| call);
-                match asks::standing(&self.client, &bot, turn, call, None).await {
-                    Ok(Some((_, state))) if state.settled() => self.settle(&key, state),
-                    Ok(_) => {
-                        if let Some((_, seen)) = self.watched.get_mut(&key) {
-                            *seen = head;
-                        }
-                    }
-                    Err(_) => {}
+                let Ok(found) = asks::standing(&self.client, &bot, turn, call, None).await else {
+                    continue;
+                };
+                // What changed there reads here; still open or set aside
+                // there, it stays where it is here.
+                if let Some((_, state)) = found
+                    && state.settled()
+                    && self.settled.get(&key) != Some(&state)
+                {
+                    self.settle(&key, state);
+                }
+                if let Some((_, seen)) = self.watched.get_mut(&key) {
+                    *seen = head;
                 }
             }
         }
@@ -11909,11 +11914,11 @@ impl App {
             return;
         }
         self.reopened.remove(key);
-        // Set aside, a task's question can still be answered or closed in
-        // its task: watched until it is.
-        match (&state, self.cards.get(key)) {
-            (asks::State::Aside, Some((_, ask, _))) if ask.task.is_some() => {
-                self.watched.insert(key.to_owned(), (ask.clone(), None));
+        // Until the person's own answer makes it final, a task's question
+        // can still be answered, or closed, in its task: watched till then.
+        match (state.takes_a_pick(), self.cards.get(key)) {
+            (true, Some((_, ask, _))) if ask.task.is_some() => {
+                (self.watched.entry(key.to_owned())).or_insert_with(|| (ask.clone(), None));
             }
             _ => {
                 self.watched.remove(key);
@@ -20276,12 +20281,20 @@ mod tests {
         app.settle(&key, asks::State::Aside);
         assert!(app.watched.contains_key(&key));
         app.reread_watched().await;
-        assert!(!app.watched.contains_key(&key));
         assert!(
             drawn(&mut app).contains(&"┃ Withdrawn · signed in already".to_owned()),
             "{:?}",
             drawn(&mut app)
         );
+        // Withdrawn, a pick still answers it: watched still, its task's
+        // newest node noted, and not read again until the task writes on.
+        assert_eq!(app.watched.get(&key).map(|(_, seen)| *seen), Some(Some(2)));
+        app.watched_at = None;
+        app.reread_watched().await;
+        assert_eq!(app.watched.get(&key).map(|(_, seen)| *seen), Some(Some(2)));
+        // The person's answer makes it final, and the watch ends.
+        app.settle(&key, asks::State::Answered("done".into()));
+        assert!(!app.watched.contains_key(&key));
     }
 
     /// Without a multiplexer, a running task that asks and works on is read
