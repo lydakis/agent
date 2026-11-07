@@ -1261,7 +1261,7 @@ impl Service {
             // The lookouts whose news may have changed: those an event
             // reached, or all of them.
             let mut touched: Option<Vec<String>> = None;
-            let mut overdue: Vec<(String, Vec<String>)> = Vec::new();
+            let mut overdue: Vec<(String, Vec<subs::Sub>)> = Vec::new();
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else {
@@ -1493,8 +1493,8 @@ impl Service {
                         ended = std::mem::take(&mut lookout.ended);
                     }
                     if !ended.is_empty() {
-                        for name in &ended {
-                            self.end_sub(String::as_str(&lead), name, "its runs were told");
+                        for sub in &ended {
+                            self.end_sub(String::as_str(&lead), sub, "its runs were told");
                         }
                         self.reread(&client).await;
                     }
@@ -1551,8 +1551,8 @@ impl Service {
             // any note tells what they heard.
             if !overdue.is_empty() {
                 for (lead, over) in std::mem::take(&mut overdue) {
-                    for name in &over {
-                        self.end_sub(&lead, name, "its until came");
+                    for sub in &over {
+                        self.end_sub(&lead, sub, "its until came");
                     }
                 }
                 self.reread(&client).await;
@@ -1852,14 +1852,10 @@ impl Service {
         // A subscription whose `until` came ends, as an automation does.
         let now_s = (epoch_ms() / 1000) as i64;
         for (subscriber, subs) in read.iter_mut() {
-            let over: Vec<String> = (subs.iter())
-                .filter(|sub| sub.over(now_s))
-                .map(|sub| sub.name.clone())
-                .collect();
-            for name in &over {
-                self.end_sub(subscriber, name, "its until came");
+            for sub in subs.iter().filter(|sub| sub.over(now_s)) {
+                self.end_sub(subscriber, sub, "its until came");
             }
-            subs.retain(|sub| !over.contains(&sub.name));
+            subs.retain(|sub| !sub.over(now_s));
         }
         read.retain(|_, subs| !subs.is_empty());
         // Every revision read is kept, one that changes nothing and a
@@ -1891,10 +1887,10 @@ impl Service {
 
     /// End `subscriber`'s subscription `name`, as it says `why`, in its
     /// file and the log; the next read of the files stops it.
-    fn end_sub(&self, subscriber: &str, name: &str, why: &str) {
-        let removed = subs::remove(&self.store, subscriber, name);
+    fn end_sub(&self, subscriber: &str, sub: &subs::Sub, why: &str) {
+        let removed = subs::end(&self.store, subscriber, sub);
         self.write(
-            &json!({"at_ms": epoch_ms(), "lead": subscriber, "ended": name, "why": why,
+            &json!({"at_ms": epoch_ms(), "lead": subscriber, "ended": sub.name, "why": why,
             "removed": removed.as_ref().is_ok_and(|r| *r), "error": removed.err()}),
         );
     }
@@ -1937,7 +1933,7 @@ impl Service {
                         .iter()
                         .all(|name| !name.contains('*') && !self.records.contains_key(*name));
                 if watched_gone && subscriber != gone {
-                    self.end_sub(subscriber, &sub.name, "every bot it watched was deleted");
+                    self.end_sub(subscriber, sub, "every bot it watched was deleted");
                 }
             }
         }
@@ -2488,11 +2484,12 @@ struct Lookout {
     /// on each path tells, by `Sub::counter` as they were when it went: one
     /// replaced meanwhile is not charged for it. Tasks' path, then sources'.
     charged: [Vec<String>; 2],
-    /// Subscriptions whose notes ran out, for the service to end.
-    ended: Vec<String>,
+    /// Subscriptions whose notes ran out, for the service to end, as they
+    /// were read: one put in its place since stays.
+    ended: Vec<subs::Sub>,
     /// Subscriptions whose `until` came before the files were read again,
     /// for the service to end.
-    over: Vec<String>,
+    over: Vec<subs::Sub>,
     /// Where what its sources said waits, untold, so a restart loses none
     /// of what a digest or a busy subscriber held.
     held: Option<PathBuf>,
@@ -3218,8 +3215,8 @@ impl Lookout {
     fn overdue(&mut self) -> bool {
         let now = (epoch_ms() / 1000) as i64;
         for sub in self.subs.iter().filter(|sub| sub.over(now)) {
-            if !self.over.contains(&sub.name) {
-                self.over.push(sub.name.clone());
+            if !self.over.contains(sub) {
+                self.over.push(sub.clone());
             }
         }
         !self.over.is_empty()
@@ -3275,7 +3272,7 @@ impl Lookout {
             let Some(sub) = self.subs.iter().find(|sub| sub.counter() == counter) else {
                 continue;
             };
-            let (Some(runs), name) = (sub.runs, sub.name.clone()) else {
+            let (Some(runs), sub) = (sub.runs, sub.clone()) else {
                 continue;
             };
             let told = self.runs_told.entry(counter.clone()).or_default();
@@ -3286,8 +3283,8 @@ impl Lookout {
             told.push(request.clone());
             if told.len() as u64 >= runs {
                 self.runs_told.remove(&counter);
-                if !self.ended.contains(&name) {
-                    self.ended.push(name);
+                if !self.ended.contains(&sub) {
+                    self.ended.push(sub);
                 }
             }
         }
@@ -5964,7 +5961,7 @@ mod tests {
         assert!(again.ended.is_empty());
         again.charged[0] = again.charges(names(&["twice"]).iter());
         again.spend(0, &key("b"));
-        assert_eq!(again.ended, ["twice"]);
+        assert_eq!(again.ended[0].name, "twice");
         assert!(again.runs_told.is_empty());
         // Its last note under way on one path holds the other back, so a
         // one-shot is told once; one with notes to spare holds nothing.
@@ -5987,7 +5984,7 @@ mod tests {
         late.until = Some("2020-01-01 00:00".into());
         again.subs.push(late);
         assert!(again.overdue());
-        assert_eq!(again.over, ["late"]);
+        assert_eq!(again.over[0].name, "late");
         // Replaced while its note is on the way, even in one call, the new
         // one is not charged for it and counts afresh.
         again.charged[1] = again.charges(names(&["twice"]).iter());

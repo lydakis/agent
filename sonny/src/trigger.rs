@@ -4029,6 +4029,10 @@ async fn next_run(
             .filter(|run| run.handle.as_deref() == Some(handle.as_str()))
             .cloned();
         keep_runs(places, trigger, kept).map_err(unkept)?;
+        // The run before may end past its `--until`: none comes after it.
+        if trigger.until.is_some_and(|until| now() >= until) {
+            return Err(json!({"outcome": "ended", "detail": "its until came"}));
+        }
     }
     // What runs replaced goes, kept on the row until its delete went.
     let mut retiring = Vec::new();
@@ -6451,6 +6455,51 @@ pub(crate) mod tests {
             "another store"
         );
         assert_eq!(run_of(&w.places, Some("00ab"), "p.lead", 77), None);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_run_waited_on_past_the_until_starts_none_after_it() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            seen.lock().unwrap().push(request["op"].clone());
+            match request["op"].as_str() {
+                Some("wait") => {
+                    // The run before ends only after the until.
+                    std::thread::sleep(std::time::Duration::from_millis(1100));
+                    let handle = request["handles"][0].as_str().unwrap().to_owned();
+                    json!({"results": {handle: {"status": "completed"}}})
+                }
+                Some("create") => json!({"bot_id": 62}),
+                Some("submit") => json!({"turn": 1}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let w = World::new("fresh-until");
+        std::fs::create_dir_all(&w.root).unwrap();
+        let s = Trigger {
+            name: "p.r".into(),
+            target: Target::Start {
+                name: "p.r".into(),
+                model: "openai/gpt".into(),
+                effort: None,
+                by: None,
+                fresh: true,
+            },
+            dir: Some(w.root.clone()),
+            until: Some(now() + 1),
+            ..trigger()
+        };
+        w.install(&s).unwrap();
+        let mut kept = Kept::default();
+        let mut one = kept.runs.take("p.r");
+        one.id = Some(61);
+        one.handle = Some("turn:p.r-1/1".into());
+        kept.runs.running = Some(one);
+        let outcome = deliver(&client, &w.places, &s, &mut kept, "every 30m", None).await;
+        assert_eq!(outcome["outcome"], "ended", "{outcome}");
+        assert_eq!(*asked.lock().unwrap(), [json!("wait")]);
     }
 
     #[tokio::test]

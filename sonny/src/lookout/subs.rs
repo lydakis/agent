@@ -757,6 +757,20 @@ pub fn remove(store: &Path, subscriber: &str, name: &str) -> Result<bool, String
     drop_named(store, subscriber, &mut subs, name)
 }
 
+/// End `sub` of `subscriber`'s, as the lookout read it: one put in its
+/// place under the name since, by another call, stays. Whether it went.
+pub fn end(store: &Path, subscriber: &str, sub: &Sub) -> Result<bool, String> {
+    let _held = held(store)?;
+    let mut subs = read_whole(store, subscriber)?;
+    let before = subs.len();
+    subs.retain(|s| s != sub);
+    if subs.len() == before {
+        return Ok(false);
+    }
+    write(store, subscriber, &subs)?;
+    Ok(true)
+}
+
 fn drop_named(
     store: &Path,
     subscriber: &str,
@@ -1169,6 +1183,13 @@ mod tests {
         )
         .unwrap();
         assert_ne!(read(&store, "shop.lead")[0].counter(), sub.counter());
+        // The one the lookout read ended, its replacement stays.
+        assert_eq!(end(&store, "shop.lead", sub), Ok(false));
+        assert_eq!(read(&store, "shop.lead").len(), 1);
+        let now_there = read(&store, "shop.lead")[0].clone();
+        assert_eq!(end(&store, "shop.lead", &now_there), Ok(true));
+        assert!(read(&store, "shop.lead").is_empty());
+        change(&store, "shop.lead", Some(1), Some(&once), None, &[]).unwrap();
         // A time gone, or no notes at all, is refused.
         let past = crate::trigger::until_text(now - 120);
         let refused = change(
