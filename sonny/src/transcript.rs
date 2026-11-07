@@ -1554,6 +1554,123 @@ pub fn gathered(kinds: &[&str], names: &[String], open: bool, width: usize) -> L
     Line::from(format!("{head} {}", if open { "▾" } else { "▸" })).dim()
 }
 
+/// Calls that send another agent words: what the row gathering them says
+/// as `sent to`.
+const SENDS: [&str; 4] = [
+    "Started a turn for",
+    "Steered",
+    "Queued for",
+    "Left a note for",
+];
+
+/// What `did` (calls as Sonny says them: `Steered`, `calc.fix`) did, in a
+/// few lower-case words each, in the order first done: `sent 4 to
+/// calc.fix`, `followed calc.neg`, `saved 2 memories`.
+pub fn did(did: &[(String, String)]) -> Vec<String> {
+    let mut said: Vec<(String, Vec<String>)> = Vec::new();
+    for (verb, what) in did {
+        let verb = match verb.as_str() {
+            verb if SENDS.contains(&verb) => "sent to",
+            verb => verb,
+        };
+        match said.iter_mut().find(|(v, _)| v == verb) {
+            Some((_, whats)) => whats.push(what.clone()),
+            None => said.push((verb.to_owned(), vec![what.clone()])),
+        }
+    }
+    said.into_iter()
+        .map(|(verb, whats)| {
+            let n = whats.len();
+            let memories = |done: &str| match n {
+                1 => format!("{done} a memory"),
+                n => format!("{done} {n} memories"),
+            };
+            match verb.as_str() {
+                "Saved to memory" => memories("saved"),
+                "Updated in memory" => memories("updated"),
+                "Removed from memory" => memories("removed"),
+                verb => {
+                    let names = crate::calls::once(whats.into_iter());
+                    let verb = lower_first(verb);
+                    match (verb.strip_suffix(" to"), names.len() < n) {
+                        (Some(sent), true) => format!("{sent} {n} to {}", names.join(", ")),
+                        (None, true) => format!("{verb} {} ×{n}", names.join(", ")),
+                        _ => format!("{verb} {}", names.join(", ")),
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+fn lower_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// How far a plan has got, as the row gathering it says: `plan 1/3`,
+/// `plan done`, or `cleared the plan` for none.
+pub fn plan_progress(steps: &[String]) -> String {
+    let done = steps.iter().filter(|step| step.starts_with("[x]")).count();
+    match steps.len() {
+        0 => "cleared the plan".to_owned(),
+        all if done == all => "plan done".to_owned(),
+        all => format!("plan {done}/{all}"),
+    }
+}
+
+/// The row for what went on between two things said: how many of each
+/// `kinds` came in and whom `names` names, as [`gathered`] says them,
+/// then what the agent `did` and where its `plan` stands, `▸` to open;
+/// open, `▾`. Names give way first, then the words for what was done.
+pub fn gap(
+    kinds: &[&str],
+    names: &[String],
+    done: &[(String, String)],
+    plan: Option<&str>,
+    open: bool,
+    width: usize,
+) -> Line<'static> {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for kind in kinds {
+        match counts.iter_mut().find(|(k, _)| k == kind) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((kind, 1)),
+        }
+    }
+    let came: Vec<String> = (counts.into_iter())
+        .map(|(kind, n)| match n {
+            1 => format!("1 {kind}"),
+            n => format!("{n} {kind}s"),
+        })
+        .collect();
+    let mut acts = did(done);
+    acts.extend(plan.map(str::to_owned));
+    let acts = acts.join(", ");
+    let room = width.saturating_sub(2);
+    let text = match (came.is_empty(), acts.is_empty()) {
+        (true, _) => cut(&format!("↳ {acts}"), room),
+        (false, empty) => {
+            let head = format!("↳ {}", came.join(", "));
+            let tail = match empty {
+                true => String::new(),
+                false => format!(" · {acts}"),
+            };
+            let names = crate::calls::once(names.iter().cloned()).join(", ");
+            let left = room.saturating_sub(head.width() + tail.width() + 3);
+            let named = match !names.is_empty() && left >= 8.min(names.width()) {
+                true => format!(" · {}", cut(&names, left).replace(",…", "…")),
+                false => String::new(),
+            };
+            cut(&format!("{head}{named}{tail}"), room)
+        }
+    };
+    Line::from(format!("{text} {}", if open { "▾" } else { "▸" })).dim()
+}
+
 /// `lines` moved `columns` to the right, a wrapped row still known for
 /// one, so a copy joins it as before.
 pub fn indented(lines: Vec<Line<'static>>, columns: usize) -> Vec<Line<'static>> {
@@ -2931,6 +3048,72 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_row_between_things_said_says_what_came_and_what_was_done() {
+        let call = |verb: &str, what: &str| (verb.to_owned(), what.to_owned());
+        // Sends of any kind are said once, counted when one agent had more.
+        let done = [
+            call("Steered", "calc.add"),
+            call("Queued for", "calc.add"),
+            call("Left a note for", "calc.neg"),
+            call("Followed", "leads"),
+            call("Saved to memory", "flow"),
+            call("Saved to memory", "taste"),
+            call("Scheduled", "lead.next"),
+            call("Scheduled", "lead.next"),
+        ];
+        assert_eq!(
+            did(&done),
+            [
+                "sent 3 to calc.add, calc.neg",
+                "followed leads",
+                "saved 2 memories",
+                "scheduled lead.next ×2",
+            ]
+        );
+        assert_eq!(
+            did(&[call("Started a turn for", "a"), call("Steered", "b")]),
+            ["sent to a, b"]
+        );
+        let plan = |steps: &[&str]| {
+            plan_progress(&steps.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(plan(&["[x] a", "[>] b", "[ ] c"]), "plan 1/3");
+        assert_eq!(plan(&["[x] a", "[x] b"]), "plan done");
+        assert_eq!(plan(&[]), "cleared the plan");
+        // What came in, whom, then what was done; names give way first.
+        let names: Vec<String> = ["sbx-test.lead", "Titanium.lead", "blue.lead", "errand.lead"]
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        let kinds = ["task update", "task update", "message"];
+        let done = [call("Removed the automation", "lead.next")];
+        let row = gap(&kinds, &names, &done, Some("plan done"), false, 140).to_string();
+        assert_eq!(
+            row,
+            "↳ 2 task updates, 1 message · sbx-test.lead, Titanium.lead, blue.lead, errand.lead · \
+             removed the automation lead.next, plan done ▸"
+        );
+        let row = gap(&kinds, &names, &done, Some("plan done"), true, 100).to_string();
+        assert!(row.width() <= 100, "{row}");
+        assert_eq!(
+            row,
+            "↳ 2 task updates, 1 message · sbx-test.lead, Titani… · removed the automation lead.next, plan done ▾"
+        );
+        // Too narrow for names: none, and what was done is cut last.
+        let row = gap(&kinds, &names, &done, Some("plan done"), false, 60).to_string();
+        assert!(row.width() <= 60, "{row}");
+        assert!(
+            row.starts_with("↳ 2 task updates, 1 message · removed the"),
+            "{row}"
+        );
+        // Nothing came in: only what was done.
+        assert_eq!(
+            gap(&[], &[], &done, None, false, 100).to_string(),
+            "↳ removed the automation lead.next ▸"
+        );
+    }
 
     #[test]
     fn the_lookout_s_notes_are_named_for_what_they_bring() {
