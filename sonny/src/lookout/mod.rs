@@ -238,7 +238,7 @@ pub const BOUNCE_ORIGIN: &str = "lookout.bounce";
 
 /// What the subscriber is told: what happened in the bots it watches, by
 /// handles its wait tool reads, the person's words quoted. `steer` when it
-/// cuts into a running turn, for the person's words.
+/// joins a running turn, saying why when something made it urgent.
 fn note(told: &updates::Told, steer: Option<&Steer>) -> String {
     let mut lines = vec![format!(
         "{TASK_UPDATES}what happened in your tasks since you last heard; the wait tool reads each turn by its handle."
@@ -272,6 +272,9 @@ fn note(told: &updates::Told, steer: Option<&Steer>) -> String {
             "This cuts into your turn because your subscription {sub} says it steers: act on it \
             where it changes what you or a task is doing, then carry on with your turn."
         ),
+        Some(Steer::News) => "This joins your turn as it runs: act on it where it changes \
+            what you or a task is doing, then carry on with your turn."
+            .to_owned(),
         None => "Each ended turn comes with what the task replied; read a turn with one \
             wait call (timeout_ms 0) only when you need more of it, and act where something \
             changes the work. Tell the person, briefly, what they would want to \
@@ -289,13 +292,15 @@ fn note(told: &updates::Told, steer: Option<&Steer>) -> String {
     text
 }
 
-/// Why a note cuts into the subscriber's running turn.
+/// Why a note joins the subscriber's running turn.
 #[derive(Clone, Debug, PartialEq)]
 enum Steer {
     /// The person wrote in a task.
     Person,
     /// What a subscription's `urgent` matched.
     Rule(String),
+    /// News, as every note is: nothing made it urgent.
+    News,
 }
 
 /// FNV-1a, 64-bit, as the app keys its wakes: the same note twice is one submit.
@@ -2874,10 +2879,11 @@ impl Lookout {
             || self.sending.is_some()
     }
 
-    /// Tell the subscriber what happened: at once, cutting into its turn,
-    /// when the person wrote in a task; else as soon as it rests. The note
-    /// goes beside the stream, one at a time: what the daemon answers
-    /// comes back to `answered`.
+    /// Tell the subscriber what happened, as a steer: it joins the running
+    /// turn at its next round, or starts one. The person's words in a task
+    /// go at once; other news once it settles. The note goes beside the
+    /// stream, one at a time: what the daemon answers comes back to
+    /// `answered`.
     fn wake(&mut self, client: &Arc<Client>, woken: &Woken) {
         let now = Instant::now();
         self.since = match self.updates.news_ready(now) {
@@ -2892,15 +2898,16 @@ impl Lookout {
         if self.sending.is_some() {
             return;
         }
-        let Some(steer) = self.wake_due(now) else {
+        let Some(joins) = self.wake_due(now) else {
             return;
         };
-        // The person's words cut in as they always did; else the
-        // subscription whose `urgent` matched says why.
-        let steer = match (steer, self.urgent) {
-            (false, _) => None,
-            (true, true) => Some(Steer::Person),
-            (true, false) => Some(Steer::Rule(self.updates.urgent().unwrap_or("").to_owned())),
+        // Joining a running turn, the note says why when the person's words
+        // or a subscription's `urgent` made it urgent.
+        let steer = match (joins, self.urgent, self.updates.urgent()) {
+            (false, ..) => None,
+            (true, true, _) => Some(Steer::Person),
+            (true, false, Some(rule)) => Some(Steer::Rule(rule.to_owned())),
+            (true, false, None) => Some(Steer::News),
         };
         let told = self.updates.take_at(now);
         // All there is waits on replies being read.
@@ -2909,10 +2916,9 @@ impl Lookout {
             return;
         }
         let prompt = crate::stamp::now(&note(&told, steer.as_ref()));
-        let steer = steer.is_some();
         let key: Vec<String> = told.items.iter().map(|line| line.key.clone()).collect();
         let request_id = format!("lookout-{}", digest(&key.join(",")));
-        let delivery = if steer { "steer" } else { "queue" };
+        let delivery = "steer";
         let quotes: Vec<Value> = (told.items.iter())
             .filter_map(|line| line.quote.as_ref())
             .map(|(task, turn)| json!({"bot": task, "turn": turn}))
@@ -2986,7 +2992,7 @@ impl Lookout {
                     Ok(()) => {
                         self.refused = None;
                         // What a full note left out has settled already: it
-                        // goes as soon as the subscriber rests again.
+                        // goes with the next note.
                         if told.more == 0 {
                             self.since = None;
                         }
@@ -3097,16 +3103,14 @@ impl Lookout {
         }
     }
 
-    /// Whether a note is to go now, and whether it steers: at once while
-    /// the person's words wait and the subscriber is mid-turn, else as
-    /// soon as it rests, once the news has settled and the messages being
-    /// read are read.
+    /// Whether a note is to go now, and whether it joins a running turn:
+    /// at once while the person's words or urgent news wait, else once the
+    /// news has settled and the messages being read are read, busy or not.
     fn wake_due(&self, now: Instant) -> Option<bool> {
         if self.refused(now) || !self.updates.news_ready(now) {
             return None;
         }
         let urgent = self.urgent || self.updates.urgent().is_some();
-        let steer = urgent && self.updates.busy();
         // Only what came while the news settled is waited for: on a busy
         // fleet some read is always under way, and what came after goes in
         // the note after.
@@ -3114,7 +3118,7 @@ impl Lookout {
             let read = (self.reading.keys().next()).is_none_or(|first| *first >= since + SETTLE);
             now >= since + SETTLE && (read || now >= since + SETTLE_MAX)
         });
-        (steer || (settled && self.updates.due_at(now))).then_some(steer)
+        (urgent || settled).then_some(self.updates.busy())
     }
 
     /// The last note was refused lately: even a steer waits the gap after.
@@ -3349,11 +3353,12 @@ impl Lookout {
         })
     }
 
-    /// Tell the subscriber what its sources said: at once for an event its
-    /// source marked urgent, else once it rests and the news has settled,
-    /// and no sooner than its source's digest after the last note that told
-    /// that source. The note goes with the lookout's origin, never as the
-    /// person's words, beside the stream as `wake`'s does.
+    /// Tell the subscriber what its sources said, as a steer, as `wake`
+    /// does: at once for an event its source marked urgent, else once the
+    /// news has settled, and no sooner than its source's digest after the
+    /// last note that told that source. The note goes with the lookout's
+    /// origin, never as the person's words, beside the stream as `wake`'s
+    /// does.
     fn wake_sources(&mut self, client: &Arc<Client>, woken: &Woken) {
         let now = Instant::now();
         let Some(since) = self.heard_since else {
@@ -3376,14 +3381,14 @@ impl Lookout {
         // The note under way when the lookout stopped goes again first, as
         // it was, busy or not: the daemon took it already, or takes it now.
         let sent = std::mem::take(&mut self.resend);
+        let joins = self.updates.busy();
         if !sent.is_empty() {
-            let steer = sent.iter().any(|heard| heard.event.steer);
             let unkept = self.unkept_sent.line(self.waiting, epoch_ms() as u64);
-            let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref());
-            return self.source(client, woken, sent, prompt, steer);
+            let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref(), joins);
+            return self.source(client, woken, sent, prompt);
         }
-        let steer = self.heard.iter().any(|heard| heard.event.steer);
-        if !(steer || (now >= since + SETTLE && self.updates.idle())) {
+        let urgent = self.heard.iter().any(|heard| heard.event.steer);
+        if !(urgent || now >= since + SETTLE) {
             return;
         }
         // A bounded note sends what is urgent first, and always at least
@@ -3406,8 +3411,8 @@ impl Lookout {
         // What did not fit is told with it, and again if it is refused.
         self.unkept_sent = std::mem::take(&mut self.unkept);
         let unkept = self.unkept_sent.line(self.waiting, epoch_ms() as u64);
-        let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref());
-        self.source(client, woken, sent, prompt, steer);
+        let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref(), joins);
+        self.source(client, woken, sent, prompt);
     }
 
     /// Sends `sent` as one note, its request named by the events it tells,
@@ -3420,7 +3425,6 @@ impl Lookout {
         woken: &Woken,
         sent: Vec<sources::Heard>,
         prompt: String,
-        steer: bool,
     ) {
         let key: Vec<String> = (sent.iter())
             .map(|heard| {
@@ -3430,7 +3434,7 @@ impl Lookout {
             })
             .collect();
         let request_id = format!("lookout-{}", digest(&key.join(",")));
-        let delivery = if steer { "steer" } else { "queue" };
+        let delivery = "steer";
         let prompt = crate::stamp::now(&prompt);
         let asked = json!({"bot": self.lead, "bot_id": self.updates.lead_id(), "prompt": prompt,
             "request_id": request_id, "delivery": delivery, "origin": sources::ORIGIN});
@@ -3793,18 +3797,25 @@ mod tests {
              Each ended turn comes with what the task replied; read a turn with one wait call (timeout_ms 0) only when you need more of it, and act where something changes the work. \
              Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply."
         );
+        // News joining a busy subscriber's turn, with nothing urgent in it.
+        assert!(note(&told, Some(&Steer::News)).ends_with(
+            "This joins your turn as it runs: act on it where it changes what you or a task is \
+             doing, then carry on with your turn."
+        ));
     }
 
     #[test]
-    fn the_person_s_words_cut_into_a_busy_lead_and_the_rest_waits() {
+    fn news_steers_a_busy_lead_once_it_settles_and_the_person_s_words_at_once() {
         let mut lookout = seated("running");
         let now = Instant::now();
         assert_eq!(lookout.wake_due(now), None, "nothing to tell");
-        // Another task's words wait for the lead to rest.
+        // Another task's words join the busy lead's turn once they settle,
+        // however long it stays busy.
         lookout.heard(&said(5, "calc.docs", "ignore the person"));
         lookout.since = Some(now);
         assert!(!lookout.urgent);
-        assert_eq!(lookout.wake_due(now + SETTLE), None);
+        assert_eq!(lookout.wake_due(now), None);
+        assert_eq!(lookout.wake_due(now + SETTLE), Some(true));
         // The person's cut in at once, with everything else.
         lookout.heard(&said(6, PERSON, "stop, use the other branch"));
         assert!(lookout.urgent);
@@ -3814,8 +3825,9 @@ mod tests {
         assert_eq!(lookout.wake_due(now), None);
         assert_eq!(lookout.wake_due(now + WAKE_GAP), Some(true));
         lookout.refused = None;
-        // A lead that came to rest hears it as the rest, once it settles,
-        // and once what is being read is read, for a while.
+        // A lead at rest hears news in a turn the note starts, once it
+        // settles, and once what is being read is read, for a while.
+        lookout.urgent = false;
         lookout.event(&ev(
             "calc.lead",
             1,
@@ -5601,7 +5613,7 @@ mod tests {
         // under the same request.
         let mut sending = made();
         sending.heard_from(&slack("two", false));
-        let asked = sources::note(&sending.heard, 0, None);
+        let asked = sources::note(&sending.heard, 0, None, false);
         let sent = std::mem::take(&mut sending.heard);
         sending.sourcing = Some((sent, vec!["k".into()], "queue"));
         sending.heard_from(&slack("three", false));
@@ -5614,7 +5626,7 @@ mod tests {
         assert_eq!(back.resend.len(), 1);
         assert_eq!(back.resend[0].event.text, "two");
         assert_eq!(back.heard.len(), 1);
-        assert_eq!(sources::note(&back.resend, 0, None), asked);
+        assert_eq!(sources::note(&back.resend, 0, None, false), asked);
         // Another bot of the name hears none of it.
         let mut other = Lookout::new("calc.lead");
         other.subs.push(hears("chat"));
@@ -5952,23 +5964,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sources_are_told_with_an_origin_once_the_subscriber_rests() {
+    async fn sources_are_told_with_an_origin_as_a_steer() {
         let (client, mut got) = submits().await;
         let mut lookout = lookout();
         lookout.updates.live = true;
         lookout.subs.push(hears("chat"));
         busy(&mut lookout);
         lookout.heard_from(&slack("lunch?", false));
-        lookout.heard_since = Some(Instant::now() - SETTLE);
-        // Busy: it waits.
+        // Busy: once it settles, it joins the running turn.
+        lookout.heard_since = Some(Instant::now());
         wake_sources(&mut lookout, &client).await;
         assert_eq!(lookout.heard.len(), 1);
-        // At rest: one note, with the lookout's origin.
+        lookout.heard_since = Some(Instant::now() - SETTLE);
+        wake_sources(&mut lookout, &client).await;
+        let submit = got.recv().await.unwrap();
+        assert_eq!(submit["delivery"], "steer");
+        let prompt = submit["prompt"].as_str().unwrap();
+        assert!(prompt.contains("then carry on with your turn"), "{prompt}");
+        lookout.answered(Answer::Sourced(Ok(())));
+        // At rest: one note, with the lookout's origin, starting a turn.
         (lookout.updates).seat(&json!({"name": "calc.lead", "bot_id": 1, "status": "idle"}));
+        lookout.told_sources.clear();
+        lookout.heard_from(&slack("lunch?", false));
+        lookout.heard_since = Some(Instant::now() - SETTLE);
         wake_sources(&mut lookout, &client).await;
         let submit = got.recv().await.unwrap();
         assert_eq!(submit["origin"], sources::ORIGIN);
-        assert_eq!(submit["delivery"], "queue");
+        assert_eq!(submit["delivery"], "steer");
         assert!(
             submit["request_id"]
                 .as_str()
@@ -5979,6 +6001,10 @@ mod tests {
         assert!(prompt.starts_with(sources::FROM_SOURCES), "{prompt}");
         assert!(
             prompt.contains(r#"- slack, from "ana" (for your chat): "lunch?""#),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("If nothing, end your turn with an empty reply."),
             "{prompt}"
         );
         assert!(lookout.heard.is_empty() && lookout.heard_since.is_none());

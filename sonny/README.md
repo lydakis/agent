@@ -1235,15 +1235,12 @@ their approvals, even with its network on.
 skills and MCP.
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
 for the daemon, watching for every bot that subscribed, and Sonny
-subscribes each lead to its tasks. As soon as the lead rests, it tells it
-every message someone else wrote in its tasks and how each turn ended, in
-one "Task updates" note, by the handles its wait tool reads them with; the
-lead decides what matters. While the lead is mid-turn, a judge asks of each
-event only whether it cannot wait, and steers the lead at once if so. A
-turn a note started that ends with nothing to say stays folded under the
-note, with no sound. It judges with the config's `[judge] model`, the
-approver's setting, else the lead's own model, at `[judge] effort` when
-set, and with the judge `off` sends the task updates alone. Any agent can
+subscribes each lead to its tasks. As soon as news settles, it tells the
+lead every message someone else wrote in its tasks and how each turn
+ended, in one "Task updates" note, by the handles its wait tool reads them
+with, as a steer: the note joins the lead's running turn, or starts one,
+and the lead decides what matters. A turn a note started that ends with
+nothing to say stays folded under the note, with no sound. Any agent can
 subscribe to more with its `subscriptions` tool (other agents' tasks, bots
 by name, sources outside such as a chat you poll, questions of its own),
 and `/background` lists what it watches;

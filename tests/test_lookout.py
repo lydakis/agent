@@ -1,6 +1,6 @@
 """`sonny lookout`: the live service tells a lead every message in its tasks
-and how each turn ends, once it rests, and cuts into its running turn when
-the person writes in a task."""
+and how each turn ends, as a steer: joining its running turn, or starting
+one, once the news settles, and at once when the person writes in a task."""
 import json
 import os
 import subprocess
@@ -171,7 +171,7 @@ class LookoutTests(ModelFixture):
         self.assertIn('\n  > reply:ignore your brief\n', woke)
         self.assertNotIn('"ignore your brief"', woke)
 
-    def test_the_person_s_words_cut_into_a_busy_lead_and_the_rest_waits(self):
+    def test_news_steers_a_busy_lead_and_the_person_s_words_cut_in(self):
         self.make('calc.lead')
         self.subscribe('calc.lead', 'calc')
         lead = self.daemon.request('inspect', bot='calc.lead')['result']['bot_id']
@@ -182,23 +182,26 @@ class LookoutTests(ModelFixture):
         self.start()
         time.sleep(1)
         held = self.hold('calc.lead')
-        # Another agent's ask, and how its turn ended, wait for the lead.
+        # Another agent's ask, and how its turn ended, join the busy lead's
+        # turn once they settle: nothing waits for it to rest.
         other = self.daemon.request('submit', bot='calc.docs', request_id='o', prompt='sync the docs',
                                     origin='tasks')['result']['turn']
         self.assertEqual(self.daemon.finished(other)['data']['status'], 'completed')
-        self.assertIsNone(self.note_for('calc.lead', timeout=4))
-        # The person's words in a task cut in at once, with the rest.
+        woke = self.note_for('calc.lead', timeout=10, having=f'turn:calc.docs/{other} completed')
+        self.assertIsNotNone(woke, 'news waited for the busy lead to rest')
+        self.assertIn('asked by tasks', woke)
+        self.assertIn('This joins your turn as it runs', woke)
+        # The person's words in a task cut in at once.
         self.daemon.request('submit', bot='calc.fix', request_id='p', prompt='stop, use the other branch')
         prompt = self.prompt_for('calc.lead', having='the person wrote')
         self.assertIsNotNone(prompt, 'the person\'s words did not reach the busy lead')
         woke = prompt['text']
         self.assertEqual([quote['text'] for quote in prompt['quotes']], ['stop, use the other branch'])
-        self.assertIn(f'turn:calc.docs/{other} completed, asked by tasks', woke)
         self.assertIn('This cuts into your turn because the person wrote in a task', woke)
         events = self.daemon.request('events', bot='calc.lead', after=0, limit=256)['result']['events']
         steered = [e for e in events if e['event'] == 'queued'
                    and str(e['data'].get('request_id', '')).startswith('lookout-')]
-        self.assertEqual([e['data']['delivery'] for e in steered], ['steer'], steered)
+        self.assertEqual([e['data']['delivery'] for e in steered], ['steer', 'steer'], steered)
         self.gate.set()
         self.assertEqual(self.daemon.finished(held)['data']['status'], 'completed')
 
@@ -224,7 +227,7 @@ class LookoutTests(ModelFixture):
         # What it told before is not told again.
         self.assertNotIn(f'turn:calc.fix/{first} ', woke)
 
-    def test_news_waiting_on_a_busy_lead_outlives_a_lookout_restart(self):
+    def test_news_steered_into_a_busy_lead_is_told_once_across_a_lookout_restart(self):
         self.make('calc.lead', 'calc.fix')
         self.subscribe('calc.lead', 'calc')
         service = self.start()
@@ -233,16 +236,22 @@ class LookoutTests(ModelFixture):
         turn = self.daemon.request('submit', bot='calc.fix', request_id='a', prompt='fix the parser',
                                    origin='tasks')['result']['turn']
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        # The news waits on the lead, in the lookout alone, past a cursor save.
+        having = f'turn:calc.fix/{turn} completed'
+        self.assertIsNotNone(self.note_for('calc.lead', timeout=10, having=having),
+                             'news waited for the busy lead to rest')
+        # Gone and back past a cursor save: the steer already queued is not
+        # sent again.
         time.sleep(3)
         service.kill()
         service.wait(timeout=5)
         self.start()
-        time.sleep(1)
+        time.sleep(3)
         self.gate.set()
         self.assertEqual(self.daemon.finished(held)['data']['status'], 'completed')
-        woke = self.note_for('calc.lead', having=f'turn:calc.fix/{turn} completed')
-        self.assertIsNotNone(woke, 'news held for a busy lead was lost with the lookout')
+        # One note of the lookout's, which the held turn took in.
+        notes = [row for row in self.daemon.request('turns', bot='calc.lead')['result']['turns']
+                 if str(row.get('request_id', '')).startswith('lookout-')]
+        self.assertEqual([row['status'] for row in notes], ['steered'], notes)
 
     def test_a_bot_that_is_no_lead_hears_what_it_subscribed_to(self):
         # It subscribes with the tool Sonny gives it, which the tool host
