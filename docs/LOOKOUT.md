@@ -215,12 +215,14 @@ its name. A line over 64 KiB is skipped, and an event's text is cut at
 run that fails, and a source started or stopped go to `STORE.lookout.log`.
 The lookout reads the settings again every 15 seconds: a source added or
 changed starts, one removed stops, and a lookout that stops stops its
-sources' commands. So does a source whose command's files changed since it
-started, as a service manager restarts a unit on its new binary: every
-word of the command that is a path to a file (`~` and `$HOME` read as the
-home folder), and its first word as `PATH` finds it. An edited script, or
-a program upgraded in place, runs on its new code within 15 seconds, a
+sources' commands. So does a source when a file its `watch` list names
+changed, came or went since it started, as a service manager restarts a
+unit on its new binary: `watch = ["~/bin/slack-poll"]`, each file from `/`
+or `~/`. An edited script then runs on its new code within 15 seconds, a
 stream that never exits included; the log says `source_stopped` with why.
+Nothing is watched unless listed, so a cursor the command writes is no
+reason to start again. Keep a source's command and the files it watches
+where no agent can write: they run as the person, outside any sandbox.
 
 A source whose last 3 runs failed (exited other than 0, or did not start)
 is down: every subscription to it, whatever its topic or filter, hears so

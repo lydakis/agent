@@ -264,7 +264,10 @@ approval gate as a call that leaves the sandbox would; `memory` and
   keys stripped. Nothing of a trigger runs between its fires. A goal's
   check command runs the same way.
 - **Lookout sources** are commands the person sets up in `config.toml`,
-  run with `sh -c` as the person outside any sandbox.
+  run with `sh -c` as the person outside any sandbox. A source runs its
+  script again on every run, and starts again on an edit to a file its
+  `watch` list names, so its command and those files must be ones no
+  agent can write: keep them outside every agent's folders.
 - **MCP servers** run as the person outside every sandbox, started from
   `~/.agent/config.toml` with `~/.agent/env` in their environment. An
   agent reaches them only through `exec`, a QuickJS script with no files,
