@@ -4680,7 +4680,7 @@ pub fn watch(
     // the conversation, and `NO_COLOR` is honoured here too.
     crate::term::detect();
     let _ = execute!(std::io::stdout(), EnterAlternateScreen, cursor::Hide);
-    let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+    let backend = crate::frames::Backend::new(std::io::stdout());
     let drawn = ratatui::Terminal::new(backend)
         .map_err(|e| e.to_string())
         .and_then(|mut terminal| {

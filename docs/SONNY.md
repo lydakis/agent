@@ -297,7 +297,9 @@ can leave is listed and removable:
   gone, the daemon unreachable, `missed`) loses its definition but keeps
   its last result, so `ls` lists it as not delivered, and why,
   until it is removed. When that result cannot be written, the definition
-  stays, listed, rather than ending with no trace.
+  stays, listed, rather than ending with no trace. A one-off its `--if`
+  says no to at its time leaves nothing, its result included: nothing came
+  of it to tell, as an ask's deadline once the ask was answered.
 - **Removing** deletes the definition, the queue and the state file, so it
   reaches an ended row and a live automation alike. A fire of it that runs
   meanwhile runs to its end, and records nothing, as for an automation removed
