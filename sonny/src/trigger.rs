@@ -9027,8 +9027,8 @@ pub(crate) mod tests {
     fn each_home_has_its_own_tag() {
         use std::ffi::OsStr;
         // tests/test_trigger.py computes the same tag.
-        assert_eq!(home_tag(OsStr::new("/Users/lydakis")), "11c173e6");
-        assert_eq!(home_tag(OsStr::new("/Users/lydakis/")), "11c173e6");
+        assert_eq!(home_tag(OsStr::new("/Users/ana")), "21fce129");
+        assert_eq!(home_tag(OsStr::new("/Users/ana/")), "21fce129");
         assert_eq!(home_tag(OsStr::new("/tmp/eval-1")), "535e3091");
         assert_eq!(home_tag(OsStr::new("/")), "29622bb2");
         assert!(tagged("11c173e6.p.fix-login"));

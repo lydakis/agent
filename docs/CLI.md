@@ -220,9 +220,8 @@ tries its held turns at once.
 - Every time flag takes a duration with its unit: `500ms`, `30s`, `5m`,
   `1h`, or a bare `0`. A bare number is refused, so no flag guesses a unit:
   `--timeout`, `--approval-hold`, `--grace`, `--stall-timeout`,
-  `--idle-exit` and `--keep-warm`. The last three count whole seconds. The
-  protocol keeps its own units (`timeout_ms`, `grace_ms`, `approval_hold_ms`,
-  `keep_warm` seconds). `--approval-hold` is how long a new bot's gated calls
+  `--idle-exit`. The last two count whole seconds. The
+  protocol keeps its own units (`timeout_ms`, `grace_ms`, `approval_hold_ms`). `--approval-hold` is how long a new bot's gated calls
   wait live for a verdict, and its terminal reads for output, before the turn
   parks (default `2s`; `0` parks at once). `--after` is an exclusive event cursor for `follow` and an exclusive
   turn ID for `turns`. `--checkpoint` is a history node ID.
@@ -248,7 +247,7 @@ tries its held turns at once.
   setting, applied after each of its turns.
 - `run` sets a new bot's own settings with `--context-bytes`, `--context-items`,
   `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`,
-  `--approval-hold`, `--max-output-tokens`, `--keep-warm`, `--cache-ttl`,
+  `--approval-hold`, `--max-output-tokens`, `--cache-ttl`,
   `--sandbox`, `--writable` (repeatable, made absolute from the current
   folder), `--network`, `--hide-senders`, `--quiet-background`, `--hold`, `--unix-socket` (repeatable: an
   absolute socket, or folder of them, its commands reach) and `--outputs` (made absolute; a new

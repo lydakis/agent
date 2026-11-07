@@ -551,14 +551,14 @@ class SocketAndCliTests(ModelFixture):
     def test_daemon_limits_match_on_startup_and_attach_and_bots_keep_their_settings(self):
         flags = ['--idle-exit', '0', '--stall-timeout', '30s']
         self.agent('run', *self.common, *flags, '--context-bytes', '1024', '--context-items', '2',
-                   '--keep-warm', '0', '--cache-ttl', '1h', '--new', '--bot', 'Bob', 'hi')
+                   '--cache-ttl', '1h', '--new', '--bot', 'Bob', 'hi')
         self.agent('run', *self.again, *flags, '--bot', 'Bob', 'again')
         control = Connection(self.socket)
         self.addCleanup(control.close)
         settings = control.request('inspect', bot='Bob')['result']['settings']
         self.assertEqual((settings['context_bytes'], settings['context_items'], settings['compact_at'],
-                          settings['keep_warm'], settings['cache_ttl'], settings['max_output_tokens']),
-                         (1024, 2, 75, 0, '1h', None))
+                          settings['cache_ttl'], settings['max_output_tokens']),
+                         (1024, 2, 75, '1h', None))
         # The daemon checks each setting's range and creates nothing it refuses.
         small = self.agent('run', *self.common, '--context-bytes', '512', '--new', '--bot', 'Small', 'hi', check=False)
         self.assertEqual(small.returncode, 1)
@@ -570,7 +570,7 @@ class SocketAndCliTests(ModelFixture):
         refused = self.agent('stats', '--store', str(self.store), '--stall-timeout', '2m', check=False)
         self.assertIn('--stall-timeout: requested 2m but daemon has 30s', refused.stderr)
         # How a bot calls its model is chosen when it is made, not by the daemon.
-        for flag, value in (('--keep-warm', '4m'), ('--cache-ttl', '5m'), ('--max-output-tokens', '4096')):
+        for flag, value in (('--cache-ttl', '5m'), ('--max-output-tokens', '4096')):
             refused = self.agent('stats', '--store', str(self.store), flag, value, check=False)
             self.assertEqual(refused.returncode, 2)
             self.assertIn(f'does not accept {flag}', refused.stderr)
@@ -602,8 +602,6 @@ class SocketAndCliTests(ModelFixture):
             ('run', '--stall-timeout', '0', 'hi'),
             ('run', '--stall-timeout', '25h', 'hi'),
             ('run', '--stall-timeout', '30', 'hi'),
-            ('run', '--keep-warm', '5m', 'hi'),
-            ('run', '--keep-warm', '1500ms', 'hi'),
             ('wait', '--timeout-ms', '5', 'proc:1'),
             ('run', '--retain-turns', '2', 'hi'),
             ('run', '--cache-ttl', '2h', 'hi'),
@@ -856,7 +854,7 @@ class SocketAndCliTests(ModelFixture):
         self.assertTrue({'processes', 'active', 'connecting', 'connections', 'idle_exit_seconds'} <= set(ready['limits']))
         self.assertEqual(ready['limits']['stall_timeout_seconds'], 600)
         # How a bot calls its model is its own setting, not the daemon's.
-        self.assertFalse({'output_tokens', 'keep_warm_seconds', 'cache_ttl'} & set(ready['limits']))
+        self.assertFalse({'output_tokens', 'cache_ttl'} & set(ready['limits']))
         self.assertEqual(ready['limits']['connections'], -(-ready['limits']['active'] // 64))
 
     def test_burst_eviction_exits_client_and_replay_recovers_terminal_event(self):

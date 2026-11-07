@@ -331,42 +331,6 @@ impl Fallback {
     }
 }
 
-/// The last model call of a turn, kept so its prompt cache can be refreshed
-/// while the calls it planned run: see [`Turn::run_tool`].
-struct Warm<'a> {
-    provider: &'a Provider,
-    model: &'a str,
-    instructions: &'a str,
-    reasoning: Option<&'a str>,
-    tools: &'a serde_json::value::RawValue,
-    /// The schema the call's reply followed; a refresh asks for the same.
-    output_schema: Option<&'a serde_json::value::RawValue>,
-    context: &'a Context,
-    /// The items the call sent without thinking: a refresh sends the same.
-    thinking: Strip,
-    /// Whether the call offered web search; a refresh offers the same.
-    web_search: bool,
-    after: std::time::Duration,
-    /// When the cache was last read, by the call or a refresh.
-    read_at: tokio::time::Instant,
-    stopped: bool,
-    /// What the refreshes spent, for the bot's and turn's budgets.
-    tokens: Spend,
-    /// What those caps leave the refreshes: they stop once they have spent
-    /// it.
-    room: agent_runtime::store::Room,
-    /// The refresh in flight, held by [`Accounting`] so an interrupt that
-    /// drops the turn's rounds still settles one already sent.
-    pending: &'a mut Option<Pending>,
-}
-
-/// A refresh running as its own task, and whether it has been sent.
-struct Pending {
-    refresh: Arc<agent_runtime::provider::Refresh>,
-    /// The usage, and when the refresh was sent.
-    task: tokio::task::JoinHandle<Result<(agent_runtime::provider::Usage, tokio::time::Instant)>>,
-}
-
 /// Lives outside the cancellable rounds future. No allocation or per-attempt
 /// storage write: each execution segment flushes once, including when parked.
 #[derive(Default)]
@@ -387,12 +351,6 @@ struct Accounting {
     /// What the summary call copies, kept in the park record so its retry
     /// sends the same request.
     copied: Option<agent_runtime::store::CopiedCall>,
-    /// A prompt-cache refresh in flight while a reply streams or a tool runs.
-    refresh: Option<Pending>,
-    /// When the last call's cache was last read by a refresh sent while the
-    /// reply streamed, and whether one was refused.
-    warm_read_at: Option<tokio::time::Instant>,
-    warm_stopped: bool,
     /// The provider's sticky-routing token for this turn's model calls,
     /// kept in the park record while the turn waits.
     route: std::sync::OnceLock<String>,
@@ -527,7 +485,7 @@ impl Finished {
 }
 
 /// The provider as a bot's settings shape its calls: its output bound,
-/// cache lifetime, keep-warm and speed. The bot's defaults borrow it
+/// cache lifetime and speed. The bot's defaults borrow it
 /// unchanged.
 pub fn shaped<'p>(
     provider: &'p Provider,
@@ -535,7 +493,6 @@ pub fn shaped<'p>(
 ) -> Result<std::borrow::Cow<'p, Provider>> {
     provider.shaped(
         settings.max_output_tokens,
-        settings.keep_warm(),
         settings.cache_hour(),
         settings.speed(),
     )
@@ -548,12 +505,7 @@ fn shaped_other<'p>(
     provider: &'p Provider,
     settings: &Settings,
 ) -> Result<std::borrow::Cow<'p, Provider>> {
-    provider.shaped(
-        settings.max_output_tokens,
-        settings.keep_warm(),
-        settings.cache_hour(),
-        None,
-    )
+    provider.shaped(settings.max_output_tokens, settings.cache_hour(), None)
 }
 
 impl Turn {
@@ -599,13 +551,7 @@ impl Turn {
             (stopped, result) = (Some(Halt::Shutdown), fail(SHUTDOWN));
         }
         // The rounds future is gone, so cancellation cannot discard this flush.
-        // A refresh it had already sent is billed: record what it cost.
-        if let Some(Ok((usage, sent_at))) = settle(&mut accounting.refresh).await
-            && let Err(error) = self.record_refresh(usage, sent_at).await
-        {
-            result = Err(error);
-        }
-        // So is a summary that landed beside a call the rounds ended in, and
+        // A summary that landed beside a call the rounds ended in, and
         // it is installed as a summary before that call would have been; one
         // still running was cancelled with them, as a call is.
         if let Err(error) = self
@@ -2444,7 +2390,6 @@ impl Turn {
                         &workspace,
                         &environment,
                         &record,
-                        None,
                         accounting.route.get().map(String::as_str),
                         accounting.summary_retry(),
                     )
@@ -2508,9 +2453,6 @@ impl Turn {
             }
             // Rules given while the turn runs rule this round's calls on.
             self.take_given_rules();
-            // A refresh the last call left in flight ends here: the next call
-            // reads the cache itself, and the budget counts what it billed.
-            self.settle_refresh(&mut record, accounting).await?;
             // One planned at a boundary that started over has not run.
             beside = None;
             // The budget is checked before each call. One the turn has
@@ -2782,9 +2724,6 @@ impl Turn {
                             // It waits outside the rounds once landed, so
                             // an interrupt still installs it.
                             done = summary.as_mut() => {
-                                if let Ok(Summary::Written(_)) = &done.result {
-                                    self.side.replaced.store(true, Relaxed);
-                                }
                                 *landed = Some(done);
                                 (call.await, None)
                             }
@@ -2793,13 +2732,12 @@ impl Turn {
                 }
             };
             let (called, running) = called;
-            self.side.replaced.store(false, Relaxed);
             if let Some((rounds, share)) = held {
                 model_rounds -= rounds;
                 record.take_back(share);
             }
             // A call that withheld its replayed thinking recorded that on
-            // the bot; refreshes send what it sent.
+            // the bot; the context keeps what it sent.
             if context.window.as_ref().is_some_and(|w| {
                 w.family == agent_runtime::codec::Family::Anthropic && !w.ids.is_empty()
             }) {
@@ -2946,10 +2884,7 @@ impl Turn {
             if response.calls.is_empty() && !response.paused {
                 // A steer that arrived during the final call keeps the turn
                 // going for one more round rather than ending it unheard,
-                // when the budget and round limit allow one. A refresh the
-                // reply left in flight is billed first, as the next round
-                // would count it.
-                self.settle_refresh(&mut record, accounting).await?;
+                // when the budget and round limit allow one.
                 let whole = self.summarizes(&record);
                 if calls_left(&record, model_rounds)
                     && self
@@ -2966,40 +2901,7 @@ impl Turn {
                 }
                 return Ok(Round::Finished);
             }
-            // The cache's lifetime runs from the sending of the call that
-            // read it, or of a refresh sent while its reply streamed.
-            let read_at = accounting
-                .warm_read_at
-                .unwrap_or_else(tokio::time::Instant::now);
-            let stopped = accounting.warm_stopped;
             let summary_retry = accounting.summary_retry();
-            let pending = &mut accounting.refresh;
-            // No call has sent the view a summary installed here, so there
-            // is no cache of it to keep warm.
-            let mut warm = provider
-                .keep_warm_after(
-                    model,
-                    record.effort.as_deref(),
-                    record.output_schema.is_some(),
-                )
-                .filter(|_| !installed)
-                .map(|after| Warm {
-                    provider,
-                    model,
-                    instructions: &record.instructions,
-                    reasoning: record.effort.as_deref(),
-                    tools: &tools,
-                    output_schema: record.output_schema.as_deref(),
-                    context: &context,
-                    thinking: context.thinking,
-                    web_search: searches(&record),
-                    after,
-                    read_at,
-                    stopped: stopped || record.exhausted().is_some(),
-                    tokens: Spend::default(),
-                    room: record.left(),
-                    pending,
-                });
             let stop = self
                 .execute_calls(
                     response.calls,
@@ -3008,13 +2910,10 @@ impl Turn {
                     &workspace,
                     &environment,
                     &record,
-                    warm.as_mut(),
                     accounting.route.get().map(String::as_str),
                     summary_retry,
                 )
                 .await?;
-            let refreshed = warm.map_or_else(Spend::default, |warm| warm.tokens);
-            record.add(refreshed);
             if let Some(stop) = stop {
                 return Ok(stop.round());
             }
@@ -3048,20 +2947,6 @@ impl Turn {
                     .get(name)
                     .is_some_and(|provider| record.family().is_ok_and(|f| provider.family() == f))
             })
-    }
-
-    /// End a refresh left in flight and count what it billed.
-    async fn settle_refresh(
-        &self,
-        record: &mut agent_runtime::store::Bot,
-        accounting: &mut Accounting,
-    ) -> Result<()> {
-        if let Some(refreshed) = settle(&mut accounting.refresh).await
-            && let Some((tokens, _)) = self.account_refresh(refreshed).await?
-        {
-            record.add(tokens);
-        }
-        Ok(())
     }
 
     /// `attached` takes attached messages along with steers; a reply that
@@ -3201,19 +3086,6 @@ impl Turn {
             record.cache_bot(),
             matches!(body, Body::Span(..)),
         );
-        // A summary's view is replaced once it lands; only the turn's call
-        // is refreshed while it streams.
-        // A refresh renders the turn's request with its calls allowed, so
-        // it would not read what a call without them sent.
-        let mut warm_after = match body {
-            Body::Window(_) if tool_calls => provider.keep_warm_after(
-                model,
-                record.effort.as_deref(),
-                record.output_schema.is_some(),
-            ),
-            Body::Window(_) => None,
-            Body::Copied(_) | Body::Span(..) => None,
-        };
         // Replayed thinking a 400 may have come from, withheld from this
         // call's later attempts.
         let mut withheld = None;
@@ -3246,7 +3118,7 @@ impl Turn {
                 && matches!(body, Body::Window(_))
                 && *model_rounds + 1 >= self.settings().max_rounds()
             {
-                (tool_calls, warm_after) = (false, None);
+                tool_calls = false;
                 accounting.limit = Some(Limit::Rounds);
                 self.withheld(turn, Limit::Rounds).await?;
             }
@@ -3265,7 +3137,6 @@ impl Turn {
                     .map_or(0, |&node| node as u64),
                 _ => 0,
             };
-            (accounting.warm_read_at, accounting.warm_stopped) = (None, false);
             let sent = agent_runtime::provider::Sent::default();
             // The call's own provider and model, and where this attempt goes.
             let (own_provider, own_model) = (provider, model);
@@ -3310,36 +3181,7 @@ impl Turn {
                     },
                     &mut accounting.report,
                 );
-            // The fallback's answer is not the request a refresh renders.
-            let result = match (warm_after.filter(|_| fallback.is_none()), body) {
-                (Some(after), Body::Window(context)) => {
-                    let mut warm = Warm {
-                        provider,
-                        model,
-                        instructions,
-                        reasoning: record.effort.as_deref(),
-                        tools,
-                        output_schema: record.output_schema.as_deref(),
-                        context,
-                        thinking: withheld.unwrap_or(context.thinking),
-                        web_search: searches(record),
-                        after,
-                        read_at: tokio::time::Instant::now(),
-                        stopped: false,
-                        tokens: Spend::default(),
-                        room: record.left(),
-                        pending: &mut accounting.refresh,
-                    };
-                    let result = self.stream_warm(call, &sent, &mut warm).await;
-                    // The call's own read, unless a refresh read the cache since.
-                    accounting.warm_read_at =
-                        Some(sent.get().map_or(warm.read_at, |at| warm.read_at.max(at)));
-                    accounting.warm_stopped = warm.stopped;
-                    record.add(warm.tokens);
-                    result?
-                }
-                _ => call.await,
-            };
+            let result = call.await;
             let sent_ms = sent.get().map_or(0, epoch_ms);
             let error = match result {
                 Ok(mut completion) => {
@@ -3507,7 +3349,7 @@ impl Turn {
             let capped = match record.exhausted() {
                 Some(_) if window && tool_calls => {
                     let limit = record.room().map_or(Limit::Budget, |(_, limit)| limit);
-                    (tool_calls, warm_after) = (false, None);
+                    tool_calls = false;
                     accounting.limit = Some(limit);
                     announce = Some(limit);
                     None
@@ -3691,84 +3533,16 @@ impl Turn {
         Ok(())
     }
 
-    /// Await a model call, refreshing its own prompt cache each time the
-    /// cache has sat unread for `after`: a reply that streams for longer
-    /// than the cache lives would otherwise let the prefix it read expire
-    /// before the next call. The cache is read from when `sent` records the
-    /// call was sent, which pacing or admission can delay. A refresh still
-    /// in flight when the reply ends is left in `warm.pending`, for the tool
-    /// run or the next round to settle.
-    async fn stream_warm<T>(
-        &self,
-        call: impl std::future::Future<Output = T>,
-        sent: &agent_runtime::provider::Sent,
-        warm: &mut Warm<'_>,
-    ) -> Result<T> {
-        tokio::pin!(call);
-        loop {
-            if warm.stopped {
-                return Ok(call.await);
-            }
-            if warm.pending.is_none() {
-                // Nothing is cached before the send, and one still to come
-                // leaves the cache unread for `after` no sooner than from now.
-                let due = match sent.get() {
-                    Some(at) => warm.read_at.max(at),
-                    None => tokio::time::Instant::now(),
-                } + warm.after;
-                tokio::select! {
-                    biased;
-                    result = &mut call => return Ok(result),
-                    () = tokio::time::sleep_until(due) => {}
-                }
-                let Some(at) = sent.get() else { continue };
-                warm.read_at = warm.read_at.max(at);
-                if warm.read_at + warm.after > tokio::time::Instant::now() {
-                    continue;
-                }
-                // A summary beside the call has written the view that
-                // replaces this one: its cache is not read again.
-                if self.side.replaced.load(Relaxed) {
-                    return Ok(call.await);
-                }
-                // Nor once the daemon is stopping: no call after this one
-                // would read it, and the drain sends no new request.
-                if self.stopping.load(Relaxed) {
-                    return Ok(call.await);
-                }
-                *warm.pending = Some(self.refresh(warm));
-            }
-            let refreshed = {
-                let task = &mut warm.pending.as_mut().expect("a refresh in flight").task;
-                tokio::select! {
-                    biased;
-                    result = &mut call => return Ok(result),
-                    joined = task => joined.unwrap_or_else(|_| fail("keep_warm_lost")),
-                }
-            };
-            *warm.pending = None;
-            self.refreshed(warm, refreshed).await?;
-        }
-    }
-
-    /// Run a prepared tool, refreshing the last model call's prompt cache
-    /// each time it has sat unread for `after`. The outer error is the
-    /// runtime's; the inner one is the tool's result.
-    /// Run a tool while keeping the cache warm. With `lift`, a steer moves
-    /// the run to the background instead, handed back unfinished, once the
-    /// paired signal says it is running: a command still waiting for a
-    /// process slot stays in line in the foreground.
+    /// Run a prepared tool. The outer error is the runtime's; the inner one
+    /// is the tool's result. With `lift`, a steer moves the run to the
+    /// background instead, handed back unfinished, once the paired signal
+    /// says it is running: a command still waiting for a process slot stays
+    /// in line in the foreground.
     async fn run_tool<T, F: Future<Output = Result<T>>>(
         &self,
         run: F,
         lift: Option<(&Lift, oneshot::Receiver<()>)>,
-        warm: Option<&mut Warm<'_>>,
     ) -> Result<Ran<F, T>> {
-        enum Next<T> {
-            Ran(Result<T>),
-            Lifted,
-            Refreshed(Result<(agent_runtime::provider::Usage, tokio::time::Instant)>),
-        }
         let mut run = Box::pin(run);
         let lifted = async {
             // A run that ends before it starts wins the race below.
@@ -3781,190 +3555,11 @@ impl Turn {
             }
         };
         tokio::pin!(lifted);
-        let Some(warm) = warm.filter(|warm| !warm.stopped) else {
-            return Ok(tokio::select! {
-                biased;
-                result = &mut run => Ran::Done(result),
-                () = &mut lifted => Ran::Lifted(run),
-            });
-        };
-        loop {
-            if warm.pending.is_none() {
-                tokio::select! {
-                    biased;
-                    result = &mut run => return Ok(Ran::Done(result)),
-                    () = &mut lifted => return Ok(Ran::Lifted(run)),
-                    () = tokio::time::sleep_until(warm.read_at + warm.after) => {}
-                }
-                // A stopping daemon sends no new refresh: the next call that
-                // would read the cache waits for the next start.
-                if self.stopping.load(Relaxed) {
-                    return Ok(tokio::select! {
-                        biased;
-                        result = &mut run => Ran::Done(result),
-                        () = &mut lifted => Ran::Lifted(run),
-                    });
-                }
-                *warm.pending = Some(self.refresh(warm));
-            }
-            let next = {
-                let task = &mut warm.pending.as_mut().expect("a refresh in flight").task;
-                tokio::select! {
-                    biased;
-                    result = &mut run => Next::Ran(result),
-                    () = &mut lifted => Next::Lifted,
-                    joined = task => Next::Refreshed(joined.unwrap_or_else(|_| fail("keep_warm_lost"))),
-                }
-            };
-            match next {
-                // The tool's result ends the refreshes, as does handing it to
-                // the background. One already sent is billed, so it is
-                // answered and recorded; an unsent one is dropped at no cost.
-                Next::Ran(result) => {
-                    if let Some(refreshed) = settle(warm.pending).await {
-                        self.refreshed(warm, refreshed).await?;
-                    }
-                    return Ok(Ran::Done(result));
-                }
-                // The command keeps running while the refresh is answered,
-                // so its timeout and pipes still apply; one that ends
-                // meanwhile returns as usual.
-                Next::Lifted => {
-                    let mut finished = None;
-                    let refreshed = {
-                        let settled = settle(warm.pending);
-                        tokio::pin!(settled);
-                        tokio::select! {
-                            biased;
-                            refreshed = &mut settled => refreshed,
-                            result = &mut run => {
-                                finished = Some(result);
-                                settled.await
-                            }
-                        }
-                    };
-                    if let Some(refreshed) = refreshed {
-                        self.refreshed(warm, refreshed).await?;
-                    }
-                    return Ok(match finished {
-                        Some(result) => Ran::Done(result),
-                        None => Ran::Lifted(run),
-                    });
-                }
-                Next::Refreshed(refreshed) => {
-                    *warm.pending = None;
-                    self.refreshed(warm, refreshed).await?;
-                }
-            }
-            if warm.stopped {
-                return Ok(tokio::select! {
-                    biased;
-                    result = &mut run => Ran::Done(result),
-                    () = &mut lifted => Ran::Lifted(run),
-                });
-            }
-        }
-    }
-
-    /// Send the last model call's request again, only to refresh its cache,
-    /// as a task of its own: an interrupt that drops the turn's rounds must
-    /// not drop a refresh already sent, which is billed.
-    fn refresh(&self, warm: &Warm<'_>) -> Pending {
-        let refresh = Arc::new(agent_runtime::provider::Refresh::default());
-        let provider = warm.provider.clone();
-        let (model, instructions) = (warm.model.to_owned(), warm.instructions.to_owned());
-        let reasoning = warm.reasoning.map(str::to_owned);
-        let tools = warm.tools.to_owned();
-        let output_schema = warm.output_schema.map(ToOwned::to_owned);
-        let web_search = warm.web_search;
-        let items = self.items(warm.context, warm.thinking);
-        let sent = refresh.clone();
-        let expires = warm.read_at + agent_runtime::provider::CACHE_LIFETIME;
-        let task = tokio::spawn(async move {
-            let request = ModelRequest {
-                model: &model,
-                instructions: &instructions,
-                reasoning: reasoning.as_deref(),
-                tools: &tools,
-                allow_tool_calls: true,
-                output_schema: output_schema.as_deref(),
-                web_search,
-                fallback_credit: None,
-                cache_key: None,
-                items,
-                chain: None,
-                route: None,
-                sent: None,
-            };
-            provider.keep_warm(request, &sent, expires).await
-        });
-        Pending { refresh, task }
-    }
-
-    /// Record a refresh against `warm`. A refused one ends the refreshes
-    /// until the next model call, which rebuilds the cache as it would have
-    /// without them.
-    async fn refreshed(
-        &self,
-        warm: &mut Warm<'_>,
-        refreshed: Result<(agent_runtime::provider::Usage, tokio::time::Instant)>,
-    ) -> Result<()> {
-        match self.account_refresh(refreshed).await? {
-            Some((tokens, sent_at)) => {
-                warm.tokens = warm.tokens.plus(tokens);
-                // The refresh's own read, from when it was sent. One carried
-                // over from an earlier attempt can be older than this one's.
-                warm.read_at = warm.read_at.max(sent_at);
-                // A cap reached ends them: no call after it would read the cache.
-                warm.stopped |= !warm.room.holds(warm.tokens);
-            }
-            None => warm.stopped = true,
-        }
-        Ok(())
-    }
-
-    /// Record a refresh's answer: billed like any call but not a model
-    /// round. Returns the tokens it billed and when it was sent, or `None`
-    /// when it was refused.
-    async fn account_refresh(
-        &self,
-        refreshed: Result<(agent_runtime::provider::Usage, tokio::time::Instant)>,
-    ) -> Result<Option<(Spend, tokio::time::Instant)>> {
-        let (usage, sent_at) = match refreshed {
-            Ok(refreshed) => refreshed,
-            Err(error) => {
-                self.hub
-                    .live(
-                        &self.bot,
-                        json!({"event":"keep_warm_failed","bot":self.bot,"turn":self.turn,
-                            "durable":false,"error":error.code,"detail":error.detail}),
-                    )
-                    .await?;
-                return Ok(None);
-            }
-        };
-        // It re-reads the history: its work is its output.
-        let tokens = Spend {
-            tokens: usage.input_tokens.saturating_add(usage.output_tokens),
-            work: usage.output_tokens,
-        };
-        self.record_refresh(usage, sent_at).await?;
-        Ok(Some((tokens, sent_at)))
-    }
-
-    async fn record_refresh(
-        &self,
-        mut usage: agent_runtime::provider::Usage,
-        sent_at: tokio::time::Instant,
-    ) -> Result<()> {
-        usage.sent_ms = epoch_ms(sent_at);
-        self.tokens.add(&usage);
-        let turn = self.turn;
-        self.store
-            .op("keep_warm_usage", move |db| {
-                db.keep_warm_usage(turn, &usage)
-            })
-            .await
+        Ok(tokio::select! {
+            biased;
+            result = &mut run => Ran::Done(result),
+            () = &mut lifted => Ran::Lifted(run),
+        })
     }
 
     /// Run planned calls in order. Returns true when a wait parked the turn;
@@ -3982,7 +3577,6 @@ impl Turn {
         workspace: &std::path::Path,
         environment: &[(String, String)],
         record: &Bot,
-        mut warm: Option<&mut Warm<'_>>,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
     ) -> Result<Option<Stop>> {
@@ -4032,7 +3626,7 @@ impl Turn {
                 for _ in 1..batch.len() {
                     calls.next();
                 }
-                self.execute_parallel(batch, record, workspace, environment, warm.as_deref_mut())
+                self.execute_parallel(batch, record, workspace, environment)
                     .await?;
                 continue;
             }
@@ -4139,7 +3733,7 @@ impl Turn {
                             .await
                             .map(Outcome::text)
                     };
-                    match self.run_tool(search, None, warm.as_deref_mut()).await? {
+                    match self.run_tool(search, None).await? {
                         Ran::Done(Ok(outcome)) => {
                             self.kept(outcome, record, workspace, &call.call_id).await
                         }
@@ -4216,7 +3810,7 @@ impl Turn {
                         sandbox,
                         sender,
                     );
-                    match self.run_tool(start, None, warm.as_deref_mut()).await? {
+                    match self.run_tool(start, None).await? {
                         Ran::Done(Ok(outcome)) => {
                             seen = Self::seen(id, &outcome);
                             outcome
@@ -4250,7 +3844,7 @@ impl Turn {
                         self.settings().approval_hold_ms(),
                         sandbox,
                     );
-                    match self.run_tool(hold, None, warm.as_deref_mut()).await? {
+                    match self.run_tool(hold, None).await? {
                         Ran::Done(Ok(Some(outcome))) => {
                             seen = Self::seen(handle, &outcome);
                             outcome
@@ -4290,7 +3884,7 @@ impl Turn {
                         kill,
                         sandbox,
                     );
-                    match self.run_tool(typed, None, warm.as_deref_mut()).await? {
+                    match self.run_tool(typed, None).await? {
                         Ran::Done(Ok(outcome)) => {
                             seen = Self::seen(handle, &outcome);
                             outcome
@@ -4399,10 +3993,7 @@ impl Turn {
                         place.clone(),
                         started,
                     );
-                    match self
-                        .run_tool(run, Some((&self.lift, running)), warm.as_deref_mut())
-                        .await?
-                    {
+                    match self.run_tool(run, Some((&self.lift, running))).await? {
                         Ran::Done(Ok(outcome)) => {
                             self.kept(outcome, record, workspace, &call.call_id).await
                         }
@@ -4421,7 +4012,6 @@ impl Turn {
                         self.registry
                             .execute(prepared, workspace, environment, sandbox),
                         None,
-                        warm.as_deref_mut(),
                     )
                     .await?
                 {
@@ -4501,7 +4091,6 @@ impl Turn {
         record: &Bot,
         workspace: &std::path::Path,
         environment: &[(String, String)],
-        warm: Option<&mut Warm<'_>>,
     ) -> Result<()> {
         let turn = self.turn;
         let starting: Vec<ToolCall> = batch.iter().map(|(call, _)| call.clone()).collect();
@@ -4579,7 +4168,7 @@ impl Turn {
             let (ran, wrote) = tokio::join!(run, write);
             ran.and(wrote)
         };
-        match self.run_tool(record, None, warm).await? {
+        match self.run_tool(record, None).await? {
             Ran::Done(result) => result,
             Ran::Lifted(_) => unreachable!("a batch is not lifted whole"),
         }
@@ -5449,27 +5038,6 @@ impl Turn {
     }
 }
 
-/// Cancel a refresh not yet sent, or wait for the answer to one that was.
-/// It stays in `pending` until answered, so a caller dropped meanwhile
-/// leaves it for the turn's end to settle.
-async fn settle(
-    pending: &mut Option<Pending>,
-) -> Option<Result<(agent_runtime::provider::Usage, tokio::time::Instant)>> {
-    let in_flight = pending.as_mut()?;
-    let refreshed = if in_flight.refresh.cancel() {
-        in_flight.task.abort();
-        None
-    } else {
-        Some(
-            (&mut in_flight.task)
-                .await
-                .unwrap_or_else(|_| fail("keep_warm_lost")),
-        )
-    };
-    *pending = None;
-    refreshed
-}
-
 /// When `at` was, in milliseconds since the Unix epoch.
 fn epoch_ms(at: tokio::time::Instant) -> u64 {
     now_ms().saturating_sub(at.elapsed().as_millis() as u64)
@@ -5945,9 +5513,6 @@ pub struct SideCounts {
     summary_ms: AtomicU64,
     retries: AtomicU64,
     paced_ms: AtomicU64,
-    /// A summary beside the turn's call wrote its replacement for the view
-    /// the call sent, so no refresh keeps that view's cache warm.
-    replaced: AtomicBool,
 }
 
 /// Time from now until dropped, added to a summary counter.
@@ -7024,7 +6589,6 @@ mod tests {
                 &dir,
                 &[],
                 &record,
-                None,
                 None,
                 None,
             ),

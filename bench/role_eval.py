@@ -641,7 +641,7 @@ def determinable(home, request):
 
 
 # The label Sonny's scheduler job takes, before its HOME's tag.
-SCHEDULER = 'me.lydakis.agent.scheduler.'
+SCHEDULER = 'sonny.scheduler.'
 
 
 def let_go_scheduler(home):

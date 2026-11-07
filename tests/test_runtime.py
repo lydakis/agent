@@ -635,9 +635,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 self.server.credits = getattr(self.server, 'credits', 0) + 1
             if 'thinking' in request:
                 assert request['thinking']['block_binding'] == {'prefix_mismatch_behavior': 'drop_block'}
-            # A cache refresh is the same request with no output and no stream.
-            warm = request['max_tokens'] == 0
-            assert request['model'] in ('synthetic-claude', 'synthetic-claude-2') and request['stream'] != warm
+            assert request['model'] in ('synthetic-claude', 'synthetic-claude-2') and request['stream']
             cache = getattr(self.server, 'cache_control', {'type': 'ephemeral'})
             for block in request.get('system', []):
                 assert block['text'] and block['cache_control'] == cache
@@ -688,28 +686,6 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 self.send_header('Content-Length', str(len(body)))
                 last = getattr(self.server, 'compaction_retry_after', '0.4')
                 self.send_header('Retry-After', last if self.server.compaction_refusals == 0 else '0.001')
-                self.end_headers()
-                self.wfile.write(body)
-                self.wfile.flush()
-                return
-            if warm and getattr(self.server, 'refuse_warm', False):
-                body = b'{"type":"error","error":{"type":"invalid_request_error","message":"no"}}'
-                self.send_response(400)
-                self.send_header('Content-Length', str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                self.wfile.flush()
-                return
-            if warm:
-                time.sleep(getattr(self.server, 'warm_delay', 0))
-                body = json.dumps({'type': 'message', 'role': 'assistant', 'content': [],
-                                   'model': request['model'] + '-20260926',
-                                   'stop_reason': 'max_tokens', 'usage': {
-                                       'input_tokens': 0, 'cache_read_input_tokens': 9,
-                                       'cache_creation_input_tokens': 0, 'output_tokens': 0}}).encode()
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
                 self.wfile.flush()
@@ -958,98 +934,8 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.addCleanup(client.close)
         return client, model, path
 
-    def test_a_long_tool_call_keeps_the_prompt_cache_warm(self):
-        client, model, path = self.start(settings={'keep_warm': 1})
-        client.request('create', bot='Bob', workspace=str(path), effort='low')
-        turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 2.5')['result']['turn']
-        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        requests = []
-        while not model.requests.empty():
-            requests.append(model.requests.get())
-        call, warms, answer = requests[0], requests[1:-1], requests[-1]
-        # Refreshed once a second of the command's run, never after it ended;
-        # each is the call's request with no output and no stream.
-        self.assertEqual(len(warms), 2)
-        for warm in warms:
-            self.assertEqual(warm, {**call, 'max_tokens': 0, 'stream': False})
-        self.assertEqual(answer['messages'][2]['content'][0]['type'], 'tool_result')
-        # Each refresh is billed as the cache read it was, not as a model round,
-        # and records when it was sent: a second apart, after the call.
-        usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
-        sent = [u.pop('sent_ms') for u in usage]
-        self.assertEqual([u for u in usage if u.get('purpose') == 'keep_warm'], [
-            {'input_tokens': 9, 'output_tokens': 0, 'cached_input_tokens': 9, 'purpose': 'keep_warm',
-             'served_model': 'synthetic-claude-20260926', 'work_tokens': 0}] * 2)
-        self.assertEqual(len(usage), 4)
-        self.assertEqual(sent, sorted(sent))
-        self.assertGreaterEqual(sent[2] - sent[1], 900)
-
-    def test_a_drain_sends_no_refresh_while_a_command_finishes(self):
-        client, model, path = self.start(settings={'keep_warm': 1})
-        client.request('create', bot='Bob', workspace=str(path), effort='low')
-        turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 2.5')['result']['turn']
-        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
-        model.requests.get(timeout=3)
-        # The command runs on through the drain, past when its cache would be
-        # refreshed twice; no refresh goes out, and the turn parks after it.
-        self.assertTrue(client.request('shutdown', grace_ms=60_000)['result']['shutting_down'])
-        parked = client.receive(lambda e: e.get('event') == 'turn_paced' and e.get('turn') == turn)
-        self.assertEqual(parked['data'], {'resume_at_ms': None, 'stopped': True})
-        self.assertEqual(client.process.wait(timeout=10), 0)
-        self.assertTrue(model.requests.empty())
-        self.assertFalse([m for m in client.saved if m.get('event') == 'usage'
-                          and m['data'].get('purpose') == 'keep_warm'])
-
-    def test_refreshes_stop_at_the_turns_cap(self):
-        client, model, path = self.start(settings={'keep_warm': 1})
-        def run(bot, cap, counts='tokens'):
-            client.request('create', bot=bot, workspace=str(path), effort='low')
-            turn = client.request('submit', bot=bot, request_id='w', prompt='shell:sleep 2.5',
-                                  budget_tokens=cap, budget_counts=counts)['result']['turn']
-            end = client.finished(turn)['data']
-            requests = []
-            while not model.requests.empty():
-                requests.append(model.requests.get())
-            usage = [m['data'] for m in client.saved
-                     if m.get('event') == 'usage' and m.get('bot') == bot]
-            return end, sum(r['max_tokens'] == 0 for r in requests), usage
-        # The call spends the cap: only a last call without tools follows
-        # it, and nothing reads a cache refreshed for one with them.
-        end, warms, usage = run('Bob', 1)
-        self.assertEqual((end['status'], end['limit'], warms), ('completed', 'turn_budget', 0))
-        # A refresh bills the history it re-reads: room for one refresh,
-        # and the second would bill past the cap, so the call after it is
-        # the last.
-        call = usage[0]['input_tokens'] + usage[0]['output_tokens']
-        end, warms, _ = run('Ann', call + 9)
-        self.assertEqual((end['status'], end['limit'], warms), ('completed', 'turn_budget', 1))
-        # But it does no work: under a cap on work with room, the cache is
-        # kept warm as without one.
-        end, warms, usage = run('Cy', usage[0]['work_tokens'] + 9, 'work')
-        self.assertEqual((end['status'], end.get('limit')), ('completed', None))
-        self.assertGreater(warms, 0)
-        self.assertEqual({u['work_tokens'] for u in usage if u.get('purpose') == 'keep_warm'}, {0})
-
-    def test_a_long_reply_keeps_its_own_prompt_cache_warm(self):
-        client, model, path = self.start(settings={'keep_warm': 1})
-        model.generate_delay = 2.5
-        client.request('create', bot='Bob', workspace=str(path), effort='low')
-        turn = client.request('submit', bot='Bob', request_id='g1', prompt='long')['result']['turn']
-        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        requests = []
-        while not model.requests.empty():
-            requests.append(model.requests.get())
-        # Refreshed once a second while the reply streamed, never after it
-        # ended; each is the call's own request with no output and no stream.
-        call, warms = requests[0], requests[1:]
-        self.assertEqual(len(warms), 2)
-        for warm in warms:
-            self.assertEqual(warm, {**call, 'max_tokens': 0, 'stream': False})
-        usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
-        self.assertEqual([u.get('purpose') for u in usage], ['keep_warm', 'keep_warm', None])
-
     def test_a_turns_reply_follows_the_schema_it_was_sent_with(self):
-        client, model, path = self.start(settings={'keep_warm': 1})
+        client, model, path = self.start()
         client.request('create', bot='Bob', workspace=str(path), effort='low')
         schema = {'type': 'object', 'additionalProperties': False, 'required': ['a'],
                   'properties': {'a': {'type': 'string'}}}
@@ -1071,124 +957,18 @@ class AnthropicRuntimeTests(unittest.TestCase):
             self.assertEqual(sent['output_config'],
                              {'effort': 'low', 'format': {'type': 'json_schema', 'schema': schema}})
             self.assertNotIn('tool_choice', sent)
-        # Its calls are never refreshed: `max_tokens: 0` refuses a
-        # structured output, so the refresh could only fail.
-        model.generate_delay = 2.5
-        turn = submit('s2', 'long', output_schema=schema)['result']['turn']
-        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        requests = []
-        while not model.requests.empty():
-            requests.append(model.requests.get())
-        self.assertEqual(len(requests), 1)
-        self.assertEqual(requests[0]['output_config']['format']['schema'], schema)
         # A turn sent without one is free text.
-        model.generate_delay = 0
         turn = submit('s3', 'hello')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(model.requests.get(timeout=1)['output_config'], {'effort': 'low'})
 
-    def test_a_refresh_in_flight_when_the_reply_ends_carries_into_the_tool(self):
-        client, model, path = self.start(settings={'keep_warm': 1})
-        model.generate_delay = 1.5
-        model.warm_delay = 1
-        client.request('create', bot='Bob', workspace=str(path), effort='low')
-        turn = client.request('submit', bot='Bob', request_id='g2', prompt='shell:true')['result']['turn']
-        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        requests = []
-        while not model.requests.empty():
-            requests.append(model.requests.get())
-        # The refresh sent a second into the reply is still unanswered when
-        # the reply and then the tool end: it is answered and recorded once,
-        # and nothing is sent after the tool.
-        self.assertEqual([r['max_tokens'] == 0 for r in requests], [False, True, False])
-        usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
-        self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm', None])
-
-    def test_a_steer_after_a_reply_that_spent_the_budget_runs_on_its_own(self):
-        client, model, path = self.start(settings={'keep_warm': 1})
-        model.generate_delay = 1.5
-        model.warm_delay = 1
-        # The call does 14 tokens of work (7 in, 7 out), the whole budget;
-        # its refresh re-reads the history, billing 9 but doing none.
-        client.request('create', bot='Bob', workspace=str(path), effort='low', budget_tokens=14,
-                       budget_counts='work')
-        turn = client.request('submit', bot='Bob', request_id='s1', prompt='long')['result']['turn']
-        model.requests.get(timeout=5)
-        steer = client.request('submit', bot='Bob', request_id='s2', prompt='more', delivery='steer')
-        # The refresh still in flight when the reply ends is answered and
-        # counted before the steer could join. The reply spent the budget,
-        # so the turn completes on it rather than calling for the steer,
-        # and the steer, run on its own, is refused.
-        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        self.assertEqual(client.finished(steer['result']['turn'])['data']['error'], 'budget_exhausted')
-        self.assertEqual(model.requests.get(timeout=1)['max_tokens'], 0)
-        self.assertTrue(model.requests.empty())
-        bob = client.request('inspect', bot='Bob')['result']
-        self.assertEqual((bob['work_tokens'], bob['tokens_used']), (14, 23))
-
-    def test_a_call_waiting_to_be_sent_is_refreshed_only_from_its_send(self):
-        # One request may start at a time and Ann's waits for its headers,
-        # so Bob's call waits to be sent; its cache exists only from then.
-        client, model, path = self.start(extra=('--max-connecting', '1'), settings={'keep_warm': 1})
-        model.hold_delay = 2.5
-        model.generate_delay = 1.5
-        model.arrivals = []
-        for bot in ('Ann', 'Bob'):
-            client.request('create', bot=bot, workspace=str(path), effort='low')
-        held = client.request('submit', bot='Ann', request_id='h1', prompt='hold')['result']['turn']
-        model.requests.get(timeout=5)
-        turn = client.request('submit', bot='Bob', request_id='h2', prompt='long')['result']['turn']
-        for waited in (held, turn):
-            self.assertEqual(client.finished(waited)['data']['status'], 'completed')
-        bob = [(at, r) for at, r in model.arrivals if r['messages'][-1]['content'][0].get('text') == 'long']
-        (sent, call), warms = bob[0], bob[1:]
-        self.assertTrue(warms)
-        for _, warm in warms:
-            self.assertEqual(warm, {**call, 'max_tokens': 0, 'stream': False})
-        self.assertGreaterEqual(warms[0][0] - sent, 0.9)
-
-    def test_a_refused_refresh_ends_the_refreshes_but_not_the_turn(self):
-        client, model, path = self.start(settings={'keep_warm': 1})
-        model.refuse_warm = True
-        client.request('create', bot='Bob', workspace=str(path), effort='low')
-        turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 2.5')['result']['turn']
-        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        failed = [m for m in client.saved if m.get('event') == 'keep_warm_failed']
-        self.assertEqual([(m['turn'], m['error'], m['durable']) for m in failed],
-                         [(turn, 'provider_http_400', False)])
-        warms = [r for r in iter(lambda: None if model.requests.empty() else model.requests.get(), None)
-                 if r['max_tokens'] == 0]
-        self.assertEqual(len(warms), 1)
-
-    def test_a_refresh_sent_before_the_tool_ends_is_still_recorded(self):
-        client, model, path = self.start(settings={'keep_warm': 1})
-        model.warm_delay = 1
-        client.request('create', bot='Bob', workspace=str(path), effort='low')
-        turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 1.5')['result']['turn']
-        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
-        self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm', None])
-
-    def test_an_interrupt_still_records_a_refresh_already_sent(self):
-        client, model, path = self.start(settings={'keep_warm': 1})
-        model.warm_delay = 1.5
-        client.request('create', bot='Bob', workspace=str(path), effort='low')
-        turn = client.request('submit', bot='Bob', request_id='i1', prompt='shell:sleep 10')['result']['turn']
-        call = model.requests.get(timeout=5)
-        self.assertEqual(model.requests.get(timeout=5)['max_tokens'], 0)  # the refresh is in flight
-        client.request('interrupt', bot='Bob', turn=turn)
-        self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
-        usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
-        self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm'])
-        self.assertEqual(call['max_tokens'] > 0, True)
-
-    def test_an_hour_long_cache_is_marked_priced_apart_and_not_refreshed(self):
-        client, model, path = self.start(settings={'keep_warm': 1, 'cache_ttl': '1h'})
+    def test_an_hour_long_cache_is_marked_and_priced_apart(self):
+        client, model, path = self.start(settings={'cache_ttl': '1h'})
         model.cache_control = {'type': 'ephemeral', 'ttl': '1h'}
         # A report without the per-lifetime split: every write is an hour's.
         model.start_usage = {'cache_creation_input_tokens': 3}
         client.request('create', bot='Bob', workspace=str(path), effort='low')
-        turn = client.request('submit', bot='Bob', request_id='h1', prompt='shell:sleep 1.5')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='h1', prompt='shell:true')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual([r['max_tokens'] > 0 for r in (model.requests.get(timeout=1),
                                                          model.requests.get(timeout=1))], [True, True])
