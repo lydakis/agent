@@ -2808,6 +2808,9 @@ struct App {
     /// Tasks' questions set aside in their own windows that a click on
     /// the card brought back here: pinned though the task no longer is.
     reopened: std::collections::HashSet<String>,
+    /// Of those, the ones to read again from their tasks: the fleet's
+    /// reading changed since, and the task may have settled them.
+    reread: Vec<asks::Ask>,
     /// The asks this window answered and closed, by call, until their
     /// answers land.
     sent_answers: Vec<String>,
@@ -4334,6 +4337,7 @@ impl App {
             settled: HashMap::new(),
             unsettled: Vec::new(),
             reopened: Default::default(),
+            reread: Vec::new(),
             sent_answers: Vec::new(),
             task_answers: Vec::new(),
             task_asks_read: None,
@@ -11626,6 +11630,20 @@ impl App {
             };
             self.settle(&ask.key(), state);
         }
+        for ask in std::mem::take(&mut self.reread) {
+            let (Some(task), Some(turn)) = (&ask.task, asks::turn_of(&ask.id)) else {
+                continue;
+            };
+            let call = ask.id.split_once('/').map_or("", |(_, call)| call);
+            // Answered or closed there: so it reads here too. Still open
+            // or set aside, it stays where the click put it.
+            if let Ok(Some((_, state))) =
+                asks::standing(&self.client, &task.bot, turn, call, None).await
+                && state.settled()
+            {
+                self.settle(&ask.key(), state);
+            }
+        }
     }
 
     /// The answers sent to tasks from here that their tasks have not
@@ -11743,6 +11761,10 @@ impl App {
             return;
         }
         let mut kept = self.screen.ask_tags();
+        // An older page being drawn holds the newer rows aside meanwhile.
+        if let Some(newer) = &self.newer {
+            kept.extend(newer.ask_tags());
+        }
         // Cards committed but not yet on the screen.
         kept.extend(self.marks.iter().filter_map(|(_, mark)| match mark {
             screen::Mark::Tag(screen::Tag::Ask(n)) => Some(*n),
@@ -11985,6 +12007,14 @@ impl App {
             .cloned()
             .collect();
         self.unsettled.extend(gone);
+        // Reopened here, each is read again from its task, which may have
+        // been answered or closed there since.
+        let reread: Vec<asks::Ask> = (self.asks.iter())
+            .filter(|ask| self.reopened.contains(&ask.key()) && !keys.contains(&ask.key()))
+            .filter(|ask| !self.reread.iter().any(|have| have.key() == ask.key()))
+            .cloned()
+            .collect();
+        self.reread.extend(reread);
         self.asks.retain(still);
         self.aside.retain(still);
         self.task_answers
@@ -12025,6 +12055,7 @@ impl App {
         self.settled.clear();
         self.unsettled.clear();
         self.reopened.clear();
+        self.reread.clear();
     }
 
     /// The ask made as call `call` in turn `turn`, as [`asks::id`] names
@@ -20131,7 +20162,10 @@ mod tests {
             app.cards.insert(key.clone(), (10_000 + n, ask, false));
             app.settled.insert(key, asks::State::Withdrawn("w".into()));
         }
+        // Kept while an older page is drawn, the newer rows held aside.
+        app.newer = Some(std::mem::take(&mut app.screen));
         app.forget_trimmed_cards();
+        app.screen = app.newer.take().unwrap();
         assert_eq!(app.cards.keys().collect::<Vec<_>>(), ["ask:1/c1"]);
         assert_eq!(app.settled.len(), 1);
     }
@@ -20158,6 +20192,11 @@ mod tests {
         app.press(&format!("card/{key}")).await;
         assert_eq!(app.asking().map(asks::Ask::key), Some(key.clone()));
         app.pin_task_asks();
+        assert_eq!(app.asking().map(asks::Ask::key), Some(key.clone()));
+        // It is read again from its task; still unanswered there, it stays.
+        assert_eq!(app.reread.len(), 1);
+        app.settle_task_asks().await;
+        assert!(app.reread.is_empty());
         assert_eq!(app.asking().map(asks::Ask::key), Some(key));
     }
 
