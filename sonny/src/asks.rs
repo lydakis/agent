@@ -1420,8 +1420,10 @@ pub async fn served_close(
     }
     // Its deadline goes with it: nothing to fire, nothing left on disk.
     let name = trigger_name(bot, turn, &call);
-    let _ =
-        tokio::task::spawn_blocking(move || crate::trigger::tool(&json!({"remove": name}))).await;
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::trigger::tool(&json!({"remove": name}), &crate::trigger::Caller::default())
+    })
+    .await;
     let outcome = match state {
         State::Withdrawn(_) => "withdrawn",
         _ => "answered",
