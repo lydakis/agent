@@ -102,6 +102,11 @@ A key `table.key` goes under `[table]`; a bare key goes at the top.
 
 {{SETTINGS}}
 
+`[sonny] hours = ["Mon-Fri 09:00-19:00"]` is the person's working hours,
+local time, a list of day runs each with a time range. Unset, Sonny keeps
+no clock and goes quiet only on `/quiet`. Set, it goes quiet once the hours
+end and no window has been used for `sonny.quiet_after`.
+
 ## .agents/project.toml
 
 | Key | What it sets | Over the config's |
