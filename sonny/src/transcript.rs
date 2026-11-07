@@ -2855,7 +2855,7 @@ fn shown(path: &str, workspace: &str) -> String {
     }
 }
 
-pub fn finished(status: &str, detail: &str, seconds: Option<u64>, width: usize) -> Line<'static> {
+pub fn finished(status: &str, detail: &str, seconds: Option<u64>) -> Line<'static> {
     let mut label = match status {
         "completed" => "Worked".to_owned(),
         "steered" => "Steered".to_owned(),
@@ -2867,20 +2867,13 @@ pub fn finished(status: &str, detail: &str, seconds: Option<u64>, width: usize) 
     if !detail.is_empty() {
         label.push_str(&format!(" · {detail}"));
     }
-    let text = format!("─ {label} ");
-    // No wider than 80 columns, so a pane that narrows later rarely re-wraps it.
-    let fill = width.min(80).saturating_sub(text.width());
-    let style = if matches!(status, "completed" | "steered") {
-        Style::new().dim()
-    } else {
-        Style::new().fg(Color::Red)
+    // Words only, muted: the person's band already parts one turn from the
+    // next, and a rule as wide as the column outweighed the reply above it.
+    let style = match status {
+        "completed" | "steered" => Style::new().dim(),
+        _ => Style::new().fg(Color::Red),
     };
-    // The fill is a span of its own: a row that ends in one is a rule, cut
-    // at the edge rather than wrapped (`screen`).
-    Line::from(vec![
-        Span::styled(text, style),
-        Span::styled("─".repeat(fill), style),
-    ])
+    Line::from(Span::styled(label, style))
 }
 
 /// How full a conversation of `size` tokens is, as the footer says it:
@@ -3197,6 +3190,17 @@ mod tests {
             assert!(style.add_modifier.contains(Modifier::DIM), "{span:?}");
             assert!(!style.add_modifier.contains(Modifier::BOLD), "{span:?}");
         }
+    }
+
+    #[test]
+    fn a_finished_turn_ends_on_its_words_alone_muted() {
+        let done = finished("completed", "", Some(11));
+        assert_eq!(done.to_string(), "Worked for 11s");
+        assert!(!done.to_string().contains('─'), "no rule");
+        assert!(done.spans[0].style.add_modifier.contains(Modifier::DIM));
+        // A failure is still read in red.
+        let failed = finished("failed", "", None);
+        assert!(failed.spans.iter().all(|s| s.style.fg == Some(Color::Red)));
     }
 
     #[test]
