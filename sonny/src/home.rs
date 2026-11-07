@@ -806,6 +806,12 @@ fn mirror_at(
             }
             if !file || !same(&source, &target) {
                 std::fs::copy(&source, &target).map_err(|e| fail(&target, e))?;
+                // Changed now: macOS's copy keeps the source's time, and git
+                // takes a file of the same size and time as unchanged.
+                let copied = std::fs::File::open(&target).map_err(|e| fail(&target, e))?;
+                copied
+                    .set_modified(std::time::SystemTime::now())
+                    .map_err(|e| fail(&target, e))?;
             }
             own_bits(&source, &target).map_err(|e| fail(&target, e))?;
         } else {
