@@ -10,10 +10,10 @@
 //!   in [`crate::used`] and as often (at most once every 10 seconds a
 //!   window).
 //! - `away`: there while quiet is on. It says since when and why. Nothing
-//!   runs to start it: whoever asks whether the person is away (a window's
-//!   minute check, a sound, a message to a lead) and finds them past their
-//!   hours and gone `quiet_after` writes it, with the start the hours and
-//!   `present` give. A window writes it for `/quiet`; the window the person
+//!   runs to start it: a window that finds the person past their hours and
+//!   gone `quiet_after` (on start, on its minute check, before a sound)
+//!   writes it, with the start the hours and `present` give. The stamp on a
+//!   lead's message only reads: the file, else the same sum. A window writes it for `/quiet`; the window the person
 //!   writes words from ends it, so quiet ends for every agent at once.
 //!
 //! A glance, a scroll or a focus keeps quiet from starting but does not end
@@ -199,16 +199,31 @@ fn modified(file: &Path) -> Option<i64> {
     Some(modified.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64)
 }
 
-/// Quiet now; none while it is off. The first to ask once the person is
-/// past their hours and gone `quiet_after` starts it, so nothing has to run
-/// to start it on time: until someone asks, nobody needs to know.
+/// Quiet now, as a reader sees it: the file while it is there, else
+/// what the hours and the last use say. Writes nothing, so the stamp on a
+/// lead's message (from the lookout, the scheduler or a window) only reads.
 pub fn away() -> Option<Away> {
-    // Kept until the file changes: a window asks once a minute and the
-    // sound asks on each alert, and an idle window opens no files (A17).
-    static KEPT: crate::kept::Slot<Option<Away>> = std::sync::Mutex::new(None);
     let file = away_file()?;
-    let kept = crate::kept::read(&KEPT, "away", vec![file.clone()], || (away_at(&file), None));
-    kept.or_else(|| arm_at(&schedule(), &present_file()?, &file, now()))
+    kept(&file).or_else(|| due(&schedule(), &present_file()?, now()))
+}
+
+/// Quiet now, as a window sees it: as [`away`], and if quiet is due and
+/// not yet written, the window writes it, so the person's first words
+/// back know since when they were away. Windows alone write it: on start,
+/// on their minute check and before a sound.
+pub fn arm() -> Option<Away> {
+    let file = away_file()?;
+    kept(&file).or_else(|| arm_at(&schedule(), &present_file()?, &file, now()))
+}
+
+/// The file as last read, kept until it changes: a window asks once a
+/// minute and the sound on each alert, and an idle window opens no files
+/// (A17).
+fn kept(file: &Path) -> Option<Away> {
+    static KEPT: crate::kept::Slot<Option<Away>> = std::sync::Mutex::new(None);
+    crate::kept::read(&KEPT, "away", vec![file.to_path_buf()], || {
+        (away_at(file), None)
+    })
 }
 
 fn away_at(file: &Path) -> Option<Away> {
@@ -234,7 +249,7 @@ fn write(away: Away) -> String {
 }
 
 /// Start quiet, unless it is on: the file appears whole, and only where
-/// none is, so two askers starting it at once agree on one start and no reader sees it half written.
+/// none is, so two windows starting it at once agree on one start and no reader sees it half written.
 pub fn start(away: Away) -> Result<(), String> {
     start_at(&away_file().ok_or("HOME is not set")?, away)
 }
@@ -265,20 +280,25 @@ fn end_at(file: &Path) -> Option<Away> {
     away
 }
 
-/// Start quiet if the schedule says it is time: what it started, if it
-/// did. With no hours, not even `present` is looked at.
-fn arm_at(schedule: &Schedule, present: &Path, file: &Path, now: i64) -> Option<Away> {
+/// Quiet if the hours and the last use say it is due, as of `now`. With
+/// no hours, not even `present` is looked at.
+fn due(schedule: &Schedule, present: &Path, now: i64) -> Option<Away> {
     if schedule.hours.is_empty() {
         return None;
     }
     let since = schedule.starts(modified(present), now)?;
-    if since > now || file.exists() {
-        return None;
-    }
-    let away = Away {
+    (since <= now).then_some(Away {
         since,
         why: Why::Hours,
-    };
+    })
+}
+
+/// Start quiet if it is due and not on: what it started, if it did.
+fn arm_at(schedule: &Schedule, present: &Path, file: &Path, now: i64) -> Option<Away> {
+    let away = due(schedule, present, now)?;
+    if file.exists() {
+        return None;
+    }
     start_at(file, away).ok()?;
     Some(away)
 }
@@ -461,6 +481,12 @@ mod tests {
         let at_19_20 = UNIX_EPOCH + Duration::from_secs(friday(19, 20) as u64);
         used.set_modified(at_19_20).unwrap();
         assert_eq!(arm_at(&week, &present, &file, friday(19, 45)), None);
+        // A reader sees it due at 19:50 and writes nothing.
+        assert_eq!(
+            due(&week, &present, friday(19, 50)).map(|away| away.since),
+            Some(friday(19, 50))
+        );
+        assert!(!file.exists());
         let started = arm_at(&week, &present, &file, friday(19, 50)).unwrap();
         assert_eq!(
             started,

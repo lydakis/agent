@@ -59,7 +59,7 @@ impl Sounds {
         }
         // Nothing rings while the person is away: what needs them counts
         // in the footer for when they are back.
-        if crate::quiet::away().is_some() {
+        if crate::quiet::arm().is_some() {
             return;
         }
         if matches!(alert, Alert::NeedsYou | Alert::LeadDone | Alert::Failed) {

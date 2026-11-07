@@ -1563,7 +1563,7 @@ async fn run() -> Result<(), String> {
     app.sounds.chime = settings.chime;
     app.schedule = settings.quiet.clone();
     quiet::set_schedule(settings.quiet.clone());
-    app.quiet = quiet::away();
+    app.quiet = quiet::arm();
     app.verbose = settings.verbose;
     set_measure(settings.text_width);
     margin::set_limits(settings.margin_notes, settings.margin_note_lines);
@@ -4711,12 +4711,12 @@ impl App {
                 }
                 _ = self.woken.notified() => changed = true,
             }
-            // Quiet starts when someone first asks past the hours (this
-            // check, at most a minute late) and ends in whichever window
-            // the person writes in: asked once a minute, never per frame.
+            // A window starts quiet once it is due (this check, at most a
+            // minute late) and it ends in whichever window the person
+            // writes in: asked once a minute, never per frame.
             if self.quiet_read.elapsed() >= quiet::READ_EVERY {
                 self.quiet_read = Instant::now();
-                self.quiet = quiet::away();
+                self.quiet = quiet::arm();
             }
             if self.picked_read.elapsed() > Duration::from_secs(1) {
                 self.picked_read = Instant::now();
