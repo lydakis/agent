@@ -767,6 +767,31 @@ pub fn forget(store: &Path, subscriber: &str, id: Option<i64>) -> Result<usize, 
     Ok(before - subs.len())
 }
 
+/// What `subscriber` holds that no bot now listed holds: all of it when
+/// no bot by that name is listed (`live` none), else what an older bot by
+/// that name added. A file written since the listing (`listed`) is left
+/// as it is: a bot made since may have written it. A delete the lookout
+/// missed while it was away ends them as one it saw does. How many went.
+pub fn unheld(
+    store: &Path,
+    subscriber: &str,
+    live: Option<i64>,
+    listed: std::time::SystemTime,
+) -> Result<usize, String> {
+    let _held = held(store)?;
+    let written = std::fs::metadata(file(store, subscriber)).and_then(|m| m.modified());
+    if written.is_ok_and(|at| at >= listed) {
+        return Ok(0);
+    }
+    let mut subs = read_whole(store, subscriber)?;
+    let before = subs.len();
+    subs.retain(|sub| live.is_some_and(|live| sub.owner.is_none_or(|owner| owner == live)));
+    if subs.len() < before {
+        write(store, subscriber, &subs)?;
+    }
+    Ok(before - subs.len())
+}
+
 /// A `subscriptions` call of `subscriber`'s: `add` one, as `to_json`
 /// writes it, or `remove` one by name, then list them all, with the
 /// `sources` the person set up. Adding one again changes nothing; one

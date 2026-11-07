@@ -5402,11 +5402,15 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         return ends(places, trigger, true);
     }
     // Its `--until` came: it ends now, sending nothing, as a subscription's
-    // `until` ends it, and its row says why.
-    if trigger.until.is_some_and(|until| now >= until) {
-        let ended = json!({"outcome": "ended", "detail": "its until came"});
-        settle(places, trigger, &ended, &kept);
-        return;
+    // `until` ends it, and its row says why. Asked again after a wait for a
+    // resume or its `--if`, so neither carries a send past it.
+    let ended = |at: i64| trigger.until.is_some_and(|until| at >= until);
+    let ends_now = |kept: &Kept| {
+        let ended = named(json!({"outcome": "ended", "detail": "its until came"}));
+        settle(places, trigger, &ended, kept);
+    };
+    if ended(now) {
+        return ends_now(&kept);
     }
     if !asked {
         // A one-off's calendar entry has no year: the same date a year early
@@ -5507,6 +5511,9 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
             settle(places, trigger, &failed, &kept);
             return;
         }
+    }
+    if ended(self::now()) {
+        return ends_now(&kept);
     }
     let outcome = with_daemon(trigger, async |client| {
         deliver(client, places, trigger, &mut kept, &why, ask).await
@@ -8326,7 +8333,42 @@ pub(crate) mod tests {
         assert_eq!(
             s.json(&json!({}))["until"],
             json!(until_text(s.until.unwrap()))
-        );
+        ); // A run asked for past its until ends naming the ask, so the one who
+        // asked hears it ended rather than waiting.
+        let t = Trigger {
+            name: "until-asked".into(),
+            ..s.clone()
+        };
+        w.install(&t).unwrap();
+        let taking = w.places.taking(&t.name);
+        std::fs::create_dir_all(&taking).unwrap();
+        let ask = Asked {
+            kind: Ask::Fire,
+            path: taking.join("1"),
+            receipt: w.places.receipt(&t.name, "1"),
+        };
+        std::fs::write(&ask.path, "").unwrap();
+        fire(&w.places, &t, Some(&ask));
+        let row = (w.rows().into_iter())
+            .find(|row| row["name"] == "until-asked")
+            .unwrap();
+        assert_eq!(
+            (&row["last"]["outcome"], &row["last"]["ask"]),
+            (&json!("ended"), &json!("1"))
+        ); // Its `--if` ran past its until: it ends, sending nothing.
+        let slow = Trigger {
+            name: "until-slow".into(),
+            until: Some(now() + 1),
+            gate: Some("sleep 2".into()),
+            dir: Some(w.root.clone()),
+            ..s.clone()
+        };
+        w.install(&slow).unwrap();
+        fire(&w.places, &slow, None);
+        let row = (w.rows().into_iter())
+            .find(|row| row["name"] == "until-slow")
+            .unwrap();
+        assert_eq!(row["last"]["outcome"], "ended", "{row}");
     }
 
     #[test]

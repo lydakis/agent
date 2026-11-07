@@ -1123,6 +1123,9 @@ impl Service {
         from_sources: &mut tokio::sync::mpsc::Receiver<sources::Said>,
     ) {
         let readers = Readers::connect(&self.socket, client.clone()).await;
+        // Subscriptions written after this are left as they are: a bot
+        // made since, which the listing may miss, may have written them.
+        let listed_at = std::time::SystemTime::now();
         let (bots, complete) = listed(&client).await;
         self.records = (bots.iter())
             .filter_map(|b| Some((b["name"].as_str()?.to_owned(), b.clone())))
@@ -1154,6 +1157,11 @@ impl Service {
         subs::steer_files(&self.store);
         let revisions = subs::revisions(&self.store);
         self.subscribers = subs::all(&self.store).into_iter().collect();
+        // Bots deleted while it was away: their subscriptions end now, as
+        // ones it hears deleted do. Only from a whole listing.
+        if complete && self.unheld(listed_at) {
+            self.subscribers = subs::all(&self.store).into_iter().collect();
+        }
         self.read_at.clear();
         subs::take(&mut self.read_at, &revisions, epoch_ms());
         subs::took(&self.store, &self.read_at);
@@ -1876,6 +1884,22 @@ impl Service {
         );
     }
 
+    /// Subscribers no bot now listed holds, as after deletes the lookout
+    /// was away for: what they held ends. Whether any did.
+    fn unheld(&self, listed: std::time::SystemTime) -> bool {
+        let mut any = false;
+        for name in self.subscribers.keys() {
+            let live = (self.records.get(name)).and_then(|bot| bot["bot_id"].as_i64());
+            let ended = subs::unheld(&self.store, name, live, listed);
+            if ended.as_ref().is_ok_and(|n| *n > 0) || ended.is_err() {
+                any = true;
+                self.write(&json!({"at_ms": epoch_ms(), "lead": name, "ended": "all",
+                    "why": "its subscriber was deleted", "error": ended.err()}));
+            }
+        }
+        any
+    }
+
     /// A bot was deleted: the subscriptions it held end with it, and so
     /// does any that watched only bots by their names, every one of them
     /// gone now, and no source.
@@ -2132,6 +2156,11 @@ impl Service {
                 .cloned()
                 .collect();
             if all || subs != lookout.subs {
+                let gone: Vec<String> = (lookout.subs.iter())
+                    .filter(|had| !subs.iter().any(|sub| sub.name == had.name))
+                    .map(|had| had.name.clone())
+                    .collect();
+                lookout.updates.ended(&gone);
                 lookout.subs = subs;
                 lookout.counting();
                 lookout.roots(&self.records, &self.made);
@@ -4218,6 +4247,25 @@ mod tests {
     }
 
     #[test]
+    fn news_only_an_ended_subscription_heard_goes_with_it() {
+        let mut lookout = seated("idle");
+        lookout.subs[0].digest = Some("1h".into());
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        let now = Instant::now();
+        ended(&mut lookout, 4, "completed");
+        let told = lookout.updates.take_at(now);
+        lookout.updates.sent(told);
+        // Held by the digest, then the subscription ends: no note tells it.
+        ended(&mut lookout, 5, "completed");
+        assert!(lookout.updates.news());
+        lookout.updates.ended(&["other".into()]);
+        assert!(lookout.updates.news(), "another's end leaves it");
+        lookout.updates.ended(&["tasks".into()]);
+        assert!(!lookout.updates.news());
+    }
+
+    #[test]
     fn a_task_note_and_a_sources_note_never_both_slip_one_digest() {
         let mut lookout = seated("idle");
         lookout.subs[0].digest = Some("1h".into());
@@ -5886,6 +5934,27 @@ mod tests {
         service.subscribers = subs::all(&store).into_iter().collect();
         service.ended_with("shop.docs", Some(3));
         assert_eq!(names(&store), ["glob", "ci"]);
+        // A delete the lookout was away for: a subscriber no longer listed
+        // ends whole, and one still listed keeps what its bot holds.
+        add(
+            "shop.gone",
+            4,
+            json!({"name": "old", "bots": ["shop.lead"]}),
+        );
+        service.subscribers = subs::all(&store).into_iter().collect();
+        let after = std::time::SystemTime::now() + Duration::from_secs(5);
+        assert!(service.unheld(after));
+        assert!(subs::read(&store, "shop.gone").is_empty());
+        assert_eq!(names(&store), ["glob", "ci"]);
+        service.subscribers = subs::all(&store).into_iter().collect();
+        assert!(!service.unheld(after), "nothing more");
+        // A file written since the listing is left: a bot made since may
+        // have written it.
+        add("shop.new", 5, json!({"name": "new", "bots": ["shop.lead"]}));
+        service.subscribers = subs::all(&store).into_iter().collect();
+        let before = std::time::SystemTime::now() - Duration::from_secs(5);
+        assert!(!service.unheld(before));
+        assert_eq!(subs::read(&store, "shop.new").len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -206,6 +206,26 @@ impl News {
         }
     }
 
+    /// These subscriptions ended: a piece only they heard is no news now,
+    /// and none of them holds back the rest. Whether any is left.
+    fn ended(&mut self, gone: &[String]) -> bool {
+        fn kept(hold: &mut super::activity::Hold, gone: &[String]) -> bool {
+            let heard = !hold.heard.is_empty();
+            hold.heard.retain(|sub| !gone.contains(sub));
+            hold.windows.retain(|(sub, _)| !gone.contains(sub));
+            !heard || !hold.heard.is_empty()
+        }
+        for turn in [&mut self.act, &mut self.theirs] {
+            if turn.as_mut().is_some_and(|t| !kept(&mut t.hold, gone)) {
+                *turn = None;
+            }
+        }
+        self.said.retain_mut(|said| kept(&mut said.hold, gone));
+        self.notes.retain_mut(|noted| kept(&mut noted.hold, gone));
+        self.asks.retain_mut(|asked| kept(&mut asked.hold, gone));
+        *self != News::default()
+    }
+
     /// When each piece of it may be told, as the subscriptions that heard
     /// that piece say: each keeps its own, so a piece told, read or left
     /// for a later note takes its digests with it.
@@ -1516,6 +1536,15 @@ impl Updates {
         self.take_at(Instant::now())
     }
 
+    /// Subscriptions that ended or were removed: what waits that only
+    /// they heard goes with them, as a source's events no longer heard do,
+    /// so one that lasted so many notes tells none past them.
+    pub fn ended(&mut self, gone: &[String]) {
+        if !gone.is_empty() {
+            self.tasks.retain_mut(|(_, news)| news.ended(gone));
+        }
+    }
+
     /// `take`, as of `now`: news a digest still holds waits too.
     pub fn take_at(&mut self, now: Instant) -> Told {
         // A task whose only news is a turn whose reply is still being read
@@ -1632,7 +1661,7 @@ impl Updates {
                         subs.push(sub.clone());
                     }
                 }
-                for sub in &hold.counted {
+                for sub in &hold.heard {
                     if !counted.contains(sub) {
                         counted.push(sub.clone());
                     }
