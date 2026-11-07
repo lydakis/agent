@@ -3824,8 +3824,16 @@ fn baseline(places: &Places, trigger: &Trigger, seen: &Seen, fresh: bool) -> Res
 /// otherwise, and nothing to an agent but a lead: quiet is the leads'
 /// alone.
 fn away_line(target: &Target) -> String {
-    let lead = matches!(target, Target::Bot { name, .. } if crate::project::is_lead(name));
-    match crate::quiet::away().filter(|_| lead) {
+    match target {
+        Target::Bot { name, .. } => away_to(name),
+        Target::Start { .. } => String::new(),
+    }
+}
+
+/// The away line for a prompt to `bot`, by name: as [`away_line`], for a
+/// result passed on to whoever the trigger replies to.
+fn away_to(bot: &str) -> String {
+    match crate::quiet::away().filter(|_| crate::project::is_lead(bot)) {
         Some(away) => format!(
             "[{}]\n",
             crate::quiet::away_clause(away, &crate::quiet::schedule())
@@ -5116,9 +5124,10 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
         ""
     };
     let prompt = format!(
-        "[automation {} · {} · {bot} turn {turn} {status}{cut}]\n{answer}",
+        "[automation {} · {} · {bot} turn {turn} {status}{cut}]\n{}{answer}",
         trigger.name,
-        stamp(now())
+        stamp(now()),
+        away_to(to)
     );
     let sent = client
         .request(
