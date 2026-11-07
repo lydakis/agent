@@ -60,6 +60,7 @@
 //! sky_haiku_hold = 10           # minutes the title is held before it can pass
 //! tool_processes = 8            # processes Sonny runs for agents at once in all: tool calls 3/4, goal checks 1/4; 0, the default, four times the CPUs
 //! lookout_waiting = 4096        # events from sources that wait for one agent, 1024 by default; past it newer ones are not kept, and its next note says so; 0 no limit
+//! lookout_rest_minutes = 30     # longest news without a digest waits for a busy agent to rest, 15 by default; news with a digest waits its digest; then it cuts in; 0 waits for rest however long
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
 //!
@@ -509,6 +510,10 @@ pub struct Sonny {
     /// newer ones are not kept, and its next note says how many, from
     /// where and when. 0 for no limit.
     pub lookout_waiting: u64,
+    /// The minutes news with no digest waits for a busy agent to rest,
+    /// before it cuts into the running turn; news with a digest waits its
+    /// digest. 0 waits for rest however long.
+    pub lookout_rest_minutes: u64,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
     /// The agent-browser action categories that the `browser` tool puts
@@ -614,6 +619,7 @@ impl Default for Sonny {
             sky_haiku_hold: 10,
             tool_processes: 0,
             lookout_waiting: 1024,
+            lookout_rest_minutes: 15,
             chime: true,
             verbose: false,
             text_width: TEXT_WIDTH,
@@ -1230,6 +1236,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_hold",
                 "tool_processes",
                 "lookout_waiting",
+                "lookout_rest_minutes",
                 "unsandboxed",
                 "default_permissions",
                 "browser_confirm",
@@ -1322,6 +1329,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "sky_haiku_hold" => Some(&mut config.sonny.sky_haiku_hold),
                 "tool_processes" => Some(&mut config.sonny.tool_processes),
                 "lookout_waiting" => Some(&mut config.sonny.lookout_waiting),
+                "lookout_rest_minutes" => Some(&mut config.sonny.lookout_rest_minutes),
                 "text_width" => Some(&mut config.sonny.text_width),
                 "margin_notes" => Some(&mut config.sonny.margin_notes),
                 _ => None,

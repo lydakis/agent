@@ -56,16 +56,27 @@ const NOTE_ITEMS: usize = 16;
 /// them newer ones are not kept, and its next note says so.
 const WAITING: usize = 1024;
 
-/// What `sonny.lookout_waiting` says now, 0 for no limit; and, read with
-/// it, the most notes a margin holds, the most of a task's notes its lead
-/// hears of at once. Settings that do not read keep the defaults.
-fn waiting() -> usize {
+/// How long news with no digest waits for a busy subscriber to rest
+/// unless `sonny.lookout_rest_minutes` says.
+const REST_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// What `sonny.lookout_waiting` says now, 0 for no limit, and how long
+/// news waits for a busy subscriber to rest (`sonny.lookout_rest_minutes`),
+/// none for however long; and, read with them, the most notes a margin
+/// holds, the most of a task's notes its lead hears of at once. Settings
+/// that do not read keep the defaults.
+fn waiting() -> (usize, Option<Duration>) {
     let Ok(sonny) = agent_client::config::load().map(|config| config.sonny) else {
         crate::margin::set_most_notes(agent_client::config::MARGIN_NOTES);
-        return WAITING;
+        return (WAITING, Some(REST_WAIT));
     };
     crate::margin::set_most_notes(sonny.margin_notes);
-    usize::try_from(sonny.lookout_waiting).unwrap_or(usize::MAX)
+    let rest = (sonny.lookout_rest_minutes > 0)
+        .then(|| Duration::from_secs(sonny.lookout_rest_minutes.saturating_mul(60)));
+    (
+        usize::try_from(sonny.lookout_waiting).unwrap_or(usize::MAX),
+        rest,
+    )
 }
 
 /// Events from sources a subscriber's full lookout did not keep: how many,
@@ -269,6 +280,10 @@ fn note(told: &updates::Told, steer: Option<&Steer>) -> String {
             "This cuts into your turn because your subscription {sub} says it steers: act on it \
             where it changes what you or a task is doing, then carry on with your turn."
         ),
+        Some(Steer::Late) => "This cuts into your turn because it waited as long as it may for \
+            your turn to end: act on it where it changes what you or a task is doing, then carry \
+            on with your turn."
+            .to_owned(),
         None => "Each ended turn comes with what the task replied; read a turn with one \
             wait call (timeout_ms 0) only when you need more of it, and act where something \
             changes the work. Tell the person, briefly, what they would want to \
@@ -293,6 +308,8 @@ enum Steer {
     Person,
     /// What a subscription's `urgent` matched.
     Rule(String),
+    /// News that waited as long as it may for the subscriber to rest.
+    Late,
 }
 
 /// FNV-1a, 64-bit, as the app keys its wakes: the same note twice is one submit.
@@ -721,10 +738,12 @@ async fn serve(settings: Settings) -> Result<(), String> {
     let mut log = settings.store.as_os_str().to_owned();
     log.push(".lookout.jsonl");
     let (sent, mut from_sources) = tokio::sync::mpsc::channel(256);
+    let (waiting, rest) = waiting();
     let mut service = Service {
         runner: sources::Runner::new(beside(&settings.store, ".sources"), sent),
         store: settings.store.clone(),
-        waiting: waiting(),
+        waiting,
+        rest,
         records: HashMap::new(),
         made: Made::default(),
         working: HashMap::new(),
@@ -842,6 +861,9 @@ struct Service {
     /// How many events from sources wait for one subscriber
     /// (`sonny.lookout_waiting`), as the settings said at the last read.
     waiting: usize,
+    /// How long news with no digest waits for a busy subscriber to rest
+    /// (`sonny.lookout_rest_minutes`), none for however long.
+    rest: Option<Duration>,
     /// The sources the person set up, running.
     runner: sources::Runner,
     /// Every bot as the daemon lists it, kept up from the stream: who made
@@ -1476,9 +1498,10 @@ impl Service {
                         reread = Some(now);
                         self.goals.reread();
                         self.runner.reload();
-                        self.waiting = waiting();
+                        (self.waiting, self.rest) = waiting();
                         for lookout in self.lookouts.values_mut() {
                             lookout.waiting = self.waiting;
+                            lookout.rest = self.rest;
                         }
                         self.reread(&client).await;
                     }
@@ -1990,6 +2013,7 @@ impl Service {
         let updates = updates_for(lead, &workspace, self.registry.clone(), self.live);
         let mut lookout = Lookout::new(lead);
         lookout.waiting = self.waiting;
+        lookout.rest = self.rest;
         self.seated += 1;
         lookout.id = self.seated;
         lookout.log = Some(self.log.clone());
@@ -2350,6 +2374,9 @@ struct Lookout {
     /// How many of those wait at most (`sonny.lookout_waiting`), 0 for no
     /// limit.
     waiting: usize,
+    /// How long news with no digest waits for the subscriber to rest
+    /// before it cuts in, news with one its digest; none for however long.
+    rest: Option<Duration>,
     /// What came past them, not kept, for the next note to say.
     unkept: Unkept,
     /// What the note on its way says was not kept, until the daemon takes it.
@@ -2419,6 +2446,7 @@ impl Lookout {
             from: None,
             heard: Vec::new(),
             waiting: WAITING,
+            rest: Some(REST_WAIT),
             unkept: Unkept::default(),
             unkept_sent: Unkept::default(),
             heard_since: None,
@@ -2894,10 +2922,11 @@ impl Lookout {
         };
         // The person's words cut in as they always did; else the
         // subscription whose `urgent` matched says why.
-        let steer = match (steer, self.urgent) {
-            (false, _) => None,
-            (true, true) => Some(Steer::Person),
-            (true, false) => Some(Steer::Rule(self.updates.urgent().unwrap_or("").to_owned())),
+        let steer = match (steer, self.urgent, self.updates.urgent()) {
+            (false, ..) => None,
+            (true, true, _) => Some(Steer::Person),
+            (true, false, Some(rule)) => Some(Steer::Rule(rule.to_owned())),
+            (true, false, None) => Some(Steer::Late),
         };
         let told = self.updates.take_at(now);
         // All there is waits on replies being read.
@@ -3103,7 +3132,7 @@ impl Lookout {
             return None;
         }
         let urgent = self.urgent || self.updates.urgent().is_some();
-        let steer = urgent && self.updates.busy();
+        let steer = (urgent || self.late(now)) && self.updates.busy();
         // Only what came while the news settled is waited for: on a busy
         // fleet some read is always under way, and what came after goes in
         // the note after.
@@ -3112,6 +3141,17 @@ impl Lookout {
             now >= since + SETTLE && (read || now >= since + SETTLE_MAX)
         });
         (steer || (settled && self.updates.due_at(now))).then_some(steer)
+    }
+
+    /// The news a note may tell now has waited as long as it may for the
+    /// subscriber to rest: a busy one then hears it in its running turn, as
+    /// a digest promises at most its span and a turn kept going by steers
+    /// from elsewhere may never end.
+    fn late(&self, now: Instant) -> bool {
+        let (Some(rest), Some(since)) = (self.rest, self.since) else {
+            return false;
+        };
+        now >= since + self.updates.rest_wait(now, rest)
     }
 
     /// The last note was refused lately: even a steer waits the gap after.
@@ -3376,13 +3416,16 @@ impl Lookout {
         if !sent.is_empty() {
             let steer = sent.iter().any(|heard| heard.event.steer);
             let unkept = self.unkept_sent.line(self.waiting, epoch_ms() as u64);
-            let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref());
+            let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref(), false);
             return self.source(client, woken, sent, prompt, steer);
         }
-        let steer = self.heard.iter().any(|heard| heard.event.steer);
-        if !(steer || (now >= since + SETTLE && self.updates.idle())) {
+        let urgent = self.heard.iter().any(|heard| heard.event.steer);
+        let rests = now >= since + SETTLE && self.updates.idle();
+        let late = !urgent && !rests && self.heard_late(now);
+        if !(urgent || rests || late) {
             return;
         }
+        let steer = urgent || late;
         // A bounded note sends what is urgent first, and always at least
         // one; what a digest still holds waits after the rest.
         let (mut ready, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.heard)
@@ -3403,8 +3446,27 @@ impl Lookout {
         // What did not fit is told with it, and again if it is refused.
         self.unkept_sent = std::mem::take(&mut self.unkept);
         let unkept = self.unkept_sent.line(self.waiting, epoch_ms() as u64);
-        let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref());
+        let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref(), late);
         self.source(client, woken, sent, prompt, steer);
+    }
+
+    /// Something its sources said that may be told now has waited as long
+    /// as it may for the subscriber to rest: its subscription's digest, else
+    /// its source's, else the lookout's wait for rest.
+    fn heard_late(&self, now: Instant) -> bool {
+        let Some(rest) = self.rest else {
+            return false;
+        };
+        let now_ms = epoch_ms();
+        (self.heard.iter())
+            .filter(|heard| self.ready(heard, now))
+            .any(|heard| {
+                let own = (heard.subs.iter())
+                    .filter_map(|sub| self.sub_digest(sub))
+                    .min();
+                let wait = own.or(heard.event.digest).unwrap_or(rest);
+                now_ms.saturating_sub(heard.event.at_ms) >= wait.as_millis()
+            })
     }
 
     /// Sends `sent` as one note, its request named by the events it tells,
@@ -3839,6 +3901,37 @@ mod tests {
             ..said(8, PERSON, "tabs")
         });
         assert!(!busy.urgent && busy.wake_due(now).is_none());
+    }
+
+    #[test]
+    fn news_a_busy_lead_never_rests_for_cuts_in_once_it_waited_long_enough() {
+        let mut lookout = seated("running");
+        let now = Instant::now();
+        lookout.heard(&said(5, "calc.docs", "the docs build is red"));
+        lookout.since = Some(now);
+        assert!(!lookout.urgent);
+        // It waits for the lead to rest, as long as it may.
+        assert_eq!(lookout.wake_due(now + SETTLE), None);
+        assert_eq!(lookout.wake_due(now + REST_WAIT - SETTLE), None);
+        // Then it cuts in, and says why.
+        assert_eq!(lookout.wake_due(now + REST_WAIT), Some(true));
+        let told = lookout.updates.take_at(now + REST_WAIT);
+        assert!(note(&told, Some(&Steer::Late)).ends_with(
+            "This cuts into your turn because it waited as long as it may for your turn to \
+            end: act on it where it changes what you or a task is doing, then carry on with \
+            your turn."
+        ));
+        // `0` waits for rest however long, as before.
+        let mut patient = seated("running");
+        patient.rest = None;
+        patient.heard(&said(6, "calc.docs", "the docs build is red"));
+        patient.since = Some(now);
+        assert_eq!(patient.wake_due(now + 24 * REST_WAIT), None);
+        // A lead that rests hears it as it always did, as no steer.
+        let mut idle = seated("idle");
+        idle.heard(&said(7, "calc.docs", "the docs build is red"));
+        idle.since = Some(now);
+        assert_eq!(idle.wake_due(now + 24 * REST_WAIT), Some(false));
     }
 
     /// A task's turn the lead asked for, ended as `status`.
@@ -4743,6 +4836,7 @@ mod tests {
             runner: sources::Runner::new(store.join("sources"), tokio::sync::mpsc::channel(1).0),
             store,
             waiting: WAITING,
+            rest: Some(REST_WAIT),
             records: (records.iter())
                 .map(|r| (r["name"].as_str().unwrap().to_owned(), r.clone()))
                 .collect(),
@@ -5533,6 +5627,52 @@ mod tests {
     }
 
     #[test]
+    fn what_sources_said_waits_for_rest_at_most_its_digest_or_the_rest_wait() {
+        let mut lookout = lookout();
+        let mut chat = hears("chat");
+        chat.digest = Some("10m".into());
+        lookout.subs.push(chat);
+        lookout.subs.push(hears("eng"));
+        let now = Instant::now();
+        let at = |ago: Duration| epoch_ms() - ago.as_millis();
+        let ten = Duration::from_secs(600);
+        // Heard by a subscription with a digest: late once it waited that.
+        let mut lunch = slack("lunch?", false);
+        lunch.at_ms = at(ten - Duration::from_secs(60));
+        lookout.subs.retain(|sub| sub.name == "chat");
+        lookout.heard_from(&lunch);
+        assert!(!lookout.heard_late(now));
+        lookout.heard[0].event.at_ms = at(ten);
+        assert!(lookout.heard_late(now));
+        // One its digest still holds is not late: it may not be told yet.
+        lookout.updates.told_subs.insert("chat".into(), now);
+        assert!(!lookout.heard_late(now));
+        lookout.updates.told_subs.clear();
+        // Heard with no digest at all: it waits the lookout's rest wait.
+        lookout.subs = vec![hears("eng")];
+        lookout.rehear();
+        assert!(!lookout.heard_late(now));
+        lookout.heard[0].event.at_ms = at(REST_WAIT);
+        assert!(lookout.heard_late(now));
+        // Its source's digest takes the rest wait's place.
+        lookout.heard[0].event.digest = Some(Duration::from_secs(3600));
+        lookout.heard[0].event.at_ms = at(Duration::from_secs(1800));
+        lookout.told_sources.clear();
+        assert!(!lookout.heard_late(now));
+        lookout.heard[0].event.at_ms = at(Duration::from_secs(3600));
+        assert!(lookout.heard_late(now));
+        // `0` waits however long.
+        lookout.rest = None;
+        assert!(!lookout.heard_late(now));
+        // The note says why it cuts in.
+        let note = sources::note(&lookout.heard, 0, None, true);
+        assert!(note.ends_with(
+            "This cuts into your turn because it waited as long as it may for your turn to \
+            end: act where something changes your work, then carry on with your turn."
+        ));
+    }
+
+    #[test]
     fn a_topic_is_heard_by_its_subscriptions_and_the_source_s() {
         let mut lookout = lookout();
         let mut thread = sub("commons.flaky", &[], &[]);
@@ -5598,7 +5738,7 @@ mod tests {
         // under the same request.
         let mut sending = made();
         sending.heard_from(&slack("two", false));
-        let asked = sources::note(&sending.heard, 0, None);
+        let asked = sources::note(&sending.heard, 0, None, false);
         let sent = std::mem::take(&mut sending.heard);
         sending.sourcing = Some((sent, vec!["k".into()], "queue"));
         sending.heard_from(&slack("three", false));
@@ -5611,7 +5751,7 @@ mod tests {
         assert_eq!(back.resend.len(), 1);
         assert_eq!(back.resend[0].event.text, "two");
         assert_eq!(back.heard.len(), 1);
-        assert_eq!(sources::note(&back.resend, 0, None), asked);
+        assert_eq!(sources::note(&back.resend, 0, None, false), asked);
         // Another bot of the name hears none of it.
         let mut other = Lookout::new("calc.lead");
         other.subs.push(hears("chat"));
@@ -5949,13 +6089,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sources_cut_into_a_subscriber_that_never_rests_once_late() {
+        let (client, mut got) = submits().await;
+        let mut lookout = lookout();
+        lookout.updates.live = true;
+        lookout.subs.push(hears("chat"));
+        busy(&mut lookout);
+        lookout.heard_from(&sources::Event {
+            at_ms: epoch_ms() - REST_WAIT.as_millis(),
+            ..slack("lunch?", false)
+        });
+        lookout.heard_since = Some(Instant::now() - REST_WAIT);
+        wake_sources(&mut lookout, &client).await;
+        let submit = got.recv().await.unwrap();
+        assert_eq!(submit["delivery"], "steer");
+        let prompt = submit["prompt"].as_str().unwrap();
+        assert!(prompt.contains("it waited as long as it may"), "{prompt}");
+        assert!(lookout.heard.is_empty());
+    }
+
+    #[tokio::test]
     async fn sources_are_told_with_an_origin_once_the_subscriber_rests() {
         let (client, mut got) = submits().await;
         let mut lookout = lookout();
         lookout.updates.live = true;
         lookout.subs.push(hears("chat"));
         busy(&mut lookout);
-        lookout.heard_from(&slack("lunch?", false));
+        lookout.heard_from(&sources::Event {
+            at_ms: epoch_ms(),
+            ..slack("lunch?", false)
+        });
         lookout.heard_since = Some(Instant::now() - SETTLE);
         // Busy: it waits.
         wake_sources(&mut lookout, &client).await;

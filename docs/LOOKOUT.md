@@ -7,7 +7,7 @@ bot and submits one short note to the subscriber, which decides itself
 what matters. Nothing judges the news. The lookout decides only when the
 subscriber hears it: the person's own words in a task cut into its
 running turn, as their words to it would; everything else waits until it
-rests. It also runs the sources the person sets up outside the daemon,
+rests, but no longer than it may (Late news, below). It also runs the sources the person sets up outside the daemon,
 such as a chat poller, and tells their news to the bots that subscribed
 to them (Sources, below). Neither the daemon nor the `agent` CLI knows of
 it.
@@ -451,6 +451,22 @@ own words in a task always steer, whatever any subscription says.
 `steer`. A steer joins the running turn and starts none, so what it
 interrupts makes no news of its own for another subscriber: subscriptions
 that steer on each other cannot wake each other in a loop.
+
+### Late news
+
+News waits for its subscriber to rest at most so long, then cuts into the
+running turn as a steer does: news a digest held waits its digest (the
+subscription's, else its source's), and other news
+`sonny.lookout_rest_minutes`, 15 by default; 0 waits however long. A
+digest promises "at most every while", not "only when you rest", and a
+subscriber kept busy by messages from elsewhere may never rest: a turn
+that steers keep going need not end, and one queued after another leaves
+no moment between them. For task updates the wait counts from when the
+news could first be told; for what sources said, from when the lookout
+read it. The note then ends "This cuts into your turn because it waited
+as long as it may for your turn to end", and goes as a steer. The
+person's words, a subscription's `steer` and a source's urgent events go
+at once as before; a subscriber that rests hears everything as before.
 
 Who sets which: an agent adds `steer` itself for what it owns, as a pull
 request it opened; a `filter` or a `digest` only when the person asks for

@@ -1012,6 +1012,23 @@ impl Updates {
         }
     }
 
+    /// How long the news a note may tell now waits for the lead to rest
+    /// before it cuts in: `rest` for what goes as soon as the lead rests,
+    /// a digest's own span for what a digest held; the shortest of those.
+    pub fn rest_wait(&self, now: Instant, rest: Duration) -> Duration {
+        let ready = (self.tasks.iter()).filter(|(_, news)| self.ready(news, now));
+        (ready.flat_map(|(_, news)| news.holds()))
+            .flat_map(|hold| {
+                let now_ = hold.now.then_some(rest);
+                let windows = (hold.windows.iter())
+                    .filter(|(sub, digest)| self.sub_ready(sub, *digest, now))
+                    .map(|(_, digest)| *digest);
+                now_.into_iter().chain(windows)
+            })
+            .min()
+            .unwrap_or(rest)
+    }
+
     /// Whether there is news a note may tell now.
     pub fn news_ready(&self, now: Instant) -> bool {
         self.live && self.tasks.iter().any(|(_, news)| self.ready(news, now))
