@@ -78,6 +78,8 @@ pub enum Tag {
     Note(u64),
     /// A `plan` call, by the client's number for it.
     Plan(u64),
+    /// A question's card, by the client's number for it.
+    Ask(u64),
     /// The last row of the words streamed as this item of the running
     /// turn, until their message names its node.
     Streamed(u64),
@@ -425,6 +427,16 @@ impl Screen {
     }
 
     /// The row tagged `tag`, the newest if more are.
+    /// The question cards whose rows the screen still keeps, by number.
+    pub fn ask_tags(&self) -> std::collections::HashSet<u64> {
+        (self.rows.iter())
+            .filter_map(|row| match row.tag {
+                Some(Tag::Ask(n)) => Some(n),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn tagged(&self, tag: Tag) -> Option<usize> {
         self.rows.iter().rposition(|row| row.tag == Some(tag))
     }

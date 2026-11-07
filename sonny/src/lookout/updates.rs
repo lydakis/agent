@@ -95,6 +95,14 @@ impl Turn {
     }
 }
 
+/// A turn's end told before who asked was read: `asked_by` names it.
+fn unnamed(t: &Turn, turn: i64) -> bool {
+    t.turn == turn
+        && t.count == 1
+        && t.by.is_none()
+        && ![APPROVAL, QUIET].contains(&t.status.as_str())
+}
+
 /// A message written in a task: who wrote it, and the words, only when
 /// the person did, kept to know the same words again; the note quotes
 /// them whole, `bytes` long.
@@ -363,6 +371,8 @@ pub struct Updates {
     /// note the lead had not heard: a filter on who asked hears them as
     /// they are.
     unheard: HashMap<Key, (Turn, bool)>,
+    /// The lead's waits still running, by call, and what each read.
+    waits: HashMap<String, Read>,
     /// The turn that last ended and who asked for it, as its end names
     /// them: none when that is still to be read.
     ended: Option<(Key, Option<String>)>,
@@ -376,6 +386,22 @@ struct Forward {
     from: Option<String>,
     origin: Option<String>,
     reply: Option<String>,
+}
+
+/// What a wait of the lead's took from the news as it started: put back if
+/// the wait ends without handing those turns over, failed or cancelled.
+/// What changes these where they were changes them here too: who asked
+/// (`asked_by`), the reply (`replied`), a forward passed on.
+#[derive(Default)]
+struct Read {
+    /// The lead's turn the wait runs in: only its end ends the wait.
+    turn: i64,
+    news: Vec<(String, News)>,
+    unheard: Vec<(Key, (Turn, bool))>,
+    /// Of those, the ones whose asker and reply were read while the wait
+    /// ran: their end as `asked_by` and `replied` would have told it.
+    heard: Vec<(Key, Turn, bool)>,
+    forwarding: Vec<(Key, Forward)>,
 }
 
 /// A reply cut to `REPLY_CHARS`, and further while it reads past
@@ -488,6 +514,7 @@ impl Updates {
             replying: HashSet::new(),
             runs: HashMap::new(),
             unheard: HashMap::new(),
+            waits: HashMap::new(),
         }
     }
 
@@ -603,6 +630,11 @@ impl Updates {
                             false => {
                                 self.forwarding.remove(&key);
                             }
+                        }
+                        // Or held by a wait still running: passed on all
+                        // the same, whatever the wait comes to.
+                        for read in self.waits.values_mut() {
+                            read.forwarding.retain(|(k, _)| *k != key);
                         }
                     }
                 } else if let Some(by) = data["origin"].as_str().or(data["person"].as_str()) {
@@ -752,6 +784,20 @@ impl Updates {
             }
             "turn_finished" => {
                 let Some(turn) = turn else { return };
+                // A wait still open as its turn ends handed nothing. Another
+                // turn of the lead's ending (a steer it took, a queued one
+                // stopped) leaves the running turn's waits be.
+                if name == self.lead {
+                    let ended: Vec<String> = (self.waits.iter())
+                        .filter(|(_, read)| read.turn == turn)
+                        .map(|(call, _)| call.clone())
+                        .collect();
+                    for call in ended {
+                        if let Some(read) = self.waits.remove(&call) {
+                            self.unread(read);
+                        }
+                    }
+                }
                 self.approvals.remove(&key(turn));
                 let status = data["status"].as_str().unwrap_or("?").to_owned();
                 let from = self.from.remove(&key(turn));
@@ -1033,6 +1079,7 @@ impl Updates {
         self.replying.remove(&(name.to_owned(), turn));
         self.asker_unread(name, turn);
         let text = text.trim();
+        self.replied_held(&(name.to_owned(), turn), text);
         if !self.live {
             return;
         }
@@ -1061,6 +1108,30 @@ impl Updates {
         }
     }
 
+    /// A reply read while a wait of the lead's holds its turn: kept with
+    /// it, for a wait that ends without handing it over. An automation's
+    /// run that went well and found no words is no news.
+    fn replied_held(&mut self, key: &Key, text: &str) {
+        let reply = (!text.is_empty()).then(|| quotable(text));
+        for read in self.waits.values_mut() {
+            (read.heard).retain(|(k, told, _)| k != key || reply.is_some() || !told.run());
+            for (_, told, _) in read.heard.iter_mut().filter(|(k, ..)| k == key) {
+                told.reply = reply.clone();
+            }
+            let Some(reply) = &reply else { continue };
+            for (_, news) in read.news.iter_mut().filter(|(name, _)| *name == key.0) {
+                for told in [&mut news.act, &mut news.theirs].into_iter().flatten() {
+                    if told.turn == key.1 {
+                        told.reply = Some(reply.clone());
+                    }
+                }
+            }
+            for (_, forward) in read.forwarding.iter_mut().filter(|(k, _)| k == key) {
+                forward.reply = Some(text.to_owned());
+            }
+        }
+    }
+
     /// Whether who asked for a turn that just ended is still to be read.
     pub fn asker_unknown(&self, name: &str, turn: i64) -> bool {
         self.unknown.contains(&(name.to_owned(), turn))
@@ -1083,6 +1154,45 @@ impl Updates {
             forward.from = from.clone();
             forward.origin = origin.clone();
         }
+        // Held by a wait still running: kept as heard, for the wait's end.
+        for read in self.waits.values_mut() {
+            for (_, forward) in (read.forwarding.iter_mut()).filter(|(k, _)| *k == key) {
+                forward.from = from.clone();
+                forward.origin = origin.clone();
+            }
+        }
+        let held = (self.waits.iter()).find_map(|(call, read)| {
+            let at = read.unheard.iter().position(|(k, _)| *k == key)?;
+            Some((call.clone(), at, read.unheard[at].1.0.status.clone()))
+        });
+        if let Some((call, at, status)) = held {
+            let by = self.by(&status, from, origin);
+            let read = self.waits.get_mut(&call).expect("found above");
+            let (key, (mut told, answered)) = read.unheard.remove(at);
+            told.by = by;
+            read.heard.push((key, told, answered));
+            return;
+        }
+        // Or news a wait holds, with no subscription rules: named as it
+        // would be below, and told by `put` if the wait hands it back.
+        let held = (self.waits.iter()).find_map(|(call, read)| {
+            let at = (read.news.iter()).position(|(task, news)| {
+                task == name && news.act.as_ref().is_some_and(|t| unnamed(t, turn))
+            })?;
+            let status = read.news[at].1.act.as_ref()?.status.clone();
+            Some((call.clone(), at, status))
+        });
+        if let Some((call, at, status)) = held {
+            let by = self.by(&status, from, origin);
+            let read = self.waits.get_mut(&call).expect("found above");
+            let mut told = read.news[at].1.act.take().expect("found above");
+            if read.news[at].1.empty() {
+                read.news.remove(at);
+            }
+            told.by = by;
+            read.heard.push((key, told, false));
+            return;
+        }
         if let Some((mut told, answered)) = self.unheard.remove(&key) {
             told.by = self.by(&told.status, from, origin);
             if told.run() {
@@ -1096,11 +1206,7 @@ impl Updates {
             return;
         };
         let told = self.tasks[at].1.act.as_ref();
-        let Some(status) = told
-            .filter(|t| t.turn == turn && t.count == 1 && t.by.is_none())
-            .filter(|t| ![APPROVAL, QUIET].contains(&t.status.as_str()))
-            .map(|t| t.status.clone())
-        else {
+        let Some(status) = told.filter(|t| unnamed(t, turn)).map(|t| t.status.clone()) else {
             return;
         };
         let by = self.by(&status, from, origin);
@@ -1384,32 +1490,88 @@ impl Updates {
         }
     }
 
-    /// The lead read these turns with its wait tool: what they said is no
-    /// news to it any more.
-    pub fn read(&mut self, handles: &HashSet<String>) {
+    /// The lead's wait `call`, in its turn `lead_turn`, started on these
+    /// turns: what they said is no news to it any more, once the wait
+    /// hands them over (`wait_ended`).
+    pub fn read(&mut self, lead_turn: i64, call: &str, handles: &HashSet<String>) {
+        let reads = |name: &str, turn: i64| handles.contains(&format!("turn:{name}/{turn}"));
+        let mut read = self.waits.remove(call).unwrap_or_default();
+        read.turn = lead_turn;
         for (name, news) in &mut self.tasks {
-            for kind in [&mut news.act, &mut news.theirs] {
+            let mut took = News::default();
+            for (kind, into) in [
+                (&mut news.act, &mut took.act),
+                (&mut news.theirs, &mut took.theirs),
+            ] {
                 // How a goal ended is no part of what the wait read.
                 if kind.as_ref().is_some_and(|t| {
                     t.status != APPROVAL
                         && t.status != QUIET
                         && t.goal.is_none()
-                        && handles.contains(&format!("turn:{name}/{}", t.turn))
+                        && reads(name, t.turn)
                 }) {
-                    *kind = None;
+                    *into = kind.take();
                 }
+            }
+            if took != News::default() {
+                read.news.push((name.clone(), took));
             }
         }
         self.tasks.retain(|(_, news)| !news.empty());
         // As is one whose asker is still to be read.
-        self.unheard.retain(|(name, turn), (t, _)| {
-            t.goal.is_some() || !handles.contains(&format!("turn:{name}/{turn}"))
-        });
+        read.unheard.extend(
+            self.unheard
+                .extract_if(|(name, turn), (t, _)| t.goal.is_none() && reads(name, *turn)),
+        );
         // A turn its goal's check holds stays: the wait read how it ended,
         // not how its goal did.
-        self.forwarding.retain(|key, _| {
-            self.goaled.contains(key) || !handles.contains(&format!("turn:{}/{}", key.0, key.1))
-        });
+        let goaled = &self.goaled;
+        read.forwarding.extend(
+            self.forwarding
+                .extract_if(|key, _| !goaled.contains(key) && reads(&key.0, key.1)),
+        );
+        self.waits.insert(call.to_owned(), read);
+    }
+
+    /// The lead's wait `call` ended, and `handed` says whether its result
+    /// holds the turns it read: a failed or cancelled one held none, so
+    /// what it took is news again.
+    pub fn wait_ended(&mut self, call: &str, handed: bool) {
+        if let Some(read) = self.waits.remove(call)
+            && !handed
+        {
+            self.unread(read);
+        }
+    }
+
+    /// What `read` took, put back, less the news of tasks gone since.
+    fn unread(&mut self, read: Read) {
+        for (name, news) in read.news {
+            if self.task(&name) {
+                self.news_of(&name).merge(news);
+            }
+        }
+        for (key, held) in read.unheard {
+            if self.task(&key.0) {
+                self.unheard.entry(key).or_insert(held);
+            }
+        }
+        // Its reply was read with who asked, while the wait held it.
+        for ((name, _), told, answered) in read.heard {
+            if self.task(&name) {
+                self.put(&name, told, answered);
+            }
+        }
+        for (key, forward) in read.forwarding {
+            if self.task(&key.0) {
+                self.forwarding.entry(key).or_insert(forward);
+            }
+        }
+    }
+
+    /// Whether a wait of the lead's still runs on news it took.
+    pub fn waiting(&self) -> bool {
+        !self.waits.is_empty()
     }
 
     /// Whether ended turns wait to be told, on a trigger or a goal's check.
@@ -1693,6 +1855,7 @@ impl Updates {
     /// The lead was deleted, or another took its name: what was news for
     /// it is no one's.
     pub fn forget(&mut self) {
+        self.waits.clear();
         self.tasks.clear();
         self.runs.clear();
         self.unheard.clear();
@@ -1739,6 +1902,12 @@ impl Updates {
     }
 
     fn drop_news(&mut self, name: &str) {
+        for read in self.waits.values_mut() {
+            read.news.retain(|(task, _)| task != name);
+            read.unheard.retain(|((task, _), _)| task != name);
+            read.heard.retain(|((task, _), ..)| task != name);
+            read.forwarding.retain(|((task, _), _)| task != name);
+        }
         self.tasks.retain(|(task, _)| task != name);
         self.runs.retain(|(task, _), _| task != name);
         self.unheard.retain(|(task, _), _| task != name);
@@ -2479,7 +2648,7 @@ mod tests {
         // ended is still news.
         updates.goal_turn("shop.fix", 9);
         turn(&mut updates, "shop.fix", 9, goal.clone(), "completed");
-        updates.read(&["turn:shop.fix/9".to_owned()].into());
+        updates.read(9, "w", &["turn:shop.fix/9".to_owned()].into());
         updates.goal_settled("shop.fix", 9, Some(", and met its goal: its check exits 0"));
         let told = updates.take();
         assert!(text(&told).contains("turn:shop.fix/9 completed, asked by goal, and met its goal"));
@@ -2492,7 +2661,7 @@ mod tests {
             10,
             Some(", and met its goal: its check exits 0"),
         );
-        updates.read(&["turn:shop.fix/10".to_owned()].into());
+        updates.read(9, "w", &["turn:shop.fix/10".to_owned()].into());
         let told = updates.take();
         assert!(
             text(&told).contains("turn:shop.fix/10 completed, asked by goal, and met its goal")
@@ -2963,7 +3132,7 @@ mod tests {
         // A wait that returned before the turn ended read no silence.
         updates.event(&ev("shop.fix", Some(3), "text_delta", json!({})), later);
         updates.expire(later + QUIET_AFTER);
-        updates.read(&["turn:shop.fix/3".to_owned()].into());
+        updates.read(9, "w", &["turn:shop.fix/3".to_owned()].into());
         let told = updates.take();
         assert_eq!(told.items.len(), 1);
         // Printing again starts a new silence, which is news of its own.
@@ -2995,6 +3164,59 @@ mod tests {
             silent(&mut updates, at + 4 * QUIET_AFTER)
                 .contains("turn:shop.fix/8 has printed nothing")
         );
+    }
+
+    #[test]
+    fn what_a_wait_held_takes_who_asked_and_a_forward_passed_on_meanwhile() {
+        let mut updates = fleet();
+        let now = Instant::now();
+        let done = |turn| {
+            ev(
+                "shop.fix",
+                Some(turn),
+                "turn_finished",
+                json!({"status": "completed"}),
+            )
+        };
+        let reads = |handle: &str| HashSet::from([handle.to_owned()]);
+        // Turns not seen starting, their news held by a wait while who
+        // asked is read; then the wait fails. An automation's run that
+        // said nothing is no news.
+        updates.event(&done(4), now);
+        assert!(updates.asker_unknown("shop.fix", 4));
+        updates.read(9, "w1", &reads("turn:shop.fix/4"));
+        assert!(!updates.news());
+        updates.asked_by("shop.fix", 4, None, Some("automation".into()));
+        updates.replied("shop.fix", 4, "");
+        updates.wait_ended("w1", false);
+        assert!(!updates.news());
+        // One the person asked for is theirs.
+        updates.event(&done(5), now);
+        updates.read(9, "w2", &reads("turn:shop.fix/5"));
+        updates.asked_by("shop.fix", 5, None, None);
+        updates.replied("shop.fix", 5, "done");
+        updates.wait_ended("w2", false);
+        let told = updates.take();
+        assert_eq!(told.items.len(), 1);
+        assert!(told.items[0].theirs, "{}", told.items[0].text);
+        assert!(
+            told.items[0].text.contains("> done"),
+            "{}",
+            told.items[0].text
+        );
+        updates.sent(told);
+        // A trigger's answer passed on while a wait held its turn stays
+        // passed on when the wait fails.
+        let fire = json!({"request_id": "trigger_t6.to.1"});
+        turn(&mut updates, "shop.docs", 6, fire, "completed");
+        assert_eq!(updates.forwarding.len(), 1);
+        updates.read(9, "w3", &reads("turn:shop.docs/6"));
+        let passed = json!({"from": {"bot": "shop.docs", "turn": 6}});
+        updates.event(&ev("shop.lead", Some(10), "accepted", passed), now);
+        updates.wait_ended("w3", false);
+        assert!(updates.forwarding.is_empty());
+        updates.expire(Instant::now() + FORWARD);
+        assert!(!updates.news());
     }
 
     #[test]
@@ -3030,9 +3252,9 @@ mod tests {
             "completed",
         );
         // Reading an earlier turn leaves the latest news.
-        updates.read(&["turn:shop.fix/4".to_owned()].into());
+        updates.read(9, "w", &["turn:shop.fix/4".to_owned()].into());
         assert!(updates.due());
-        updates.read(&["turn:shop.fix/5".to_owned()].into());
+        updates.read(9, "w", &["turn:shop.fix/5".to_owned()].into());
         assert!(!updates.due());
     }
 
