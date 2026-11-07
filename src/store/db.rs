@@ -88,6 +88,10 @@ pub struct Bot {
     /// The creator's captured identity, validated by the store. A later bot
     /// reusing the name is not mistaken for it. `None` for a root bot.
     pub created_by_id: Option<i64>,
+    /// Generations below the bot that starts its line: 0 for one made with
+    /// no creator or made to start a line, its creator's and one for any
+    /// other, and its source's for a fork its source made.
+    pub depth: u64,
     /// The node of the bot's current carry-forward note, if it wrote one.
     pub note: Option<i64>,
     /// The node of the bot's current compaction, if any, and the client's
@@ -963,6 +967,8 @@ pub struct Binding<'a> {
     /// The client's idempotency key: a resend with the same key and fields
     /// gets the bot it made.
     pub request_id: Option<&'a str>,
+    /// The bot starts a line of its own, at depth 0, though it has a creator.
+    pub starts_line: bool,
 }
 #[derive(Debug)]
 pub struct Started {
@@ -1925,6 +1931,9 @@ pub struct Database {
     /// Bounds on submissions waiting to start, turns and prompt bytes; zero
     /// is unbounded. Daemon configuration, set once after open.
     pending_limits: (usize, usize),
+    /// The most generations a bot may be below the one that starts its
+    /// line; `None` for no bound. Daemon configuration, set once after open.
+    max_depth: Option<u64>,
     /// Queued and ready turns and their prompt and quoted bytes. Counted from the rows
     /// at open and kept by the one writer at each transition, so admission
     /// and `stats` cost nothing on the store.
@@ -2285,7 +2294,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 82;
+    pub const SCHEMA: i32 = 83;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2316,6 +2325,7 @@ impl Database {
         Ok(Self {
             conn,
             pending_limits: (0, 0),
+            max_depth: None,
             pending: (0, 0),
             approvals: 0,
             outcomes: Vec::new(),
@@ -2458,7 +2468,7 @@ impl Database {
                 expire_ms INTEGER, expires_at INTEGER,
                 sent_bytes INTEGER, sent_tokens INTEGER, compact_asked INTEGER NOT NULL DEFAULT 0,
                 declared TEXT, work INTEGER NOT NULL DEFAULT 0, work_read INTEGER,
-                budget_counts TEXT);
+                budget_counts TEXT, depth INTEGER NOT NULL DEFAULT 0);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -2578,6 +2588,7 @@ impl Database {
         let mut db = Self {
             conn,
             pending_limits: (0, 0),
+            max_depth: None,
             pending: (0, 0),
             approvals: 0,
             outcomes: Vec::new(),
@@ -2950,6 +2961,7 @@ impl Database {
             bot_id: r.get(15)?,
             created_by: r.get(16)?,
             created_by_id: r.get(17)?,
+            depth: r.get::<_, i64>(44)?.max(0) as u64,
             note: r.get(18)?,
             compaction: r.get(19)?,
             compaction_instructions: r.get(20)?,
@@ -3021,23 +3033,25 @@ impl Database {
             },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
-    fn creator_id(
+    /// Its id and depth, read in the same query.
+    fn creator(
         conn: &Connection,
         creator: Option<&str>,
         expected: Option<i64>,
-    ) -> Result<Option<i64>> {
+    ) -> Result<Option<(i64, u64)>> {
         match (creator, expected) {
             (None, None) => Ok(None),
             (Some(creator), Some(id)) => {
                 let found = conn
-                    .query_row(
-                        "SELECT id FROM bots WHERE name=? AND id=? AND status!='deleting'",
-                        params![creator, id],
-                        |r| r.get::<_, i64>(0),
-                    )
+                    .prepare_cached(
+                        "SELECT id,depth FROM bots WHERE name=? AND id=? AND status!='deleting'",
+                    )?
+                    .query_row(params![creator, id], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+                    })
                     .optional()?;
                 found.map(Some).ok_or(Error::new("creator_not_found"))
             }
@@ -3423,7 +3437,7 @@ impl Database {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
                     input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at,
-                    work,budget_counts
+                    work,budget_counts,depth
              FROM bots WHERE {from}{maker}{running} ORDER BY name LIMIT ?2"
         ))?;
         let mut rows = statement.query(values.as_slice())?;
@@ -3445,6 +3459,7 @@ impl Database {
                 "cache_hit":cache_hit(r.get::<_, i64>(13)?, r.get::<_, i64>(12)?),
                 "created_by":r.get::<_, Option<String>>(15)?,
                 "created_by_id":r.get::<_, Option<i64>>(16)?,
+                "depth":r.get::<_, i64>(23)?,
                 "gates":r.get::<_, Option<String>>(17)?
                     .map(|gates| serde_json::from_str::<Value>(&gates)).transpose()?
                     .unwrap_or_else(|| json!([]))});
@@ -3557,6 +3572,14 @@ impl Database {
             "fallback":binding.fallback,"gate":binding.gate,"settings":binding.settings,
             "declare":binding.declared})
         });
+        // Kept only when set, so a resend sent before the field existed
+        // still matches.
+        let request = request.map(|mut request| {
+            if binding.starts_line {
+                request["starts_line"] = json!(true);
+            }
+            request
+        });
         if let Some(bot) = self.resent(name, binding.request_id, request.as_ref())? {
             if bot.compaction_instructions.as_deref() != binding.compaction_instructions {
                 return Err(conflict(name, "compaction_instructions"));
@@ -3566,7 +3589,13 @@ impl Database {
         binding.settings.validate()?;
         let tx = self.conn.savepoint()?;
         let id = identity(&tx)?;
-        let created_by_id = Self::creator_id(&tx, binding.created_by, binding.created_by_id)?;
+        let creator = Self::creator(&tx, binding.created_by, binding.created_by_id)?;
+        let created_by_id = creator.map(|(id, _)| id);
+        let depth = match creator {
+            Some((_, above)) if !binding.starts_line => above + 1,
+            _ => 0,
+        };
+        Self::within_depth(self.max_depth, name, depth)?;
         let declared = match binding.declared {
             Some(declared) => stored_declared(declared)?,
             None => Self::creator_declared(&tx, created_by_id)?,
@@ -3591,7 +3620,7 @@ impl Database {
             None => binding.settings.clone(),
         };
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallback,gates,settings,creation,declared,budget_counts) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallback,gates,settings,creation,declared,budget_counts,depth) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -3613,13 +3642,14 @@ impl Database {
                 creation(binding.request_id, request),
                 declared,
                 binding.budget_counts.stored(),
+                depth as i64,
             ],
         )?;
         // The event carries the list record's fields, so a follower can
         // seat a new bot without a request per creation.
         let mut data = json!({"bot_id":id,"provider":binding.provider,"model":binding.model,
             "effort":binding.effort,"workspace":workspace,"status":"idle","running_turn":null,
-            "created_by":binding.created_by,"created_by_id":created_by_id});
+            "created_by":binding.created_by,"created_by_id":created_by_id,"depth":depth});
         if let Some(gates) = &gates {
             data["gates"] = serde_json::from_str(gates)?;
         }
@@ -6051,6 +6081,24 @@ impl Database {
     /// Bounds for submissions waiting to start; zero is unbounded.
     pub fn set_pending_limits(&mut self, turns: usize, bytes: usize) {
         self.pending_limits = (turns, bytes);
+    }
+    /// The most generations below the bot that starts its line a bot may
+    /// be made at; `None` for no bound.
+    pub fn set_max_depth(&mut self, depth: Option<u64>) {
+        self.max_depth = depth;
+    }
+    /// Refuse making `name` at `depth` past `max_depth`.
+    fn within_depth(max_depth: Option<u64>, name: &str, depth: u64) -> Result<()> {
+        match max_depth {
+            Some(most) if depth > most => Err(Error::with(
+                "depth_limit",
+                format!(
+                    "{name} would be {depth} generations below the bot that starts its line; max_depth is {most}"
+                ),
+            )
+            .facts(json!({"depth":depth,"max_depth":most}))),
+            _ => Ok(()),
+        }
     }
     /// Queued and ready turns and their bytes: their prompts and the words
     /// they quote, which wait with them until they start.
@@ -10707,7 +10755,16 @@ impl Database {
         };
         let tx = self.conn.savepoint()?;
         let id = identity(&tx)?;
-        let created_by_id = Self::creator_id(&tx, created_by, created_by_id)?;
+        let creator = Self::creator(&tx, created_by, created_by_id)?;
+        let created_by_id = creator.map(|(id, _)| id);
+        // A fork its source makes stands where its source does; one another
+        // bot makes is one below its maker, as a bot it creates is.
+        let depth = match creator {
+            None => 0,
+            Some((id, _)) if id == parent.bot_id => parent.depth,
+            Some((_, above)) => above + 1,
+        };
+        Self::within_depth(self.max_depth, name, depth)?;
         // A fork keeps its source's gates and its creator's, and adds its own.
         let inherited = Self::creator_gates(&tx, created_by_id)?;
         let gates = stored_gates(&merge_gates(
@@ -10720,7 +10777,7 @@ impl Database {
             None => parent.settings.clone(),
         };
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at,declared,budget_counts) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,thinking_from,thinking_to,thinking_elided,gates,allowed,settings,creation,expire_ms,expires_at,declared,budget_counts,depth) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -10757,6 +10814,7 @@ impl Database {
                 expire_ms.map(|ms| epoch_ms().saturating_add(ms as i64)),
                 stored_declared(&parent.declared)?,
                 budget_counts.stored(),
+                depth as i64,
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -10810,7 +10868,7 @@ impl Database {
         let mut data = json!({"bot_id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
             "provider":parent.provider,"model":parent.model,"effort":parent.effort,
             "workspace":workspace,"status":"idle","running_turn":null,
-            "created_by":created_by,"created_by_id":created_by_id});
+            "created_by":created_by,"created_by_id":created_by_id,"depth":depth});
         if let Some(gates) = &gates {
             data["gates"] = serde_json::from_str(gates)?;
         }
@@ -14417,6 +14475,33 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                 FROM nodes WHERE turn_seq IS NOT NULL
                     OR id IN (SELECT prompt_node FROM turns WHERE prompt_node IS NOT NULL))",
             [Database::OPENING_CHARS as i64],
+        )?;
+    }
+    // Schema 83: a bot keeps how many generations below the start of its
+    // line it is, counted along its makers: 0 with none, or with one gone.
+    // A side copy its source made counts one below it, as nothing recorded
+    // which forks those were.
+    if from < 83
+        && !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='depth')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        conn.execute_batch(
+            "ALTER TABLE bots ADD COLUMN depth INTEGER NOT NULL DEFAULT 0;
+             CREATE TEMP TABLE line_depths(id INTEGER PRIMARY KEY, depth INTEGER NOT NULL);
+             INSERT INTO temp.line_depths
+               WITH RECURSIVE line(id, depth) AS (
+                 SELECT b.id, 0 FROM bots b
+                 WHERE b.created_by_id IS NULL
+                    OR NOT EXISTS(SELECT 1 FROM bots c WHERE c.id=b.created_by_id)
+                 UNION ALL
+                 SELECT b.id, line.depth+1 FROM bots b JOIN line ON b.created_by_id=line.id
+               )
+               SELECT id, max(depth) FROM line GROUP BY id;
+             UPDATE bots SET depth=d.depth FROM temp.line_depths d WHERE d.id=bots.id AND d.depth>0;
+             DROP TABLE temp.line_depths;",
         )?;
     }
     Ok(())

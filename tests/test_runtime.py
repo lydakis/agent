@@ -2449,6 +2449,46 @@ class RuntimeTests(ModelFixture):
         self.addCleanup(client.close)
         self.assertEqual(client.request('inspect', bot='Bob')['result']['instructions'], 'Be brief.')
 
+    def test_a_line_goes_no_deeper_than_max_depth(self):
+        client = self.client(extra=('--max-depth', '2'))
+        self.assertEqual(client.ready['limits']['depth'], 2)
+        made = {}
+
+        def create(name, maker=None, **params):
+            if maker:
+                params.update(created_by=maker, created_by_id=made[maker]['bot_id'])
+            answer = client.request('create', bot=name, workspace=str(self.path), **params)
+            if 'result' in answer:
+                made[name] = answer['result']
+            return answer
+
+        create('Lead')
+        create('Task', 'Lead')
+        create('Helper', 'Task')
+        self.assertEqual([made[name]['depth'] for name in ('Lead', 'Task', 'Helper')], [0, 1, 2])
+        refused = create('Deeper', 'Helper')
+        self.assertEqual((refused['error'], refused['depth'], refused['max_depth']), ('depth_limit', 3, 2))
+        # A bot at the bound can't fork its way back up.
+        up = client.request('fork', source='Lead', bot='Up', created_by='Helper',
+                            created_by_id=made['Helper']['bot_id'])
+        self.assertEqual(up['error'], 'depth_limit')
+        # Its own copy stands where it does.
+        copy = client.request('fork', source='Helper', bot='Copy', created_by='Helper',
+                              created_by_id=made['Helper']['bot_id'], expire_ms=60000)['result']
+        self.assertEqual(copy['depth'], 2)
+        # A client outside any sandbox may start a line anywhere.
+        fresh = create('Fresh', 'Helper', starts_line=True)['result']
+        self.assertEqual((fresh['depth'], fresh['created_by']), (0, 'Helper'))
+        self.assertEqual(create('Below', 'Fresh')['result']['depth'], 1)
+        listed = {bot['name']: bot['depth'] for bot in client.request('bots')['result']['bots']}
+        self.assertEqual(listed, {'Lead': 0, 'Task': 1, 'Helper': 2, 'Copy': 2, 'Fresh': 0, 'Below': 1})
+        # Without the flag, no bound.
+        client.close()
+        client = self.client()
+        self.assertIsNone(client.ready['limits']['depth'])
+        self.assertIn('result', client.request('create', bot='Deeper', workspace=str(self.path),
+                                               created_by='Helper', created_by_id=made['Helper']['bot_id']))
+
     def test_stores_open_under_any_provider_set_and_turns_check_the_family(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))

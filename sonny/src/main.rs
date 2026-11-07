@@ -1280,6 +1280,7 @@ fn main() -> std::process::ExitCode {
     // knows.
     lookout::subs::at_start();
     haiku::at_start();
+    config::at_start();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         // The tool host runs this for each call of a tool Sonny answers.
@@ -1552,8 +1553,8 @@ async fn run() -> Result<(), String> {
     // tools, or none.
     if options.side.is_none() {
         app.role = match project {
-            Some(_) => served::Role::of(0),
-            None => declared::role(&app.client, &bot).await,
+            Some(_) => served::Role::LEAD,
+            None => declared::role(&bot),
         };
         app.declare = declared::declare(&bot, app.role);
     }
@@ -1817,7 +1818,7 @@ pub(crate) fn made(
     workspace: &Path,
 ) -> Result<(), String> {
     let config = agent_client::config::load()?;
-    let declare = json!(declared::tools(served::Role::of(1)));
+    let declare = json!(declared::tools(served::Role::TASK));
     let tools = agent_client::default_tools(client.providers(), model, config.web_search);
     asked["tools"] = json!(tools);
     asked["declare"] = declare.clone();
@@ -4370,7 +4371,7 @@ impl App {
             react_to: None,
             profile: Default::default(),
             declare: None,
-            role: served::Role::at(2, 2),
+            role: served::Role::TASK,
             bot_reactions: Vec::new(),
             react_calls: HashMap::new(),
             picked: reactions::Picked::default(),
@@ -18159,7 +18160,7 @@ mod tests {
         })
         .await;
         let mut app = app(client);
-        app.declare = declared::declare(&json!({}), served::Role::at(2, 2));
+        app.declare = declared::declare(&json!({}), served::Role::TASK);
         app.running = Some(Running {
             turn: 1,
             started: Instant::now(),
@@ -18173,10 +18174,7 @@ mod tests {
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();
         assert_eq!(sent["op"], "configure");
-        assert_eq!(
-            sent["declare"],
-            json!(declared::tools(served::Role::at(2, 2)))
-        );
+        assert_eq!(sent["declare"], json!(declared::tools(served::Role::TASK)));
         assert!(app.declare.is_none());
     }
 
@@ -18446,7 +18444,7 @@ mod tests {
         app.tools = vec!["shell".into()];
         let custom = json!({"gates": [{"tag": "ci", "tools": ["shell"]}]});
         app.mode = approvals::mode(&custom);
-        app.declared = declared::declare(&custom, served::Role::at(0, 2)).unwrap();
+        app.declared = declared::declare(&custom, served::Role::LEAD).unwrap();
         app.gating = Some("ask");
         assert!(app.configure().await);
         let sent = asked.lock().unwrap()[0].clone();

@@ -1029,18 +1029,20 @@ way `/react` does, and each note in the margin has its own `↩`.
   its full path. The `remove_task` tool (`task`, `discard`) removes a task
   that is done and its worktree, refusing while the worktree has
   uncommitted changes. Its branch is kept unless it is merged.
-- **Tasks that start their own:** any agent with room below it in its
-  lead's line has `start_task` and `remove_task` too, for help inside its
-  own brief, such as a review or a watch on something; separate work still
-  goes to its lead. `[sonny] task_depth` (in `/config`) says how many
-  generations of tasks a line has: 2 by default, so the lead's tasks start
-  helpers and those helpers start none; 1 keeps starting to the lead; 0
-  has no end. A task's helper is started from the lead's folder, in its
-  project, in the repository the task works in, on the last commit of the
-  task's branch, so it builds on the task's work; the lead hears it as one
-  of its line. A
-  start deeper than the setting allows is refused (`task_depth_reached`),
-  and a task removes only agents of its own line.
+- **Tasks that start their own:** every agent has `start_task` and
+  `remove_task`, for help inside its own brief, such as a review or a
+  watch on something; separate work still goes to its lead. How deep a
+  line goes is the daemon's to bound: `[daemon] depth` (in `/config`,
+  read when the daemon starts) says how many generations below the agent
+  that starts a line a new agent may be, 2 by default, so the lead's tasks
+  start helpers and those helpers start none; 1 keeps starting to the
+  lead; 0 has no end. Sonny makes each lead, the person's and
+  `new_project`'s, start a line of its own. A task's helper is started
+  from the lead's folder, in its project, in the repository the task works
+  in, on the last commit of the task's branch, so it builds on the task's
+  work; the lead hears it as one of its line. A start deeper than the
+  daemon allows is refused with the daemon's `depth_limit`, before any
+  folder is made for it, and a task removes only agents of its own line.
 - **Forking a task with its files:** after each turn a task completes, the
   lookout keeps its worktree's files as a commit beside the repository's
   history (`refs/agent/snapshots/STORE/BOT_ID/TURN`, through an index of its
@@ -1127,11 +1129,8 @@ Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
 person sees, as a checklist), `margin` (notes beside the conversation),
 `resolve_task`, `subscriptions`, `show_agent` and
-`run_in_pane`; `start_task` and `remove_task` go to every agent the
-line's `task_depth` leaves room below, and its tasks take them only while
-they have room too, from their first turn, as the daemon counts the
-generations down (`inherit` as a count); a lead's own, which its tasks never take, is
-`new_project`. The daemon shows them to
+`run_in_pane`, `start_task` and `remove_task`; a lead's own, which its
+tasks never take, is `new_project`. The daemon shows them to
 the model and records each call: `react`, `plan`, `margin` and
 `resolve_task` run nothing, and the rest wait for Sonny's answer. Sonny's tool host answers
 those, running each call in the calling agent's folder, so they work with

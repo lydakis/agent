@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --max-load --stall-timeout --idle-exit";
+const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --max-load --max-depth --stall-timeout --idle-exit";
 
 struct Command {
     name: &'static str,
@@ -397,6 +397,10 @@ fn print_flags(flags: &str) {
             "--max-load" => (
                 "LOAD",
                 "New commands wait while the 1-minute load average is this or more and one is running; 0 is no gate",
+            ),
+            "--max-depth" => (
+                "N",
+                "Most generations a new bot may be below the bot that starts its line; 0 is unbounded",
             ),
             "--max-output-tokens" => (
                 "N",
