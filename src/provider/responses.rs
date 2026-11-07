@@ -4,7 +4,8 @@
 //! completion; the terminal output stands in only when none streamed. The
 //! ChatGPT Codex endpoint streams items and leaves the terminal output empty.
 use super::{
-    Completion, Delta, Frame, MAX_OUTPUT, ToolCall, Usage, detail_of, encoded_len, valid_call_id,
+    Completion, Delta, Frame, MAX_OUTPUT, ToolCall, Usage, detail_of, encoded_len, unparsed,
+    valid_call_id,
 };
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
@@ -43,7 +44,7 @@ pub struct State {
 
 impl State {
     pub fn frame(&mut self, frame: &[u8]) -> Result<Frame> {
-        let event: Event<'_> = serde_json::from_slice(frame)?;
+        let event: Event<'_> = serde_json::from_slice(frame).map_err(|e| unparsed(e, frame))?;
         if self.completion.is_some() {
             return fail("event_after_completion");
         }
@@ -198,7 +199,8 @@ fn parse_completion_with_usage(
         output: Vec<&'a RawValue>,
         usage: Option<Value>,
     }
-    let response: Response<'_> = serde_json::from_str(raw.get())?;
+    let response: Response<'_> =
+        serde_json::from_str(raw.get()).map_err(|e| unparsed(e, raw.get().as_bytes()))?;
     *reported = response.usage.as_ref().map(|usage| Usage {
         served_model: response.model.map(Cow::into_owned).unwrap_or_default(),
         ..parse_usage(usage)
@@ -225,7 +227,7 @@ fn parse_completion_with_usage(
         streamed_items
     };
     for raw in output {
-        let item: Value = serde_json::from_slice(&raw)?;
+        let item: Value = serde_json::from_slice(&raw).map_err(|e| unparsed(e, &raw))?;
         match item["type"].as_str() {
             Some("message") if item["role"] == "assistant" => {
                 for content in item["content"]
@@ -246,7 +248,9 @@ fn parse_completion_with_usage(
                 let search =
                     item["namespace"] == super::RUN_NAMESPACE && item["name"] == super::RUN_NAME;
                 let mut call = match kind {
-                    "function_call" => serde_json::from_value::<ToolCall>(item)?,
+                    "function_call" => {
+                        serde_json::from_value::<ToolCall>(item).map_err(|e| unparsed(e, &raw))?
+                    }
                     _ => {
                         #[derive(Deserialize)]
                         struct Custom {
@@ -254,7 +258,8 @@ fn parse_completion_with_usage(
                             call_id: String,
                             input: String,
                         }
-                        let custom: Custom = serde_json::from_value(item)?;
+                        let custom: Custom =
+                            serde_json::from_value(item).map_err(|e| unparsed(e, &raw))?;
                         ToolCall {
                             name: custom.name,
                             call_id: custom.call_id,
@@ -321,6 +326,33 @@ mod tests {
 
         let calls = RawValue::from_string(r#"{"status":"completed","output":[{"type":"function_call","name":"echo","call_id":"x","arguments":"{}"},{"type":"function_call","name":"echo","call_id":"x","arguments":"{}"}]}"#.into()).unwrap();
         assert!(parse_completion(&calls, "").is_err());
+    }
+    #[test]
+    fn a_reply_that_does_not_parse_says_why_and_how_it_began() {
+        // A call whose arguments come as an object, not the string the
+        // Responses API sends.
+        let raw = r#"{"status":"completed","output":[{"type":"function_call","name":"echo","call_id":"x","arguments":{"text":"hi"}}]}"#;
+        let error = parse_completion(&RawValue::from_string(raw.into()).unwrap(), "").unwrap_err();
+        assert_eq!(error.code, "invalid_json");
+        let detail = error.detail.unwrap();
+        assert!(
+            detail.contains("invalid type: map, expected a string"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(r#"it began {"type":"function_call","name":"echo""#),
+            "{detail}"
+        );
+        // A frame is quoted only so far, its line breaks as spaces.
+        let mut state = State::default();
+        let frame = format!("{{\"type\":\n{}", "x".repeat(4096));
+        let detail = state.frame(frame.as_bytes()).unwrap_err().detail.unwrap();
+        assert!(detail.contains(r#"it began {"type": xx"#), "{detail}");
+        assert!(
+            detail.ends_with('…') && detail.len() < 1024,
+            "{}",
+            detail.len()
+        );
     }
     #[test]
     fn a_custom_tool_call_reads_as_its_input() {

@@ -117,7 +117,9 @@ skills and memory of the folder are the same for all of them.
 
 `~/.agent/env` (`KEY=VALUE` lines, readable only by you) holds the provider
 keys, and `AWS_PROFILE` for Bedrock, which Sonny applies over your shell's to
-the daemon it starts; the approver and the lookout run as that daemon's
+the daemon it starts; it does not set providers, so an `AGENT_PROVIDER` there
+is passed over and Sonny says to move it to `provider` in
+`~/.agent/config.toml`; the approver and the lookout run as that daemon's
 companions, with its environment, so they live as long as it does whether
 or not a window is open. Settings go in
 `~/.agent/config.toml`, as Codex keeps them: `provider` (the daemon's

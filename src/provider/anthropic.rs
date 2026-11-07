@@ -3,7 +3,7 @@
 //! signatures so tool-using turns can continue.
 use super::{
     Completion, Delta, Frame, MAX_OUTPUT, ModelTokens, ToolCall, Usage, detail_of, encoded_len,
-    valid_call_id,
+    unparsed, valid_call_id,
 };
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
@@ -119,7 +119,7 @@ impl State {
             .ok_or(Error::new("invalid_content_index"))
     }
     pub fn frame(&mut self, frame: &[u8]) -> Result<Frame> {
-        let event: Value = serde_json::from_slice(frame)?;
+        let event: Value = serde_json::from_slice(frame).map_err(|e| unparsed(e, frame))?;
         if self.done {
             return fail("event_after_completion");
         }
