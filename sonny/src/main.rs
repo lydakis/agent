@@ -1959,7 +1959,12 @@ fn status_cli(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let read = runtime.block_on(async {
         let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
-        let bot = match agent.contains('.') {
+        // An agent by its name, else a project, dotted or not, by its lead.
+        let named = client
+            .request("bots", json!({"name": agent, "limit": 1}))
+            .await
+            .unwrap_or_default();
+        let bot = match named["bots"][0]["name"] == agent.as_str() {
             true => agent,
             false => format!("{agent}.lead"),
         };
@@ -5519,6 +5524,14 @@ impl App {
             if self.waiting.file.is_none() {
                 self.waiting.file =
                     Some(waiting::dir(&self.store()).join(format!("{}.json", self.bot)));
+                // A turn that ended while no window was open lets an older
+                // mark go.
+                let newest = json!({"bot": self.bot, "newest": true, "limit": 1});
+                if let Ok(page) = self.client.request("turns", newest).await
+                    && let Some(turn) = page["turns"][0]["turn"].as_i64()
+                {
+                    self.waiting.started(turn);
+                }
             }
             self.waiting.read();
             self.pin_task_asks();
@@ -10492,6 +10505,7 @@ impl App {
         // Its tasks' questions pinned here count as theirs.
         let here = self.asks.iter().any(|ask| ask.task.is_none())
             || !self.approvals.is_empty()
+            || self.waiting.holds(self.running.is_some())
             || (self.fleet.as_ref()).is_some_and(|fleet| fleet.needs.waits(&self.bot));
         (count("working"), usize::from(here) + count("needs you"))
     }
