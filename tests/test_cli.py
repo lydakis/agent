@@ -1094,6 +1094,40 @@ class SocketAndCliTests(ModelFixture):
         self.assertTrue((self.path / 'wrote').exists())
         self.assertFalse((kept / 'x').exists())
 
+    @unittest.skipUnless(shutil.which('bwrap'), 'placeholders are bubblewrap\'s')
+    def test_a_lent_sandbox_s_placeholders_stay_while_any_command_mounts_them(self):
+        daemon = SocketClient(self.binary, self.store, self.url, 'shell', extra=['--protect', '.codex'], env=clean_env())
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Writer', workspace=str(self.path), settings={'sandbox': 'workspace-write'})
+        sandbox = [str(self.binary), 'sandbox', '--store', str(self.store), '--socket', str(daemon.socket_path),
+                   '--bot', 'Writer', '--']
+        # A missing .codex is held as an empty placeholder while any command
+        # mounts it: the first to start ending first must not remove it from
+        # under a later one still running, which could then write there.
+        def started(name):
+            deadline = time.monotonic() + 15
+            while not (self.path / name).exists():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.05)
+        first = subprocess.Popen([*sandbox, '/bin/sh', '-c',
+                                  'touch first; while [ ! -e go ]; do sleep 0.05; done'],
+                                 env=clean_env(), cwd=self.path)
+        self.addCleanup(first.kill)
+        started('first')
+        later = subprocess.Popen([*sandbox, '/bin/sh', '-c',
+                                  'touch later; while [ ! -e done ]; do sleep 0.05; done; '
+                                  'mkdir -p .codex 2> /dev/null; touch .codex/x 2> /dev/null || echo kept'],
+                                 env=clean_env(), cwd=self.path, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(later.kill)
+        started('later')
+        (self.path / 'go').touch()
+        self.assertEqual(first.wait(timeout=30), 0)
+        (self.path / 'done').touch()
+        out, _ = later.communicate(timeout=30)
+        self.assertEqual(later.returncode, 0)
+        self.assertEqual(out.strip(), 'kept')
+        self.assertFalse((self.path / '.codex' / 'x').exists())
+
     def test_creator_identity_is_required_and_survives_daemon_restart(self):
         self.agent('run', *self.common, '--new', '--bot', 'Creator',
                    'shell:printf "%s" "$AGENT_BOT_ID" > own-id')

@@ -2854,9 +2854,12 @@ command a bot wrote outside its turns, as Codex runs whatever an agent wrote
 in its sandbox: Sonny's automation gates (`--if`) that an agent added.
 One `lend` request (protocol 54), `{"op":"lend","bot":NAME,"bot_id":ID?}`,
 answers `{bot, bot_id, policy, env}`: the sandbox the daemon builds for the
-bot's commands (null for a bot whose commands run unconfined), with the
-bot's own capped socket open for as long as the session that asked lasts,
-and the whole environment its commands get: the daemon's own, without the
+bot's commands (null for a bot whose commands run unconfined), held by
+the daemon for as long as the session that asked lasts as one of the bot's
+own commands is: its capped socket open, and its placeholders for missing
+protected folders counted with those of the daemon's own commands, so
+neither removes one the other's sandbox still mounts. With it comes the
+whole environment its commands get: the daemon's own, without the
 credentials it holds or the variables `--shell-exclude` withholds, with its
 `AGENT_*` variables, the bot's `env` setting, `AGENT_BOT`, `AGENT_BOT_ID` and
 `AGENT_SOCKET` reaching the daemon through that socket. The command runs in
@@ -2866,7 +2869,7 @@ store) and nothing of the caller's environment reaches it. Only a session
 outside every sandbox may lend (`not_permitted`), so a confined command
 cannot reach another bot's socket; `bot_id` that is not the bot's is
 `bot_not_found`. The lend costs one round trip and, for a bot whose socket
-was not listening, one bind, kept once per session however often it asks.
+was not listening, one bind.
 `agent sandbox` exits as its command does, or 125 when it
 could not run it (a usage error, no sandbox here, the bot not found), as
 `env` and `timeout` do, with the error on stderr.

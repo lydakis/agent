@@ -7573,8 +7573,9 @@ An `--if` an agent added runs through `agent sandbox --bot`: one `agent`
 process, one `lend` round trip, and, for a confined agent, the sandbox
 launch its own commands pay. `lend` builds the policy as a turn does and
 the command's whole environment (the daemon's, some tens of variables),
-and binds the bot's socket only when it was not listening, keeping one
-share per bot per session however often it asks. Nothing changes on the
+and binds the bot's socket only when it was not listening, holding it
+and the sandbox's placeholders, as for one of the bot's commands, until
+the session closes. Nothing changes on the
 turn path: the tool shell's environment comes from the same function, as
 the same steps in the same order, and the service holds one more map, of
 the shares sessions borrowed, empty unless a gate runs. A gate the person

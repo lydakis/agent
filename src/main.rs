@@ -254,7 +254,8 @@ fn sandboxed(args: &[String]) -> Result<i32> {
 }
 
 /// `program` with `rest`, in `policy` when one is given, with `environment`
-/// in place of this one's when one is given: its exit status, as a shell
+/// (a lent command's, whose sandbox the daemon holds) in place of this
+/// one's when one is given: its exit status, as a shell
 /// reports one a signal ended.
 fn run_in(
     policy: Option<&agent_runtime::sandbox::Policy>,
@@ -281,8 +282,12 @@ fn run_in(
         };
         // What the sandbox holds in place stays held while the command
         // runs, and what it left in place for it is gone before this exits,
-        // as for a bot's command.
-        let held = agent_runtime::sandbox::hold(policy).await;
+        // as for a bot's command. A lent sandbox's the daemon holds, in the
+        // list its own commands share, until this session closes.
+        let held = match environment {
+            Some(_) => None,
+            None => Some(agent_runtime::sandbox::hold(policy).await),
+        };
         let status = match agent_runtime::sandbox::command(policy, program, rest, false) {
             Ok(mut child) => {
                 given(&mut child);
@@ -290,7 +295,9 @@ fn run_in(
             }
             Err(e) => Err(e),
         };
-        held.release();
+        if let Some(held) = held {
+            held.release();
+        }
         status
     })?;
     // A command a signal ended exits as a shell reports it.

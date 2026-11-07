@@ -1214,9 +1214,11 @@ struct Service {
     identity: u128,
     /// Open client sessions, kept by the run loop for `stats`.
     sessions: usize,
-    /// The bots' own sockets each session was lent, by bot, which listen
-    /// until it closes.
-    lent: HashMap<u64, HashMap<i64, agent_runtime::sandbox::Listening>>,
+    /// What each session was lent, which the daemon holds until it closes:
+    /// the bot's own socket listening, and its sandbox's placeholders, held
+    /// in the one list the daemon's own commands share, so neither side
+    /// removes one the other's sandbox still mounts.
+    lent: HashMap<u64, Vec<agent_runtime::sandbox::Hold>>,
     limit_active: usize,
     /// Per bot: the live turn. A parked turn's task ends while a resumed
     /// task may already own the slot.
@@ -3931,11 +3933,12 @@ impl Service {
                     .map_err(|_| Error::new("sandbox_unavailable"))??;
                 }
                 if let Some(policy) = policy.as_mut() {
-                    // The session holds one share per bot, however often it
-                    // asks; the command reaches the daemon through it.
-                    if let Some(listening) = policy.listening.take() {
-                        self.lent.entry(session).or_default().insert(id, listening);
-                    }
+                    // Held for the session, as for one of the bot's own
+                    // commands: its socket, and its placeholders and what
+                    // its command may not leave, gone once the session is.
+                    let hold = agent_runtime::sandbox::hold(policy).await;
+                    self.lent.entry(session).or_default().push(hold);
+                    policy.listening = None;
                     if let Some(own) = policy.reach() {
                         environment.push(("AGENT_SOCKET".into(), own.display().to_string()));
                     }
