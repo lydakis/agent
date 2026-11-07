@@ -269,7 +269,7 @@ fn subscriptions() -> Value {
         "description": "Your subscriptions in the person's lookout, which watches agents for you and tells you \
             what happens in them in a note starting \"Task updates\": every message someone other than you \
             writes in them, the person's quoted, and how each turn ends, by the handle your wait tool reads. \
-            The person's own words cut into your running turn; the rest waits until your turn ends. Each \
+            Each note joins your running turn, or starts one. Each \
             watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
             sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
             \"From your sources\": every event, at once when the source says it steers, or one topic of a \
@@ -316,7 +316,7 @@ fn subscriptions() -> Value {
                                 never wait for it."},
                         "steer": {"type": "object",
                             "description": "What it hears that this matches, a pattern as filter's, is a steer: \
-                                it cuts into your running turn and waits for no digest, as the person's words do. As \
+                                it goes at once and waits for no digest, as the person's words do. As \
                                 {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."}
                     },
                     "required": ["name"],
