@@ -428,7 +428,9 @@ follow it while the daemon runs (`serve --provider-config`): the kernel
 tells the daemon when the file changes (inotify, kqueue; nothing runs in
 between), including the file a linked `config.toml` names, and the new set is built and checked beside the old, then swapped
 in whole. Turns that start after the swap use it; running turns finish on
-the providers they started with. A provider whose spec is unchanged is kept
+the providers they started with, and a turn parked meanwhile (on a tool
+wait or an approval) resumes on the set in use when it resumes, as it would
+after a restart, so a rotated key or a moved endpoint reaches it. A provider whose spec is unchanged is kept
 as it was, with its pacing, connections and keys. A file that does not
 parse, a spec that does not bind (a key variable the daemon was not started
 with, say), and the removal of a provider an agent's model, fallback or
@@ -439,7 +441,8 @@ whole, and the old set stays. `stats.provider_reload` says what the last
 change came to (`applied` with `added`, `removed` and `changed`, or
 `refused` with its error); new sessions' `ready.providers` show the set in
 use, `provider_models` names each provider's family and efforts for sessions that
-connected before, and held turns are tried again after a change is applied.
+connected before (a provider's speeds still come with `ready`, so `/fast`
+offers a newly added provider's faster tiers after Sonny reconnects), and held turns are tried again after a change is applied.
 `run --model` names a new bot's model or an existing bot's turn model; the
 daemon has no model of its own, so a new bot needs `--model`, `AGENT_MODEL`,
 or `model` in `~/.agent/config.toml`, in that order. Both are only creation
