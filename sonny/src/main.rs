@@ -2808,9 +2808,12 @@ struct App {
     /// Tasks' questions set aside in their own windows that a click on
     /// the card brought back here: pinned though the task no longer is.
     reopened: std::collections::HashSet<String>,
-    /// Of those, the ones to read again from their tasks: the fleet's
-    /// reading changed since, and the task may have settled them.
-    reread: Vec<asks::Ask>,
+    /// Tasks' questions set aside, or reopened here, whose task could
+    /// still answer or close them: each with its task's newest node when
+    /// it was last read, read again once the task's history moves on.
+    watched: HashMap<String, (asks::Ask, Option<i64>)>,
+    /// When the watched questions' tasks were last looked at.
+    watched_at: Option<Instant>,
     /// The asks this window answered and closed, by call, until their
     /// answers land.
     sent_answers: Vec<String>,
@@ -4337,7 +4340,8 @@ impl App {
             settled: HashMap::new(),
             unsettled: Vec::new(),
             reopened: Default::default(),
-            reread: Vec::new(),
+            watched: HashMap::new(),
+            watched_at: None,
             sent_answers: Vec::new(),
             task_answers: Vec::new(),
             task_asks_read: None,
@@ -11630,18 +11634,53 @@ impl App {
             };
             self.settle(&ask.key(), state);
         }
-        for ask in std::mem::take(&mut self.reread) {
-            let (Some(task), Some(turn)) = (&ask.task, asks::turn_of(&ask.id)) else {
+        self.reread_watched().await;
+    }
+
+    /// The tasks' questions set aside or reopened here, read again from
+    /// their tasks once a task's history moved on: answered or closed
+    /// there, so they read here too; still open or set aside, they stay.
+    /// Each task is looked at once every few seconds, one request each,
+    /// and a question read only when its task wrote since.
+    async fn reread_watched(&mut self) {
+        if self.watched.is_empty()
+            || self
+                .watched_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+        {
+            return;
+        }
+        self.watched_at = Some(Instant::now());
+        let mut bots: Vec<String> = (self.watched.values())
+            .filter_map(|(ask, _)| ask.task.as_ref().map(|task| task.bot.clone()))
+            .collect();
+        bots.sort();
+        bots.dedup();
+        for bot in bots {
+            let Ok(record) = self.client.request("inspect", json!({"bot": bot})).await else {
                 continue;
             };
-            let call = ask.id.split_once('/').map_or("", |(_, call)| call);
-            // Answered or closed there: so it reads here too. Still open
-            // or set aside, it stays where the click put it.
-            if let Ok(Some((_, state))) =
-                asks::standing(&self.client, &task.bot, turn, call, None).await
-                && state.settled()
-            {
-                self.settle(&ask.key(), state);
+            let head = record["head"].as_i64();
+            let due: Vec<(String, asks::Ask)> = (self.watched.iter())
+                .filter(|(_, (ask, seen))| {
+                    ask.task.as_ref().is_some_and(|task| task.bot == bot) && *seen != head
+                })
+                .map(|(key, (ask, _))| (key.clone(), ask.clone()))
+                .collect();
+            for (key, ask) in due {
+                let Some(turn) = asks::turn_of(&ask.id) else {
+                    continue;
+                };
+                let call = ask.id.split_once('/').map_or("", |(_, call)| call);
+                match asks::standing(&self.client, &bot, turn, call, None).await {
+                    Ok(Some((_, state))) if state.settled() => self.settle(&key, state),
+                    Ok(_) => {
+                        if let Some((_, seen)) = self.watched.get_mut(&key) {
+                            *seen = head;
+                        }
+                    }
+                    Err(_) => {}
+                }
             }
         }
     }
@@ -11776,6 +11815,7 @@ impl App {
             .collect();
         for key in gone {
             self.cards.remove(&key);
+            self.watched.remove(&key);
             let pinned = (self.asks.iter().chain(&self.aside)).any(|ask| ask.key() == key);
             if !pinned {
                 self.settled.remove(&key);
@@ -11869,6 +11909,16 @@ impl App {
             return;
         }
         self.reopened.remove(key);
+        // Set aside, a task's question can still be answered or closed in
+        // its task: watched until it is.
+        match (&state, self.cards.get(key)) {
+            (asks::State::Aside, Some((_, ask, _))) if ask.task.is_some() => {
+                self.watched.insert(key.to_owned(), (ask.clone(), None));
+            }
+            _ => {
+                self.watched.remove(key);
+            }
+        }
         self.settled.insert(key.to_owned(), state);
         let before = self.asks.len();
         self.asks.retain(|open| open.key() != key);
@@ -11934,6 +11984,7 @@ impl App {
             // still answers it, so it is pinned here again.
             self.settled.remove(key);
             self.reopened.insert(key.to_owned());
+            // Still watched: its task can still answer or close it.
             let to = (self.asks.iter())
                 .position(|open| asks::turn_of(&open.id) > asks::turn_of(&ask.id))
                 .unwrap_or(self.asks.len());
@@ -12007,14 +12058,6 @@ impl App {
             .cloned()
             .collect();
         self.unsettled.extend(gone);
-        // Reopened here, each is read again from its task, which may have
-        // been answered or closed there since.
-        let reread: Vec<asks::Ask> = (self.asks.iter())
-            .filter(|ask| self.reopened.contains(&ask.key()) && !keys.contains(&ask.key()))
-            .filter(|ask| !self.reread.iter().any(|have| have.key() == ask.key()))
-            .cloned()
-            .collect();
-        self.reread.extend(reread);
         self.asks.retain(still);
         self.aside.retain(still);
         self.task_answers
@@ -12055,7 +12098,7 @@ impl App {
         self.settled.clear();
         self.unsettled.clear();
         self.reopened.clear();
-        self.reread.clear();
+        self.watched.clear();
     }
 
     /// The ask made as call `call` in turn `turn`, as [`asks::id`] names
@@ -20193,11 +20236,52 @@ mod tests {
         assert_eq!(app.asking().map(asks::Ask::key), Some(key.clone()));
         app.pin_task_asks();
         assert_eq!(app.asking().map(asks::Ask::key), Some(key.clone()));
-        // It is read again from its task; still unanswered there, it stays.
-        assert_eq!(app.reread.len(), 1);
+        // Watched in its task; still unanswered there, it stays.
+        assert!(app.watched.contains_key(&key));
         app.settle_task_asks().await;
-        assert!(app.reread.is_empty());
-        assert_eq!(app.asking().map(asks::Ask::key), Some(key));
+        assert_eq!(app.asking().map(asks::Ask::key), Some(key.clone()));
+        assert!(app.watched.contains_key(&key));
+    }
+
+    /// A task's question set aside is watched: once its task writes on and
+    /// has withdrawn it, its card in the lead's window says so.
+    #[tokio::test]
+    async fn a_tasks_question_set_aside_follows_what_its_task_does_after() {
+        let arguments = json!({"question": "Signed in?", "why": "w", "command": "gh auth login"});
+        let asked = arguments.clone();
+        let client = daemon_answering(move |request| match request["op"].as_str() {
+            Some("inspect") => json!({"head": 2}),
+            Some("history_nodes") => json!({"nodes": [{"node": 2, "turn": 5},
+                {"node": 1, "turn": 4}], "next_from": null}),
+            Some("history_items") => {
+                let close = json!({"type": "function_call", "name": asks::CLOSE,
+                    "call_id": "k1", "arguments": json!({"id": "ask:4/c9",
+                    "outcome": "withdrawn", "note": "signed in already"}).to_string()});
+                let ask = json!({"type": "function_call", "name": asks::TOOL,
+                    "call_id": "c9", "arguments": asked.to_string()});
+                json!({"items": [{"node": 2, "item": close}, {"node": 1, "item": ask}]})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        let mut ask = asks::call("ask:4/c9", &arguments).unwrap();
+        ask.task = Some(asks::Asker {
+            bot: "p.fix".into(),
+            name: "fix".into(),
+        });
+        let key = ask.key();
+        app.commit_ask(&ask);
+        app.settle(&key, asks::State::Aside);
+        assert!(app.watched.contains_key(&key));
+        app.reread_watched().await;
+        assert!(!app.watched.contains_key(&key));
+        assert!(
+            drawn(&mut app).contains(&"┃ Withdrawn · signed in already".to_owned()),
+            "{:?}",
+            drawn(&mut app)
+        );
     }
 
     /// Without a multiplexer, a running task that asks and works on is read
