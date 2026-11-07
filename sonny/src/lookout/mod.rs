@@ -4282,6 +4282,28 @@ mod tests {
     }
 
     #[test]
+    fn news_no_digest_gates_waits_the_rest_wait_beside_digested_news() {
+        let mut lookout = seated("running");
+        lookout.subs[0].digest = Some("1h".into());
+        lookout.subs.push(sub("watch", &[], &["other.bot"]));
+        (lookout.updates).seat(&json!({"name": "other.bot", "bot_id": 3, "status": "idle"}));
+        lookout.globbed.insert("other.bot".into());
+        let listed = lookout.updates.listed();
+        lookout.sync(&listed);
+        let now = Instant::now();
+        ended(&mut lookout, 4, "completed");
+        assert_eq!(
+            lookout.updates.rest_wait(now, REST_WAIT),
+            Duration::from_secs(3600)
+        );
+        lookout.heard(&Seen {
+            task: "other.bot".into(),
+            ..said(6, "calc.docs", "hi")
+        });
+        assert_eq!(lookout.updates.rest_wait(now, REST_WAIT), REST_WAIT);
+    }
+
+    #[test]
     fn of_two_digests_whichever_allows_first_lets_news_go() {
         let mut lookout = seated("idle");
         lookout.subs[0].digest = Some("15m".into());

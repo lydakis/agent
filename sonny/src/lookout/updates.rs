@@ -1019,7 +1019,9 @@ impl Updates {
         let ready = (self.tasks.iter()).filter(|(_, news)| self.ready(news, now));
         (ready.flat_map(|(_, news)| news.holds()))
             .flat_map(|hold| {
-                let now_ = hold.now.then_some(rest);
+                // What no digest gates, a subscription's with none or no
+                // rules at all, goes as soon as the lead rests.
+                let now_ = (hold.now || hold.windows.is_empty()).then_some(rest);
                 let windows = (hold.windows.iter())
                     .filter(|(sub, digest)| self.sub_ready(sub, *digest, now))
                     .map(|(_, digest)| *digest);
