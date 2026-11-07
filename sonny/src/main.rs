@@ -31,6 +31,7 @@ mod exec;
 mod footer;
 mod frames;
 mod fuzzy;
+mod git;
 mod haiku;
 mod herdr;
 mod highlight;
@@ -82,7 +83,6 @@ mod setup;
 mod shell;
 mod skills;
 mod sky;
-mod snapshot;
 mod sound;
 mod stamp;
 mod started;
@@ -13402,8 +13402,6 @@ impl App {
             own_folder: place == new::Place::Empty,
             here: place == new::Place::Here,
             folder: None,
-            from: None,
-            turn: None,
             builds_on: None,
             env,
             made_by: Some(self.bot.clone()),

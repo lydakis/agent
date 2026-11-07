@@ -69,6 +69,14 @@ pub const STEPS: &[Step] = &[
         done: crate::trigger::no_gate_unowned,
         retire: "0.11.0",
     },
+    // Fork-from-turn's snapshot refs, in the repositories of the person's
+    // tasks, go with their OK (0.9.0).
+    Step {
+        id: "snapshot-refs",
+        text: include_str!("../upgrades/snapshot-refs.md"),
+        done: crate::git::no_snapshot_refs,
+        retire: "0.11.0",
+    },
 ];
 
 /// Whether `~/.agent/env` sets no `AGENT_JUDGE`, the reviewer's model
@@ -166,6 +174,12 @@ pub const MIGRATIONS: &[Migration] = &[
     // Goals are gone: the lookout's goals folder goes (0.9.0).
     Migration {
         id: crate::lookout::subs::GOALS_GONE,
+        retire: "0.11.0",
+    },
+    // Each store's snapshot indexes, unused since fork-from-turn went,
+    // go (0.9.0).
+    Migration {
+        id: crate::git::NO_SNAPSHOTS,
         retire: "0.11.0",
     },
 ];
