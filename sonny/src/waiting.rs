@@ -439,29 +439,30 @@ async fn waiting_for(
     Ok(waiting.filter(|_| !asked))
 }
 
-/// Whether `bot`'s turn `turn` took in the person's own words: a message
-/// of theirs, not another agent's, the lookout's or an automation's.
+/// Whether `bot`'s turn `turn` took in the person's own words: its prompt
+/// or a message steered into it, theirs, not another agent's, a client's
+/// or another person's. The daemon reads a turn's words whole however
+/// long it ran; past `PROMPTS` bytes of them it is read again whole.
 async fn heard_the_person(client: &Client, bot: &str, turn: i64) -> Result<bool, String> {
-    let page = client
-        .request(
-            "history_nodes",
-            json!({"bot": bot, "limit": TURN_END_NODES}),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    let nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
-        .filter(|node| node["turn"].as_i64() == Some(turn))
-        .filter_map(|node| node["node"].as_i64())
-        .collect();
-    let (items, short) = crate::needs::items(client, bot, &nodes).await;
-    if short && items.is_empty() {
-        return Err(format!("turn {turn} of {bot} could not be read"));
+    for bytes in [PROMPTS, PROMPTS_MOST] {
+        let read = client
+            .request("prompts", json!({"bot": bot, "turn": turn, "bytes": bytes}))
+            .await
+            .map_err(|e| e.to_string())?;
+        let theirs = (read["prompts"].as_array().into_iter().flatten()).any(|words| {
+            words["from"].is_null() && words["origin"].is_null() && words["person"].is_null()
+        });
+        if theirs || read["prompts_more"] != true {
+            return Ok(theirs);
+        }
     }
-    Ok(items.iter().any(|(_, item)| {
-        item["role"] == "user"
-            && !crate::transcript::relays(&crate::text(item), item["from"].as_str())
-    }))
+    Ok(false)
 }
+
+/// How many bytes of a turn's words [`heard_the_person`] reads first, and
+/// at most: the daemon's own bound.
+const PROMPTS: usize = 16 * 1024;
+const PROMPTS_MOST: usize = 256 * 1024;
 
 /// Ask a copy of `bot`, with no tools, whether its turn `turn`'s reply
 /// waits on the person, and what reviews it named: its reply, in JSON
@@ -758,15 +759,18 @@ mod tests {
                     "text": r#"{"waiting": true, "for": "staging or prod", "reviews": ["CR-881"],
                         "options": [{"label": "Staging", "explanation": "First."},
                             {"label": "Prod", "explanation": "Now."}], "recommended": 1}"#}}}),
-                // calc.plan's turn 3 took in the person's words; calc.told's
-                // only its lead's, which hears its reply.
-                Some("history_items") => {
-                    let from = match request["bot"].as_str() {
-                        Some("calc.told") => json!({"bot": "calc.lead"}),
-                        _ => Value::Null,
-                    };
-                    json!({"items": [{"node": 11, "from": from, "item": {"type": "message",
-                        "role": "user", "content": [{"type": "input_text", "text": "Ship it."}]}}]})
+                // calc.plan's turn 3 started with its lead's brief and took
+                // in the person's words as a steer, its long brief read
+                // whole on a second read; calc.told's only its lead's,
+                // which hears its reply.
+                Some("prompts") => {
+                    let lead = json!({"turn": 3, "text": "brief", "from": {"bot": "calc.lead", "turn": 2}});
+                    match (request["bot"].as_str(), request["bytes"].as_u64()) {
+                        (Some("calc.told"), _) => json!({"prompts": [lead], "prompts_more": false}),
+                        (_, Some(16384)) => json!({"prompts": [lead], "prompts_more": true}),
+                        _ => json!({"prompts": [lead, {"turn": 4, "text": "Ship it.", "steer": true}],
+                            "prompts_more": false}),
+                    }
                 }
                 // Turn 3 ended at node 12; a later turn began since.
                 Some("history_nodes") => json!({"nodes": [{"node": 14, "turn": 4},
