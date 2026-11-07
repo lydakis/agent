@@ -1,7 +1,8 @@
 //! The code reviews each agent's turns named, kept by the window that
 //! sees each turn of a project's agent end ([`crate::waiting`]), so
 //! `/status` counts them all and shows the latest, with no history read
-//! again: `STORE.reviews/BOT.json`, a list, oldest first. A review is
+//! again: `STORE.reviews/BOT.json`, the bot's id and a list, oldest
+//! first, so a bot made again under a deleted one's name starts with none. A review is
 //! whatever the turn called it, as the copy that read the turn names it,
 //! from a command's output or the reply: a pull or merge request, a change in Gerrit, a Phabricator
 //! revision, an internal CR, in git or not: `o/r#7`, `D1234`, `CR-881`,
@@ -25,17 +26,20 @@ fn file(store: &Path, bot: &str) -> PathBuf {
     dir(store).join(format!("{bot}.json"))
 }
 
-/// The reviews `bot`'s replies named, oldest first.
-pub fn read(store: &Path, bot: &str) -> Vec<String> {
+/// The reviews `bot`'s replies named, oldest first, while `bot_id` is the
+/// bot they were kept for.
+pub fn read(store: &Path, bot: &str, bot_id: i64) -> Vec<String> {
     std::fs::read(file(store, bot))
         .ok()
-        .and_then(|kept| serde_json::from_slice(&kept).ok())
+        .and_then(|kept| serde_json::from_slice::<serde_json::Value>(&kept).ok())
+        .filter(|kept| kept["bot_id"].as_i64() == Some(bot_id))
+        .and_then(|kept| serde_json::from_value(kept["reviews"].clone()).ok())
         .unwrap_or_default()
 }
 
-/// Keep the reviews a reply of `bot`'s `named`: one named again moves to
-/// the end, as the latest.
-pub fn note(store: &Path, bot: &str, named: &[String]) -> Result<(), String> {
+/// Keep the reviews a reply of `bot`, as `bot_id`, `named`: one named
+/// again moves to the end, as the latest.
+pub fn note(store: &Path, bot: &str, bot_id: i64, named: &[String]) -> Result<(), String> {
     let named: Vec<String> = (named.iter())
         .map(|name| {
             let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -47,7 +51,7 @@ pub fn note(store: &Path, bot: &str, named: &[String]) -> Result<(), String> {
         return Ok(());
     }
     crate::waiting::locked(&dir(store), || {
-        let mut kept = read(store, bot);
+        let mut kept = read(store, bot, bot_id);
         let before = kept.clone();
         for review in named {
             kept.retain(|k| *k != review);
@@ -59,8 +63,8 @@ pub fn note(store: &Path, bot: &str, named: &[String]) -> Result<(), String> {
         if kept == before {
             return Ok(());
         }
-        let json = serde_json::to_vec(&kept).map_err(|e| e.to_string())?;
-        crate::waiting::replace(&file(store, bot), &json)
+        let json = serde_json::json!({"bot_id": bot_id, "reviews": kept});
+        crate::waiting::replace(&file(store, bot), json.to_string().as_bytes())
     })
 }
 
@@ -83,13 +87,17 @@ mod tests {
             .join(format!("sonny-reviews-{}", std::process::id()))
             .join("store");
         let named = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        note(&store, "calc.a", &named(&["o/r#3"])).unwrap();
-        note(&store, "calc.a", &[]).unwrap();
-        note(&store, "calc.a", &named(&["CR-881", " ", "o/r#3"])).unwrap();
-        assert_eq!(read(&store, "calc.a"), ["CR-881", "o/r#3"]);
-        assert_eq!(said(&read(&store, "calc.a")), "2 reviews · o/r#3");
+        note(&store, "calc.a", 1, &named(&["o/r#3"])).unwrap();
+        note(&store, "calc.a", 1, &[]).unwrap();
+        note(&store, "calc.a", 1, &named(&["CR-881", " ", "o/r#3"])).unwrap();
+        assert_eq!(read(&store, "calc.a", 1), ["CR-881", "o/r#3"]);
+        assert_eq!(said(&read(&store, "calc.a", 1)), "2 reviews · o/r#3");
+        // A bot made again under the name starts with none.
+        assert_eq!(read(&store, "calc.a", 2), Vec::<String>::new());
+        note(&store, "calc.a", 2, &named(&["D1234"])).unwrap();
+        assert_eq!(read(&store, "calc.a", 2), ["D1234"]);
         assert_eq!(said(&["D1234".to_owned()]), "D1234");
-        assert_eq!(read(&store, "calc.b"), Vec::<String>::new());
+        assert_eq!(read(&store, "calc.b", 1), Vec::<String>::new());
         let _ = std::fs::remove_dir_all(store.parent().unwrap());
     }
 }

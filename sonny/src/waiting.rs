@@ -251,22 +251,22 @@ pub fn reviews(reply: &str) -> Vec<String> {
 /// How many copies one window has asking at once.
 const CHECKS: usize = 4;
 static ASKING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CHECKS);
-/// Whether `bot` is a side chat or a check's copy, as its record says:
-/// only a bot named as `/side` or a check names one is looked up, and a
-/// task merely named `NAME.side-feed` or `NAME.waiting-00ff10` is checked
-/// as any other.
-async fn side_or_copy(client: &Client, bot: &str) -> bool {
-    if crate::side_source(bot).is_none() && !is_copy(bot) {
-        return false;
-    }
+/// `bot`'s record, as `bots` lists it.
+async fn record(client: &Client, bot: &str) -> Option<Value> {
     let page = (client
         .request("bots", json!({"name": bot, "limit": 1}))
         .await)
-        .unwrap_or_default();
-    let row = &page["bots"][0];
+        .ok()?;
+    Some(page["bots"][0].clone()).filter(|row| row["name"] == bot)
+}
+
+/// Whether `row`, the record of a bot named `bot`, is a side chat or a
+/// check's copy: a task merely named `NAME.side-feed` or
+/// `NAME.waiting-00ff10` is checked as any other.
+fn side_or_copy(bot: &str, row: &Value) -> bool {
     // A check's copy expires and may call no tool.
     let copy = is_copy(bot) && row["expire_ms"].is_u64() && row["allowed"] == json!([]);
-    row["name"] == bot && (crate::side_copy(row).is_some() || copy)
+    crate::side_copy(row).is_some() || copy
 }
 
 /// The turns this window checks now, which it heard end more than once.
@@ -299,13 +299,15 @@ pub fn spawn(client: Arc<Client>, store: PathBuf, bot: String, turn: i64) {
         _ => return,
     }
     tokio::spawn(async move {
-        if !side_or_copy(&client, &bot).await
+        if let Some(row) = record(&client, &bot).await
+            && let Some(bot_id) = row["bot_id"].as_i64()
+            && !side_or_copy(&bot, &row)
             && let Ok(_asking) = ASKING.acquire().await
             // Another window answered it while this one waited its turn.
             && !answered(&store, &bot, turn)
             // What could not be checked, a second window's copy the
             // daemon refused among it, is left unmarked.
-            && let Ok(found) = waiting_for(&client, &store, &bot, turn).await
+            && let Ok(found) = waiting_for(&client, &store, &bot, bot_id, turn).await
         {
             let mark = found.map(|waiting_for| Mark { turn, waiting_for });
             let _ = keep(&store, &bot, turn, mark.as_ref());
@@ -325,6 +327,7 @@ async fn waiting_for(
     client: &Client,
     store: &Path,
     bot: &str,
+    bot_id: i64,
     turn: i64,
 ) -> Result<Option<String>, String> {
     let handle = format!("turn:{bot}/{turn}");
@@ -339,7 +342,7 @@ async fn waiting_for(
         return Ok(None);
     }
     let reply = self::check(client, bot, turn).await?;
-    crate::reviews::note(store, bot, &reviews(&reply))?;
+    crate::reviews::note(store, bot, bot_id, &reviews(&reply))?;
     let waiting = answer(&reply)
         .ok_or_else(|| format!("the check's reply was not the JSON asked for: {reply}"))?;
     let asked = crate::needs::scan(client, bot, Some(turn))
@@ -354,6 +357,13 @@ async fn waiting_for(
 /// another window's copy of that turn is asked already.
 pub async fn check(client: &Client, bot: &str, turn: i64) -> Result<String, String> {
     let checkpoint = turn_end(client, bot, turn).await?;
+    // The copy answers on the model and effort the turn ran on, which may
+    // be its own, not the bot's, and has that turn cached.
+    let ran = client
+        .request("turns", json!({"bot": bot, "after": turn - 1, "limit": 1}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let ran = Some(&ran["turns"][0]).filter(|ran| ran["turn"].as_i64() == Some(turn));
     let name = copy_name(bot, turn as u128 % 0x80_0000);
     // This window's own request: another's, of the same name, is refused
     // while this copy is there.
@@ -366,7 +376,7 @@ pub async fn check(client: &Client, bot: &str, turn: i64) -> Result<String, Stri
         )
         .await
         .map_err(|e| e.to_string())?;
-    let reply = ask(client, &name, &forked["bot_id"]).await;
+    let reply = ask(client, &name, &forked["bot_id"], ran).await;
     let _ = client
         .request("delete", json!({"bot": name, "bot_id": forked["bot_id"]}))
         .await;
@@ -414,13 +424,21 @@ pub fn is_copy(bot: &str) -> bool {
 }
 
 /// The copy's reply, interrupting a turn that runs past [`WAIT`].
-async fn ask(client: &Client, name: &str, id: &Value) -> Result<String, String> {
+async fn ask(
+    client: &Client,
+    name: &str,
+    id: &Value,
+    ran: Option<&Value>,
+) -> Result<String, String> {
+    let mut submit = json!({"bot": name, "bot_id": id, "request_id": format!("{name}.1"),
+        "prompt": ASK, "delivery": "reject", "output_schema": schema()});
+    for field in ["model", "effort"] {
+        if let Some(on) = ran.and_then(|ran| ran[field].as_str()) {
+            submit[field] = json!(on);
+        }
+    }
     let submitted = client
-        .request(
-            "submit",
-            json!({"bot": name, "bot_id": id, "request_id": format!("{name}.1"),
-                "prompt": ASK, "delivery": "reject", "output_schema": schema()}),
-        )
+        .request("submit", submit)
         .await
         .map_err(|e| e.to_string())?;
     let handle = (submitted["handle"].as_str())
@@ -539,25 +557,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir(&store));
     }
 
-    #[tokio::test]
-    async fn a_task_named_like_a_side_chat_or_copy_is_one_only_if_its_record_says() {
-        let client = crate::tests::daemon_answering(|request| match request["name"].as_str() {
-            Some("shop.side-feed") => json!({"bots": [{"name": "shop.side-feed",
-                "created_by": "shop.lead", "expire_ms": null}]}),
-            Some("shop.side-a1") => json!({"bots": [{"name": "shop.side-a1",
-                "created_by": "shop", "expire_ms": 99}]}),
-            Some("shop.waiting-00ff10") => json!({"bots": [{"name": "shop.waiting-00ff10",
-                "created_by": "shop.lead", "expire_ms": null, "allowed": ["*"]}]}),
-            Some("shop.waiting-00ff11") => json!({"bots": [{"name": "shop.waiting-00ff11",
-                "expire_ms": 99, "allowed": []}]}),
-            _ => json!({"bots": []}),
-        })
-        .await;
-        assert!(!side_or_copy(&client, "shop.side-feed").await);
-        assert!(side_or_copy(&client, "shop.side-a1").await);
-        assert!(!side_or_copy(&client, "shop.waiting-00ff10").await);
-        assert!(side_or_copy(&client, "shop.waiting-00ff11").await);
-        assert!(!side_or_copy(&client, "shop.web").await);
+    #[test]
+    fn a_task_named_like_a_side_chat_or_copy_is_one_only_if_its_record_says() {
+        let side = json!({"name": "shop.side-a1", "created_by": "shop", "expire_ms": 99});
+        let feed = json!({"name": "shop.side-feed", "created_by": "shop.lead", "expire_ms": null});
+        let copy = json!({"name": "shop.waiting-00ff11", "expire_ms": 99, "allowed": []});
+        let task = json!({"name": "shop.waiting-00ff10", "created_by": "shop.lead",
+            "expire_ms": null, "allowed": ["*"]});
+        assert!(side_or_copy("shop.side-a1", &side));
+        assert!(!side_or_copy("shop.side-feed", &feed));
+        assert!(side_or_copy("shop.waiting-00ff11", &copy));
+        assert!(!side_or_copy("shop.waiting-00ff10", &task));
+        assert!(!side_or_copy("shop.web", &json!({"name": "shop.web"})));
     }
 
     #[tokio::test]
@@ -578,6 +589,9 @@ mod tests {
                 // Turn 3 ended at node 12; a later turn began since.
                 Some("history_nodes") => json!({"nodes": [{"node": 14, "turn": 4},
                     {"node": 12, "turn": 3}, {"node": 11, "turn": 3}]}),
+                // The turn ran on a model of its own.
+                Some("turns") => json!({"turns": [{"turn": 3, "model": "openai/gpt-x",
+                    "effort": "high"}]}),
                 Some("fork") => json!({"bot_id": 9}),
                 Some("submit") => json!({"handle": "turn:copy/1", "turn": 1}),
                 _ => json!({}),
@@ -588,12 +602,12 @@ mod tests {
             .join(format!("sonny-waiting-for-{}", std::process::id()))
             .join("store");
         assert_eq!(
-            waiting_for(&client, &store, "calc.plan", 3).await,
+            waiting_for(&client, &store, "calc.plan", 5, 3).await,
             Ok(Some("staging or prod".into()))
         );
         // The review the copy says its reply named, in any system, is
         // kept for `/status`.
-        assert_eq!(crate::reviews::read(&store, "calc.plan"), ["CR-881"]);
+        assert_eq!(crate::reviews::read(&store, "calc.plan", 5), ["CR-881"]);
         let requests = asked.lock().unwrap().clone();
         let fork = requests.iter().find(|r| r["op"] == "fork").unwrap();
         assert_eq!(fork["source"], "calc.plan");
@@ -605,11 +619,16 @@ mod tests {
             submit["output_schema"]["required"],
             json!(["waiting", "for", "reviews"])
         );
+        // It answers on the model and effort the turn ran on.
+        assert_eq!(
+            (&submit["model"], &submit["effort"]),
+            (&json!("openai/gpt-x"), &json!("high"))
+        );
         assert!(requests.iter().any(|r| r["op"] == "delete"));
         // No words, no copy.
         asked.lock().unwrap().clear();
         assert_eq!(
-            waiting_for(&client, &store, "calc.quiet", 3).await,
+            waiting_for(&client, &store, "calc.quiet", 6, 3).await,
             Ok(None)
         );
         assert!(!asked.lock().unwrap().iter().any(|r| r["op"] == "fork"));

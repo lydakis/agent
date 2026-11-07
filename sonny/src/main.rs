@@ -786,7 +786,7 @@ async fn read_status(
             profile,
             latest: step,
             place,
-            pr: match reviews::read(&store, name) {
+            pr: match reviews::read(&store, name, bot["bot_id"].as_i64().unwrap_or(-1)) {
                 kept if !kept.is_empty() => reviews::said(&kept),
                 _ => pr.unwrap_or_default(),
             },
@@ -5525,15 +5525,19 @@ impl App {
             self.read_tasks().await;
             if let Some(fleet) = &mut self.fleet {
                 fleet.rescan().await;
+                // A check's mark lands after its turn's events: what it
+                // sets off sounds now, not with the next event.
+                for (alert, what) in std::mem::take(&mut fleet.alerts) {
+                    self.sounds.alert(alert, &what);
+                }
             }
             if self.waiting.file.is_none() {
                 self.waiting.file =
                     Some(waiting::dir(&self.store()).join(format!("{}.json", self.bot)));
-                // A turn that ended while no window was open lets an older
-                // mark go.
-                let newest = json!({"bot": self.bot, "newest": true, "limit": 1});
-                if let Ok(page) = self.client.request("turns", newest).await
-                    && let Some(turn) = page["turns"][0]["turn"].as_i64()
+                // A turn that ran while no window was open lets an older
+                // mark go; a steer it took in, which never ran, does not.
+                if let Ok(ran) = last_ran(&self.client, &self.bot, None).await
+                    && let Some(turn) = ran["turn"].as_i64()
                 {
                     self.waiting.started(turn);
                 }
