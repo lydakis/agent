@@ -474,7 +474,8 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
     let key = (bot.clone(), turn);
     // Where the check's time went, over every attempt: reading the turn
     // for the evidence, and each judge turn that ended, so a slow failed
-    // attempt counts too. One still running when it gave up is untimed.
+    // attempt counts too. One still running when it gave up, or whose
+    // history could not be read whole, is untimed.
     let mut usage = Usage::default();
     let mut spent = Spent::default();
     let mut attempts = 0;
@@ -678,7 +679,7 @@ async fn judge(
             Err(Unreviewed::Failed(why))
         }
         Judged::Answers { answers, usage } => {
-            spent.judged(Some(&usage.timing));
+            spent.judged(usage.timing.as_ref());
             let verdicts = intent
                 .planned
                 .iter()

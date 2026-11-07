@@ -34,7 +34,8 @@ pub struct Usage {
     /// Of `input`, what the provider had cached.
     pub cached: u64,
     pub output: u64,
-    pub timing: Timing,
+    /// None when the turn's times or history could not be read whole.
+    pub timing: Option<Timing>,
 }
 
 /// Where a check's turn spent its time, in milliseconds, as the daemon
@@ -72,11 +73,11 @@ impl Timing {
     /// when it was written and whether it is a tool's output. A tool's
     /// time runs from the round that called it to the last output of
     /// those it called; the verdict's from the last output, or the
-    /// turn's start, to its end.
-    pub fn of(row: &Value, submitted_ms: i64, entries: &[(i64, bool)]) -> Self {
+    /// turn's start, to its end. None for a turn not ended.
+    pub fn of(row: &Value, submitted_ms: i64, entries: &[(i64, bool)]) -> Option<Self> {
         let at = |key: &str| row[key].as_i64();
         let (Some(started), Some(finished)) = (at("started_ms"), at("finished_ms")) else {
-            return Self::default();
+            return None;
         };
         let (mut tools, mut called, mut looked) = (0, None, None);
         for &(written, output) in entries {
@@ -99,7 +100,7 @@ impl Timing {
             .map_or(started, |(written, _)| (*written).clamp(started, finished));
         let span = |from: i64, to: i64| (to - from).max(0) as u64;
         let tools_ms = (tools.max(0) as u64).min(span(started, answered_from));
-        Self {
+        Some(Self {
             queued_ms: span(submitted_ms, started),
             looking_ms: span(started, answered_from) - tools_ms,
             tools_ms,
@@ -107,7 +108,7 @@ impl Timing {
             paced_ms: row["paced_ms"].as_u64().unwrap_or(0),
             rounds: row["model_rounds"].as_u64().unwrap_or(0),
             retries: row["retries"].as_u64().unwrap_or(0),
-        }
+        })
     }
 }
 
@@ -128,9 +129,9 @@ fn tool_output(item: &Value) -> bool {
 }
 
 /// Each history entry of `bot`'s turn `turn`, oldest first, as when it
-/// was written and whether it is a tool's output. Empty when it could not
-/// be read: the time then reads as all the verdict's.
-async fn entries(client: &Client, bot: &str, turn: i64) -> Vec<(i64, bool)> {
+/// was written and whether it is a tool's output. None when any of it
+/// could not be read, so no split is made from part of it.
+async fn entries(client: &Client, bot: &str, turn: i64) -> Option<Vec<(i64, bool)>> {
     // Pages run newest first: they are read until one reaches an earlier
     // turn, or the history's start.
     let mut written = Map::new();
@@ -143,7 +144,7 @@ async fn entries(client: &Client, bot: &str, turn: i64) -> Vec<(i64, bool)> {
             )
             .await
         else {
-            return Vec::new();
+            return None;
         };
         match turn_nodes(&page, turn, &mut written) {
             Some(next) => from = Some(next),
@@ -167,28 +168,31 @@ async fn entries(client: &Client, bot: &str, turn: i64) -> Vec<(i64, bool)> {
             )
             .await
         else {
-            return Vec::new();
+            return None;
         };
         let page = page["items"].as_array().cloned().unwrap_or_default();
-        let Some(mut rest) = rest(&left[..asked], &page) else {
-            return Vec::new();
-        };
+        let mut rest = rest(&left[..asked], &page)?;
         rest.extend_from_slice(&left[asked..]);
         left = rest;
         items.extend(page);
     }
-    let mut entries: Vec<(i64, i64, bool)> = (items.iter())
-        .filter_map(|entry| {
-            let node = entry["node"].as_i64()?;
-            let at = written.get(&node.to_string())?.as_i64()?;
-            Some((node, at, tool_output(&entry["item"])))
-        })
-        .collect();
+    // An item too large to send can't say whether it was a tool's output.
+    let mut entries: Vec<(i64, i64, bool)> = Vec::with_capacity(items.len());
+    for entry in &items {
+        if !entry["error"].is_null() {
+            return None;
+        }
+        let node = entry["node"].as_i64()?;
+        let at = written.get(&node.to_string())?.as_i64()?;
+        entries.push((node, at, tool_output(&entry["item"])));
+    }
     entries.sort_unstable();
-    entries
-        .into_iter()
-        .map(|(_, at, output)| (at, output))
-        .collect()
+    Some(
+        entries
+            .into_iter()
+            .map(|(_, at, output)| (at, output))
+            .collect(),
+    )
 }
 
 /// The most nodes one history read takes, as the daemon allows.
@@ -503,7 +507,7 @@ pub async fn turn_with(
             outcome["error"].as_str().unwrap_or("no answer")
         );
         let failed = Failed {
-            timing: Some(usage.timing),
+            timing: usage.timing,
             ..failed(why)
         };
         return (Err(failed), None);
@@ -519,7 +523,7 @@ pub async fn turn_with(
             let failed = Failed {
                 why,
                 reply: Some(text.to_owned()),
-                timing: Some(usage.timing),
+                timing: usage.timing,
             };
             return (Err(failed), None);
         }
@@ -540,13 +544,13 @@ async fn usage(client: &Client, bot: &str, turn: i64, submitted_ms: i64) -> Usag
     // called, with no round after to count them.
     let entries = match row["status"] != "completed" || tokens("model_rounds") > 1 {
         true => entries(client, bot, turn).await,
-        false => Vec::new(),
+        false => Some(Vec::new()),
     };
     Usage {
         input: tokens("input_tokens"),
         cached: tokens("cached_input_tokens"),
         output: tokens("output_tokens"),
-        timing: Timing::of(row, submitted_ms, &entries),
+        timing: entries.and_then(|entries| Timing::of(row, submitted_ms, &entries)),
     }
 }
 
@@ -590,7 +594,7 @@ mod tests {
         let timing = Timing::of(&row, 700, &entries);
         assert_eq!(
             timing,
-            Timing {
+            Some(Timing {
                 queued_ms: 300,
                 looking_ms: 2_000,
                 tools_ms: 3_000,
@@ -598,10 +602,10 @@ mod tests {
                 paced_ms: 50,
                 rounds: 3,
                 retries: 1,
-            }
+            })
         );
         // One round, nothing looked at: all the verdict's.
-        let once = Timing::of(&row, 1_000, &[]);
+        let once = Timing::of(&row, 1_000, &[]).unwrap();
         assert_eq!(
             (once.looking_ms, once.tools_ms, once.verdict_ms),
             (0, 0, 8_000)
@@ -615,10 +619,7 @@ mod tests {
         assert!(!tool_output(&json!({"role": "user", "content": [
             {"type": "input_text", "text": "look"}]})));
         // A turn not yet ended has no time to split.
-        assert_eq!(
-            Timing::of(&json!({"started_ms": 1}), 0, &[]),
-            Timing::default()
-        );
+        assert_eq!(Timing::of(&json!({"started_ms": 1}), 0, &[]), None);
     }
 
     #[test]
