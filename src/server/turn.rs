@@ -1705,9 +1705,9 @@ impl Turn {
                 None => match summarizer.family() {
                     agent_runtime::codec::Family::Anthropic => (Body::Span(&plan, stripped), tools),
                     agent_runtime::codec::Family::Responses => {
-                        empty = self
-                            .registry
-                            .encoded(summarizer.family(), &[], &[], false)?;
+                        empty =
+                            self.registry
+                                .encoded(summarizer.family(), false, &[], &[], false)?;
                         (Body::Span(&plan, stripped), &*empty)
                     }
                 },
@@ -2101,9 +2101,11 @@ impl Turn {
         Ok(instructions.len()
             + match family {
                 agent_runtime::codec::Family::Anthropic => tools.get().len(),
-                agent_runtime::codec::Family::Responses => {
-                    self.registry.encoded(family, &[], &[], false)?.get().len()
-                }
+                agent_runtime::codec::Family::Responses => self
+                    .registry
+                    .encoded(family, false, &[], &[], false)?
+                    .get()
+                    .len(),
             })
     }
 
@@ -2405,6 +2407,7 @@ impl Turn {
         // This bot's tools, encoded once per distinct selection and shared.
         let tools = self.registry.encoded(
             provider.family(),
+            provider.grammars(),
             &record.tools,
             &record.declared,
             record.sandboxed(),

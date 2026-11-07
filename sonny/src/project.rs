@@ -911,6 +911,7 @@ async fn create(
         model: Some(model),
         effort: (config.sonny.lead_effort.clone()).or(effort.filter(|e| !e.is_empty())),
         web_search: config.web_search,
+        web_search_off: config.web_search_off,
         fallbacks: config.fallbacks,
         ..Default::default()
     };
@@ -937,10 +938,15 @@ async fn make(
         // lead doesn't get is left out there.
         None => {
             let model = picks.model.as_deref().or(role.model.as_deref());
-            agent_client::default_tools(client.providers(), model.unwrap_or(""), picks.web_search)
-                .into_iter()
-                .map(String::from)
-                .collect()
+            agent_client::default_tools(
+                client.providers(),
+                model.unwrap_or(""),
+                picks.web_search,
+                &picks.web_search_off,
+            )
+            .into_iter()
+            .map(String::from)
+            .collect()
         }
     };
     let declare = json!(crate::declared::tools(crate::served::Role::LEAD));
@@ -987,6 +993,7 @@ pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
         picks.effort = config.sonny.lead_effort;
     }
     picks.web_search = config.web_search;
+    picks.web_search_off = config.web_search_off;
     picks.fallbacks = config.fallbacks;
     let socket = std::env::var_os("AGENT_SOCKET")
         .map(PathBuf::from)

@@ -44,7 +44,29 @@ pub struct State {
 
 impl State {
     pub fn frame(&mut self, frame: &[u8]) -> Result<Frame> {
-        let event: Event<'_> = serde_json::from_slice(frame).map_err(|e| unparsed(e, frame))?;
+        let event: Event<'_> = match serde_json::from_slice(frame) {
+            Ok(event) => event,
+            // An error in a shape of the endpoint's own is still its error,
+            // its message under `error` or at the top, with no `type` or
+            // with fields of other types than OpenAI's.
+            Err(error) => {
+                let value = serde_json::from_slice::<Value>(frame).unwrap_or(Value::Null);
+                let kind = match value.get("type") {
+                    None => "error",
+                    Some(kind) => kind.as_str().unwrap_or_default(),
+                };
+                let said = detail_of(&value)
+                    .or_else(|| detail_of(&value["response"]))
+                    .is_some();
+                return match kind {
+                    "error" | "response.failed" | "response.incomplete" if said => {
+                        let kind = kind.to_owned();
+                        self.failed(&kind, value)
+                    }
+                    _ => Err(unparsed(error, frame)),
+                };
+            }
+        };
         if self.completion.is_some() {
             return fail("event_after_completion");
         }
@@ -96,67 +118,71 @@ impl State {
             }
             "error" | "response.failed" | "response.incomplete" => {
                 let value: Value = serde_json::from_slice(frame).unwrap_or(Value::Null);
-                self.usage = value["response"]
-                    .get("usage")
-                    .filter(|v| !v.is_null())
-                    .map(|usage| Usage {
-                        served_model: value["response"]["model"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_owned(),
-                        ..parse_usage(usage)
-                    });
-                let detail = detail_of(&value)
-                    .or_else(|| detail_of(&value["response"]))
-                    .or_else(|| {
-                        value["response"]["incomplete_details"]["reason"]
-                            .as_str()
-                            .map(str::to_owned)
-                    });
-                // A rate limit refused inside the stream is a distinct outcome
-                // from a response the model could not finish: it is the
-                // provider's pace, not the request, and a fleet must see it.
-                let rate_limited = (event.kind == "error"
-                    && value["code"].as_str() == Some("rate_limit_exceeded"))
-                    || [&value["error"], &value["response"]["error"]]
-                        .iter()
-                        .any(|error| error["code"].as_str() == Some("rate_limit_exceeded"))
-                    || detail
-                        .as_deref()
-                        .is_some_and(|d| d.starts_with("Rate limit reached"));
-                // A ChatGPT plan's usage limit can also end a started stream.
-                // A code at the top level of an `error` event, as above.
-                let errors = [&value, &value["error"], &value["response"]["error"]];
-                let named = |test: fn(&str) -> bool| {
-                    errors
-                        .iter()
-                        .any(|error| error["code"].as_str().is_some_and(test))
-                };
-                // An overload or a server failure after the stream began is
-                // the provider's, not the request's, and is retried as Codex
-                // retries it (openai/codex e8e6a92, sse/responses_error.rs):
-                // `slow_down` as a rate limit, an overload holding the pool.
-                let code = if named(super::quota) {
-                    "provider_quota_exhausted"
-                } else if named(super::plan_unavailable) {
-                    "provider_plan_unavailable"
-                } else if rate_limited || named(|code| code == "slow_down") {
-                    "provider_rate_limited"
-                } else if named(|code| code == "server_is_overloaded") {
-                    "provider_overloaded"
-                } else if named(|code| code == "server_error") {
-                    "provider_server_error"
-                } else {
-                    "provider_incomplete"
-                };
-                match detail {
-                    Some(detail) => fail_with(code, detail),
-                    None => fail(code),
-                }
+                self.failed(event.kind, value)
             }
             // Metadata and tool argument deltas are represented by the
             // validated terminal output. Unknown final item kinds fail.
             _ => Ok(Frame::Quiet),
+        }
+    }
+    /// The provider's refusal or failure, from the stream's error event.
+    fn failed(&mut self, kind: &str, value: Value) -> Result<Frame> {
+        self.usage = value["response"]
+            .get("usage")
+            .filter(|v| !v.is_null())
+            .map(|usage| Usage {
+                served_model: value["response"]["model"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                ..parse_usage(usage)
+            });
+        let detail = detail_of(&value)
+            .or_else(|| detail_of(&value["response"]))
+            .or_else(|| {
+                value["response"]["incomplete_details"]["reason"]
+                    .as_str()
+                    .map(str::to_owned)
+            });
+        // A rate limit refused inside the stream is a distinct outcome
+        // from a response the model could not finish: it is the
+        // provider's pace, not the request, and a fleet must see it.
+        let rate_limited = (kind == "error"
+            && value["code"].as_str() == Some("rate_limit_exceeded"))
+            || [&value["error"], &value["response"]["error"]]
+                .iter()
+                .any(|error| error["code"].as_str() == Some("rate_limit_exceeded"))
+            || detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("Rate limit reached"));
+        // A ChatGPT plan's usage limit can also end a started stream.
+        // A code at the top level of an `error` event, as above.
+        let errors = [&value, &value["error"], &value["response"]["error"]];
+        let named = |test: fn(&str) -> bool| {
+            errors
+                .iter()
+                .any(|error| error["code"].as_str().is_some_and(test))
+        };
+        // An overload or a server failure after the stream began is
+        // the provider's, not the request's, and is retried as Codex
+        // retries it (openai/codex e8e6a92, sse/responses_error.rs):
+        // `slow_down` as a rate limit, an overload holding the pool.
+        let code = if named(super::quota) {
+            "provider_quota_exhausted"
+        } else if named(super::plan_unavailable) {
+            "provider_plan_unavailable"
+        } else if rate_limited || named(|code| code == "slow_down") {
+            "provider_rate_limited"
+        } else if named(|code| code == "server_is_overloaded") {
+            "provider_overloaded"
+        } else if named(|code| code == "server_error") {
+            "provider_server_error"
+        } else {
+            "provider_incomplete"
+        };
+        match detail {
+            Some(detail) => fail_with(code, detail),
+            None => fail(code),
         }
     }
     pub fn usage(&self) -> Option<Usage> {
@@ -327,6 +353,33 @@ mod tests {
         let calls = RawValue::from_string(r#"{"status":"completed","output":[{"type":"function_call","name":"echo","call_id":"x","arguments":"{}"},{"type":"function_call","name":"echo","call_id":"x","arguments":"{}"}]}"#.into()).unwrap();
         assert!(parse_completion(&calls, "").is_err());
     }
+    #[test]
+    fn an_error_in_the_endpoint_s_own_shape_says_what_it_said() {
+        // No `type`, as an OpenAI-shaped error body; a message alone; and
+        // an `error` event whose other fields are not OpenAI's types.
+        for frame in [
+            r#"{"error":{"code":"validation_error","message":"The request was rejected by target.","param":null,"type":"invalid_request_error"}}"#,
+            r#"{"message":"The request was rejected by target."}"#,
+            r#"{"type":"error","output_index":null,"error":{"message":"The request was rejected by target."}}"#,
+        ] {
+            let error = State::default().frame(frame.as_bytes()).unwrap_err();
+            assert_eq!(error.code, "provider_incomplete", "{frame}");
+            assert_eq!(
+                error.detail.as_deref(),
+                Some("The request was rejected by target."),
+                "{frame}"
+            );
+        }
+        // One that says nothing is still a frame that did not parse.
+        for frame in [
+            r#"{"error":"x"}"#,
+            r#"{"type":"response.created","output_index":"x"}"#,
+        ] {
+            let error = State::default().frame(frame.as_bytes()).unwrap_err();
+            assert_eq!(error.code, "invalid_json", "{frame}");
+        }
+    }
+
     #[test]
     fn a_reply_that_does_not_parse_says_why_and_how_it_began() {
         // A call whose arguments come as an object, not the string the

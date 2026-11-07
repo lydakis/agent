@@ -1095,21 +1095,9 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     if let Some(file) = agent_client::config::path().filter(|_| options.providers_from_config) {
         command.arg("--provider-config").arg(file);
     }
-    // Discovery's catalog beside the person's model list, rewritten by
-    // every start of the daemon of the home store beside it
-    // (`state.sqlite`); a daemon on another store (a test, a side daemon,
-    // another file in the same folder) leaves it alone. The folder is
-    // compared resolved, so an alias of it counts.
-    if let Some(models) = agent_client::models::path().filter(|models| {
-        let place = |path: &Path| {
-            Some((
-                std::fs::canonicalize(path.parent()?).ok()?,
-                path.file_name()?.to_owned(),
-            ))
-        };
-        let home = place(&models.with_file_name("state.sqlite"));
-        home.is_some() && home == place(&options.store)
-    }) {
+    // Discovery's catalog, rewritten by every start of the home store's
+    // daemon; a daemon on another store leaves it alone.
+    if let Some(models) = home_models(&options.store) {
         command
             .arg("--models")
             .arg(agent_client::models::discovered(&models));
@@ -1605,11 +1593,34 @@ fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
 /// discovery's catalog beside it; reading them needs no daemon.
 /// `--discover` rewrites the catalog from the listings of the providers the
 /// daemon runs, as every daemon start does, and says on stderr what changed.
+/// The person's model list, when `store` is the home store beside it
+/// (`state.sqlite`): only that store's daemon writes discovery's catalog,
+/// so a test, a side daemon or another file in the same folder never
+/// replaces it. The folder is compared resolved, so an alias of it counts.
+fn home_models(store: &Path) -> Option<PathBuf> {
+    agent_client::models::path().filter(|models| {
+        let place = |path: &Path| {
+            Some((
+                std::fs::canonicalize(path.parent()?).ok()?,
+                path.file_name()?.to_owned(),
+            ))
+        };
+        let home = place(&models.with_file_name("state.sqlite"));
+        home.is_some() && home == place(store)
+    })
+}
+
 fn models(options: &Options) -> Result<i32> {
     let path = agent_client::models::path().ok_or(Error::with("usage", "set HOME"))?;
     if options.discover {
-        let catalog = agent_client::models::discovered(&path);
         let mut connection = ensure_daemon(options)?;
+        if home_models(&options.store).is_none() {
+            return fail_with(
+                "usage",
+                "--discover rewrites the home store's catalog; this store is another one (--store or AGENT_STORE), and its daemon's provider_models lists what its providers serve",
+            );
+        }
+        let catalog = agent_client::models::discovered(&path);
         let listing = connection.request("provider_models", json!({}))?;
         let refreshed = agent_client::models::refresh(&catalog, &listing).map_err(Error::from)?;
         for (provider, said) in &refreshed.refused {
@@ -1765,11 +1776,16 @@ fn run(options: &Options) -> Result<i32> {
         let tools: Vec<String> = match role.as_ref().and_then(|r| r.tools.clone()) {
             Some(tools) if !options.tools_explicit => tools,
             _ if !options.tools_explicit => {
-                let search = config()?.web_search;
-                agent_client::default_tools(&connection.ready["providers"], &model, search)
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect()
+                let config = config()?;
+                agent_client::default_tools(
+                    &connection.ready["providers"],
+                    &model,
+                    config.web_search,
+                    &config.web_search_off,
+                )
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
             }
             _ => options
                 .tools

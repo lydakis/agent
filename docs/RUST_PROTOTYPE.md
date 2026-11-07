@@ -3053,8 +3053,10 @@ parameters is refused at once and waits for no answer.
 
 Protocol version 22 lets a declared tool take free-form text, as
 `apply_patch` does: a tool declared with `grammar`, a Lark grammar its
-input follows, is declared on Responses as a custom tool whose call is the
-text itself, and elsewhere as a function of that text, so its `parameters`
+input follows, is declared on OpenAI's own API (a key or the ChatGPT plan)
+as a custom tool whose call is the text itself, and elsewhere, other
+Responses endpoints among them, as a function of that text: Grok on Bedrock
+refuses custom tools. So its `parameters`
 must take `input` as a required string (`invalid_declare` otherwise).
 Either way the call's `arguments` are `{"input": TEXT}` and its answer is
 the provider's custom tool output where it has one. The grammar counts
@@ -3694,10 +3696,11 @@ is set. `apply_patch` takes Codex's patch format: one patch adds, deletes,
 updates and moves any number of files, every change checked before any file is
 written, so a patch that does not apply changes nothing. Its context lines
 match exactly, then ignoring trailing and surrounding whitespace, then with
-typographic punctuation read as ASCII. On Responses it is a custom tool whose
+typographic punctuation read as ASCII. On OpenAI's own API it is a custom tool whose
 call is the patch itself, constrained by its Lark grammar, and its result a
-`custom_tool_call_output`; on Anthropic, a function taking the patch as
-`input`. Paths are relative to the workspace unless absolute; nothing confines a
+`custom_tool_call_output`; on any other endpoint, a function taking the patch as
+`input`. A history holding custom calls replays as it is: Bedrock's GPT takes
+it beside the function (checked 2026-11-07). Paths are relative to the workspace unless absolute; nothing confines a
 tool to the workspace, and tools run with the service's OS permissions.
 Native file tools accept regular files, including symlinks to regular files.
 Known pipes, devices, and other special files return `file_not_regular`. Opens
@@ -3711,12 +3714,12 @@ namespace, which the daemon answers by posting the call's commands to the
 provider's `alpha/search` (bounded at 1 MiB and two minutes) and returning its
 `output`. Searches are paced in a pool of their own and their failures classed
 as a model call's: a rate limit closes the pool, a server or connection failure
-backs off, and both retry within the two minutes before the model hears of them. Bedrock's GPT models get the hosted `web_search` tool over indexed
+backs off, and both retry within the two minutes before the model hears of them. Bedrock Mantle's GPT models get the hosted `web_search` tool over indexed
 results, and Anthropic's API gets its hosted server tool, `web_search_20260209`
 for Claude 4.6 and later but Haiku, `web_search_20250305` otherwise; the
 provider runs both, its blocks and citations are kept in the history as sent,
 and a `pause_turn` stop asks again without a new message. A ChatGPT plan login,
-Claude on Bedrock and any other gateway offer none: `create` refuses the tool
+Claude on Bedrock, Bedrock runtime's OpenAI route and any other gateway offer none: `create` refuses the tool
 there with `web_search_unavailable`, and `ready` says per provider whether it
 searches (`web_search`). It runs without approval, as Codex's does.
 

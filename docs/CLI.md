@@ -472,7 +472,9 @@ with the CLI's built-in text as the default; the daemon has none. `run
 default `shell,write_stdin,read,write,wait,history` with the file editor its model
 family is trained on: `apply_patch` for a Responses model, else `edit`, and
 `web_search` where the provider offers it and `web_fetch` for any, unless
-`~/.agent/config.toml` sets `web_search = "disabled"`. An
+`~/.agent/config.toml` sets `web_search = "disabled"` (or names the model in
+`web_search_off`, `PROVIDER/MODEL` patterns with `*` and `?`, which leaves
+search out and keeps `web_fetch`). An
 existing bot keeps its own,
 so `--tools` while continuing one is a usage error.
 `run --fallback PROVIDER/MODEL` gives a new bot a model, in its family, that

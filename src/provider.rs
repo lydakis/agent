@@ -257,6 +257,8 @@ pub struct Provider {
     /// A Bedrock endpoint, however it authenticates: it takes no fallback
     /// credit and serves no WebSocket.
     bedrock: bool,
+    /// Bedrock Mantle, the one Bedrock endpoint that hosts server-side tools.
+    mantle: bool,
     /// The models this provider last listed, shared by every clone.
     listing: Arc<models::Listing>,
     /// The windows the person set, with the name this provider is bound
@@ -512,7 +514,9 @@ impl Provider {
             Family::Anthropic => "messages",
         };
         url.set_path(&format!("{}/{route}", url.path().trim_end_matches('/')));
-        let bedrock = aws::endpoint(&url).is_some();
+        let endpoint = aws::endpoint(&url);
+        let bedrock = endpoint.is_some();
+        let mantle = endpoint.is_some_and(|(_, service)| service == "bedrock-mantle");
         Ok(Self {
             transport,
             pools: Arc::new(pace::Pools::default()),
@@ -527,6 +531,7 @@ impl Provider {
             sockets: None,
             aws: None,
             bedrock,
+            mantle,
             listing: Arc::default(),
             windows: None,
         })
@@ -572,6 +577,14 @@ impl Provider {
         if let Some(sockets) = &self.sockets {
             sockets.recorded(bot, ids);
         }
+    }
+    /// Whether the endpoint takes OpenAI's custom tools, whose call is
+    /// free-form text a grammar shapes: OpenAI's own API, on a key or the
+    /// ChatGPT plan. Other Responses endpoints may serve OpenAI's models
+    /// but refuse the tool for others (Grok on Bedrock, 2026-11-07), so
+    /// there a grammar tool is a function taking its text.
+    pub fn grammars(&self) -> bool {
+        self.family == Family::Responses && self.url.host_str() == Some("api.openai.com")
     }
     pub fn family(&self) -> Family {
         self.family
@@ -2370,7 +2383,7 @@ mod tests {
                 Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
             let schemas = crate::tools::Registry::all()
                 .unwrap()
-                .encoded(family, &["echo".into()], &[], false)
+                .encoded(family, false, &["echo".into()], &[], false)
                 .unwrap();
             for allow in [true, false] {
                 for tools in [&*schemas, &*none()] {
@@ -2431,7 +2444,9 @@ mod tests {
         for family in [Family::Anthropic, Family::Responses] {
             let provider =
                 Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
-            let schemas = tools.encoded(family, &["echo".into()], &[], false).unwrap();
+            let schemas = tools
+                .encoded(family, false, &["echo".into()], &[], false)
+                .unwrap();
             let body = |output_schema, reasoning| {
                 let mut prefix = provider
                     .prefix(&Request {
