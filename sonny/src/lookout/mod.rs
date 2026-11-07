@@ -3414,10 +3414,12 @@ impl Lookout {
         // it was, busy or not: the daemon took it already, or takes it now.
         let sent = std::mem::take(&mut self.resend);
         if !sent.is_empty() {
-            let steer = sent.iter().any(|heard| heard.event.steer);
+            let urgent = sent.iter().any(|heard| heard.event.steer);
+            // One that went because it was late is late still.
+            let late = !urgent && sent.iter().any(|heard| self.late_one(heard));
             let unkept = self.unkept_sent.line(self.waiting, epoch_ms() as u64);
-            let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref(), false);
-            return self.source(client, woken, sent, prompt, steer);
+            let prompt = sources::note(&sent, self.heard.len(), unkept.as_deref(), late);
+            return self.source(client, woken, sent, prompt, urgent || late);
         }
         let urgent = self.heard.iter().any(|heard| heard.event.steer);
         let rests = now >= since + SETTLE && self.updates.idle();
@@ -3454,28 +3456,30 @@ impl Lookout {
     /// as it may for the subscriber to rest: its subscription's digest, else
     /// its source's, else the lookout's wait for rest.
     fn heard_late(&self, now: Instant) -> bool {
+        (self.heard.iter())
+            .filter(|heard| self.ready(heard, now))
+            .any(|heard| self.late_one(heard))
+    }
+
+    /// Whether this, heard, has waited as long as it may for the subscriber
+    /// to rest. Each subscription that hears it waits its own digest, `0`
+    /// none, else its source's, as `ready` reads them; the first that may
+    /// tell it says when it is late.
+    fn late_one(&self, heard: &sources::Heard) -> bool {
         let Some(rest) = self.rest else {
             return false;
         };
-        let now_ms = epoch_ms();
-        (self.heard.iter())
-            .filter(|heard| self.ready(heard, now))
-            .any(|heard| {
-                // Each subscription that hears it waits its own digest, `0`
-                // none, else its source's, as `ready` reads them; the
-                // first that may tell it says when it is late.
-                let window = |name: &String| {
-                    let own = (self.subs.iter()).find(|sub| sub.name == *name);
-                    match own.filter(|sub| sub.digest.is_some()) {
-                        Some(sub) => sub.digest_span(),
-                        None => heard.event.digest,
-                    }
-                    .unwrap_or(rest)
-                };
-                let wait = (heard.subs.iter().map(window).min())
-                    .unwrap_or_else(|| heard.event.digest.unwrap_or(rest));
-                now_ms.saturating_sub(heard.event.at_ms) >= wait.as_millis()
-            })
+        let window = |name: &String| {
+            let own = (self.subs.iter()).find(|sub| sub.name == *name);
+            match own.filter(|sub| sub.digest.is_some()) {
+                Some(sub) => sub.digest_span(),
+                None => heard.event.digest,
+            }
+            .unwrap_or(rest)
+        };
+        let wait = (heard.subs.iter().map(window).min())
+            .unwrap_or_else(|| heard.event.digest.unwrap_or(rest));
+        epoch_ms().saturating_sub(heard.event.at_ms) >= wait.as_millis()
     }
 
     /// Sends `sent` as one note, its request named by the events it tells,
@@ -6123,6 +6127,28 @@ mod tests {
         let prompt = submit["prompt"].as_str().unwrap();
         assert!(prompt.contains("it waited as long as it may"), "{prompt}");
         assert!(lookout.heard.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_late_note_sent_again_after_a_restart_still_cuts_in() {
+        let (client, mut got) = submits().await;
+        let mut lookout = lookout();
+        lookout.updates.live = true;
+        lookout.subs.push(hears("chat"));
+        busy(&mut lookout);
+        lookout.resend = vec![sources::Heard {
+            event: sources::Event {
+                at_ms: epoch_ms() - REST_WAIT.as_millis(),
+                ..slack("lunch?", false)
+            },
+            subs: vec!["chat".into()],
+        }];
+        lookout.heard_since = Some(Instant::now());
+        wake_sources(&mut lookout, &client).await;
+        let submit = got.recv().await.unwrap();
+        assert_eq!(submit["delivery"], "steer");
+        let prompt = submit["prompt"].as_str().unwrap();
+        assert!(prompt.contains("it waited as long as it may"), "{prompt}");
     }
 
     #[tokio::test]
