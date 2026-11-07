@@ -7666,8 +7666,12 @@ impl App {
             return (lines, marks);
         }
         let kinds: Vec<&str> = cluster.messages().map(|m| m.kind).collect();
+        // Each name once, as the row says it: a long gap has few.
+        let mut seen = std::collections::HashSet::new();
         let names: Vec<String> = (cluster.messages())
-            .flat_map(|m| m.names.iter().cloned())
+            .flat_map(|m| m.names.iter())
+            .filter(|name| seen.insert(name.as_str()))
+            .cloned()
             .collect();
         let plan = (cluster.plans().last())
             .and_then(|at| self.plans.get(&at))
