@@ -212,6 +212,7 @@ impl News {
         fn kept(hold: &mut super::activity::Hold, gone: &[String]) -> bool {
             let heard = !hold.heard.is_empty();
             hold.heard.retain(|sub| !gone.contains(sub));
+            hold.steered.retain(|sub| !gone.contains(sub));
             hold.windows.retain(|(sub, _)| !gone.contains(sub));
             !heard || !hold.heard.is_empty()
         }
@@ -248,16 +249,12 @@ impl News {
     /// The subscription whose `urgent` matched some of it, while that is
     /// still to be told: each piece keeps its own.
     fn urgent(&self) -> Option<&str> {
-        self.urgents().next()
-    }
-
-    /// Every subscription whose `urgent` matched some of it.
-    fn urgents(&self) -> impl Iterator<Item = &str> {
         let turns = [&self.act, &self.theirs].into_iter().flatten();
         (turns.filter_map(|t| t.urgent.as_deref()))
             .chain(self.said.iter().filter_map(|s| s.urgent.as_deref()))
             .chain(self.notes.iter().filter_map(|n| n.urgent.as_deref()))
             .chain(self.asks.iter().filter_map(|a| a.urgent.as_deref()))
+            .next()
     }
 
     /// It holds the person's words.
@@ -1756,9 +1753,10 @@ impl Updates {
             }
             // Each subscription whose `steer` matched what it tells
             // steered, whether or not the note joins a turn.
-            for rule in news.urgents().filter(|_| self.live) {
-                if !steered.iter().any(|had| had == rule) {
-                    steered.push(rule.to_owned());
+            let steering = (news.holds()).flat_map(|hold| &hold.steered);
+            for sub in steering.filter(|_| self.live) {
+                if !steered.contains(sub) {
+                    steered.push(sub.clone());
                 }
             }
             if hearing.is_empty() {

@@ -1212,7 +1212,8 @@ struct Timed<'a> {
 }
 
 /// About how many notes these events would be, as the lookout sends
-/// them: a note goes once what came settles, or at once for a steer,
+/// them: a note goes once what came since the note before settles, and
+/// an event is ready, or at once for a steer,
 /// carrying what is ready by then, steers first, as many as a note holds;
 /// each event no sooner than a digest after the note before on its
 /// clock. What a note had no room for, or a digest still holds, waits for
@@ -1233,11 +1234,21 @@ fn notes(times: &[Timed]) -> usize {
         before: Option<u128>,
     ) -> usize {
         let settle = super::SETTLE.as_millis();
-        let goes = |last: &HashMap<&str, u128>, free: u128, e: &Timed| {
-            ready(last, e).max(free) + if e.steer { 0 } else { settle }
+        // What waits settles from when the first of it came since the note
+        // before, as the lookout's `heard_since`; a steer waits for none.
+        let goes = |last: &HashMap<&str, u128>, free: u128, settled: u128, e: &Timed| {
+            let at = ready(last, e).max(free);
+            if e.steer { at } else { at.max(settled) }
         };
         let mut notes = 0;
-        while let Some(went) = (waiting.iter()).map(|e| goes(last, *free, e)).min() {
+        while let Some(since) = (waiting.iter()).map(|e| e.at.max(*free)).min() {
+            let settled = since + settle;
+            let Some(went) = (waiting.iter())
+                .map(|e| goes(last, *free, settled, e))
+                .min()
+            else {
+                break;
+            };
             if before.is_some_and(|at| went >= at) {
                 break;
             }
@@ -1697,6 +1708,13 @@ mod tests {
         ];
         // A steer goes at once, alone: what its digest holds waits on.
         assert_eq!(notes(&steered), 3);
+        // What settled while its digest held it goes once the digest ends.
+        let late = [
+            t(s(0), false, hour, "a"),
+            t(s(60), false, hour, "a"),
+            t(s(3603), true, hour, "a"),
+        ];
+        assert_eq!(notes(&late), 3);
         // Steers wait for no settle: each goes as it comes.
         assert_eq!(
             notes(&[

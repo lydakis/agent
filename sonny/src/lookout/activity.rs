@@ -82,6 +82,8 @@ pub struct Hold {
     /// each, toward the listing's counts and a `runs` end, and it is no
     /// news once they all ended.
     pub heard: Vec<String>,
+    /// Those of them whose `steer` matched it: it steers for each.
+    pub steered: Vec<String>,
 }
 
 impl Hold {
@@ -107,6 +109,11 @@ impl Hold {
         for sub in other.heard {
             if !self.heard.contains(&sub) {
                 self.heard.push(sub);
+            }
+        }
+        for sub in other.steered {
+            if !self.steered.contains(&sub) {
+                self.steered.push(sub);
             }
         }
         self
@@ -136,10 +143,10 @@ pub fn hear(rules: &[Rule], event: &Value, skips: bool) -> Option<Heard> {
     };
     let mut urgent = None;
     for rule in hearing {
-        if urgent.is_none()
-            && (rule.urgent.as_deref()).is_some_and(|u| super::pattern::matches(u, event))
-        {
-            urgent = Some(rule.sub.clone());
+        // The first says why it cuts in; it steers for every one.
+        if (rule.urgent.as_deref()).is_some_and(|u| super::pattern::matches(u, event)) {
+            urgent.get_or_insert_with(|| rule.sub.clone());
+            hold.steered.push(rule.sub.clone());
         }
         match rule.digest {
             Some(digest) => hold.windows.push((rule.sub.clone(), digest)),
@@ -210,6 +217,7 @@ mod tests {
                     ("tenth".into(), Duration::from_secs(600))
                 ],
                 heard: vec!["hourly".into(), "tenth".into()],
+                steered: Vec::new(),
             }
         );
         // What goes now still counts as told for the digests that heard it.
@@ -217,6 +225,7 @@ mod tests {
             now: true,
             windows: vec![("hourly".into(), Duration::from_secs(3600))],
             heard: vec!["hourly".into()],
+            steered: Vec::new(),
         };
         let plain = rule("plain", None, None, 0);
         assert_eq!(
@@ -245,10 +254,16 @@ mod tests {
                     now: false,
                     windows: vec![("migration".into(), Duration::from_secs(3600))],
                     heard: vec!["migration".into()],
+                    steered: vec!["migration".into()],
                 },
                 urgent: Some("migration".into())
             })
         );
+        // Another whose `steer` matched too steers as well; the first says why.
+        let also = rule("also", None, Some(json!({"status": ["failed"]})), 0);
+        let both = hear(&[rules[0].clone(), also], &event, false).unwrap();
+        assert_eq!(both.urgent.as_deref(), Some("migration"));
+        assert_eq!(both.hold.steered, ["migration", "also"]);
         let calm = json!({"type": "turn.ended", "bot": "calc.fix", "status": "completed"});
         assert_eq!(hear(&rules, &calm, false).unwrap().urgent, None);
     }
@@ -274,10 +289,14 @@ mod tests {
             now: false,
             windows: vec![w("b", 5), w("a", 50)],
             heard: vec!["b".into()],
+            steered: vec!["b".into()],
         };
         let merged = a.merge(b);
         assert_eq!(merged.windows, [w("a", 50), w("b", 5)]);
-        assert_eq!(merged.heard, ["b"]);
+        assert_eq!(
+            (&merged.heard, &merged.steered),
+            (&vec!["b".to_owned()], &vec!["b".to_owned()])
+        );
     }
 
     #[test]
