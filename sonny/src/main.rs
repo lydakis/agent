@@ -2747,6 +2747,9 @@ struct App {
     /// When the person last used this window, for a lead that keeps only
     /// so many task windows open.
     window_used: used::Marks,
+    /// A scroll or a paste: the person is here, though the agent's own
+    /// mark waits for a key, a click or focus.
+    window_present: used::Present,
     place_read: Option<(String, Instant)>,
     model: String,
     effort: Option<String>,
@@ -4301,6 +4304,7 @@ impl App {
             place_job: None,
             tab_job: None,
             window_used: Default::default(),
+            window_present: Default::default(),
             place_read: None,
             model,
             effort: record["effort"].as_str().map(str::to_owned),
@@ -10443,6 +10447,15 @@ impl App {
                 })
         ) {
             self.window_used.used(&self.bot);
+        } else if matches!(
+            &event,
+            Event::Paste(_)
+                | Event::Mouse(event::MouseEvent {
+                    kind: event::MouseEventKind::ScrollUp | event::MouseEventKind::ScrollDown,
+                    ..
+                })
+        ) {
+            self.window_present.used();
         }
         match &event {
             Event::Resize(..) => self.stale = true,

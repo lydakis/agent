@@ -174,6 +174,26 @@ impl Marks {
     }
 }
 
+/// A window's presence marks, for what uses it without marking its agent
+/// (a scroll, a paste): the person is here all the same, so quiet waits
+/// ([`crate::quiet`]). Kept apart so the agent's own mark stays as it was.
+#[derive(Default)]
+pub struct Present {
+    last: Option<Instant>,
+}
+
+impl Present {
+    /// The person is here: `present` is marked off the screen's thread,
+    /// unless it was within [`EVERY`].
+    pub fn used(&mut self) {
+        if self.last.is_some_and(|last| last.elapsed() < EVERY) {
+            return;
+        }
+        self.last = Some(Instant::now());
+        tokio::task::spawn_blocking(crate::quiet::mark_present);
+    }
+}
+
 fn mark(file: &std::path::Path) {
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
