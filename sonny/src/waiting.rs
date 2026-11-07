@@ -277,6 +277,7 @@ async fn waiting_for(
 /// that follows [`schema`]; an error when the copy could not be made, or
 /// another window's copy of that turn is asked already.
 pub async fn check(client: &Client, bot: &str, turn: i64) -> Result<String, String> {
+    let checkpoint = turn_end(client, bot, turn).await?;
     let name = copy_name(bot, turn as u128 % 0x80_0000);
     // This window's own request: another's, of the same name, is refused
     // while this copy is there.
@@ -284,7 +285,7 @@ pub async fn check(client: &Client, bot: &str, turn: i64) -> Result<String, Stri
     let forked = client
         .request(
             "fork",
-            json!({"source": bot, "bot": name, "allow": [],
+            json!({"source": bot, "bot": name, "allow": [], "checkpoint": checkpoint,
                 "expire_ms": EXPIRE.as_millis() as u64, "request_id": request}),
         )
         .await
@@ -294,6 +295,27 @@ pub async fn check(client: &Client, bot: &str, turn: i64) -> Result<String, Stri
         .request("delete", json!({"bot": name, "bot_id": forked["bot_id"]}))
         .await;
     reply
+}
+
+/// How far back a turn's last node is looked for among `bot`'s newest.
+const TURN_END_NODES: usize = 64;
+
+/// The last node of `bot`'s turn `turn`, where its copy forks, so it reads
+/// that turn though another began since; an error when it is not among
+/// the newest, too far behind to check.
+async fn turn_end(client: &Client, bot: &str, turn: i64) -> Result<i64, String> {
+    let page = client
+        .request(
+            "history_nodes",
+            json!({"bot": bot, "limit": TURN_END_NODES}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    (page["nodes"].as_array().into_iter().flatten())
+        .filter(|node| node["turn"].as_i64() == Some(turn))
+        .filter_map(|node| node["node"].as_i64())
+        .max()
+        .ok_or_else(|| format!("turn {turn} of {bot} is not among its newest"))
 }
 
 /// The copy's name: `bot` cut short enough that the name, and the submit's
@@ -429,7 +451,9 @@ mod tests {
                     {"status": "completed", "text": " "}}}),
                 Some("wait") => json!({"results": {handle: {"status": "completed",
                     "text": r#"{"waiting": true, "for": "staging or prod", "reviews": ["CR-881"]}"#}}}),
-                Some("history_nodes") => json!({"nodes": []}),
+                // Turn 3 ended at node 12; a later turn began since.
+                Some("history_nodes") => json!({"nodes": [{"node": 14, "turn": 4},
+                    {"node": 12, "turn": 3}, {"node": 11, "turn": 3}]}),
                 Some("fork") => json!({"bot_id": 9}),
                 Some("submit") => json!({"handle": "turn:copy/1", "turn": 1}),
                 _ => json!({}),
@@ -450,6 +474,8 @@ mod tests {
         let fork = requests.iter().find(|r| r["op"] == "fork").unwrap();
         assert_eq!(fork["source"], "calc.plan");
         assert_eq!(fork["allow"], json!([]));
+        // It reads the turn it checks, not the one begun since.
+        assert_eq!(fork["checkpoint"], 12);
         let submit = requests.iter().find(|r| r["op"] == "submit").unwrap();
         assert_eq!(
             submit["output_schema"]["required"],

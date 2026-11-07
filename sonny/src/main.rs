@@ -4558,6 +4558,11 @@ impl Fleet {
             let ask = self.open_ask(&bot, seen);
             self.needs.asked(&bot, ask);
             let waits = self.needs.waits(&bot);
+            // A task its lead took back while its check ran is idle again
+            // once the check says it waits on the person.
+            if waits {
+                self.activity.entry(bot.clone()).or_insert(started::IDLE);
+            }
             self.settle(&bot, waits);
         }
     }
