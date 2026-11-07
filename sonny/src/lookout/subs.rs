@@ -82,6 +82,11 @@ impl Sub {
     /// Whether it hears this event of a source: it names the source, or
     /// the source and the event's topic, and its filter, if any, matches.
     pub fn hears(&self, event: &super::sources::Event) -> bool {
+        // The lookout's word that a source is down or back reaches every
+        // subscription to it, whatever its topic or filter.
+        if event.lookout {
+            return (self.sources.iter()).any(|name| super::sources::named(name).0 == event.source);
+        }
         let named = |name: &String| match super::sources::named(name) {
             (source, None) => source == event.source,
             (source, topic) => source == event.source && topic == event.topic.as_deref(),
