@@ -50,7 +50,10 @@ pub const QUIET: &str = "no reply";
 
 /// Whether a task in `state` waits on nothing more of its own.
 pub fn settled(state: &str) -> bool {
-    matches!(state, IDLE | DONE | QUIET | "failed" | "stopped" | "removed")
+    matches!(
+        state,
+        IDLE | DONE | QUIET | "failed" | "stopped" | "removed"
+    )
 }
 
 /// A state's mark and its color.
