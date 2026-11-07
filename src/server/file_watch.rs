@@ -43,12 +43,34 @@ fn c_path(path: &Path) -> std::io::Result<std::ffi::CString> {
 #[cfg(target_os = "linux")]
 mod imp {
     use super::{c_path, notify, split};
+    use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tokio::{io::unix::AsyncFd, sync::mpsc};
 
+    /// A write closed, or an entry made, moved or removed in a folder:
+    /// never a plain modify, so a log appended beside it costs no wakeup.
+    const MASK: u32 = libc::IN_CLOSE_WRITE
+        | libc::IN_MOVED_TO
+        | libc::IN_MOVED_FROM
+        | libc::IN_CREATE
+        | libc::IN_DELETE;
+
+    /// Watches the folder `path` is in for entries named as it is: the
+    /// watch descriptor and the name.
+    fn add(fd: &impl AsRawFd, path: &Path) -> std::io::Result<(i32, OsString)> {
+        let (folder, name) = split(path)?;
+        let folder = c_path(&folder)?;
+        // SAFETY: fd is a live inotify fd and folder a NUL-terminated path.
+        let wd = unsafe { libc::inotify_add_watch(fd.as_raw_fd(), folder.as_ptr(), MASK) };
+        if wd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((wd, name))
+    }
+
     pub fn spawn(path: PathBuf, sender: mpsc::Sender<()>) -> std::io::Result<()> {
-        let (folder, name) = split(&path)?;
         // SAFETY: inotify_init1 takes flags only and returns a new fd or -1.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
@@ -56,17 +78,17 @@ mod imp {
         }
         // SAFETY: fd was just returned to this process and is owned here.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let folder = c_path(&folder)?;
-        // A write closed, or an entry made, moved or removed in the folder:
-        // never a plain modify, so a log appended beside it costs no wakeup.
-        let mask = libc::IN_CLOSE_WRITE
-            | libc::IN_MOVED_TO
-            | libc::IN_MOVED_FROM
-            | libc::IN_CREATE
-            | libc::IN_DELETE;
-        // SAFETY: fd is a live inotify fd and folder a NUL-terminated path.
-        if unsafe { libc::inotify_add_watch(fd.as_raw_fd(), folder.as_ptr(), mask) } < 0 {
-            return Err(std::io::Error::last_os_error());
+        // The name given, which a link swapped or a file renamed over
+        // changes, and what it resolves to, which an edit through a link
+        // (into a dotfiles checkout) changes without touching the name.
+        let mut names: HashMap<i32, Vec<OsString>> = HashMap::new();
+        let (own, name) = add(&fd, &path)?;
+        names.entry(own).or_default().push(name);
+        let mut target = std::fs::canonicalize(&path).ok();
+        if let Some(resolved) = &target
+            && let Ok((wd, name)) = add(&fd, resolved)
+        {
+            names.entry(wd).or_default().push(name);
         }
         // SAFETY: the OwnedFd is open, and it keeps the one descriptor
         // until the AsyncFd that owns it drops.
@@ -107,19 +129,45 @@ mod imp {
                         let named = &buffer[at + HEADER..end];
                         let named =
                             &named[..named.iter().position(|b| *b == 0).unwrap_or(named.len())];
-                        // The folder itself went away: nothing more will come.
-                        if event.mask & (libc::IN_IGNORED | libc::IN_DELETE_SELF) != 0 {
-                            return;
-                        }
-                        if named == std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str())
-                            || event.mask & libc::IN_Q_OVERFLOW != 0
-                        {
-                            changed = true;
-                        }
                         at = end;
+                        if event.mask & libc::IN_Q_OVERFLOW != 0 {
+                            changed = true;
+                            continue;
+                        }
+                        if event.mask & libc::IN_IGNORED != 0 {
+                            names.remove(&event.wd);
+                            // The folder of the name given went away:
+                            // nothing more will come.
+                            if event.wd == own {
+                                return;
+                            }
+                            continue;
+                        }
+                        let watched = names.get(&event.wd).is_some_and(|names| {
+                            names.iter().any(|name| {
+                                named == std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str())
+                            })
+                        });
+                        changed |= watched;
                     }
                 }
-                if changed && !notify(&sender) {
+                if !changed {
+                    continue;
+                }
+                // The link may name another file now: watch that one too.
+                let resolved = tokio::fs::canonicalize(&path).await.ok();
+                if resolved.is_some() && resolved != target {
+                    target = resolved;
+                    if let Some(resolved) = &target
+                        && let Ok((wd, name)) = add(fd.get_ref(), resolved)
+                    {
+                        let names = names.entry(wd).or_default();
+                        if !names.contains(&name) {
+                            names.push(name);
+                        }
+                    }
+                }
+                if !notify(&sender) {
                     return;
                 }
             }
@@ -223,7 +271,9 @@ mod imp {
             libc::fcntl(queue.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
         // The folder's entries (a file renamed into place), and the file
-        // itself while it is there (written in place).
+        // itself while it is there (written in place). The file is opened
+        // through a link, so an edit to the file a link names is told too,
+        // and a file renamed over that one ends its watch and is reopened.
         let folder = open_events(&folder)?;
         register(&queue, &folder, libc::NOTE_WRITE)?;
         let mut file = open_events(&path).ok();
@@ -312,6 +362,38 @@ mod tests {
         // A rewrite after the rename is still told: the new file is watched.
         std::fs::write(&path, "a = 4\n").unwrap();
         assert!(told(&mut receiver).await, "write after rename");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_edit_to_the_file_a_link_names_is_told() {
+        let dir = std::env::temp_dir().join(format!("watch-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        std::fs::create_dir_all(dir.join("dotfiles")).unwrap();
+        let target = dir.join("dotfiles/config.toml");
+        std::fs::write(&target, "a = 1\n").unwrap();
+        let path = dir.join("home/config.toml");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let mut receiver = super::watch(&path).unwrap();
+        std::fs::write(&target, "a = 2\n").unwrap();
+        assert!(told(&mut receiver).await, "write to the target");
+        while tokio::time::timeout(Duration::from_millis(200), receiver.recv())
+            .await
+            .is_ok()
+        {}
+        // The link pointed elsewhere: edits there are told from then on.
+        let other = dir.join("dotfiles/other.toml");
+        std::fs::write(&other, "a = 3\n").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&other, &path).unwrap();
+        assert!(told(&mut receiver).await, "link swapped");
+        while tokio::time::timeout(Duration::from_millis(200), receiver.recv())
+            .await
+            .is_ok()
+        {}
+        std::fs::write(&other, "a = 4\n").unwrap();
+        assert!(told(&mut receiver).await, "write to the new target");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

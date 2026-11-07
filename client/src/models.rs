@@ -5,9 +5,10 @@
 //! is given. The daemon keeps it current from the providers' own listings
 //! each time it starts, and `agent models --discover` does the same on
 //! demand: a three-way merge of the file, the providers' listings now and
-//! what they listed last time (`models.listed`, beside it), so a model a
+//! what refreshes put in the file (`models.listed`, beside it), so a model a
 //! provider newly lists is added, one it stopped listing is removed, and a
-//! line the person deleted, added or annotated stays as they left it.
+//! line the person deleted, added or annotated stays as they left it, a
+//! deletion even through a time the provider stopped listing the model.
 use crate::Error;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -36,6 +37,21 @@ pub fn path() -> Option<PathBuf> {
 
 /// The listed models in file order, each once. No file is no list.
 pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
+    let Some(text) = read_file(path, true)? else {
+        return Ok(Vec::new());
+    };
+    parse(&text).map_err(|(line, reason)| {
+        Error::with(
+            "models_invalid",
+            &format!("{}:{line}: {reason}", path.display()),
+        )
+    })
+}
+
+/// A list file's text, or none where there is none: a regular file of at
+/// most 1 MiB of UTF-8. A refresh reads with `follow` false, so a link put
+/// where it writes is refused rather than read through.
+fn read_file(path: &Path, follow: bool) -> Result<Option<String>, Error> {
     use std::io::Read;
     let unreadable = |error: std::io::Error| {
         Error::with("models_unreadable", &format!("{}: {error}", path.display()))
@@ -44,14 +60,15 @@ pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
     // rather than waited on; reads of a regular file are unaffected.
     let opened = {
         use std::os::unix::fs::OpenOptionsExt;
+        let link = if follow { 0 } else { libc::O_NOFOLLOW };
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | link)
             .open(path)
     };
     let file = match opened {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(unreadable(error)),
     };
     if !file.metadata().map_err(unreadable)?.is_file() {
@@ -71,16 +88,10 @@ pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
             &format!("{}: larger than 1 MiB", path.display()),
         ));
     }
-    let text = String::from_utf8(bytes).map_err(|error| {
+    String::from_utf8(bytes).map(Some).map_err(|error| {
         Error::with(
             "models_unreadable",
             &format!("{}: {}", path.display(), error.utf8_error()),
-        )
-    })?;
-    parse(&text).map_err(|(line, reason)| {
-        Error::with(
-            "models_invalid",
-            &format!("{}:{line}: {reason}", path.display()),
         )
     })
 }
@@ -89,35 +100,17 @@ pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
 /// place: a failed write leaves no partial list, and a list made meanwhile
 /// is not replaced but refused with `models_file_exists`.
 pub fn install(path: &Path, text: &str) -> Result<(), Error> {
-    use std::io::Write;
     let failed = |error: std::io::Error| match error.kind() {
         std::io::ErrorKind::AlreadyExists => {
             Error::with("models_file_exists", &path.display().to_string())
         }
         _ => Error::with("models_unwritable", &format!("{}: {error}", path.display())),
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(failed)?;
-    }
-    let staged = path.with_file_name(format!(".models.{}", std::process::id()));
-    let installed = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staged)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        std::fs::hard_link(&staged, path)
-    })();
+    let staged = stage(path, text)?;
+    let installed = std::fs::hard_link(&staged, path);
     let _ = std::fs::remove_file(&staged);
     installed.map_err(failed)?;
-    // The new name is durable only once its directory is.
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(failed)?;
-    }
-    Ok(())
+    sync_folder(path)
 }
 
 fn parse(text: &str) -> Result<Vec<Model>, (usize, &'static str)> {
@@ -303,8 +296,9 @@ pub struct Refreshed {
     pub refused: Vec<(String, String)>,
 }
 
-/// Where the last listing each provider gave is kept: `models.listed`
-/// beside the list, one `PROVIDER/MODEL` per line.
+/// Where the refresh keeps what it put in the list: `models.listed`
+/// beside the list, one `PROVIDER/MODEL` per line. An id there and not in
+/// the list was deleted by hand and is not added back.
 pub fn listed_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".listed");
@@ -350,63 +344,63 @@ pub fn refresh(path: &Path, listing: &Value) -> Result<Refreshed, Error> {
         .filter_map(|(name, listed)| Some((name, listed_lines(name, listed["models"].as_array()?))))
         .collect();
     let record_path = listed_path(path);
+    // One refresh of a folder at a time (a daemon starting and `agent
+    // models --discover`), so neither installs a merge made from a list
+    // the other has since replaced.
+    let _held = hold(path)?;
     for _ in 0..4 {
         let text = match read_text(path)? {
             Some(text) => text,
             None => {
                 let text = render(listing, &[])?;
+                // What the list holds, not every id listed: a provider
+                // left out for the size limit is not recorded as deleted.
+                let added: Vec<String> = parse(&text)
+                    .map(|models| models.into_iter().map(|m| m.id).collect())
+                    .unwrap_or_default();
+                let record = record_text(added.iter().cloned().collect(), path)?;
                 match install(path, &text) {
                     // Someone wrote one meanwhile: merge into theirs.
                     Err(error) if error.code == "models_file_exists" => continue,
                     installed => installed?,
                 }
-                let record = answered
-                    .iter()
-                    .flat_map(|(_, lines)| lines.iter().map(|(id, _)| id.clone()))
-                    .collect();
-                write_record(&record_path, record)?;
+                write_record(&record_path, &record)?;
                 return Ok(Refreshed {
                     created: true,
-                    added: parse(&text)
-                        .map(|models| models.into_iter().map(|m| m.id).collect())
-                        .unwrap_or_default(),
+                    added,
                     removed: Vec::new(),
                     refused,
                 });
             }
         };
         let record = read_record(&record_path)?;
-        let (merged, added, removed) = merge(&text, &record, &answered);
-        if merged.len() as u64 > LIMIT {
-            return Err(Error::with(
-                "models_invalid",
-                &format!(
-                    "{}: a refresh would make it larger than 1 MiB",
-                    path.display()
-                ),
-            ));
-        }
-        if merged != text && !replace(path, &text, &merged)? {
+        let merged = merge(&text, &record, &answered);
+        // Built and checked before the list is touched, so a record that
+        // could not be written never leaves a list it does not describe.
+        let mut next: std::collections::BTreeSet<String> = record
+            .into_iter()
+            .filter(|id| !merged.removed.contains(id))
+            .collect();
+        next.extend(merged.listed.iter().cloned());
+        let next = match record_text(next.clone(), path) {
+            Ok(next) => next,
+            // Past the limit only through ids deleted by hand long ago:
+            // keep only those still listed.
+            Err(_) => record_text(
+                next.into_iter()
+                    .filter(|id| merged.listed.contains(id) || merged.offered.contains(id))
+                    .collect(),
+                path,
+            )?,
+        };
+        if merged.text != text && !replace(path, &text, &merged.text)? {
             continue;
         }
-        let mut kept: std::collections::BTreeSet<String> = record
-            .into_iter()
-            .filter(|id| {
-                !answered
-                    .iter()
-                    .any(|(name, _)| id.split_once('/').is_some_and(|(p, _)| p == name.as_str()))
-            })
-            .collect();
-        kept.extend(
-            answered
-                .iter()
-                .flat_map(|(_, lines)| lines.iter().map(|(id, _)| id.clone())),
-        );
-        write_record(&record_path, kept)?;
+        write_record(&record_path, &next)?;
         return Ok(Refreshed {
             created: false,
-            added,
-            removed,
+            added: merged.added,
+            removed: merged.removed,
             refused,
         });
     }
@@ -416,55 +410,122 @@ pub fn refresh(path: &Path, listing: &Value) -> Result<Refreshed, Error> {
     ))
 }
 
+/// Holds the list's folder for one refresh, waiting up to ten seconds for
+/// another to finish. A folder whose file system has no locks is not held.
+fn hold(path: &Path) -> Result<std::fs::File, Error> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let failed = |error: std::io::Error| {
+        Error::with("models_unwritable", &format!("{}: {error}", path.display()))
+    };
+    let folder = folder(path);
+    std::fs::create_dir_all(folder).map_err(failed)?;
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(folder)
+        .map_err(failed)?;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        // SAFETY: flock on a descriptor `held` owns; closing it lets go.
+        if unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(held);
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
+            return Ok(held);
+        }
+        if std::time::Instant::now() >= until {
+            return Err(Error::with(
+                "models_busy",
+                &format!("{}: another refresh holds it", path.display()),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn folder(path: &Path) -> &Path {
+    path.parent()
+        .filter(|folder| !folder.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
 /// The list's text, or none where there is no list; a list that does not
 /// parse is refused, never merged into.
 fn read_text(path: &Path) -> Result<Option<String>, Error> {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        _ => {}
-    }
-    // `read` refuses what is not a regular file, too large or malformed.
-    read(path)?;
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(Error::with(
-            "models_unreadable",
-            &format!("{}: {error}", path.display()),
-        )),
-    }
+    let Some(text) = read_file(path, false)? else {
+        return Ok(None);
+    };
+    parse(&text).map_err(|(line, reason)| {
+        Error::with(
+            "models_invalid",
+            &format!("{}:{line}: {reason}", path.display()),
+        )
+    })?;
+    Ok(Some(text))
 }
 
-/// The ids providers listed last time; none before the first refresh.
+/// The ids the refresh put in the list; none before the first refresh.
 fn read_record(path: &Path) -> Result<std::collections::HashSet<String>, Error> {
-    Ok(read(path)?.into_iter().map(|model| model.id).collect())
+    let Some(text) = read_file(path, false)? else {
+        return Ok(Default::default());
+    };
+    let models = parse(&text).map_err(|(line, reason)| {
+        Error::with(
+            "models_invalid",
+            &format!("{}:{line}: {reason}", path.display()),
+        )
+    })?;
+    Ok(models.into_iter().map(|model| model.id).collect())
 }
 
-fn write_record(path: &Path, ids: std::collections::BTreeSet<String>) -> Result<(), Error> {
+/// The record's text, refused past the size its reader takes.
+fn record_text(ids: std::collections::BTreeSet<String>, path: &Path) -> Result<String, Error> {
     let mut text = String::from(
-        "# What the providers listed at the last refresh of the list beside this one;\n\
-         # a model listed here and missing there was deleted by hand and is not added back.\n",
+        "# What the refresh put in the list beside this one; a model here and\n\
+         # missing there was deleted by hand and is not added back.\n",
     );
     for id in ids {
         text.push_str(&id);
         text.push('\n');
     }
-    match std::fs::read_to_string(path) {
-        Ok(old) if old == text => Ok(()),
-        _ => replace_unchecked(path, &text),
+    match text.len() as u64 > LIMIT {
+        true => Err(Error::with(
+            "models_invalid",
+            &format!("{}: its record would be larger than 1 MiB", path.display()),
+        )),
+        false => Ok(text),
     }
 }
 
-/// The merged text: for each provider that answered, lines it listed last
-/// time and no longer lists are dropped, with the notes discovery wrote
+fn write_record(path: &Path, text: &str) -> Result<(), Error> {
+    match read_file(path, false) {
+        Ok(Some(old)) if old == text => Ok(()),
+        _ => replace_unchecked(path, text),
+    }
+}
+
+/// A merge: the list's new text, what it added and removed, and every id
+/// the answering providers list now that the new text holds (`listed`) or
+/// that was left out of it (`offered`).
+#[derive(Default)]
+struct Merged {
+    text: String,
+    added: Vec<String>,
+    removed: Vec<String>,
+    listed: std::collections::HashSet<String>,
+    offered: std::collections::HashSet<String>,
+}
+
+/// The merged text: for each provider that answered, lines the refresh put
+/// in and it no longer lists are dropped, with the notes discovery wrote
 /// about it failing; models it lists that the list has never had are added
-/// after its last line, or as a block at the end. Everything else is kept
-/// byte for byte.
+/// after its last line, or as a block at the end, while they fit the size
+/// limit. Everything else is kept byte for byte.
 fn merge(
     text: &str,
     record: &std::collections::HashSet<String>,
     answered: &[(&String, Vec<(String, String)>)],
-) -> (String, Vec<String>, Vec<String>) {
+) -> Merged {
     let provider_of = |id: &str| id.split_once('/').map(|(provider, _)| provider.to_owned());
     let listed: std::collections::HashMap<&str, std::collections::HashSet<&str>> = answered
         .iter()
@@ -475,19 +536,20 @@ fn merge(
             )
         })
         .collect();
+    let mut merged = Merged::default();
     let mut kept: Vec<(Option<String>, &str)> = Vec::new();
-    let mut removed = Vec::new();
     let mut present = std::collections::HashSet::new();
     for line in text.split_inclusive('\n') {
         let id = entry(line);
         if let Some(id) = id {
             present.insert(id.to_owned());
-            let gone = provider_of(id)
-                .and_then(|provider| listed.get(provider.as_str()))
-                .is_some_and(|now| record.contains(id) && !now.contains(id));
-            if gone {
-                removed.push(id.to_owned());
+            let now = provider_of(id).and_then(|provider| listed.get(provider.as_str()));
+            if now.is_some_and(|now| record.contains(id) && !now.contains(id)) {
+                merged.removed.push(id.to_owned());
                 continue;
+            }
+            if now.is_some_and(|now| now.contains(id)) {
+                merged.listed.insert(id.to_owned());
             }
         } else if answered.iter().any(|(name, _)| failure_note(line, name)) {
             // The provider answers now, so what the first list said about
@@ -500,7 +562,7 @@ fn merge(
     if out.last().is_some_and(|line| !line.ends_with('\n')) {
         out.last_mut().expect("last").push('\n');
     }
-    let mut added = Vec::new();
+    let mut size: usize = out.iter().map(String::len).sum();
     for (name, lines) in answered {
         let new: Vec<&(String, String)> = lines
             .iter()
@@ -509,15 +571,22 @@ fn merge(
         if new.is_empty() {
             continue;
         }
-        added.extend(new.iter().map(|(id, _)| id.clone()));
         let block: String = new.iter().map(|(_, line)| line.as_str()).collect();
         let last = kept
             .iter()
             .rposition(|(provider, _)| provider.as_deref() == Some(name.as_str()));
+        let gap = usize::from(last.is_none() && out.last().is_some_and(|l| !l.trim().is_empty()));
+        if (size + gap + block.len()) as u64 > LIMIT {
+            merged.offered.extend(new.iter().map(|(id, _)| id.clone()));
+            continue;
+        }
+        size += gap + block.len();
+        merged.added.extend(new.iter().map(|(id, _)| id.clone()));
+        merged.listed.extend(new.iter().map(|(id, _)| id.clone()));
         match last {
             Some(index) => out[index].push_str(&block),
             None => {
-                if out.last().is_some_and(|line| !line.trim().is_empty()) {
+                if gap == 1 {
                     out.push("\n".to_owned());
                 }
                 out.push(block);
@@ -525,7 +594,8 @@ fn merge(
             }
         }
     }
-    (out.concat(), added, removed)
+    merged.text = out.concat();
+    merged
 }
 
 /// The model a list line names, if it names one.
@@ -548,51 +618,100 @@ fn failure_note(line: &str, name: &str) -> bool {
 }
 
 /// Replaces the list with `new` if it still reads `old`, whole and in one
-/// rename, keeping its permissions; false if it changed meanwhile.
+/// rename, keeping its permissions; false if it changed meanwhile. The new
+/// text is written out first and the list compared last, just before the
+/// rename, so an edit saved while it was written is merged, not lost.
 fn replace(path: &Path, old: &str, new: &str) -> Result<bool, Error> {
-    match std::fs::read_to_string(path) {
-        Ok(now) if now == old => {}
-        _ => return Ok(false),
+    let staged = stage(path, new)?;
+    if !matches!(read_file(path, false), Ok(Some(now)) if now == old) {
+        let _ = std::fs::remove_file(&staged);
+        return Ok(false);
     }
-    replace_unchecked(path, new)?;
+    commit(&staged, path)?;
     Ok(true)
 }
 
 fn replace_unchecked(path: &Path, text: &str) -> Result<(), Error> {
+    let staged = stage(path, text)?;
+    commit(&staged, path)
+}
+
+/// Writes `text` to a new file beside `path`, durable and with the
+/// permissions `path` has. The file is made new under a name not used
+/// before, never opened through a link or over a file already there, so a
+/// name planted in the folder can only be skipped, never written through.
+fn stage(path: &Path, text: &str) -> Result<PathBuf, Error> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let failed = |error: std::io::Error| {
         Error::with("models_unwritable", &format!("{}: {error}", path.display()))
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(failed)?;
-    }
-    let mut name = std::ffi::OsString::from(".");
-    name.push(path.file_name().unwrap_or_default());
-    name.push(format!(".{}", std::process::id()));
-    let staged = path.with_file_name(name);
-    let written = (|| {
-        let mut file = std::fs::OpenOptions::new()
+    std::fs::create_dir_all(folder(path)).map_err(failed)?;
+    // The permissions of the list there now, never of what a link names.
+    let permissions = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|meta| meta.permissions());
+    for _ in 0..8 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.subsec_nanos());
+        let mut name = std::ffi::OsString::from(".");
+        name.push(path.file_name().unwrap_or_default());
+        name.push(format!(
+            ".{}.{}{nanos:08x}",
+            std::process::id(),
+            STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let staged = path.with_file_name(name);
+        let mut file = match std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&staged)?;
-        if let Ok(meta) = std::fs::metadata(path) {
-            file.set_permissions(meta.permissions())?;
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&staged)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(failed(error)),
+        };
+        let written = (|| {
+            if let Some(permissions) = &permissions {
+                file.set_permissions(permissions.clone())?;
+            }
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        })();
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&staged);
+            return Err(failed(error));
         }
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&staged, path)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&staged);
+        return Ok(staged);
     }
-    written.map_err(failed)?;
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(failed)?;
+    Err(Error::with(
+        "models_unwritable",
+        &format!("{}: no free name to write beside it", path.display()),
+    ))
+}
+
+/// Renames a staged file over `path`, which replaces the name there (a
+/// link too) and never writes through it.
+fn commit(staged: &Path, path: &Path) -> Result<(), Error> {
+    if let Err(error) = std::fs::rename(staged, path) {
+        let _ = std::fs::remove_file(staged);
+        return Err(Error::with(
+            "models_unwritable",
+            &format!("{}: {error}", path.display()),
+        ));
     }
-    Ok(())
+    sync_folder(path)
+}
+
+/// A new name is durable only once its folder is.
+fn sync_folder(path: &Path) -> Result<(), Error> {
+    std::fs::File::open(folder(path))
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| Error::with("models_unwritable", &format!("{}: {error}", path.display())))
 }
 
 #[cfg(test)]
@@ -874,6 +993,86 @@ mod tests {
             std::fs::read_to_string(dir.join("models")).unwrap(),
             "not a model\n"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_model_deleted_by_hand_stays_deleted_through_a_listing_that_drops_it() {
+        let dir = temp("marker");
+        let list = dir.join("models");
+        let both = json!({"providers":{"openai":{"models":[{"id":"a"},{"id":"b"}]}}});
+        refreshed_in(&dir, both.clone());
+        let text = std::fs::read_to_string(&list)
+            .unwrap()
+            .replace("openai/b\n", "");
+        std::fs::write(&list, &text).unwrap();
+        // b leaves the listing for one refresh, then comes back.
+        refreshed_in(
+            &dir,
+            json!({"providers":{"openai":{"models":[{"id":"a"}]}}}),
+        );
+        let back = refreshed_in(&dir, both);
+        assert_eq!(back, super::Refreshed::default());
+        assert_eq!(std::fs::read_to_string(&list).unwrap(), text);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_model_the_provider_drops_and_lists_again_comes_back() {
+        let dir = temp("returns");
+        let both = json!({"providers":{"openai":{"models":[{"id":"a"},{"id":"b"}]}}});
+        refreshed_in(&dir, both.clone());
+        let gone = refreshed_in(
+            &dir,
+            json!({"providers":{"openai":{"models":[{"id":"a"}]}}}),
+        );
+        assert_eq!(gone.removed, ["openai/b"]);
+        let back = refreshed_in(&dir, both);
+        assert_eq!(back.added, ["openai/b"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_listing_past_the_size_limit_is_left_out_and_never_recorded() {
+        let dir = temp("large");
+        let list = dir.join("models");
+        let long: Vec<serde_json::Value> = (0..6000)
+            .map(|n| json!({"id": format!("{n:0>200}")}))
+            .collect();
+        let listing = json!({"providers":{
+            "big":{"models": long},
+            "openai":{"models":[{"id":"a"}]}}});
+        let first = refreshed_in(&dir, listing.clone());
+        assert_eq!(first.added, ["openai/a"]);
+        let record = std::fs::read_to_string(super::listed_path(&list)).unwrap();
+        assert!(!record.contains("big/"), "{}", record.len());
+        // Later refreshes still read their record, and still leave it out.
+        let again = refreshed_in(&dir, listing);
+        assert_eq!(again, super::Refreshed::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_link_put_where_the_refresh_writes_is_never_written_through() {
+        let dir = temp("planted");
+        let list = dir.join("models");
+        let listing = json!({"providers":{"openai":{"models":[{"id":"a"}]}}});
+        refreshed_in(&dir, listing.clone());
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep\n").unwrap();
+        let record = super::listed_path(&list);
+        std::fs::remove_file(&record).unwrap();
+        std::os::unix::fs::symlink(&victim, &record).unwrap();
+        let error = super::refresh(&list, &listing).unwrap_err();
+        assert_eq!(error.code, "models_unreadable");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+        // Nothing staged is left behind either.
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -419,13 +419,14 @@ fails with `provider_required`.
 Providers taken from the config file (no `--provider`, no `AGENT_PROVIDER`)
 follow it while the daemon runs (`serve --provider-config`): the kernel
 tells the daemon when the file changes (inotify, kqueue; nothing runs in
-between), and the new set is built and checked beside the old, then swapped
+between), including the file a linked `config.toml` names, and the new set is built and checked beside the old, then swapped
 in whole. Turns that start after the swap use it; running turns finish on
 the providers they started with. A provider whose spec is unchanged is kept
 as it was, with its pacing, connections and keys. A file that does not
 parse, a spec that does not bind (a key variable the daemon was not started
 with, say), and the removal of a provider an agent's model, fallback or
-compaction model still names (`provider_in_use`, naming them) are refused
+compaction model, or an unfinished turn's own model, still names
+(`provider_in_use`, naming them) are refused
 whole, and the old set stays. `stats.provider_reload` says what the last
 change came to (`applied` with `added`, `removed` and `changed`, or
 `refused` with its error); new sessions' `ready.providers` show the set in
@@ -492,11 +493,15 @@ model's name and context size as its note and a comment for a provider that
 listed nothing; when no usable model survives rendering within the file
 limit, it writes nothing and fails with `models_none_listed`, naming each
 refusal, so it can run again after a login. Once the file exists the merge
-is three-way, against what each provider listed last time
+is three-way, against what refreshes put in the file
 (`~/.agent/models.listed`): a model a provider newly lists is added after
-that provider's last line, one it stopped listing is removed, and every
+that provider's last line while the file stays within its limit, one it
+stopped listing is removed (and added again if it comes back), and every
 other line (the person's own models, notes, comments, and the absence of
-lines they deleted) is kept byte for byte. A provider that does not answer
+lines they deleted, even through a time the provider stopped listing them)
+is kept byte for byte. One refresh of the folder runs at a time, and the
+file is compared just before it is replaced, so an edit saved meanwhile is
+merged again rather than lost. A provider that does not answer
 leaves its lines as they are, and providers the daemon does not run are
 never touched. Model ids are compared as strings, never read for versions
 or families. A file that does not parse is refused, never merged into; a

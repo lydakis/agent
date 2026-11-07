@@ -1499,10 +1499,16 @@ impl Binder {
         let (key, login) = if spec.chatgpt_login {
             // No variable carries the tokens; the shared set redacts them,
             // and every pair a refresh brings later.
-            let login = agent_runtime::provider::login::Login::open(
-                &agent_runtime::provider::login::default_path()?,
-                Some(credentials.clone()),
-            )?;
+            // Read off the run loop: a reload binds while bots run.
+            let redaction = credentials.clone();
+            let login = tokio::task::spawn_blocking(move || {
+                agent_runtime::provider::login::Login::open(
+                    &agent_runtime::provider::login::default_path()?,
+                    Some(redaction),
+                )
+            })
+            .await
+            .map_err(|_| Error::new("provider_login_unavailable"))??;
             (None, Some(Arc::new(login)))
         } else {
             let key = spec
@@ -6144,6 +6150,69 @@ mod tests {
                 .is_some()
         );
         drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_provider_an_unfinished_turn_names_is_in_use() {
+        let dir = std::env::temp_dir().join(format!("agent-in-use-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let binding = || Binding {
+            provider: "openai",
+            family: Family::Responses,
+            model: "synthetic-model",
+            instructions: "test",
+            effort: None,
+            budget_tokens: None,
+            budget_counts: Default::default(),
+            tools: &[],
+            created_by: None,
+            created_by_id: None,
+            compaction_instructions: None,
+            compaction_model: None,
+            fallback: None,
+            gate: None,
+            settings: Default::default(),
+            declared: None,
+            request_id: None,
+        };
+        let in_use = |providers: &[&str]| {
+            let providers: Vec<String> = providers.iter().map(|p| (*p).to_owned()).collect();
+            let store = store.clone();
+            async move {
+                store
+                    .op("bots_on_providers", move |db| {
+                        db.bots_on_providers(&providers)
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        store
+            .op("create", move |db| {
+                db.create("Bob", Some("/synthetic"), binding())?;
+                db.create("Cy", Some("/synthetic"), binding())?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(in_use(&["other"]).await.is_empty());
+        assert_eq!(in_use(&["openai"]).await, ["Bob", "Cy"]);
+        // Bob's next turn asks for a model of another provider.
+        store
+            .op("begin", |db| {
+                let options = TurnOptions {
+                    model: Some("other/synthetic-model".into()),
+                    ..Default::default()
+                };
+                db.begin("Bob", "r1", "work", true, &options, |_, _| Ok(()))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(in_use(&["other"]).await, ["Bob"]);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
