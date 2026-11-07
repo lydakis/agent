@@ -286,6 +286,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | A new lead's effort | `[sonny] lead_effort` | `effort` |
 | Each new task's model | (the lead's) | `threads_model` |
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
+| Each new task's speed (`standard`, `fast` or `ultrafast`) | `[sonny] task_speed` | `threads_speed` |
 | The approver's judge | `[judge] model`, `effort` | |
 | What `/side`'s copy may do | `[sonny] side_chat` (`fork`, the default, or `answer`) | |
 | The chime, the agent's steps, and every tool call drawn | `[sonny] chime`, `steps`, `verbose` (true or false) | |
@@ -544,7 +545,7 @@ you missed: another agent, the margin, the commons, or a reply of its own
 you scrolled past. Such a guess says where from after the key, dim, as in
 `› check pricing's failing test  tab  ↳ shop.pricing`; Tab takes only the
 words. The copy names the source from a fixed set (`earlier`, `margin`,
-`commons`, or an agent's name, which Sonny looks up), so a guess about the
+`commons`, or an agent's name, which Sonny looks up and a click opens), so a guess about the
 reply you are reading, or a source it made up, shows none, and a window
 too narrow for the whole guess and its source leaves the source out.
 
@@ -649,6 +650,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   price per token. The footer names the speed after the effort; a pick
   made while a turn runs applies when the lead is idle. A provider that
   serves standard alone, as Bedrock does for Claude, says so instead.
+  The tasks an agent starts on its own model run at its speed, as its
+  helpers do at theirs, unless `threads_speed` or `[sonny] task_speed`
+  names one; a task whose provider does not serve that speed starts at
+  standard, and the start says so.
 
   ![/fast: standard in effect, fast and ultrafast with what each costs](../docs/sonny/fast-mode-menu.png)
 - `/compact` asks first, then summarizes the lead's conversation before
@@ -1413,7 +1418,11 @@ has a question for you"), in a row of task updates, in a message from
 another agent, and in the pane's own text. Only a name the daemon knows
 is one, so it is drawn in the agents' blue, and a word that only looks
 like one stays plain. In a row a click opens, such as `↳ From calc.neg
-▸`, the name opens the agent and the rest of the row the message. Leads
+▸`, the name opens the agent and the rest of the row the message. Sonny
+names agents the same way wherever it draws one, by the whole name: a
+task's question pinned in its lead's window says `↳ From shop.fix`, a
+commons post its writer, a guess for your next message the agent it came
+from. Blue is only ever a link, so a name in blue always opens. Leads
 and tasks write an agent's whole name when they point you to it, where
 that helps you act.
 

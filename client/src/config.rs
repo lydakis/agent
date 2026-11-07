@@ -37,6 +37,7 @@
 //! [sonny]
 //! lead_effort = "medium"        # a new lead's effort
 //! task_effort = "high"          # each new task's
+//! task_speed = "fast"          # each new task's speed where its provider serves it; else its starter's on the same model
 //! lead_profile = "my-lead"      # the role a new lead starts in, not lead
 //! task_profile = "worker"       # what every other agent is told, not task
 //! side_chat = "answer"          # calls no tool; "fork", the default, may do anything its agent may
@@ -436,6 +437,9 @@ pub struct Judge {
 pub struct Sonny {
     pub lead_effort: Option<String>,
     pub task_effort: Option<String>,
+    /// `standard`, `fast` or `ultrafast`: each new task's speed, in place
+    /// of its starter's.
+    pub task_speed: Option<String>,
     /// The profile a lead runs as, in place of `lead`.
     pub lead_profile: Option<String>,
     /// The profile every other agent Sonny starts is told, in place of
@@ -565,6 +569,9 @@ pub struct Hours {
 /// `quiet_after` says otherwise: long enough for a break, short enough
 /// that an evening's replies do not pile up.
 pub const QUIET_AFTER: u64 = 30 * 60;
+
+/// The speeds a task may be given: the daemon's tiers by name.
+pub const SPEEDS: [&str; 3] = ["standard", "fast", "ultrafast"];
 
 /// The days `hours` names, as the time stamp writes them.
 pub const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -717,6 +724,7 @@ impl Default for Sonny {
         Sonny {
             lead_effort: None,
             task_effort: None,
+            task_speed: None,
             lead_profile: None,
             task_profile: None,
             unsandboxed: Vec::new(),
@@ -1358,6 +1366,7 @@ fn parse(text: &str) -> Result<Config, String> {
             "sonny" => &[
                 "lead_effort",
                 "task_effort",
+                "task_speed",
                 "lead_profile",
                 "task_profile",
                 "side_chat",
@@ -1589,6 +1598,15 @@ fn parse(text: &str) -> Result<Config, String> {
                         ));
                     }
                 };
+                continue;
+            }
+            if key == "task_speed" {
+                if !SPEEDS.contains(&value.as_str()) {
+                    return Err(format!(
+                        "sonny.task_speed is standard, fast or ultrafast, not {value}"
+                    ));
+                }
+                config.sonny.task_speed = Some(value);
                 continue;
             }
             if key == "task_tabs" {
