@@ -27,6 +27,12 @@ Sonny's tool host answers outside the agent's sandbox, since an automation runs
 as the person outside it: `add` (the fields below, as `every`, `cron`, `start {name,
 model, effort}`, `reply_to`, `if`, `runs`, `turn_budget_tokens`, `replace`
 and `message`), `remove`, `run` or `show` NAME, or nothing to list them.
+An agent lists and shows only its own: those that wake it, send their answers
+to it, or start an agent it added; `sonny automation list` lists every one.
+A look acts on nothing and runs as any read does, also for an agent whose
+sandbox no one reviews. An add, a removal or a run is a step its gate judges
+first (`approve_step`), as a script's calls are, and is refused, as the
+other ways out of its sandbox are, for a confined agent with no gate.
 A row whose last fire sent a turn says how that turn ended, as the daemon
 has it: `last.turn_status`, and `last.turn_error` when it did not complete,
 so an agent sees the failure the person sees in `/background`. It does not

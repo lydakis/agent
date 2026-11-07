@@ -116,7 +116,7 @@ pub fn local(epoch: i64) -> libc::tm {
 }
 
 /// `epoch` in local time, its weekday and its offset from UTC.
-fn when(epoch: i64) -> String {
+pub fn when(epoch: i64) -> String {
     let tm = local(epoch);
     let offset = tm.tm_gmtoff / 60;
     format!(

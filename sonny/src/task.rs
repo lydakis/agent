@@ -183,9 +183,17 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     let mut helped = None;
     let mut written = source.is_some();
     // The lead's mode, whose sandbox the task works in, and Sonny's git for
-    // it in a sandbox too unless the lead has none.
-    let mode = lead_mode(&agent, &start.env, starter).unwrap_or_else(crate::approvals::default);
-    let confine = crate::approvals::sandbox(mode, here)
+    // it in a sandbox too unless the lead has none; and the lead's state
+    // folder, which the task writes as the lead does.
+    let lead = lead_record(&agent, &start.env, starter);
+    let mode = (lead.as_ref())
+        .and_then(crate::approvals::mode)
+        .unwrap_or_else(crate::approvals::default);
+    let state = match &lead {
+        Some(lead) => crate::state::of(lead, starter),
+        None => crate::state::folder(starter),
+    };
+    let confine = crate::approvals::sandbox(mode, here, None)
         .get("sandbox")
         .and_then(Value::as_str)
         != Some("danger-full-access");
@@ -404,7 +412,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // committing to its repository and running the commands the config
     // lets out of it, or, in `full`, unconfined, as nothing would answer a
     // call that asks to leave.
-    for (key, value) in crate::approvals::sandbox(mode, &place.dir) {
+    for (key, value) in crate::approvals::sandbox(mode, &place.dir, state.as_deref()) {
         let flag = format!("--{key}");
         match value {
             Value::String(value) => flags.extend([flag, value]),
@@ -969,8 +977,8 @@ fn ends_name(after: &str, part_of_name: impl Fn(char) -> bool) -> bool {
     }
 }
 
-/// The permissions row of the lead `name`, from its gates and sandbox.
-fn lead_mode(agent: &Path, env: &[(String, String)], name: &str) -> Option<&'static str> {
+/// The lead `name` as `inspect` gives it: none when it can't be read.
+fn lead_record(agent: &Path, env: &[(String, String)], name: &str) -> Option<Value> {
     let output = Command::new(agent)
         .envs(env.iter().map(|(key, value)| (key, value)))
         .args(["inspect", "--bot", name])
@@ -978,8 +986,7 @@ fn lead_mode(agent: &Path, env: &[(String, String)], name: &str) -> Option<&'sta
         .stderr(Stdio::null())
         .output()
         .ok()?;
-    let record: Value = serde_json::from_slice(&output.stdout).ok()?;
-    crate::approvals::mode(&record)
+    serde_json::from_slice(&output.stdout).ok()
 }
 
 /// Whether the daemon has a task `name`: one whose start failed after it

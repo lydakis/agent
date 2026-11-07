@@ -17,8 +17,9 @@ use agent_runtime::{
     output::{self, Output},
     provider::{Listed, Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
-        Answer, Binding, Bot, Decision, Delivery, FOLDERS_JSON, Fork, Gate, MAX_GATES, Publication,
-        RULES_JSON, Settings, Started, Step, Stepped, Store, TurnOptions, Waiting, Wake,
+        Answer, Binding, Bot, Decision, Delivery, ENV_JSON, FOLDERS_JSON, Fork, Gate, MAX_GATES,
+        Publication, RULES_JSON, Settings, Started, Step, Stepped, Store, TurnOptions, Waiting,
+        Wake,
     },
     tools::{
         ANSWER_BYTES, DECLARED_BYTES, Declared, MAX_DECLARED, Outcome, Registry, validate_declared,
@@ -156,18 +157,21 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             }),
             output::encoded_len(&(bot, created_by)),
             // The workspace, the writable folders, the Unix sockets,
-            // canonical, and the command rules, which the reply's settings
-            // repeat; a bot another makes takes its creator's rules, and a
-            // sandboxed one's folders.
+            // canonical, the command rules and the variables, which the
+            // reply's settings repeat; a bot another makes takes its
+            // creator's rules and variables, and a sandboxed one's folders.
             usize::from(workspace.is_some()) * PATH_JSON
                 + match created_by {
-                    Some(_) => 2 * FOLDERS_JSON + RULES_JSON,
+                    Some(_) => 2 * FOLDERS_JSON + RULES_JSON + ENV_JSON,
                     None => {
                         (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON)
                             + (settings.unix_sockets.len() * PATH_JSON).min(FOLDERS_JSON)
                             + (settings.rules.as_ref())
                                 .map_or(0, |rules| output::encoded_len(rules).unwrap_or(RULES_JSON))
                                 .min(RULES_JSON)
+                            + output::encoded_len(&settings.env)
+                                .unwrap_or(ENV_JSON)
+                                .min(ENV_JSON)
                     }
                 },
             // Both the bot and its event carry its gates, most of them
@@ -274,6 +278,10 @@ enum Command {
         /// An idempotency key: resending the request with it gets the bot
         /// it made, `duplicate: true`, instead of `bot_exists`.
         request_id: Option<String>,
+        /// The bot starts a line of its own: its depth is 0 though it has
+        /// a creator. Refused on a sandboxed bot's own socket.
+        #[serde(default)]
+        starts_line: bool,
     },
     /// A bot's whole record: what `bots` lists plus its instructions and
     /// settings. A read; nothing about the bot changes.
@@ -879,6 +887,9 @@ pub struct Configuration {
     pub walled: Vec<PathBuf>,
     /// The context windows the person set, by model path.
     pub context_windows: Arc<agent_runtime::provider::Windows>,
+    /// The most generations below the bot that starts its line a `create`
+    /// or `fork` may make a bot at; none by default.
+    pub max_depth: Option<u64>,
 }
 
 /// `path` by its real path, or, while it doesn't exist, by the real path
@@ -1564,9 +1575,11 @@ pub async fn run(config: Configuration) -> Result<()> {
     }
     let (store, publications) = Store::open_with(&config.store, limits.readers).await?;
     let (pending, pending_bytes) = (limits.pending, limits.pending_bytes);
+    let max_depth = config.max_depth;
     store
         .call(move |db| {
             db.set_pending_limits(pending, pending_bytes);
+            db.set_max_depth(max_depth);
             Ok(())
         })
         .await?;
@@ -1669,7 +1682,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,"input_bytes":limits.input_bytes,
             "readers":limits.readers,"connections":limits.connections,
             "load":(limits.load > 0.0).then_some(limits.load),
-            "idle_exit_seconds":config.idle_exit,
+            "idle_exit_seconds":config.idle_exit,"depth":config.max_depth,
             "stall_timeout_seconds":stall_timeout.as_secs()},
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
@@ -2305,9 +2318,15 @@ impl Service {
                 created_by,
                 created_by_id,
                 declare,
+                starts_line,
                 ..
             } => {
                 claim(created_by, created_by_id)?;
+                // Where a line starts is the person's, from outside any
+                // sandbox, or a confined bot could make a line without end.
+                if *starts_line {
+                    return refuse("start a line");
+                }
                 if declare.iter().flatten().any(|tool| !passes(tool)) {
                     return refuse("declare a tool a client answers that it can't pass on");
                 }
@@ -3319,6 +3338,7 @@ impl Service {
                 mut settings,
                 declare,
                 request_id,
+                starts_line,
             } => {
                 if budget_tokens == Some(0) {
                     return fail_with("invalid_budget", "budget_tokens must be at least 1");
@@ -3429,6 +3449,7 @@ impl Service {
                                 settings: *settings,
                                 declared: declare.as_deref(),
                                 request_id: request_id.as_deref(),
+                                starts_line,
                             },
                         )?;
                         let cursor = event.as_ref().and_then(|e| e["cursor"].as_i64());
@@ -5604,6 +5625,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )?;
                 let turn = db
@@ -5792,6 +5814,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )?;
                 let turn = db
@@ -6023,6 +6046,7 @@ mod tests {
             settings: Default::default(),
             declared: None,
             request_id: None,
+            starts_line: false,
         };
         let turn = store
             .op("create", move |db| {
@@ -6280,6 +6304,7 @@ mod tests {
                                 settings: Default::default(),
                                 declared: None,
                                 request_id: None,
+                                starts_line: false,
                             },
                         )?;
                         let turn = db
@@ -6592,6 +6617,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )?;
                 // No slot was free when it was accepted, so it queued.
@@ -6680,6 +6706,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )
                 .map(|_| ())
@@ -6931,6 +6958,7 @@ mod tests {
             settings: Box::default(),
             declare: None,
             request_id: None,
+            starts_line: false,
         }
     }
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -7652,6 +7680,7 @@ mod tests {
                             settings: Default::default(),
                             declared: None,
                             request_id: None,
+                            starts_line: false,
                         },
                     )?;
                     creator = Some(bot);
@@ -7938,6 +7967,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )?;
                 let turn = db

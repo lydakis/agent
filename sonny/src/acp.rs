@@ -1614,15 +1614,17 @@ async fn setup_lead(
     ) {
         asked["instructions"] = json!(text);
     }
-    let declare = declared::declare(&record, crate::served::Role::of(0));
+    let declare = declared::declare(&record, crate::served::Role::LEAD);
     if let Some(declare) = &declare {
         asked["declare"] = declare.clone();
     }
     let mode = approvals::mode(&record);
+    let state = crate::state::of(&record, &lead.bot);
+    let sandbox = |mode| approvals::sandbox(mode, Path::new(&workspace), state.as_deref());
     let mut gating = lead.new.then(approvals::default);
     if gating.is_none()
         && let Some(mode) = mode.filter(|mode| *mode != "full")
-        && !approvals::sandboxed_as(&record, &approvals::sandbox(mode, Path::new(&workspace)))
+        && !approvals::sandboxed_as(&record, &sandbox(mode))
     {
         gating = Some(mode);
     }
@@ -1640,10 +1642,11 @@ async fn setup_lead(
             mode,
             &approvals::gateable(&tools, declared),
         ));
-        fields.insert(
-            "settings".into(),
-            Value::Object(approvals::sandbox(mode, Path::new(&workspace))),
-        );
+        fields.insert("settings".into(), Value::Object(sandbox(mode)));
+    }
+    // Its shell names its state folder, in every row.
+    if let Some(env) = (state.as_deref()).and_then(|state| crate::state::env(&record, state)) {
+        asked["settings"]["env"] = env;
     }
     // A lead at work keeps its setup until the next thread finds it idle.
     if asked.as_object().is_some_and(|fields| fields.len() > 1) {

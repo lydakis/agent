@@ -69,6 +69,11 @@ a formula of the machine, as `processes = "cpus * 64"` or
 daemon's to end, as `make -l` does, a turn held long parking until then.
 `stall_timeout = "15m"` sets how long a provider stream may send no
 content before it is retried (`--stall-timeout`, 10 minutes by default).
+`depth = 2`, the default for `--max-depth`, is how many generations below
+the bot that starts its line a new bot may be, as Codex's
+`agents.max_depth`: a bot run with no `AGENT_BOT` starts one, its children
+are at 1 and theirs at 2, and a `run --new` or `fork` deeper is refused as
+`depth_limit`; 0 is no end.
 A key it does not know, or a formula it cannot work out for this machine
 (one below 0 here included), is `config_invalid` when the file is read.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an

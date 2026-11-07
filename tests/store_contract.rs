@@ -53,6 +53,7 @@ fn binding() -> Binding<'static> {
         settings: Default::default(),
         declared: None,
         request_id: None,
+        starts_line: false,
     }
 }
 /// Compaction planning as a turn runs it: a catch-up walk goes in pieces.
@@ -3392,6 +3393,47 @@ fn a_store_that_cannot_be_copied_is_not_migrated() {
 }
 
 #[test]
+fn an_older_store_counts_each_bot_s_depth_along_its_makers() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema82-depth-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let mut maker: Option<Bot> = None;
+        for name in ["A", "B", "C", "D"] {
+            let mut b = binding();
+            b.created_by = maker.as_ref().map(|m| m.name.as_str());
+            b.created_by_id = maker.as_ref().map(|m| m.bot_id);
+            let (bot, _) = db.create(name, Some("/synthetic"), b).unwrap();
+            maker = Some(bot);
+        }
+        let b = db.inspect("B").unwrap();
+        let mut by_b = binding();
+        by_b.created_by = Some("B");
+        by_b.created_by_id = Some(b.bot_id);
+        db.create("Orphan", Some("/synthetic"), by_b).unwrap();
+        db.create("Solo", Some("/synthetic"), binding()).unwrap();
+        db.delete_bot("B").unwrap();
+    }
+    // A store from before schema 83 kept no depth.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE bots DROP COLUMN depth; PRAGMA user_version=82;")
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let depth = |name: &str| db.inspect(name).unwrap().depth;
+    // Counted from a bot with no maker, or whose maker is gone.
+    assert_eq!(
+        ["A", "C", "D", "Orphan", "Solo"].map(depth),
+        [0, 0, 1, 0, 0]
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn a_turn_keeps_the_schema_its_reply_follows() {
     let path = std::env::temp_dir().join(format!(
         "agent-schema80-output-schema-{}.sqlite",
@@ -4711,7 +4753,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
             "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
-            "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null})
+            "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{}})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -7062,6 +7104,114 @@ fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
             db.create("Creator", Some("/synthetic"), binding()).unwrap();
         }
     }
+}
+
+#[test]
+fn a_bot_is_made_no_deeper_below_the_start_of_its_line_than_the_bound() {
+    let mut db = db();
+    db.set_max_depth(Some(2));
+    let by = |name: &'static str, bot: &Bot| {
+        let mut b = binding();
+        b.created_by = Some(name);
+        b.created_by_id = Some(bot.bot_id);
+        b
+    };
+    let fork_by = |name: &'static str, bot: &Bot| Fork {
+        created_by: Some(name),
+        created_by_id: Some(bot.bot_id),
+        ..Fork::default()
+    };
+    // No creator starts a line; each bot another makes is one below it.
+    let (lead, event) = db.create("Lead", Some("/synthetic"), binding()).unwrap();
+    assert_eq!(
+        (lead.depth, &event.unwrap()["data"]["depth"]),
+        (0, &json!(0))
+    );
+    let (task, _) = db
+        .create("Task", Some("/synthetic"), by("Lead", &lead))
+        .unwrap();
+    let (helper, _) = db
+        .create("Helper", Some("/synthetic"), by("Task", &task))
+        .unwrap();
+    assert_eq!((task.depth, helper.depth), (1, 2));
+    // Past the bound, a typed refusal with the facts, and nothing made.
+    let before = db.list(None, 64, None, false, None).unwrap();
+    let refused = db
+        .create("Deeper", Some("/synthetic"), by("Helper", &helper))
+        .unwrap_err();
+    assert_eq!(refused.code, "depth_limit");
+    assert_eq!(
+        refused.detail.as_deref(),
+        Some("Deeper would be 3 generations below the bot that starts its line; max_depth is 2")
+    );
+    let facts = refused.facts.as_deref().unwrap();
+    assert_eq!(
+        (&facts["depth"], &facts["max_depth"]),
+        (&json!(3), &json!(2))
+    );
+    assert_eq!(db.list(None, 64, None, false, None).unwrap(), before);
+    // A fork another makes is one below its maker, wherever its source is:
+    // a bot at the bound can't fork its way back up.
+    let refused = db
+        .fork("Lead", "Up", fork_by("Helper", &helper))
+        .unwrap_err();
+    assert_eq!(refused.code, "depth_limit");
+    let (twin, _) = db.fork("Helper", "Twin", fork_by("Lead", &lead)).unwrap();
+    assert_eq!(twin.depth, 1);
+    // One its source makes, a side copy, stands where its source does.
+    let (copy, event) = db
+        .fork("Helper", "Copy", fork_by("Helper", &helper))
+        .unwrap();
+    assert_eq!(
+        (copy.depth, &event.unwrap()["data"]["depth"]),
+        (2, &json!(2))
+    );
+    // One no bot makes starts a line.
+    let (theirs, _) = db.fork("Helper", "Theirs", Fork::default()).unwrap();
+    assert_eq!(theirs.depth, 0);
+    // A bot made to start a line is at 0 though another made it.
+    let mut fresh = by("Helper", &helper);
+    fresh.starts_line = true;
+    let (fresh, _) = db.create("Fresh", Some("/synthetic"), fresh).unwrap();
+    assert_eq!((fresh.depth, fresh.created_by_id), (0, Some(helper.bot_id)));
+    db.create("Below", Some("/synthetic"), by("Fresh", &fresh))
+        .unwrap();
+    // Listed and inspected with it.
+    let listed = db.list(None, 64, None, false, None).unwrap();
+    let depth_of = |name: &str| {
+        (listed["bots"].as_array().unwrap().iter())
+            .find(|bot| bot["name"] == name)
+            .map(|bot| bot["depth"].clone())
+    };
+    assert_eq!(depth_of("Helper"), Some(json!(2)));
+    assert_eq!(depth_of("Below"), Some(json!(1)));
+    assert_eq!(db.inspect("Below").unwrap().depth, 1);
+    // A keyed creation resent answers as before, whatever the bound is
+    // now, and one that names another mark is another request.
+    let keyed = |starts_line: bool| Binding {
+        request_id: Some("k"),
+        starts_line,
+        ..by("Task", &task)
+    };
+    db.create("Keyed", Some("/synthetic"), keyed(false))
+        .unwrap();
+    db.set_max_depth(Some(1));
+    assert_eq!(
+        db.create("Keyed", Some("/synthetic"), keyed(false))
+            .unwrap()
+            .1,
+        None
+    );
+    assert_eq!(
+        db.create("Keyed", Some("/synthetic"), keyed(true))
+            .unwrap_err()
+            .code,
+        "idempotency_conflict"
+    );
+    // With no bound, any depth.
+    db.set_max_depth(None);
+    db.create("Deeper", Some("/synthetic"), by("Helper", &helper))
+        .unwrap();
 }
 
 #[test]
@@ -10251,6 +10401,7 @@ fn schema_46_settings_keep_turns_as_prune_names_it() {
     let made = || Binding {
         settings: settings.clone(),
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     {
@@ -15152,6 +15303,7 @@ fn a_resent_keyed_creation_gets_its_bot_and_a_changed_one_names_the_field() {
     let mut db = db();
     let keyed = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     let (bob, event) = db.create("Bob", Some("/synthetic"), keyed()).unwrap();
@@ -15185,6 +15337,7 @@ fn a_resent_keyed_creation_gets_its_bot_and_a_changed_one_names_the_field() {
                 Some("/synthetic"),
                 Binding {
                     request_id,
+                    starts_line: false,
                     ..binding()
                 },
             )
@@ -15236,6 +15389,7 @@ fn a_resent_keyed_fork_gets_its_fork_wherever_the_source_moved() {
     // A bot created under the key is not a fork of it.
     let made = Binding {
         request_id: Some("branch"),
+        starts_line: false,
         ..binding()
     };
     db.create("Made", Some("/synthetic"), made).unwrap();
@@ -15271,6 +15425,7 @@ fn a_deleted_identity_is_gone_and_a_later_namesake_is_not() {
     // A keyed creation resent after its bot was deleted does not make it again.
     let keyed = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     let (kay, _) = db.create("Kay", Some("/synthetic"), keyed()).unwrap();
@@ -15299,6 +15454,7 @@ fn schema_43_bots_were_made_without_a_key() {
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let keyed = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     assert_eq!(
@@ -15457,6 +15613,7 @@ fn a_keyed_creation_resends_after_its_instructions_change() {
     let mut db = db();
     let made = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     let (bot, _) = db.create("Bob", None, made()).unwrap();
@@ -15480,6 +15637,7 @@ fn schema_48_creations_keep_the_instructions_they_were_sent_with() {
     let _ = std::fs::remove_file(&path);
     let made = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     {
@@ -16441,6 +16599,88 @@ fn a_bot_made_by_another_goes_by_its_creators_rules() {
         ..Default::default()
     };
     let refused = db.set_settings("Ann", None, &named, &empty).unwrap_err();
+    assert_eq!(refused.code, "invalid_setting");
+}
+
+#[test]
+fn a_bot_s_variables_are_its_creator_s() {
+    let mut db = db();
+    let env = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+        (pairs.iter())
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    };
+    let with = |pairs: &[(&str, &str)]| Settings {
+        env: env(pairs),
+        ..Default::default()
+    };
+    db.create(
+        "Ann",
+        Some("/synthetic"),
+        Binding {
+            settings: with(&[("SONNY_STATE", "/state/Ann")]),
+            ..binding()
+        },
+    )
+    .unwrap();
+    // Whatever a child is made with, it takes its creator's: none plants
+    // a variable that changes what its approved commands run.
+    let made = |db: &mut Database, name: &str, by: &str| {
+        let by_id = db.inspect(by).unwrap().bot_id;
+        db.create(
+            name,
+            Some("/synthetic"),
+            Binding {
+                created_by: Some(by),
+                created_by_id: Some(by_id),
+                settings: with(&[("LD_PRELOAD", "/tmp/x.so")]),
+                ..binding()
+            },
+        )
+        .unwrap();
+    };
+    made(&mut db, "Bob", "Ann");
+    made(&mut db, "Cat", "Bob");
+    assert_eq!(
+        db.inspect("Cat").unwrap().settings.env,
+        env(&[("SONNY_STATE", "/state/Ann")])
+    );
+    // Nor can it be given its own.
+    let named = ["env".to_owned()];
+    let refused = db
+        .set_settings("Bob", None, &named, &with(&[("PATH", "/tmp")]))
+        .unwrap_err();
+    assert_eq!(refused.code, "invalid_setting");
+    // The creator's change reaches every bot it made, and theirs.
+    let moved = with(&[("SONNY_STATE", "/state/Ann2")]);
+    let changed = db.set_settings("Ann", None, &named, &moved).unwrap();
+    assert_eq!(changed, ["env"]);
+    for name in ["Bob", "Cat"] {
+        assert_eq!(db.inspect(name).unwrap().settings.env, moved.env);
+    }
+    let changed = db
+        .set_settings("Ann", None, &named, &Settings::default())
+        .unwrap();
+    assert_eq!(changed, ["env"]);
+    assert_eq!(db.inspect("Cat").unwrap().settings, Settings::default());
+    // The daemon's own names, names no shell sets and NUL are refused.
+    for (name, value) in [
+        ("AGENT_SOCKET", "/s"),
+        ("agent_bot", "x"),
+        ("1X", "x"),
+        ("A-B", "x"),
+        ("", "x"),
+        ("OK", "a\0b"),
+    ] {
+        let refused = db
+            .set_settings("Ann", None, &named, &with(&[(name, value)]))
+            .unwrap_err();
+        assert_eq!(refused.code, "invalid_setting", "{name}");
+    }
+    let big = "x".repeat(17 << 10);
+    let refused = db
+        .set_settings("Ann", None, &named, &with(&[("BIG", &big)]))
+        .unwrap_err();
     assert_eq!(refused.code, "invalid_setting");
 }
 

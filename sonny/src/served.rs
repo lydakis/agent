@@ -68,65 +68,26 @@ const SWEEP: Duration = Duration::from_secs(30);
 const SPLIT: [&str; 5] = crate::mux::SPLITS;
 
 /// What an agent may do beyond what every agent may: a lead makes
-/// projects, and an agent with room below it in its lead's line, as the
-/// config's `task_depth` bounds it, starts and removes tasks, which the
-/// agents it starts take too while they have room of their own.
+/// projects. Every agent starts and removes tasks; how deep a line goes
+/// is the daemon's to bound (`[daemon] depth`), and a start past it is
+/// refused with the daemon's own error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Role {
     pub lead: bool,
-    pub starts: bool,
-    /// How many generations below it start tasks too, `None` for no end:
-    /// the daemon passes its start down that far, one fewer each time.
-    pub passes: Option<u64>,
 }
 
 impl Role {
     /// Every tool: for telling Sonny's tools from others by name.
-    pub const ALL: Role = Role {
-        lead: true,
-        starts: true,
-        passes: None,
-    };
-
-    /// The role of an agent `depth` generations below its lead, the lead
-    /// itself at 0, in a line `limit` generations deep, 0 for no end.
-    pub fn at(depth: u64, limit: u64) -> Role {
-        Role {
-            lead: depth == 0,
-            starts: limit == 0 || depth < limit,
-            passes: (limit != 0).then(|| limit.saturating_sub(depth + 1)),
-        }
-    }
-
-    /// [`Role::at`] in the line the person's config bounds.
-    pub fn of(depth: u64) -> Role {
-        Role::at(depth, depth_limit())
-    }
-}
-
-/// How many generations of tasks a lead's line has, as the config says.
-pub fn depth_limit() -> u64 {
-    agent_client::config::load().map_or(2, |config| config.sonny.task_depth)
+    pub const ALL: Role = Role { lead: true };
+    pub const LEAD: Role = Role { lead: true };
+    pub const TASK: Role = Role { lead: false };
 }
 
 /// Sonny's answered tools, as it declares them on a bot in `role`: a
-/// lead's own and a starter's, and those every agent has, `exec` while the
-/// person has MCP servers.
+/// lead's own, and those every agent has, `exec` while the person has MCP
+/// servers.
 pub fn tools(role: Role) -> Vec<Value> {
-    let mut tools = Vec::new();
-    if role.starts {
-        tools.extend([start(), remove()]);
-        // The daemon gives them to the agents this one makes, and theirs,
-        // as many generations down as have room, `false` for none.
-        if let Some(generations) = role.passes {
-            for tool in &mut tools {
-                tool["inherit"] = match generations {
-                    0 => json!(false),
-                    n => json!(n),
-                };
-            }
-        }
-    }
+    let mut tools = vec![start(), remove()];
     if role.lead {
         tools.push(project());
     }
@@ -174,6 +135,9 @@ fn start() -> Value {
                     "description": "An empty folder of the task's own instead of a worktree or this folder: \
                         for work that makes its own copy of what it changes, such as a workspace on another \
                         branch made with this folder's tooling, or that must not touch this folder."},
+                "tab": {"type": "boolean",
+                    "description": "A tab of its own, for a task the person will want to watch or talk to, \
+                        asked or not."},
                 "setup": {"type": "boolean",
                     "description": "Run the folder's .agents/setup in the copy first: true for a task \
                         that will change files, false for one that only reads."},
@@ -204,6 +168,25 @@ fn start() -> Value {
         // A setup script may build for minutes.
         "expire_ms": 20 * 60 * 1000
     })
+}
+
+/// Open the task `name` just started in a tab of its own, as its starter
+/// asked: said after the start's result only when it could not. With
+/// `task_tabs = "every"`, the lead's Sonny opens it as its turn starts.
+async fn tab(caller: &str, project: &str, name: &str) -> String {
+    let every = agent_client::config::load()
+        .is_ok_and(|c| c.sonny.task_tabs == agent_client::config::TaskTabs::Every);
+    if every {
+        return String::new();
+    }
+    let name = name.trim();
+    let bot = match name.strip_prefix(&format!("{project}.")) {
+        Some(_) => name.to_owned(),
+        None => format!("{project}.{name}"),
+    };
+    crate::task_tab(caller, &bot)
+        .await
+        .unwrap_or_else(|error| format!("\n\nNo tab opened for it: {error}"))
 }
 
 fn remove() -> Value {
@@ -333,13 +316,17 @@ fn subscriptions() -> Value {
 fn automations() -> Value {
     json!({
         "name": AUTOMATIONS,
-        "description": "Your automations, which wake an agent later, again and again, or when something \
-            happens, even with Sonny closed (a Mac keeps watch). Each run gives the agent the message in its \
-            own conversation after a line with the run's time and what started it; a run while the agent is working \
-            waits for its work, one run of a repeating automation at a time. Add one, or remove, run or show one by name; with none, the result lists \
-            them all with any problems. Adding the same one again changes nothing; a different one under a name \
-            in use is refused with the field that differs unless replace is set. Write the message as what to \
-            check and when to stop, including removing its own automation once the work is done.",
+        // Its gate judges what `automate` puts to it: an add, a removal
+        // or a run, not a look.
+        "steps": true,
+        "description": "Your automations, which wake an agent later, repeatedly, or when something \
+            happens, even with Sonny closed. Each run gives the agent the message in its own conversation, \
+            after a line saying when and why it ran; a run waits for the agent's work, one run of an automation \
+            at a time. Add one, or remove, run or show one by name; with none, the result lists yours (those \
+            that wake you, answer to you or start an agent you added) with any problems. Adding the same one \
+            again changes nothing; a different one under a name in use is refused with the field that differs \
+            unless replace is set. Write the message as what to check and when to stop, and to remove its \
+            automation once the work is done.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -521,10 +508,9 @@ fn show() -> Value {
     json!({
         "name": SHOW,
         "description": "Put an agent's window where the person asks, or where they should watch it now: a tab \
-            of its own, the default, or a split on one side of yours, or of the agent beside names, or \
-            floating over that window for a moment where the terminal can float it. Another project's \
-            lead (PROJECT.lead) opens in its project's own home instead, unless it is open there already. \
-            Every agent you start gets a tab of its own when its turn starts, without this.",
+            of its own, the default, a split beside yours or the agent beside names, or floating over that \
+            window where the terminal can float it. Another project's lead (PROJECT.lead) opens in its \
+            project's own home, unless open there already.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -619,14 +605,35 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ),
                 ));
             }
-            if !line.role.starts {
+            // The daemon bounds how deep a line goes and refuses the
+            // agent past it; asked first, by its own facts, so a start it
+            // would refuse makes no folder and runs no setup.
+            let itself = text("from")
+                .and_then(|from| crate::resolved::call(&json!({"task": from}), &line.project))
+                .is_some_and(|from| from == caller);
+            // Without a daemon to ask, the start goes on to meet its answer.
+            let most = match (line.depth > 0 && !itself)
+                .then(|| crate::daemon_paths(None, None).ok())
+                .flatten()
+            {
+                Some((_, socket)) => match Client::connect(&socket).await {
+                    Ok((client, _events)) => {
+                        let most = client.max_depth();
+                        client.close().await;
+                        most
+                    }
+                    Err(_) => None,
+                },
+                None => None,
+            };
+            if let Some(most) = most.filter(|most| line.depth >= *most) {
                 return Err((
-                    "task_depth_reached",
+                    "depth_limit",
                     format!(
-                        "{caller} is as deep in its lead's line as task_depth ({}) in the \
-                         person's config lets agents start tasks: do this work yourself, or ask \
-                         your lead for a task of its own",
-                        line.limit
+                        "a task you start would be {} generations below the agent that starts \
+                         your line, and the daemon's max_depth is {most}: do this work yourself, \
+                         or ask the agent that started you for a task of its own",
+                        line.depth + 1
                     ),
                 ));
             }
@@ -664,14 +671,21 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 from: text("from"),
                 turn: arguments["turn"].as_i64(),
                 // A task's own helper builds on its work.
-                builds_on: (!line.role.lead).then(|| caller.clone()),
+                builds_on: (!line.lead).then(|| caller.clone()),
                 env: Vec::new(),
                 made_by: None,
             };
             let started = crate::task::start(&line.folder, &line.project, &caller, &start)
                 .map_err(|e| ("task_not_started", e))?;
+            let started = match arguments["tab"] == true {
+                true => format!(
+                    "{started}{}",
+                    tab(&caller, &line.project, &start.name).await
+                ),
+                false => started,
+            };
             // What the lead's gone tasks left, which only it can clear.
-            let left = match line.role.lead {
+            let left = match line.lead {
                 true => crate::task::left_behind(&line.folder, &line.project),
                 false => Vec::new(),
             };
@@ -697,7 +711,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .ok_or(("invalid_arguments", "a task's name, without /".to_owned()))?;
             // A lead removes any of its project's; another agent only one
             // of its own line, so no task removes its lead's others.
-            if !line.role.lead && !Line::made(&task, &caller) {
+            if !line.lead && !Line::made(&task, &caller) {
                 return Err((
                     "task_not_removed",
                     format!("{task} is not a task you or yours started; ask your lead"),
@@ -846,19 +860,30 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             .map_err(|e| ("ask_refused", e))
         }
         AUTOMATIONS => {
+            // The daemon's store says whose automations are the caller's:
+            // its id there, as fires deliver to it.
+            let client = match crate::daemon_paths(None, None) {
+                Ok((_, socket)) => Client::connect(&socket).await.ok().map(|(c, _)| c),
+                Err(_) => None,
+            };
+            let caller = crate::trigger::Caller {
+                id: std::env::var("AGENT_BOT_ID")
+                    .ok()
+                    .and_then(|id| id.parse().ok()),
+                store: client.as_ref().and_then(|c| c.store()).map(str::to_owned),
+            };
             // A trigger's add runs on a runtime of its own.
             let arguments = arguments.clone();
-            let mut said = tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments))
-                .await
-                .map_err(|e| ("tool_failed", e.to_string()))?
-                .map_err(|e| ("automation_refused", e))?;
+            let mut said =
+                tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments, &caller))
+                    .await
+                    .map_err(|e| ("tool_failed", e.to_string()))?
+                    .map_err(|e| ("automation_refused", e))?;
             // How the turns their last fires sent ended, as the person's
             // `/background` shows them; without the daemon, as the files say.
             // Only a trigger made on this daemon's store: a turn handle names
             // a bot and a turn, which another store's daemon has its own of.
-            if let Ok((_, socket)) = crate::daemon_paths(None, None)
-                && let Ok((client, _events)) = Client::connect(&socket).await
-            {
+            if let Some(client) = client {
                 let ours: Vec<Value> = match (client.store(), crate::trigger::Places::home()) {
                     (Some(store), Ok(places)) => crate::trigger::on_store(&places, store)
                         .into_iter()
@@ -909,12 +934,15 @@ fn unknown(name: &str) -> String {
     )
 }
 
-/// Where the agent calling a tool stands in its lead's line, as the
-/// person's config bounds it: what it may start, the folder its tasks
+/// Where the agent calling a tool stands in its lead's line: whether it
+/// leads it, how deep in it the daemon counts it, the folder its tasks
 /// start from, its lead's, and the project they are named in.
 struct Line {
-    role: Role,
-    limit: u64,
+    /// A lead, or a side chat of one, which starts tasks as its lead does.
+    lead: bool,
+    /// Generations below the agent that starts its line, as the daemon
+    /// keeps it.
+    depth: u64,
     folder: PathBuf,
     project: String,
     /// The task a side chat of a task is a copy of, which starts that
@@ -927,17 +955,19 @@ impl Line {
     /// and so is that of an agent no lead heads the line of. Read with the
     /// daemon's CLI, as the start itself is made.
     fn of(caller: &str, here: &Path) -> Line {
-        let limit = depth_limit();
         let mut side_of = None;
-        let (depth, lead) = match crate::project::is_lead(caller) {
-            true => (0, None),
+        let (below, depth, lead) = match crate::project::is_lead(caller) {
+            true => (false, 0, None),
             false => {
                 let record =
                     crate::task::record_of_bot(caller).unwrap_or_else(|| json!({"name": caller}));
                 side_of = crate::side_copy(&record).map(str::to_owned);
-                crate::declared::line_by(&record, limit, |at| {
+                let lead = crate::declared::lead_by(&record, |at| {
                     crate::task::record_of_bot(at["created_by"].as_str()?)
-                })
+                });
+                // A lead's side chat starts its tasks as the lead does.
+                let below = !side_of.as_deref().is_some_and(crate::project::is_lead);
+                (below, record["depth"].as_u64().unwrap_or(0), lead)
             }
         };
         let lead = lead.as_ref().and_then(|lead| {
@@ -947,16 +977,15 @@ impl Line {
         });
         let project = project_of(lead.as_ref().map_or(caller, |(lead, _)| lead));
         let folder = match lead {
-            Some((_, folder)) if depth > 0 => folder,
+            Some((_, folder)) if below => folder,
             _ => here.to_owned(),
         };
         Line {
-            role: Role::at(depth, limit),
-            limit,
+            lead: !below,
+            depth,
             folder,
             project,
-            // A lead's side chat starts its tasks as the lead does.
-            side_of: side_of.filter(|_| depth > 0),
+            side_of: side_of.filter(|_| below),
         }
     }
 
@@ -1218,6 +1247,9 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                                 Some(EXEC) => script(&hub, &client, &call).await,
                                 Some(BROWSER) => browse(&client, &call).await,
                                 Some(DESKTOP) => desktop(&client, &call).await,
+                                Some(AUTOMATIONS) => automate(&client, &call, &me, &store, &socket)
+                                    .await
+                                    .map(Value::String),
                                 _ => answer(&client, &call, &me, &store, &socket)
                                     .await
                                     .map(Value::String),
@@ -1503,6 +1535,50 @@ async fn browse(client: &Arc<Client>, call: &Value) -> Result<Value, (&'static s
     }
 }
 
+/// Whether an `automations` call only looks: it lists them or shows one,
+/// and adds, removes and runs none.
+fn looks(arguments: &Value) -> bool {
+    ["add", "remove", "run"]
+        .iter()
+        .all(|key| arguments.get(key).is_none_or(Value::is_null))
+}
+
+/// Answer an `automations` call: one that adds, removes or runs one is a
+/// step the agent's gate judges first, as a script's calls are; a look
+/// runs unjudged, as reads do.
+async fn automate(
+    client: &Arc<Client>,
+    call: &Value,
+    me: &Path,
+    store: &Path,
+    socket: &Path,
+) -> Answer {
+    if looks(&call["arguments"]) {
+        return answer(client, call, me, store, socket).await;
+    }
+    let bot = str_of(&call["bot"]);
+    unreviewed(client, &bot, &Value::Null, AUTOMATIONS).await?;
+    let steps = crate::exec::Steps::new(
+        client.clone(),
+        bot,
+        call["turn"].as_i64().unwrap_or(0),
+        str_of(&call["call_id"]),
+    );
+    let asked = std::time::Instant::now();
+    let step = (steps
+        .ask(AUTOMATIONS, AUTOMATIONS, call["arguments"].clone())
+        .await)
+        .map_err(|e| ("automation_refused", e))?;
+    // The daemon's clock for the call stood still while the gate weighed
+    // it, so this one does too.
+    let call = later(call, asked.elapsed());
+    let answered = answer(client, &call, me, store, socket).await;
+    if let Some(step) = step {
+        steps.ran(step, answered.is_err()).await;
+    }
+    answered
+}
+
 /// Answer a `desktop` call in the host, with the agent's gate judging what
 /// acts on the desktop.
 async fn desktop(client: &Arc<Client>, call: &Value) -> Result<Value, (&'static str, String)> {
@@ -1550,6 +1626,15 @@ async fn unreviewed(
 }
 
 /// The time a call has left before the daemon gives up on it.
+/// `call` with its time to answer moved `by` later.
+fn later(call: &Value, by: Duration) -> Value {
+    let mut call = call.clone();
+    if let Some(expires) = call["expires_ms"].as_u64() {
+        call["expires_ms"] = json!(expires.saturating_add(by.as_millis() as u64));
+    }
+    call
+}
+
 fn left(call: &Value) -> Duration {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1636,8 +1721,11 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         None => record.clone(),
     };
     let name = call["name"].as_str().unwrap_or_default();
-    // That bot, by its id, not one given its name since.
-    unreviewed(client, bot, &record["bot_id"], name).await?;
+    // That bot, by its id, not one given its name since. `automate` has
+    // seen to an automations call: a look needs no one to review it.
+    if name != AUTOMATIONS {
+        unreviewed(client, bot, &record["bot_id"], name).await?;
+    }
     // As the calling turn runs, which keeps its folder and model when the
     // bot's own change for a turn after it.
     let turn = call["turn"].as_i64().unwrap_or(0);
@@ -1835,7 +1923,7 @@ fn code(said: &str) -> &'static str {
         "no_caller",
         "invalid_arguments",
         "task_not_started",
-        "task_depth_reached",
+        "depth_limit",
         "tasks_exist",
         "task_not_removed",
         "not_shown",
@@ -2499,26 +2587,18 @@ mod tests {
                 .collect()
         };
         let every = [SUBSCRIPTIONS, SHOW, RUN, AUTOMATIONS, MEMORY, COMMONS, GOAL];
-        assert_eq!(names(tools(Role::at(2, 2))), every);
+        // Every agent starts and removes tasks; the daemon bounds how deep.
         let mut task = vec![START, REMOVE];
         task.extend(every);
-        assert_eq!(names(tools(Role::at(1, 2))), task);
+        assert_eq!(names(tools(Role::TASK)), task);
         let mut lead = vec![START, REMOVE, PROJECT];
         lead.extend(every);
-        assert_eq!(names(tools(Role::at(0, 2))), lead);
-        for tool in tools(Role::at(0, 1))
-            .into_iter()
-            .filter(|t| t["name"] != EXEC)
-        {
+        assert_eq!(names(tools(Role::LEAD)), lead);
+        for tool in tools(Role::LEAD).into_iter().filter(|t| t["name"] != EXEC) {
             assert_eq!(tool["answered_by"], TAG);
-            // A lead's own are not its tasks', in a line one deep.
-            // The browser and the desktop, when there, are every agent's
-            // as well.
+            // Making projects alone is a lead's own, never its tasks'.
             let name = str_of(&tool["name"]);
-            assert_eq!(
-                tool.get("inherit").is_some(),
-                !(every.contains(&name.as_str()) || name == BROWSER || name == DESKTOP)
-            );
+            assert_eq!(tool.get("inherit").is_some(), name == PROJECT);
         }
         assert_eq!(project_of("shop.web.lead"), "shop.web");
         assert_eq!(project_of("shop.fix"), "shop");
