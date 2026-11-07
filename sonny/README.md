@@ -1096,7 +1096,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   answered (`✓` and the answer) or withdrawn (a muted `–` and why), and a
   settled card folds to its question and that row until a click on the
   question opens it. A pick of yours on a withdrawn card, or on one the
-  agent closed for you, still answers it. The lead does not wait on you blindly: each
+  agent closed for you, still answers it. Before it asks, an agent runs
+  `sonny ask list`: the newest 20 questions its lead's agents asked in the
+  last week, each with who asked it, when, and where it stands (`--before NODE` for older
+  ones, `--all` for every agent, `--json`), so it goes with an answer you
+  already gave instead of asking again; the agent reads and decides, and
+  nothing matches wording. The lead does not wait on you blindly: each
   ask says what it does until you answer, and the card's last row says
   so. It goes on with the option it recommends at once when that can be
   undone (`Going with 2 meanwhile; another pick undoes it.`), goes on with
