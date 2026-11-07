@@ -471,13 +471,13 @@ impl View {
     /// a row's detail, a model's provider, muted in a column of its own.
     fn bars(&self, heading: &str, rows: &[Row], total: &Spent, width: usize) -> Vec<Line<'static>> {
         let mut out = vec![Line::from(heading.to_owned()).bold()];
-        let name_width = rows
+        let mut name_width = rows
             .iter()
             .map(|(name, _, _)| name.width())
             .max()
             .unwrap_or(0)
             .clamp(4, 28);
-        let detail_width = (rows.iter())
+        let mut detail_width = (rows.iter())
             .map(|(_, detail, _)| detail.width())
             .max()
             .unwrap_or(0)
@@ -489,13 +489,26 @@ impl View {
             .max()
             .unwrap_or(0)
             .max(1);
-        // The name, its detail, the bar, then the tokens and share.
+        // The name, its detail, the bar, then the tokens and share, in
+        // `width`: a narrow card cuts the detail and then the name, so the
+        // bar keeps its least and no row wraps.
         let figures = 13;
+        let least = 4;
+        let words = width.saturating_sub(figures + least);
+        let over = (name_width + 2 + detail_width + 2).saturating_sub(words);
+        // A detail that fits is shown whole, however short; one that must
+        // be cut goes once fewer than four columns of it would be left.
+        detail_width = match (over, detail_width.saturating_sub(over)) {
+            (0, n) => n,
+            (_, n) if n < 4 => 0,
+            (_, n) => n,
+        };
         let detail_room = match detail_width {
             0 => 0,
             n => n + 2,
         };
-        let room = (width.saturating_sub(name_width + 2 + detail_room + figures)).clamp(4, 60);
+        name_width = name_width.min(words.saturating_sub(2 + detail_room)).max(4);
+        let room = (width.saturating_sub(name_width + 2 + detail_room + figures)).clamp(least, 60);
         for (name, detail, spent) in rows {
             let sum = spent.total(self.cached);
             let mut spans = vec![Span::raw(format!(
@@ -749,6 +762,68 @@ mod tests {
         );
         assert_eq!(cell(&tops, &parts, 2), ('█', Style::new().fg(CACHED)));
         assert_eq!(cell(&tops, &parts, 3).0, ' ');
+    }
+
+    #[test]
+    fn no_row_of_the_card_is_wider_than_the_card() {
+        // Long names and details in a narrow pane: the bar gives way to
+        // its least, then the detail and the name are cut.
+        let mut view = View::new(scope());
+        let (_, window) = view.query(1_800_000_000_000);
+        view.loaded(
+            window,
+            Ok(json!({
+                "turns": 2, "input_tokens": 2000, "cached_input_tokens": 1000, "output_tokens": 200,
+                "bots": [
+                    {"bot": "p.the-refunds-for-every-region-at-once", "turns": 1, "input_tokens": 1000, "cached_input_tokens": 500, "output_tokens": 100},
+                    {"bot": "p.lead", "turns": 1, "input_tokens": 1000, "cached_input_tokens": 500, "output_tokens": 100},
+                ],
+                "other_bots": null,
+                "models": [
+                    {"model": "bedrock/us.anthropic.claude-opus-5-5-v1:0", "turns": 1, "input_tokens": 1000, "cached_input_tokens": 500, "output_tokens": 100},
+                    {"model": "a-gateway-with-a-long-name/an-unlisted-model-with-a-long-id", "turns": 1, "input_tokens": 1000, "cached_input_tokens": 500, "output_tokens": 100},
+                ],
+                "origins": [],
+                "series": [],
+            })),
+        );
+        // The sentence over the bars wraps as prose; a bar row would
+        // wrap its share away from its bar.
+        for width in 30..=100 {
+            let card = view.card(width);
+            let bars = card
+                .into_iter()
+                .filter(|line| text(std::slice::from_ref(line)).ends_with('%'));
+            for line in bars {
+                assert!(
+                    line.width() <= width,
+                    "{} columns in {width}: {:?}",
+                    line.width(),
+                    text(&[line])
+                );
+            }
+        }
+        // With room, the provider stays beside the model.
+        let card = text(&view.card(100));
+        assert!(card.contains("bedrock"), "{card}");
+    }
+
+    #[test]
+    fn a_short_provider_is_shown_whole_when_it_fits() {
+        // A binding named in two letters needs no cut, so it stays: it is
+        // what tells one model's rows apart.
+        let view = View::new(scope());
+        let spent = Spent {
+            fresh: 1000,
+            ..Spent::default()
+        };
+        let rows: Vec<Row> = vec![
+            ("Opus 5.5".into(), "gw".into(), spent),
+            ("Opus 5.5".into(), "ap".into(), spent),
+        ];
+        let card = text(&view.bars("By model", &rows, &spent, 80));
+        assert!(card.contains("Opus 5.5  gw  "), "{card}");
+        assert!(card.contains("Opus 5.5  ap  "), "{card}");
     }
 
     #[test]

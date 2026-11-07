@@ -244,6 +244,8 @@ enum Command {
         instructions: Option<String>,
         effort: Option<String>,
         budget_tokens: Option<u64>,
+        /// What `budget_tokens` counts: `tokens`, the default, or `work`.
+        budget_counts: Option<agent_runtime::store::Counts>,
         /// The tools this bot may call, from the daemon's registered set.
         tools: Option<Vec<String>>,
         /// The bot on whose behalf the client creates this one, if any.
@@ -332,6 +334,7 @@ enum Command {
         bot: String,
         workspace: Option<String>,
         budget_tokens: Option<u64>,
+        budget_counts: Option<agent_runtime::store::Counts>,
         created_by: Option<String>,
         created_by_id: Option<i64>,
         /// A gate the fork adds to those it inherits.
@@ -416,9 +419,11 @@ enum Command {
         /// with who wrote them: a turn's prompt, or with `reply` the reply
         /// it ended with.
         quotes: Option<Vec<agent_runtime::store::QuoteRef>>,
-        /// The most input plus output tokens this turn may spend, beside
-        /// the bot's own budget; absent leaves only that.
+        /// The most tokens this turn may spend, beside the bot's own
+        /// budget; absent leaves only that.
         budget_tokens: Option<u64>,
+        /// What `budget_tokens` counts: `tokens`, the default, or `work`.
+        budget_counts: Option<agent_runtime::store::Counts>,
         /// Pictures sent with the prompt, each a media type and base64;
         /// absent or null is none.
         images: Option<Vec<agent_runtime::codec::Image>>,
@@ -998,6 +1003,20 @@ const MAX_QUOTES: usize = agent_runtime::store::Database::QUOTES;
 /// The most pictures one prompt, or one tool result, may carry.
 const IMAGES: usize = 20;
 
+/// What a budget counts, which only a budget can name.
+fn counts(
+    budget_tokens: Option<u64>,
+    counts: Option<agent_runtime::store::Counts>,
+) -> Result<agent_runtime::store::Counts> {
+    match (budget_tokens, counts) {
+        (None, Some(_)) => fail_with(
+            "invalid_budget",
+            "budget_counts names what budget_tokens counts, so it goes with one",
+        ),
+        (_, counts) => Ok(counts.unwrap_or_default()),
+    }
+}
+
 /// Pictures a provider takes: a media type both families know, base64 of
 /// an image of that type, and within [`IMAGES`] and [`IMAGES_BYTES`].
 /// `carrier` names what carries them, a prompt or a tool result.
@@ -1349,6 +1368,9 @@ struct Active {
     lift: Arc<turn::Lift>,
     /// Released by the task before it submits its finish ([`Slot::release`]).
     slot: Slot,
+    /// Command rules a `configure` gave while the turn runs, which its next
+    /// round takes.
+    given_rules: Arc<std::sync::Mutex<Option<Arc<agent_runtime::rules::Rules>>>>,
 }
 impl Active {
     /// The running turn, unless it has committed or is committing its end;
@@ -3133,6 +3155,7 @@ impl Service {
         if lifted {
             lift.arm();
         }
+        let given_rules: Arc<std::sync::Mutex<_>> = Arc::default();
         let slot = (self.active)
             .start(bot.clone(), |slot| Active {
                 turn,
@@ -3142,6 +3165,7 @@ impl Service {
                 compact: compact.clone(),
                 lift: lift.clone(),
                 slot,
+                given_rules: given_rules.clone(),
             })
             .slot
             .clone();
@@ -3157,6 +3181,7 @@ impl Service {
             background_failures: self.background_failures.clone(),
             settings: Default::default(),
             rules: Default::default(),
+            given_rules,
             ruled: Default::default(),
             window: Default::default(),
             resumed,
@@ -3281,6 +3306,7 @@ impl Service {
                 instructions,
                 effort,
                 budget_tokens,
+                budget_counts,
                 tools,
                 created_by,
                 created_by_id,
@@ -3297,6 +3323,7 @@ impl Service {
                 if budget_tokens == Some(0) {
                     return fail_with("invalid_budget", "budget_tokens must be at least 1");
                 }
+                let budget_counts = counts(budget_tokens, budget_counts)?;
                 if let Some(key) = &request_id {
                     name("request_id", key)?;
                 }
@@ -3391,6 +3418,7 @@ impl Service {
                                 instructions: &instructions,
                                 effort: effort.as_deref(),
                                 budget_tokens,
+                                budget_counts,
                                 tools: &tools,
                                 created_by: created_by.as_deref(),
                                 created_by_id,
@@ -3577,7 +3605,20 @@ impl Service {
                 if let Some(declare) = &declare {
                     validate_declared(declare)?;
                 }
-                if let Some(turn) = self.active.get(&bot).and_then(Active::running) {
+                // The command rules alone may change while a turn runs: its
+                // next round takes them, and a round already announced keeps
+                // the rules it was announced under.
+                let rules_only = settings
+                    .as_ref()
+                    .is_some_and(|changes| changes.len() == 1 && changes.contains_key("rules"))
+                    && instructions.is_none()
+                    && model.is_none()
+                    && gate.is_none()
+                    && declare.is_none()
+                    && fallback.is_none()
+                    && compaction_instructions.is_none()
+                    && compaction_model.is_none();
+                if !rules_only && let Some(turn) = self.active.get(&bot).and_then(Active::running) {
                     return Err(Error::with(
                         "bot_busy",
                         format!("turn {turn} of {bot} is running"),
@@ -3689,11 +3730,17 @@ impl Service {
                     }
                     None => None,
                 };
+                // Rules given reach turns running now, its own (which only
+                // a change of rules alone may meet) and its kin's.
+                let given_rules = (named.iter().any(|key| key == "rules"))
+                    .then_some(given.as_ref())
+                    .flatten()
+                    .map(|given| given.rules.clone().unwrap_or_default());
                 let answer = store
                     .op("configure", move |db| {
                         let id = db.identity(&bot, bot_id)?;
                         // A parked turn reads the bot again when it resumes.
-                        if let Some(turn) = db.inspect(&bot)?.running_turn {
+                        if !rules_only && let Some(turn) = db.inspect(&bot)?.running_turn {
                             return Err(Error::with(
                                 "bot_busy",
                                 format!("turn {turn} of {bot} is running"),
@@ -3707,8 +3754,12 @@ impl Service {
                         {
                             changed.push("gates".into());
                         }
+                        let mut kin = Vec::new();
                         if let Some(given) = &given {
-                            changed.extend(db.set_settings(&bot, Some(id), &named, given)?);
+                            let (set, of_kin) =
+                                db.set_settings_of_kin(&bot, Some(id), &named, given)?;
+                            changed.extend(set);
+                            kin = of_kin;
                         }
                         if let Some((provider, name)) = &model
                             && db.set_model(&bot, Some(id), provider, name, effort.as_deref())?
@@ -3740,11 +3791,29 @@ impl Service {
                             .into_iter()
                             .map(String::from),
                         );
-                        Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))
+                        Ok((json!({"bot":bot,"bot_id":id,"changed":changed}), kin))
                     })
                     .await?;
+                let (answer, kin) = answer;
                 // Followers read the bot again; nothing durable to replay.
                 if answer["changed"].as_array().is_some_and(|c| !c.is_empty()) {
+                    let name = answer["bot"].as_str().unwrap_or_default();
+                    // Its running turn and those of the bots it made, and
+                    // theirs, which go by its rules, each at its next round:
+                    // the walk the store made for them names them, so a
+                    // change costs one look per such bot and no round pays.
+                    if let Some(policy) = given_rules {
+                        let rules = Arc::new(agent_runtime::rules::Rules::new(policy));
+                        for running in std::iter::once(name)
+                            .chain(kin.iter().map(String::as_str))
+                            .filter_map(|bot| self.active.get(bot))
+                        {
+                            *running
+                                .given_rules
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(rules.clone());
+                        }
+                    }
                     let mut event = answer.clone();
                     event["event"] = json!("configured");
                     event["durable"] = json!(false);
@@ -3974,7 +4043,10 @@ impl Service {
                     "pending_bytes": pending_bytes,
                     "pending_limit": self.limits.pending,
                     "pending_bytes_limit": self.limits.pending_bytes,
-                    "running_processes": running,
+                    // What process_limit bounds: the background commands
+                    // whose results the store has yet to record, waiting
+                    // for a slot or not, and the foreground ones running.
+                    "running_processes": running + self.registry.foreground_running() as i64,
                     "queued_processes": self.registry.pending(),
                     "process_limit": self.limits.processes,
                     // Terminals and detached commands, which --max-lasting
@@ -4400,6 +4472,7 @@ impl Service {
                 bot,
                 workspace: path,
                 budget_tokens,
+                budget_counts,
                 created_by,
                 created_by_id,
                 approve,
@@ -4412,6 +4485,7 @@ impl Service {
                 if budget_tokens == Some(0) {
                     return fail_with("invalid_budget", "budget_tokens must be at least 1");
                 }
+                let budget_counts = counts(budget_tokens, budget_counts)?;
                 if expire_ms.is_some_and(|ms| !(1000..=MAX_EXPIRE_MS).contains(&ms)) {
                     return fail_with("invalid_expire", "expire_ms is from 1 s to 7 days");
                 }
@@ -4464,6 +4538,7 @@ impl Service {
                                 checkpoint,
                                 workspace: path.as_deref(),
                                 budget_tokens,
+                                budget_counts,
                                 created_by: created_by.as_deref(),
                                 created_by_id,
                                 gate: gate.as_ref(),
@@ -4612,6 +4687,7 @@ impl Service {
                 person,
                 quotes,
                 budget_tokens,
+                budget_counts,
                 images,
                 wait_ms,
                 output_schema,
@@ -4742,6 +4818,7 @@ impl Service {
                         format!("budget_tokens must be from 1 to {}", i64::MAX),
                     );
                 }
+                let budget_counts = counts(budget_tokens, budget_counts)?;
                 // A turn may run in another checkout or on another model of
                 // the same family; the conversation encoding never changes.
                 let options = TurnOptions {
@@ -4755,6 +4832,7 @@ impl Service {
                     person,
                     quotes,
                     budget_tokens,
+                    budget_counts,
                     images,
                     wait_ms,
                     output_schema,
@@ -5272,6 +5350,7 @@ mod tests {
             compact: Arc::default(),
             lift: Arc::default(),
             slot: Slot::alone(),
+            given_rules: Default::default(),
         };
         assert!(active.cancel(turn::INTERRUPTED));
         assert!(active.cancel(turn::SHUTDOWN));
@@ -5514,6 +5593,7 @@ mod tests {
                         instructions: "test",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -5578,6 +5658,7 @@ mod tests {
                 compact: Arc::default(),
                 lift: Arc::default(),
                 slot,
+                given_rules: Default::default(),
             }),
             next_task: 1,
             jobs: JoinSet::new(),
@@ -5664,6 +5745,7 @@ mod tests {
             compact: Arc::default(),
             lift: Arc::default(),
             slot: Slot::alone(),
+            given_rules: Default::default(),
         };
         // A pause only parks the turn: an interrupt after it ends it.
         let (cancel, cause) = watch::channel(None);
@@ -5699,6 +5781,7 @@ mod tests {
                         instructions: "test",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -5785,6 +5868,7 @@ mod tests {
                 compact: Arc::default(),
                 lift: Arc::default(),
                 slot,
+                given_rules: Default::default(),
             }),
             next_task: 1,
             jobs: JoinSet::new(),
@@ -5928,6 +6012,7 @@ mod tests {
             instructions: "test",
             effort: None,
             budget_tokens: None,
+            budget_counts: Default::default(),
             tools: &[],
             created_by: None,
             created_by_id: None,
@@ -6005,6 +6090,7 @@ mod tests {
                     compact: Arc::default(),
                     lift: Arc::default(),
                     slot,
+                    given_rules: Default::default(),
                 })
             }),
             next_task: 0,
@@ -6110,6 +6196,7 @@ mod tests {
             person: None,
             quotes: None,
             budget_tokens: None,
+            budget_counts: Default::default(),
             images: None,
             wait_ms: None,
             output_schema: None,
@@ -6182,6 +6269,7 @@ mod tests {
                                 instructions: "",
                                 effort: None,
                                 budget_tokens: None,
+                                budget_counts: Default::default(),
                                 tools: &[],
                                 created_by: None,
                                 created_by_id: None,
@@ -6493,6 +6581,7 @@ mod tests {
                         instructions: "",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -6580,6 +6669,7 @@ mod tests {
                         instructions: "",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -6828,6 +6918,7 @@ mod tests {
             instructions: Some(String::new()),
             effort: None,
             budget_tokens: None,
+            budget_counts: Default::default(),
             tools: Some(Vec::new()),
             created_by: None,
             created_by_id: None,
@@ -7550,6 +7641,7 @@ mod tests {
                             instructions: "",
                             effort: None,
                             budget_tokens: None,
+                            budget_counts: Default::default(),
                             tools: &tools,
                             created_by: creator.as_ref().map(|c| c.name.as_str()),
                             created_by_id: creator.as_ref().map(|c| c.bot_id),
@@ -7835,6 +7927,7 @@ mod tests {
                         instructions: "",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &tools,
                         created_by: None,
                         created_by_id: None,

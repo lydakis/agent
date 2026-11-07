@@ -31,6 +31,7 @@ fn binding(family: Family) -> Binding<'static> {
         instructions: "test",
         effort: None,
         budget_tokens: None,
+        budget_counts: Default::default(),
         tools: &[],
         created_by: None,
         created_by_id: None,

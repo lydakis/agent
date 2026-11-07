@@ -381,8 +381,8 @@ fn automations() -> Value {
                         "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N messages."},
                         "turn_budget_tokens": {"type": "integer", "minimum": 1,
                             "description": "A cap on the tokens of each turn a run starts, counting every request's \
-                                input with the agent's history, so a cap below that history fails every run \
-                                before it starts. Set one only when the person asks for a spending limit."},
+                                input with the agent's history, so a cap below that history ends every run on \
+                                its first reply. Set one only when the person asks for a spending limit."},
                         "shadow": {"type": "boolean",
                             "description": "A dry run, as when moving a job from elsewhere onto an automation: \
                                 each run goes to a read-only copy of the agent, where anything past \
@@ -879,8 +879,23 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             }
             Ok(said.to_string())
         }
-        _ => Err(("unknown_tool", format!("Sonny answers no tool {name}"))),
+        _ => Err(("unknown_tool", unknown(name))),
     }
+}
+
+/// What a call of a tool Sonny no longer answers is told: the tools it
+/// answers now, since a bot's list is renewed only once its turn ends, so
+/// one an earlier Sonny gave it (`triggers`, now `automations`) can be
+/// called in the meantime.
+fn unknown(name: &str) -> String {
+    let mut names: Vec<String> = (crate::declared::tools(Role::ALL).iter())
+        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .collect();
+    names.sort();
+    format!(
+        "Sonny answers no tool {name}; the tools it answers now are {}, and this agent's list is renewed when its turn ends",
+        names.join(", ")
+    )
 }
 
 /// Where the agent calling a tool stands in its lead's line, as the
@@ -1831,6 +1846,14 @@ fn code(said: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_sonny_no_longer_answers_is_told_the_ones_it_does() {
+        let said = unknown("triggers");
+        assert!(said.starts_with("Sonny answers no tool triggers; the tools it answers now are "));
+        assert!(said.contains("automations"), "{said}");
+        assert!(!said.contains(" triggers,"), "{said}");
+    }
 
     #[tokio::test]
     async fn a_call_that_ran_is_never_run_again_when_its_result_was_not_recorded() {

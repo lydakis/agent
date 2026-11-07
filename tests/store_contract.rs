@@ -3,9 +3,9 @@ use agent_runtime::{
     codec::Family,
     provider::{ToolCall, Usage},
     store::{
-        Answered, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage, Database,
-        Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Planning, QuoteRef, Settings, Strip,
-        TurnBudget, TurnOptions, Wake,
+        Answered, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage, Counts, Database,
+        Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Limit, Planning, QuoteRef, Settings,
+        Strip, TurnBudget, TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome},
 };
@@ -42,6 +42,7 @@ fn binding() -> Binding<'static> {
         instructions: "test",
         effort: None,
         budget_tokens: None,
+        budget_counts: Default::default(),
         tools: &READ,
         created_by: None,
         created_by_id: None,
@@ -165,6 +166,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         person: None,
         quotes: Vec::new(),
         budget_tokens: None,
+        budget_counts: Default::default(),
         images: Vec::new(),
         wait_ms: None,
         output_schema: None,
@@ -5775,6 +5777,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         person: None,
         quotes: Vec::new(),
         budget_tokens: None,
+        budget_counts: Default::default(),
         images: Vec::new(),
         wait_ms: None,
         output_schema: None,
@@ -5909,6 +5912,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         person: None,
         quotes: Vec::new(),
         budget_tokens: None,
+        budget_counts: Default::default(),
         images: Vec::new(),
         wait_ms: None,
         output_schema: None,
@@ -6479,66 +6483,110 @@ fn turn_pages_read_newest_first_from_the_end() {
     );
 }
 
-#[test]
-fn budgets_count_tokens_and_turn_listings_carry_accounting() {
-    use agent_runtime::provider::Usage;
-    let mut db = db();
-    let mut capped = binding();
-    capped.budget_tokens = Some(150);
-    db.create("Bob", Some("/synthetic"), capped).unwrap();
-    let turn = db
-        .begin(
-            "Bob",
-            "r1",
-            "work",
-            true,
-            &TurnOptions::default(),
-            allow_provider,
-        )
-        .unwrap()
-        .turn;
-    let usage = Usage {
-        input_tokens: 100,
-        output_tokens: 20,
+/// What a provider reports for one call: `input` sent, `output` generated,
+/// on `model`.
+fn usage(input: u64, output: u64, model: &str) -> Usage {
+    Usage {
+        input_tokens: input,
+        output_tokens: output,
         cached_input_tokens: 0,
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
         sent_ms: 0,
         models: Vec::new(),
-        served_model: String::new(),
+        served_model: model.into(),
         context_window: 0,
-    };
-    db.append(turn, vec![assistant("one")], &[], Some(&usage))
-        .unwrap();
-    assert_eq!(db.inspect("Bob").unwrap().tokens_used, 120);
+    }
+}
+/// A model round whose request sent `added` input tokens new.
+fn round(db: &mut Database, turn: i64, text: &str, usage: Usage, added: u64) {
+    db.append_under(
+        turn,
+        vec![assistant(text)],
+        &[],
+        Some(&usage),
+        &Default::default(),
+        None,
+        added,
+    )
+    .unwrap();
+}
+fn begun(db: &mut Database, bot: &str, key: &str) -> i64 {
+    db.begin(
+        bot,
+        key,
+        "work",
+        true,
+        &TurnOptions::default(),
+        allow_provider,
+    )
+    .unwrap()
+    .turn
+}
+
+#[test]
+fn budgets_count_work_and_turn_listings_carry_accounting() {
+    let mut db = db();
+    let mut capped = binding();
+    (capped.budget_tokens, capped.budget_counts) = (Some(150), Counts::Work);
+    db.create("Bob", Some("/synthetic"), capped).unwrap();
+    let turn = begun(&mut db, "Bob", "r1");
+    // A bot's first call has no history yet: all it sends is new.
+    db.append(
+        turn,
+        vec![assistant("one")],
+        &[],
+        Some(&usage(100, 20, "m")),
+    )
+    .unwrap();
+    let bot = db.inspect("Bob").unwrap();
+    assert_eq!((bot.tokens_used, bot.work.used), (120, 120));
     db.finish(turn, None).unwrap();
-    // Below the cap, a second turn is admitted; its own call pushes past it.
-    let second = db
-        .begin(
-            "Bob",
-            "r2",
-            "more",
-            true,
-            &TurnOptions::default(),
-            allow_provider,
-        )
-        .unwrap()
-        .turn;
-    db.append(second, vec![assistant("two")], &[], Some(&usage))
-        .unwrap();
+    // Below the cap, a second turn is admitted. Its call sends the 120 the
+    // first sent and got back again, which is free, and 30 new.
+    let second = begun(&mut db, "Bob", "r2");
+    round(&mut db, second, "two", usage(150, 20, "m"), 30);
     db.finish(second, None).unwrap();
-    assert_eq!(
-        db.begin(
+    let bot = db.inspect("Bob").unwrap();
+    assert_eq!((bot.tokens_used, bot.work.used), (290, 170));
+    let refused = db
+        .begin(
             "Bob",
             "r3",
             "again",
             true,
             &TurnOptions::default(),
-            allow_provider
+            allow_provider,
         )
-        .unwrap_err()
-        .code,
-        "budget_exhausted"
+        .unwrap_err();
+    assert_eq!(refused.code, "budget_exhausted");
+    assert_eq!(
+        refused.facts.map(|facts| Value::Object(*facts)),
+        Some(json!({"budget_tokens":150,"budget_counts":"work","work_tokens":170}))
+    );
+    // By default a cap counts the provider's tokens, the history included:
+    // the same calls spend Ann's after one turn.
+    let mut capped = binding();
+    capped.budget_tokens = Some(150);
+    db.create("Ann", Some("/synthetic"), capped).unwrap();
+    for (key, input, added) in [("a1", 100, 100), ("a2", 150, 30)] {
+        let turn = begun(&mut db, "Ann", key);
+        round(&mut db, turn, key, usage(input, 20, "m"), added);
+        db.finish(turn, None).unwrap();
+    }
+    let refused = db
+        .begin(
+            "Ann",
+            "a3",
+            "again",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap_err();
+    assert_eq!(
+        refused.facts.map(|facts| Value::Object(*facts)),
+        Some(json!({"budget_tokens":150,"budget_counts":"tokens","tokens_used":290}))
     );
     let page = db.turns("Bob", 0, None, 1, false).unwrap();
     let first = &page["turns"][0];
@@ -6546,16 +6594,220 @@ fn budgets_count_tokens_and_turn_listings_carry_accounting() {
         (
             first["turn"].as_i64(),
             first["input_tokens"].as_i64(),
-            first["output_tokens"].as_i64()
+            first["output_tokens"].as_i64(),
+            first["work_tokens"].as_i64()
         ),
-        (Some(turn), Some(100), Some(20))
+        (Some(turn), Some(100), Some(20), Some(120))
     );
     assert_eq!(first["status"], "completed");
     assert!(first["started_ms"].as_i64().unwrap() <= first["finished_ms"].as_i64().unwrap());
     assert_eq!(page["next_after"], turn);
     let rest = db.turns("Bob", turn, None, 64, false).unwrap();
     assert_eq!(rest["turns"].as_array().unwrap().len(), 1);
+    assert_eq!(rest["turns"][0]["work_tokens"], 50);
     assert!(rest["next_after"].is_null());
+}
+
+#[test]
+fn work_charges_what_a_request_sends_new_once_and_survives_a_restart() {
+    let path = std::env::temp_dir().join(format!("agent-work-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Bob", "r1");
+    let work = |db: &Database| {
+        let bot = db.inspect("Bob").unwrap();
+        (bot.work.used, bot.work.read, bot.head)
+    };
+    // Before any call nothing is read: the first call's input is all new,
+    // and its history is read through its own items.
+    assert_eq!(work(&db).1, None);
+    db.append(turn, vec![assistant("a")], &[], Some(&usage(1000, 10, "m")))
+        .unwrap();
+    let (used, read, head) = work(&db);
+    assert_eq!((used, read), (1010, head));
+    // A round is charged its output and what its request sent new.
+    round(&mut db, turn, "b", usage(1050, 10, "m"), 40);
+    let (used, read, head) = work(&db);
+    assert_eq!((used, read), (1060, head));
+    // A failed attempt is charged what it sent new and its output, and
+    // reads through what it sent, so its retry sends nothing new.
+    db.failed_usage(turn, &usage(1090, 5, "m"), 30, head)
+        .unwrap();
+    assert_eq!(work(&db), (1095, head, head));
+    round(&mut db, turn, "c", usage(1090, 10, "m"), 0);
+    let (used, _, head) = work(&db);
+    assert_eq!(used, 1105);
+    // A summary and a cache refresh re-read the history: their output
+    // alone, and what was read stays read.
+    db.compaction_usage(turn, Some(&usage(1100, 50, "m")))
+        .unwrap();
+    db.keep_warm_usage(turn, &usage(1100, 1, "m")).unwrap();
+    assert_eq!(work(&db), (1156, head, head));
+    db.finish(turn, None).unwrap();
+    drop(db);
+    // A restart reads on from the same node.
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(work(&db), (1156, head, head));
+    let turn = begun(&mut db, "Bob", "r2");
+    round(&mut db, turn, "d", usage(260, 10, "m"), 50);
+    db.finish(turn, None).unwrap();
+    let (used, read, head) = work(&db);
+    assert_eq!((used, read), (1216, head));
+    let turns = db.turns("Bob", 0, None, 8, false).unwrap();
+    let rows: Vec<i64> = (turns["turns"].as_array().unwrap().iter())
+        .map(|t| t["work_tokens"].as_i64().unwrap())
+        .collect();
+    assert_eq!(rows, [1156, 60]);
+    // Each usage event says what it charged.
+    let events = db.events("Bob", 0, 256).unwrap();
+    let charged: Vec<i64> = (events["events"].as_array().unwrap().iter())
+        .filter(|e| e["event"] == "usage")
+        .map(|e| e["data"]["work_tokens"].as_i64().unwrap())
+        .collect();
+    assert_eq!(charged, [1010, 50, 35, 10, 50, 1, 60]);
+    // A fork's history is its source's: what the source's calls read is
+    // read, through the checkpoint at most.
+    let head = head.unwrap();
+    for (name, checkpoint) in [("Now", head), ("Before", head - 2)] {
+        db.fork(
+            "Bob",
+            name,
+            Fork {
+                checkpoint: Some(checkpoint),
+                ..Fork::default()
+            },
+        )
+        .unwrap();
+        let fork = db.inspect(name).unwrap();
+        assert_eq!((fork.work.used, fork.work.read), (0, Some(checkpoint)));
+    }
+    // A source whose calls have not read through the checkpoint leaves
+    // what follows its read new to the fork too.
+    db.create("Cy", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Cy", "c1");
+    db.append(turn, vec![assistant("e")], &[], Some(&usage(100, 10, "m")))
+        .unwrap();
+    let read = db.inspect("Cy").unwrap().work.read;
+    db.append(turn, vec![assistant("f")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    let tip = db.inspect("Cy").unwrap().head;
+    assert!(tip > read);
+    db.fork(
+        "Cy",
+        "Later",
+        Fork {
+            checkpoint: tip,
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.inspect("Later").unwrap().work.read, read);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_turn_that_completes_on_a_limits_last_call_names_the_limit() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    // Its last call went without tool calls for the turn's budget, and the
+    // turn completed on its reply: it ended at that budget, not failing.
+    let turn = begun(&mut db, "Bob", "r1");
+    db.append_under(
+        turn,
+        vec![assistant("done so far")],
+        &[],
+        Some(&usage(100, 10, "m")),
+        &Default::default(),
+        Some(Limit::TurnBudget),
+        110,
+    )
+    .unwrap();
+    let ended = db.finish(turn, None).unwrap();
+    let data = &ended.last().unwrap()["data"];
+    assert_eq!(
+        (&data["status"], &data["limit"]),
+        (&json!("completed"), &json!("turn_budget"))
+    );
+    let row = &db.turns("Bob", 0, None, 8, false).unwrap()["turns"][0];
+    assert_eq!(
+        (&row["status"], &row["limit"]),
+        (&json!("completed"), &json!("turn_budget"))
+    );
+    // One whose limited call was followed by another, or that did not
+    // complete, names none.
+    let limited = |db: &mut Database, turn, limit| {
+        db.append_under(
+            turn,
+            vec![assistant("x")],
+            &[],
+            None,
+            &Default::default(),
+            limit,
+            0,
+        )
+        .unwrap();
+    };
+    let turn = begun(&mut db, "Bob", "r2");
+    limited(&mut db, turn, Some(Limit::Rounds));
+    limited(&mut db, turn, None);
+    db.finish(turn, None).unwrap();
+    let turn = begun(&mut db, "Bob", "r3");
+    limited(&mut db, turn, Some(Limit::Budget));
+    let ended = db
+        .finish(turn, Some(&Error::new("provider_incomplete")))
+        .unwrap();
+    assert!(ended.last().unwrap()["data"].get("limit").is_none());
+    let rows = db.turns("Bob", 0, None, 8, false).unwrap();
+    for row in &rows["turns"].as_array().unwrap()[1..] {
+        assert!(row.get("limit").is_none(), "{row}");
+    }
+}
+
+#[test]
+fn schema_79_counts_on_from_usage_and_reads_through_a_history() {
+    let path =
+        std::env::temp_dir().join(format!("agent-schema79-work-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let turn = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let mut capped = binding();
+        capped.budget_tokens = Some(1000);
+        db.create("Bob", Some("/synthetic"), capped).unwrap();
+        db.create("New", Some("/synthetic"), binding()).unwrap();
+        let turn = begun(&mut db, "Bob", "r1");
+        db.append(turn, vec![assistant("a")], &[], Some(&usage(500, 10, "m")))
+            .unwrap();
+        turn
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE bots DROP COLUMN work; ALTER TABLE bots DROP COLUMN work_read;
+             ALTER TABLE turns DROP COLUMN work;
+             ALTER TABLE turns DROP COLUMN limited; ALTER TABLE bots DROP COLUMN budget_counts;
+             ALTER TABLE turns DROP COLUMN budget_counts; PRAGMA user_version=79;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // What was counted stays counted, for the bot and its turn.
+    assert_eq!(db.inspect("Bob").unwrap().work.used, 510);
+    let row = &db.turns("Bob", 0, None, 8, false).unwrap()["turns"][0];
+    assert_eq!(
+        (row["turn"].as_i64(), row["work_tokens"].as_i64()),
+        (Some(turn), Some(510))
+    );
+    // Its history is read through its head: what joins it is new.
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!(bob.work.read, bob.head);
+    assert!(bob.head.is_some());
+    // A bot with no history has everything to send.
+    let fresh = begun(&mut db, "New", "n1");
+    db.append(fresh, vec![assistant("d")], &[], Some(&usage(40, 10, "m")))
+        .unwrap();
+    assert_eq!(db.inspect("New").unwrap().work.used, 50);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -7100,6 +7352,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 person: None,
                 quotes: Vec::new(),
                 budget_tokens: None,
+                budget_counts: Default::default(),
                 images: Vec::new(),
                 wait_ms: None,
                 output_schema: None,
@@ -9860,6 +10113,8 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                     served_model: String::new(),
                     context_window: 0,
                 },
+                100,
+                None,
             )
             .unwrap();
             db.finish(second, Some(&Error::new("provider_incomplete")))
@@ -10071,6 +10326,7 @@ fn schema_47_turns_take_their_own_token_cap() {
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let capped = TurnOptions {
         budget_tokens: Some(300),
+        budget_counts: Counts::Work,
         ..TurnOptions::default()
     };
     let turn = db
@@ -10084,27 +10340,32 @@ fn schema_47_turns_take_their_own_token_cap() {
         bot.turn_budget = db.context(turn).unwrap().budget;
         bot
     };
-    db.append(turn, vec![assistant("two")], &[], Some(&usage(100, 20)))
-        .unwrap();
+    // Its history is read through its head: the call sends nothing new.
+    round(&mut db, turn, "two", usage(100, 20), 0);
     let bot = check(&db);
     let cap = TurnBudget {
         tokens: 300,
         until: 420,
+        counts: Counts::Work,
     };
-    assert_eq!((bot.turn_budget, bot.ceiling()), (Some(cap), Some(420)));
+    assert_eq!(
+        (bot.turn_budget, bot.room()),
+        (Some(cap), Some((280, Limit::TurnBudget)))
+    );
     assert!(bot.exhausted().is_none());
-    db.append(turn, vec![assistant("three")], &[], Some(&usage(180, 20)))
-        .unwrap();
+    // A call that sends 280 new, and 20 come out.
+    round(&mut db, turn, "three", usage(400, 20), 280);
     let error = check(&db).exhausted().unwrap();
     assert_eq!(error.code, "turn_budget_exhausted");
     assert_eq!(
         error.facts.map(|facts| Value::Object(*facts)),
-        Some(json!({"turn_budget_tokens":300,"turn_tokens_used":320}))
+        Some(json!({"turn_budget_tokens":300,"budget_counts":"work","turn_work_tokens":320}))
     );
     db.finish(turn, None).unwrap();
     // A resend names the same cap; the earlier turn reports none.
     let other = TurnOptions {
         budget_tokens: Some(200),
+        budget_counts: Counts::Work,
         ..TurnOptions::default()
     };
     assert_eq!(
@@ -16028,7 +16289,7 @@ fn a_planned_call_keeps_what_the_rules_made_of_it() {
     let (git, git_call) = shell_call("fc_2", "c2", "git push");
     let (ls, ls_call) = shell_call("fc_3", "c3", "ls");
     let calls = [rm_call.clone(), git_call.clone(), ls_call.clone()];
-    db.append_under(turn, vec![rm, git, ls], &calls, None, &rules)
+    db.append_under(turn, vec![rm, git, ls], &calls, None, &rules, None, 0)
         .unwrap();
     // The prompt one is announced.
     let page = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();

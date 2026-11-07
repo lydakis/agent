@@ -127,6 +127,7 @@ mod tests {
             compact: Arc::default(),
             lift: Arc::default(),
             slot,
+            given_rules: Default::default(),
         }
     }
 

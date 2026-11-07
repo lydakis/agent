@@ -185,7 +185,7 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "sonny.commons_invite_tokens",
-        about: "the tokens an invite pays for in its thread: its turn, and the turns replies there start while any are left",
+        about: "the tokens of work an invite pays for in its thread: its turn, and the turns replies there start while any are left; a turn started runs to its end",
         values: &[],
         default: "1000000",
     },

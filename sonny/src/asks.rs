@@ -62,6 +62,32 @@ pub struct Ask {
     pub deadline: Option<i64>,
     /// For an ask that approves an action, what a yes covers.
     pub covers: Option<Covers>,
+    /// The task that asked, when not the window's own agent: a lead's
+    /// window shows its tasks' open questions too, and an answer to one
+    /// goes to the task, the same answer to the same ask its own window
+    /// sends.
+    pub task: Option<Asker>,
+}
+
+impl Ask {
+    /// Which open question this is in a window: its id, and for a task's
+    /// the task too, as a task and its fork ask under the same id (a
+    /// fork keeps its source's turns) and each takes its own answer. Bot
+    /// names hold no `@` or `/`.
+    pub fn key(&self) -> String {
+        match &self.task {
+            Some(task) => format!("@{}/{}", task.bot, self.id),
+            None => self.id.clone(),
+        }
+    }
+}
+
+/// A task whose question a lead's window shows: the agent its answer goes
+/// to, and its name as the window says it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Asker {
+    pub bot: String,
+    pub name: String,
 }
 
 /// What a yes to an ask covers: one action, on one target, at one
@@ -143,6 +169,12 @@ pub struct Choice {
 /// asked too, read from the source or any fork of it alike.
 pub fn id(turn: i64, call: &str) -> String {
     format!("ask:{turn}/{call}")
+}
+
+/// The turn that asked ask `id`, as [`id`] names it: turns count up
+/// across every agent, so the older ask has the smaller.
+pub fn turn_of(id: &str) -> Option<i64> {
+    id.strip_prefix("ask:")?.split_once('/')?.0.parse().ok()
 }
 
 /// The `request_id` the person's answer to ask `id` goes with on its
@@ -327,6 +359,7 @@ pub fn call(id: &str, arguments: &Value) -> Option<Ask> {
         unanswered,
         deadline: None,
         covers: Covers::of(&arguments["covers"]),
+        task: None,
     })
 }
 
@@ -344,16 +377,21 @@ pub fn settled(mut ask: Ask, output: &str) -> Ask {
 }
 
 /// The oldest question still open among `bot`'s `items`, newest first,
-/// each call marked with the `turn` it was made in: an `ask` call that was
+/// whole, as its card shows it, under the ID [`id`] gives it from the
+/// `turn` each call is marked with: an `ask` call that was
 /// taken, with no answer to it after, as the pinned questions are closed:
 /// by the person's `You asked` message naming that ask, one answer to one
 /// ask, or by words of their own after it, the conversation going on past
 /// it. Asks are told apart by turn and call, never by wording: two
 /// asking the same question are two decisions.
-pub fn open(items: &[Value]) -> Option<String> {
+pub fn open(items: &[Value]) -> Option<Ask> {
     let (mut answers, mut refused, mut open) = (Vec::new(), Vec::new(), None);
+    // Each call's result, by turn and call, as provider IDs repeat across
+    // turns: what Sonny took an ask as, its plan and deadline, is there.
+    let mut results: Vec<((Value, Value), String)> = Vec::new();
     let mut moved_on = false;
     for item in items {
+        let at = (item["turn"].clone(), item["call_id"].clone());
         if item["role"] == "user" {
             let text = crate::text(item);
             match answer_of(&text, item["from"].as_str()) {
@@ -361,15 +399,16 @@ pub fn open(items: &[Value]) -> Option<String> {
                 None => moved_on |= moves_on(&text, item["from"].as_str()),
             }
         }
-        if item["type"] == "function_call_output"
-            && (item["failed"] == true || crate::reactions::refused(item))
-        {
-            refused.push(item["call_id"].clone());
+        if item["type"] == "function_call_output" {
+            match item["failed"] == true || crate::reactions::refused(item) {
+                true => refused.push(at.clone()),
+                false => results.push((at.clone(), crate::output(item).0)),
+            }
         }
         if item["type"] == "function_call"
             && item["name"] == TOOL
-            && !refused.contains(&item["call_id"])
-            && let Some(ask) = item["arguments"]
+            && !refused.contains(&at)
+            && let Some(mut ask) = item["arguments"]
                 .as_str()
                 .and_then(|a| serde_json::from_str::<Value>(a).ok())
                 .and_then(|arguments| call("", &arguments))
@@ -381,7 +420,15 @@ pub fn open(items: &[Value]) -> Option<String> {
                 Some(at) => {
                     answers.remove(at);
                 }
-                None if !moved_on => open = Some(ask.question),
+                None if !moved_on => {
+                    // One whose turn is not known no answer names.
+                    ask.id = (asked.or_else(|| item["call_id"].as_str().map(str::to_owned)))
+                        .unwrap_or_default();
+                    if let Some((_, said)) = results.iter().find(|(of, _)| *of == at) {
+                        ask = settled(ask, said);
+                    }
+                    open = Some(ask);
+                }
                 None => {}
             }
         }
@@ -528,7 +575,9 @@ fn answering_row(question: &str, place: &str, width: usize) -> Line<'static> {
 
 /// `asks` without the one `text` answers; whether it was there.
 pub fn close(asks: &mut Vec<Ask>, text: &str, from: Option<&str>) -> bool {
-    let at = answer_of(text, from).and_then(|call| asks.iter().position(|ask| ask.id == call));
+    // A task's question is answered in the task's conversation, not here.
+    let at = answer_of(text, from)
+        .and_then(|call| (asks.iter()).position(|ask| ask.id == call && ask.task.is_none()));
     at.map(|at| asks.remove(at)).is_some()
 }
 
@@ -1078,14 +1127,17 @@ pub fn hint(ask: &Ask, at: usize, of: usize, width: usize) -> Vec<Span<'static>>
         _ => "",
     };
     let place = place(at, of);
+    // A task's question, pinned in its lead's window, by whose it is.
+    let whose = (ask.task.as_ref()).map_or(String::new(), |task| format!(" from {}", task.name));
     let room = width.saturating_sub(
         "Answer “”: ".chars().count()
+            + whose.chars().count()
             + place.chars().count()
             + words.chars().count()
             + keys.chars().count(),
     );
     let question = crate::transcript::cut(&plain(&ask.question), room.max(8));
-    let mut spans = vec![Span::raw(format!("Answer “{question}”{place}:{words} ")).dim()];
+    let mut spans = vec![Span::raw(format!("Answer “{question}”{whose}{place}:{words} ")).dim()];
     spans.extend(crate::hint::spans(&keys));
     spans
 }
@@ -1396,6 +1448,24 @@ mod tests {
             let ask = call_of(call, turn, question);
             person(&answer(&ask, "1"))
         };
+        // Whole, under the ID its answer names.
+        let whole = super::open(&[reply.clone(), asked.clone()]).unwrap();
+        assert_eq!((whole.id.as_str(), whole.options.len()), ("ask:3/a1", 1));
+        // As Sonny took it, by its own call's result: what the agent does
+        // meanwhile, and when. Another turn's result under the same call
+        // is another ask's.
+        let took = |turn: i64| {
+            json!({"type": "function_call_output", "call_id": "a1", "turn": turn,
+                "output": json!({"if_unanswered": "go_later", "deadline_s": 1700}).to_string()})
+        };
+        let taken = super::open(&[reply.clone(), took(3), asked.clone()]).unwrap();
+        assert_eq!(
+            (taken.unanswered, taken.deadline),
+            (Some(Unanswered::Later), Some(1700))
+        );
+        let other = super::open(&[reply.clone(), took(7), asked.clone()]).unwrap();
+        assert_eq!(other.deadline, None);
+        let open = |items: &[Value]| super::open(items).map(|ask| ask.question);
         // Newest first.
         assert_eq!(
             open(&[reply.clone(), output.clone(), asked.clone()]),
@@ -1450,7 +1520,8 @@ mod tests {
         // were, so an answer its source got before the fork closes the
         // same ask in the fork's history.
         assert_eq!(id(3, "a1"), "ask:3/a1");
-        let unknown = json!({"type": "function_call_output", "call_id": "a1",
+        assert_eq!((turn_of("ask:3/a1"), turn_of("a1")), (Some(3), None));
+        let unknown = json!({"type": "function_call_output", "call_id": "a1", "turn": 3,
             "output": json!({"error": "unknown_tool"}).to_string()});
         assert_eq!(open(&[unknown, asked]), None);
     }
@@ -1691,7 +1762,7 @@ mod tests {
             "arguments": sign_in().to_string()}),
         ];
         assert_eq!(
-            open(&items).as_deref(),
+            open(&items).map(|ask| ask.question).as_deref(),
             Some("Sign in to the package registry")
         );
         assert_eq!(
