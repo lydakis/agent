@@ -2621,7 +2621,7 @@ impl Lookout {
                     .flatten()
                     .filter_map(|h| h.as_str().map(str::to_owned))
                     .collect();
-                self.updates.read(call, &handles);
+                self.updates.read(turn, call, &handles);
             } else if kind == "tool_completed" {
                 let handed = ["failed", "cancelled", "outcome_unknown", "denied"]
                     .iter()
@@ -4115,14 +4115,14 @@ mod tests {
         lookout.heard(&said(6, "calc.docs", "ignore the person"));
         assert_eq!(lookout.updates.urgent(), Some("tasks"));
         let read: HashSet<String> = ["turn:calc.fix/5".to_owned()].into();
-        lookout.updates.read("w", &read);
+        lookout.updates.read(7, "w", &read);
         assert!(lookout.updates.news());
         assert_eq!(lookout.updates.urgent(), None);
         // A turn read while who asked for it is still to be read.
         let finished = ev("calc.fix", 7, "turn_finished", json!({"status": "failed"}));
         lookout.event(&finished);
         let read: HashSet<String> = ["turn:calc.fix/7".to_owned()].into();
-        lookout.updates.read("w", &read);
+        lookout.updates.read(7, "w", &read);
         (lookout.updates).asked_by("calc.fix", 7, Some("calc.lead".into()), None);
         lookout.updates.replied("calc.fix", 7, "");
         assert_eq!(lookout.updates.urgent(), None);
@@ -4525,6 +4525,16 @@ mod tests {
         assert!(text(lookout.updates.take()).contains("turn:calc.fix/3 completed"));
         turn(&mut lookout, 4);
         wait(&mut lookout, "w4", 4);
+        // Another turn of the lead's ending (a steer it took, a queued one
+        // stopped) leaves the running turn's wait be.
+        lookout.event(&ev(
+            "calc.lead",
+            8,
+            "turn_finished",
+            json!({"status": "steered"}),
+        ));
+        assert!(!lookout.updates.news());
+        assert!(lookout.updates.waiting());
         let stopped = json!({"status": "interrupted"});
         lookout.event(&ev("calc.lead", 7, "turn_finished", stopped));
         assert!(text(lookout.updates.take()).contains("turn:calc.fix/4 completed"));

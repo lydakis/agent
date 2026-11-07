@@ -384,6 +384,8 @@ struct Forward {
 /// the wait ends without handing those turns over, failed or cancelled.
 #[derive(Default)]
 struct Read {
+    /// The lead's turn the wait runs in: only its end ends the wait.
+    turn: i64,
     news: Vec<(String, News)>,
     unheard: Vec<(Key, (Turn, bool))>,
     forwarding: Vec<(Key, Forward)>,
@@ -764,10 +766,18 @@ impl Updates {
             }
             "turn_finished" => {
                 let Some(turn) = turn else { return };
-                // A wait still open as the lead's turn ends handed nothing.
+                // A wait still open as its turn ends handed nothing. Another
+                // turn of the lead's ending (a steer it took, a queued one
+                // stopped) leaves the running turn's waits be.
                 if name == self.lead {
-                    for (_, read) in std::mem::take(&mut self.waits) {
-                        self.unread(read);
+                    let ended: Vec<String> = (self.waits.iter())
+                        .filter(|(_, read)| read.turn == turn)
+                        .map(|(call, _)| call.clone())
+                        .collect();
+                    for call in ended {
+                        if let Some(read) = self.waits.remove(&call) {
+                            self.unread(read);
+                        }
                     }
                 }
                 self.approvals.remove(&key(turn));
@@ -1408,11 +1418,13 @@ impl Updates {
         }
     }
 
-    /// The lead's wait `call` started on these turns: what they said is no
-    /// news to it any more, once the wait hands them over (`wait_ended`).
-    pub fn read(&mut self, call: &str, handles: &HashSet<String>) {
+    /// The lead's wait `call`, in its turn `lead_turn`, started on these
+    /// turns: what they said is no news to it any more, once the wait
+    /// hands them over (`wait_ended`).
+    pub fn read(&mut self, lead_turn: i64, call: &str, handles: &HashSet<String>) {
         let reads = |name: &str, turn: i64| handles.contains(&format!("turn:{name}/{turn}"));
         let mut read = self.waits.remove(call).unwrap_or_default();
+        read.turn = lead_turn;
         for (name, news) in &mut self.tasks {
             let mut took = News::default();
             for (kind, into) in [
@@ -2556,7 +2568,7 @@ mod tests {
         // ended is still news.
         updates.goal_turn("shop.fix", 9);
         turn(&mut updates, "shop.fix", 9, goal.clone(), "completed");
-        updates.read("w", &["turn:shop.fix/9".to_owned()].into());
+        updates.read(9, "w", &["turn:shop.fix/9".to_owned()].into());
         updates.goal_settled("shop.fix", 9, Some(", and met its goal: its check exits 0"));
         let told = updates.take();
         assert!(text(&told).contains("turn:shop.fix/9 completed, asked by goal, and met its goal"));
@@ -2569,7 +2581,7 @@ mod tests {
             10,
             Some(", and met its goal: its check exits 0"),
         );
-        updates.read("w", &["turn:shop.fix/10".to_owned()].into());
+        updates.read(9, "w", &["turn:shop.fix/10".to_owned()].into());
         let told = updates.take();
         assert!(
             text(&told).contains("turn:shop.fix/10 completed, asked by goal, and met its goal")
@@ -3040,7 +3052,7 @@ mod tests {
         // A wait that returned before the turn ended read no silence.
         updates.event(&ev("shop.fix", Some(3), "text_delta", json!({})), later);
         updates.expire(later + QUIET_AFTER);
-        updates.read("w", &["turn:shop.fix/3".to_owned()].into());
+        updates.read(9, "w", &["turn:shop.fix/3".to_owned()].into());
         let told = updates.take();
         assert_eq!(told.items.len(), 1);
         // Printing again starts a new silence, which is news of its own.
@@ -3107,9 +3119,9 @@ mod tests {
             "completed",
         );
         // Reading an earlier turn leaves the latest news.
-        updates.read("w", &["turn:shop.fix/4".to_owned()].into());
+        updates.read(9, "w", &["turn:shop.fix/4".to_owned()].into());
         assert!(updates.due());
-        updates.read("w", &["turn:shop.fix/5".to_owned()].into());
+        updates.read(9, "w", &["turn:shop.fix/5".to_owned()].into());
         assert!(!updates.due());
     }
 
