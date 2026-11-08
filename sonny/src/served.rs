@@ -179,19 +179,21 @@ async fn tab(caller: &str, project: &str, name: &str) -> String {
 fn remove() -> Value {
     json!({
         "name": REMOVE,
-        "description": "Remove a task once the person says it is done: the agent, then the folder Sonny made \
-            it; for a task no longer there, the folder it left, which a start lists. A worktree is removed, and its branch kept while it has commits not merged here; a folder of its \
-            own is deleted with all it holds, only with discard, since Sonny cannot check what the task made \
-            there: ask the task first whether its work is pushed. It refuses, before removing anything, while \
-            the task is working or its worktree has uncommitted changes, and says what. With discard, that work is dropped: only \
-            when the person says to drop it.",
+        "description": "Clean up a task once the person says it is done: mark it done, as mark_done does, \
+            and remove the folder Sonny made it; for a task no longer there, the folder it left, which a start lists. \
+            Its agent and history stay, and a message to it reopens it, without that folder. A worktree is removed, \
+            and its branch kept while it has commits not merged here; a folder of its own is deleted with all it \
+            holds, only with discard, since Sonny cannot check what the task made there: ask the task first whether \
+            its work is pushed. It refuses, before changing anything, while the task is working or its worktree has \
+            uncommitted changes, and says what. With discard, that work is dropped: only when the person says to \
+            drop it.",
         "parameters": {
             "type": "object",
             "properties": {
                 "task": {"type": "string", "minLength": 1, "description": "The task's name, as you started it."},
                 "discard": {"type": "boolean",
-                    "description": "Remove it even with work that is not here, which is lost; for a \
-                        task in a folder of its own, once it says its work is pushed."}
+                    "description": "Remove its folder even with work that is not here, which is lost; \
+                        for a task in a folder of its own, once it says its work is pushed."}
             },
             "required": ["task"],
             "additionalProperties": false
@@ -699,8 +701,17 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     format!("{task} is not a task you or yours started; ask your lead"),
                 ));
             }
-            crate::task::remove(&line.folder, &task, arguments["discard"] == true)
-                .map_err(|e| ("task_not_removed", e))
+            // Done as `mark_done` marks it, by this call: the mark is a fact
+            // the windows show, kept with no window open.
+            let (store, _) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
+            let call = std::env::var("AGENT_CALL").unwrap_or_default();
+            crate::task::remove(
+                &line.folder,
+                &task,
+                arguments["discard"] == true,
+                (&store, &call),
+            )
+            .map_err(|e| ("task_not_removed", e))
         }
         SHOW => crate::show(
             &caller,

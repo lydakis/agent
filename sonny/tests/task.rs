@@ -38,6 +38,7 @@ impl Lab {
              if [ -e \"$AGENT_LOG.slow\" ]; then for a in \"$@\"; do [ \"$a\" != --speed ] || { cat \"$AGENT_LOG.slow\" >&2; exit 1; }; done; fi; for a in \"$@\"; do if [ \"$a\" = - ]; then cat; echo; else printf '%s\\n' \"$a\"; fi; done > \"$AGENT_LOG\"; [ -z \"$AGENT_FAIL\" ] || exit 1; echo '{\"handle\":\"h\"}';;\n\
              ls) cat \"$AGENT_LOG.ls\" 2>/dev/null || echo '[]';;\n\
              inspect) cat \"$AGENT_LOG.inspect\" 2>/dev/null || exit 1;;\n\
+             turns) cat \"$AGENT_LOG.turns\" 2>/dev/null || echo '[]';;\n\
              rm) printf '%s\\n' \"$@\" > \"$AGENT_LOG.rm\";;\nesac\n",
         )
         .unwrap();
@@ -91,6 +92,7 @@ impl Lab {
             .env("AGENT_BIN", &self.agent)
             .env("AGENT_LOG", self.scratch.join("run.log"))
             .env("AGENT_STORE", self.store())
+            .env("AGENT_CALL", "call-1")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "t")
@@ -179,6 +181,15 @@ impl Lab {
     fn remove(&self, dir: &Path, discard: bool) -> (bool, String) {
         let call = serde_json::json!({"task": "demo.fix", "discard": discard});
         self.tool(dir, "remove_task", call, false)
+    }
+
+    /// The mark of `task` done, kept beside the store.
+    fn done(&self, task: &str) -> Option<serde_json::Value> {
+        let store = std::fs::canonicalize(&self.scratch)
+            .unwrap()
+            .join("state.sqlite.resolved");
+        let text = std::fs::read_to_string(store.join(format!("{task}.json"))).ok()?;
+        serde_json::from_str(&text).ok()
     }
 
     /// The daemon's store the lookout and these calls name.
@@ -490,28 +501,61 @@ fn a_task_starts_with_the_agent_installed_beside_sonny() {
 }
 
 #[test]
-fn a_done_worktree_task_is_removed_with_its_merged_branch() {
+fn a_done_worktree_task_is_marked_done_and_its_worktree_removed_with_its_merged_branch() {
     let lab = Lab::new("rm-worktree");
     let (ok, said) = lab.task(false, false);
     assert!(ok, "{said}");
     let worktree = lab.home.join(".agent/worktrees/demo.fix");
     std::fs::write(lab.scratch.join("run.log.ls"), r#"[{"name":"demo.fix"}]"#).unwrap();
-    // Work not committed yet keeps it, and its agent too.
+    // Work not committed yet keeps it.
     std::fs::write(worktree.join("new.txt"), "x\n").unwrap();
     let (ok, err) = lab.remove(&lab.repo, false);
     assert!(!ok && err.contains("uncommitted changes"), "{err}");
-    assert!(worktree.exists() && !lab.scratch.join("run.log.rm").exists());
+    assert!(worktree.exists() && lab.done("demo.fix").is_none());
     std::fs::remove_file(worktree.join("new.txt")).unwrap();
+    // So does a turn not ended, running or waiting to.
+    let turns = |list: serde_json::Value| {
+        std::fs::write(lab.scratch.join("run.log.turns"), list.to_string()).unwrap()
+    };
+    turns(
+        serde_json::json!([{"turn": 9, "status": "queued", "finished_ms": null},
+        {"turn": 7, "status": "completed", "finished_ms": 5}]),
+    );
     let (ok, err) = lab.remove(&lab.repo, false);
-    assert!(ok, "{err}");
+    assert!(!ok && err.contains("its turn 9 has not ended"), "{err}");
+    assert!(worktree.exists() && lab.done("demo.fix").is_none());
+    turns(
+        serde_json::json!([{"turn": 9, "status": "completed", "finished_ms": 8},
+        {"turn": 7, "status": "completed", "finished_ms": 5}]),
+    );
+    let (ok, said) = lab.remove(&lab.repo, false);
+    assert!(ok, "{said}");
+    assert_eq!(said, "Marked demo.fix done and removed its worktree.");
     assert!(!worktree.exists());
-    let removed = std::fs::read_to_string(lab.scratch.join("run.log.rm")).unwrap();
-    assert_eq!(removed, "rm\n--bot\ndemo.fix\n");
+    // Its agent and history stay: nothing deletes them.
+    assert!(!lab.scratch.join("run.log.rm").exists());
+    // Done up to its newest turn, as mark_done marks it, by this call.
+    assert_eq!(
+        lab.done("demo.fix"),
+        Some(serde_json::json!({"turn": 9, "call": "call-1"}))
+    );
     // Its branch had nothing more than this one, so it went too.
     assert_eq!(
         lab.git(&lab.repo, &["branch", "--list", "agent/demo.fix"]),
         ""
     );
+    // Called again, it is done still, with nothing left to tidy.
+    let (ok, said) = lab.remove(&lab.repo, false);
+    assert_eq!((ok, said.as_str()), (true, "Marked demo.fix done."));
+    // Its name stays its own: a start of another task of that name is refused.
+    std::fs::write(
+        lab.scratch.join("run.log.inspect"),
+        r#"{"name":"demo.fix"}"#,
+    )
+    .unwrap();
+    let (ok, err) = lab.task(false, false);
+    assert!(!ok && err.contains("demo.fix is a task already"), "{err}");
+    assert!(!worktree.exists());
 }
 
 #[test]
@@ -525,8 +569,16 @@ fn a_task_outside_git_is_removed() {
     let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5, "workspace": workspace}]);
     std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
     let (ok, said) = lab.remove(&workspace, false);
-    assert!(ok, "{said}");
-    assert!(lab.scratch.join("run.log.rm").exists());
+    assert_eq!((ok, said.as_str()), (true, "Marked demo.fix done."));
+    assert!(lab.done("demo.fix").is_some());
+    assert!(!lab.scratch.join("run.log.rm").exists());
+    // A name that is no task and left no folder is said to be none.
+    let call = serde_json::json!({"task": "demo.gone"});
+    let (ok, said) = lab.tool(&workspace, "remove_task", call, false);
+    assert!(
+        !ok && said.contains("no task or folder of a task is named demo.gone"),
+        "{said}"
+    );
 }
 
 #[test]
@@ -612,7 +664,7 @@ fn a_task_s_own_folder_is_removed_only_with_discard() {
     std::fs::write(lab.scratch.join("run.log.ls"), r#"[{"name":"demo.fix"}]"#).unwrap();
     let (ok, err) = lab.remove(&ws, false);
     assert!(!ok && err.contains("with discard"), "{err}");
-    assert!(folder.exists() && !lab.scratch.join("run.log.rm").exists());
+    assert!(folder.exists() && lab.done("demo.fix").is_none());
     // Removed from another folder, it is refused, and a task of that name
     // started there is not given it.
     let (ok, err) = lab.remove(&lab.repo, true);

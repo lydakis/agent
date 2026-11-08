@@ -1061,9 +1061,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   task's instructions, with `task.md` after it. Paths in the lead's folder
   that a brief names (through a link too) are turned into the same paths
   in the task's worktree, so the task never writes the lead's folder by
-  its full path. The `remove_task` tool (`task`, `discard`) removes a task
-  that is done and its worktree, refusing while the worktree has
-  uncommitted changes. Its branch is kept unless it is merged.
+  its full path. The `remove_task` tool (`task`, `discard`) cleans up a
+  task that is done: it marks it done, as `mark_done` does, and removes
+  its worktree, refusing while the task is working or the worktree has
+  uncommitted changes. Its branch is kept unless it is merged. The agent
+  and its history stay, so a message reopens it; only the person deletes
+  an agent, with `agent rm`.
 - **Tasks that start their own:** every agent has `start_task` and
   `remove_task`, for help inside its own brief, such as a review or a
   watch on something; separate work still goes to its lead. How deep a
