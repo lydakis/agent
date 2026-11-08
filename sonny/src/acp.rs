@@ -437,9 +437,19 @@ impl Agent {
             Some(client) if self.t3.is_none() => folder_leads(client, &cwd).await,
             _ => Vec::new(),
         };
+        // A listed id names a lead, or a task one of them started.
+        let listed = resumed.and_then(listed_bot);
+        let known = match (&listed, lister) {
+            (Some(pinned), lister) if !project::is_lead(&pinned.bot) => match lister {
+                Some(client) => a_task(client, pinned).await,
+                None => false,
+            },
+            _ => true,
+        };
         if let Some(client) = lister {
             client.close().await;
         }
+        let listed = listed.filter(|_| known);
         let id = match resumed {
             Some(id) => id.to_owned(),
             None => crate::unique("sonny"),
@@ -467,7 +477,7 @@ impl Agent {
         let bound = match resumed {
             // A listed id names its lead itself, whatever the session was
             // moved to since.
-            Some(id) => match listed_lead(id).or_else(|| t3::recall(id)) {
+            Some(id) => match listed.or_else(|| t3::recall(id)) {
                 Some(pinned) => {
                     session
                         .bind(self, Some(pinned), false, &project::Pick::Last)
@@ -491,10 +501,11 @@ impl Agent {
     }
 
     /// `session/list`: the leads Sonny can open a session on, the one
-    /// folder's when the client names a `cwd`, else every project's, a
-    /// page at a time. Each is listed by an id `session/resume` takes, which
-    /// names the lead and its identity, so a lead removed and made again
-    /// under its name is not the one reopened.
+    /// folder's when the client names a `cwd`, each with the tasks it
+    /// started, else every project's leads, a page at a time. Each is
+    /// listed by an id `session/resume` takes, which names the bot and its
+    /// identity, so one removed and made again under its name is not the
+    /// one reopened.
     async fn listed(&self, params: &Value) -> Reply {
         self.ready().await.map_err(|e| (FAILED, e))?;
         let (client, _events) = Client::connect(&self.options.socket)
@@ -506,10 +517,18 @@ impl Agent {
                 Err((INVALID_PARAMS, "cwd must be an absolute path".to_owned()))
             }
             Some(cwd) => match project::folder_project(cwd) {
-                Ok((project, dir)) => project::leads(&client, &project, &dir)
-                    .await
-                    .map(|leads| (leads, None))
-                    .map_err(|e| (FAILED, e)),
+                Ok((project, dir)) => {
+                    let leads = project::leads(&client, &project, &dir)
+                        .await
+                        .map_err(|e| (FAILED, e));
+                    match leads {
+                        Ok(leads) => with_tasks(&client, leads)
+                            .await
+                            .map(|listed| (listed, None))
+                            .map_err(|e| (FAILED, e)),
+                        Err(error) => Err(error),
+                    }
+                }
                 // A folder no lead can work in has none.
                 Err(_) => Ok((Vec::new(), None)),
             },
@@ -519,15 +538,24 @@ impl Agent {
         };
         let store = client.store().map(str::to_owned);
         client.close().await;
-        let (leads, next) = listing?;
-        let sessions: Vec<Value> = leads
+        let (bots, next) = listing?;
+        let id = |bot: &Value| {
+            let (name, bot_id) = (bot["name"].as_str()?, bot["bot_id"].as_i64()?);
+            Some(lead_session(name, bot_id, store.as_deref()))
+        };
+        let sessions: Vec<Value> = bots
             .iter()
-            .filter_map(|lead| {
-                let (bot, bot_id) = (lead["name"].as_str()?, lead["bot_id"].as_i64()?);
-                Some(
-                    json!({"sessionId": lead_session(bot, bot_id, store.as_deref()),
-                    "cwd": lead["workspace"], "title": bot}),
-                )
+            .filter_map(|bot| {
+                let mut listed = json!({"sessionId": id(bot)?, "cwd": bot["workspace"],
+                    "title": bot["name"]});
+                // A task names the lead that started it.
+                if !project::is_lead(bot["name"].as_str()?)
+                    && let (Some(lead), Some(by)) =
+                        (bot["created_by"].as_str(), bot["created_by_id"].as_i64())
+                {
+                    listed["_meta"] = json!({"lead": lead_session(lead, by, store.as_deref())});
+                }
+                Some(listed)
             })
             .collect();
         let mut listed = json!({"sessions": sessions});
@@ -556,8 +584,6 @@ fn agent_option(leads: &[String], current: &str) -> Value {
         "currentValue": current, "options": choices})
 }
 
-/// The id `session/list` gives a lead: its name, its identity, and the
-/// lineage of the store it is in, since identities are a store's own.
 /// Who a client says sent a prompt or chose for a call, by its
 /// `_meta.person`: a name as the daemon takes a prompt's `person`, 1 to
 /// 128 of `A-Z a-z 0-9 . _ -`. The daemon shows the model who wrote it,
@@ -577,6 +603,9 @@ fn person(params: &Value) -> Result<Option<&str>, String> {
     }
 }
 
+/// The id `session/list` gives a lead or a task: its name, its identity,
+/// and the lineage of the store it is in, since identities are a store's
+/// own.
 fn lead_session(bot: &str, bot_id: i64, store: Option<&str>) -> String {
     match store {
         Some(store) => format!("{bot}#{bot_id}@{store}"),
@@ -584,19 +613,87 @@ fn lead_session(bot: &str, bot_id: i64, store: Option<&str>) -> String {
     }
 }
 
-/// The lead a listed session id names, as `session/resume` reopens it:
-/// that lead of that store, or none.
-fn listed_lead(session: &str) -> Option<t3::Pinned> {
-    let (lead, store) = match session.rsplit_once('@') {
-        Some((lead, store)) => (lead, Some(store.to_owned())),
+/// The bot a listed session id names, as `session/resume` reopens it:
+/// that bot of that store, or none. A lead's, or one `a_task` takes.
+fn listed_bot(session: &str) -> Option<t3::Pinned> {
+    let (listed, store) = match session.rsplit_once('@') {
+        Some((listed, store)) => (listed, Some(store.to_owned())),
         None => (session, None),
     };
-    let (bot, bot_id) = lead.rsplit_once('#')?;
-    (project::is_lead(bot)).then_some(())?;
+    let (bot, bot_id) = listed.rsplit_once('#')?;
+    (!bot.is_empty()).then_some(())?;
     Some(t3::Pinned {
         bot: bot.to_owned(),
         bot_id: Some(bot_id.parse().ok()?),
         store,
+    })
+}
+
+/// Whether `pinned`, no lead, is a task a lead started: made by a lead,
+/// and not a side chat of it. That one of that identity, or none.
+async fn a_task(client: &Client, pinned: &t3::Pinned) -> bool {
+    let inspected = client
+        .request(
+            "inspect",
+            json!({"bot": pinned.bot, "bot_id": pinned.bot_id}),
+        )
+        .await;
+    inspected.is_ok_and(|record| task(&record))
+}
+
+/// Whether `record`, a bot as `bots` or `inspect` gives it, is a task a
+/// lead started.
+fn task(record: &Value) -> bool {
+    let (name, maker) = (record["name"].as_str(), record["created_by"].as_str());
+    name.is_some_and(|name| !project::is_lead(name))
+        && maker.is_some_and(project::is_lead)
+        && crate::side_copy(record).is_none()
+}
+
+/// The tasks the lead `lead_id` started, every one, by name.
+async fn tasks_of(client: &Client, lead_id: i64) -> Result<Vec<Value>, String> {
+    let mut found = Vec::new();
+    let mut after = Value::Null;
+    loop {
+        let page = client
+            .request(
+                "bots",
+                json!({"created_by_id": lead_id, "limit": 256, "after": after}),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        found.extend(
+            (page["bots"].as_array().into_iter().flatten())
+                .filter(|bot| task(bot))
+                .cloned(),
+        );
+        after = page["next_after"].clone();
+        if after.is_null() {
+            return Ok(found);
+        }
+    }
+}
+
+/// `leads`, each followed by the tasks it started.
+async fn with_tasks(client: &Client, leads: Vec<Value>) -> Result<Vec<Value>, String> {
+    let mut listed = Vec::with_capacity(leads.len());
+    for lead in leads {
+        let tasks = match lead["bot_id"].as_i64() {
+            Some(lead_id) => tasks_of(client, lead_id).await?,
+            None => Vec::new(),
+        };
+        listed.push(lead);
+        listed.extend(tasks);
+    }
+    Ok(listed)
+}
+
+/// The bot a lead's `start_task` call names, as `start_task` names it.
+fn task_bot(project: &str, arguments: &Value) -> Option<String> {
+    let short = arguments["name"].as_str()?.trim();
+    Some(match short.strip_prefix(&format!("{project}.")) {
+        Some(_) => short.to_owned(),
+        None => format!("{project}.{short}"),
     })
 }
 
@@ -1561,6 +1658,26 @@ impl Session {
                     tokio::spawn(async move { elicit(asked, &agent, &session, lead, &ask).await });
                     return;
                 }
+                // A task the lead started, which a client opens as a
+                // thread of its own by the session id it is given.
+                if name == crate::served::START
+                    && !failed
+                    && shown.starts_with("Started ")
+                    && agent.t3.is_none()
+                    && let Some(project) = state.bound.as_ref().and_then(|b| b.project.as_deref())
+                    && let Some(task) = task_bot(project, &arguments)
+                    && let Ok(record) = client.request("inspect", json!({"bot": task})).await
+                    && let Some(bot_id) = record["bot_id"].as_i64()
+                {
+                    let session = lead_session(&task, bot_id, client.store());
+                    out.update(
+                        id,
+                        json!({"sessionUpdate": "tool_call_update", "toolCallId": call,
+                        "_meta": {"task": {"sessionId": session, "title": task,
+                        "cwd": record["workspace"]}}}),
+                    );
+                    return;
+                }
                 // A task the lead started opens as a thread of its own.
                 if name == crate::served::START
                     && !failed
@@ -2149,14 +2266,8 @@ async fn open_task(
 ) {
     let (project, lead_workspace) = (at.project, at.workspace);
     let Some(t3) = &agent.t3 else { return };
-    let Some(name) = arguments["name"].as_str() else {
+    let Some(bot) = task_bot(project, arguments) else {
         return;
-    };
-    // Named as `start_task` names it.
-    let short = name.trim();
-    let bot = match short.strip_prefix(&format!("{project}.")) {
-        Some(_) => short.to_owned(),
-        None => format!("{project}.{short}"),
     };
     let name = bot.strip_prefix(&format!("{project}.")).unwrap_or(&bot);
     let opened = async {
@@ -2588,20 +2699,40 @@ mod tests {
     }
 
     #[test]
-    fn a_listed_session_names_a_lead_and_its_identity() {
+    fn a_listed_session_names_a_bot_and_its_identity() {
         let id = lead_session("calc.lead.billing", 7, Some("00ab"));
         assert_eq!(id, "calc.lead.billing#7@00ab");
-        let pinned = listed_lead(&id).unwrap();
+        let pinned = listed_bot(&id).unwrap();
         assert_eq!(
             (pinned.bot.as_str(), pinned.bot_id, pinned.store.as_deref()),
             ("calc.lead.billing", Some(7), Some("00ab"))
         );
-        let unstored = listed_lead(&lead_session("calc.lead", 7, None)).unwrap();
+        let unstored = listed_bot(&lead_session("calc.lead", 7, None)).unwrap();
         assert_eq!((unstored.bot.as_str(), unstored.store), ("calc.lead", None));
-        // Only a lead, and only by its identity.
-        assert!(listed_lead("calc.fix-cart#7").is_none());
-        assert!(listed_lead("calc.lead").is_none());
-        assert!(listed_lead("calc.lead#x").is_none());
+        // A task too, which only `a_task` lets open; only by its identity.
+        assert_eq!(listed_bot("calc.fix-cart#7").unwrap().bot, "calc.fix-cart");
+        assert!(listed_bot("calc.lead").is_none());
+        assert!(listed_bot("calc.lead#x").is_none());
+        assert!(listed_bot("#7").is_none());
+    }
+
+    #[test]
+    fn a_task_is_a_bot_a_lead_started() {
+        let bot = |name: &str, by: Option<&str>| json!({"name": name, "created_by": by});
+        assert!(task(&bot("calc.fix", Some("calc.lead"))));
+        assert!(task(&bot("calc.fix", Some("calc.lead.billing"))));
+        // Not a lead, one no lead started, nor a lead's side chat.
+        assert!(!task(&bot("calc.lead.billing", Some("calc.lead"))));
+        assert!(!task(&bot("calc.check", Some("calc.fix"))));
+        assert!(!task(&bot("calc.loose", None)));
+        let mut side = bot("calc.lead.side-1a2b", Some("calc.lead"));
+        side["expire_ms"] = json!(60_000);
+        assert!(!task(&side));
+        // Named as `start_task` names it.
+        let named = |name: &str| task_bot("calc", &json!({"name": name}));
+        assert_eq!(named(" fix ").as_deref(), Some("calc.fix"));
+        assert_eq!(named("calc.fix").as_deref(), Some("calc.fix"));
+        assert_eq!(task_bot("calc", &json!({})), None);
     }
 
     #[test]

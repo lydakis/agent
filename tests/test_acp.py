@@ -478,6 +478,61 @@ class AcpTests(ModelFixture):
         other = f'{lead}@{"0" * 16 if store != "0" * 16 else "1" * 16}'
         self.assertIn('another store', self.resume(repo, other)['error']['message'])
 
+    def test_a_task_the_lead_starts_is_a_thread_a_client_opens(self):
+        """Any client, not only T3 Code: a task the lead starts comes with
+        the session id that opens it, `session/list` lists it under its
+        lead, and `session/resume` opens it, as it opens no other bot."""
+        repo = self.repo()
+        self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('start_task', inherit=False)])
+        env = {k: v for k, v in self.env.items() if not k.startswith('T3_')}
+        thread = Thread(self, env, repo)
+        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {},
+                                                   'clientInfo': {'name': 'slack-bridge'}}))
+        opened, _ = thread.answer_of(thread.ask('session/new', {'cwd': str(repo), 'mcpServers': []}))
+        session = opened['result']['sessionId']
+        thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead'}))
+        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix calc.py.'})]
+        answered, updates = thread.answer_of(thread.ask('session/prompt', {
+            'sessionId': session, 'prompt': [{'type': 'text', 'text': 'script'}]}))
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        fix = self.daemon.request('inspect', bot='calc.fix')['result']
+        lead_id = self.daemon.request('inspect', bot='calc.lead')['result']['bot_id']
+        # The call that started it names it, before the prompt is answered.
+        [task] = [u['_meta']['task'] for u in updates
+                  if u['sessionUpdate'] == 'tool_call_update' and 'task' in u.get('_meta', {})]
+        name, store = task['sessionId'].rsplit('@', 1)
+        self.assertEqual(name, f'calc.fix#{fix["bot_id"]}')
+        self.assertRegex(store, r'^[0-9a-f]{16}$')
+        self.assertEqual((task['title'], task['cwd']), ('calc.fix', fix['workspace']))
+        # Listed by folder under its lead, which it names; in all, leads only.
+        listed, _ = thread.answer_of(thread.ask('session/list', {'cwd': str(repo)}))
+        sessions = listed['result']['sessions']
+        self.assertEqual([(s['title'], s.get('_meta')) for s in sessions],
+                         [('calc.lead', None), ('calc.fix', {'lead': f'calc.lead#{lead_id}@{store}'})])
+        self.assertEqual((sessions[1]['sessionId'], sessions[1]['cwd']), (task['sessionId'], fix['workspace']))
+        listed, _ = thread.answer_of(thread.ask('session/list', {}))
+        self.assertEqual([s['title'] for s in listed['result']['sessions']], ['calc.lead'])
+        # It opens as the task, and a prompt there is the task's.
+        reopened = Thread(self, env, repo)
+        reopened.answer_of(reopened.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        answered, _ = reopened.answer_of(reopened.ask('session/resume', {
+            'sessionId': task['sessionId'], 'cwd': str(repo), 'mcpServers': []}))
+        self.assertEqual(answered['result']['configOptions'][-1]['currentValue'], 'calc.fix')
+        before = len(self.daemon.request('turns', bot='calc.fix')['result']['turns'])
+        answered, _ = reopened.answer_of(reopened.ask('session/prompt', {
+            'sessionId': task['sessionId'], 'prompt': [{'type': 'text', 'text': 'how is it going?'}]}))
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        self.assertEqual(len(self.daemon.request('turns', bot='calc.fix')['result']['turns']), before + 1)
+        reopened.close()
+        # A bot no lead started does not open, by any id.
+        self.daemon.request('create', bot='calc.loose', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Loose.')
+        loose = self.daemon.request('inspect', bot='calc.loose')['result']['bot_id']
+        refused = self.resume(repo, f'calc.loose#{loose}@{store}')
+        self.assertIn('does not know', refused['error']['message'])
+
     def test_a_client_names_who_wrote_each_prompt_and_who_answered_for_a_call(self):
         """A client several people write through, as a team's chat bridge:
         `_meta.person` names who wrote a prompt, which the lead reads, and
