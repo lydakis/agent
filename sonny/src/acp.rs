@@ -1917,14 +1917,16 @@ impl Session {
             .request("follow", follow(lead))
             .await
             .map_err(|e| e.to_string())?;
-        let mut watched = HashSet::new();
+        // The tasks followed, by name, each the identity it is now: a
+        // follow is by name, and a bot made later under it is not the task.
+        let mut watched: HashMap<String, i64> = HashMap::new();
         let store = agent_client::socket::canonical_store(&agent.options.store)
             .unwrap_or_else(|_| agent.options.store.clone());
         // Followed before they are read, so none asked between is missed.
         let tasks = tasks_of(&client, lead_id).await?;
         for task in &tasks {
-            if let Some(bot) = task["name"].as_str()
-                && watched.insert(bot.to_owned())
+            if let (Some(bot), Some(id)) = (task["name"].as_str(), task["bot_id"].as_i64())
+                && watched.insert(bot.to_owned(), id).is_none()
             {
                 (client.request("follow", follow(bot)).await).map_err(|e| e.to_string())?;
             }
@@ -1932,8 +1934,9 @@ impl Session {
         for task in tasks.iter().filter(|task| lately(task, since)) {
             self.task_asked(agent, &client, &store, task).await;
         }
-        // Calls started, by bot and call: the lead's `start_task`, a task's ask.
-        let mut started = HashSet::new();
+        // The lead's `start_task` calls started, and the tasks' asks, by
+        // task and call.
+        let (mut starting, mut asking) = (HashSet::new(), HashSet::new());
         while let Some(event) = events.recv().await {
             if event["event"] == "follow_lagged" {
                 break;
@@ -1942,44 +1945,58 @@ impl Session {
                 continue;
             };
             let data = &event["data"];
-            let key = (
-                bot.to_owned(),
-                data["call_id"].as_str().unwrap_or("").to_owned(),
-            );
+            let call = data["call_id"].as_str().unwrap_or("").to_owned();
             let done = data["failed"] != true && data["denied"] != true;
-            let new_tasks = match event["event"].as_str() {
-                Some("tool_started") => {
-                    let name = data["name"].as_str();
-                    if (bot == lead && name == Some(crate::served::START))
-                        || (bot != lead && name == Some(asks::TOOL))
-                    {
-                        started.insert(key);
+            let kind = event["event"].as_str().unwrap_or("");
+            if bot == lead {
+                match kind {
+                    "tool_started" if data["name"] == crate::served::START => {
+                        starting.insert(call);
+                        continue;
                     }
-                    false
+                    // A task started: followed from now on.
+                    "tool_completed" if starting.remove(&call) && done => {}
+                    // One whose start came before this followed: the
+                    // lead's turn ends after it.
+                    "turn_finished" => {}
+                    _ => continue,
                 }
-                // A task started: followed from now on.
-                Some("tool_completed") if bot == lead => started.remove(&key) && done,
-                // One whose start came before this followed: its lead's
-                // turn ends after it.
-                Some("turn_finished") => bot == lead,
-                Some("tool_completed") if started.remove(&key) && done => {
-                    let task = (client.request("inspect", json!({"bot": bot})).await)
-                        .map_err(|e| e.to_string())?;
-                    self.task_asked(agent, &client, &store, &task).await;
-                    false
-                }
-                _ => false,
-            };
-            if new_tasks {
                 for task in tasks_of(&client, lead_id).await? {
-                    if let Some(bot) = task["name"].as_str()
-                        && watched.insert(bot.to_owned())
-                    {
-                        (client.request("follow", follow(bot)).await).map_err(|e| e.to_string())?;
-                        // Its question may have come before it was followed.
-                        self.task_asked(agent, &client, &store, &task).await;
+                    let (Some(bot), Some(id)) = (task["name"].as_str(), task["bot_id"].as_i64())
+                    else {
+                        continue;
+                    };
+                    match watched.insert(bot.to_owned(), id) {
+                        Some(was) if was == id => continue,
+                        Some(_) => {}
+                        None => {
+                            (client.request("follow", follow(bot)).await)
+                                .map_err(|e| e.to_string())?;
+                        }
                     }
+                    // Its questions may have come before it was followed.
+                    self.task_asked(agent, &client, &store, &task).await;
                 }
+                continue;
+            }
+            // A task's question put, or its turn over, which takes in one
+            // whose ask began before this followed: read what it has open,
+            // if it is still the task followed.
+            let key = (bot.to_owned(), call);
+            if kind == "tool_started" && data["name"] == asks::TOOL {
+                asking.insert(key);
+                continue;
+            }
+            let asked = kind == "tool_completed" && asking.remove(&key) && done;
+            let ended = kind == "turn_finished";
+            if (asked || ended)
+                && let Some(&id) = watched.get(bot)
+                && let Ok(task) = client
+                    .request("inspect", json!({"bot": bot, "bot_id": id}))
+                    .await
+                && task["created_by_id"].as_i64() == Some(lead_id)
+            {
+                self.task_asked(agent, &client, &store, &task).await;
             }
         }
         client.close().await;

@@ -765,6 +765,16 @@ class AcpTests(ModelFixture):
         ran('calc.check', 'script')
         colour = form(thread)
         self.assertTrue(colour['params']['message'].startswith('From calc.check\n\nWhich colour?'))
+        # Another bot made under a task's name, after it is gone, is not
+        # that task: its questions are its own.
+        self.assertIn('result', self.daemon.request('delete', bot='calc.fix'))
+        self.assertIn('result', self.daemon.request(
+            'create', bot='calc.fix', instructions='Not a task.', declare=[declared('ask', inherit=False)], **made))
+        self.model.call_script = [asked('Which secret?', 'One', 'Two')]
+        ran('calc.fix', 'script')
+        hello = thread.ask('session/prompt', {'sessionId': lead, 'prompt': [{'type': 'text', 'text': 'hello'}]})
+        seen = thread.until(lambda m: m.get('id') == hello and 'method' not in m)
+        self.assertNotIn('elicitation/create', [m.get('method') for m in seen])
 
     def test_t3_code_threads_pick_their_lead_by_words_not_by_an_option(self):
         """T3 Code carries option picks over to the next thread it opens."""
