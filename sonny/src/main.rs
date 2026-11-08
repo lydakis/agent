@@ -9350,6 +9350,12 @@ impl App {
                 }
             }
             "compaction_text_delta" | "compaction_thinking_delta" => {
+                // Words that ended before it are a step: compaction comes
+                // only before another model call. Held for what follows,
+                // they would sit by the spinner while the history scrolls.
+                if self.live.as_ref().is_some_and(|live| live.closed) {
+                    self.end_live(Words::Step);
+                }
                 if let Some(running) = &mut self.running {
                     running.phase = "Compacting".into();
                 }
@@ -21275,6 +21281,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn words_before_a_compaction_are_written_as_a_step_not_held_by_its_spinner() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        let said = |text: &str| json!({"event": "text_delta", "bot": "b", "turn": 1, "text": text});
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.daemon(said("Reading the logs next.")).await;
+        app.daemon(turn_event("message", 1, json!({"node": 2})))
+            .await;
+        assert!(app.pending.is_empty(), "held until what follows");
+        // The summary streams before the next model call: the words are
+        // that call's step, written into the history as a call would.
+        let summary =
+            json!({"event": "compaction_text_delta", "bot": "b", "turn": 1, "text": "So far"});
+        app.daemon(summary).await;
+        assert!(app.live.is_none());
+        let written: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert!(
+            written
+                .iter()
+                .any(|row| row.contains("Reading the logs next.")),
+            "{written:?}"
+        );
+        assert_eq!(app.running.as_ref().unwrap().phase, "Compacting");
+    }
+
     /// A stand-in daemon holding a project: its lead, a task whose turn
     /// waits on the person's approval, and one at rest on its own question.
     async fn project_waiting() -> (Arc<Client>, Events) {
@@ -22808,6 +22840,45 @@ mod tests {
         app.submit().await;
         app.key(key(KeyCode::Up)).await;
         assert_eq!(&*app.input, "ship it");
+    }
+
+    #[tokio::test]
+    async fn up_in_a_prompt_taller_than_the_composer_reaches_its_top_lines() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.recall.sent("sent before", Vec::new(), 0);
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let long: Vec<String> = (1..=20).map(|n| format!("line {n}")).collect();
+        app.input.set(&long.join("\n"));
+        let text =
+            |line: &Line| -> String { line.spans.iter().map(|s| s.content.as_ref()).collect() };
+        // Typed to its end, the composer shows its last rows.
+        let (rows, (row, _)) = app.composer(80);
+        assert_eq!(rows.len(), COMPOSER_ROWS);
+        assert!(
+            text(&rows[row]).contains("line 20"),
+            "{:?}",
+            text(&rows[row])
+        );
+        // Up walks back through every row, the shown ones following.
+        for n in (1..20).rev() {
+            app.key(key(KeyCode::Up)).await;
+            let (rows, (row, _)) = app.composer(80);
+            assert!(text(&rows[row]).contains(&format!("line {n}")), "line {n}");
+        }
+        let (rows, (row, _)) = app.composer(80);
+        assert_eq!(row, 0);
+        assert!(text(&rows[0]).ends_with("line 1"));
+        assert_eq!(*app.input, long.join("\n"), "nothing recalled yet");
+        // Down walks back to the end; only past the top does Up recall.
+        for _ in 1..20 {
+            app.key(key(KeyCode::Down)).await;
+        }
+        let (rows, (row, _)) = app.composer(80);
+        assert!(text(&rows[row]).contains("line 20"));
+        for _ in 0..20 {
+            app.key(key(KeyCode::Up)).await;
+        }
+        assert_eq!(&*app.input, "sent before");
     }
 
     #[tokio::test]
