@@ -1236,7 +1236,9 @@ the version installed, and removes it when agent-browser is gone. Agents
 drive it through the `browser` tool, which the tool host answers outside
 their sandbox: it runs the skill's commands in each agent's own browser
 session, its answers read from agent-browser's JSON, and a screenshot
-comes back as a picture, up to 20 a call. It refuses what would
+without a path comes back as a picture only the agent sees, up to 20 a
+call; the tool tells the agent to show the person one by saving it to a
+path and putting it in its reply as a Markdown image. It refuses what would
 reach past the browser: flags that launch another program or load an
 extension, plugins, the clipboard, the browser's DevTools address, and
 writes outside the agent's folder. It opens `file://` pages anywhere,
@@ -1251,7 +1253,7 @@ desktop`), and agents see and use the person's own desktop through the
 `desktop` tool, which the tool host answers outside their sandbox, since a
 sandboxed process reaches no other app. It runs the skill's commands one
 call at a time across agents, as there is one desktop: what only looks (a
-snapshot, `find`, a screenshot, which comes back as a picture, the apps
+snapshot, `find`, a screenshot, which comes back as a picture only the agent sees, the apps
 and windows) runs at once; a call with a command that acts (a click,
 typing, a key, launching or closing an app, a window, a notification, the
 clipboard) waits for the agent's approvals once. It passes only the flags
