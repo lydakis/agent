@@ -39,12 +39,6 @@ fn span(setting: &Setting) -> bool {
         && agent_client::config::span(setting.key, setting.default).is_ok()
 }
 
-/// Whether a setting is `[sonny] hours`: a list in the file, typed as its
-/// runs joined with a comma.
-fn hours(setting: &Setting) -> bool {
-    setting.key == "sonny.hours"
-}
-
 /// The rows `/config` takes with room for all: the blank one, a heading
 /// for each table, and the settings.
 pub fn height() -> usize {
@@ -298,18 +292,6 @@ pub const SETTINGS: &[Setting] = &[
         default: "0",
     },
     Setting {
-        key: "sonny.hours",
-        about: "your working hours, local time; set, Sonny goes quiet once they end and no window is used for quiet_after; unset, it keeps no clock and goes quiet only on /quiet",
-        values: &[],
-        default: "none",
-    },
-    Setting {
-        key: "sonny.quiet_after",
-        about: "how long no Sonny window is used, outside the hours in [sonny] hours, before Sonny goes quiet: agents work on, nothing rings, and they are told the person is away until the person writes again",
-        values: &[],
-        default: "30m",
-    },
-    Setting {
         key: "sonny.lookout_waiting",
         about: "events from your sources that wait for one agent while it is busy: past it, newer ones are not kept, and the agent's next note says how many, from where and when; 0 for no limit",
         values: &[],
@@ -333,10 +315,13 @@ pub const SETTINGS: &[Setting] = &[
 pub const DEPTH: &str = "task-depth-daemon";
 /// The migration that renames `[judge]` to `[reviewer]`.
 pub const REVIEWER: &str = "judge-reviewer";
+/// The migration that takes quiet mode's keys, files and skill away.
+pub const QUIET_GONE: &str = "quiet-gone";
 
 /// At start, once each, before the config is read: a line depth the
-/// person set for Sonny moved to the daemon, which bounds it now; and the
-/// reviewer's model and effort under the reviewer's name.
+/// person set for Sonny moved to the daemon, which bounds it now; the
+/// reviewer's model and effort under the reviewer's name; and quiet mode,
+/// gone, leaving no key the config would refuse, no file and no skill.
 pub fn at_start() {
     let (Some(home), Some(path)) = (
         std::env::var_os("HOME").map(PathBuf::from),
@@ -351,6 +336,13 @@ pub fn at_start() {
     let migrated = home.join(".agent/sonny/migrated");
     crate::upgrade::once(&migrated, DEPTH, || rewrite(&path, depth_moved));
     crate::upgrade::once(&migrated, REVIEWER, || rewrite(&path, reviewer_named));
+    crate::upgrade::once(&migrated, QUIET_GONE, || {
+        for file in ["away", "present"] {
+            let _ = std::fs::remove_file(home.join(".agent/sonny").join(file));
+        }
+        crate::skills::remove("away");
+        rewrite(&path, quiet_gone)
+    });
 }
 
 /// The config at `path` as `change` rewrites it, each other line as the
@@ -470,6 +462,54 @@ fn reviewer_named(text: &str) -> Result<Option<String>, ()> {
     }
 }
 
+/// `text` as [`rewrite`] writes it for [`QUIET_GONE`]: none when `[sonny]`
+/// sets neither `hours` nor `quiet_after`. Their lines go, a list run over
+/// several lines whole, and every other line stays as written. What is
+/// written must parse to the config with only those keys gone, so a key
+/// lines can't take away (a dotted key, an inline table) is an error.
+fn quiet_gone(text: &str) -> Result<Option<String>, ()> {
+    const GONE: [&str; 2] = ["hours", "quiet_after"];
+    let old: toml::Table = text.parse().map_err(drop)?;
+    let mut expected = old.clone();
+    let Some(toml::Value::Table(sonny)) = expected.get_mut("sonny") else {
+        return Ok(None);
+    };
+    if GONE
+        .iter()
+        .filter(|key| sonny.remove(**key).is_some())
+        .count()
+        == 0
+    {
+        return Ok(None);
+    }
+    let (mut table, mut list) = (String::new(), false);
+    let mut new = String::new();
+    for raw in text.split_inclusive('\n') {
+        let trimmed = raw.trim();
+        if list {
+            list = !trimmed.contains(']');
+            continue;
+        }
+        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            table = trimmed.trim_matches(['[', ']']).trim().to_owned();
+        }
+        let set = trimmed.split_once('=');
+        if let Some((key, value)) = set
+            && table == "sonny"
+            && GONE.contains(&key.trim())
+        {
+            let value = value.trim();
+            list = value.starts_with('[') && !value.contains(']');
+            continue;
+        }
+        new.push_str(raw);
+    }
+    match new.parse::<toml::Table>() {
+        Ok(parsed) if parsed == expected => Ok(Some(new)),
+        _ => Err(()),
+    }
+}
+
 /// The `sonny-config` skill: where the settings live and every key of the
 /// file, from [`SETTINGS`], so it says what this Sonny reads.
 pub fn skill() -> String {
@@ -477,9 +517,6 @@ pub fn skill() -> String {
         .iter()
         .map(|setting| {
             let values = match setting.values {
-                [] if hours(setting) => {
-                    "day runs, each with a time range, as `Mon-Fri 09:00-19:00`, more joined with a comma".to_owned()
-                }
                 [] if number(setting) => "a whole number".to_owned(),
                 [] if span(setting) => "a span, as `30s`, `15m` or `1h`".to_owned(),
                 [] => "a name".to_owned(),
@@ -548,12 +585,6 @@ impl View {
                 let first = table.get(path.next().unwrap_or_default());
                 let value = path.try_fold(first, |at, key| Some(at?.get(key))).flatten();
                 value.and_then(|v| match v {
-                    toml::Value::Array(runs) => Some(
-                        (runs.iter())
-                            .filter_map(toml::Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    ),
                     toml::Value::Boolean(on) => Some(on.to_string()),
                     toml::Value::Integer(n) => Some(n.to_string()),
                     v => v.as_str().map(str::to_owned),
@@ -567,13 +598,6 @@ impl View {
     fn write(&mut self, value: Option<String>) {
         let setting = &SETTINGS[self.pick];
         let value = value.map(|value| match (setting.values == SWITCH, number(setting)) {
-            _ if hours(setting) => toml::Value::Array(
-                (value.split(','))
-                    .map(str::trim)
-                    .filter(|run| !run.is_empty())
-                    .map(|run| toml::Value::String(run.to_owned()))
-                    .collect(),
-            ),
             (true, _) => toml::Value::Boolean(value == "true"),
             (_, true) => value
                 .parse()
@@ -847,6 +871,25 @@ mod tests {
     }
 
     #[test]
+    fn quiet_mode_s_keys_go_and_the_rest_stays_as_written() {
+        let text = "[sonny]\nchime = true\nhours = [\"Mon-Fri 09:00-19:00\"]  # mine\nquiet_after = \"45m\"\nverbose = true\n\n[daemon]\ndepth = 2\n";
+        assert_eq!(
+            quiet_gone(text),
+            Ok(Some(
+                "[sonny]\nchime = true\nverbose = true\n\n[daemon]\ndepth = 2\n".into()
+            ))
+        );
+        // A list over several lines goes whole.
+        let text = "[sonny]\nhours = [\n  \"Mon-Fri 09:00-19:00\",\n  \"Sat 10:00-12:00\",\n]\nchime = true\n";
+        assert_eq!(quiet_gone(text), Ok(Some("[sonny]\nchime = true\n".into())));
+        // Nothing to take away, here or in another table.
+        assert_eq!(quiet_gone("[sonny]\nchime = true\n"), Ok(None));
+        assert_eq!(quiet_gone("[daemon]\ndepth = 2\n"), Ok(None));
+        // A key lines can't take away is left for the reader's error.
+        assert_eq!(quiet_gone("sonny.quiet_after = \"30m\"\n"), Err(()));
+    }
+
+    #[test]
     fn every_key_the_file_takes_is_listed() {
         // A key or value the reader does not take would be refused.
         let dir = std::env::temp_dir().join(format!("sonny-config-keys-{}", std::process::id()));
@@ -861,7 +904,6 @@ mod tests {
         for (at, setting) in SETTINGS.iter().enumerate() {
             view.pick = at;
             let named = match (number(setting), span(setting)) {
-                _ if hours(setting) => "Mon-Fri 09:00-19:00, Sat 10:00-14:00",
                 // Wide enough for a text width.
                 (true, _) => "70",
                 (_, true) => "15m",

@@ -5,10 +5,6 @@
 //! line naming the local time they were sent. The line comes after the
 //! words, so what the model read before stays cached, and Sonny draws the
 //! words without it.
-//!
-//! While the person is away ([`crate::quiet`]) the line says so after the
-//! time, and the person's first message back says they are back: facts,
-//! as the time is.
 
 /// The line's start and end: `[Sent Sat 31 Oct 2026 16:12, UTC-04:00.]`.
 const OPEN: &str = "\n\n[Sent ";
@@ -24,50 +20,14 @@ pub fn stamped(prompt: &str, epoch: i64) -> String {
     format!("{prompt}{OPEN}{}{CLOSE}", when(epoch))
 }
 
-/// `prompt` with the line naming `epoch`, and `clause`, a sentence of
-/// [`crate::quiet`]'s, after the time.
-pub fn stamped_with(prompt: &str, epoch: i64, clause: Option<&str>) -> String {
-    match clause {
-        Some(clause) => format!(
-            "{prompt}{OPEN}{}. {}{CLOSE}",
-            when(epoch),
-            clause.strip_suffix('.').unwrap_or(clause)
-        ),
-        None => stamped(prompt, epoch),
-    }
-}
-
 fn epoch_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// `prompt` to `bot`, stamped now: to a lead, saying the person is away
-/// while they are. Quiet is the leads' alone; tasks work and report to
-/// them as ever.
-pub fn now(prompt: &str, bot: &str) -> String {
-    let clause = (crate::project::is_lead(bot))
-        .then(crate::quiet::away)
-        .flatten()
-        .map(|away| crate::quiet::away_clause(away, &crate::quiet::schedule()));
-    stamped_with(prompt, epoch_now(), clause.as_deref())
-}
-
-/// The person's own words to `bot`, stamped now: they end quiet for
-/// every agent, and a lead they write to first hears since when they were
-/// away.
-pub fn person(prompt: &str, bot: &str) -> String {
-    let clause = (crate::quiet::spoke())
-        .filter(|_| crate::project::is_lead(bot))
-        .map(crate::quiet::back_clause);
-    stamped_with(prompt, epoch_now(), clause.as_deref())
-}
-
-/// Another person's words, a teammate's through an ACP client, stamped
-/// now: they say nothing of the person's own being away or back, so they
-/// neither end quiet nor say since when.
-pub fn other(prompt: &str) -> String {
+/// `prompt` stamped now.
+pub fn now(prompt: &str) -> String {
     stamped(prompt, epoch_now())
 }
 
@@ -78,15 +38,23 @@ pub fn unstamped(text: &str) -> &str {
     };
     let line = &text[at + OPEN.len()..];
     let read = |line: &str| match line.split_once(". ") {
-        Some((time, clause)) => {
-            names_a_time(time) && crate::quiet::is_clause(&format!("{clause}."))
-        }
+        Some((time, clause)) => names_a_time(time) && was_away_or_back(&format!("{clause}.")),
         None => names_a_time(line),
     };
     match line.strip_suffix(CLOSE).is_some_and(read) {
         true => &text[..at],
         false => text,
     }
+}
+
+/// Whether `text` is a sentence Sonny once put after the time, while
+/// quiet mode was (gone in 0.9.1): kept so the conversations it stamped
+/// draw as their words still.
+fn was_away_or_back(text: &str) -> bool {
+    (text.starts_with("The person is away since ")
+        || text.starts_with("The person is back; they were away since "))
+        && text.ends_with('.')
+        && !text.contains('\n')
 }
 
 /// Whether `line` is what `when` writes: `Sat 31 Oct 2026 16:12, UTC-04:00`.
@@ -155,22 +123,11 @@ mod tests {
     }
 
     #[test]
-    fn a_stamp_saying_the_person_is_away_or_back_reads_as_the_words_too() {
-        let away = "The person is away since Fri 6 Nov 19:40; their hours are Mon-Fri 09:00-19:00.";
-        let sent = stamped_with("look at the build", 1_793_473_920, Some(away));
-        assert!(
-            sent.ends_with("; their hours are Mon-Fri 09:00-19:00.]"),
-            "{sent}"
-        );
-        assert!(!sent.contains("..]"), "{sent}");
-        assert_eq!(unstamped(&sent), "look at the build");
-        let back = "The person is back; they were away since Fri 6 Nov 19:40.";
-        let sent = stamped_with("morning", 1_793_473_920, Some(back));
-        assert_eq!(unstamped(&sent), "morning");
-        assert_eq!(
-            stamped_with("hi", 1_793_473_920, None),
-            stamped("hi", 1_793_473_920)
-        );
+    fn a_stamp_older_sonnys_wrote_saying_the_person_was_away_or_back_reads_as_the_words_too() {
+        let away = "look at the build\n\n[Sent Sat 7 Nov 2026 16:12, UTC-04:00. The person is away since Fri 6 Nov 19:40; their hours are Mon-Fri 09:00-19:00.]";
+        assert_eq!(unstamped(away), "look at the build");
+        let back = "morning\n\n[Sent Sat 7 Nov 2026 16:12, UTC-04:00. The person is back; they were away since Fri 6 Nov 19:40.]";
+        assert_eq!(unstamped(back), "morning");
         // A sentence of the person's own after a time is theirs.
         let typed = "see\n\n[Sent Sat 31 Oct 2026 16:12, UTC-04:00. Then I left.]";
         assert_eq!(unstamped(typed), typed);

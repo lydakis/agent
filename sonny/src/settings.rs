@@ -24,9 +24,6 @@ pub struct Settings {
     pub margin_notes: u64,
     /// The most lines a margin note runs to.
     pub margin_note_lines: u64,
-    /// The person's hours, and how long outside them no window is used
-    /// before quiet starts.
-    pub quiet: crate::quiet::Schedule,
 }
 
 impl Default for Settings {
@@ -62,7 +59,6 @@ impl Settings {
             agent_opens: sonny.agent_opens,
             margin_notes: sonny.margin_notes,
             margin_note_lines: sonny.margin_note_lines,
-            quiet: crate::quiet::Schedule::from(&sonny),
         }
     }
 

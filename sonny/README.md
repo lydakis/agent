@@ -300,7 +300,6 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Where a click on an agent's name goes | `[sonny] agent_opens` (`tab`, the default, or `beside`) | |
 | Which tasks open in a tab | `[sonny] task_tabs` (`asked`, the default, or `every`) | |
 | Task windows a lead keeps open | `[sonny] task_windows` (32 by default, 0 for no limit) | |
-| Quiet outside your working hours | `[sonny] hours` (ranges in local time, as `["Mon-Fri 09:00-19:00"]`; unset, the default, no clock) and `quiet_after` (how long no window is used outside them before quiet starts, `30m` by default) | |
 | The daemon started with the machine | `[sonny] start_at_boot` (true or false, the default) | |
 | News from outside for the lookout | `[sonny.sources.NAME] command`, `every` | |
 
@@ -508,8 +507,7 @@ A client several people write through names who wrote each prompt in its
 `A-Z a-z 0-9 . _ -`, so `ana.lopez`, not `Ana Lopez`; another is refused).
 The lead reads `[Written by ana.lopez.]` after the words and their time,
 and Sonny's window shows the name on the message. Their words are not
-yours: they neither end quiet nor say you are back, and the reviewer takes
-none of them as your consent. The client's answer to a call waiting on a
+yours: the reviewer takes none of them as your consent. The client's answer to a call waiting on a
 person may name who chose in its own `_meta.person`, which the call's
 record keeps as who answered (else `acp`). A pick on one of the lead's
 questions that names someone goes to the lead as their words: it reads
@@ -1260,18 +1258,9 @@ way `/react` does, and each note in the margin has its own `↩`.
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`
   leaves the agents working.
-- Quiet: outside the hours in `[sonny] hours`, once no Sonny window has
-  been used for `quiet_after` (30 minutes), Sonny goes quiet. Agents keep
-  working; the line Sonny ends each message to a lead with tells it the
-  person is away and since when (tasks are untouched and report to their
-  lead as ever), nothing rings, and every footer says `quiet since
-  19:40`, or `quiet when you step away` while it waits for you. Your next
-  words to any agent end it for all of them, and that message tells a lead
-  you are back; a glance, a click on a question or 9:00 does not.
-  `/quiet` goes quiet now, any hour, and `/quiet off` ends it. Off unless
-  you set `hours` or write `/quiet`. Over SSH with no display and no `BROWSER`,
-  what Sonny would open (a link, a file, the page) is copied instead, so
-  it doesn't start on the remote machine's screen.
+- Over SSH with no display and no `BROWSER`, what Sonny would open (a
+  link, a file, the page) is copied instead, so it doesn't start on the
+  remote machine's screen.
 
 Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
