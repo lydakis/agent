@@ -1556,8 +1556,9 @@ impl Session {
                     && state.asked.insert(ask.id.clone())
                 {
                     let asked = out.asking("elicitation/create", form(id, &ask, Some(&call)));
+                    let lead = (bot, state.bound.as_ref().and_then(|b| b.bot_id));
                     let (agent, session) = (agent.clone(), self.id.clone());
-                    tokio::spawn(async move { elicit(asked, &agent, &session, &bot, &ask).await });
+                    tokio::spawn(async move { elicit(asked, &agent, &session, lead, &ask).await });
                     return;
                 }
                 // A task the lead started opens as a thread of its own.
@@ -1745,12 +1746,16 @@ impl Session {
         .await;
         // The oldest first, as they were asked.
         for ask in open.into_iter().rev() {
-            if !self.state.lock().await.asked.insert(ask.id.clone()) {
-                continue;
-            }
+            let bot_id = {
+                let mut state = self.state.lock().await;
+                if !state.asked.insert(ask.id.clone()) {
+                    continue;
+                }
+                state.bound.as_ref().and_then(|b| b.bot_id)
+            };
             let asked = (agent.out).asking("elicitation/create", form(&self.id, &ask, None));
-            let (agent, session, bot) = (agent.clone(), self.id.clone(), bot.to_owned());
-            tokio::spawn(async move { elicit(asked, &agent, &session, &bot, &ask).await });
+            let (agent, session, lead) = (agent.clone(), self.id.clone(), (bot.to_owned(), bot_id));
+            tokio::spawn(async move { elicit(asked, &agent, &session, lead, &ask).await });
         }
     }
 }
@@ -1790,8 +1795,9 @@ fn form(session: &str, ask: &asks::Ask, call: Option<&str>) -> Value {
     params
 }
 
-/// Put a question `bot` asked to the person as a form, and send their
-/// pick to it as their answer, once, whichever window answers first.
+/// Put a question the lead asked to the person as a form, and send their
+/// pick to that lead, by its name and identity, as their answer, once,
+/// whichever window answers first.
 /// A pick by someone the client names is that person's words, as their
 /// prompts are: the lead reads it, but it answers nothing in Sonny's
 /// windows, where only the person answers.
@@ -1799,7 +1805,7 @@ async fn elicit(
     asked: oneshot::Receiver<Value>,
     agent: &Agent,
     session: &str,
-    bot: &str,
+    (bot, bot_id): (String, Option<i64>),
     ask: &asks::Ask,
 ) {
     let Some(answer) = Out::answer_to(asked).await else {
@@ -1814,6 +1820,11 @@ async fn elicit(
     if !asks::picks(ask, picked) {
         return;
     }
+    // Someone named by a name the daemon would not take: their pick is
+    // nobody's answer, least of all the person's.
+    let Ok(person) = person(&answer) else {
+        return;
+    };
     // Through the thread's connection as it is now: the one the question
     // came on may have dropped while the person chose.
     let session = (agent.sessions.lock().ok()).and_then(|s| s.get(session).cloned());
@@ -1822,8 +1833,8 @@ async fn elicit(
         return;
     };
     let words = asks::answer(ask, picked);
-    let mut submitted = json!({"bot": bot, "delivery": "steer"});
-    let _ = match person(&answer).ok().flatten() {
+    let mut submitted = json!({"bot": bot, "bot_id": bot_id, "delivery": "steer"});
+    let _ = match person {
         Some(person) => {
             submitted["prompt"] = json!(crate::stamp::other(&words));
             submitted["person"] = json!(person);
@@ -1836,7 +1847,7 @@ async fn elicit(
         }
         // A pick leaves quiet on, as a click on a card does.
         None => {
-            submitted["prompt"] = json!(crate::stamp::now(&words, bot));
+            submitted["prompt"] = json!(crate::stamp::now(&words, &bot));
             crate::answer_once(&client, &ask.id, submitted)
                 .await
                 .map(drop)
@@ -1905,12 +1916,13 @@ async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Va
         Some(outcome) if outcome["outcome"] == "selected" => "deny",
         _ => return,
     };
-    // The person the client says chose, else the client.
-    let by = answer
-        .as_ref()
-        .and_then(|answer| person(answer).ok().flatten())
-        .unwrap_or("acp")
-        .to_owned();
+    // The person the client says chose, else the client. Someone named
+    // by a name the daemon would not take chose nothing: the call waits.
+    let by = match answer.as_ref().map(person) {
+        Some(Err(_)) => return,
+        Some(Ok(Some(person))) => person.to_owned(),
+        _ => "acp".to_owned(),
+    };
     // Through the thread's connection as it is now: the one the call was
     // listed on may have dropped while the person chose.
     let Some(session) = agent

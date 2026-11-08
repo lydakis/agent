@@ -602,7 +602,20 @@ class AcpTests(ModelFixture):
                   if m.get('method') == 'elicitation/create']
         self.assertEqual(live['params']['message'].split('\n')[0], 'Which queue?')
         self.assertEqual(live['params']['toolCallId'], 'script-1')
-        thread.send({'id': live['id'], 'result': {'action': 'decline'}})
+        # A pick naming someone by a name the daemon would not take answers
+        # nothing, and is nobody's words.
+        thread.send({'id': live['id'], 'result': {'action': 'accept', 'content': {'pick': '2'},
+                                                  '_meta': {'person': 'Ana Lopez'}}})
+        hello = thread.ask('session/prompt', {'sessionId': session, 'prompt': [{'type': 'text', 'text': 'hello'}]})
+        thread.until(lambda m: m.get('id') == hello and 'method' not in m)
+        later = []
+        while True:
+            try:
+                later.append(json.dumps(self.model.requests.get_nowait()['input']))
+            except queue.Empty:
+                break
+        self.assertTrue(any('hello' in request for request in later))
+        self.assertFalse(any('script-1): Which queue' in request for request in later))
 
     def test_t3_code_threads_pick_their_lead_by_words_not_by_an_option(self):
         """T3 Code carries option picks over to the next thread it opens."""
