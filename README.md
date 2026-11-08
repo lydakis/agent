@@ -298,6 +298,9 @@ that request alone ([CLI.md](docs/CLI.md)). A model's context window, which
 sets when its agents compact, is what its provider lists, else Anthropic's published one for Claude, else
 200K; `[context_windows]` sets it by model, as `"bedrock/*openai.*" =
 1000000`, the most specific pattern winning, also lower on purpose.
+`[prices]` gives what a million tokens cost by the same patterns, and
+Sonny's `/usage` shows each model's cost and the total; nothing is
+bundled, so prices never go stale behind your back.
 
 ## How fast is it?
 

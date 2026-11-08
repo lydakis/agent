@@ -9862,7 +9862,12 @@ impl App {
             .as_millis() as i64;
         let (query, window) = view.query(now);
         let read = self.client.request("usage", query).await;
-        view.loaded(window, read.map_err(|error| error.to_string()));
+        // The sheet as the file says now, so an edit shows at the next
+        // read; a file that does not parse prices nothing.
+        let prices = agent_client::config::load()
+            .map(|config| config.prices)
+            .unwrap_or_default();
+        view.loaded(window, read.map_err(|error| error.to_string()), prices);
     }
 
     async fn reread(&mut self) {

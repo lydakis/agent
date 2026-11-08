@@ -27,6 +27,10 @@
 //! "bedrock/*openai.*" = 1000000 # every OpenAI model on Bedrock
 //! "anthropic/claude-opus-5-5" = 500000  # lower than the model's own on purpose
 //!
+//! [prices]                      # what a million tokens cost, for /usage; by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
+//! "anthropic/claude-opus-5*" = { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25 }
+//! "openai/*" = { input = 1.25, cached = 0.125, output = 10 }  # cached and cache_write are input's when unset, cache_write_1h cache_write's
+//!
 //! [judge]
 //! model = "openai/gpt-6-luna"   # who judges for the approver and the lookout
 //! effort = "low"                # a model judge's effort
@@ -151,6 +155,10 @@ pub struct Config {
     /// Unset, the provider's listing, else the daemon's own default. The
     /// agent CLI starts the daemon with them.
     pub context_windows: BTreeMap<String, u64>,
+    /// `[prices]`: what a million tokens cost on each model whose
+    /// `PROVIDER/MODEL` path a pattern matches, most specific first, as
+    /// `price` looks them up. Nothing is priced unless the person says.
+    pub prices: Vec<(String, Price)>,
     pub judge: Judge,
     pub shell_environment_policy: ShellEnvironmentPolicy,
     pub sonny: Sonny,
@@ -166,7 +174,43 @@ pub const ATTACH_WAIT_MS: u64 = 86_400_000;
 /// The longest the daemon lets an attached message wait: a year.
 pub const MAX_ATTACH_WAIT_MS: u64 = 365 * ATTACH_WAIT_MS;
 
+/// What a million tokens cost on a model, in the person's currency.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Price {
+    /// Input read fresh.
+    pub input: f64,
+    /// Input read from the provider's prompt cache.
+    pub cached: f64,
+    /// Input written to the cache for five minutes.
+    pub cache_write: f64,
+    /// Input written to the cache for an hour.
+    pub cache_write_1h: f64,
+    pub output: f64,
+}
+
+impl Price {
+    /// What a call or a sum of them cost: `input` holds the `cached` reads
+    /// and the cache writes, `written` of them, `written_1h` of those for
+    /// an hour, each at its own rate.
+    pub fn cost(&self, input: u64, cached: u64, written: u64, written_1h: u64, output: u64) -> f64 {
+        let hour = written_1h.min(written);
+        let fresh = input.saturating_sub(cached).saturating_sub(written);
+        (fresh as f64 * self.input
+            + cached as f64 * self.cached
+            + (written - hour) as f64 * self.cache_write
+            + hour as f64 * self.cache_write_1h
+            + output as f64 * self.output)
+            / 1e6
+    }
+}
+
 impl Config {
+    /// The price `[prices]` sets for `path`, `PROVIDER/MODEL`: the most
+    /// specific pattern that matches it.
+    pub fn price(&self, path: &str) -> Option<Price> {
+        price(&self.prices, path)
+    }
+
     /// The `wait_ms` a client sends with delivery attach: none when
     /// `attach_wait` is 0, which waits as long as it takes.
     pub fn attach_wait(&self) -> Option<u64> {
@@ -1352,6 +1396,28 @@ fn parse(text: &str) -> Result<Config, String> {
             }
             continue;
         }
+        if name == "prices" {
+            let models = value.as_table().ok_or("prices must be a table")?;
+            for (pattern, price) in models {
+                if !pattern.contains('/') || pattern.contains(char::is_whitespace) {
+                    return Err(format!(
+                        "prices keys are PROVIDER/MODEL, * and ? wildcards, as \"anthropic/claude-opus-5*\", not {pattern:?}"
+                    ));
+                }
+                config
+                    .prices
+                    .push((pattern.clone(), price_of(pattern, price)?));
+            }
+            // Literal paths first, then the patterns with the most literal
+            // characters, as the daemon ranks `[context_windows]`.
+            let wild = |c: char| matches!(c, '*' | '?');
+            let rank = |pattern: &str| {
+                let literal = pattern.chars().filter(|c| !wild(*c)).count();
+                (pattern.chars().any(wild), std::cmp::Reverse(literal))
+            };
+            (config.prices).sort_by(|(a, _), (b, _)| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+            continue;
+        }
         if name == "fallbacks" {
             let models = value.as_table().ok_or("fallbacks must be a table")?;
             for (model, fallback) in models {
@@ -1938,6 +2004,60 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
     Ok((sources, commons))
 }
 
+/// The price for `path`, `PROVIDER/MODEL`, in `prices` as `Config` keeps
+/// them: the first, most specific, pattern that matches it.
+pub fn price(prices: &[(String, Price)], path: &str) -> Option<Price> {
+    (prices.iter())
+        .find(|(pattern, _)| matches(pattern, path))
+        .map(|(_, price)| *price)
+}
+
+/// A `[prices]` entry: input and output, and any of cached, cache_write
+/// and cache_write_1h, each a number of 0 or more; an unset one is the
+/// rate it would fall back to without a cache.
+fn price_of(pattern: &str, value: &toml::Value) -> Result<Price, String> {
+    let shape = || {
+        format!(
+            "prices.{pattern:?} is {{ input = 5, output = 25 }} with any of cached, cache_write and cache_write_1h, each per million tokens"
+        )
+    };
+    let fields = value.as_table().ok_or_else(shape)?;
+    let mut rates: [Option<f64>; 5] = [None; 5];
+    for (key, rate) in fields {
+        let at = ["input", "cached", "cache_write", "cache_write_1h", "output"]
+            .iter()
+            .position(|known| known == key)
+            .ok_or_else(|| format!("prices.{pattern:?} has no key {key}: {}", shape()))?;
+        let rate = match rate {
+            toml::Value::Integer(n) => *n as f64,
+            toml::Value::Float(n) => *n,
+            _ => f64::NAN,
+        };
+        if !(rate.is_finite() && rate >= 0.0) {
+            return Err(format!("prices.{pattern:?}.{key} is a number of 0 or more"));
+        }
+        rates[at] = Some(rate);
+    }
+    let [
+        Some(input),
+        cached,
+        cache_write,
+        cache_write_1h,
+        Some(output),
+    ] = rates
+    else {
+        return Err(shape());
+    };
+    let cache_write = cache_write.unwrap_or(input);
+    Ok(Price {
+        input,
+        cached: cached.unwrap_or(input),
+        cache_write,
+        cache_write_1h: cache_write_1h.unwrap_or(cache_write),
+        output,
+    })
+}
+
 fn string(key: &str, value: &toml::Value) -> Result<String, String> {
     match value.as_str() {
         Some("") => Err(format!("{key} must not be empty")),
@@ -2458,6 +2578,38 @@ mod tests {
         assert_eq!(fallbacks.get("a/big").map(String::as_str), Some("a/other"));
         assert!(parse("[fallbacks]\n\"a/big\" = 1\n").is_err());
         assert!(parse("fallbacks = \"a/other\"").is_err());
+        let config = parse(
+            "[prices]\n\"anthropic/*\" = { input = 3, output = 15 }\n\
+             \"anthropic/claude-opus-5*\" = { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25 }\n",
+        )
+        .unwrap();
+        let opus = config.price("anthropic/claude-opus-5-5").unwrap();
+        assert_eq!((opus.input, opus.cached, opus.output), (5.0, 0.5, 25.0));
+        // A million fresh, a million read, a million written of which half
+        // for an hour, and a million out.
+        let cost = opus.cost(3_000_000, 1_000_000, 1_000_000, 500_000, 1_000_000);
+        assert!(
+            (cost - (5.0 + 0.5 + 3.125 + 5.0 + 25.0)).abs() < 1e-9,
+            "{cost}"
+        );
+        let other = config.price("anthropic/claude-haiku-4-5").unwrap();
+        assert_eq!(
+            (other.cached, other.cache_write, other.cache_write_1h),
+            (3.0, 3.0, 3.0),
+            "the cache's rates are input's when unset"
+        );
+        assert_eq!(config.price("openai/gpt-6"), None);
+        for wrong in [
+            "[prices]\n\"anthropic\" = { input = 1, output = 1 }\n",
+            "[prices]\n\"a/b\" = { input = 1 }\n",
+            "[prices]\n\"a/b\" = { input = 1, output = -1 }\n",
+            "[prices]\n\"a/b\" = { input = 1, output = \"$1\" }\n",
+            "[prices]\n\"a/b\" = { input = 1, output = 1, reasoning = 1 }\n",
+            "[prices]\n\"a/b\" = 5\n",
+            "prices = 5\n",
+        ] {
+            assert!(parse(wrong).is_err(), "{wrong}");
+        }
         let windows = parse("[context_windows]\n\"bedrock/*\" = 400000\n\"a/b\" = 1024\n")
             .unwrap()
             .context_windows;

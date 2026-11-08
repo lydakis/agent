@@ -2308,7 +2308,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 84;
+    pub const SCHEMA: i32 = 85;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2518,6 +2518,11 @@ impl Database {
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
             CREATE INDEX IF NOT EXISTS turns_prompt_node ON turns(prompt_node) WHERE prompt_node IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS turn_models(turn INTEGER NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+                model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(turn,model)) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS retained_turns(turn INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
                 bot TEXT NOT NULL REFERENCES bots(name));
             CREATE INDEX IF NOT EXISTS retained_turns_bot ON retained_turns(bot,turn);
@@ -11980,10 +11985,10 @@ impl Database {
     /// What the turns of the bots whose names match `name` (every bot
     /// when absent) spent, from those started at `since_ms` or later: in
     /// all, by bot (the `limit` that spent most, the rest summed as one),
-    /// by model, by the origin its client gave the turn, and, with
-    /// `bucket_ms`, in buckets of that width from
-    /// `since_ms`. A turn counts wholly where it started. One statement,
-    /// so one snapshot.
+    /// by the model that spent it, with its cache writes, by the origin its
+    /// client gave the turn, and, with `bucket_ms`, in buckets of that
+    /// width from `since_ms`. A turn counts wholly where it started. One
+    /// snapshot.
     pub fn usage(
         &self,
         name: Option<&str>,
@@ -12018,12 +12023,14 @@ impl Database {
             Some(_) => " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 || CAST(x'ff' AS TEXT)",
             None => "",
         };
-        let mut statement = self.conn.prepare_cached(&format!(
-            "SELECT t.bot,b.id,COALESCE(t.model,t.bot_model,b.provider||'/'||b.model),
-                    (t.started_ms-?1)/?2,COUNT(*),SUM(t.input_tokens),
+        // A turn counts once in each grouping but by model, where it
+        // counts under every model that spent in it.
+        let snapshot = self.conn.unchecked_transaction()?;
+        let mut statement = snapshot.prepare_cached(&format!(
+            "SELECT t.bot,b.id,(t.started_ms-?1)/?2,COUNT(*),SUM(t.input_tokens),
                     SUM(t.cached_input_tokens),SUM(t.output_tokens),t.origin
              FROM turns t JOIN bots b ON b.name=t.bot
-             WHERE t.started_ms>=?1{glob} GROUP BY 1,3,4,9"
+             WHERE t.started_ms>=?1{glob} GROUP BY 1,3,8"
         ))?;
         let width = bucket_ms.unwrap_or(i64::MAX);
         let mut rows = match name {
@@ -12034,25 +12041,50 @@ impl Database {
         };
         let mut total = Spent::default();
         let mut bots: HashMap<String, (i64, Spent)> = HashMap::new();
-        let mut models: HashMap<String, Spent> = HashMap::new();
         let mut origins: HashMap<Option<String>, Spent> = HashMap::new();
         let mut series: BTreeMap<i64, Spent> = BTreeMap::new();
         while let Some(r) = rows.next()? {
             let spent = Spent {
-                turns: r.get(4)?,
-                input_tokens: r.get(5)?,
-                cached_input_tokens: r.get(6)?,
-                output_tokens: r.get(7)?,
+                turns: r.get(3)?,
+                input_tokens: r.get(4)?,
+                cached_input_tokens: r.get(5)?,
+                output_tokens: r.get(6)?,
             };
             total.add(&spent);
             let bot = bots.entry(r.get(0)?).or_default();
             bot.0 = r.get(1)?;
             bot.1.add(&spent);
-            models.entry(r.get(2)?).or_default().add(&spent);
-            origins.entry(r.get(8)?).or_default().add(&spent);
+            origins.entry(r.get(7)?).or_default().add(&spent);
             if bucket_ms.is_some() {
-                series.entry(r.get(3)?).or_default().add(&spent);
+                series.entry(r.get(2)?).or_default().add(&spent);
             }
+        }
+        drop(rows);
+        let mut statement = snapshot.prepare_cached(&format!(
+            "SELECT m.model,COUNT(*),SUM(m.input_tokens),SUM(m.cached_input_tokens),
+                    SUM(m.output_tokens),SUM(m.cache_write_tokens),SUM(m.cache_write_1h_tokens)
+             FROM turns t JOIN turn_models m ON m.turn=t.id
+             WHERE t.started_ms>=?1{glob} GROUP BY 1"
+        ))?;
+        let mut rows = match name {
+            Some(pattern) => statement.query(params![
+                since_ms,
+                None::<i64>,
+                pattern,
+                glob_prefix(pattern)
+            ])?,
+            None => statement.query(params![since_ms])?,
+        };
+        // Each model's spend, and its cache writes: 5-minute and hour.
+        let mut models: Vec<(String, Spent, i64, i64)> = Vec::new();
+        while let Some(r) = rows.next()? {
+            let spent = Spent {
+                turns: r.get(1)?,
+                input_tokens: r.get(2)?,
+                cached_input_tokens: r.get(3)?,
+                output_tokens: r.get(4)?,
+            };
+            models.push((r.get(0)?, spent, r.get(5)?, r.get(6)?));
         }
         let mut bots: Vec<(String, i64, Spent)> = bots
             .into_iter()
@@ -12064,7 +12096,6 @@ impl Database {
         for (_, _, spent) in bots.drain(limit.min(bots.len())..) {
             others.add(&spent);
         }
-        let mut models: Vec<(String, Spent)> = models.into_iter().collect();
         models.sort_by(|a, b| b.1.tokens().cmp(&a.1.tokens()).then_with(|| a.0.cmp(&b.0)));
         let mut origins: Vec<(Option<String>, Spent)> = origins.into_iter().collect();
         origins.sort_by(|a, b| b.1.tokens().cmp(&a.1.tokens()).then_with(|| a.0.cmp(&b.0)));
@@ -12090,9 +12121,11 @@ impl Database {
         };
         out["models"] = models
             .iter()
-            .map(|(model, spent)| {
+            .map(|(model, spent, written, hourly)| {
                 let mut row = spent.json();
                 row["model"] = json!(model);
+                row["cache_write_tokens"] = json!(written);
+                row["cache_write_1h_tokens"] = json!(hourly);
                 row
             })
             .collect();
@@ -12359,6 +12392,7 @@ fn record_usage_for(
         data["purpose"] = json!(purpose);
     }
     let cursor = event(conn, &bot.name, Some(turn), "usage", data.clone())?;
+    spent_by_model(conn, turn, usage)?;
     conn.prepare_cached(
         "UPDATE turns SET input_tokens=input_tokens+?,output_tokens=output_tokens+?,
              cached_input_tokens=cached_input_tokens+?,work=work+? WHERE id=?",
@@ -12383,6 +12417,55 @@ fn record_usage_for(
         bot.name
     ])?;
     Ok(entry(cursor, &bot.name, Some(turn), "usage", data))
+}
+
+/// File a call's spend under the model that spent it: the turn's own,
+/// unless the call names its attempts, as a summary, a refused request's
+/// fallback, or a provider-side fallback does. An attempt that names no
+/// provider binding ran on the turn's. One keyed upsert per model, in the
+/// transaction that records the call.
+fn spent_by_model(conn: &Connection, turn: i64, usage: &Usage) -> Result<()> {
+    let mut upsert = conn.prepare_cached(
+        "INSERT INTO turn_models(turn,model,input_tokens,cached_input_tokens,
+             cache_write_tokens,cache_write_1h_tokens,output_tokens)
+         SELECT id,CASE WHEN ?3 IS NULL THEN model
+                  ELSE COALESCE(?2,substr(model,1,instr(model,'/')-1))||'/'||?3 END,
+                ?4,?5,?6,?7,?8
+         FROM (SELECT t.id,COALESCE(t.model,t.bot_model,b.provider||'/'||b.model) AS model
+               FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=?1)
+         WHERE true
+         ON CONFLICT(turn,model) DO UPDATE SET
+             input_tokens=input_tokens+excluded.input_tokens,
+             cached_input_tokens=cached_input_tokens+excluded.cached_input_tokens,
+             cache_write_tokens=cache_write_tokens+excluded.cache_write_tokens,
+             cache_write_1h_tokens=cache_write_1h_tokens+excluded.cache_write_1h_tokens,
+             output_tokens=output_tokens+excluded.output_tokens",
+    )?;
+    if usage.models.is_empty() {
+        upsert.execute(params![
+            turn,
+            None::<&str>,
+            None::<&str>,
+            usage.input_tokens as i64,
+            usage.cached_input_tokens as i64,
+            usage.cache_write_tokens as i64,
+            usage.cache_write_1h_tokens as i64,
+            usage.output_tokens as i64
+        ])?;
+    }
+    for attempt in &usage.models {
+        upsert.execute(params![
+            turn,
+            attempt.provider.as_deref(),
+            attempt.model.as_str(),
+            attempt.input_tokens as i64,
+            attempt.cached_input_tokens as i64,
+            attempt.cache_write_tokens as i64,
+            attempt.cache_write_1h_tokens as i64,
+            attempt.output_tokens as i64
+        ])?;
+    }
+    Ok(())
 }
 
 fn epoch_ms() -> i64 {
@@ -14562,6 +14645,23 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             "UPDATE bots SET settings=json_remove(settings,'$.keep_warm')
              WHERE json_extract(settings,'$.keep_warm') IS NOT NULL",
             [],
+        )?;
+    }
+    // Schema 85: a turn's spend is kept by the model that spent it, with
+    // its cache writes. Earlier turns kept one total and no writes, so each
+    // is filed whole under its own model, as `usage` counted it before.
+    if from < 85 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS turn_models(turn INTEGER NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+                model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(turn,model)) WITHOUT ROWID;
+             INSERT OR IGNORE INTO turn_models(turn,model,input_tokens,cached_input_tokens,output_tokens)
+               SELECT t.id,COALESCE(t.model,t.bot_model,b.provider||'/'||b.model),
+                      t.input_tokens,t.cached_input_tokens,t.output_tokens
+               FROM turns t JOIN bots b ON b.name=t.bot
+               WHERE t.input_tokens>0 OR t.output_tokens>0;",
         )?;
     }
     Ok(())
