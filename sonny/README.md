@@ -494,6 +494,15 @@ by an id that names the lead, its identity and its store's lineage
 made again under its name, or a lead of another store, is not the one
 listed, and is refused.
 
+A task the lead starts is a session too. The `start_task` call that started
+it is updated with the task's id, title and folder in its
+`_meta.task` (`{"sessionId": "calc.fix#9@…", "title": "calc.fix", "cwd": …}`),
+and `session/resume` with that id opens the task, where prompts go to it,
+not to the lead. `session/list` with a folder lists each of its leads
+followed by the tasks it started, each task naming its lead's id in
+`_meta.lead`; listed without one, it names leads only. No other bot opens
+by an id: one no lead started is refused.
+
 A client several people write through names who wrote each prompt in its
 `_meta.person`, a name as the daemon takes one (1 to 128 of
 `A-Z a-z 0-9 . _ -`, so `ana.lopez`, not `Ana Lopez`; another is refused).
