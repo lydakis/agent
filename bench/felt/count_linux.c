@@ -22,8 +22,8 @@ __attribute__((constructor)) static void start(void){const char*d=getenv("FELT_L
  char a[900]="";FILE*f=fopen("/proc/self/cmdline","r");if(f){size_t n=fread(a,1,800,f);fclose(f);for(size_t i=0;i<n;i++)if(!a[i])a[i]=' ';a[n]=0;}
  char pp[32];snprintf(pp,sizeof pp,"%d",getppid());emit("start",pp,a);}
 static void argv_line(char*const argv[],char*o,size_t s){o[0]=0;for(int i=0;argv&&argv[i]&&i<6;i++){strncat(o,argv[i],s-strlen(o)-2);strcat(o," ");}}
-int posix_spawn(pid_t*pid,const char*path,const posix_spawn_file_actions_t*fa,const posix_spawnattr_t*at,char*const argv[],char*const envp[]){REAL(posix_spawn);char a[600];argv_line(argv,a,sizeof a);emit("spawn",path,a);return real_posix_spawn(pid,path,fa,at,argv,envp);}
-int posix_spawnp(pid_t*pid,const char*path,const posix_spawn_file_actions_t*fa,const posix_spawnattr_t*at,char*const argv[],char*const envp[]){REAL(posix_spawnp);char a[600];argv_line(argv,a,sizeof a);emit("spawn",path,a);return real_posix_spawnp(pid,path,fa,at,argv,envp);}
+int posix_spawn(pid_t*pid,const char*path,const posix_spawn_file_actions_t*fa,const posix_spawnattr_t*at,char*const argv[],char*const envp[]){REAL(posix_spawn);char a[600];argv_line(argv,a,sizeof a);int rc=real_posix_spawn(pid,path,fa,at,argv,envp);emit(rc?"spawnfail":"spawn",path,a);return rc;}
+int posix_spawnp(pid_t*pid,const char*path,const posix_spawn_file_actions_t*fa,const posix_spawnattr_t*at,char*const argv[],char*const envp[]){REAL(posix_spawnp);char a[600];argv_line(argv,a,sizeof a);int rc=real_posix_spawnp(pid,path,fa,at,argv,envp);emit(rc?"spawnfail":"spawn",path,a);return rc;}
 int execve(const char*path,char*const argv[],char*const envp[]){REAL(execve);char a[600];argv_line(argv,a,sizeof a);emit("exec",path,a);return real_execve(path,argv,envp);}
 pid_t fork(void){REAL(fork);emit("fork","","");return real_fork();}
 int open(const char*p,int fl,...){REAL(open);mode_t m=0;if(fl&O_CREAT){va_list ap;va_start(ap,fl);m=va_arg(ap,int);va_end(ap);}emit((fl&(O_WRONLY|O_RDWR))?"openw":"open",p,"");return real_open(p,fl,m);}

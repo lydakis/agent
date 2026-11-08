@@ -71,16 +71,18 @@ static void argv_line(char *const argv[], char *out, size_t size) {
 static int my_posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *fa,
                           const posix_spawnattr_t *at, char *const argv[], char *const envp[]) {
   char a[600]; argv_line(argv, a, sizeof a);
-  emit("spawn", path, a);
-  return posix_spawn(pid, path, fa, at, argv, envp);
+  int rc = posix_spawn(pid, path, fa, at, argv, envp);
+  emit(rc == 0 ? "spawn" : "spawnfail", path, a);
+  return rc;
 }
 INTERPOSE(my_posix_spawn, posix_spawn)
 
 static int my_posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_actions_t *fa,
                            const posix_spawnattr_t *at, char *const argv[], char *const envp[]) {
   char a[600]; argv_line(argv, a, sizeof a);
-  emit("spawn", file, a);
-  return posix_spawnp(pid, file, fa, at, argv, envp);
+  int rc = posix_spawnp(pid, file, fa, at, argv, envp);
+  emit(rc == 0 ? "spawn" : "spawnfail", file, a);
+  return rc;
 }
 INTERPOSE(my_posix_spawnp, posix_spawnp)
 

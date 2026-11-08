@@ -143,6 +143,8 @@ def main():
     parser.add_argument('--phases', default='idle,busy,fleet,source')
     parser.add_argument('--repo', default='.', help='checkout holding bench/ (the synthetic model)')
     args = parser.parse_args()
+    for name in ('agent', 'sonny', 'dylib', 'repo'):
+        setattr(args, name, str(Path(getattr(args, name)).resolve()))
 
     out = Path(args.out).resolve()
     if out.exists():
@@ -169,6 +171,32 @@ def main():
                                f'openai=responses,{url}', '--socket', str(sock)],
                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                               stderr=open(out / 'daemon.err', 'w'), env=env, start_new_session=True)
+    try:
+        run(args, out, logs, home, ws, store, sock, env)
+    finally:
+        for proc in (daemon, model):
+            proc.terminate()
+        let_go_jobs(home)
+    report(out)
+
+
+def let_go_jobs(home):
+    """A Sonny on a scratch HOME still schedules into the person's own
+    launchd domain (or systemd user manager): let go of every job whose
+    file it wrote under the scratch HOME, and of nothing else."""
+    if sys.platform == 'darwin':
+        for plist in (home / 'Library' / 'LaunchAgents').glob('*.plist'):
+            subprocess.run(['launchctl', 'bootout', f'gui/{os.getuid()}/{plist.stem}'],
+                           capture_output=True)
+            print(f'let go of launchd job {plist.stem}')
+    else:
+        units = home / '.config' / 'systemd' / 'user'
+        for unit in units.glob('*.service') if units.is_dir() else []:
+            subprocess.run(['systemctl', '--user', 'disable', '--now', unit.name], capture_output=True)
+            print(f'let go of systemd unit {unit.name}')
+
+
+def run(args, out, logs, home, ws, store, sock, env):
     deadline = time.monotonic() + 15
     while True:
         try:
@@ -258,10 +286,7 @@ def main():
         time.sleep(3)  # let the last turn's echoes settle between phases
 
     window.close()
-    daemon.terminate()
-    model.terminate()
     (out / 'phases.json').write_text(json.dumps(phases, indent=1))
-    report(out)
 
 
 def label(start_args):
@@ -303,8 +328,8 @@ def report(out):
             for ms, kind, a, b in calls:
                 if phase['from_ms'] <= ms < phase['to_ms']:
                     by_label[who][kind] += 1
-                    if kind in ('spawn', 'exec', 'fork'):
-                        spawned[f'{who}: {b or a}'.strip()] += 1
+                    if kind in ('spawn', 'spawnfail', 'exec', 'fork'):
+                        spawned[f'{who} {kind}: {b or a}'.strip()] += 1
                     else:
                         paths[(who, kind)][a] += 1
         cpu = collections.Counter()
