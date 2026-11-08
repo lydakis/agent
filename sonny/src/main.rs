@@ -20448,7 +20448,7 @@ mod tests {
         assert_eq!(
             rows[2..],
             [
-                "↳ sent to calc.add, calc.neg, calc.div, calc.mul, removed calc.add ▸",
+                "↳ sent to calc.add, calc.neg, calc.div, calc.mul, cleaned up calc.add ▸",
                 "",
                 "• Messaged those.",
                 "",
