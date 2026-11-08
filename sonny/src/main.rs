@@ -17805,6 +17805,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_question_read_cut_short_after_its_listing_is_never_kept() {
+        // The listing comes back, then reading its items fails: what was
+        // read may lack the open question, so it is kept for none, and the
+        // next refresh reads again.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let broken = Arc::new(AtomicBool::new(true));
+        let failing = broken.clone();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => json!({"bots": [{"name": "shop.t1", "bot_id": 1, "head": 1,
+                "status": "completed", "running_turn": null,
+                "last": {"turn": 1, "status": "completed"}}], "next_after": null}),
+                    "history_nodes" => {
+                        json!({"nodes": [{"node": 2, "turn": 1}, {"node": 1, "turn": 1}],
+                            "next_from": null})
+                    }
+                    "history_items" if failing.load(Ordering::SeqCst) => {
+                        json!({"error": "storage_error", "detail": "a failed read"})
+                    }
+                    "history_items" => json!({"items": [
+                        {"node": 2, "item": {"type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": "done"}]}},
+                        {"node": 1, "item": {"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": "go"}]}}]}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.status_rows().await.unwrap();
+        assert!(!app.asks_seen.contains_key("shop.t1"));
+        broken.store(false, Ordering::SeqCst);
+        app.status_rows().await.unwrap();
+        assert!(app.asks_seen.contains_key("shop.t1"));
+    }
+
+    #[tokio::test]
     async fn a_lead_window_reads_its_agents_histories_before_status_opens() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let histories = Arc::new(AtomicUsize::new(0));

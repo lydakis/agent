@@ -102,10 +102,12 @@ const SCANNED: usize = 400;
 const READ: usize = 100;
 
 /// Read `bot`'s newest history for the question it has open, and whether
-/// its turn `last`, or with none its newest, resolved it; none when the history could not be listed,
-/// what a later read gave up on read as far as it came. Newest first, and
-/// no further than the person's last words of their own: past those every
-/// question before is set aside.
+/// its turn `last`, or with none its newest, resolved it: newest first, and
+/// no further than the person's last words of their own, past which every
+/// question before is set aside. None unless every read it needed came
+/// back whole: a history that could not be listed, or items a read gave up
+/// on, may hold the open question or the mark, so what was read is no
+/// answer, and nobody keeps it as one.
 pub async fn scan(client: &Client, bot: &str, last: Option<i64>) -> Option<Seen> {
     let page = client
         .request("history_nodes", json!({"bot": bot, "limit": SCANNED}))
@@ -145,11 +147,11 @@ pub async fn scan(client: &Client, bot: &str, last: Option<i64>) -> Option<Seen>
             }
             fresh.extend(kept.into_iter().rev());
         }
+        if short {
+            return None;
+        }
         let past = fresh.iter().any(moves_on);
         items.extend(fresh);
-        if short {
-            break;
-        }
         // The person wrote past every question older than this, and the
         // last turn, newer, is read.
         if past
@@ -235,22 +237,24 @@ const LAST_TURN: usize = 64;
 
 /// Whether `bot`'s turn `turn`, its newest, marked it done, as its history
 /// says before any window kept the mark: read from its newest nodes of
-/// that turn. False when the history can't be read.
-pub async fn resolved_turn(client: &Client, bot: &str, turn: i64) -> bool {
+/// that turn. None when the history can't be read whole: not knowing is
+/// not "not done".
+pub async fn resolved_turn(client: &Client, bot: &str, turn: i64) -> Option<bool> {
     let asked = json!({"bot": bot, "limit": LAST_TURN});
-    let Ok(page) = client.request("history_nodes", asked).await else {
-        return false;
-    };
+    let page = client.request("history_nodes", asked).await.ok()?;
     let nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
         .filter(|n| n["turn"].as_i64() == Some(turn))
         .filter_map(|n| n["node"].as_i64())
         .collect();
     if nodes.is_empty() {
-        return false;
+        return Some(false);
     }
-    let (read, _) = items(client, bot, &nodes).await;
+    let (read, short) = items(client, bot, &nodes).await;
+    if short {
+        return None;
+    }
     let read: Vec<Value> = read.into_iter().map(|(_, item)| item).collect();
-    resolved_itself(&read, bot)
+    Some(resolved_itself(&read, bot))
 }
 
 /// Whether `items`, one turn of `bot`'s, hold a `mark_done` call of its
