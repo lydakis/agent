@@ -4,6 +4,7 @@ import os
 import queue
 import sqlite3
 import threading
+import time
 from contextlib import closing
 from unittest import skipUnless
 from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
@@ -194,7 +195,11 @@ class CompactionTests(ModelFixture):
             current = client.request('inspect', bot='Bob')['result']['compaction']
             self.assertNotEqual(current, previous)
             previous = current
-        requests = self.requests()
+        # The last turn's summary is written as it ends, after it reports.
+        requests, deadline = self.requests(), time.monotonic() + 5
+        while sum(is_summary(r) for r in requests) < 5 and time.monotonic() < deadline:
+            time.sleep(.01)
+            requests += self.requests()
         self.assertEqual(sum(is_summary(r) for r in requests), 5)
         self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':'), ensure_ascii=False).encode()) - 2
                             <= 4096 for r in requests))
@@ -243,6 +248,8 @@ class CompactionTests(ModelFixture):
         self.create(client)
         for n in range(3):
             self.assertEqual(self.run_turn(client, 'Bob', n, str(n) * 500)['data']['status'], 'completed')
+        # The last turn ended past the threshold and summarized as it ended.
+        client.summarized('Bob')
         bot = client.request('inspect', bot='Bob')['result']
         self.assertIsNone(bot['compaction'])
         self.assertEqual(bot['tokens_used'], 440)  # three answers plus the rejected summary
@@ -255,6 +262,8 @@ class CompactionTests(ModelFixture):
         self.create(client)
         for n in range(3):
             self.assertEqual(self.run_turn(client, 'Bob', n, str(n) * 500)['data']['status'], 'completed')
+        # The last turn ended past the threshold and summarized as it ended.
+        client.summarized('Bob')
         bot = client.request('inspect', bot='Bob')['result']
         self.assertIsNone(bot['compaction'])
         self.assertEqual(bot['tokens_used'], 440)
@@ -357,8 +366,10 @@ class CompactionTests(ModelFixture):
     def test_parked_summary_resumes_as_a_summary_after_restart(self):
         client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
         self.create(client)
+        # Under the threshold as these end, so the next prompt crosses it
+        # at that turn's start.
         for n in range(2):
-            self.run_turn(client, 'Bob', n, str(n) * 500)
+            self.run_turn(client, 'Bob', n, str(n) * 300)
         self.requests()
         self.model.compaction_refusals = 1
         turn = client.request('submit', bot='Bob', request_id='next', prompt='2' * 500)['result']['turn']
@@ -381,7 +392,7 @@ class CompactionTests(ModelFixture):
                 self.addCleanup(client.close)
                 self.create(client)
                 for n in range(2):
-                    self.run_turn(client, 'Bob', n, str(n) * 500)
+                    self.run_turn(client, 'Bob', n, str(n) * 300)
                 self.requests()
                 self.model.compaction_refusals = 64
                 turn = client.request('submit', bot='Bob', request_id='next', prompt='2' * 500)['result']['turn']
@@ -489,10 +500,21 @@ class CompactionTests(ModelFixture):
         self.assertEqual(db.execute('select count(*) from compactions').fetchone()[0], 0)
         for bot in ('Bob', 'Alice'):
             self.assertEqual(self.run_turn(client, bot, 'next', 'y' * 1500)['data']['status'], 'completed')
+            # Each summary leaves the view past the threshold, so the turn
+            # summarizes again as it ends.
+            client.summarized(bot)
+        firsts = []
+        for bot in ('Bob', 'Alice'):
+            events = client.request('events', bot=bot, after=0, limit=256)['result']['events']
+            compacted = [e['data'] for e in events if e['event'] == 'compacted']
+            self.assertEqual(len(compacted), 2)
+            self.assertNotIn('after_turn', compacted[0]['request'])
+            self.assertTrue(compacted[1]['request']['after_turn'])
+            firsts.append(compacted[0])
         rows = db.execute('select node,cut from compactions order by node').fetchall()
-        self.assertEqual(len(rows), 2)
-        self.assertNotEqual(rows[0][0], rows[1][0])
-        self.assertEqual(rows[0][1], rows[1][1])
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(len({node for node, _ in rows}), 4)
+        self.assertEqual(firsts[0]['cut'], firsts[1]['cut'])
 
     def test_failed_summaries_do_not_grow_requests_with_the_transcript(self):
         self.model.reject_compaction = True
@@ -613,6 +635,7 @@ class CompactionTests(ModelFixture):
         self.create(client)
         for n in range(3):
             self.run_turn(client, 'Bob', n, str(n) * 500)
+        client.summarized('Bob')
         # A larger budget prevents another compaction while testing pure append.
         # Settings are fixed at creation, so the test edits the store.
         client.close()
@@ -1108,9 +1131,11 @@ class SummaryCopyTests(ModelFixture):
         client = self.start()
         for n in range(3):
             self.turn(client, str(n), str(n) * 500)
+        client.summarized('Bob')
         requests = self.requests()
         copy, own = [n for n, r in enumerate(requests) if is_summary(r)]
-        self.assertEqual(own, copy + 1)
+        # Started as a turn ended, it may go beside the next turn's call.
+        self.assertGreater(own, copy)
         self.assertEqual(self.copies(requests[:own]), [copy])
         self.assertEqual((requests[own]['tools'], requests[own]['instructions']), ([], 'Summarize.'))
         bot = client.request('inspect', bot='Bob')['result']
@@ -1133,6 +1158,8 @@ class SummaryCopyTests(ModelFixture):
             turn = client.request('submit', bot='Bob', request_id=str(n), prompt=str(n) * 500,
                                   model='openai/synthetic-large')['result']['turn']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # The last turn summarizes as it ends, on the bot's summarizer.
+        client.summarized('Bob')
         requests = self.requests()
         index, = [n for n, r in enumerate(requests) if is_summary(r)]
         summary = requests[index]
@@ -1152,9 +1179,11 @@ class SummaryCopyTests(ModelFixture):
         # model, which the summarizer's cache never saw.
         self.model.models = ('synthetic-model', 'synthetic-large')
         client = self.start()
-        for n in range(3):
+        # Under the threshold until the last prompt, so that turn summarizes
+        # as it starts, before any call of its own.
+        for n, size in enumerate((300, 300, 700)):
             model = {'model': 'openai/synthetic-large'} if n < 2 else {}
-            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=str(n) * 500,
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=str(n) * size,
                                   **model)['result']['turn']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = self.requests()
@@ -1233,6 +1262,7 @@ class SummaryCopyTests(ModelFixture):
         client = self.start(compaction_model='openai/synthetic-small')
         for n in range(3):
             self.turn(client, str(n), str(n) * 500)
+        client.summarized('Bob')
         summary, = [r for r in self.requests() if is_summary(r)]
         self.assertEqual((summary['model'], summary['instructions'], summary['tools']),
                          ('synthetic-small', 'Summarize.', []))

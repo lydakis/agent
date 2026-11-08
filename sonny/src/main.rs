@@ -9479,6 +9479,14 @@ impl App {
                     }
                 }
             }
+            // A summary the last turn started as it ended streams, and
+            // retries, while the bot waits or the next turn runs: it is
+            // neither's step, and the call streaming now is not retrying.
+            "compaction_text_delta" | "compaction_thinking_delta" | "retry"
+                if self
+                    .running
+                    .as_ref()
+                    .is_none_or(|running| Some(running.turn) != turn) => {}
             "compaction_text_delta" | "compaction_thinking_delta" => {
                 // Words that ended before it are a step: compaction comes
                 // only before another model call. Held for what follows,
@@ -22039,6 +22047,19 @@ mod tests {
             "{written:?}"
         );
         assert_eq!(app.running.as_ref().unwrap().phase, "Compacting");
+        // One the last turn started as it ended leaves this turn's words
+        // and status as they are.
+        app.running.as_mut().unwrap().phase = "Working".into();
+        app.daemon(said("Still reading.")).await;
+        let after =
+            json!({"event": "compaction_text_delta", "bot": "b", "turn": 0, "text": "Earlier"});
+        app.daemon(after).await;
+        let retried = json!({"event": "retry", "bot": "b", "turn": 0,
+            "data": {"attempt": 1, "error": "provider_unavailable", "delay_ms": 500}});
+        app.daemon(retried).await;
+        assert!(app.live.is_some());
+        assert_eq!(app.said, "Still reading.");
+        assert_eq!(app.running.as_ref().unwrap().phase, "Working");
     }
 
     /// A stand-in daemon holding a project: its lead, a task whose turn

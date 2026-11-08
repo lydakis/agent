@@ -5,7 +5,8 @@ server's `release` event is set, which lets a screen park many bots on one
 anchor turn. `shell:` prompts return one shell tool call and then a reply; `wait:` prompts
 return one wait tool call on the given handles and then a reply; `call:NAME`
 prompts call the tool NAME with no arguments and then reply; `delay:N`
-prompts reply after N milliseconds so many turns overlap; `limited:` prompts
+prompts reply after N milliseconds so many turns overlap (and a summary
+after the server's `summary_delay` seconds); `limited:` prompts
 are refused with 429 and a one-second Retry-After every time. A judge's
 round from `sonny approver` gets every question answered 0.05.
 No history validation: the daemon's request bodies are counted, not checked.
@@ -65,6 +66,13 @@ class Model(http.server.BaseHTTPRequestHandler):
                 return
         held = user.startswith('hold:')
         delay = float(user[6:]) / 1000 if user.startswith('delay:') else 0
+        # A summary takes the server's `summary_delay`, as a long one on a
+        # real provider takes its time; each request's arrival is noted.
+        summary = user.startswith('[compaction request]')
+        if summary:
+            delay = getattr(self.server, 'summary_delay', 0)
+        if hasattr(self.server, 'arrivals'):
+            self.server.arrivals.append((time.monotonic(), summary, user))
         if user.startswith('shell:') and last.get('type') != 'function_call_output':
             text, output = '', [{'type': 'function_call', 'name': 'shell', 'call_id': 'sh-1',
                                  'arguments': json.dumps({'command': user[6:], 'timeout_ms': 5000})}]
