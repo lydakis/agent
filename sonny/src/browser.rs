@@ -465,6 +465,9 @@ struct Checked {
 struct Launch {
     confirm: String,
     profile: Option<String>,
+    /// Whose share of Sonny's processes its commands take: the agent's,
+    /// as its other tools' are, not its session's.
+    owner: String,
 }
 
 /// Each session's lock, held through a call, with the confirmations its
@@ -1239,9 +1242,9 @@ async fn run(session: &str, args: &[String], launch: &Launch) -> Ran {
         None => &mut command,
     };
     // A place among the processes Sonny runs for agents, as a tool call's
-    // `sonny tool` takes one, held while agent-browser runs: an agent's
-    // own share, its calls one at a time already.
-    let _place = crate::budget::processes().admit(session).await;
+    // `sonny tool` takes one, held while agent-browser runs, from the
+    // agent's own share.
+    let _place = crate::budget::processes().admit(&launch.owner).await;
     match command.output().await {
         Ok(out) => {
             let (stdout, stderr) = (
@@ -1318,7 +1321,11 @@ pub async fn answer(
         ),
         call["bot"].as_str().unwrap_or_default(),
     );
-    drive(&lines, &reach, &session, None, &steps).await
+    // Its share is the one its ordinary tools take (`served::answer`):
+    // a side copy's, its source's.
+    let bot = call["bot"].as_str().unwrap_or_default();
+    let owner = crate::side_copy(&record).unwrap_or(bot);
+    drive(&lines, &reach, &session, owner, None, &steps).await
 }
 
 /// Answer a `browser` call the agent `bot` of the machine `from` made over
@@ -1346,7 +1353,17 @@ pub async fn lent(
         &format!("link\0{from}\0{store}\0{}", payload["bot_id"]),
         bot,
     );
-    drive(&lines, &Reach::lent(), &session, Some(profile), steps).await
+    // An agent of another machine: its share here is its session's, the
+    // only place it takes here.
+    drive(
+        &lines,
+        &Reach::lent(),
+        &session,
+        &session,
+        Some(profile),
+        steps,
+    )
+    .await
 }
 
 /// A call's command lines, 1 to `COMMANDS` of them.
@@ -1382,6 +1399,7 @@ async fn drive(
     lines: &[String],
     reach: &Reach,
     session: &str,
+    owner: &str,
     profile: Option<&str>,
     steps: &crate::exec::Steps,
 ) -> Result<Value, (&'static str, String)> {
@@ -1402,6 +1420,7 @@ async fn drive(
     let launch = Launch {
         confirm: confirm.clone(),
         profile: profile.map(str::to_owned),
+        owner: owner.to_owned(),
     };
     // One call at a time in a session, through its confirmations:
     // agent-browser holds one pending action a session and confirms it
