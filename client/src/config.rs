@@ -52,6 +52,7 @@
 //! margin_note_lines = 20         # the most lines a note's Markdown runs to, 12 by default; past it the note is refused
 //! agent_opens = "beside"        # a click on an agent's name: "tab", the default, or "beside"
 //! suggest = false               # no guess at the next message, on by default
+//! suggest_ideas = false         # a guess never offers an idea or a tip in its place, on by default
 //! needs_check = false           # no copy says whether a reply waits on you, on by default
 //! task_done_check = 24          # hours a task sits idle before a copy says whether it is done, 8 by default; 0 never
 //! commons = false               # agents go without the commons, on by default
@@ -554,6 +555,10 @@ pub struct Sonny {
     /// Whether a copy of the agent guesses the person's next message after
     /// a turn they started, shown in the empty composer for Tab to take.
     pub suggest: bool,
+    /// Whether that guess, when no next message is obvious, may offer a
+    /// labeled idea about the work or a tip for one of Sonny's commands
+    /// or keys instead of nothing.
+    pub suggest_ideas: bool,
     /// Whether, once an agent's turn ends with words and no question open,
     /// a copy of it says whether they wait on the person.
     pub needs_check: bool,
@@ -805,6 +810,7 @@ impl Default for Sonny {
             mcp_servers: BTreeMap::new(),
             side_chat: SideChat::default(),
             suggest: true,
+            suggest_ideas: true,
             needs_check: true,
             task_done_check: 8,
             commons: true,
@@ -1475,6 +1481,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "margin_note_lines",
                 "agent_opens",
                 "suggest",
+                "suggest_ideas",
                 "needs_check",
                 "task_done_check",
                 "start_at_boot",
@@ -1560,6 +1567,7 @@ fn parse(text: &str) -> Result<Config, String> {
             if let Some(switch) = match key.as_str() {
                 "chime" => Some(&mut config.sonny.chime),
                 "suggest" => Some(&mut config.sonny.suggest),
+                "suggest_ideas" => Some(&mut config.sonny.suggest_ideas),
                 "needs_check" => Some(&mut config.sonny.needs_check),
                 "commons" => Some(&mut config.sonny.commons),
                 "steps" => Some(&mut config.sonny.steps),
@@ -2497,6 +2505,13 @@ mod tests {
         assert_eq!(roles.sonny.task_profile.as_deref(), Some("worker"));
         assert!(config.sonny.suggest);
         assert!(!parse("[sonny]\nsuggest = false").unwrap().sonny.suggest);
+        assert!(config.sonny.suggest_ideas);
+        assert!(
+            !parse("[sonny]\nsuggest_ideas = false")
+                .unwrap()
+                .sonny
+                .suggest_ideas
+        );
         assert!(config.sonny.commons);
         assert!(!parse("[sonny]\ncommons = false").unwrap().sonny.commons);
         let sonny = parse("[sonny]\ncommons_invites = 0\ncommons_invite_tokens = 500")

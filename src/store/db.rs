@@ -29,6 +29,19 @@ const HISTORY_PAGE_BYTES: usize = 256 * 1024;
 /// steer's: a message's pictures may be 5 MiB once decoded.
 const STEER_BATCH_PICTURE_BYTES: usize = 8 * 1024 * 1024;
 
+/// How a bot's newest turn that counts ended: one that ran, or one that
+/// failed before it started. A message steered into a running turn, one
+/// riding the next call, and one cancelled while it waited in line never
+/// count: nothing of theirs ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Ended {
+    pub turn: i64,
+    pub status: String,
+    pub started_ms: Option<i64>,
+    pub finished_ms: Option<i64>,
+    /// The code it failed or was interrupted with, if any.
+    pub error: Option<String>,
+}
 #[derive(Debug, Clone, Serialize)]
 pub struct Bot {
     pub name: String,
@@ -64,6 +77,13 @@ pub struct Bot {
     pub workspace: Option<String>,
     pub status: String,
     pub running_turn: Option<i64>,
+    /// When its running turn started; `None` while none runs.
+    pub started_ms: Option<i64>,
+    /// What its turn waits on while the bot is `waiting`, `paced` or
+    /// `held`: what that turn's own `waiting_on` says. `None` otherwise.
+    pub waiting_on: Option<Box<serde_json::value::RawValue>>,
+    /// Its newest turn that ended having run, or failed before it started.
+    pub last: Option<Ended>,
     pub provider: String,
     pub family: String,
     pub model: String,
@@ -2378,7 +2398,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 87;
+    pub const SCHEMA: i32 = 88;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2552,7 +2572,9 @@ impl Database {
                 expire_ms INTEGER, expires_at INTEGER,
                 sent_bytes INTEGER, sent_tokens INTEGER, compact_asked INTEGER NOT NULL DEFAULT 0,
                 declared TEXT, work INTEGER NOT NULL DEFAULT 0, work_read INTEGER,
-                budget_counts TEXT, depth INTEGER NOT NULL DEFAULT 0);
+                budget_counts TEXT, depth INTEGER NOT NULL DEFAULT 0,
+                started_ms INTEGER, waiting_on TEXT, last_turn INTEGER, last_status TEXT,
+                last_started_ms INTEGER, last_finished_ms INTEGER, last_error TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -3041,6 +3063,9 @@ impl Database {
             workspace: r.get(2)?,
             status: r.get(3)?,
             running_turn: r.get(4)?,
+            started_ms: r.get(45)?,
+            waiting_on: raw_json(r, 46)?,
+            last: ended(r, 47)?,
             provider: r.get(5)?,
             family: r.get(6)?,
             model: r.get(7)?,
@@ -3128,7 +3153,7 @@ impl Database {
             },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,last_started_ms,last_finished_ms,last_error";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     /// Its id and depth, read in the same query.
@@ -3550,6 +3575,16 @@ impl Database {
                 "name is a GLOB pattern of 1 to 256 bytes",
             );
         }
+        // The events' high-water mark, read before the bots: a client that
+        // lists and then follows from it misses no change, and one it
+        // replays it saw already only restates a state its next event
+        // replaces. The sequence, not the newest row, which a deleted bot
+        // takes with it, so the cursor never falls behind what was pruned.
+        let cursor: i64 = (self.conn)
+            .prepare_cached("SELECT seq FROM sqlite_sequence WHERE name='events'")?
+            .query_row([], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
         let after = after.unwrap_or("");
         let limit_rows = (limit + 1) as i64;
         let prefix = name.map(glob_prefix);
@@ -3586,7 +3621,8 @@ impl Database {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
                     input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at,
-                    work,budget_counts,depth
+                    work,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,
+                    last_started_ms,last_finished_ms,last_error
              FROM bots WHERE {from}{maker}{running} ORDER BY name LIMIT ?2"
         ))?;
         let mut rows = statement.query(values.as_slice())?;
@@ -3597,7 +3633,9 @@ impl Database {
             let bot = json!({"name":r.get::<_, String>(0)?,"bot_id":r.get::<_, i64>(14)?,
                 "head":r.get::<_, Option<i64>>(1)?,
                 "workspace":r.get::<_, Option<String>>(2)?,"status":r.get::<_, String>(3)?,
-                "running_turn":r.get::<_, Option<i64>>(4)?,"provider":r.get::<_, String>(5)?,
+                "running_turn":r.get::<_, Option<i64>>(4)?,
+                "started_ms":r.get::<_, Option<i64>>(24)?,"waiting_on":raw_json(r, 25)?,
+                "last":ended(r, 26)?,"provider":r.get::<_, String>(5)?,
                 "family":r.get::<_, String>(6)?,"model":r.get::<_, String>(7)?,
                 "effort":r.get::<_, Option<String>>(8)?,
                 "budget_tokens":r.get::<_, Option<i64>>(9)?,
@@ -3632,7 +3670,7 @@ impl Database {
             bots.push(bot);
         }
         let next = more.then(|| bots.last().unwrap()["name"].clone());
-        Ok(json!({"bots":bots,"next_after":next}))
+        Ok(json!({"bots":bots,"next_after":next,"cursor":cursor}))
     }
     fn exists(&self, name: &str) -> Result<bool> {
         Ok(self
@@ -3798,6 +3836,7 @@ impl Database {
         // seat a new bot without a request per creation.
         let mut data = json!({"bot_id":id,"provider":binding.provider,"model":binding.model,
             "effort":binding.effort,"workspace":workspace,"status":"idle","running_turn":null,
+            "started_ms":null,"waiting_on":null,"last":null,
             "created_by":binding.created_by,"created_by_id":created_by_id,"depth":depth});
         if let Some(gates) = &gates {
             data["gates"] = serde_json::from_str(gates)?;
@@ -6908,6 +6947,13 @@ impl Database {
             params![turn, serde_json::to_string(&blocked)?, due as i64],
         )?;
         let data = json!({"blocked":blocked,"resume_at_ms":due});
+        // Nothing runs while the turn at the front of its line is held, so
+        // its bot says it is held, and on what.
+        tx.prepare_cached(
+            "UPDATE bots SET status='held',waiting_on=?2
+             WHERE name=?1 AND running_turn IS NULL AND status!='deleting'",
+        )?
+        .execute(params![name, data.to_string()])?;
         let cursor = event(&tx, &name, Some(turn), "turn_held", data.clone())?;
         let next = next_held(&tx, now as i64)?;
         tx.commit()?;
@@ -7035,11 +7081,33 @@ impl Database {
         } else {
             "failed"
         };
+        let finished = epoch_ms();
         let tx = self.conn.savepoint()?;
         tx.execute(
             "UPDATE turns SET status=?,finished_ms=? WHERE id=?",
-            params![ended, epoch_ms(), turn],
+            params![ended, finished, turn],
         )?;
+        // One that failed is its bot's newest ending, and its status when
+        // none runs; one cancelled in line did nothing. Ending the held turn
+        // at the front of the line ends the hold, and the bot says again how
+        // its last turn ended; ending one behind it leaves the hold.
+        if ended == "failed" {
+            record_ended(
+                &tx,
+                &name,
+                turn,
+                ended,
+                None,
+                Some(finished),
+                Some(&error.code),
+            )?;
+        }
+        tx.prepare_cached(
+            "UPDATE bots SET status=COALESCE(last_status,'idle'),waiting_on=NULL
+             WHERE name=?1 AND running_turn IS NULL AND status!='deleting'
+                AND (status!='held' OR ?2)",
+        )?
+        .execute(params![&name, status == "ready"])?;
         if status == "ready" {
             promote(&tx, &name)?;
         }
@@ -8104,8 +8172,8 @@ impl Database {
             "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
             params![serde_json::to_string(&waiting)?, turn],
         )?;
-        tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
         let data = json!({"call_id":call.call_id,"approval":true,"deadline_ms":deadline_ms});
+        parked(&tx, &bot.name, "waiting", &data)?;
         event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
         tx.commit()?;
         self.forget_live(turn);
@@ -8168,8 +8236,8 @@ impl Database {
             "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
             params![serde_json::to_string(&waiting)?, turn],
         )?;
-        tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
         let data = json!({"call_id":call.call_id,"load":true,"deadline_ms":deadline_ms});
+        parked(&tx, &bot.name, "waiting", &data)?;
         event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
         tx.commit()?;
         self.forget_live(turn);
@@ -8325,8 +8393,8 @@ impl Database {
             "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
             params![serde_json::to_string(&waiting)?, turn],
         )?;
-        tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
         let data = json!({"call_id":call_id,"answer":tag,"deadline_ms":deadline_ms});
+        parked(&tx, &bot.name, "waiting", &data)?;
         event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
         tx.commit()?;
         self.forget_live(turn);
@@ -10083,13 +10151,18 @@ impl Database {
         // retention has dropped the turn's events.
         // One that completed on a call a limit sent without tool calls ended
         // at that limit, not failing; one that did not keeps no limit.
+        let finished = epoch_ms();
+        let mut started: Option<i64> = None;
         let limit: Option<String> = tx
             .prepare_cached(&format!(
                 "UPDATE turns SET status=?1,finished_ms=?2,reply_node={REPLY_NODE},
                     limited=CASE WHEN ?1='completed' THEN limited END
-                  WHERE id=?3 RETURNING limited"
+                  WHERE id=?3 RETURNING limited,started_ms"
             ))?
-            .query_row(params![status, epoch_ms(), turn], |r| r.get(0))?;
+            .query_row(params![status, finished, turn], |r| {
+                started = r.get(1)?;
+                r.get(0)
+            })?;
         // A request a safety classifier declined, and the bot's fallback
         // too: what it added since the model last answered goes to later
         // requests as notes in its place, since Anthropic says to remove it
@@ -10167,12 +10240,25 @@ impl Database {
                 }
             }
         }
-        // An expiring bot's clock starts again from this turn's end.
-        tx.execute(
-            "UPDATE bots SET head=?,running_turn=NULL,status=?,closed=NULL,open_calls=NULL,
-                expires_at=?+expire_ms WHERE name=?",
-            params![head, status, epoch_ms(), bot.name],
-        )?;
+        // An expiring bot's clock starts again from this turn's end. It
+        // says how its newest turn ended: this one, or a later message that
+        // failed in line while this one ran.
+        // One statement, as before this kept the ending: each CASE reads
+        // the row as it was.
+        tx.prepare_cached(
+            "UPDATE bots SET head=?1,running_turn=NULL,closed=NULL,open_calls=NULL,
+                started_ms=NULL,waiting_on=NULL,expires_at=?2+expire_ms,
+                status=CASE WHEN last_turn>?4 THEN last_status ELSE ?5 END,
+                last_status=CASE WHEN last_turn>?4 THEN last_status ELSE ?5 END,
+                last_started_ms=CASE WHEN last_turn>?4 THEN last_started_ms ELSE ?6 END,
+                last_finished_ms=CASE WHEN last_turn>?4 THEN last_finished_ms ELSE ?2 END,
+                last_error=CASE WHEN last_turn>?4 THEN last_error ELSE ?7 END,
+                last_turn=CASE WHEN last_turn>?4 THEN last_turn ELSE ?4 END
+             WHERE name=?3",
+        )?
+        .execute(params![
+            head, finished, bot.name, turn, status, started, code
+        ])?;
         promote(&tx, &bot.name)?;
         if status == "completed" {
             tx.execute(
@@ -10293,8 +10379,8 @@ impl Database {
             "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
             params![serde_json::to_string(&waiting)?, turn],
         )?;
-        tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
         let data = json!({"call_id":call_id,"handles":handles,"deadline_ms":deadline_ms,"any":any});
+        parked(&tx, &bot.name, "waiting", &data)?;
         let cursor = event(&tx, &bot.name, Some(turn), "turn_waiting", data.clone())?;
         tx.commit()?;
         self.forget_live(turn);
@@ -10367,7 +10453,7 @@ impl Database {
                 turn
             ],
         )?;
-        tx.execute("UPDATE bots SET status='paced' WHERE name=?", [&bot.name])?;
+        parked(&tx, &bot.name, "paced", &data)?;
         let cursor = event(&tx, &bot.name, Some(turn), "turn_paced", data.clone())?;
         tx.commit()?;
         self.forget_live(turn);
@@ -10516,11 +10602,11 @@ impl Database {
                 turn
             ],
         )?;
-        tx.execute("UPDATE bots SET status='paced' WHERE name=?", [&bot.name])?;
         let data = match stop {
             Halt::Pause => json!({"resume_at_ms":null,"paused":true}),
             Halt::Shutdown => json!({"resume_at_ms":null,"stopped":true}),
         };
+        parked(&tx, &bot.name, "paced", &data)?;
         let cursor = event(&tx, &bot.name, Some(turn), "turn_paced", data.clone())?;
         tx.commit()?;
         self.forget_live(turn);
@@ -10703,7 +10789,10 @@ impl Database {
             "UPDATE turns SET status='running',waiting=NULL,paced_ms=paced_ms+? WHERE id=?",
             params![waiting.paced_elapsed_ms(), turn],
         )?;
-        tx.execute("UPDATE bots SET status='running' WHERE name=?", [&bot.name])?;
+        tx.execute(
+            "UPDATE bots SET status='running',waiting_on=NULL WHERE name=?",
+            [&bot.name],
+        )?;
         let data = json!({"call_id":waiting.call_id});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_resumed", data.clone())?;
         tx.commit()?;
@@ -11350,6 +11439,7 @@ impl Database {
         let mut data = json!({"bot_id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
             "provider":parent.provider,"model":parent.model,"effort":parent.effort,
             "workspace":workspace,"status":"idle","running_turn":null,
+            "started_ms":null,"waiting_on":null,"last":null,
             "created_by":created_by,"created_by_id":created_by_id,"depth":depth});
         if let Some(gates) = &gates {
             data["gates"] = serde_json::from_str(gates)?;
@@ -13531,6 +13621,61 @@ fn flush(tx: &Connection, turn: i64, live: Option<&Live>) -> Result<()> {
 /// Store an event, written now or, should the clock have gone back, when
 /// the event before it was: times rise with cursors, as a log's time index
 /// keeps them (Kafka's), so a follow from a time skips nothing.
+/// A bot's turn parked: the bot's status says how, and what it waits on is
+/// what the turn's event says, as the turn's own `waiting_on` does.
+fn parked(tx: &Connection, bot: &str, status: &str, on: &Value) -> Result<()> {
+    tx.prepare_cached("UPDATE bots SET status=?2,waiting_on=?3 WHERE name=?1")?
+        .execute(params![bot, status, on.to_string()])?;
+    Ok(())
+}
+/// Keep how `turn` ended as its bot's last, unless a later turn of the bot
+/// ended already: a message that failed in line while this turn ran.
+fn record_ended(
+    tx: &Connection,
+    bot: &str,
+    turn: i64,
+    status: &str,
+    started_ms: Option<i64>,
+    finished_ms: Option<i64>,
+    error: Option<&str>,
+) -> Result<()> {
+    tx.prepare_cached(
+        "UPDATE bots SET last_turn=?2,last_status=?3,last_started_ms=?4,last_finished_ms=?5,
+            last_error=?6 WHERE name=?1 AND (last_turn IS NULL OR last_turn<?2)",
+    )?
+    .execute(params![bot, turn, status, started_ms, finished_ms, error])?;
+    Ok(())
+}
+/// A JSON text column as it was stored, unparsed.
+fn raw_json(
+    r: &rusqlite::Row,
+    at: usize,
+) -> rusqlite::Result<Option<Box<serde_json::value::RawValue>>> {
+    r.get::<_, Option<String>>(at)?
+        .map(|text| {
+            serde_json::value::RawValue::from_string(text).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    at,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
+}
+/// A bot's last ending, from its five columns starting at `at`.
+fn ended(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Option<Ended>> {
+    let Some(turn) = r.get::<_, Option<i64>>(at)? else {
+        return Ok(None);
+    };
+    Ok(Some(Ended {
+        turn,
+        status: r.get(at + 1)?,
+        started_ms: r.get(at + 2)?,
+        finished_ms: r.get(at + 3)?,
+        error: r.get(at + 4)?,
+    }))
+}
 fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Result<i64> {
     conn.prepare_cached(
         "INSERT INTO events(bot,turn,kind,data,written_ms) VALUES (?1,?2,?3,?4,
@@ -13789,21 +13934,23 @@ fn start_locked(
     keep_quotes(tx, turn, quotes.as_deref(), head)?;
     data["node"] = json!(head);
     keep_sender(tx, turn, head, data)?;
+    let now = epoch_ms();
     if prompt.len() >= PROMPT_SHARE_BYTES {
         tx.execute(
             "UPDATE turns SET status='running',started_ms=?,held=NULL,prompt='',prompt_node=? WHERE id=?",
-            params![epoch_ms(), head, turn],
+            params![now, head, turn],
         )?;
     } else {
         tx.execute(
             "UPDATE turns SET status='running',started_ms=?,held=NULL WHERE id=?",
-            params![epoch_ms(), turn],
+            params![now, turn],
         )?;
     }
     // `finish` answers every call, so a turn starts on a closed head.
     tx.execute(
-        "UPDATE bots SET head=?1,status='running',running_turn=?2,closed=?1,open_calls=0 WHERE name=?3",
-        params![head, turn, bot.name],
+        "UPDATE bots SET head=?1,status='running',running_turn=?2,closed=?1,open_calls=0,
+            started_ms=?4,waiting_on=NULL WHERE name=?3",
+        params![head, turn, bot.name, now],
     )?;
     Ok(Some(head))
 }
@@ -15217,6 +15364,64 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         )?
     {
         conn.execute("ALTER TABLE tools ADD COLUMN audit INTEGER", [])?;
+    }
+    // Schema 88: a bot carries its whole status, kept with each turn's
+    // transitions: when its running turn started, what it waits on, and how
+    // its newest turn that counts ended, read here from its turns.
+    if from < 88
+        && !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='last_turn')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        migrate_bot_status(conn)?;
+    }
+    Ok(())
+}
+/// 87 -> 88: each bot's status, from the turns it has.
+fn migrate_bot_status(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE bots ADD COLUMN started_ms INTEGER;
+         ALTER TABLE bots ADD COLUMN waiting_on TEXT;
+         ALTER TABLE bots ADD COLUMN last_turn INTEGER;
+         ALTER TABLE bots ADD COLUMN last_status TEXT;
+         ALTER TABLE bots ADD COLUMN last_started_ms INTEGER;
+         ALTER TABLE bots ADD COLUMN last_finished_ms INTEGER;
+         ALTER TABLE bots ADD COLUMN last_error TEXT;
+         UPDATE bots SET started_ms=(SELECT started_ms FROM turns WHERE id=bots.running_turn)
+          WHERE running_turn IS NOT NULL;
+         UPDATE bots SET (last_turn,last_status,last_started_ms,last_finished_ms)=(
+           SELECT id,status,started_ms,finished_ms FROM turns t WHERE t.bot=bots.name
+            AND t.status IN ('completed','failed','interrupted')
+            AND (t.status!='interrupted' OR t.started_ms IS NOT NULL)
+           ORDER BY t.id DESC LIMIT 1);
+         UPDATE bots SET last_error=(SELECT json_extract(data,'$.error') FROM events
+           WHERE turn=bots.last_turn AND kind='turn_finished' ORDER BY id DESC LIMIT 1)
+          WHERE last_status IN ('failed','interrupted');
+         UPDATE bots SET status=last_status
+          WHERE running_turn IS NULL AND last_status IS NOT NULL AND status!='deleting';
+         UPDATE bots SET status='held',waiting_on=(
+           SELECT json_object('blocked',json(t.held),'resume_at_ms',t.due_ms) FROM turns t
+            WHERE t.bot=bots.name AND t.status='ready' AND t.held IS NOT NULL)
+          WHERE running_turn IS NULL AND status!='deleting' AND EXISTS(
+           SELECT 1 FROM turns t WHERE t.bot=bots.name AND t.status='ready' AND t.held IS NOT NULL);",
+    )?;
+    // A parked turn's `waiting_on`, as its view reads it.
+    let parked: Vec<(String, i64)> = conn
+        .prepare(
+            "SELECT name,running_turn FROM bots
+             WHERE status IN ('waiting','paced') AND running_turn IS NOT NULL",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut view = conn.prepare(&format!(
+        "SELECT {TURN_VIEW} FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=?"
+    ))?;
+    let mut update = conn.prepare("UPDATE bots SET waiting_on=? WHERE name=?")?;
+    for (bot, turn) in parked {
+        let on = view.query_row([turn], turn_view)?["waiting_on"].take();
+        update.execute(params![(!on.is_null()).then(|| on.to_string()), bot])?;
     }
     Ok(())
 }
