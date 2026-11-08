@@ -14,6 +14,7 @@ mod approver;
 mod asked;
 mod asks;
 mod attach;
+mod audit;
 mod background;
 mod banner;
 mod boot;
@@ -3358,7 +3359,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 28] = [
+const COMMANDS: [(&str, &str); 29] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -3396,6 +3397,10 @@ const COMMANDS: [(&str, &str); 28] = [
     ("/commons", "Read what the agents of every project share"),
     ("/sky", "Watch every agent light up as they talk"),
     ("/usage", "Show the tokens the agents spent, over time"),
+    (
+        "/audit",
+        "Show every tool call the agents made: where it ran, who allowed it",
+    ),
     ("/pause", "Stop every agent until /resume, saying why"),
     ("/resume", "Let the agents go on after a pause"),
     ("/mcp", "List the MCP servers agents' scripts call"),
@@ -3453,6 +3458,8 @@ struct Watch {
     background: Option<background::View>,
     /// `/usage` holds it instead.
     usage: Option<usage::View>,
+    /// `/audit` holds it instead.
+    audit: Option<audit::View>,
     /// `/commons` holds it instead.
     commons: Option<commons::View>,
     /// `/sky` holds it instead.
@@ -5722,6 +5729,7 @@ impl App {
                 && self.watch.as_ref().is_some_and(|w| {
                     w.read.elapsed() > Duration::from_secs(2)
                         || w.usage.as_ref().is_some_and(usage::View::due)
+                        || w.audit.as_ref().is_some_and(audit::View::due)
                 })
             {
                 self.reread().await;
@@ -9350,6 +9358,12 @@ impl App {
                 }
             }
             "compaction_text_delta" | "compaction_thinking_delta" => {
+                // Words that ended before it are a step: compaction comes
+                // only before another model call. Held for what follows,
+                // they would sit by the spinner while the history scrolls.
+                if self.live.as_ref().is_some_and(|live| live.closed) {
+                    self.end_live(Words::Step);
+                }
                 if let Some(running) = &mut self.running {
                     running.phase = "Compacting".into();
                 }
@@ -9806,6 +9820,7 @@ impl App {
             open: Vec::new(),
             background: None,
             usage: None,
+            audit: None,
             commons: None,
             sky: None,
             picked: None,
@@ -9848,6 +9863,7 @@ impl App {
             open: Vec::new(),
             background: Some(view),
             usage: None,
+            audit: None,
             commons: None,
             sky: None,
             picked: None,
@@ -9873,6 +9889,7 @@ impl App {
             open: Vec::new(),
             background: None,
             usage: Some(view),
+            audit: None,
             commons: None,
             sky: None,
             picked: None,
@@ -9881,6 +9898,38 @@ impl App {
             more: false,
         });
         self.open_pane(pane::Pane::card("usage", STATUS_KEYS));
+    }
+
+    /// Every tool call the project's agents made, or every agent's, newest
+    /// first: `/audit` in the pane, as `/status` is, until Esc.
+    async fn audit(&mut self) {
+        let scope = self.scope();
+        let project = scope.project.clone();
+        let mut view = audit::View::new(scope);
+        self.read_audit(&mut view).await;
+        self.watch = Some(Watch {
+            project,
+            rows: Vec::new(),
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: Some(view),
+            commons: None,
+            sky: None,
+            picked: None,
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+        });
+        self.open_pane(pane::Pane::card("audit", STATUS_KEYS));
+    }
+
+    /// `view` read from the daemon again.
+    async fn read_audit(&self, view: &mut audit::View) {
+        let read = self.client.request("audit", view.query()).await;
+        view.loaded(read.map_err(|error| error.to_string()));
     }
 
     /// What the agents of every project share: `/commons` in the pane,
@@ -9898,6 +9947,7 @@ impl App {
             open: Vec::new(),
             background: None,
             usage: None,
+            audit: None,
             commons: Some(commons::View::open(&home)),
             sky: None,
             picked: None,
@@ -9919,6 +9969,7 @@ impl App {
             open: Vec::new(),
             background: None,
             usage: None,
+            audit: None,
             commons: None,
             sky: Some(sky::View::open(self.options.socket.clone(), self.store())),
             picked: None,
@@ -9962,6 +10013,16 @@ impl App {
         {
             view.reload();
             watch.read = Instant::now();
+            return;
+        }
+        if let Some(mut view) = self.watch.as_mut().and_then(|w| w.audit.take()) {
+            if view.due() {
+                self.read_audit(&mut view).await;
+            }
+            if let Some(watch) = &mut self.watch {
+                watch.audit = Some(view);
+                watch.read = Instant::now();
+            }
             return;
         }
         if let Some(mut view) = self.watch.as_mut().and_then(|w| w.usage.take()) {
@@ -10583,6 +10644,7 @@ impl App {
             && let Some(watch) = &self.watch
             && watch.background.is_none()
             && watch.usage.is_none()
+            && watch.audit.is_none()
             && watch.commons.is_none()
         {
             let bots = card_bots(watch, self.width.max(40), &self.bot);
@@ -10695,6 +10757,32 @@ impl App {
                 }
                 return true;
             }
+            // `/audit` takes its own keys: the filters, whose, a pick.
+            if self.pane_keys
+                && pane.is_card()
+                && let Some(view) = self.watch.as_mut().and_then(|w| w.audit.as_mut())
+            {
+                match key.code {
+                    _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
+                    }
+                    KeyCode::PageUp => pane.screen.page(true),
+                    KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
+                    KeyCode::Home => pane.screen.hold(usize::MAX),
+                    KeyCode::End => pane.screen.latest(),
+                    _ => match view.key(*key) {
+                        audit::Key::Stay => {}
+                        audit::Key::Close => self.close_pane(true),
+                        audit::Key::Open(bot) => {
+                            self.close_pane(true);
+                            self.open_agent(&bot, false);
+                        }
+                    },
+                }
+                return true;
+            }
             // `/usage` takes its own keys: the period, whose, cached reads.
             if self.pane_keys
                 && pane.is_card()
@@ -10747,6 +10835,8 @@ impl App {
                             && let Some(watch) = &mut self.watch
                             && watch.background.is_none()
                             && watch.usage.is_none()
+                            && watch.audit.is_none()
+                            && watch.audit.is_none()
                             && watch.commons.is_none()
                             && watch.sky.is_none() =>
                     {
@@ -12211,6 +12301,15 @@ impl App {
         if prompt == "/sky" {
             self.input.clear();
             self.sky();
+            return;
+        }
+        if prompt == "/audit" {
+            self.input.clear();
+            if self.options.side.is_some() {
+                self.notice = Some("/audit is for the agent itself, not a side chat".into());
+            } else {
+                self.audit().await;
+            }
             return;
         }
         if prompt == "/usage" {
@@ -14051,6 +14150,7 @@ impl App {
         let open = self.pane.as_ref().is_some_and(|pane| pane.is_card());
         let listing = watch.background.is_none()
             && watch.usage.is_none()
+            && watch.audit.is_none()
             && watch.commons.is_none()
             && watch.sky.is_none();
         let bots = card_bots(watch, self.width.max(40), &self.bot);
@@ -14292,6 +14392,25 @@ impl App {
                         pane.screen.show_row(0, 0);
                     }
                 } else if watch.picked != Some(at) {
+                    watch.picked = Some(at);
+                    pane.screen.keep_in_view(at, 2);
+                }
+            } else if let Some(view) = &watch.audit {
+                let lines: Vec<Line<'static>> = view
+                    .card(width)
+                    .into_iter()
+                    .map(|line| {
+                        let mut spans = vec![Span::raw(" ")];
+                        spans.extend(line.spans);
+                        Line::from(spans).style(line.style)
+                    })
+                    .collect();
+                pane.set_card(lines, &view.keys());
+                pane.foot = None;
+                // A new pick is scrolled to, with the two rows under it.
+                if let Some(at) = view.picked_row()
+                    && watch.picked != Some(at)
+                {
                     watch.picked = Some(at);
                     pane.screen.keep_in_view(at, 2);
                 }
@@ -21362,6 +21481,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn words_before_a_compaction_are_written_as_a_step_not_held_by_its_spinner() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        let said = |text: &str| json!({"event": "text_delta", "bot": "b", "turn": 1, "text": text});
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.daemon(said("Reading the logs next.")).await;
+        app.daemon(turn_event("message", 1, json!({"node": 2})))
+            .await;
+        assert!(app.pending.is_empty(), "held until what follows");
+        // The summary streams before the next model call: the words are
+        // that call's step, written into the history as a call would.
+        let summary =
+            json!({"event": "compaction_text_delta", "bot": "b", "turn": 1, "text": "So far"});
+        app.daemon(summary).await;
+        assert!(app.live.is_none());
+        let written: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert!(
+            written
+                .iter()
+                .any(|row| row.contains("Reading the logs next.")),
+            "{written:?}"
+        );
+        assert_eq!(app.running.as_ref().unwrap().phase, "Compacting");
+    }
+
     /// A stand-in daemon holding a project: its lead, a task whose turn
     /// waits on the person's approval, and one at rest on its own question.
     async fn project_waiting() -> (Arc<Client>, Events) {
@@ -22329,6 +22474,7 @@ mod tests {
             open: Vec::new(),
             background: None,
             usage: None,
+            audit: None,
             commons: None,
             sky: None,
             picked: None,
@@ -22816,6 +22962,7 @@ mod tests {
             open: Vec::new(),
             background: None,
             usage: None,
+            audit: None,
             commons: None,
             sky: None,
             picked: None,
@@ -22895,6 +23042,45 @@ mod tests {
         app.submit().await;
         app.key(key(KeyCode::Up)).await;
         assert_eq!(&*app.input, "ship it");
+    }
+
+    #[tokio::test]
+    async fn up_in_a_prompt_taller_than_the_composer_reaches_its_top_lines() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        app.recall.sent("sent before", Vec::new(), 0);
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        let long: Vec<String> = (1..=20).map(|n| format!("line {n}")).collect();
+        app.input.set(&long.join("\n"));
+        let text =
+            |line: &Line| -> String { line.spans.iter().map(|s| s.content.as_ref()).collect() };
+        // Typed to its end, the composer shows its last rows.
+        let (rows, (row, _)) = app.composer(80);
+        assert_eq!(rows.len(), COMPOSER_ROWS);
+        assert!(
+            text(&rows[row]).contains("line 20"),
+            "{:?}",
+            text(&rows[row])
+        );
+        // Up walks back through every row, the shown ones following.
+        for n in (1..20).rev() {
+            app.key(key(KeyCode::Up)).await;
+            let (rows, (row, _)) = app.composer(80);
+            assert!(text(&rows[row]).contains(&format!("line {n}")), "line {n}");
+        }
+        let (rows, (row, _)) = app.composer(80);
+        assert_eq!(row, 0);
+        assert!(text(&rows[0]).ends_with("line 1"));
+        assert_eq!(*app.input, long.join("\n"), "nothing recalled yet");
+        // Down walks back to the end; only past the top does Up recall.
+        for _ in 1..20 {
+            app.key(key(KeyCode::Down)).await;
+        }
+        let (rows, (row, _)) = app.composer(80);
+        assert!(text(&rows[row]).contains("line 20"));
+        for _ in 0..20 {
+            app.key(key(KeyCode::Up)).await;
+        }
+        assert_eq!(&*app.input, "sent before");
     }
 
     #[tokio::test]

@@ -5074,13 +5074,11 @@ async fn submit(
     // fire asked for and a new agent's first message always go.
     let repeating = trigger.at.is_none() && !started && !ask.is_some_and(|a| a.kind.sends());
     let request = asking["request_id"].as_str().unwrap_or_default();
-    let submitted = match repeating && waiting_fire(client, trigger, bot, request).await {
-        true => Err(agent_client::Error::with(
-            "bot_busy",
-            "an earlier fire waits behind its work",
-        )),
-        false => client.request("submit", asking.clone()).await,
-    };
+    // Nothing to tell: the turn already waiting reads what this fire is for.
+    if repeating && waiting_fire(client, trigger, bot, request).await {
+        return json!({"outcome": "skipped", "detail": "bot_busy: an earlier fire waits behind its work"});
+    }
+    let submitted = client.request("submit", asking.clone()).await;
     let outcome = match submitted {
         Ok(turn) => {
             let mut sent = json!({"outcome": "sent", "turn": turn["turn"],
@@ -6869,6 +6867,65 @@ pub(crate) mod tests {
         let outcome = deliver(&client, &w.places, &s, &mut kept, "every 30m", None).await;
         assert_eq!(outcome["outcome"], "ended", "{outcome}");
         assert_eq!(*asked.lock().unwrap(), [json!("wait")]);
+    }
+
+    #[tokio::test]
+    async fn a_save_while_its_agent_works_waits_behind_the_work_once() {
+        // The daemon: an agent at work (turn 1), its turns newest first.
+        let turns = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            json!({"turn": 1, "status": "running", "request_id": "r1"}),
+        ]));
+        let notes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, noted) = (turns.clone(), notes.clone());
+        let client = crate::tests::daemon_answering(move |request| {
+            let mut turns = seen.lock().unwrap();
+            match (request["op"].as_str(), request["delivery"].as_str()) {
+                (Some("turns"), _) => json!({"turns": *turns}),
+                (Some("submit"), Some("attach")) => {
+                    noted.lock().unwrap().push(request["prompt"].clone());
+                    json!({"turn": 1})
+                }
+                (Some("submit"), _) => {
+                    let turn = turns.len() + 1;
+                    let queued = json!({"turn": turn, "status": "queued",
+                        "request_id": request["request_id"]});
+                    turns.insert(0, queued);
+                    json!({"turn": turn, "status": "queued"})
+                }
+                _ => json!({}),
+            }
+        })
+        .await;
+        let w = World::new("busy-saves");
+        std::fs::create_dir_all(&w.root).unwrap();
+        let s = Trigger {
+            when: "when notes.md changes".into(),
+            file: Some(w.root.join("notes.md")),
+            ..trigger()
+        };
+        w.install(&s).unwrap();
+        let mut kept = Kept::default();
+        // The first save during its turn: a turn after it, late.
+        let first = deliver(&client, &w.places, &s, &mut kept, "notes.md changed", None).await;
+        assert_eq!(
+            (&first["outcome"], &first["late"]),
+            (&json!("sent"), &json!(true)),
+            "{first}"
+        );
+        // Saves while that one waits: no second turn, and nothing to tell,
+        // as the turn waiting reads the file as it is then.
+        let second = deliver(&client, &w.places, &s, &mut kept, "notes.md changed", None).await;
+        assert_eq!(second["outcome"], "skipped", "{second}");
+        assert_eq!(turns.lock().unwrap().len(), 2);
+        assert!(notes.lock().unwrap().is_empty());
+        // Once the waiting turn runs, the next save waits behind it again.
+        turns.lock().unwrap()[0]["status"] = json!("running");
+        let third = deliver(&client, &w.places, &s, &mut kept, "notes.md changed", None).await;
+        assert_eq!(
+            (&third["outcome"], &third["late"]),
+            (&json!("sent"), &json!(true)),
+            "{third}"
+        );
     }
 
     #[tokio::test]

@@ -542,6 +542,25 @@ fn agent_option(leads: &[String], current: &str) -> Value {
 
 /// The id `session/list` gives a lead: its name, its identity, and the
 /// lineage of the store it is in, since identities are a store's own.
+/// Who a client says sent a prompt or chose for a call, by its
+/// `_meta.person`: a name as the daemon takes a prompt's `person`, 1 to
+/// 128 of `A-Z a-z 0-9 . _ -`. The daemon shows the model who wrote it,
+/// and none of it is the daemon's own person's consent.
+fn person(params: &Value) -> Result<Option<&str>, String> {
+    match &params["_meta"]["person"] {
+        Value::Null => Ok(None),
+        Value::String(name)
+            if (1..=128).contains(&name.len())
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) =>
+        {
+            Ok(Some(name))
+        }
+        _ => Err("_meta.person must be 1 to 128 of A-Z a-z 0-9 . _ -".into()),
+    }
+}
+
 fn lead_session(bot: &str, bot_id: i64, store: Option<&str>) -> String {
     match store {
         Some(store) => format!("{bot}#{bot_id}@{store}"),
@@ -1070,6 +1089,7 @@ impl Session {
     }
 
     async fn prompt(self: &Arc<Self>, agent: &Arc<Agent>, id: &Value, params: &Value) -> Reply {
+        let person = person(params).map_err(|error| (INVALID_PARAMS, error))?;
         let (text, images) = words(&params["prompt"]);
         if agent.t3.is_some() && images.is_empty() && t3::is_completion(&text) {
             return Ok(json!({"stopReason": "end_turn"}));
@@ -1154,9 +1174,16 @@ impl Session {
         let steer = state.running.is_some();
         let moving = (!steer).then_some(bound.moving.as_ref()).flatten();
         let mut asked = json!({"bot": bound.bot, "bot_id": bound.bot_id,
-            "request_id": crate::unique("acp"), "prompt": crate::stamp::person(&text, &bound.bot),
+            "request_id": crate::unique("acp"),
+            "prompt": match person {
+                Some(_) => crate::stamp::other(&text),
+                None => crate::stamp::person(&text, &bound.bot),
+            },
             "delivery": if moving.is_some() { "queue" } else { "steer" },
             "images": if images.is_empty() { Value::Null } else { json!(images) }});
+        if let Some(person) = person {
+            asked["person"] = json!(person);
+        }
         if let Some(dir) = moving {
             asked["workspace"] = json!(dir);
         }
@@ -1724,6 +1751,12 @@ async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Va
         Some(outcome) if outcome["outcome"] == "selected" => "deny",
         _ => return,
     };
+    // The person the client says chose, else the client.
+    let by = answer
+        .as_ref()
+        .and_then(|answer| person(answer).ok().flatten())
+        .unwrap_or("acp")
+        .to_owned();
     // Through the thread's connection as it is now: the one the call was
     // listed on may have dropped while the person chose.
     let Some(session) = agent
@@ -1740,7 +1773,7 @@ async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Va
             .request(
                 "answer",
                 json!({"bot": bot, "turn": call["turn"], "call_id": id, "request": call["request"],
-                    "tag": crate::person_gate(call), "decision": decision, "by": "acp"}),
+                    "tag": crate::person_gate(call), "decision": decision, "by": by}),
             )
             .await
             .is_ok(),
@@ -2295,6 +2328,26 @@ mod tests {
         let picker = agent_option(&leads, "shop.fix-cart");
         assert_eq!(picker["options"].as_array().unwrap().len(), 4);
         assert_eq!(picker["currentValue"], "shop.fix-cart");
+    }
+
+    #[test]
+    fn a_client_names_the_person_in_a_name_the_daemon_takes() {
+        assert_eq!(person(&json!({"prompt": []})), Ok(None));
+        assert_eq!(
+            person(&json!({"_meta": {"person": "ana.lopez"}})),
+            Ok(Some("ana.lopez"))
+        );
+        for refused in [
+            json!(""),
+            json!("Ana Lopez"),
+            json!("a".repeat(129)),
+            json!({"name": "ana"}),
+        ] {
+            assert!(
+                person(&json!({"_meta": {"person": refused}})).is_err(),
+                "{refused}"
+            );
+        }
     }
 
     #[test]

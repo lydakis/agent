@@ -166,7 +166,6 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual((late['last']['outcome'], late['last'].get('late')), ('sent', True), late)
         skipped = self.fire('p.task', 'Check the PR again.', generation='7')
         self.assertEqual(skipped['last']['outcome'], 'skipped', skipped)
-        # The waiting fire is found behind the notes the skipped ones left.
         again = self.fire('p.task', 'Check the PR again.', generation='7')
         self.assertEqual(again['last']['outcome'], 'skipped', again)
         self.model.release_headers.set()
@@ -176,12 +175,11 @@ class TriggerFireTests(ModelFixture):
         waited = next(t for t in turns if t['turn'] == late['last']['turn'])
         self.assertGreater(waited['turn'], busy)
         self.assertEqual(waited['status'], 'completed')
-        # The skipped fires start no turn: the bot is told in a model call.
-        for told in turns[-2:]:
-            self.assertIn(told['status'], ('attached', 'steered'))
-            self.assertRegex(told['prompt_preview'],
-                             r'^\[automation p\.task · .* · every 30m not sent to p\.task: bot_busy')
-        self.assertEqual(len(turns), 6)
+        # The skipped fires start no turn and leave no note: the waiting
+        # turn already carries what they were for, and a "not sent" note
+        # read as the fire never waking the bot (H18).
+        self.assertEqual(len(turns), 4)
+        self.assertFalse(any('not sent' in t['prompt_preview'] for t in turns), turns)
 
     def test_a_recurring_fire_waits_for_its_first_interval(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')

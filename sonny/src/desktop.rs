@@ -717,15 +717,20 @@ pub async fn drive(
         .filter(|(_, checked)| checked.kind == Kind::Acts)
         .map(|(line, _)| line)
         .collect();
-    let allowed = match acts.is_empty() {
-        true => None,
-        false => match steps
-            .ask(NAME, NAME, json!({"commands": lines, "acts": acts}))
-            .await
-        {
-            Ok(step) => step,
-            Err(why) => return Ok(Value::String(why)),
-        },
+    // Told to the agent's daemon as one step: put to its gate when a
+    // command acts, else recorded in its audit trail as one that looks.
+    let facts = crate::exec::Facts {
+        kind: NAME,
+        place: Some("outside"),
+        access: Some(if acts.is_empty() { "read" } else { "write" }),
+    };
+    let asked = match acts.is_empty() {
+        true => json!({"commands": lines}),
+        false => json!({"commands": lines, "acts": acts}),
+    };
+    let allowed = match steps.ask(NAME, NAME, asked, facts, !acts.is_empty()).await {
+        Ok(step) => step,
+        Err(why) => return Ok(Value::String(why)),
     };
     let _desktop = DESKTOP.lock().await;
     let mut failed = false;
@@ -793,9 +798,7 @@ pub async fn drive(
             break;
         }
     }
-    if let Some(step) = allowed {
-        steps.ran(step, failed).await;
-    }
+    steps.ran(allowed, failed).await;
     let text = text.trim_end().to_owned();
     if parts.is_empty() {
         return Ok(Value::String(text));
