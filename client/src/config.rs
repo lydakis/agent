@@ -11,6 +11,7 @@
 //! senders = "hidden"            # "shown", the default, labels what agents send
 //! attach_wait = "1d"            # how long an attached note waits for a call, the default; "0" as long as it takes
 //! hold = "5d"                   # how long a new agent's turn waits on a cause you can fix before it fails, the default; "0" fails at once
+//! prices = "~/sheets/llm.toml"  # the price sheet /usage costs from, ~/.agent/prices.toml by default; see `prices`
 //!
 //! [daemon]                      # what the agent CLI starts the daemon with; restart it to apply
 //! processes = "cpus * 64"       # commands running at once, the default
@@ -26,10 +27,6 @@
 //! "bedrock/*" = 400000          # by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
 //! "bedrock/*openai.*" = 1000000 # every OpenAI model on Bedrock
 //! "anthropic/claude-opus-5-5" = 500000  # lower than the model's own on purpose
-//!
-//! [prices]                      # what a million tokens cost, for /usage; by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
-//! "anthropic/claude-opus-5*" = { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25 }
-//! "openai/*" = { input = 1.25, cached = 0.125, output = 10 }  # cached and cache_write are input's when unset, cache_write_1h cache_write's
 //!
 //! [judge]
 //! model = "openai/gpt-6-luna"   # who judges for the approver and the lookout
@@ -155,10 +152,9 @@ pub struct Config {
     /// Unset, the provider's listing, else the daemon's own default. The
     /// agent CLI starts the daemon with them.
     pub context_windows: BTreeMap<String, u64>,
-    /// `[prices]`: what a million tokens cost on each model whose
-    /// `PROVIDER/MODEL` path a pattern matches, most specific first, as
-    /// `price` looks them up. Nothing is priced unless the person says.
-    pub prices: Vec<(String, Price)>,
+    /// `prices`: the price sheet's file, from `/` or `~/`; unset,
+    /// `~/.agent/prices.toml`. See `prices`.
+    pub prices: Option<String>,
     pub judge: Judge,
     pub shell_environment_policy: ShellEnvironmentPolicy,
     pub sonny: Sonny,
@@ -205,12 +201,6 @@ impl Price {
 }
 
 impl Config {
-    /// The price `[prices]` sets for `path`, `PROVIDER/MODEL`: the most
-    /// specific pattern that matches it.
-    pub fn price(&self, path: &str) -> Option<Price> {
-        price(&self.prices, path)
-    }
-
     /// The `wait_ms` a client sends with delivery attach: none when
     /// `attach_wait` is 0, which waits as long as it takes.
     pub fn attach_wait(&self) -> Option<u64> {
@@ -1397,25 +1387,11 @@ fn parse(text: &str) -> Result<Config, String> {
             continue;
         }
         if name == "prices" {
-            let models = value.as_table().ok_or("prices must be a table")?;
-            for (pattern, price) in models {
-                if !pattern.contains('/') || pattern.contains(char::is_whitespace) {
-                    return Err(format!(
-                        "prices keys are PROVIDER/MODEL, * and ? wildcards, as \"anthropic/claude-opus-5*\", not {pattern:?}"
-                    ));
-                }
-                config
-                    .prices
-                    .push((pattern.clone(), price_of(pattern, price)?));
+            let file = string(name, value)?;
+            if !(file.starts_with('/') || file.starts_with("~/")) {
+                return Err(format!("prices is a file from / or ~/, not {file:?}"));
             }
-            // Literal paths first, then the patterns with the most literal
-            // characters, as the daemon ranks `[context_windows]`.
-            let wild = |c: char| matches!(c, '*' | '?');
-            let rank = |pattern: &str| {
-                let literal = pattern.chars().filter(|c| !wild(*c)).count();
-                (pattern.chars().any(wild), std::cmp::Reverse(literal))
-            };
-            (config.prices).sort_by(|(a, _), (b, _)| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+            config.prices = Some(file);
             continue;
         }
         if name == "fallbacks" {
@@ -2004,7 +1980,82 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
     Ok((sources, commons))
 }
 
-/// The price for `path`, `PROVIDER/MODEL`, in `prices` as `Config` keeps
+/// The largest price sheet the reader takes.
+pub const SHEET_LIMIT: u64 = 1024 * 1024;
+
+/// The person's price sheet: the file config's `prices` names, else
+/// `~/.agent/prices.toml`; none when there is no such file. Each key is a
+/// `PROVIDER/MODEL` pattern, `*` and `?` wildcards, and each value what a
+/// million tokens cost on the models it matches:
+///
+/// ```toml
+/// "anthropic/claude-opus-5*" = { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25 }
+/// "openai/*" = { input = 1.25, cached = 0.125, output = 10 }
+/// ```
+///
+/// `input` and `output` are required; `cached` and `cache_write` are
+/// `input`'s when unset, and `cache_write_1h` is `cache_write`'s. The
+/// patterns come most specific first, as `price` looks them up. Nothing is
+/// priced unless the person says.
+pub fn prices(config: &Config) -> Result<Vec<(String, Price)>, String> {
+    let file = match &config.prices {
+        Some(file) => match file.strip_prefix("~/") {
+            Some(rest) => match std::env::var_os("HOME") {
+                Some(home) => PathBuf::from(home).join(rest),
+                None => return Ok(Vec::new()),
+            },
+            None => PathBuf::from(file),
+        },
+        None => match home() {
+            Some(home) => home.join("prices.toml"),
+            None => return Ok(Vec::new()),
+        },
+    };
+    let text = match std::fs::File::open(&file) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("prices_unreadable: {}: {error}", file.display())),
+        Ok(opened) => {
+            let mut text = String::new();
+            (opened.take(SHEET_LIMIT + 1).read_to_string(&mut text))
+                .map_err(|e| format!("prices_unreadable: {}: {e}", file.display()))?;
+            if text.len() as u64 > SHEET_LIMIT {
+                return Err(format!(
+                    "prices_invalid: {}: larger than 1 MiB",
+                    file.display()
+                ));
+            }
+            text
+        }
+    };
+    sheet(&text).map_err(|reason| format!("prices_invalid: {}: {reason}", file.display()))
+}
+
+/// A price sheet's text, its patterns most specific first.
+fn sheet(text: &str) -> Result<Vec<(String, Price)>, String> {
+    let table: toml::Table = text
+        .parse()
+        .map_err(|e: toml::de::Error| e.message().to_owned())?;
+    let mut prices = Vec::new();
+    for (pattern, price) in &table {
+        if !pattern.contains('/') || pattern.contains(char::is_whitespace) {
+            return Err(format!(
+                "keys are PROVIDER/MODEL, * and ? wildcards, as \"anthropic/claude-opus-5*\", not {pattern:?}"
+            ));
+        }
+        prices.push((pattern.clone(), price_of(pattern, price)?));
+    }
+    // Literal paths first, then the patterns with the most literal
+    // characters, as the daemon ranks `[context_windows]`.
+    let wild = |c: char| matches!(c, '*' | '?');
+    let rank = |pattern: &str| {
+        let literal = pattern.chars().filter(|c| !wild(*c)).count();
+        (pattern.chars().any(wild), std::cmp::Reverse(literal))
+    };
+    prices.sort_by(|(a, _), (b, _)| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+    Ok(prices)
+}
+
+/// The price for `path`, `PROVIDER/MODEL`, in `prices` as `prices` reads
 /// them: the first, most specific, pattern that matches it.
 pub fn price(prices: &[(String, Price)], path: &str) -> Option<Price> {
     (prices.iter())
@@ -2012,13 +2063,13 @@ pub fn price(prices: &[(String, Price)], path: &str) -> Option<Price> {
         .map(|(_, price)| *price)
 }
 
-/// A `[prices]` entry: input and output, and any of cached, cache_write
+/// A price sheet's entry: input and output, and any of cached, cache_write
 /// and cache_write_1h, each a number of 0 or more; an unset one is the
 /// rate it would fall back to without a cache.
 fn price_of(pattern: &str, value: &toml::Value) -> Result<Price, String> {
     let shape = || {
         format!(
-            "prices.{pattern:?} is {{ input = 5, output = 25 }} with any of cached, cache_write and cache_write_1h, each per million tokens"
+            "{pattern:?} is {{ input = 5, output = 25 }} with any of cached, cache_write and cache_write_1h, each per million tokens"
         )
     };
     let fields = value.as_table().ok_or_else(shape)?;
@@ -2027,14 +2078,14 @@ fn price_of(pattern: &str, value: &toml::Value) -> Result<Price, String> {
         let at = ["input", "cached", "cache_write", "cache_write_1h", "output"]
             .iter()
             .position(|known| known == key)
-            .ok_or_else(|| format!("prices.{pattern:?} has no key {key}: {}", shape()))?;
+            .ok_or_else(|| format!("{pattern:?} has no key {key}: {}", shape()))?;
         let rate = match rate {
             toml::Value::Integer(n) => *n as f64,
             toml::Value::Float(n) => *n,
             _ => f64::NAN,
         };
         if !(rate.is_finite() && rate >= 0.0) {
-            return Err(format!("prices.{pattern:?}.{key} is a number of 0 or more"));
+            return Err(format!("{pattern:?}.{key} is a number of 0 or more"));
         }
         rates[at] = Some(rate);
     }
@@ -2578,12 +2629,12 @@ mod tests {
         assert_eq!(fallbacks.get("a/big").map(String::as_str), Some("a/other"));
         assert!(parse("[fallbacks]\n\"a/big\" = 1\n").is_err());
         assert!(parse("fallbacks = \"a/other\"").is_err());
-        let config = parse(
-            "[prices]\n\"anthropic/*\" = { input = 3, output = 15 }\n\
+        let prices = sheet(
+            "\"anthropic/*\" = { input = 3, output = 15 }\n\
              \"anthropic/claude-opus-5*\" = { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25 }\n",
         )
         .unwrap();
-        let opus = config.price("anthropic/claude-opus-5-5").unwrap();
+        let opus = price(&prices, "anthropic/claude-opus-5-5").unwrap();
         assert_eq!((opus.input, opus.cached, opus.output), (5.0, 0.5, 25.0));
         // A million fresh, a million read, a million written of which half
         // for an hour, and a million out.
@@ -2592,24 +2643,52 @@ mod tests {
             (cost - (5.0 + 0.5 + 3.125 + 5.0 + 25.0)).abs() < 1e-9,
             "{cost}"
         );
-        let other = config.price("anthropic/claude-haiku-4-5").unwrap();
+        let other = price(&prices, "anthropic/claude-haiku-4-5").unwrap();
         assert_eq!(
             (other.cached, other.cache_write, other.cache_write_1h),
             (3.0, 3.0, 3.0),
             "the cache's rates are input's when unset"
         );
-        assert_eq!(config.price("openai/gpt-6"), None);
+        assert_eq!(price(&prices, "openai/gpt-6"), None);
         for wrong in [
-            "[prices]\n\"anthropic\" = { input = 1, output = 1 }\n",
-            "[prices]\n\"a/b\" = { input = 1 }\n",
-            "[prices]\n\"a/b\" = { input = 1, output = -1 }\n",
-            "[prices]\n\"a/b\" = { input = 1, output = \"$1\" }\n",
-            "[prices]\n\"a/b\" = { input = 1, output = 1, reasoning = 1 }\n",
-            "[prices]\n\"a/b\" = 5\n",
-            "prices = 5\n",
+            "\"anthropic\" = { input = 1, output = 1 }\n",
+            "\"a/b\" = { input = 1 }\n",
+            "\"a/b\" = { input = 1, output = -1 }\n",
+            "\"a/b\" = { input = 1, output = \"$1\" }\n",
+            "\"a/b\" = { input = 1, output = 1, reasoning = 1 }\n",
+            "\"a/b\" = 5\n",
+        ] {
+            assert!(sheet(wrong).is_err(), "{wrong}");
+        }
+        // The sheet is a file of its own: the config may name one.
+        assert_eq!(
+            parse("prices = \"~/sheets/llm.toml\"")
+                .unwrap()
+                .prices
+                .as_deref(),
+            Some("~/sheets/llm.toml")
+        );
+        for wrong in [
+            "prices = \"sheets/llm.toml\"",
+            "[prices]\n\"a/b\" = { input = 1, output = 1 }\n",
         ] {
             assert!(parse(wrong).is_err(), "{wrong}");
         }
+        let dir = std::env::temp_dir().join(format!("agent-prices-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("llm.toml");
+        std::fs::write(&file, "\"a/*\" = { input = 1, output = 2 }\n").unwrap();
+        let named = Config {
+            prices: Some(file.display().to_string()),
+            ..Config::default()
+        };
+        assert_eq!(super::prices(&named).unwrap().len(), 1);
+        std::fs::remove_file(&file).unwrap();
+        assert!(
+            super::prices(&named).unwrap().is_empty(),
+            "no file, no prices"
+        );
+        std::fs::remove_dir(&dir).unwrap();
         let windows = parse("[context_windows]\n\"bedrock/*\" = 400000\n\"a/b\" = 1024\n")
             .unwrap()
             .context_windows;

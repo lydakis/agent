@@ -3,9 +3,10 @@
 //! agent (or project), by model, and by what started the turns: the
 //! commons, a trigger, the margin, or a prompt. One daemon read, `usage`, each time
 //! the view changes and every minute while it is open: it reads every
-//! matching turn, so it is not asked for often. With `[prices]` in the
-//! person's config, each model's cost and their sum, priced here from the
-//! file as it stands at each read; the daemon counts tokens only.
+//! matching turn, so it is not asked for often. With the person's price
+//! sheet (`~/.agent/prices.toml`, or the file config's `prices` names),
+//! each model's cost and their sum, priced here from the sheet as it
+//! stands at each read; the daemon counts tokens only.
 use crate::background::Scope;
 use agent_client::config::Price;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -75,7 +76,7 @@ pub struct Spent {
     pub cached: u64,
     /// What the priced models in it cost.
     pub cost: f64,
-    /// How many of the models in it `[prices]` names no price for.
+    /// How many of the models in it the price sheet names no price for.
     pub unpriced: u64,
 }
 
@@ -151,7 +152,7 @@ pub struct View {
     error: Option<String>,
     /// When it was read last; none until it is, or once it must be again.
     at: Option<Instant>,
-    /// `[prices]` as the file said at the last read; none, no costs.
+    /// The price sheet as it was at the last read; none, no costs.
     prices: Vec<(String, Price)>,
     /// Rows scrolled past on its own screen, inline; the pane scrolls
     /// itself.
@@ -874,7 +875,7 @@ mod tests {
                 "origins": [],
                 "series": [],
             })),
-            prices("[prices]\n\"bedrock/*\" = { input = 5, output = 25 }\n"),
+            prices("\"bedrock/*\" = { input = 5, output = 25 }\n"),
         );
         // The sentence over the bars wraps as prose; a bar row would
         // wrap its share away from its bar.
@@ -999,7 +1000,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{:x}.toml", sheet.len()));
         std::fs::write(&path, sheet).unwrap();
-        let prices = agent_client::config::read(&path).unwrap().prices;
+        let config = agent_client::config::Config {
+            prices: Some(path.display().to_string()),
+            ..Default::default()
+        };
+        let prices = agent_client::config::prices(&config).unwrap();
         let _ = std::fs::remove_file(&path);
         prices
     }
@@ -1031,7 +1036,7 @@ mod tests {
             window,
             Ok(usage),
             prices(
-                "[prices]\n\"bedrock/*anthropic.claude-opus-5*\" = \
+                "\"bedrock/*anthropic.claude-opus-5*\" = \
                  { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25 }\n",
             ),
         );

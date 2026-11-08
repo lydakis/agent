@@ -49,9 +49,10 @@ each setting is; what to set is the person's call.
   wildcards (`"bedrock/*openai.*" = 1000000`), over what its provider
   lists; the most specific pattern wins, and it may be lower on purpose.
   Read when the daemon starts.
-- `[prices]` in the config: what a million tokens cost, which `/usage`
-  turns into each model's cost and a total, by `PROVIDER/MODEL` with `*`
-  wildcards, the most specific pattern winning:
+- The price sheet, `~/.agent/prices.toml`, or the file the config's
+  `prices = "~/path/sheet.toml"` names: what a million tokens cost, which
+  `/usage` turns into each model's cost and a total, by `PROVIDER/MODEL`
+  with `*` wildcards, the most specific pattern winning, one row each:
   `"anthropic/claude-opus-5*" = { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25 }`.
   `input` and `output` are required; `cached` and `cache_write` are
   `input`'s when unset, `cache_write_1h` is `cache_write`'s. Nothing is

@@ -7601,3 +7601,42 @@ path changed: lone submit CPU 31.1 → 30.8 ms, burst submit p99 4.54 →
 4.52 ms, release to terminal p99 9.73 → 9.92 ms, idle RSS 15.2 → 15.3 MiB,
 CPU per turn 0.92 → 0.92 ms, lifecycle p95 turn 697 → 714 ms, the quiet
 window 1.54 → 1.34 ms/s.
+
+## Spend kept by the model that spent it (#345)
+
+Every recorded model call now also upserts one `turn_models` row, keyed
+`(turn, model)`, `WITHOUT ROWID`, inside the job and transaction that
+already record the call's usage event, turn totals and bot totals: no new
+store job, no new commit. A call that names its attempts (a summary on
+another model, a refused request's fallback, a provider-side fallback)
+upserts one row per attempt. `usage` adds one grouped scan of the table,
+joined by primary key to the turns its window already reads.
+
+Matched screen, base `main` (3322847) against head, as the Perf workflow
+runs it (`bench.admission_burst` and `bench.completion_burst` at
+`--repeat 5`, `bench.footprint` at `--repeat 2`, `bench.lifecycle` socket
+32 echo bots), two alternating rounds, release builds on a 4-core Linux
+cloud container that was also compiling during the later rounds, so CPU
+and latency are noisier than usual:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 46.051 | 40.404 | -12.3% |
+| admission | burst submit p99, ms | 8.884 | 7.786 | -12.4% |
+| completion | release to terminal p99, ms | 17.546 | 18.826 | +7.3% |
+| footprint | idle RSS, MiB | 15.258 | 15.361 | +0.7% |
+| footprint | per idle bot, KiB | 1.642 | 1.584 | -3.5% |
+| footprint | RSS after a turn each, MiB | 23.965 | 24.703 | +3.1% |
+| footprint | CPU per turn, ms | 1.282 | 1.299 | +1.3% |
+| lifecycle | CPU, s | 0.685 | 0.71 | +3.6% |
+| lifecycle | p95 turn, ms | 679.39 | 660.488 | -2.8% |
+| lifecycle | peak RSS, MiB | 22.986 | 23.07 | +0.4% |
+
+Store work per turn is unchanged (the gate counts it and passed): the
+upsert rides the existing job. Every timing moved both ways within noise.
+
+The upsert alone, on a 1M-turn store with random turn ids (Python
+`sqlite3`, so with its call overhead): 12.8 µs; its plan is two
+primary-key searches. The schema 86 backfill, one `INSERT … SELECT` over
+`turns`, took 1.4 s on 1M turns (398 MB store) and added about 45 bytes a
+turn.
