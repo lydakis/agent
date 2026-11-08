@@ -1,6 +1,7 @@
 """Answered declared tools: a call waits for its client's answer, live or parked."""
 import json
 import os
+import queue
 import time
 import unittest
 
@@ -488,6 +489,44 @@ class StepTests(ModelFixture):
         self.assertEqual((ended['decision'], ended['reason']), ('deny', 'its client stopped waiting'))
         self.assertIn('result', daemon.request('tool_result', bot='Lead', turn=turn, call_id='script-0', output='ok'))
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+
+    def test_a_pause_admits_no_take_and_no_step_until_resume(self):
+        # A call parked for its client's answer, then a pause: neither
+        # taking the call to run it nor a new step of it gets in while the
+        # pause holds; both do once it is lifted.
+        client, turn, _ = self.script(settings={'approval_hold_ms': 0})
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        self.assertTrue(client.request('pause', reason='look first')['result']['changed'])
+        take = {'bot': 'Lead', 'turn': turn, 'call_id': 'script-0'}
+        step = dict(take, step='1', name='mcp__docs__read', arguments={'path': 'a'})
+        self.assertEqual(client.request('take_call', **take)['error'], 'daemon_paused')
+        self.assertEqual(client.request('approve_step', **step)['error'], 'daemon_paused')
+        [call] = client.request('tool_calls', tag='sonny')['result']['calls']
+        self.assertIsNone(call['taken_ms'])
+        rows = client.request('audit', bot='Lead')['result']['rows']
+        self.assertEqual([row['step'] for row in rows], [None])
+        self.assertTrue(client.request('resume')['result']['changed'])
+        self.assertIn('taken_ms', client.request('take_call', **take)['result'])
+        self.assertEqual(client.request('approve_step', **step)['result']['decision'], 'allow')
+        self.assertIn('result', self.answer(client, turn, output='read a'))
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    def test_a_step_allowed_while_paused_waits_for_resume(self):
+        # A step put to its gate before the pause, of a call parked for its
+        # answer: a verdict that lands while paused does not let it run.
+        client, turn, _ = self.script(settings={'approval_hold_ms': 0}, approve=['exec'], approver='manual')
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        request = self.ask(client, turn)
+        self.announced(client, turn)
+        client.request('pause', reason='look first')
+        self.verdict(client, turn, 'script-0/1')
+        with self.assertRaises(queue.Empty):
+            self.reply(client, request, timeout=1)
+        client.request('resume')
+        allowed = self.reply(client, request)['result']
+        self.assertEqual((allowed['call_id'], allowed['decision']), ('script-0/1', 'allow'))
+        self.assertIn('result', self.answer(client, turn, output='sent after resume'))
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
     def test_a_step_is_refused_what_its_call_would_refuse(self):
         client, turn, _ = self.script(tool=EXEC)

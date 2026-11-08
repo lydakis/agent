@@ -1,13 +1,15 @@
 //! Tasks marked done, as threads are resolved: a task marks itself done
 //! once nothing is left to do in it, and its lead can mark any of its tasks,
 //! both with the `mark_done` tool Sonny declares, and `/status` files the
-//! task under Done, out of the way. A task's own call is read from its history: its
-//! newest turn resolved it. The lead's Sonny keeps a mark for each of the
-//! lead's calls beside the store, read from the lead's history as the
-//! calls land: the task's newest turn finished by then, so one still
-//! running is not resolved. Turns are numbered across the store, so a task
-//! turn numbered after it, new work for the task or another bot under its
-//! name, reopens the task without anyone taking the mark off.
+//! task under Done, out of the way. Sonny's tool host answers each call
+//! only once it has kept the mark beside the store ([`mark`]), so a mark
+//! holds whether or not a window is open; windows only show it. A task's
+//! own call is also read from its history: its newest turn resolved it. A
+//! task's newest turn finished by the time its lead marked it is what the
+//! mark covers, so one still running is not resolved. Turns are numbered
+//! across the store, so a task turn numbered after it, new work for the
+//! task or another bot under its name, reopens the task without anyone
+//! taking the mark off.
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -16,7 +18,8 @@ use std::path::{Path, PathBuf};
 pub const TOOL: &str = "mark_done";
 
 /// The `mark_done` tool as Sonny declares it on a lead, which the
-/// tasks it starts take too, and on a task.
+/// tasks it starts take too, and on a task: Sonny's tool host answers it
+/// once the mark is kept ([`mark`]).
 pub fn tool() -> Value {
     json!({
         "name": TOOL,
@@ -35,8 +38,58 @@ pub fn tool() -> Value {
             },
             "additionalProperties": false
         },
-        "result": "Marked done."
+        "answered_by": crate::served::TAG
     })
+}
+
+/// Mark done what the `mark_done` call `call`, in turn `turn` of `by`,
+/// names, kept beside `store` before the call is answered, so the answer
+/// is true with no window open: `caller` is the agent the call acts as, a
+/// side chat's the agent it copies. A lead or a task naming no task marks
+/// itself, up to that turn. A lead names one of its tasks or another lead,
+/// and a side chat names its agent by naming none, marked up to its newest
+/// turn ended by now. A task marks only itself. What it marked, as the
+/// model reads it.
+pub async fn mark(
+    client: &agent_client::Client,
+    store: &Path,
+    (caller, by): (&str, &str),
+    (turn, call): (i64, &str),
+    arguments: &Value,
+) -> Result<String, String> {
+    let side = by != caller;
+    let lead = crate::project::is_lead(caller);
+    if itself(arguments, caller) && !side {
+        keep(store, caller, turn, call)?;
+        return Ok("Marked done.".into());
+    }
+    let task = match (itself(arguments, caller), lead) {
+        (true, _) => caller.to_owned(),
+        (false, true) => crate::project::lead_project(caller)
+            .and_then(|project| self::call(arguments, project))
+            .ok_or("a task's name, as it was started, without /")?,
+        (false, false) => {
+            return Err(format!(
+                "{caller} marks only itself done; ask your lead to mark another task"
+            ));
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let page = client
+        .request("turns", json!({"bot": task, "newest": true, "limit": 16}))
+        .await
+        .map_err(|e| format!("{task}'s turns could not be read, so it is not marked: {e}"))?;
+    let turns = page["turns"].as_array().map_or(&[][..], Vec::as_slice);
+    if turns.is_empty() {
+        return Err(format!(
+            "{task} has no turns: no agent by that name to mark"
+        ));
+    }
+    keep(store, &task, upto(turns, now), call)?;
+    Ok(format!("Marked {task} done."))
 }
 
 /// Whether a `mark_done` call with `arguments`, made by `bot`, resolves
@@ -141,8 +194,8 @@ fn kept(store: &Path, task: &str) -> Option<Value> {
     serde_json::from_slice(&std::fs::read(file(store, task)).ok()?).ok()
 }
 
-/// Whether the mark kept for `task` is the one the lead's call `call`
-/// made, which a replay of that call leaves as it is.
+/// Whether the mark kept for `task` is the one the call `call` made.
+#[cfg(test)]
 pub fn made_by(store: &Path, task: &str, call: &str) -> bool {
     kept(store, task).is_some_and(|mark| mark["call"] == call)
 }
