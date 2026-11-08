@@ -7640,3 +7640,20 @@ tests `a_waiter_leaving_costs_the_same_however_many_others_wait` and
 16,000, and `many_waits_on_one_handle_each_leave_at_the_same_cost` times
 32,000 and 64,000; each fails when twice as many take three times as long,
 and each failed against the scans or lists it replaces.
+
+The Perf workflow's matched screen (`bench.perf_gate`, GitHub runner, head
+e34d148 against main 6a15a54) passed with store work per turn the same and
+nothing past the runner's spread: no measured path parks thousands of
+waiters, so it shows the change costs the light path nothing.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 32.197 | 31.881 | -1.0% |
+| admission | burst submit p99, ms | 4.589 | 4.693 | +2.3% |
+| completion | release to terminal p99, ms | 9.785 | 9.691 | -1.0% |
+| footprint | idle RSS, MiB | 15.324 | 15.207 | -0.8% |
+| footprint | per idle bot, KiB | 1.612 | 1.638 | +1.6% |
+| footprint | CPU per turn, ms | 0.96 | 0.93 | -3.2% |
+| lifecycle | CPU, s | 0.45 | 0.435 | -3.3% |
+| lifecycle | p95 turn, ms | 729.244 | 698.447 | -4.2% |
+| lifecycle | peak RSS, MiB | 23.611 | 23.568 | -0.2% |
