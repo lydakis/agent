@@ -439,7 +439,8 @@ binds the thread to that lead of the folder, or `/new [NAME]`, which makes
 one so named, in the project's lead role. A call that
 waits for you is asked in the thread (Allow or Deny); one the reviewer passes
 runs without asking. A question the lead puts to you (its `ask`) comes as a
-form, one pick among its options, why it asks and what it recommends; the
+form, one pick among its options, what a yes covers, why it asks and what
+it recommends; the
 pick goes to the lead as your answer, as a click on its card in Sonny's
 window does, once whichever window answers first. Questions still open when
 a thread reopens come again, back to your own last words, before which a

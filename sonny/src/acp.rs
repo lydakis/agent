@@ -1763,11 +1763,17 @@ impl Session {
 /// The form field a question's pick is in.
 const PICK: &str = "pick";
 
-/// A question the lead put, as a form: the question, why it is asked and
-/// what the lead recommends, then one pick among its options, each by
+/// A question the lead put, as a form: the question, what a yes covers,
+/// why it is asked and what the lead recommends, then one pick among its options, each by
 /// its number, as a pick in Sonny's window is.
 fn form(session: &str, ask: &asks::Ask, call: Option<&str>) -> Value {
-    let mut message = ask.question.clone();
+    // What a yes covers, as the card and the answer say it, right under
+    // the question: the pick is the person's consent to that alone, so it
+    // is never sent unseen.
+    let mut message = match &ask.covers {
+        Some(covers) => format!("{}\nCovers: {}", ask.question, covers.line()),
+        None => ask.question.clone(),
+    };
     if !ask.why.is_empty() {
         message = format!("{message}\n\n{}", ask.why);
     }
@@ -2522,6 +2528,21 @@ mod tests {
         );
         // Put again once the thread follows anew, it names no call.
         assert!(super::form("s1", &ask, None).get("toolCallId").is_none());
+        // A yes that approves an action says what it covers, as the answer
+        // it sends does.
+        let approving = asks::call(
+            "ask:3/c2",
+            &json!({"question": "Publish the site?", "options": [{"label": "Yes"}, {"label": "No"}],
+                "covers": {"action": "publish", "target": "site", "revision": "3f2a9c1"},
+                "if_unanswered": "wait"}),
+        )
+        .unwrap();
+        let message = super::form("s1", &approving, None)["message"].clone();
+        assert_eq!(
+            message,
+            "Publish the site?\nCovers: publish · site · at 3f2a9c1"
+        );
+        assert!(asks::answer(&approving, "1").contains("\nCovers: publish · site · at 3f2a9c1"));
     }
 
     #[test]
