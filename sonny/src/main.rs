@@ -995,7 +995,11 @@ struct TaskAnswer {
 /// first answer to an ask and refuses another. One taken back from the
 /// queue before the agent read it answered nothing, so the next goes as
 /// the next attempt.
-async fn answer_once(client: &Client, ask: &str, submitted: Value) -> Result<Value, String> {
+pub(crate) async fn answer_once(
+    client: &Client,
+    ask: &str,
+    submitted: Value,
+) -> Result<Value, String> {
     let bot = submitted["bot"].as_str().unwrap_or_default().to_owned();
     let mut attempt = 0;
     loop {

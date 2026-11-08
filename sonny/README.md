@@ -438,7 +438,12 @@ lead when it has none yet), unless those words are `/switch NAME`, which
 binds the thread to that lead of the folder, or `/new [NAME]`, which makes
 one so named, in the project's lead role. A call that
 waits for you is asked in the thread (Allow or Deny); one the reviewer passes
-runs without asking. The turns the lead takes on its own, as when the lookout
+runs without asking. A question the lead puts to you (its `ask`) comes as a
+form, one pick among its options, why it asks and what it recommends; the
+pick goes to the lead as your answer, as a click on its card in Sonny's
+window does, once whichever window answers first. Questions still open when
+a thread reopens come again, back to your own last words, before which a
+question is set aside as in the window. One you dismiss stays open. The turns the lead takes on its own, as when the lookout
 wakes it because a task finished, show in the thread between yours, as work
 the agent started (the protocol's version 2 draft, which T3 Code speaks).
 Each task the lead starts opens as a T3 Code thread with the task's brief as
@@ -495,7 +500,11 @@ and Sonny's window shows the name on the message. Their words are not
 yours: they neither end quiet nor say you are back, and the reviewer takes
 none of them as your consent. The client's answer to a call waiting on a
 person may name who chose in its own `_meta.person`, which the call's
-record keeps as who answered (else `acp`).
+record keeps as who answered (else `acp`). A pick on one of the lead's
+questions that names someone goes to the lead as their words: it reads
+them, but only your own pick answers the question in Sonny's windows.
+Questions come as forms only to a client that says it fills them in
+(`elicitation.form`); one without forms still shows each as the `ask` call.
 
 Enter sends (and steers a running turn), Tab while a turn runs queues what
 you wrote to run after it, as Codex does, Esc interrupts, `y`/`n` answer a
