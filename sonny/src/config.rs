@@ -202,6 +202,12 @@ pub const SETTINGS: &[Setting] = &[
         default: "true",
     },
     Setting {
+        key: "sonny.suggest_ideas",
+        about: "when your next message isn't obvious, that guess may offer an idea for the work or a tip for a Sonny command or key instead, labeled; no extra call",
+        values: SWITCH,
+        default: "true",
+    },
+    Setting {
         key: "sonny.start_at_boot",
         about: "the daemon starts when this machine does (at login on a Mac), so a box's agents keep working after a restart",
         values: SWITCH,

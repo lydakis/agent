@@ -3363,6 +3363,32 @@ const COMMANDS: [(&str, &str); 28] = [
     ("/quit", "Quit; the agents keep working"),
 ];
 
+/// Every key Sonny takes and what it does, as `?` lists them; a tip in
+/// the empty composer names only these.
+const SHORTCUTS: [(&str, &str); 21] = [
+    ("enter", "send, or steer the running turn"),
+    ("tab", "queue for after the running turn"),
+    ("↑↓", "earlier prompts, past the first or last row"),
+    ("ctrl+r", "find an earlier prompt"),
+    ("shift+enter", "new line (alt+enter, ctrl+j)"),
+    ("esc", "interrupt, or stop a ! command"),
+    ("/", "commands"),
+    ("!", "run a command of your own"),
+    ("ctrl+o", "open or fold every row that folds"),
+    ("ctrl+f", "find in the conversation"),
+    ("home end", "first turn, newest turn"),
+    ("pgup pgdn", "scroll"),
+    ("tab", "with nothing typed, keys to the pane"),
+    ("ctrl+\\", "keys to the pane and back"),
+    ("ctrl+[ ctrl+]", "hide the pane, show it again"),
+    ("ctrl+g", "open the pane's agent in the main view"),
+    ("ctrl+t", "go to the pane's agent's own tab"),
+    ("alt+t ctrl+x", "boost the next message; again for more"),
+    ("ctrl+v", "paste a picture"),
+    ("ctrl+c", "copy the selection, clear, or quit"),
+    ("ctrl+l", "draw the screen again"),
+];
+
 /// The slash menu's keys, while it is open: Tab completes the pick's name
 /// until it is whole.
 fn menu_keys(menu: &[(&str, &str, Vec<usize>)], pick: usize, typed: &str) -> Option<&'static str> {
@@ -10810,29 +10836,7 @@ impl App {
     /// or being found in the conversation let go.
     /// Every key Sonny takes, beside the conversation.
     fn shortcuts(&mut self) {
-        let rows = [
-            ("enter", "send, or steer the running turn"),
-            ("tab", "queue for after the running turn"),
-            ("↑↓", "earlier prompts, past the first or last row"),
-            ("ctrl+r", "find an earlier prompt"),
-            ("shift+enter", "new line (alt+enter, ctrl+j)"),
-            ("esc", "interrupt, or stop a ! command"),
-            ("/", "commands"),
-            ("!", "run a command of your own"),
-            ("ctrl+o", "open or fold every row that folds"),
-            ("ctrl+f", "find in the conversation"),
-            ("home end", "first turn, newest turn"),
-            ("pgup pgdn", "scroll"),
-            ("tab", "with nothing typed, keys to the pane"),
-            ("ctrl+\\", "keys to the pane and back"),
-            ("ctrl+[ ctrl+]", "hide the pane, show it again"),
-            ("ctrl+g", "open the pane's agent in the main view"),
-            ("ctrl+t", "go to the pane's agent's own tab"),
-            ("alt+t ctrl+x", "boost the next message; again for more"),
-            ("ctrl+v", "paste a picture"),
-            ("ctrl+c", "copy the selection, clear, or quit"),
-            ("ctrl+l", "draw the screen again"),
-        ];
+        let rows = SHORTCUTS;
         let width = rows.iter().map(|(key, _)| key.width()).max().unwrap_or(0);
         let lines = rows
             .iter()
@@ -11481,7 +11485,7 @@ impl App {
             && key.kind != KeyEventKind::Release
             && key.code == KeyCode::Tab
             && !self.pane_keys
-            && let Some(guess) = self.suggested()
+            && let Some(guess) = self.suggested().filter(|guess| guess.takes())
         {
             // Only its words: where it came from is not part of it.
             let guess = guess.text.clone();
@@ -13402,22 +13406,27 @@ impl App {
     }
 
     /// A guess at the person's next message, after a turn of theirs ended
-    /// well, made by a copy of this bot on this window's model; unless the
-    /// config's `[sonny] suggest` is off, or the bot asked a question,
-    /// which its own card answers, or it is in zen: the guess reads all
-    /// the agent holds back, and could tell it.
+    /// well, made by a copy of this bot on this window's model, or an idea
+    /// or a tip where it has none unless `[sonny] suggest_ideas` is off;
+    /// unless the config's `[sonny] suggest` is off, or the bot asked a
+    /// question, which its own card answers, or it is in zen: the guess
+    /// reads all the agent holds back, and could tell it.
     fn suggest(&mut self) {
         self.suggestion = None;
-        if !self.asks.is_empty()
-            || self.zen.is_some()
-            || !agent_client::config::load().is_ok_and(|c| c.sonny.suggest)
-        {
+        let Some(ideas) = (agent_client::config::load().ok())
+            .filter(|c| c.sonny.suggest)
+            .map(|c| c.sonny.suggest_ideas)
+        else {
+            return;
+        };
+        if !self.asks.is_empty() || self.zen.is_some() {
             return;
         }
         self.suggesting = Some(tokio::spawn(suggest::guess(
             self.client.clone(),
             self.bot.clone(),
             self.turn_model.clone(),
+            ideas,
         )));
     }
 
@@ -13437,10 +13446,10 @@ impl App {
             let job = self.suggesting.take().unwrap();
             self.suggestion = job.await.ok().flatten();
             // The agent it came from, found kept there: its name opens it.
-            if let Some(suggest::Origin::Agent(name)) = self
+            if let Some(suggest::Cue::Agent(name)) = self
                 .suggestion
                 .as_ref()
-                .and_then(|guess| guess.from.as_ref())
+                .and_then(|guess| guess.cue.as_ref())
             {
                 self.names.get_mut().learn(name.clone(), true);
             }
@@ -14235,7 +14244,7 @@ impl App {
         // Where the pane's program has its cursor.
         let mut pane_cursor = None;
         // Tab takes a guess at the next message while one shows.
-        let switch = match self.suggested() {
+        let switch = match self.suggested().filter(|guess| guess.takes()) {
             Some(_) => "ctrl+\\",
             None => "tab",
         };
@@ -14593,8 +14602,8 @@ impl App {
             // The agent the guess came from opens it, as its name does
             // wherever it is drawn: its last word, once it is an agent's.
             let cue = (self.suggested())
-                .and_then(|guess| match &guess.from {
-                    Some(suggest::Origin::Agent(name)) => Some(name),
+                .and_then(|guess| match &guess.cue {
+                    Some(suggest::Cue::Agent(name)) => Some(name),
                     _ => None,
                 })
                 .and_then(|name| {
@@ -14718,28 +14727,44 @@ impl App {
         if let Some(guess) = self.suggested() {
             // Where it came from, when not the reply just read, after the
             // key, so it reads as apart from what Tab takes; only beside
-            // the whole guess, which a narrow window gives the room.
-            let cue = (guess.from.as_ref())
-                .map(|from| (from, format!("  ↳ {}", from.name())))
-                .filter(|(_, cue)| {
-                    width >= prompt::LEAD + guess.text.width() + TAB.width() + cue.width()
+            // the whole guess, which a narrow window gives the room. An
+            // idea or a tip says so in a word of its own, without the
+            // arrow, as it came from nowhere, and keeps it however
+            // narrow: its words are cut first.
+            let cue = (guess.cue.as_ref())
+                .map(|cue| match cue.labels() {
+                    true => (cue, format!("  {}", cue.name())),
+                    false => (cue, format!("  ↳ {}", cue.name())),
+                })
+                .filter(|(cue, words)| {
+                    cue.labels()
+                        || width >= prompt::LEAD + guess.text.width() + TAB.width() + words.width()
                 });
+            // A tip for a key is only read: no key takes it.
+            let tab = match guess.takes() {
+                true => TAB,
+                false => "",
+            };
             let room = width.saturating_sub(
-                prompt::LEAD + TAB.width() + cue.as_ref().map_or(0, |(_, cue)| cue.width()),
+                prompt::LEAD + tab.width() + cue.as_ref().map_or(0, |(_, words)| words.width()),
             );
             let mut spans = vec![
                 Span::raw("› ").bold(),
                 // Italic too: a side chat's screen, read through vt100,
                 // loses the dim.
                 Span::raw(transcript::cut(&guess.text, room)).dim().italic(),
-                Span::raw(TAB).dim(),
+                Span::raw(tab).dim(),
             ];
-            if let Some((from, _)) = cue {
-                spans.push(Span::raw("  ↳ ").dim());
+            if let Some((cue, _)) = cue {
                 // An agent by its name, which opens it as anywhere (the
                 // draw links it); the margin, the commons and "earlier" in
                 // words.
-                spans.push(Span::raw(from.name().to_owned()).dim());
+                if !cue.labels() {
+                    spans.push(Span::raw("  ↳ ").dim());
+                } else {
+                    spans.push(Span::raw("  ").dim());
+                }
+                spans.push(Span::raw(cue.name().to_owned()).dim());
             }
             return (vec![Line::from(spans)], (0, prompt::LEAD));
         }
@@ -17165,45 +17190,48 @@ mod tests {
         std::fs::remove_dir_all(home).unwrap();
     }
 
+    /// The guess a copy makes after a turn of the person's, given what it
+    /// says.
+    async fn guessed(said: &'static str) -> App {
+        let client = daemon_answering(move |asked| {
+            match (asked["op"].as_str(), asked["bot"].as_str()) {
+                (Some("fork"), _) => json!({"bot_id": 9, "head": 4}),
+                (Some("submit"), Some("b")) => json!({"turn": 1}),
+                (Some("submit"), _) => json!({"turn": 1, "handle": "turn:copy/1"}),
+                (Some("wait"), _) => json!({"results": {"turn:copy/1":
+                    {"status": "completed", "text": said}}}),
+                // Only shop.pricing is an agent the daemon keeps.
+                (Some("bots"), _) => match asked["name"].as_str() {
+                    Some("shop.pricing") => json!({"bots": [{"name": "shop.pricing"}]}),
+                    _ => json!({"bots": []}),
+                },
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.input.set("what changed in the cart?");
+        app.submit().await;
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        for _ in 0..200 {
+            app.suggested_now().await;
+            if app.suggestion.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        app
+    }
+
     #[tokio::test]
     async fn a_guess_from_news_says_where_from_after_the_key_and_tab_takes_only_its_words() {
         // The guess the copy makes, given what it says.
-        async fn guessed(said: &'static str) -> App {
-            let client = daemon_answering(move |asked| {
-                match (asked["op"].as_str(), asked["bot"].as_str()) {
-                    (Some("fork"), _) => json!({"bot_id": 9, "head": 4}),
-                    (Some("submit"), Some("b")) => json!({"turn": 1}),
-                    (Some("submit"), _) => json!({"turn": 1, "handle": "turn:copy/1"}),
-                    (Some("wait"), _) => json!({"results": {"turn:copy/1":
-                        {"status": "completed", "text": said}}}),
-                    // Only shop.pricing is an agent the daemon keeps.
-                    (Some("bots"), _) => match asked["name"].as_str() {
-                        Some("shop.pricing") => json!({"bots": [{"name": "shop.pricing"}]}),
-                        _ => json!({"bots": []}),
-                    },
-                    _ => json!({}),
-                }
-            })
-            .await;
-            let mut app = app(client);
-            app.input.set("what changed in the cart?");
-            app.submit().await;
-            app.daemon(turn_event("accepted", 1, json!({}))).await;
-            app.daemon(turn_event(
-                "turn_finished",
-                1,
-                json!({"status": "completed"}),
-            ))
-            .await;
-            for _ in 0..200 {
-                app.suggested_now().await;
-                if app.suggestion.is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            app
-        }
         let row = |app: &App, width| -> String {
             let (rows, _) = app.composer(width);
             rows[0].spans.iter().map(|s| s.content.as_ref()).collect()
@@ -17238,8 +17266,71 @@ mod tests {
             "push it",
         ] {
             let app = guessed(said).await;
-            assert_eq!(app.suggestion.as_ref().unwrap().from, None, "{said}");
+            assert_eq!(app.suggestion.as_ref().unwrap().cue, None, "{said}");
             assert!(row(&app, 80).ends_with("  tab"), "{said}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_idea_or_a_tip_says_so_in_a_word_kept_however_narrow() {
+        let row = |app: &App, width| -> String {
+            let (rows, _) = app.composer(width);
+            rows[0].spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let tab = || {
+            Event::Key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+            ))
+        };
+        // An idea: its word after the key, no arrow, as it came from
+        // nowhere; Tab takes its words.
+        let mut app = guessed(
+            "add a cold start benchmark
+idea",
+        )
+        .await;
+        assert_eq!(
+            app.suggestion.as_ref().unwrap().cue,
+            Some(suggest::Cue::Idea)
+        );
+        assert_eq!(row(&app, 80), "› add a cold start benchmark  tab  idea");
+        // Too narrow: the words are cut, the label kept.
+        let narrow = row(&app, 24);
+        assert!(narrow.ends_with("…  tab  idea"), "{narrow}");
+        app.key(tab()).await;
+        assert_eq!(&*app.input, "add a cold start benchmark");
+        // A tip for a command: Tab takes it, Enter would run it.
+        let mut app = guessed(
+            "/side why did the build slow down
+tip",
+        )
+        .await;
+        assert_eq!(
+            row(&app, 80),
+            "› /side why did the build slow down  tab  tip"
+        );
+        app.key(tab()).await;
+        assert_eq!(&*app.input, "/side why did the build slow down");
+        // A tip for a key is only read: no `tab`, and Tab does what it
+        // does otherwise.
+        let mut app = guessed(
+            "ctrl+r finds that earlier prompt
+tip",
+        )
+        .await;
+        assert_eq!(row(&app, 80), "› ctrl+r finds that earlier prompt  tip");
+        app.key(tab()).await;
+        assert!(app.input.is_empty());
+        // A tip for what Sonny does not have shows nothing.
+        for said in [
+            "/teleport to the release branch
+tip",
+            "ctrl+z undoes the last turn
+tip",
+        ] {
+            let app = guessed(said).await;
+            assert_eq!(app.suggestion, None, "{said}");
         }
     }
 
@@ -17280,7 +17371,7 @@ mod tests {
             app.suggested().map(|g| g.text.as_str()),
             Some("run the tests")
         );
-        assert_eq!(app.suggested().unwrap().from, None);
+        assert_eq!(app.suggested().unwrap().cue, None);
         let (rows, _) = app.composer(80);
         let row: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(row, "› run the tests  tab");
@@ -22786,7 +22877,7 @@ mod tests {
         app.input.clear();
         app.suggestion = Some(suggest::Guess {
             text: "run the tests".into(),
-            from: None,
+            cue: None,
         });
         app.key(ctrl('r')).await;
         app.key(key(KeyCode::Tab)).await;
