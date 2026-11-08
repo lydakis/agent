@@ -856,12 +856,15 @@ fn reads_file(store: &std::path::Path, lead: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(dir).join(format!("{lead}.json"))
 }
 
-/// The build that kept them: another may read a history otherwise.
-fn reads_build() -> String {
+/// The build that kept them, which another may read a history otherwise,
+/// and the daemon's store they were read from, by its file's identity: a
+/// store made again at the same path numbers its agents and turns anew.
+fn reads_build(identity: Option<&str>) -> String {
     format!(
-        "{} {}",
+        "{} {} {}",
         env!("CARGO_PKG_VERSION"),
-        option_env!("SONNY_COMMIT").unwrap_or("")
+        option_env!("SONNY_COMMIT").unwrap_or(""),
+        identity.unwrap_or("")
     )
 }
 
@@ -872,6 +875,7 @@ fn reads_build() -> String {
 fn take_reads(
     store: &std::path::Path,
     lead: &str,
+    identity: Option<&str>,
     status_read: &mut HashMap<String, (Value, Latest)>,
     asks_seen: &mut HashMap<String, (i64, Seen)>,
 ) {
@@ -884,7 +888,7 @@ fn take_reads(
     let Some(kept) = std::fs::read(reads_file(store, lead))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
-        .filter(|kept| kept.build == reads_build())
+        .filter(|kept| kept.build == reads_build(identity))
     else {
         return;
     };
@@ -901,6 +905,7 @@ fn take_reads(
 fn keep_reads(
     store: &std::path::Path,
     lead: &str,
+    identity: Option<&str>,
     status_read: &HashMap<String, (Value, Latest)>,
     asks_seen: &HashMap<String, (i64, Seen)>,
 ) {
@@ -914,7 +919,7 @@ fn keep_reads(
         seen: HashMap<&'a String, &'a (i64, Seen)>,
     }
     let kept = Kept {
-        build: reads_build(),
+        build: reads_build(identity),
         latest: status_read,
         seen,
     };
@@ -2162,7 +2167,7 @@ fn status_cli(args: &[String]) -> Result<(), String> {
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
         let kept = agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
-        take_reads(&kept, &lead, &mut latest, &mut asks);
+        take_reads(&kept, &lead, client.identity(), &mut latest, &mut asks);
         let read = read_status(
             &client,
             &store,
@@ -2174,7 +2179,7 @@ fn status_cli(args: &[String]) -> Result<(), String> {
         )
         .await?;
         if read.fresh {
-            keep_reads(&kept, &lead, &latest, &asks);
+            keep_reads(&kept, &lead, client.identity(), &latest, &asks);
         }
         Ok::<_, String>(read)
     })?;
@@ -9958,7 +9963,14 @@ impl App {
         self.warmed().await;
         let lead = self.scope().lead;
         if self.status_read.is_empty() {
-            take_reads(&store, &lead, &mut self.status_read, &mut self.asks_seen);
+            let identity = self.client.identity();
+            take_reads(
+                &store,
+                &lead,
+                identity,
+                &mut self.status_read,
+                &mut self.asks_seen,
+            );
         }
         let (project, rows) = match self.status_rows().await {
             Ok(read) => read,
@@ -9968,7 +9980,8 @@ impl App {
             }
         };
         if std::mem::take(&mut self.reads_unkept) {
-            keep_reads(&store, &lead, &self.status_read, &self.asks_seen);
+            let identity = self.client.identity();
+            keep_reads(&store, &lead, identity, &self.status_read, &self.asks_seen);
         }
         let alerts = self.status_alerts().await;
         self.watch = Some(Watch {
@@ -10351,7 +10364,7 @@ impl App {
                     let kept = agent_client::socket::canonical_store(&store)
                         .unwrap_or_else(|_| store.clone());
                     let (mut latest, mut seen) = (HashMap::new(), HashMap::new());
-                    take_reads(&kept, &lead, &mut latest, &mut seen);
+                    take_reads(&kept, &lead, client.identity(), &mut latest, &mut seen);
                     let view = StatusView {
                         bot: "",
                         asks: &[],
@@ -10366,7 +10379,7 @@ impl App {
                             .await
                             .ok()?;
                     if read.fresh {
-                        keep_reads(&kept, &lead, &latest, &seen);
+                        keep_reads(&kept, &lead, client.identity(), &latest, &seen);
                     }
                     woken.notify_one();
                     Some((latest, seen))
@@ -17415,7 +17428,7 @@ mod tests {
         drop(app);
         // The next reads none: nothing moved, and another lead keeping its
         // own reads in the same store takes nothing of this one's.
-        keep_reads(&store, "docs.lead", &HashMap::new(), &HashMap::new());
+        keep_reads(&store, "docs.lead", None, &HashMap::new(), &HashMap::new());
         let app = open().await;
         assert_eq!(histories.load(Ordering::SeqCst), 4);
         drop(app);
@@ -17430,6 +17443,24 @@ mod tests {
         std::fs::write(&kept, file.to_string()).unwrap();
         open().await;
         assert_eq!(histories.load(Ordering::SeqCst), 10);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn reads_kept_from_one_store_are_never_taken_for_another_at_its_path() {
+        let home = std::env::temp_dir().join(format!("status-store-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let store = home.join("state.sqlite");
+        let latest = HashMap::from([("shop.t1".to_owned(), (json!([1, 1]), Latest::default()))]);
+        keep_reads(&store, "shop.lead", Some("first"), &latest, &HashMap::new());
+        let taken = |identity| {
+            let (mut latest, mut seen) = (HashMap::new(), HashMap::new());
+            take_reads(&store, "shop.lead", identity, &mut latest, &mut seen);
+            latest.len()
+        };
+        assert_eq!(taken(Some("first")), 1);
+        // The store made again at the same path: its agents are others.
+        assert_eq!(taken(Some("second")), 0);
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -24974,7 +25005,13 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let store = home.join("state.sqlite");
         let start = std::time::Instant::now();
-        keep_reads(&store, &app.bot, &app.status_read, &app.asks_seen);
+        keep_reads(
+            &store,
+            &app.bot,
+            app.client.identity(),
+            &app.status_read,
+            &app.asks_seen,
+        );
         eprintln!("STATUS kept in {:?}", start.elapsed());
         let (client, _events) = Client::connect(Path::new(&socket)).await.unwrap();
         let mut again = super::tests::app(client);
@@ -24983,6 +25020,7 @@ mod tests {
         take_reads(
             &store,
             &again.bot,
+            again.client.identity(),
             &mut again.status_read,
             &mut again.asks_seen,
         );
