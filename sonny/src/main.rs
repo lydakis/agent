@@ -14377,12 +14377,12 @@ impl App {
             }
             if let Some((replies, list)) = &self.reacting {
                 // Newest at the bottom, nearest the composer, as they read.
-                let items: Vec<list::Item> = (list.shown().into_iter())
-                    .filter_map(|(at, found)| {
+                let items: Vec<list::Item> = (list.shown().iter())
+                    .filter_map(|&(at, ref found)| {
                         let (node, said) = replies.get(at)?;
                         let on = self.reactions.on(*node).join(" ");
                         let room = width.saturating_sub(10 + on.width());
-                        Some(list::Item::new(transcript::cut(said, room), on).found(&found))
+                        Some(list::Item::new(transcript::cut(said, room), on).found(found))
                     })
                     .collect();
                 over(
@@ -14411,13 +14411,13 @@ impl App {
                 // Newest last, as they happened; the reason stays in view
                 // before a retry is approved.
                 let room = (composer.width as usize).saturating_sub(8);
-                let items: Vec<list::Item> = (list.shown().into_iter())
-                    .filter_map(|(at, found)| {
+                let items: Vec<list::Item> = (list.shown().iter())
+                    .filter_map(|&(at, ref found)| {
                         let denied = denials.get(at)?;
                         let what = self.denied_what(denied);
                         Some(
                             list::Item::new(transcript::cut(&what, room / 2), denied_why(denied))
-                                .found(&found),
+                                .found(found),
                         )
                     })
                     .collect();
@@ -14438,13 +14438,13 @@ impl App {
             if let Some((Choice::Speed, list)) = &self.choosing {
                 let now = self.speed.as_deref().unwrap_or("standard");
                 let rows = self.speed_rows();
-                let items: Vec<list::Item> = (list.shown().into_iter())
-                    .filter_map(|(at, found)| {
+                let items: Vec<list::Item> = (list.shown().iter())
+                    .filter_map(|&(at, ref found)| {
                         let (speed, about) = rows.get(at)?;
                         Some(
                             list::Item::new(*speed, *about)
                                 .current(*speed == now)
-                                .found(&found),
+                                .found(found),
                         )
                     })
                     .collect();
@@ -14477,13 +14477,13 @@ impl App {
                 return;
             }
             if let Some((_, list)) = &self.choosing {
-                let items: Vec<list::Item> = (list.shown().into_iter())
-                    .filter_map(|(at, found)| {
+                let items: Vec<list::Item> = (list.shown().iter())
+                    .filter_map(|&(at, ref found)| {
                         let mode = self.rows.get(at)?;
                         Some(
                             list::Item::new(&mode.label, &mode.about)
                                 .current(Some(mode.name) == self.mode)
-                                .found(&found),
+                                .found(found),
                         )
                     })
                     .collect();
