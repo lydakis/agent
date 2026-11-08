@@ -1726,22 +1726,26 @@ impl Screen {
                 .set_symbol(REPLY)
                 .set_style(Style::new().add_modifier(Modifier::DIM));
             self.reply = Some((y, area.x, node));
-            // When it was written, muted where its words start, on the row
-            // over them: only a row on screen with nothing on it, the gap
-            // over an agent's words or the band's over the person's, so
-            // the time never covers anything and no row is made wider.
+            // When it was written, muted, at the top right edge of the
+            // message: the right end of the row over it, only a row on
+            // screen with nothing on it, the gap over an agent's words or
+            // the band's over the person's, so the time never covers
+            // anything and no row is made wider.
             if at > top
                 && self.shown[at - 1].line.width() == 0
                 && let Some(&ms) = self.dates.get(&node)
-                && area.width > GUTTER
             {
-                buf.set_stringn(
-                    area.x + GUTTER,
-                    y - 1,
-                    crate::stamp::written(ms),
-                    (area.width - GUTTER) as usize,
-                    Style::new().add_modifier(Modifier::DIM),
-                );
+                let when = crate::stamp::written(ms);
+                let wide = when.width() as u16;
+                // Inset from the right as the words are from the left.
+                if area.width > 2 * GUTTER + wide {
+                    buf.set_string(
+                        area.x + area.width - GUTTER - wide,
+                        y - 1,
+                        when,
+                        Style::new().add_modifier(Modifier::DIM),
+                    );
+                }
             }
         }
         // An agent's message under the mouse shows the react mark where
@@ -2615,7 +2619,7 @@ mod tests {
     }
 
     #[test]
-    fn the_message_under_the_mouse_shows_when_it_was_written_on_the_empty_row_over_it() {
+    fn the_message_under_the_mouse_shows_when_it_was_written_at_its_top_right_on_the_empty_row() {
         let mut screen = Screen::default();
         screen.push(vec![Line::from("• The tests pass.")]);
         screen.mark_last(Mark::Tag(Tag::End(5)));
@@ -2641,12 +2645,12 @@ mod tests {
         // Nothing at rest.
         let buf = draw(&mut screen);
         assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
-        // Over a message, its time where its words start, on the blank row
-        // over them, muted.
+        // Over a message, its time at its top right edge, on the blank row
+        // over it, muted.
         screen.mouse(mouse(MouseEventKind::Moved, 4, 2));
         let buf = draw(&mut screen);
-        assert_eq!(row(&buf, 1).trim_end(), format!("  {when}"));
-        assert!(buf[(2, 1)].modifier.contains(Modifier::DIM));
+        assert_eq!(row(&buf, 1), format!("{when:>38}  "));
+        assert!(buf[(37, 1)].modifier.contains(Modifier::DIM));
         assert!(row(&buf, 2).starts_with("↩ thanks"));
         // The first row on screen has no row over it: no time.
         screen.mouse(mouse(MouseEventKind::Moved, 4, 0));

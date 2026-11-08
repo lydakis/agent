@@ -682,8 +682,9 @@ way `/react` does, and each note in the margin has its own `↩`.
 
 ![The message quoted into the composer](../docs/sonny/reply-quoted.png)
 
-The message under the mouse also says when it was written, muted, on
-the empty row over its words where they start: `Sat 7 Nov 09:13`, the
+The message under the mouse also says when it was written, muted, at
+its top right edge, the right end of the empty row over it:
+`Sat 7 Nov 09:13`, the
 year too when it is not this one, on the 12-hour clock where your
 locale's time format (`LC_TIME`) reads that way, `Sat 7 Nov 9:13 AM`.
 It is the time the daemon wrote the message into the history, so a
