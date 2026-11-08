@@ -558,6 +558,9 @@ mod tests {
                         "finished_ms": ended(hours)}]})
                 }
                 Some("history_nodes") => json!({"nodes": [{"node": 20, "turn": 5}]}),
+                Some("history_items") => json!({"items": [{"node": 20,
+                    "item": {"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Done for now."}]}}]}),
                 Some("fork") => json!({"bot_id": 9}),
                 Some("submit") => json!({"handle": "turn:copy/1", "turn": 1}),
                 Some("wait") => json!({"results": {"turn:copy/1": {"status": "completed",
@@ -631,6 +634,9 @@ mod tests {
                 Some("turns") => json!({"turns": [{"turn": 5, "status": "completed",
                     "finished_ms": now - 9 * 3_600_000}]}),
                 Some("history_nodes") => json!({"nodes": [{"node": 20, "turn": 5}]}),
+                Some("history_items") => json!({"items": [{"node": 20,
+                    "item": {"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Done for now."}]}}]}),
                 Some("fork") => {
                     seen.store(true, Ordering::Release);
                     json!({"bot_id": 9})
@@ -672,7 +678,9 @@ mod tests {
                 Some("turns") => json!({"turns": [{"turn": 5, "status": "completed",
                     "finished_ms": now - 9 * 3_600_000}]}),
                 Some("history_nodes") => json!({"nodes": [{"node": 20, "turn": 5}]}),
-                Some("history_items") => json!({"items": []}),
+                Some("history_items") => json!({"items": [{"node": 20,
+                    "item": {"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Done for now."}]}}]}),
                 Some("fork") => {
                     made.fetch_add(1, Ordering::Relaxed);
                     json!({"bot_id": 9})

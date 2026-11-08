@@ -5947,9 +5947,13 @@ async fn lead_paused(
     name: &str,
 ) -> Result<Option<String>, String> {
     let unread = || format!("whether {name} is done could not be read, so this did not run");
-    let ran = crate::last_ran(client, name, None)
-        .await
-        .map_err(|_| unread())?;
+    let ran = match crate::last_ran(client, name, None).await {
+        Ok(ran) => ran,
+        // A lead that is gone is not paused: the fire finds it gone, and a
+        // repeating automation retires as ever.
+        Err(error) if error.code == "bot_not_found" => return Ok(None),
+        Err(_) => return Err(unread()),
+    };
     let newest = ran["turn"].as_i64();
     let mark = store.and_then(|store| crate::resolved::read(store, name));
     // Its history is read only when no mark says it already.
@@ -8935,6 +8939,13 @@ pub(crate) mod tests {
         )
         .await;
         assert!(lead_paused(&client, None, "web.lead").await.is_err());
+        // A lead that is gone is no unread one: the fire goes on to find it
+        // gone, which retires a repeating automation.
+        let client = crate::tests::daemon_answering(
+            |_| json!({"error": "bot_not_found", "detail": "no bot named web.lead"}),
+        )
+        .await;
+        assert_eq!(lead_paused(&client, None, "web.lead").await, Ok(None));
     }
 
     #[test]
