@@ -1306,9 +1306,7 @@ fn preview(store: &Path, subscriber: &str, sub: &Sub) -> Value {
     let mut times = Vec::new();
     let mut newest = Vec::new();
     for (event, was_cut) in &events {
-        let own =
-            event.from.as_deref() == Some(subscriber) || event.told.iter().any(|t| t == subscriber);
-        if own || !sub.hears(event) {
+        if event.from.as_deref() == Some(subscriber) || !sub.hears(event) {
             continue;
         }
         heard += 1;
