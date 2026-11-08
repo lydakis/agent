@@ -238,7 +238,8 @@ tries its held turns at once.
   end, so `turns --bot NAME --newest --limit 3` is a bot's last three turns.
 - `usage` prints what the bots' turns spent as one JSON object: tokens in
   all, by bot (the `--limit` that spent most, 64 by default, the rest summed),
-  and by model. `--name GLOB` keeps the bots `ls --name` would, `--since 7d`
+  and by the model that spent them, with each model's cache writes, so a
+  summary or fallback on another model counts under that model. `--name GLOB` keeps the bots `ls --name` would, `--since 7d`
   counts only turns started that long ago or since, and `--bucket 6h` adds a
   `series` of what was spent every six hours from then. Durations take `ms`,
   `s`, `m`, `h` or `d`.

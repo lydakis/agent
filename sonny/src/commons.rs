@@ -195,6 +195,9 @@ pub fn call(
     if let Some(name) = arguments["read"].as_str() {
         return read(&dir, name, author, from);
     }
+    if let Some(words) = arguments["search"].as_str() {
+        return search(&dir, words, author, from, LIST_BYTES);
+    }
     if arguments["post"].is_object() {
         let post = &arguments["post"];
         let (name, title, text) = (
@@ -347,6 +350,10 @@ fn start(dir: &Path, name: &str, title: &str, post: &Value) -> Result<Value, Str
     append(&path, &first)?;
     saw(dir, name, post["by"].as_str().unwrap_or_default());
     let mut started = json!({"thread": name, "posts": 1});
+    let similar = similar(dir, name, title);
+    if !similar.is_empty() {
+        started["similar_titles"] = json!(similar);
+    }
     // Agents whose turns touch it are invited, while the day has threads
     // left; now and then one of them is any agent at all.
     if let Some((reach, golden)) = reserve(dir, name) {
@@ -797,15 +804,8 @@ pub fn audience(home: &Path, thread: &str, author: &str) -> usize {
 /// later post never renames it and a long thread costs no more than a
 /// short one. None for no such thread.
 pub fn starter(home: &Path, thread: &str) -> Option<(String, Option<i64>)> {
-    use std::io::{BufRead, Read};
     valid_name(thread).ok()?;
-    let file = std::fs::File::open(dir(home).join(format!("{thread}.jsonl"))).ok()?;
-    let mut first = String::new();
-    // A post is a line; one past a megabyte is no post the tool wrote.
-    std::io::BufReader::new(file.take(1 << 20))
-        .read_line(&mut first)
-        .ok()?;
-    let post: Value = serde_json::from_str(first.trim()).ok()?;
+    let post = first_post(&dir(home).join(format!("{thread}.jsonl")))?;
     let by = post["by"].as_str()?.to_owned();
     Some((by, post["by_id"].as_i64()))
 }
@@ -859,21 +859,34 @@ fn read(dir: &Path, name: &str, author: &str, from: usize) -> Result<Value, Stri
         shown["of"] = json!(all.len());
     }
     saw(dir, name, author);
-    if from > 0 {
-        return Ok(shown);
+    if from == 0 {
+        count_reads(dir, &[name]);
+    }
+    Ok(shown)
+}
+
+/// Counts a read of each of `names` from the start, under the lock the
+/// caller holds.
+fn count_reads(dir: &Path, names: &[&str]) {
+    if names.is_empty() {
+        return;
     }
     let mut counts = reads(dir);
-    let count = counts
-        .get(name)
-        .and_then(|r| r["count"].as_u64())
-        .unwrap_or(0);
-    counts.insert(name.to_owned(), json!({"last": now(), "count": count + 1}));
+    for name in names {
+        let count = counts
+            .get(*name)
+            .and_then(|r| r["count"].as_u64())
+            .unwrap_or(0);
+        counts.insert(
+            (*name).to_owned(),
+            json!({"last": now(), "count": count + 1}),
+        );
+    }
     let _ = agent_client::files::replace_mode(
         &dir.join(READS),
         Value::Object(counts).to_string().as_bytes(),
         0o600,
     );
-    Ok(shown)
 }
 
 /// Each thread's summary as last read, by name, with the file's size and
@@ -969,6 +982,216 @@ fn list(
         listed["of"] = json!(of);
     }
     Ok(listed)
+}
+
+/// The most of a post's text a search shows: the rest is read.
+const SNIPPET_CHARS: usize = 500;
+/// The most threads with similar titles a new thread's answer names.
+const SIMILAR: usize = 5;
+
+/// What a search looks for: the words of `text`, lowercased.
+fn search_words(text: &str) -> Vec<String> {
+    let mut words: Vec<String> = (text.split(|c: char| !c.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    words.dedup();
+    words
+}
+
+/// The threads whose title or posts hold every word of `text`, case
+/// aside, newest first, from the `from`th, as many as `bytes` holds, each
+/// with the posts that hold them all (a title that does makes every post
+/// match), cut to `SNIPPET_CHARS`. One plain scan of the folder: a file
+/// missing a word is read but never parsed, and only the newest that may
+/// match are parsed, until the page is full, so a search costs the
+/// folder's bytes plus one page: about 10 ms for a thousand threads of
+/// 20 KB, 45 ms for five thousand, measured; an index waits until that
+/// matters. A thread whose every post is shown whole
+/// counts as read by `author`, as `read` from its start does; the rest are
+/// left for `read`.
+fn search(
+    dir: &Path,
+    text: &str,
+    author: &str,
+    from: usize,
+    bytes: usize,
+) -> Result<Value, String> {
+    let words = search_words(text);
+    if words.is_empty() {
+        return Err("commons_invalid: search names at least one word".into());
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({"search": words, "threads": []}));
+        }
+        entries => entries.map_err(|e| format!("commons_failed: {}: {e}", dir.display()))?,
+    };
+    let holds = |text: &str| {
+        let text = text.to_lowercase();
+        words.iter().all(|word| text.contains(word.as_str()))
+    };
+    // Each file that holds every word somewhere, by when it last changed:
+    // its last post.
+    let mut maybe: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = (path.file_name().and_then(|n| n.to_str()))
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            .filter(|n| valid_name(n).is_ok())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if holds(&raw) {
+            let at = (entry.metadata()).map_or(std::time::UNIX_EPOCH, |m| {
+                m.modified().unwrap_or(std::time::UNIX_EPOCH)
+            });
+            maybe.push((at, name, path));
+        }
+    }
+    maybe.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let (mut shown, mut size, mut read, mut found) = (Vec::new(), 0, Vec::new(), 0);
+    let mut next = None;
+    for (_, name, path) in &maybe {
+        let Ok(posts) = posts(path) else { continue };
+        let Some(first) = posts.first() else { continue };
+        let title = first["title"].as_str().unwrap_or_default();
+        let every = holds(title);
+        let mut whole = true;
+        // A thread's matches fit a page on their own: past that, how many
+        // more there are and the post to read from.
+        let (mut matches, mut held, mut more) = (Vec::new(), 0, None);
+        let hits = (posts.iter().enumerate())
+            .filter(|(_, post)| every || holds(post["text"].as_str().unwrap_or_default()));
+        for (n, post) in hits {
+            if let Some((count, _)) = &mut more {
+                *count += 1;
+                continue;
+            }
+            let text = post["text"].as_str().unwrap_or_default();
+            let cut = snippet(text);
+            let mut shown = json!({"post": n, "by": post["by"],
+                "when": when(post["at"].as_i64().unwrap_or(0)), "text": cut});
+            // As `read` marks it: written after reading outside content.
+            if post["external"] == true {
+                shown["external"] = json!(true);
+            }
+            held += shown.to_string().len();
+            if !matches.is_empty() && held > bytes {
+                more = Some((1, n));
+                continue;
+            }
+            whole &= shown["text"].as_str() == Some(text);
+            matches.push(shown);
+        }
+        // The words may sit in different posts, or outside any text.
+        if matches.is_empty() {
+            continue;
+        }
+        found += 1;
+        if found <= from {
+            continue;
+        }
+        let last = posts.last().unwrap_or(first);
+        let at = last["at"].as_i64().unwrap_or(0);
+        whole &= matches.len() == posts.len();
+        let mut thread = json!({"thread": name, "title": title, "started_by": first["by"],
+            "posts": posts.len(), "last_by": last["by"], "last_when": when(at),
+            "matches": matches});
+        if let Some((count, from)) = more {
+            thread["more_matches"] = json!(count);
+            thread["read_from"] = json!(from);
+        }
+        size += thread.to_string().len();
+        if !shown.is_empty() && size > bytes {
+            next = Some(found - 1);
+            break;
+        }
+        if whole {
+            read.push(name.clone());
+        }
+        shown.push(thread);
+    }
+    // The scan takes no lock, so posting never waits on it: a post being
+    // written, half a line, leaves its thread out of this search.
+    if !read.is_empty() {
+        let _lock = lock(dir)?;
+        for name in &read {
+            saw(dir, name, author);
+        }
+        count_reads(dir, &read.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+    let mut said = json!({"search": words, "threads": shown});
+    if let Some(next) = next {
+        said["next"] = json!(next);
+    }
+    Ok(said)
+}
+
+/// `text` cut to `SNIPPET_CHARS`, with an ellipsis when cut.
+fn snippet(text: &str) -> String {
+    match text.char_indices().nth(SNIPPET_CHARS) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.to_owned(),
+    }
+}
+
+/// The threads besides `name` whose titles share a word with `title`, as
+/// invites match agents (`words`): those sharing the most first, then the
+/// newest started, at most `SIMILAR`. Each thread's first line alone.
+fn similar(dir: &Path, name: &str, title: &str) -> Vec<Value> {
+    let words = words(title);
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(usize, i64, Value)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(other) = (path.file_name().and_then(|n| n.to_str()))
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            .filter(|n| *n != name && valid_name(n).is_ok())
+        else {
+            continue;
+        };
+        let Some(first) = first_post(&path) else {
+            continue;
+        };
+        let theirs = search_words(first["title"].as_str().unwrap_or_default());
+        let shared = words.iter().filter(|word| theirs.contains(word)).count();
+        if shared > 0 {
+            let at = first["at"].as_i64().unwrap_or(0);
+            found.push((
+                shared,
+                at,
+                json!({"thread": other, "title": first["title"]}),
+            ));
+        }
+    }
+    found.sort_by_key(|(shared, at, _)| (std::cmp::Reverse(*shared), std::cmp::Reverse(*at)));
+    found
+        .into_iter()
+        .take(SIMILAR)
+        .map(|(_, _, thread)| thread)
+        .collect()
+}
+
+/// A thread's first post, which never changes, read alone.
+fn first_post(path: &Path) -> Option<Value> {
+    use std::io::{BufRead, Read};
+    let file = std::fs::File::open(path).ok()?;
+    let mut first = String::new();
+    // A post is a line; one past a megabyte is no post the tool wrote.
+    std::io::BufReader::new(file.take(1 << 20))
+        .read_line(&mut first)
+        .ok()?;
+    serde_json::from_str(first.trim()).ok()
 }
 
 /// What one look at the commons found: its lines, and how far each
@@ -2005,6 +2228,134 @@ mod tests {
             0
         );
         assert_eq!(audience(home, "t", "a.x"), 0);
+    }
+
+    #[test]
+    fn a_search_finds_the_posts_that_hold_every_word_newest_first() {
+        let home = &home("search");
+        let say = |by: &str, arguments: Value| call(home, by, None, None, &arguments).unwrap();
+        say(
+            "a.x",
+            json!({"post": {"name": "wal", "title": "SQLite WAL stalls", "text": "Checkpoints stall under load."}}),
+        );
+        say(
+            "b.y",
+            json!({"reply": {"thread": "wal", "text": "Not here."}}),
+        );
+        say(
+            "c.z",
+            json!({"post": {"name": "timers", "title": "Flaky timers", "text": "A checkpoint STALLS the timer wheel too."}}),
+        );
+        let found = |words: &str| say("d.w", json!({"search": words}));
+        // Case aside, every word, in a post or the title; newest first.
+        let both = found("checkpoint stall");
+        let threads: Vec<&str> = (both["threads"].as_array().unwrap().iter())
+            .map(|t| t["thread"].as_str().unwrap())
+            .collect();
+        assert_eq!(threads, ["timers", "wal"]);
+        assert_eq!(
+            both["threads"][1]["matches"],
+            json!([{"post": 0, "by": "a.x",
+            "when": both["threads"][1]["matches"][0]["when"], "text": "Checkpoints stall under load."}])
+        );
+        assert_eq!(both["threads"][1]["posts"], 2);
+        // A title that holds the words makes every post match.
+        let titled = found("wal");
+        assert_eq!(titled["threads"][0]["matches"].as_array().unwrap().len(), 2);
+        assert!(
+            found("checkpoint nowhere")["threads"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            call(home, "d.w", None, None, &json!({"search": " - "}))
+                .unwrap_err()
+                .starts_with("commons_invalid")
+        );
+        // A thread shown whole counts as read: wal by its title, timers as
+        // its one post.
+        let listed = say("e.v", json!({}));
+        let reads: HashMap<&str, &Value> = (listed["threads"].as_array().unwrap().iter())
+            .map(|t| (t["thread"].as_str().unwrap(), &t["reads"]))
+            .collect();
+        assert_eq!(reads["wal"], &json!(1));
+        assert_eq!(reads["timers"], &json!(1));
+        assert_eq!(audience(home, "wal", "a.x"), 2);
+    }
+
+    #[test]
+    fn a_search_cuts_long_posts_and_comes_in_pieces() {
+        let home = &home("search_pieces");
+        // One three characters past the cut is as long cut as whole, in bytes.
+        let edge = format!("needle {}", "x".repeat(SNIPPET_CHARS - 4));
+        let post = json!({"post": {"name": "edge", "title": "E", "text": edge}});
+        call(home, "a.x", None, None, &post).unwrap();
+        search(&dir(home), "needle", "d.w", 0, LIST_BYTES).unwrap();
+        let listed = call(home, "e.v", None, None, &json!({})).unwrap();
+        assert_eq!(listed["threads"][0]["reads"], 0);
+        std::fs::remove_file(dir(home).join("edge.jsonl")).unwrap();
+        let long = format!("needle {}", "x".repeat(2 * SNIPPET_CHARS));
+        for n in 0..3 {
+            let post = json!({"post": {"name": format!("t{n}"), "title": "T", "text": long}});
+            call(home, "a.x", None, None, &post).unwrap();
+        }
+        let found = search(&dir(home), "needle", "d.w", 0, 1).unwrap();
+        assert_eq!(found["next"], 1);
+        let text = found["threads"][0]["matches"][0]["text"].as_str().unwrap();
+        assert_eq!(text.chars().count(), SNIPPET_CHARS + 1);
+        assert!(text.ends_with('…'));
+        let rest = search(&dir(home), "needle", "d.w", 1, LIST_BYTES).unwrap();
+        assert_eq!(rest["threads"].as_array().unwrap().len(), 2);
+        assert!(rest.get("next").is_none());
+        // One thread's matches past a page: how many more, and where to
+        // read; a post written after outside content says so, as in read.
+        for external in [true, false, false] {
+            let reply = json!({"reply": {"thread": "t0", "text": long, "external": external}});
+            call(home, "b.y", None, None, &reply).unwrap();
+        }
+        let many = search(&dir(home), "needle", "d.w", 0, 3 * SNIPPET_CHARS).unwrap();
+        let thread = &many["threads"][0];
+        assert_eq!(thread["thread"], "t0");
+        assert_eq!(thread["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(thread["matches"][1]["external"], true);
+        assert!(thread["matches"][0].get("external").is_none());
+        assert_eq!(
+            (thread["more_matches"].clone(), thread["read_from"].clone()),
+            (json!(2), json!(2))
+        );
+        // A cut post is not a read.
+        let listed = call(home, "e.v", None, None, &json!({})).unwrap();
+        assert!(
+            listed["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["reads"] == 0)
+        );
+    }
+
+    #[test]
+    fn a_new_thread_names_threads_with_similar_titles() {
+        let home = &home("similar");
+        let post = |name: &str, title: &str| {
+            let post = json!({"post": {"name": name, "title": title, "text": "?"}});
+            call(home, "a.x", None, None, &post).unwrap()
+        };
+        assert!(
+            post("wal", "SQLite WAL checkpoint stalls")
+                .get("similar_titles")
+                .is_none()
+        );
+        post("timers", "Flaky timers");
+        post("ckpt", "Checkpoint tuning");
+        let started = post("again", "Checkpoint stalls under load");
+        // Those sharing the most words first; never itself.
+        assert_eq!(
+            started["similar_titles"],
+            json!([{"thread": "wal", "title": "SQLite WAL checkpoint stalls"},
+                {"thread": "ckpt", "title": "Checkpoint tuning"}])
+        );
     }
 
     #[test]
