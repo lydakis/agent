@@ -924,11 +924,19 @@ fn keep_reads(
         seen,
     };
     if let Ok(bytes) = serde_json::to_vec(&kept) {
+        // History excerpts: only the person reads them, as with the store.
+        use std::os::unix::fs::PermissionsExt;
         let file = reads_file(store, lead);
-        if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        if let Some(dir) = file.parent()
+            && std::fs::create_dir_all(dir)
+                .and_then(|()| {
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                })
+                .is_err()
+        {
+            return;
         }
-        let _ = waiting::replace(&file, &bytes);
+        let _ = agent_client::files::replace_mode(&file, &bytes, 0o600);
     }
 }
 
@@ -17436,8 +17444,14 @@ mod tests {
         ran.store(true, Ordering::SeqCst);
         open().await;
         assert_eq!(histories.load(Ordering::SeqCst), 6);
-        // What another build kept is read again.
+        // Only the person can read the histories kept.
+        use std::os::unix::fs::PermissionsExt;
         let kept = reads_file(&store, "shop.lead");
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&kept), 0o600);
+        assert_eq!(mode(kept.parent().unwrap()), 0o700);
+        // What another build kept is read again.
         let mut file: Value = serde_json::from_slice(&std::fs::read(&kept).unwrap()).unwrap();
         file["build"] = json!("another");
         std::fs::write(&kept, file.to_string()).unwrap();
