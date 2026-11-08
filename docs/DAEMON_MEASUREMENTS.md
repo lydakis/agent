@@ -8056,3 +8056,93 @@ The same screen on a 4-CPU Linux container, release builds of 3b3a00f and
 - **Per idle bot moves both ways.** It reads -8.8% on another local round, against +19.2% and +11.3% here, at 1.3 to 1.75 KiB. Nothing new is held per idle bot: the map of summaries running has an entry only while one runs.
 - **A false RSS reading.** A first local footprint and lifecycle run showed head's RSS 2.8 MiB higher. All of the gap was in file-backed pages of the head binary (13.8 MiB resident against 11.1 MiB), and its anonymous memory and heap matched main's to the KiB (1644 KiB each). The head binary had just been built, so more of it sat in the page cache. Fresh copies of the two binaries gave 15.9 and 15.8 MiB idle, and the footprint and lifecycle rows above are from those copies.
 - **CPU and latency** moved both ways within the runner's noise. Under the gate's rule, nothing warned.
+
+## A turn's start parses nothing it already has
+
+Found while benchmarking after Wave 3 (2026-11-08). Callgrind on the
+five-harness screen's c32-h65536 case (32 agents, 3 turns each, 64 KiB of
+history, synthetic model) showed where the store thread's instructions went
+on main 0b35e4c (daemon unchanged since deaff2c):
+
+- **Each prompt's opening was parsed back out of its item by SQLite.** The
+  `openings` insert ran `json_extract` over the whole 64 KiB item, twice, to
+  get the first part's text and its length: 2.4 million instructions a turn,
+  19% of the daemon's instructions in this case. That first part is the
+  prompt's own words, which the store holds as it writes the item, so the
+  opening and its length now come from them. An item rewritten in place (a
+  declined note) still has its opening read back from the item.
+- **The bot row's 52-column `SELECT` was prepared on every read.** `inspect`
+  and `inspect_id` built the statement with `format!` and ran it uncached:
+  about 265,000 instructions to parse each time, 5 reads a turn, 11% of the
+  instructions. #831's six status columns made each parse 17% dearer. Both
+  reads now use the statement cache.
+- The per-turn `UPDATE`s of a turn's start and model round, and the
+  checkpoint insert, were prepared on each run too; they are cached now.
+
+| Measure, c32-h65536 | main | head | Change |
+| --- | ---: | ---: | ---: |
+| daemon instructions (callgrind, one run) | 1,218 M | 766 M | -37% |
+| store thread instructions | 829 M | 377 M | -55% |
+| daemon CPU, s (16 runs each, interleaved) | 0.305 | 0.245 | -20% |
+| first chunk p50, ms | 67 | 57 | -15% |
+| turn p99, ms | 590 | 576 | -2% |
+| RSS, MiB | 26.2 | 26.3 | 0% |
+
+The rest of a turn's start is now writing the item (`insert_node`) and
+building it (`prompt_item`). Openings read the same: the store contract
+tests that read them back pass unchanged.
+
+The hot-path screen (`bench.perf_gate`'s four benches, two alternating
+rounds) on the same 4-CPU Linux container, main 0b35e4c against head:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 41.292 | 36.011 | -12.8% |
+| admission | burst submit p99, ms | 6.888 | 3.926 | -43.0% |
+| completion | release to terminal p99, ms | 12.916 | 9.41 | -27.1% |
+| footprint | idle RSS, MiB | 15.266 | 15.254 | -0.1% |
+| footprint | per idle bot, KiB | 1.766 | 1.776 | +0.6% |
+| footprint | RSS after a turn each, MiB | 25.299 | 28.436 | +12.4% |
+| footprint | CPU per turn, ms | 1.241 | 0.868 | -30.1% |
+| lifecycle | CPU, s | 0.635 | 0.54 | -15.0% |
+| lifecycle | p95 turn, ms | 595.095 | 583.936 | -1.9% |
+| lifecycle | peak RSS, MiB | 22.949 | 23.273 | +1.4% |
+
+The Perf workflow's screen on the pull request (GitHub runner, base
+0b35e4c against head 2321b86):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 41.475 | 35.732 | -13.8% |
+| admission | burst submit p99, ms | 7.162 | 4.532 | -36.7% |
+| completion | release to terminal p99, ms | 14.283 | 10.607 | -25.7% |
+| footprint | idle RSS, MiB | 15.027 | 15.102 | +0.5% |
+| footprint | per idle bot, KiB | 1.862 | 1.872 | +0.5% |
+| footprint | RSS after a turn each, MiB | 25.176 | 27.871 | +10.7% |
+| footprint | CPU per turn, ms | 1.333 | 0.996 | -25.3% |
+| lifecycle | CPU, s | 0.625 | 0.515 | -17.6% |
+| lifecycle | p95 turn, ms | 583.032 | 580.025 | -0.5% |
+| lifecycle | peak RSS, MiB | 22.801 | 23.084 | +1.2% |
+
+It warned on two Sonny rows the change does not touch: lookout note p95 at
+10x100 (2,408 to 2,930 ms) and quiet window CPU (0.76 to 0.98 ms/s). Three
+local rounds of the same screen read them the other way and inside noise
+(note p95 2,900 to 2,519 ms; quiet window 1.19 to 1.16 ms/s), with no
+warning.
+
+Store work per turn is the same (7.37 jobs a turn on both). The footprint
+prompts are two bytes long, so their gain is the cached bot read and
+`UPDATE`s, not the openings.
+
+**RSS after a turn each is glibc's arenas, not held memory.** That row is
+the allocator's high-water mark after 1,000 turns submitted at once. Over
+six fresh-copy runs at 1,000 bots it read 25.1 MiB on main and 27.1 on the
+head. At 3,000 bots the head's growth over the created bots was bimodal: 7
+to 8 MiB like main's in some runs, 15 to 34 MiB in others. With
+`MALLOC_ARENA_MAX=1` every head run read 7.1 to 8.5 MiB (and CPU per turn
+went from about 1.0 to 1.2 ms). A store thread that answers faster meets the
+runtime's threads in malloc more often, and glibc opens another arena for
+them, which keeps what it freed. The head with only the openings change
+(bot read uncached) showed no such run at either size. No live state grows
+with the change: idle RSS and per idle bot are flat. Capping glibc's arenas
+is its own decision (it costs CPU), and macOS's allocator has no arenas.

@@ -862,15 +862,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   tasks, or `waiting on its reviewer` while the reviewer weighs a call), **Idle**
   (its turn ended, stopped, or never started, with nothing open; a pull
   request its last reply linked shows on its row), and **Done** (marked
-  done). Each agent is one line: its mark, name, state and time, and at
-  its right edge, dim, its code reviews; one that needs you says what for
-  under it. That is all it shows as it opens; `m` shows more and hides it
+  done). Each agent is one line: its mark, name, state and time; one
+  that needs you says what for under it. That is all it shows as it opens; `m` shows more and hides it
   again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
   `icon` in `[sonny.sources.NAME]` shows as that icon, as it does wherever
-  Sonny names that source: `/background` and the "From your sources" row), the code reviews
-  its turns opened or wait on, in any system, as the copy that checks
-  each turn names them from its commands' output and reply (`3 reviews · CR-881`; a pull or merge request link its last
-  reply holds shows before any is kept), its background work
+  Sonny names that source: `/background` and the "From your sources" row), a pull or merge
+  request link its last reply holds, its background work
   and its window, and under the picked agent its model and profile, and
   its latest step. Idle and Done fold to their headings (`Idle · 5 ▸`,
   `Done · 3 ▸`). A click on either, or `i` and `d`
@@ -889,13 +886,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   their runs (`/background` says `last paused: web.lead is done`) until a
   message, from you or any agent, reopens it. A run you ask for with
   `fire` still runs, and reopens it.
-  A task idle for `[sonny] task_done_check` hours (8 by default, 0
-  never) is asked by its lead's window, through a copy of it with no
-  tools, whether its work is done: a yes marks it done, its row saying
-  `marked done by the check at 14:02: its pull request merged`, and a no
-  says `checked at 14:02, work left: …` until its next turn; either way it
-  is not asked again until another of its turns ends. Leads are never
-  asked, and with no window of the project open nothing is. Each agent's
+  Each agent's
   time is how long its running turn has been at it, or how long its last
   turn took. Beside its model each agent names the profile it runs
   as, `lead` and `task` too, which the footer leaves out (it names a
@@ -1668,23 +1659,9 @@ opens `/status`. Every surface reads what needs you one way: an agent
 needs you while a call of its waits on your approval (gated for you, or
 handed to you by the reviewer) or a question it asked you is still open,
 read from the daemon whole when Sonny starts or reconnects, so a restart
-loses neither, and kept current by its events after. A question left in a
-reply's words counts too: once an agent's turn ends with words and no
-question asked, the window of its project that sees it end has a copy of
-it, with no tools, say at once whether they wait on you and what for (one
-small call, its history read from the provider's cache of the turn just
-ended). It is the window's own work, so nothing runs for it while no
-window of the project is open; a task's turn that ended meanwhile is
-checked once a lead's window opens, as it looks over its idle tasks for
-the done check, then never read again until the task moves. A task's
-reply goes to its lead, which hears every one and asks you itself what
-needs you, so a task's turn waits on you only when it took in words of
-yours, written in its window; a turn its lead or the lookout started
-never does. A yes is kept beside the store (`STORE.waiting/AGENT.json`)
-until the agent's next turn. It is status alone, in the footer, the
-tabs and `/status`, which says `waits on you for: …`: no window draws it
-as a card, as it does a question the agent asked. `[sonny] needs_check = false`
-turns the check off. `sonny status [AGENT] [--json]` prints the project
+loses neither, and kept current by its events after. A task's reply
+goes to its lead, which hears every one and asks you itself what needs
+you. `sonny status [AGENT] [--json]` prints the project
 `/status` shows, as text or JSON, for an agent's shell or a script: AGENT
 is a lead, a task or a project, and an agent's own shell defaults to it.
 The footer, the task tabs' names, `/status`, `sonny status`, the started

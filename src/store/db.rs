@@ -3225,22 +3225,18 @@ impl Database {
     }
     /// The bot holding identity `id`, whatever it is named.
     pub fn inspect_id(&self, id: i64) -> Result<Bot> {
+        // Cached: parsing this many columns costs more than the read.
         self.conn
-            .query_row(
-                &format!("SELECT {} FROM bots WHERE id=?", Self::COLUMNS),
-                [id],
-                Self::row,
-            )
+            .prepare_cached(&format!("SELECT {} FROM bots WHERE id=?", Self::COLUMNS))?
+            .query_row([id], Self::row)
             .optional()?
             .ok_or(Error::new("bot_not_found"))
     }
     pub fn inspect(&self, name: &str) -> Result<Bot> {
+        // Cached: parsing this many columns costs more than the read.
         self.conn
-            .query_row(
-                &format!("SELECT {} FROM bots WHERE name=?", Self::COLUMNS),
-                [name],
-                Self::row,
-            )
+            .prepare_cached(&format!("SELECT {} FROM bots WHERE name=?", Self::COLUMNS))?
+            .query_row([name], Self::row)
             .optional()?
             .ok_or(Error::new("bot_not_found"))
     }
@@ -7198,7 +7194,7 @@ impl Database {
         // them once its item holds their words.
         type Steer = (
             i64,
-            (Vec<u8>, Pictured, Option<Vec<u8>>),
+            Prompted,
             usize,
             Option<usize>,
             Option<String>,
@@ -7288,7 +7284,7 @@ impl Database {
                 let pictures = images_from(images.as_deref())?;
                 let prompted = prompt_item(family, &row.get::<_, String>(1)?, &after, &pictures)?;
                 // Its pictures count at their weight, as the node will.
-                let weight = (prompted.0.len() as i64 - prompted.1.extra) as usize;
+                let weight = (prompted.item.len() as i64 - prompted.pictured.extra) as usize;
                 if weight + 1 > room_bytes || room_items == 0 {
                     capped = true;
                     break;
@@ -7552,22 +7548,22 @@ impl Database {
             (0, false) => head,
             _ => bot.head,
         };
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE bots SET head=?,closed=CASE WHEN ?3 THEN closed ELSE ?2 END,open_calls=?4 WHERE name=?5",
-            params![
-                head,
-                closed,
-                calls.is_empty() && last_reasoning,
-                calls.len() as i64,
-                bot.name
-            ],
-        )?;
+        )?
+        .execute(params![
+            head,
+            closed,
+            calls.is_empty() && last_reasoning,
+            calls.len() as i64,
+            bot.name
+        ])?;
         // A successful response consumes a round in the same durable commit
         // as its messages and tool plans. Failed requests end the turn.
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE turns SET model_rounds=model_rounds+1,view_sent=1,limited=?,drops=0 WHERE id=?",
-            params![limit.map(Limit::as_str), turn],
-        )?;
+        )?
+        .execute(params![limit.map(Limit::as_str), turn])?;
         tx.commit()?;
         self.approvals += announced_calls;
         self.served.extend(served);
@@ -10286,10 +10282,8 @@ impl Database {
         ])?;
         promote(&tx, &bot.name)?;
         if status == "completed" {
-            tx.execute(
-                "INSERT INTO checkpoints VALUES (?,?)",
-                params![bot.name, head],
-            )?;
+            tx.prepare_cached("INSERT INTO checkpoints VALUES (?,?)")?
+                .execute(params![bot.name, head])?;
         }
         let mut data = json!({"status":status,"checkpoint":if status == "completed" { head } else { None },
             "error":code,"detail":error.and_then(|e| e.detail.clone())});
@@ -11421,7 +11415,8 @@ impl Database {
                 "UPDATE bots SET work_read=? WHERE name=?",
                 params![parent.work.read.map(|read| read.min(node)), name],
             )?;
-            tx.execute("INSERT INTO checkpoints VALUES (?,?)", params![name, node])?;
+            tx.prepare_cached("INSERT INTO checkpoints VALUES (?,?)")?
+                .execute(params![name, node])?;
             // The newest note version at or before the checkpoint, along
             // the source's version chain; ids grow along a lineage.
             let mut version = parent.note;
@@ -13961,22 +13956,20 @@ fn start_locked(
     keep_sender(tx, turn, head, data)?;
     let now = epoch_ms();
     if prompt.len() >= PROMPT_SHARE_BYTES {
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE turns SET status='running',started_ms=?,held=NULL,prompt='',prompt_node=? WHERE id=?",
-            params![now, head, turn],
-        )?;
+        )?
+        .execute(params![now, head, turn])?;
     } else {
-        tx.execute(
-            "UPDATE turns SET status='running',started_ms=?,held=NULL WHERE id=?",
-            params![now, turn],
-        )?;
+        tx.prepare_cached("UPDATE turns SET status='running',started_ms=?,held=NULL WHERE id=?")?
+            .execute(params![now, turn])?;
     }
     // `finish` answers every call, so a turn starts on a closed head.
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE bots SET head=?1,status='running',running_turn=?2,closed=?1,open_calls=0,
             started_ms=?4,waiting_on=NULL WHERE name=?3",
-        params![head, turn, bot.name, now],
-    )?;
+    )?
+    .execute(params![head, turn, bot.name, now])?;
     Ok(Some(head))
 }
 /// The pictures a turn's prompt was sent with, as its `images` column
@@ -15790,7 +15783,7 @@ fn prompt_item(
     prompt: &str,
     after: &[String],
     images: &[crate::codec::Image],
-) -> Result<(Vec<u8>, Pictured, Option<Vec<u8>>)> {
+) -> Result<Prompted> {
     let item = family.user_item_from(prompt, after, images)?;
     let pictured = Pictured::of(images);
     let stub = match images.len() {
@@ -15800,22 +15793,50 @@ fn prompt_item(
             super::context::prompt_stub(family, prompt, after, count, weight)?
         }
     };
-    Ok((item, pictured, stub))
+    // The item's first part is the prompt itself, so its opening comes
+    // from the words in hand, not from parsing the item back.
+    let opening = prompt.chars().take(Database::OPENING_CHARS).collect();
+    let chars = prompt.chars().count() as i64;
+    Ok(Prompted {
+        item,
+        pictured,
+        stub,
+        opening,
+        chars,
+    })
+}
+/// A prompt's item with its pictures and stub, and how its words begin.
+struct Prompted {
+    item: Vec<u8>,
+    pictured: Pictured,
+    stub: Option<Vec<u8>>,
+    opening: String,
+    chars: i64,
 }
 /// A prompt on the lineage, with its stub, which saves what it weighs less.
 fn prompt_node(
     conn: &Connection,
     parent: Option<i64>,
-    (item, pictured, stub): &(Vec<u8>, Pictured, Option<Vec<u8>>),
+    prompted: &Prompted,
     turn: Option<i64>,
 ) -> Result<i64> {
-    let weight = item.len() as i64 - pictured.extra;
-    let elided = stub.as_ref().map_or(0, |stub| weight - stub.len() as i64);
-    let id = insert_node(conn, parent, item, turn, elided, *pictured)?;
-    // How the prompt begins, parsed once here rather than by each read.
-    conn.prepare_cached(OPENING)?
-        .execute(params![id, item, Database::OPENING_CHARS as i64])?;
-    if let Some(stub) = stub {
+    let weight = prompted.item.len() as i64 - prompted.pictured.extra;
+    let elided = prompted
+        .stub
+        .as_ref()
+        .map_or(0, |stub| weight - stub.len() as i64);
+    let id = insert_node(
+        conn,
+        parent,
+        &prompted.item,
+        turn,
+        elided,
+        prompted.pictured,
+    )?;
+    // How the prompt begins, kept here rather than parsed by each read.
+    conn.prepare_cached("INSERT OR REPLACE INTO openings(node,text,chars) VALUES (?1,?2,?3)")?
+        .execute(params![id, prompted.opening, prompted.chars])?;
+    if let Some(stub) = &prompted.stub {
         conn.prepare_cached("INSERT INTO stubs(node,item) VALUES (?,?)")?
             .execute(params![id, stub])?;
     }
@@ -15925,9 +15946,11 @@ fn insert_node(
         ])?;
     Ok(id)
 }
-/// A prompt node's opening from its item (`?2`): the first `?3` characters
-/// of its text and the text's length, kept under the node (`?1`). SQLite
-/// keeps the item it parsed for the statement, so it is parsed once.
+/// A prompt node's opening read back from an item rewritten in place
+/// (`?2`): the first `?3` characters of its text and the text's length,
+/// kept under the node (`?1`). A new prompt's opening comes from its words
+/// instead (`prompt_node`): parsing a long item here costs more than the
+/// rest of its turn's start.
 const OPENING: &str = "INSERT OR REPLACE INTO openings(node,text,chars) VALUES (?1,
     substr(json_extract(CAST(?2 AS TEXT),'$.content[0].text'),1,?3),
     length(json_extract(CAST(?2 AS TEXT),'$.content[0].text')))";
