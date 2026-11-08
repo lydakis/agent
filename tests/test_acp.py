@@ -478,6 +478,45 @@ class AcpTests(ModelFixture):
         other = f'{lead}@{"0" * 16 if store != "0" * 16 else "1" * 16}'
         self.assertIn('another store', self.resume(repo, other)['error']['message'])
 
+    def test_a_client_names_who_wrote_each_prompt_and_who_answered_for_a_call(self):
+        """A client several people write through, as a team's chat bridge:
+        `_meta.person` names who wrote a prompt, which the lead reads, and
+        who chose Allow or Deny, which the daemon keeps."""
+        repo = self.repo()
+        self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('start_task', inherit=False)],
+                            approve=['start_task'], approver='manual')
+        env = {k: v for k, v in self.env.items() if not k.startswith('T3_')}
+        thread = Thread(self, env, repo)
+        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {},
+                                                   'clientInfo': {'name': 'slack-bridge'}}))
+        opened, _ = thread.answer_of(thread.ask('session/new', {'cwd': str(repo), 'mcpServers': []}))
+        session = opened['result']['sessionId']
+        thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead'}))
+        # A name the daemon does not take is refused before anything is sent.
+        refused, _ = thread.answer_of(thread.ask('session/prompt', {
+            'sessionId': session, 'prompt': [{'type': 'text', 'text': 'hi'}], '_meta': {'person': 'Ana Lopez'}}))
+        self.assertEqual(refused['error']['code'], -32602)
+        self.assertEqual(self.daemon.request('turns', bot='calc.lead')['result']['turns'], [])
+        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix calc.py.'})]
+        prompt = thread.ask('session/prompt', {'sessionId': session, 'prompt': [{'type': 'text', 'text': 'script'}],
+                                               '_meta': {'person': 'ana'}})
+        [asked] = [m for m in thread.until(lambda m: m.get('method') == 'session/request_permission')
+                   if m.get('method') == 'session/request_permission']
+        # The model read who wrote it, after the words and their time.
+        content = self.model.requests.get(timeout=5)['input'][-1]['content']
+        self.assertRegex(content[0]['text'], SENT)
+        self.assertTrue(content[0]['text'].startswith('script\n\n'))
+        self.assertEqual(content[1]['text'], '[Written by ana.]')
+        thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'deny'},
+                                                   '_meta': {'person': 'bo'}}})
+        answered, _ = thread.answer_of(prompt)
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        events = self.daemon.request('events', bot='calc.lead', after=0, limit=256)['result']['events']
+        [denied] = [e['data'] for e in events if e['event'] == 'tool_completed']
+        self.assertEqual([(v['by'], v['allow']) for v in denied['approvals']], [('bo', False)])
+
     def test_t3_code_threads_pick_their_lead_by_words_not_by_an_option(self):
         """T3 Code carries option picks over to the next thread it opens."""
         thread, _ = self.open(self.repo())
