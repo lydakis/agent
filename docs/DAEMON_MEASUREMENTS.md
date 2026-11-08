@@ -7755,3 +7755,59 @@ touch (its only change draws a notice on a `dropped` event).
 | lifecycle | CPU, s | 0.44 | 0.44 | +0.0% |
 | lifecycle | p95 turn, ms | 579.066 | 578.157 | -0.2% |
 | lifecycle | peak RSS, MiB | 22.469 | 22.502 | +0.1% |
+
+## The audit trail (protocol 57, schema 87)
+
+Each tool call writes one `audit` row inside the commit that starts it (or
+denies it) and updates it inside the commit that records its result, and
+each step a client reports writes one when it is decided and updates it on
+`step_result`. No store job is added to a turn: the statements join
+transactions the turn already commits. A row's time is kept monotone with
+one lookup of the newest row by its primary key, so a time bound is found
+by bisecting ids and the table needs no index but its own.
+
+The row's own cost, measured on its statements alone (the insert and the
+update a call makes, 20,000 calls a round inside one transaction, release
+build, 4-core Linux cloud container, a file store in WAL): 3.0 to 3.2 µs a
+call, up to 5.2 µs in a round where the WAL grew. Ids are `AUTOINCREMENT`, so
+a call still running when the trail is trimmed never finishes another's row;
+that bookkeeping row did not move the cost past the runs without it (2.7 to
+5.2 µs). The store grew about 200
+bytes a row for a shell call of an 85-character command.
+
+A page of 100 rows with 60,000 in the trail reads in about 0.5 ms whether it
+filters by kind, a bot pattern or a time (the time found in about 16 probes
+of the primary key). A filter that matches no recent row scans the trail:
+4.7 ms for 60,000 rows, so about 80 ms a million. That is a read the person
+or an agent asks for on a reader connection, never on a turn's path; an
+index on a category waits for a trail where that read is slow in use.
+
+A step a client would not have put to a gate before (a script's MCP call
+under Full or a read-only tool, a browser command that does not confirm)
+now costs its client an `approve_step` with `record`, answered at once, and
+a `step_result`: two round trips on the socket and two small store jobs,
+against an MCP call's own milliseconds. An ordinary turn sends none.
+
+The Perf workflow's matched screen of this change against its base
+(`bench.perf_gate`, GitHub runner, head 22ac1a7 against main d11cdd8):
+store work per turn is the same and the gate passed. Every daemon measure
+moved under 5%: burst submit p99 +4.5%, inside the runner's spread for it,
+with lone submit CPU -0.3% and CPU per turn -0.6%. Sonny's lookout at 10x1
+reads 0 on a run too short for its 10 ms CPU ticks.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 35.709 | 35.598 | -0.3% |
+| admission | burst submit p99, ms | 5.876 | 6.139 | +4.5% |
+| completion | release to terminal p99, ms | 12.384 | 11.995 | -3.1% |
+| footprint | idle RSS, MiB | 15.443 | 15.465 | +0.1% |
+| footprint | per idle bot, KiB | 1.536 | 1.556 | +1.3% |
+| footprint | RSS after a turn each, MiB | 24.199 | 24.35 | +0.6% |
+| footprint | CPU per turn, ms | 1.155 | 1.148 | -0.6% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 4.685 | 4.625 | -1.3% |
+| sonny | lookout note p95 at 100x10, ms | 2879.5 | 2869.0 | -0.4% |
+| sonny | quiet window CPU, ms/s | 1.73 | 1.73 | +0.0% |
+| sonny | sky replay CPU per 1k lines, ms | 11.77 | 11.77 | +0.0% |
+| lifecycle | CPU, s | 0.51 | 0.51 | +0.0% |
+| lifecycle | p95 turn, ms | 580.477 | 581.998 | +0.3% |
+| lifecycle | peak RSS, MiB | 22.75 | 22.775 | +0.1% |

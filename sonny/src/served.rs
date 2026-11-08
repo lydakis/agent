@@ -1579,17 +1579,26 @@ async fn automate(
         str_of(&call["call_id"]),
     );
     let asked = std::time::Instant::now();
+    let facts = crate::exec::Facts {
+        kind: "agents",
+        place: None,
+        access: Some("write"),
+    };
     let step = (steps
-        .ask(AUTOMATIONS, AUTOMATIONS, call["arguments"].clone())
+        .ask(
+            AUTOMATIONS,
+            AUTOMATIONS,
+            call["arguments"].clone(),
+            facts,
+            true,
+        )
         .await)
         .map_err(|e| ("automation_refused", e))?;
     // The daemon's clock for the call stood still while the gate weighed
     // it, so this one does too.
     let call = later(call, asked.elapsed());
     let answered = answer(client, &call, me, store, socket).await;
-    if let Some(step) = step {
-        steps.ran(step, answered.is_err()).await;
-    }
+    steps.ran(step, answered.is_err()).await;
     answered
 }
 

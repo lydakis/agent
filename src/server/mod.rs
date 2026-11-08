@@ -384,6 +384,29 @@ enum Command {
         bot: String,
         keep_turns: usize,
     },
+    /// A page of the audit trail, newest first: a row per tool call of
+    /// every bot and per step its client ran, each filter narrowing it.
+    Audit {
+        before: Option<i64>,
+        since_ms: Option<i64>,
+        until_ms: Option<i64>,
+        bot: Option<String>,
+        bot_id: Option<i64>,
+        turn: Option<i64>,
+        kind: Option<String>,
+        place: Option<String>,
+        approved: Option<String>,
+        access: Option<String>,
+        outcome: Option<String>,
+        tool: Option<String>,
+        limit: Option<usize>,
+    },
+    /// Delete the audit trail's rows older than `before` (an id) or
+    /// `before_ms`: only on the daemon's own socket.
+    AuditTrim {
+        before: Option<i64>,
+        before_ms: Option<i64>,
+    },
     /// A bot's turns with status, workspace, model, tokens, and timing,
     /// oldest first; with `newest`, newest first.
     Turns {
@@ -568,8 +591,17 @@ enum Command {
         /// The step's own tool, which its approver judges.
         name: String,
         arguments: Value,
+        /// Recorded in the audit trail and allowed at once, never put to a
+        /// gate: a step its client would not ask about.
+        #[serde(default)]
+        record: bool,
+        /// What the step is, as its client says, for its row in the audit
+        /// trail: one of the trail's kinds, places and accesses.
+        kind: Option<String>,
+        place: Option<String>,
+        access: Option<String>,
     },
-    /// How a step its gates allowed ended once the client ran it.
+    /// How a step the daemon allowed ended once the client ran it.
     StepResult {
         bot: String,
         turn: i64,
@@ -2380,6 +2412,8 @@ impl Service {
             Command::TakeCall { .. } => return refuse("take a declared tool call"),
             Command::ApproveStep { .. } => return refuse("put a declared call's step to a gate"),
             Command::StepResult { .. } => return refuse("record a declared call's step"),
+            // The trail is the person's record of what bots did.
+            Command::AuditTrim { .. } => return refuse("trim the audit trail"),
             Command::Shutdown { .. } => return refuse("stop the daemon"),
             // Its own is the one it has; another bot's would answer as it.
             Command::Lend { .. } => return refuse("borrow a bot's socket"),
@@ -4354,6 +4388,7 @@ impl Service {
                             unreviewed,
                             reason: reason.as_deref(),
                             by: by.as_deref(),
+                            leased: lease.is_some(),
                         };
                         match ask {
                             true => db.ask(decision),
@@ -4487,10 +4522,23 @@ impl Service {
                 step,
                 name: tool,
                 arguments,
+                record,
+                kind,
+                place,
+                access,
             } => {
                 if call_id.is_empty() {
                     return fail_with("invalid_call_id", "call_id may not be empty");
                 }
+                let facts = agent_runtime::store::audit::Facts::given(
+                    kind.as_deref(),
+                    place.as_deref(),
+                    access.as_deref(),
+                )
+                .map_err(|e| Error {
+                    code: "invalid_step".into(),
+                    ..e
+                })?;
                 name("step", &step).map_err(|e| Error {
                     code: "invalid_step".into(),
                     ..e
@@ -4526,7 +4574,17 @@ impl Service {
                 let name = bot;
                 let stepped = store
                     .op("approve_step", move |db| {
-                        db.step_announce(&name, turn, &call_id, &step, &tool, arguments, now_ms())
+                        db.step_announce(
+                            &name,
+                            turn,
+                            &call_id,
+                            &step,
+                            &tool,
+                            arguments,
+                            record,
+                            facts,
+                            now_ms(),
+                        )
                     })
                     .await?;
                 if let Step::Pending {
@@ -4808,6 +4866,67 @@ impl Service {
                 self.observe(session, output, id, async move {
                     (reader.read("history_items", move |db| db.history_items(&bot, &nodes))).await
                 })
+            }
+            Command::Audit {
+                before,
+                since_ms,
+                until_ms,
+                bot,
+                bot_id,
+                turn,
+                kind,
+                place,
+                approved,
+                access,
+                outcome,
+                tool,
+                limit,
+            } => {
+                let query = agent_runtime::store::audit::Query {
+                    before,
+                    since_ms,
+                    until_ms,
+                    bot,
+                    bot_id,
+                    turn,
+                    kind,
+                    place,
+                    approved,
+                    access,
+                    outcome,
+                    tool,
+                    limit,
+                };
+                query.check()?;
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    reader.read("audit", move |db| db.audit(&query)).await
+                })
+            }
+            Command::AuditTrim { before, before_ms } => {
+                // Pieces of rows, oldest first, each its own job, on a task
+                // of its own, as a prune's are.
+                let bound = store
+                    .op("audit_bound", move |db| db.audit_bound(before, before_ms))
+                    .await?;
+                let (store, output) = (store.clone(), output.clone());
+                self.retention.spawn(async move {
+                    let result = async {
+                        let mut trimmed = 0;
+                        loop {
+                            let piece = store
+                                .op("audit_trim", move |db| db.audit_trim(bound))
+                                .await?;
+                            trimmed += piece;
+                            if piece < agent_runtime::store::audit::TRIM_PIECE {
+                                return Ok(json!({"trimmed":trimmed,"before":bound}));
+                            }
+                        }
+                    }
+                    .await;
+                    retention_reply(session, &output, id, result).await;
+                });
+                Err(Error::new("deferred"))
             }
             Command::HistorySearch { bot, query, before } => {
                 let reader = store.reader();
@@ -6101,7 +6220,7 @@ mod tests {
                 "call_id":call.call_id,"arguments":call.arguments}))?
                 .into();
                 db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
-                db.tool_start(turn, &call)?;
+                db.tool_start(turn, &call, false, false)?;
                 db.suspend(
                     turn,
                     &call.call_id,
@@ -7132,7 +7251,7 @@ mod tests {
                 "call_id":call.call_id,"arguments":call.arguments}))?
                 .into();
                 db.append(bob, vec![item], std::slice::from_ref(&call), None)?;
-                db.tool_start(bob, &call)?;
+                db.tool_start(bob, &call, false, false)?;
                 db.suspend(bob, &call.call_id, &[parked], None, false, &[], None, None)
                     .map(|_| ())
             })
@@ -8295,7 +8414,7 @@ mod tests {
                 "call_id":call.call_id,"arguments":call.arguments}))?
                 .into();
                 db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
-                db.tool_start(turn, &call)?;
+                db.tool_start(turn, &call, false, false)?;
                 db.suspend(
                     turn,
                     &call.call_id,
@@ -8379,6 +8498,7 @@ mod tests {
                     unreviewed: false,
                     reason: None,
                     by: Some("test"),
+                    leased: false,
                 })?;
                 assert!(answered.resume);
                 Ok(turn)
