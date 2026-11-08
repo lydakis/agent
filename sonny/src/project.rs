@@ -1116,7 +1116,9 @@ async fn make(
     if let Some(state) = &state {
         settings.insert("env".into(), json!({crate::state::VAR: state}));
     }
-    let config = agent_client::config::load()?;
+    // As in `create`: a config that does not read is said where the lead
+    // opens, and the defaults stand until it reads.
+    let config = agent_client::config::load().unwrap_or_default();
     if config.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
     }

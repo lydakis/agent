@@ -1397,14 +1397,19 @@ fn agents_header(path: &Path) -> String {
 /// paragraphs cut from a file. Where memory is all that follows, none is
 /// returned.
 pub fn given_agents_files(workspace: &Path, instructions: &str) -> Vec<(PathBuf, String)> {
-    let Ok(paths) = agents_files(workspace) else {
+    // A file that cannot be read, which [`instructions_leaving_out`] left
+    // out, is no file of the run: the rest must still read as given, whole
+    // and together, so one the bot was given that can no longer be read
+    // breaks the run and none is returned.
+    let Ok(paths) = agents_files_in(workspace, home().as_deref(), &mut Leave::Out(Vec::new()))
+    else {
         return Vec::new();
     };
     let mut files = Vec::new();
     let mut blocks = String::new();
     for path in paths {
         let Ok(Some(body)) = read_bounded(&path, MAX_INSTRUCTIONS) else {
-            return Vec::new();
+            continue;
         };
         let body = body.trim();
         // An empty file is given no section.
@@ -2609,6 +2614,29 @@ mod tests {
         ));
         assert!(composed.text.contains("# Role: lead"));
         assert!(composed.text.len() <= MAX_INSTRUCTIONS);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_files_a_lead_kept_are_given_without_the_one_left_out() {
+        let root = temp("given-left-out");
+        std::os::unix::fs::symlink("gone.md", root.join("AGENTS.md")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/AGENTS.md"), "Deploys are allowed.").unwrap();
+        let sub = root.join("sub");
+        let given = instructions_leaving_out(&sub, None, &[]).unwrap().text;
+        let files = given_agents_files(&sub, &given);
+        assert_eq!(
+            files,
+            [(sub.join("AGENTS.md"), "Deploys are allowed.".to_owned())]
+        );
+        // One the bot was given that can no longer be read breaks the run.
+        std::fs::remove_file(root.join("AGENTS.md")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "Never deploy.").unwrap();
+        let both = instructions(&sub, None, &[]).unwrap().text;
+        std::fs::remove_file(root.join("AGENTS.md")).unwrap();
+        std::os::unix::fs::symlink("gone.md", root.join("AGENTS.md")).unwrap();
+        assert!(given_agents_files(&sub, &both).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
