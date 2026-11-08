@@ -184,18 +184,6 @@ pub const SETTINGS: &[Setting] = &[
         default: "tab",
     },
     Setting {
-        key: "sonny.needs_check",
-        about: "once an agent's turn ends with words and no question asked, a copy of it with no tools says whether they wait on you, and it counts as needing you; one small call, read from the warm cache",
-        values: SWITCH,
-        default: "true",
-    },
-    Setting {
-        key: "sonny.task_done_check",
-        about: "hours a task sits idle before a copy of it with no tools says whether its work is done; done marks it done, its row saying the check did and why, and new work reopens it; one call that reads its history, once per idle stretch; 0 for never",
-        values: &[],
-        default: "8",
-    },
-    Setting {
         key: "sonny.suggest",
         about: "after a turn you started, a copy of the agent guesses your next message for Tab to take; one small call",
         values: SWITCH,

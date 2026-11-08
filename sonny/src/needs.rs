@@ -73,9 +73,7 @@ impl Seen {
     /// The question still open, as every surface reads it: none for a task
     /// resolved, by its own call in the turn read or by its lead's mark kept
     /// beside `store` that no later turn reopened while nothing `running`.
-    /// A lead marked done is resolved as a task is. With no question
-    /// asked, what its last reply left waiting on the person, as a window's
-    /// check marked it ([`crate::waiting`]), while no later turn started.
+    /// A lead marked done is resolved as a task is.
     pub fn open(
         self,
         store: &std::path::Path,
@@ -87,11 +85,7 @@ impl Seen {
         if resolved {
             return None;
         }
-        self.ask.or_else(|| {
-            crate::waiting::read(store, bot)
-                .filter(|mark| crate::waiting::holds(mark, self.turn, running))
-                .map(|mark| mark.ask())
-        })
+        self.ask
     }
 }
 
@@ -470,16 +464,6 @@ impl Needs {
                     self.version += 1;
                 }
             }
-            // What a reply left waiting, unlike a question asked, goes once
-            // any later turn starts, whoever sent it.
-            "accepted"
-                if (self.asks.get(bot))
-                    .and_then(|open| open.ask.as_ref())
-                    .is_some_and(crate::waiting::is_mark) =>
-            {
-                self.asks.remove(bot);
-                self.version += 1;
-            }
             // A steer the running turn took ends as a turn of its own: only
             // the running turn's end lets go of its calls.
             "turn_finished" if !matches!(data["status"].as_str(), Some("steered" | "attached")) => {
@@ -509,23 +493,6 @@ fn from_person(data: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// What a reply left waiting goes once any later turn starts, as its
-    /// lead's message to it does; a question asked waits for the person.
-    #[test]
-    fn a_reply_s_waiting_mark_goes_once_any_turn_starts() {
-        let mark = crate::waiting::Mark {
-            turn: 3,
-            waiting_for: "which branch".into(),
-        };
-        let mut needs = Needs::default();
-        needs.asked("calc.a", Some(mark.ask()));
-        assert!(needs.waits("calc.a"));
-        let accepted = serde_json::json!({"event": "accepted", "bot": "calc.a", "turn": 4,
-            "data": {"from": {"bot": "calc.lead"}}});
-        assert!(needs.event(&accepted));
-        assert!(!needs.waits("calc.a"));
-    }
 
     fn event(bot: &str, turn: i64, kind: &str, data: Value) -> Value {
         json!({"bot": bot, "turn": turn, "event": kind, "data": data})
