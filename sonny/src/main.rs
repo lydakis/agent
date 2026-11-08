@@ -516,7 +516,7 @@ struct StatusView<'a> {
     approvals: &'a [Value],
     turn_model: Option<&'a str>,
     places: mux::Places,
-    aside: &'a dyn Fn(&str) -> bool,
+    aside: &'a (dyn Fn(&str) -> bool + Sync),
 }
 
 /// What `/status` read: its rows, what waits on the person, and which
@@ -529,6 +529,8 @@ struct StatusRead {
     listed: bool,
     read: Vec<String>,
     idle: Vec<String>,
+    /// Whether any agent's history was read, not taken from what was kept.
+    fresh: bool,
 }
 
 /// The agents of `scope` as `/status` shows them, and footers and leads
@@ -596,6 +598,7 @@ async fn read_status(
     let mine = owned(&listed, &project, &lead);
     // Side chats are not the project's agents.
     let mut kept = HashMap::new();
+    let mut fresh = false;
     for bot in &listed {
         let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
             continue;
@@ -613,7 +616,10 @@ async fn read_status(
         let head = json!([bot["bot_id"], bot["head"]]);
         let latest = match status_read.remove(name) {
             Some((seen, latest)) if seen == head && !bot["head"].is_null() => Some(latest),
-            _ => read_latest(client, name).await,
+            _ => {
+                fresh = true;
+                read_latest(client, name).await
+            }
         };
         if let Some(latest) = &latest {
             kept.insert(name.to_owned(), (head, latest.clone()));
@@ -691,6 +697,7 @@ async fn read_status(
             Some(last) if !running => match asks_seen.get(name) {
                 Some((at, seen)) if *at == last => seen.clone(),
                 _ => {
+                    fresh = true;
                     let seen =
                         (needs::scan(client, name, ran["turn"].as_i64()).await).unwrap_or_default();
                     asks_seen.insert(name.to_owned(), (last, seen.clone()));
@@ -831,7 +838,81 @@ async fn read_status(
         needs,
         read,
         idle,
+        fresh,
     })
+}
+
+/// Where `/status` keeps what it read of each agent's history for the next
+/// window, beside the store.
+fn reads_file(store: &std::path::Path) -> std::path::PathBuf {
+    let mut file = store.as_os_str().to_owned();
+    file.push(".status-reads.json");
+    file.into()
+}
+
+/// The build that kept them: another may read a history otherwise.
+fn reads_build() -> String {
+    format!(
+        "{} {}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("SONNY_COMMIT").unwrap_or("")
+    )
+}
+
+/// Take what an earlier window kept of each agent's history, where this
+/// one has nothing newer: the same head is the same history, and an ended
+/// turn's question is the same question, so a window opened later reads
+/// only the agents that ran since.
+fn take_reads(
+    store: &std::path::Path,
+    status_read: &mut HashMap<String, (Value, Latest)>,
+    asks_seen: &mut HashMap<String, (i64, Seen)>,
+) {
+    #[derive(serde::Deserialize)]
+    struct Kept {
+        build: String,
+        latest: HashMap<String, (Value, Latest)>,
+        seen: HashMap<String, (i64, Seen)>,
+    }
+    let Some(kept) = std::fs::read(reads_file(store))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
+        .filter(|kept| kept.build == reads_build())
+    else {
+        return;
+    };
+    for (name, read) in kept.latest {
+        status_read.entry(name).or_insert(read);
+    }
+    for (name, seen) in kept.seen {
+        asks_seen.entry(name).or_insert(seen);
+    }
+}
+
+/// Keep what this window read of the listed agents' histories for the
+/// next one, in place of what was kept before.
+fn keep_reads(
+    store: &std::path::Path,
+    status_read: &HashMap<String, (Value, Latest)>,
+    asks_seen: &HashMap<String, (i64, Seen)>,
+) {
+    let seen: HashMap<&String, &(i64, Seen)> = (asks_seen.iter())
+        .filter(|(name, _)| status_read.contains_key(*name))
+        .collect();
+    #[derive(serde::Serialize)]
+    struct Kept<'a> {
+        build: String,
+        latest: &'a HashMap<String, (Value, Latest)>,
+        seen: HashMap<&'a String, &'a (i64, Seen)>,
+    }
+    let kept = Kept {
+        build: reads_build(),
+        latest: status_read,
+        seen,
+    };
+    if let Ok(bytes) = serde_json::to_vec(&kept) {
+        let _ = waiting::replace(&reads_file(store), &bytes);
+    }
 }
 
 /// `bot`'s latest step, question and pull request; none when a read
@@ -2068,7 +2149,9 @@ fn status_cli(args: &[String]) -> Result<(), String> {
             aside: &|_| false,
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
-        read_status(
+        let kept = agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
+        take_reads(&kept, &mut latest, &mut asks);
+        let read = read_status(
             &client,
             &store,
             scope,
@@ -2077,7 +2160,11 @@ fn status_cli(args: &[String]) -> Result<(), String> {
             &mut asks,
             view,
         )
-        .await
+        .await?;
+        if read.fresh {
+            keep_reads(&kept, &latest, &asks);
+        }
+        Ok::<_, String>(read)
     })?;
     println!("{}", status_said(&read.project, &read.rows, as_json));
     Ok(())
@@ -3443,7 +3530,18 @@ fn menu_keys(menu: &[(&str, &str, Vec<usize>)], pick: usize, typed: &str) -> Opt
 
 use needs::Seen;
 
-#[derive(Default, Clone)]
+/// What a background pass read of the agents' histories for `/status`.
+type Reads = (
+    HashMap<String, (Value, Latest)>,
+    HashMap<String, (i64, Seen)>,
+);
+
+enum Warming {
+    Running(tokio::task::JoinHandle<Option<Reads>>),
+    Done,
+}
+
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 struct Latest {
     /// Its latest step, as a line.
     step: String,
@@ -3726,6 +3824,12 @@ struct App {
     /// history head it read them at: a history that has not moved is not
     /// read again.
     status_read: HashMap<String, (Value, Latest)>,
+    /// Whether `/status` read a history since it last kept its reads.
+    reads_unkept: bool,
+    /// A lead's window reads, once it has drawn, the histories that moved
+    /// since a window last kept its reads, off the loop: `/status` then
+    /// opens on them. None before it starts; done once it has.
+    warming: Option<Warming>,
     sounds: sound::Sounds,
     /// The footer's needs-you count, which beats a few times when it
     /// rises; kept as the footer is drawn, from what it counts.
@@ -5336,6 +5440,8 @@ impl App {
             checks_set: HashMap::new(),
             running_heads: HashMap::new(),
             status_read: HashMap::new(),
+            reads_unkept: false,
+            warming: None,
             sounds: sound::Sounds::new(false),
             needs_pulse: std::cell::Cell::default(),
             said: String::new(),
@@ -5806,6 +5912,7 @@ impl App {
             self.read_running_tasks().await;
             self.read_references().await;
             self.read_names().await;
+            self.warm_reads().await;
             for what in std::mem::take(&mut self.pressed) {
                 self.press(&what).await;
             }
@@ -9830,6 +9937,16 @@ impl App {
         if let Some(fleet) = &self.fleet {
             fleet.layout.places_now(PLACES_NOW).await;
         }
+        // What an earlier window read, on the first open here; what this
+        // one read since, kept once each open, not at every refresh.
+        let store = agent_client::socket::canonical_store(&self.options.store)
+            .unwrap_or_else(|_| self.options.store.clone());
+        // What the background pass read, waited for if it still runs, so
+        // no history is read twice.
+        self.warmed().await;
+        if self.status_read.is_empty() {
+            take_reads(&store, &mut self.status_read, &mut self.asks_seen);
+        }
         let (project, rows) = match self.status_rows().await {
             Ok(read) => read,
             Err(error) => {
@@ -9837,6 +9954,9 @@ impl App {
                 return;
             }
         };
+        if std::mem::take(&mut self.reads_unkept) {
+            keep_reads(&store, &self.status_read, &self.asks_seen);
+        }
         let alerts = self.status_alerts().await;
         self.watch = Some(Watch {
             project,
@@ -10197,7 +10317,70 @@ impl App {
             let calls = read.listed.then_some(&read.read[..]);
             fleet.adopt(&read.needs, calls, &read.idle);
         }
+        self.reads_unkept |= read.fresh;
         Ok((read.project, read.rows))
+    }
+
+    /// Start a lead window's one background pass over its agents'
+    /// histories, or take what it read once it has: what a window kept
+    /// before, and each history that moved since, read as `/status` reads
+    /// them, then kept for the next window.
+    async fn warm_reads(&mut self) {
+        match &self.warming {
+            Some(Warming::Running(job)) if job.is_finished() => self.warmed().await,
+            Some(_) => {}
+            None if !project::is_lead(&self.bot) => self.warming = Some(Warming::Done),
+            None => {
+                let (client, woken) = (self.client.clone(), self.woken.clone());
+                let (store, scope) = (self.options.store.clone(), self.scope());
+                self.warming = Some(Warming::Running(tokio::spawn(async move {
+                    let kept = agent_client::socket::canonical_store(&store)
+                        .unwrap_or_else(|_| store.clone());
+                    let (mut latest, mut seen) = (HashMap::new(), HashMap::new());
+                    take_reads(&kept, &mut latest, &mut seen);
+                    let view = StatusView {
+                        bot: "",
+                        asks: &[],
+                        approvals: &[],
+                        turn_model: None,
+                        places: Default::default(),
+                        aside: &|_| false,
+                    };
+                    let turns = HashMap::new();
+                    let read =
+                        read_status(&client, &store, scope, &turns, &mut latest, &mut seen, view)
+                            .await
+                            .ok()?;
+                    if read.fresh {
+                        keep_reads(&kept, &latest, &seen);
+                    }
+                    woken.notify_one();
+                    Some((latest, seen))
+                })));
+            }
+        }
+    }
+
+    /// Take what the background pass read, where this window read nothing
+    /// newer itself, waiting for it if it still runs.
+    async fn warmed(&mut self) {
+        let Some(Warming::Running(job)) = self.warming.replace(Warming::Done) else {
+            return;
+        };
+        let Ok(Some((latest, seen))) = job.await else {
+            return;
+        };
+        for (name, read) in latest {
+            self.status_read.entry(name).or_insert(read);
+        }
+        for (name, (turn, read)) in seen {
+            match self.asks_seen.get(&name) {
+                Some((had, _)) if *had >= turn => {}
+                _ => {
+                    self.asks_seen.insert(name, (turn, read));
+                }
+            }
+        }
     }
 
     /// Count the running turn's time from when the daemon started it, not
@@ -17174,6 +17357,107 @@ mod tests {
         app.status_rows().await.unwrap();
         assert_eq!(histories.load(Ordering::SeqCst), 259);
         assert_eq!(turn_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_window_opening_status_reads_only_the_histories_that_moved_since_the_last() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let histories = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let daemon = |read: Arc<AtomicUsize>, ran: Arc<std::sync::atomic::AtomicBool>| {
+            move |asked: &Value| match asked["op"].as_str().unwrap_or_default() {
+                "bots" => {
+                    let bot = |n: i64, turn: i64| {
+                        json!({"name": format!("shop.t{n}"), "bot_id": n, "head": turn,
+                            "status": "completed", "running_turn": null,
+                            "last": {"turn": turn, "status": "completed"}})
+                    };
+                    let last = if ran.load(Ordering::SeqCst) { 9 } else { 2 };
+                    json!({"bots": [bot(1, 1), bot(2, last)], "next_after": null})
+                }
+                "history_nodes" => {
+                    read.fetch_add(1, Ordering::SeqCst);
+                    json!({"nodes": [], "next_from": null})
+                }
+                "history_items" => json!({"items": []}),
+                _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+            }
+        };
+        let home = std::env::temp_dir().join(format!("status-reads-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let store = home.join("state.sqlite");
+        let open = || async {
+            let client = daemon_answering(daemon(histories.clone(), ran.clone())).await;
+            let mut app = app(client);
+            app.bot = "shop.lead".into();
+            app.options.store = store.clone();
+            app.status().await;
+            assert_eq!(app.watch.as_ref().unwrap().rows.len(), 2);
+            app
+        };
+        // The first window reads each agent's latest items and its question.
+        let app = open().await;
+        assert_eq!(histories.load(Ordering::SeqCst), 4);
+        drop(app);
+        // The next reads none: nothing moved.
+        let app = open().await;
+        assert_eq!(histories.load(Ordering::SeqCst), 4);
+        drop(app);
+        // One ran since: only its history is read.
+        ran.store(true, Ordering::SeqCst);
+        open().await;
+        assert_eq!(histories.load(Ordering::SeqCst), 6);
+        // What another build kept is read again.
+        let kept = reads_file(&store);
+        let mut file: Value = serde_json::from_slice(&std::fs::read(&kept).unwrap()).unwrap();
+        file["build"] = json!("another");
+        std::fs::write(&kept, file.to_string()).unwrap();
+        open().await;
+        assert_eq!(histories.load(Ordering::SeqCst), 10);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lead_window_reads_its_agents_histories_before_status_opens() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let histories = Arc::new(AtomicUsize::new(0));
+        let read = histories.clone();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => json!({"bots": [{"name": "shop.t1", "bot_id": 1, "head": 1,
+                "status": "completed", "running_turn": null,
+                "last": {"turn": 1, "status": "completed"}}], "next_after": null}),
+                    "history_nodes" => {
+                        read.fetch_add(1, Ordering::SeqCst);
+                        json!({"nodes": [], "next_from": null})
+                    }
+                    "history_items" => json!({"items": []}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let home = std::env::temp_dir().join(format!("status-warm-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let mut app = app(client.clone());
+        app.bot = "shop.lead".into();
+        app.options.store = home.join("state.sqlite");
+        // Once the window has drawn, off the loop.
+        app.warm_reads().await;
+        app.warmed().await;
+        assert_eq!(histories.load(Ordering::SeqCst), 2);
+        // `/status` opens on what it read.
+        app.status().await;
+        assert_eq!(app.watch.as_ref().unwrap().rows.len(), 1);
+        assert_eq!(histories.load(Ordering::SeqCst), 2);
+        // A task's window leaves it to its lead's.
+        let mut task = super::tests::app(client);
+        task.bot = "shop.t1".into();
+        task.warm_reads().await;
+        assert!(matches!(task.warming, Some(Warming::Done)));
+        // And kept it for the next window.
+        assert!(reads_file(&app.options.store).exists());
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[tokio::test]
@@ -24632,5 +24916,42 @@ mod tests {
                 start.elapsed()
             );
         }
+        // Another window opening it, with what this one read kept.
+        let home = std::env::temp_dir().join(format!("status-reopen-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let store = home.join("state.sqlite");
+        let start = std::time::Instant::now();
+        keep_reads(&store, &app.status_read, &app.asks_seen);
+        eprintln!("STATUS kept in {:?}", start.elapsed());
+        let (client, _events) = Client::connect(Path::new(&socket)).await.unwrap();
+        let mut again = super::tests::app(client);
+        again.bot = app.bot.clone();
+        let start = std::time::Instant::now();
+        take_reads(&store, &mut again.status_read, &mut again.asks_seen);
+        let (_, rows) = again.status_rows().await.unwrap();
+        eprintln!(
+            "STATUS reopen: {} rows in {:?}",
+            rows.len(),
+            start.elapsed()
+        );
+        // A lead's window with nothing kept: its pass off the loop, then
+        // the card opening on what it read.
+        std::fs::remove_file(reads_file(&store)).unwrap();
+        let (client, _events) = Client::connect(Path::new(&socket)).await.unwrap();
+        let mut warm = super::tests::app(client);
+        warm.bot = app.bot.clone();
+        warm.options.store = store.clone();
+        let start = std::time::Instant::now();
+        warm.warm_reads().await;
+        warm.warmed().await;
+        eprintln!("STATUS background pass in {:?}", start.elapsed());
+        let start = std::time::Instant::now();
+        let (_, rows) = warm.status_rows().await.unwrap();
+        eprintln!(
+            "STATUS open after the pass: {} rows in {:?}",
+            rows.len(),
+            start.elapsed()
+        );
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

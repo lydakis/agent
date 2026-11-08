@@ -47,7 +47,7 @@ const MAX_MINUTES: u64 = 7 * 24 * 60;
 /// How much of the question a fire's message quotes, in characters.
 const QUOTED: usize = 300;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Ask {
     /// What it is, as [`id`] names it: the agent, the turn and the call
     /// that asked it.
@@ -170,7 +170,7 @@ pub fn closed_by(item: &Value) -> Option<(String, State)> {
 
 /// A task whose question a lead's window shows: the agent its answer goes
 /// to, and its name as the window says it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Asker {
     pub bot: String,
     pub name: String,
@@ -180,7 +180,7 @@ pub struct Asker {
 /// revision where the target has one. A yes covers that and nothing else,
 /// as a review's approval covers the commit it saw, so another target or
 /// revision needs another ask.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Covers {
     pub action: String,
     pub target: String,
@@ -212,7 +212,7 @@ impl Covers {
 }
 
 /// What an agent does while the person has not answered.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Unanswered {
     /// Goes on with what it recommends at once: a step it can undo.
     Now,
@@ -241,7 +241,7 @@ impl Unanswered {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Choice {
     pub label: String,
     /// What picking it means.
