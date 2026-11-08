@@ -16346,8 +16346,8 @@ fn usage_files_each_call_under_the_model_that_spent_it_with_its_cache_writes() {
 }
 
 #[test]
-fn schema_86_files_each_earlier_turn_whole_under_its_own_model() {
-    let path = std::env::temp_dir().join(format!("agent-spend-86-{}.sqlite", std::process::id()));
+fn schema_85_files_each_earlier_turn_whole_under_its_own_model() {
+    let path = std::env::temp_dir().join(format!("agent-spend-85-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
     {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
@@ -16378,7 +16378,7 @@ fn schema_86_files_each_earlier_turn_whole_under_its_own_model() {
         }
     }
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE turn_models; PRAGMA user_version=85;")
+    conn.execute_batch("DROP TABLE turn_models; PRAGMA user_version=84;")
         .unwrap();
     let db = Database::initialize(conn).unwrap();
     let usage = db.usage(None, 0, None, 64).unwrap();

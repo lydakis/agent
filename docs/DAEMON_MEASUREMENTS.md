@@ -7637,6 +7637,6 @@ upsert rides the existing job. Every timing moved both ways within noise.
 
 The upsert alone, on a 1M-turn store with random turn ids (Python
 `sqlite3`, so with its call overhead): 12.8 µs; its plan is two
-primary-key searches. The schema 86 backfill, one `INSERT … SELECT` over
+primary-key searches. The schema 85 backfill, one `INSERT … SELECT` over
 `turns`, took 1.4 s on 1M turns (398 MB store) and added about 45 bytes a
 turn.
