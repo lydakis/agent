@@ -5264,6 +5264,14 @@ impl Database {
         if let Some(running) = bot.running_turn.filter(|&running| Some(running) != billed) {
             tx.execute("UPDATE turns SET view_sent=0 WHERE id=?", [running])?;
         }
+        // Nor is the view any turn since sent: one that ended while it was
+        // written is the one the next turn reads.
+        if let Some(ended) = ended {
+            tx.execute(
+                "UPDATE turns SET view_sent=0 WHERE bot=?1 AND id>?2 AND view_sent IS 1",
+                params![name, ended.turn],
+            )?;
+        }
         let cursor = event(&tx, name, billed, "compacted", data.clone())?;
         if let Some(ended) = ended {
             retain_late(&tx, ended.turn, name)?;

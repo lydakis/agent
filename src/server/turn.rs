@@ -1557,32 +1557,40 @@ impl Turn {
                         model: &model,
                         ahead: Some(ahead),
                     };
-                    match self
-                        .plan(
-                            &mut record,
-                            self.turn,
-                            &mut accounting,
-                            &tools,
-                            keeps,
-                            false,
-                            Some(sent),
-                        )
-                        .await
-                    {
-                        Ok(Some(mut planned)) => {
-                            planned.choice.trigger = trigger;
-                            self.summarize(
-                                planned,
+                    let work = async {
+                        match self
+                            .plan(
                                 &mut record,
-                                &mut rounds,
                                 self.turn,
                                 &mut accounting,
                                 &tools,
+                                keeps,
+                                false,
+                                Some(sent),
                             )
                             .await
+                        {
+                            Ok(Some(mut planned)) => {
+                                planned.choice.trigger = trigger;
+                                self.summarize(
+                                    planned,
+                                    &mut record,
+                                    &mut rounds,
+                                    self.turn,
+                                    &mut accounting,
+                                    &tools,
+                                )
+                                .await
+                            }
+                            Ok(None) => Ok(Summary::Skipped),
+                            Err(error) => Err(error),
                         }
-                        Ok(None) => Ok(Summary::Skipped),
-                        Err(error) => Err(error),
+                    };
+                    // A pause or the bot's deletion stops its call; the
+                    // calls it finished were billed as they finished.
+                    tokio::select! {
+                        result = work => result,
+                        () = handle.halted() => Err(Error::new(PAUSED)),
                     }
                 },
             ),
@@ -1602,9 +1610,11 @@ impl Turn {
                 rounds: rounds - start,
             },
         };
-        // Its retries and waits on its pool count toward the turn it is
+        // Landed first: what it wrote is billed as it goes in. Its
+        // retries and waits on its pool then count toward the turn it is
         // billed to, which flushed its own as it ended.
         let (retries, paced_ms) = accounting.totals();
+        self.land(&handle, landed, base, unlanded).await;
         if retries > 0 || paced_ms > 0 {
             let turn = self.turn;
             let _ = self
@@ -1614,7 +1624,6 @@ impl Turn {
                 })
                 .await;
         }
-        self.land(&handle, landed, base, unlanded).await;
     }
 
     /// A summary started after this turn lands: held for the bot's turn
@@ -6286,14 +6295,24 @@ pub type Tail = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 pub type Aheads = Arc<std::sync::Mutex<HashMap<String, Arc<Ahead>>>>;
 
 /// The summary `bot`'s last turn started, if one is running, comes to
-/// nothing: whoever waits for it goes on without it.
+/// nothing: its call stops, whoever waits for it goes on without it, and
+/// a bot made later under the name does not find it.
 pub fn drop_ahead(aheads: &Aheads, bot: &str) {
     let dropped = aheads.lock().unwrap_or_else(|e| e.into_inner()).remove(bot);
     if let Some(ahead) = dropped {
+        ahead.stop();
         ahead
             .landed
             .store(true, std::sync::atomic::Ordering::Release);
         ahead.told.notify_waiters();
+    }
+}
+
+/// Every summary started as a turn ended stops its call; each still bills
+/// what it spent and lands with nothing written.
+pub fn stop_aheads(aheads: &Aheads) {
+    for ahead in aheads.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        ahead.stop();
     }
 }
 
@@ -6307,6 +6326,9 @@ pub struct Ahead {
     state: tokio::sync::Mutex<AheadState>,
     /// The most it may spend, under the bot's budget.
     share: Spend,
+    /// Set when a pause or the bot's deletion stops its call.
+    stopped: AtomicBool,
+    halt: Notify,
     /// Set once, under `state`, as it lands.
     landed: AtomicBool,
     told: Notify,
@@ -6326,12 +6348,30 @@ impl Ahead {
         Arc::new(Self {
             state: Default::default(),
             share,
+            stopped: AtomicBool::new(false),
+            halt: Notify::new(),
             landed: AtomicBool::new(false),
             told: Notify::new(),
         })
     }
     fn pending(&self) -> bool {
         !self.landed.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.halt.notify_waiters();
+    }
+    async fn halted(&self) {
+        loop {
+            let halt = self.halt.notified();
+            tokio::pin!(halt);
+            halt.as_mut().enable();
+            if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            halt.await;
+        }
     }
     async fn wait(&self) {
         loop {

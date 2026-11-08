@@ -269,6 +269,42 @@ class SummaryAfterTurnTests(ModelFixture):
         self.assertIsNone(client.request('inspect', bot='Bob')['result']['compaction'])
         self.assertEqual(self.compacted(client), [])
 
+    def test_an_expired_bots_summary_is_not_taken_in_by_a_namesake(self):
+        self.model.timeline, self.model.summary_delay = [], 4.0
+        client = self.client(tools='shell', settings=SETTINGS)
+        # A fork may expire; it copies its source's settings.
+        self.assertIn('result', client.request('create', bot='Src', workspace=str(self.path), tools=['shell'],
+                                               compaction_instructions='Summarize.'))
+        forked = client.request('fork', source='Src', bot='Bob', workspace=str(self.path), expire_ms=1000)
+        self.assertIn('result', forked)
+        self.past_threshold(client)
+        self.wait_for(lambda: getattr(self.model, 'summarizing', False))
+        # It expires idle while the summary runs.
+        self.wait_for(lambda: 'error' in client.request('inspect', bot='Bob'), timeout=5)
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                                               compaction_instructions='Summarize.'))
+        gate = threading.Event()
+        self.model.request_gates = queue.Queue()
+        self.model.request_gates.put(gate)
+        turn = client.request('submit', bot='Bob', request_id='new', prompt='long:2x1')['result']['turn']
+        time.sleep(3)
+        gate.set()
+        self.assertEqual(client.finished(turn, timeout=15)['data']['status'], 'completed')
+        self.assertIsNone(client.request('inspect', bot='Bob')['result']['compaction'])
+        self.assertEqual(self.compacted(client), [])
+
+    def test_a_summary_landing_after_a_later_turn_ended_is_not_taken_for_its_view(self):
+        # The turn after the one that started it ends first; the summary
+        # then goes in with no turn running, and that later turn's last
+        # call no longer sent the bot's view.
+        client = self.start(delay=1.5)
+        self.past_threshold(client)
+        later = self.turn(client, 2, 'small')
+        client.summarized('Bob', timeout=10)
+        with closing(sqlite3.connect(self.path / 'state.sqlite')) as db:
+            sent, = db.execute('select view_sent from turns where id=?', (later['turn'],)).fetchone()
+        self.assertEqual(sent, 0)
+
     def events(self, client):
         events, after = [], 0
         while page := client.request('events', bot='Bob', after=after, limit=256)['result']['events']:
