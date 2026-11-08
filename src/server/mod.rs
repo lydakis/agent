@@ -673,8 +673,9 @@ enum Command {
     },
     /// Stop every agent until `resume`, across restarts: each running turn
     /// parks at once, its unanswered calls answered `daemon_paused`, and
-    /// continues on `resume`; no turn starts, and queued work waits.
-    /// `by` names who pulled it; a bot's own socket is that bot. While a
+    /// continues on `resume`; no turn starts, and queued work waits. No
+    /// call is taken and no step allowed until then; results of what ran
+    /// are taken. `by` names who pulled it; a bot's own socket is that bot. While a
     /// pause holds, another changes nothing.
     Pause {
         reason: String,
@@ -3159,13 +3160,16 @@ impl Service {
         }
         let approvals: Vec<i64> = asked.iter().map(|asked| asked.0).collect();
         let store = self.store.clone();
+        // While paused, an allowed step waits for `resume`, which checks
+        // every waiting step again.
+        let held = self.held().is_some();
         let check = move |db: &mut agent_runtime::store::Database| {
             let now = now_ms();
             let mut checked = Vec::with_capacity(asked.len());
             for (approval, bot, turn, id, gone) in asked {
                 let stepped = match gone {
                     true => db.step_abandon(&bot, turn, &id, now),
-                    false => db.step_check(&bot, turn, &id, now),
+                    false => db.step_check(&bot, turn, &id, now, held),
                 };
                 // A check that lost the group's transaction lost what the
                 // checks before it wrote too: the whole batch fails, as
@@ -4309,8 +4313,11 @@ impl Service {
                 self.paused = None;
                 let changed = lifted.is_some();
                 if changed {
-                    // What waited starts as capacity allows.
+                    // What waited starts as capacity allows, and the steps
+                    // allowed meanwhile go on.
                     self.ready_hint = true;
+                    let waiting: Vec<i64> = self.stepping.keys().copied().collect();
+                    self.check_steps(waiting, false);
                     self.notices.push(
                         json!({"event": "resumed", "pause": lifted, "by": by, "durable": false}),
                     );
@@ -4628,6 +4635,14 @@ impl Service {
                 if !arguments.is_object() {
                     return fail_with("invalid_step", "arguments must be an object");
                 }
+                // Paused or shutting down, nothing new runs: no step is
+                // put to a gate, recorded, or allowed until the line goes on.
+                if let Some(held) = self.held() {
+                    return fail_with(
+                        held,
+                        "no step runs while the daemon is held; ask again after resume",
+                    );
+                }
                 if serde_json::to_vec(&arguments)?.len() > ANSWER_BYTES {
                     return fail_with(
                         "step_arguments_limit",
@@ -4691,6 +4706,14 @@ impl Service {
             Command::TakeCall { bot, turn, call_id } => {
                 if call_id.is_empty() {
                     return fail_with("invalid_call_id", "call_id may not be empty");
+                }
+                // Paused or shutting down, nothing new runs: the call waits,
+                // untaken, to be taken once the line goes on.
+                if let Some(held) = self.held() {
+                    return fail_with(
+                        held,
+                        "no call is taken while the daemon is held; take it after resume",
+                    );
                 }
                 store
                     .op("take_call", move |db| {
