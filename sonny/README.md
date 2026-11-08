@@ -885,6 +885,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   you dropped the work, and the lead can mark any of its tasks done the
   same way; the lead hears when a task marked itself done, and the task's
   window closes once its turn ends. New work sent to the task reopens it.
+  A lead is marked done the same way once you say its project is done: it
+  calls `mark_done` naming no task, or an outer lead names it. Its row
+  reads done, its old questions are set aside, and its automations skip
+  their runs (`/background` says `last paused: web.lead is done`) until a
+  message, from you or any agent, reopens it. A run you ask for with
+  `fire` still runs, and reopens it.
   A task idle for `[sonny] task_done_check` hours (8 by default, 0
   never) is asked by its lead's window, through a copy of it with no
   tools, whether its work is done: a yes marks it done, its row saying

@@ -5720,6 +5720,25 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
             return;
         }
     }
+    // A done lead's automations wait for a message to reopen it; one the
+    // person runs now runs. Only a lead with a mark costs a look at its
+    // newest turn, and one that can't be looked at runs as ever.
+    if !asked
+        && let Target::Bot { name, .. } = &trigger.target
+        && crate::project::is_lead(name)
+        && let Some(store) = trigger.daemon.store.as_deref()
+    {
+        let store =
+            agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_owned());
+        if crate::resolved::read(&store, name).is_some()
+            && let Ok(Some(why)) =
+                with_daemon(trigger, async |c| lead_paused(c, &store, name).await)
+        {
+            let paused = named(json!({"outcome": "paused", "detail": why}));
+            settle(places, trigger, &paused, &kept);
+            return;
+        }
+    }
     let mut why = match asked {
         true => RUN_NOW.to_owned(),
         false => trigger.when.clone(),
@@ -5907,6 +5926,16 @@ fn looked(places: &Places, trigger: &Trigger, seen: &Seen) {
 /// cannot be reached or serves another store.
 /// How often a fire waiting out a pause looks again.
 const PAUSE_LOOK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Why the lead `name`'s automations wait now: its mark beside `store`
+/// says it is done and no turn of its since reopened it. None when it
+/// isn't, or its newest turn can't be read.
+async fn lead_paused(client: &Client, store: &Path, name: &str) -> Option<String> {
+    let mark = crate::resolved::read(store, name)?;
+    let asked = json!({"bot": name, "newest": true, "limit": 1});
+    let page = client.request("turns", asked).await.ok()?;
+    crate::resolved::paused(name, Some(mark), page["turns"][0]["turn"].as_i64())
+}
 
 /// Wait while `trigger`'s daemon is paused. A daemon that does not answer
 /// is not paused here: the check then runs and says what it finds.
@@ -8785,6 +8814,31 @@ pub(crate) mod tests {
             refused.contains("--until 2026-09-28 09:00 has passed"),
             "{refused}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_done_lead_s_automations_wait_until_a_turn_reopens_it() {
+        let newest = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(9));
+        let seen = newest.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            let turn = seen.load(std::sync::atomic::Ordering::SeqCst);
+            match request["op"].as_str() {
+                Some("turns") => json!({"turns": [{"turn": turn}]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("sonny-lead-paused-{}", std::process::id()));
+        let store = dir.join("store");
+        // Not marked: it runs.
+        assert_eq!(lead_paused(&client, &store, "web.lead").await, None);
+        crate::resolved::keep(&store, "web.lead", 9, "c1").unwrap();
+        let why = lead_paused(&client, &store, "web.lead").await.unwrap();
+        assert!(why.contains("web.lead is done"), "{why}");
+        // A message reopened it: it runs again.
+        newest.store(10, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(lead_paused(&client, &store, "web.lead").await, None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

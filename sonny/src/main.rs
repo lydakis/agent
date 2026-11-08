@@ -703,7 +703,7 @@ async fn read_status(
                 ..Default::default()
             },
         };
-        let itself = seen.itself && name != lead && ran["status"] == "completed";
+        let itself = seen.itself && ran["status"] == "completed";
         let resolved =
             itself || resolved::holds(resolved::read(&store, name), ran["turn"].as_i64(), running);
         // With no question asked, what its last reply left waiting on the
@@ -9878,6 +9878,23 @@ impl App {
             return;
         };
         let project = &project;
+        // A lead marks itself done, naming no task, up to the turn that
+        // marks it, which ending leaves it done.
+        let lead = match self.options.side.is_some() {
+            true => side_source(&self.bot).map(str::to_owned),
+            false => Some(self.bot.clone()),
+        };
+        if let (Some(lead), Some(turn)) = (lead, turn)
+            && project::is_lead(&lead)
+            && resolved::itself(arguments, &lead)
+        {
+            if (now || !resolved::made_by(&self.store(), &lead, call))
+                && let Err(error) = resolved::keep(&self.store(), &lead, turn, call)
+            {
+                self.notice = Some(error);
+            }
+            return;
+        }
         let (Some(task), Some(turn)) = (resolved::call(arguments, project), turn) else {
             return;
         };
@@ -22700,6 +22717,32 @@ mod tests {
         fleet.go_to("calc.b", true);
         fleet.layout.settle();
         assert!(windowed(&fleet).contains(&"calc.b".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn a_lead_marks_itself_done_and_an_outer_lead_names_a_lead() {
+        let client = daemon_answering(|asked| match asked["op"].as_str() {
+            Some("turns") if asked["bot"] == "web.lead" => {
+                json!({"turns": [{"turn": 7, "status": "completed", "finished_ms": 1}]})
+            }
+            _ => json!({"turns": []}),
+        })
+        .await;
+        let dir = std::env::temp_dir().join(unique("sonny-lead-done"));
+        let mut app = app(client);
+        app.bot = "calc.lead".into();
+        app.project = Some("calc".into());
+        app.options.store = dir.join("store");
+        // Naming no task, a lead marks itself, up to the turn that marks it.
+        app.resolve(&json!({}), "c1", Some(12), true).await;
+        assert_eq!(resolved::read(&app.store(), "calc.lead"), Some(12));
+        assert!(resolved::made_by(&app.store(), "calc.lead", "c1"));
+        // An outer lead names a lead as it is, up to its newest turn ended.
+        app.resolve(&json!({"task": "web.lead"}), "c2", Some(13), true)
+            .await;
+        assert_eq!(resolved::read(&app.store(), "web.lead"), Some(7));
+        assert_eq!(resolved::read(&app.store(), "calc.web.lead"), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
