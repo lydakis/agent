@@ -1038,6 +1038,10 @@ pub struct TurnOptions {
     /// A JSON Schema, as JSON text, the turn's reply follows: the
     /// provider's structured output. None leaves the reply free text.
     pub output_schema: Option<String>,
+    /// The daemon's own fact for the running turn its strict steer names,
+    /// such as a dropped reply: no budget refuses it, since that turn's
+    /// calls are what the budget bounds, and its last call should read it.
+    pub fact: bool,
 }
 /// An attached message whose wait ran out, delivered now as a steer.
 #[derive(Debug)]
@@ -1126,6 +1130,9 @@ const UNTELLING: &str = "UPDATE processes SET told=0 WHERE id IN (
 /// The origin of the message that tells a bot its background commands
 /// ended.
 pub const BACKGROUND_ORIGIN: &str = "background";
+/// The origin of the message that tells a bot its last reply was dropped:
+/// the model's own output cap cut it short.
+pub const LIMIT_ORIGIN: &str = "limit";
 /// How a background command ended, as its bot is told: its result without
 /// the output, which a `wait` on its handle reads.
 /// The fields of a result that say how its command ended, in the order
@@ -6305,6 +6312,7 @@ impl Database {
                             images: Vec::new(),
                             wait_ms: r.get::<_, Option<i64>>(16)?.map(|n| n as u64),
                             output_schema: r.get(18)?,
+                            fact: false,
                         },
                         r.get(7)?,
                         r.get(13)?,
@@ -6344,6 +6352,8 @@ impl Database {
                 images: _,
                 wait_ms,
                 output_schema,
+                // Admission alone: not kept with the turn.
+                fact: _,
             } = &saved_options;
             let images = saved_images.map(|kept| pictures_digest(&kept));
             let differs = [
@@ -6471,8 +6481,9 @@ impl Database {
             return Err(Error::with("bot_busy", detail)
                 .facts(json!({"running_turn":bot.running_turn,"fork_point":bot.fork_point})));
         }
-        if let Some(budget) =
-            (bot.budget_tokens).filter(|b| bot.spent().of(bot.budget_counts) >= *b)
+        if let Some(budget) = (bot.budget_tokens)
+            .filter(|b| bot.spent().of(bot.budget_counts) >= *b)
+            .filter(|_| !(options.fact && options.expected_turn.is_some()))
         {
             return Err(budget_exhausted(&bot, budget));
         }
@@ -7354,6 +7365,61 @@ impl Database {
             params![asked as i64, id, asked as i64],
         )?;
         Ok(changed == 1)
+    }
+    /// Drop a turn's reply that the model's own output cap cut short: none
+    /// of it is recorded. One commit tells the model what cut it, a strict
+    /// steer for this turn from the `limit` origin whose words are
+    /// `{"dropped":facts}`, records the `dropped` event windows read, and,
+    /// when the provider billed nothing for the call (`count`), counts its
+    /// round, as a billed failure's usage counts it.
+    pub fn drop_reply(&mut self, turn: i64, facts: &Value, count: bool) -> Result<()> {
+        let bot = self.active(turn)?;
+        self.conn.execute_batch("SAVEPOINT drop_reply")?;
+        let dropped = (|| {
+            if count {
+                self.conn.execute(
+                    "UPDATE turns SET model_rounds=model_rounds+1 WHERE id=?",
+                    [turn],
+                )?;
+            }
+            event(&self.conn, &bot.name, Some(turn), "dropped", facts.clone())?;
+            let rounds: i64 =
+                self.conn
+                    .query_row("SELECT model_rounds FROM turns WHERE id=?", [turn], |r| {
+                        r.get(0)
+                    })?;
+            let options = TurnOptions {
+                delivery: Delivery::Steer,
+                expected_turn: Some(turn),
+                origin: Some(LIMIT_ORIGIN.to_owned()),
+                fact: true,
+                ..TurnOptions::default()
+            };
+            // Not held to the bounds on submissions, as a background note
+            // is not: the turn's own calls bound it.
+            let limits = std::mem::take(&mut self.pending_limits);
+            let begun = self.begin(
+                &bot.name,
+                &format!("{LIMIT_ORIGIN}-{turn}-{rounds}"),
+                &json!({"dropped": facts}).to_string(),
+                false,
+                &options,
+                |_, _| Ok(()),
+            );
+            self.pending_limits = limits;
+            begun.map(|_| ())
+        })();
+        match dropped {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE drop_reply")?;
+                Ok(())
+            }
+            Err(error) => {
+                self.conn
+                    .execute_batch("ROLLBACK TO drop_reply; RELEASE drop_reply")?;
+                Err(error)
+            }
+        }
     }
     /// Record a model call's retry: its attempt, the error it answers and
     /// how long it waits.

@@ -1327,6 +1327,7 @@ pub fn from_outside(origin: Option<&str>) -> &'static str {
         Some("tasks") => "a task",
         Some("judge") => "a judge",
         Some("background") => "a background command",
+        Some("limit") => "the model's output limit",
         _ => "outside",
     }
 }

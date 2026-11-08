@@ -1009,14 +1009,15 @@ or stringify the full conversation on each turn. Provider HTTP/TLS comes from
 transactions from [rusqlite](https://docs.rs/rusqlite/0.40.2/rusqlite/).
 
 Current limits: 8 MiB / 4,096 items of model context per request (stored
-history is unbounded), 256 KiB input prompt, 64 KiB instructions, 768 KiB JSON-encoded terminal provider output
-(a full 128,000-token answer, under the 1 MiB event cap; tool call ids and
-names count toward it), 64 KiB JSON-encoded
+history is unbounded), 256 KiB input prompt, 64 KiB instructions, no bound of
+the daemon's own on one reply (the model's own output cap bounds it; see
+[Replies the model's cap cuts short](#replies-the-models-cap-cuts-short)), 64 KiB JSON-encoded
 tool call id without NUL, unique within its turn (a longer one, one with a
 NUL, or one an earlier call of the response or turn used fails the response
 with `invalid_tool_call_id`, so every gated call can be listed and answered
-by a command naming it alone), 2 MiB SSE frame,
-16 MiB response stream, 200 provider rounds per turn, and the configurable
+by a command naming it alone), a 16 MiB response stream, over HTTP or a
+socket, which also bounds one SSE frame (an endpoint that never stops; no
+model writes that much), 200 provider rounds per turn, and the configurable
 active-turn, process, and connection-startup bounds below. Provider startup
 admission, when bounded, has a 60-second timeout and releases its permit when
 response headers arrive. Both live providers hold headers until the first
@@ -2180,6 +2181,31 @@ the cached prefix, it rewrites the message cache once. A model that calls a
 tool anyway has those calls run, as any committed plan's, and the turn then
 fails `tool_round_limit`.
 Unbilled failures remain bounded by the attempt and time limits above.
+
+### Replies the model's cap cuts short
+
+A reply the model's own output cap cuts short (Anthropic's `max_tokens` stop,
+Responses' `response.incomplete` for `max_output_tokens`) is not retried, as
+the same request would write the same reply. It is dropped: nothing of it is
+recorded, so no partial tool call can run, and the turn goes on with every
+earlier round kept. One commit counts its round (its usage does when the
+provider reported it), records a durable `dropped` event, and queues a strict
+steer for the turn from the `limit` origin, which the next boundary takes as
+it takes any steer. Its words are the facts, and the event's data the same:
+
+```json
+{"dropped":{"limit":"max_tokens","output_tokens":32000,"in":"write"}}
+```
+
+`in` is what the reply was writing when cut, `text`, `reasoning`, or the tool
+it called, when the stream said. No budget refuses that steer: the turn's
+calls are what the budget bounds, and a spent one still makes the turn's last
+call, which reads it. The cap cutting three replies of a turn in a row ends
+the turn on the third, `provider_incomplete` with the same facts on its
+`turn_finished`, since each can cost a whole reply's output. The daemon puts
+no bound of its own on a reply under the 16 MiB response stream: events carry
+previews of calls (2 KiB of arguments), text streams live in pieces of at most
+128 KiB, and a history read answers `item_too_large` for one item past a line.
 
 ### Held turns
 

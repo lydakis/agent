@@ -9314,6 +9314,26 @@ impl App {
             "tool_calls_withheld" => {
                 self.notice = Some("at the round limit: this reply ends the turn".into())
             }
+            "dropped" => {
+                // The model's own output cap cut its reply short: the
+                // daemon dropped it, so what streamed of it goes too, and
+                // told the agent, whose next call streams afresh.
+                self.live = None;
+                self.live_item = None;
+                self.ahead.clear();
+                self.streamed = false;
+                self.said.clear();
+                self.replay = None;
+                self.notice = Some(match data["in"].as_str() {
+                    Some(what) => format!(
+                        "the model's output limit cut its reply short while writing {what}; \
+                         the reply was dropped and the agent told"
+                    ),
+                    None => "the model's output limit cut its reply short; \
+                             the reply was dropped and the agent told"
+                        .into(),
+                });
+            }
             "retry" => {
                 // Messages written as the next began may come again, or
                 // not: what was shown stays, and the call's own is drawn.
@@ -18705,6 +18725,51 @@ mod tests {
         // Reactions find each message by its node.
         assert!(app.kept(screen::Tag::End(2)));
         assert!(!app.kept(screen::Tag::Streamed(1)));
+    }
+
+    #[tokio::test]
+    async fn a_reply_the_model_s_cap_cut_short_is_let_go_and_the_next_drawn() {
+        let client = daemon_with(json!({
+            "3": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "Written in parts."}]}
+        }))
+        .await;
+        let mut app = app(client);
+        let event =
+            |event: &str, data: Value| json!({"event": event, "bot": "b", "turn": 1, "data": data});
+        app.daemon(event("accepted", json!({}))).await;
+        let said = |item: u64, text: &str| {
+            let mut delta = event("text_delta", json!({}));
+            (delta["item"], delta["text"]) = (json!(item), json!(text));
+            delta
+        };
+        app.daemon(said(1, "Here is the whole file at once")).await;
+        app.daemon(event(
+            "dropped",
+            json!({"limit": "max_tokens", "output_tokens": 32000, "in": "text"}),
+        ))
+        .await;
+        assert!(app.live.is_none() && app.said.is_empty());
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("output limit") && n.contains("writing text"))
+        );
+        app.daemon(said(3, "Written in parts.")).await;
+        app.daemon(event("message", json!({"node": 3}))).await;
+        let open = app.open_rows(80);
+        let drawn: Vec<String> = (app.pending.iter().chain(&open))
+            .map(|line| line.to_string())
+            .collect();
+        assert!(!drawn.iter().any(|l| l.contains("whole file")), "{drawn:?}");
+        assert_eq!(
+            drawn
+                .iter()
+                .filter(|l| l.contains("Written in parts."))
+                .count(),
+            1,
+            "{drawn:?}"
+        );
     }
 
     #[tokio::test]
