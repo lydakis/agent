@@ -64,6 +64,13 @@ pub fn person(prompt: &str, bot: &str) -> String {
     stamped_with(prompt, epoch_now(), clause.as_deref())
 }
 
+/// Another person's words, a teammate's through an ACP client, stamped
+/// now: they say nothing of the person's own being away or back, so they
+/// neither end quiet nor say since when.
+pub fn other(prompt: &str) -> String {
+    stamped(prompt, epoch_now())
+}
+
 /// A message's words without the line `stamped` put after them.
 pub fn unstamped(text: &str) -> &str {
     let Some(at) = text.rfind(OPEN) else {

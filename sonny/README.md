@@ -487,6 +487,16 @@ by an id that names the lead, its identity and its store's lineage
 made again under its name, or a lead of another store, is not the one
 listed, and is refused.
 
+A client several people write through names who wrote each prompt in its
+`_meta.person`, a name as the daemon takes one (1 to 128 of
+`A-Z a-z 0-9 . _ -`, so `ana.lopez`, not `Ana Lopez`; another is refused).
+The lead reads `[Written by ana.lopez.]` after the words and their time,
+and Sonny's window shows the name on the message. Their words are not
+yours: they neither end quiet nor say you are back, and the reviewer takes
+none of them as your consent. The client's answer to a call waiting on a
+person may name who chose in its own `_meta.person`, which the call's
+record keeps as who answered (else `acp`).
+
 Enter sends (and steers a running turn), Tab while a turn runs queues what
 you wrote to run after it, as Codex does, Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
