@@ -393,9 +393,14 @@ task works on, and `/status` (or its name) opens it again, also after the
 lead starts again (kept in `~/.agent/sonny/aside/`); its `/status` row
 says `window set aside for room`. A task set aside that comes to need you
 opens its window again on its own, as what needs you keeps its window. `--rex-host HOST` puts the session on another Rex
-server; `--no-layout` turns the layout off. Sonny writes the skill for the
-multiplexer it runs in to `~/.agents/skills` (`rex-windows`,
-`herdr-panes` or `cmux-tabs`, from `skills/`), so any agent can run a long command where
+server; `--no-layout` turns the layout off. Sonny writes a skill for each
+multiplexer the machine has to `~/.agents/skills` (`rex-windows`,
+`herdr-panes` and `cmux-tabs`, from `skills/`). Each sends the agent to
+`sonny where` first, which prints the multiplexer and the workspace or
+session its calls act in now, by the rule the tools follow: where the person
+last used a window of the agent's (or of the agent that made it), so a
+project open in Herdr and in cmux at once has its agents act in the one the
+person is typing in. With that, any agent can run a long command where
 the person can watch it, and read it back: the `run_in_pane` tool
 (`name`, `command`, `split` right, left, above, below or float) opens a block
 labelled `AGENT/NAME` in a tab of its own (or on that side of the agent's
