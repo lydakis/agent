@@ -154,11 +154,6 @@ def main():
     (ws / 'README').write_text('felt\n')
     store = out / 'state.sqlite'
     sock = Path(f'/tmp/felt-{os.getpid()}.sock')
-    # A scripted source, as a poller is written: print what is new, exit.
-    (home / '.agent' / 'config.toml').write_text(
-        '[sonny.sources.ticker]\n'
-        'command = "date +\'{\\"id\\":\\"%s\\",\\"text\\":\\"tick %s\\"}\'"\n'
-        'every = "10s"\n')
 
     port_file = out / 'port'
     model = subprocess.Popen([sys.executable, '-m', 'bench.lookout_scale', '--model', str(port_file),
@@ -228,22 +223,33 @@ def main():
             worker = threading.Thread(target=busy_loop, args=(
                 [f'fleet.t{t}' for t in range(args.tasks)], ['stream:20:50']))
         elif phase == 'source':
+            # A scripted source, as a poller is written: print what is new,
+            # exit. The lookout reads its settings every 15 s.
+            (home / '.agent' / 'config.toml').write_text(
+                '[sonny.sources.ticker]\n'
+                'command = "date +\'{\\"id\\":\\"%s\\",\\"text\\":\\"tick %s\\"}\'"\n'
+                'every = "10s"\n')
             folder = Path(str(store) + '.lookout')
             folder.mkdir(exist_ok=True)
             (folder / 'ws.lead.json').write_text(json.dumps(
                 {'subscriptions': [{'name': 'tick', 'sources': ['ticker']}]}))
+            time.sleep(16)
         if worker:
             worker.start()
+        time.sleep(3)  # the phase's load under way before counting
+        started = time.time()
         pids = [int(p.stem) for p in logs.glob('*.log')]
         before = cpu_rss(pids)
-        time.sleep(max(0, args.seconds - 12))
-        echo = window.probe()  # the last ~12 s: 20 keys, 0.5 s apart
-        stop.set()
-        if worker:
-            worker.join(30)
+        time.sleep(args.seconds)
         pids = [int(p.stem) for p in logs.glob('*.log')]
         after = cpu_rss(pids)
         ended = time.time()
+        # Key to echo under the same load, after the counted window: typing
+        # notes the window as used, which writes, and is not idle cost.
+        echo = window.probe()
+        stop.set()
+        if worker:
+            worker.join(30)
         phases.append({'phase': phase, 'from_ms': int(started * 1000), 'to_ms': int(ended * 1000),
                        'cpu': {pid: round(after[pid][0] - before.get(pid, (0, 0))[0], 3)
                                for pid in after},
