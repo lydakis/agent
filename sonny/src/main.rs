@@ -1256,6 +1256,13 @@ async fn spread_pass(
         notice: None,
         sandboxes: Default::default(),
     };
+    // The lead's own change is set once the daemon took it, not while it
+    // keeps it for the end of the lead's running turn: until then the
+    // agents it made are bounded by its old permissions. Read before the
+    // listing, so one it makes before taking it is listed.
+    let lead_set = lead_set
+        && (client.request("inspect", json!({"bot": lead})).await)
+            .is_ok_and(|record| record["configure_pending"].is_null());
     let listing = every_bot(&client).await;
     let listed = listing.is_some();
     let bots = listing.unwrap_or_default();
@@ -1267,12 +1274,6 @@ async fn spread_pass(
             .collect(),
         false => Vec::new(),
     };
-    // The lead's own change is set once the daemon took it, not while it
-    // keeps it for the end of the lead's running turn: until then the
-    // agents it made are bounded by its old permissions.
-    let lead_set = lead_set
-        && (client.request("inspect", json!({"bot": lead})).await)
-            .is_ok_and(|record| record["configure_pending"].is_null());
     passed.after_lead = listed && lead_set;
     let lead_id = (bots.iter())
         .find(|bot| bot["name"] == lead)
@@ -20776,7 +20777,11 @@ mod tests {
         let workspace = std::env::temp_dir().join(unique("spread"));
         std::fs::create_dir_all(&workspace).unwrap();
         let folder = workspace.display().to_string();
-        let client = daemon_serving(json!({}), move |request| match request["op"].as_str() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_serving(json!({}), move |request| {
+            seen.lock().unwrap().push(format!("{} {}", request["op"], request["bot"]));
+            match request["op"].as_str() {
             Some("bots") => json!({"bots": [
                 {"name": "b", "bot_id": 1, "running_turn": 4},
                 {"name": "b.task", "bot_id": 2, "created_by_id": 1, "running_turn": 3},
@@ -20789,6 +20794,7 @@ mod tests {
             Some("configure") => json!({"bot": "b.task", "bot_id": 2, "running_turn": 3,
                 "configure_pending": {"approve": ["shell"]}, "changed": []}),
             _ => json!({}),
+            }
         })
         .await;
         let passed = spread_pass(
@@ -20805,6 +20811,14 @@ mod tests {
         assert_eq!(passed.waiting, ["b.task"]);
         assert!(passed.settled.is_empty());
         assert!(!passed.again);
+        // The lead is read before the listing: an agent it makes before
+        // taking its change is listed by the pass that finds it taken.
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(
+            asked[..2],
+            ["\"inspect\" \"b\"", "\"bots\" null"],
+            "{asked:?}"
+        );
         let _ = std::fs::remove_dir_all(workspace);
     }
 

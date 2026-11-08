@@ -835,7 +835,8 @@ pub fn reach_line(name: &str, reach: Option<Reach>, width: usize) -> String {
 /// The `configure` fields that give a bot `mode`, with the sandbox the
 /// mode gives an agent in its folder, or `None` when its gate is already
 /// the one `gate` makes and its sandbox the mode's: the same approver over the same tools,
-/// with no expiry. `record` is the bot as `inspect` gives it, with the
+/// with no expiry, and no change the daemon keeps for its running turn's
+/// end, which may set another. `record` is the bot as `inspect` gives it, with the
 /// tools its client declared, and `name` its name; its folder's sandbox
 /// comes from `sandboxes`, with its state folder ([`crate::state::of`]).
 pub fn regate(
@@ -882,7 +883,8 @@ pub fn regate(
         confined = sandboxed_as(record, &sandbox);
         fields.insert("settings".into(), Value::Object(sandbox));
     }
-    (!has || !confined).then_some(fields)
+    let kept = !record["configure_pending"].is_null();
+    (!has || !confined || kept).then_some(fields)
 }
 
 #[cfg(test)]
@@ -940,6 +942,19 @@ mod tests {
         assert_eq!(
             regate(&kept, "auto", "stated.fix.check", &mut Sandboxes::default()),
             None
+        );
+        // Unless the daemon keeps a change for its turn's end, an earlier
+        // pick's, say: the row is given again, over it.
+        let mut later = kept.clone();
+        later["configure_pending"] = json!({"approve": [], "settings": {"sandbox": "read-only"}});
+        assert!(
+            regate(
+                &later,
+                "auto",
+                "stated.fix.check",
+                &mut Sandboxes::default()
+            )
+            .is_some()
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
