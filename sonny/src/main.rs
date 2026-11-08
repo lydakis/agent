@@ -340,6 +340,8 @@ fn usage() -> String {
      sonny sky draws every agent on the daemon lighting up as they talk, as /sky does,\n\
      on its own in the whole terminal; --center NAME puts an agent in the middle, and\n\
      --replay [WHEN] plays the past back from WHEN: 2h, 30m or 1d ago, or 02:10 (an hour ago).\n\
+     sonny where [AGENT] prints the multiplexer and its workspace or session that AGENT's\n\
+     run_in_pane and show_agent calls act in now (AGENT is $AGENT_BOT in an agent's shell).\n\
      sonny lookout watches every lead on the daemon, tells it what happens in its tasks\n\
      and answers its agents' calls of Sonny's tools; Sonny starts one.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
@@ -916,6 +918,14 @@ async fn agents_project(bot: &str) -> Result<(PathBuf, String, Vec<String>), Str
     let socket = std::env::var_os("AGENT_SOCKET")
         .map(PathBuf::from)
         .ok_or("AGENT_SOCKET is not set")?;
+    agents_project_at(&socket, bot).await
+}
+
+/// [`agents_project`] on the daemon at `socket`.
+async fn agents_project_at(
+    socket: &std::path::Path,
+    bot: &str,
+) -> Result<(PathBuf, String, Vec<String>), String> {
     let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
     let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
     let project = project_of(&client, bot).await;
@@ -1842,6 +1852,8 @@ fn main() -> std::process::ExitCode {
         }
         Some((verb, rest)) if verb == "sky" => sky_cli(rest),
         Some((verb, rest)) if verb == "status" => status_cli(rest),
+        // An agent's shell runs this, before it opens anything in a terminal.
+        Some((verb, rest)) if verb == "where" => where_cli(rest),
         // An agent's shell runs this, for zen it was asked for in words.
         Some((verb, rest)) if verb == "zen" => zen::cli(rest),
         Some((verb, rest)) if verb == "home" => {
@@ -1935,6 +1947,50 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
     sky::watch(&runtime, socket, store, centre, replay)
+}
+
+/// `sonny where [AGENT]`: the multiplexer and the home in it that AGENT's
+/// `run_in_pane` and `show_agent` calls act in now, by the rule they
+/// follow ([`mux::aim`]), so an agent reads which terminal the person
+/// watches its work in, not one guessed from the skills it has.
+fn where_cli(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: sonny where [AGENT] [--store PATH] [--socket PATH]";
+    let (mut store, mut socket, mut agent) = (None, None, None);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--store" => store = args.next().map(PathBuf::from),
+            "--socket" => socket = args.next().map(PathBuf::from),
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            name if !name.starts_with('-') && agent.is_none() => agent = Some(name.to_owned()),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let agent = (agent.or_else(|| std::env::var("AGENT_BOT").ok()))
+        .filter(|agent| !agent.is_empty())
+        .ok_or(format!("name an agent\n{USAGE}"))?;
+    let (store, socket) = daemon_paths(store, socket)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let (socket, project, chain) = runtime.block_on(agents_project_at(&socket, &agent))?;
+    // A sandboxed agent's shell on macOS reaches the daemon by its own
+    // socket, which no Sonny window notes its place under: the windows
+    // note it under the socket they reach the daemon by, the store's own
+    // unless one was named.
+    let noted = std::iter::once(socket.clone())
+        .chain(agent_client::socket::default_socket(&store).ok())
+        .find(|socket| mux::noted(socket, &project))
+        .unwrap_or(socket);
+    println!(
+        "{}",
+        mux::aim(&noted, &project, &chain, None)?.said(&project)
+    );
+    Ok(())
 }
 
 /// `sonny status [AGENT] [--json]`: what `/status` reads, for an agent's
@@ -2108,7 +2164,7 @@ async fn run() -> Result<(), String> {
             // Sonny no longer writes an `errand` skill: one it wrote, unedited, goes.
             skills::remove("errand");
             if options.layout {
-                mux::install_skill(options.rex_host.as_deref());
+                mux::install_skill();
             }
             let lead =
                 project::open(&client, &dir, options.model.as_deref(), &options.lead).await?;
@@ -4452,7 +4508,7 @@ impl Fleet {
         ];
         // Said only when the tasks go somewhere this pane is not.
         let note = (!layout.here()).then(|| format!("tasks open in {}", layout.home()));
-        mux::install_skill(options.rex_host.as_deref());
+        mux::install_skill();
         let (tell, said) = tokio::sync::mpsc::unbounded_channel();
         let mut layout = layout;
         layout.keep_aside(used::aside());

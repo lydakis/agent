@@ -1,9 +1,13 @@
 ---
 name: rex-windows
-description: Use whenever a command runs long or is interactive (dev servers, watchers, builds or test runs past the shell tool's 10 minutes, REPLs): run it in a Rex terminal block the person can watch, then read, wait on or stop it; and put an agent's window where the person asks (its own tab, or a split beside another).
+description: Use when `sonny where` names Rex (run it first whenever the person asks which terminal you are in) and a command runs long or is interactive (dev servers, watchers, builds or test runs past the shell tool's 10 minutes, REPLs): run it in a Rex terminal block the person can watch, then read, wait on or stop it; and put an agent's window where the person asks (its own tab, or a split beside another).
 ---
 
-Rex is the terminal multiplexer the person watches the work in. Each project has one Rex session: the one its lead runs in. In it, every agent has a block labelled with its full name (`shop.fix-cart`), and a tab named after what it is doing. Use a block only for a command that runs longer than the shell tool allows (up to 10 minutes with `timeout_ms`), that keeps running (a server, a watcher), or that the person wants to watch. Everything else, a one-minute test run or build included, stays in the shell tool: give it a `timeout_ms` that covers it rather than a short one, since one shell call is faster than a block, a wait and a read.
+## Which terminal
+
+The person can have this project open in more than one multiplexer at once, so run `sonny where` first: before you open, read or move anything in a terminal, and whenever the person asks where you are. It prints, in one line, the multiplexer and the workspace or session your `run_in_pane` and `show_agent` calls act in now: where the person last used a window of yours, or of the agent that started you. Follow this skill when it names Rex, and the `herdr-panes` or `cmux-tabs` skill when it names another. When it says nothing opened would be seen, the person is in no multiplexer, so keep your commands in the shell tool. Run it again when the person says they moved to another window.
+
+Rex is a terminal multiplexer the person watches the work in. Each project has one Rex session: the one its lead runs in. In it, every agent has a block labelled with its full name (`shop.fix-cart`), and a tab named after what it is doing. Use a block only for a command that runs longer than the shell tool allows (up to 10 minutes with `timeout_ms`), that keeps running (a server, a watcher), or that the person wants to watch. Everything else, a one-minute test run or build included, stays in the shell tool: give it a `timeout_ms` that covers it rather than a short one, since one shell call is faster than a block, a wait and a read.
 
 ## Tabs or a split
 
