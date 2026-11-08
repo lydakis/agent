@@ -6,6 +6,10 @@
 //! thread through T3 Code's tools, the lead thread's child while the
 //! person's prompt runs, and that thread is the task's.
 //!
+//! Any other client, such as a bridge from a chat app, is served the same
+//! way: it picks the lead behind a session with the Agent option, and
+//! finds the leads to reopen with `session/list`.
+//!
 //! It speaks the protocol's version 2 draft as T3 Code does: the turns a
 //! bot takes on its own, as when the lookout wakes a lead because a task
 //! finished, reach the thread between the person's prompts, as work the
@@ -43,6 +47,9 @@ const FAILED: i64 = -32603;
 /// The model and effort pickers' first choice: what the thread's bot
 /// runs, or what Sonny gives a new lead.
 const DEFAULT: &str = "default";
+
+/// The option that picks the lead behind a thread.
+const AGENT: &str = "agent";
 
 /// `sonny acp [--store PATH] [--socket PATH]`.
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -215,6 +222,7 @@ impl Agent {
                 Some(session) => session.prompt(&self, id, params).await,
                 None => Err((INVALID_PARAMS, "no such session".into())),
             },
+            "session/list" => self.listed(params).await,
             "session/set_config_option" => match self.session(params) {
                 Some(session) => session.set_option(&self, params).await,
                 None => Err((INVALID_PARAMS, "no such session".into())),
@@ -263,7 +271,7 @@ impl Agent {
                 "loadSession": false,
                 "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true},
                 "mcpCapabilities": {"http": false, "sse": false, "acp": false},
-                "sessionCapabilities": {"resume": {}, "close": {}}
+                "sessionCapabilities": {"resume": {}, "close": {}, "list": {}}
             },
             "authMethods": [],
             "agentInfo": {"name": "sonny", "title": "Sonny", "version": env!("CARGO_PKG_VERSION")}
@@ -329,12 +337,12 @@ impl Agent {
     /// What the providers list now, as `/model` asks them, with what
     /// `~/.agent/models` says of them and the models only it names. A
     /// listing that does not come in time leaves the file's.
-    async fn list(&self) {
+    async fn list(&self, client: Option<&Client>) {
         let file = agent_client::models::path()
             .and_then(|path| agent_client::models::read(&path).ok())
             .unwrap_or_default();
         let mut offer = Offer::default();
-        if let Ok((client, _events)) = Client::connect(&self.options.socket).await {
+        if let Some(client) = client {
             offer.providers = client.providers().clone();
             let listing =
                 tokio::time::timeout(LISTING, client.request("provider_models", json!({}))).await;
@@ -355,7 +363,6 @@ impl Agent {
                     }
                 }
             }
-            client.close().await;
         }
         for model in file {
             match offer.models.iter_mut().find(|listed| listed.id == model.id) {
@@ -398,7 +405,17 @@ impl Agent {
             .filter(|cwd| cwd.is_absolute())
             .ok_or((INVALID_PARAMS, "cwd must be an absolute path".to_owned()))?;
         self.ready().await.map_err(|e| (FAILED, e))?;
-        self.list().await;
+        // One connection for what the thread's pickers list.
+        let lister = Client::connect(&self.options.socket).await.ok();
+        let lister = lister.as_ref().map(|(client, _)| client.as_ref());
+        self.list(lister).await;
+        let leads = match lister {
+            Some(client) if self.t3.is_none() => folder_leads(client, &cwd).await,
+            _ => Vec::new(),
+        };
+        if let Some(client) = lister {
+            client.close().await;
+        }
         let id = match resumed {
             Some(id) => id.to_owned(),
             None => crate::unique("sonny"),
@@ -406,7 +423,10 @@ impl Agent {
         let session = Arc::new(Session {
             id: id.clone(),
             cwd,
-            state: AsyncMutex::new(State::default()),
+            state: AsyncMutex::new(State {
+                leads,
+                ..State::default()
+            }),
             follower: Mutex::new(None),
             switching: AsyncMutex::new(()),
         });
@@ -421,7 +441,7 @@ impl Agent {
         }
         // A thread comes back as the bot it was, or not at all.
         let bound = match resumed {
-            Some(id) => match t3::recall(id) {
+            Some(id) => match t3::recall(id).or_else(|| listed_lead(id)) {
                 Some(pinned) => {
                     session
                         .bind(self, Some(pinned), false, &project::Pick::Last)
@@ -443,6 +463,98 @@ impl Agent {
             None => json!({"sessionId": id, "configOptions": options}),
         })
     }
+
+    /// `session/list`: the leads Sonny can open a session on, the one
+    /// folder's when the client names a `cwd`, else every project's, a
+    /// page at a time. Each is listed by an id `session/resume` takes, which
+    /// names the lead and its identity, so a lead removed and made again
+    /// under its name is not the one reopened.
+    async fn listed(&self, params: &Value) -> Reply {
+        self.ready().await.map_err(|e| (FAILED, e))?;
+        let (client, _events) = Client::connect(&self.options.socket)
+            .await
+            .map_err(|e| (FAILED, e.to_string()))?;
+        let cwd = params["cwd"].as_str().map(PathBuf::from);
+        let listing = match &cwd {
+            Some(cwd) if !cwd.is_absolute() => {
+                Err((INVALID_PARAMS, "cwd must be an absolute path".to_owned()))
+            }
+            Some(cwd) => match project::folder_project(cwd) {
+                Ok((project, dir)) => project::leads(&client, &project, &dir)
+                    .await
+                    .map(|leads| (leads, None))
+                    .map_err(|e| (FAILED, e)),
+                // A folder no lead can work in has none.
+                Err(_) => Ok((Vec::new(), None)),
+            },
+            None => project::every_lead(&client, params["cursor"].as_str())
+                .await
+                .map_err(|e| (FAILED, e)),
+        };
+        client.close().await;
+        let (leads, next) = listing?;
+        let sessions: Vec<Value> = leads
+            .iter()
+            .filter_map(|lead| {
+                let (bot, bot_id) = (lead["name"].as_str()?, lead["bot_id"].as_i64()?);
+                Some(json!({"sessionId": lead_session(bot, bot_id),
+                    "cwd": lead["workspace"], "title": bot}))
+            })
+            .collect();
+        let mut listed = json!({"sessions": sessions});
+        if let Some(next) = next {
+            listed["nextCursor"] = json!(next);
+        }
+        Ok(listed)
+    }
+}
+
+/// The agent picker: the folder's leads, after `default`, the lead the
+/// thread's first prompt opens as `sonny` opens one there. `current` is
+/// the thread's bot, or the lead picked for it, which is listed whatever
+/// folder it works in.
+fn agent_option(leads: &[String], current: &str) -> Value {
+    let mut choices = vec![json!({"value": DEFAULT, "name": "Default",
+        "description": "A new lead named after your first words, or the folder's first lead when it has none"})];
+    for lead in leads {
+        choices.push(json!({"value": lead, "name": lead}));
+    }
+    if current != DEFAULT && !leads.iter().any(|lead| lead == current) {
+        choices.push(json!({"value": current, "name": current}));
+    }
+    json!({"id": AGENT, "configId": AGENT, "name": "Agent",
+        "description": "The lead behind this thread", "type": "select",
+        "currentValue": current, "options": choices})
+}
+
+/// The id `session/list` gives a lead: its name and its identity.
+fn lead_session(bot: &str, bot_id: i64) -> String {
+    format!("{bot}#{bot_id}")
+}
+
+/// The lead a listed session id names, as `session/resume` reopens it.
+fn listed_lead(session: &str) -> Option<t3::Pinned> {
+    let (bot, bot_id) = session.rsplit_once('#')?;
+    (project::is_lead(bot)).then_some(())?;
+    Some(t3::Pinned {
+        bot: bot.to_owned(),
+        bot_id: Some(bot_id.parse().ok()?),
+        store: None,
+    })
+}
+
+/// The leads working in the folder `cwd` reaches, by name, first one
+/// first: what the agent picker offers.
+async fn folder_leads(client: &Client, cwd: &Path) -> Vec<String> {
+    let Ok((project, dir)) = project::folder_project(cwd) else {
+        return Vec::new();
+    };
+    (project::leads(client, &project, &dir)
+        .await
+        .unwrap_or_default())
+    .iter()
+    .filter_map(|lead| lead["name"].as_str().map(str::to_owned))
+    .collect()
 }
 
 type Reply = Result<Value, (i64, String)>;
@@ -495,6 +607,11 @@ struct State {
     /// it is next idle; a new lead starts on the model.
     picked: Option<String>,
     effort: Option<String>,
+    /// The lead the client picked for a thread that is no bot yet, which
+    /// its first prompt opens.
+    agent: Option<String>,
+    /// The leads of the thread's folder, as the agent picker lists them.
+    leads: Vec<String>,
     /// Tasks whose threads are opening, as children of the person's prompt
     /// while it runs, and the answers of the prompts whose turns ended
     /// meanwhile, held until they are open.
@@ -648,8 +765,17 @@ impl Session {
             store: client.store().map(str::to_owned),
         };
         t3::remember(&self.id, &pinned);
+        // A lead made just now joins the picker's list.
+        let leads = match agent.t3 {
+            None => Some(folder_leads(&client, &self.cwd).await),
+            Some(_) => None,
+        };
         {
             let mut state = self.state.lock().await;
+            if let Some(leads) = leads {
+                state.leads = leads;
+                state.agent = None;
+            }
             state.running = running;
             state.calls = calls;
             state.cursor = cursor;
@@ -710,11 +836,23 @@ impl Session {
         let effort = (state.effort.as_deref())
             .or(bound.and_then(|bound| bound.effort.as_deref()))
             .unwrap_or(DEFAULT);
-        agent.options(
+        let mut options = agent.options(
             model,
             effort,
             bound.map(|bound| (bound.model.as_str(), bound.client.providers())),
-        )
+        );
+        // T3 Code carries a thread's option picks over to the next thread
+        // it opens, which would put every new thread on one lead: there,
+        // `/switch` picks.
+        if agent.t3.is_none()
+            && let Value::Array(options) = &mut options
+        {
+            let current = (bound.map(|bound| bound.bot.as_str()))
+                .or(state.agent.as_deref())
+                .unwrap_or(DEFAULT);
+            options.push(agent_option(&state.leads, current));
+        }
+        options
     }
 
     async fn show_options(&self, agent: &Agent) {
@@ -729,12 +867,16 @@ impl Session {
     /// model of its family only, at once when the bot is idle and with its
     /// next turn when it is not; a thread that is no bot yet keeps it for
     /// the lead it makes.
-    async fn set_option(&self, agent: &Agent, params: &Value) -> Reply {
+    async fn set_option(self: &Arc<Self>, agent: &Arc<Agent>, params: &Value) -> Reply {
         let option = params.get("configId").unwrap_or(&params["id"]);
         let Some(value) = params["value"].as_str() else {
             return Err((INVALID_PARAMS, "an option is picked by its value".into()));
         };
         let _one = self.switching.lock().await;
+        if option == AGENT && agent.t3.is_none() {
+            self.pick_agent(agent, value).await?;
+            return Ok(json!({"configOptions": self.options(agent).await}));
+        }
         if option == "effort" {
             let mut state = self.state.lock().await;
             state.effort = match &state.bound {
@@ -779,6 +921,44 @@ impl Session {
             .await
             .map_err(|error| (INVALID_PARAMS, error))?;
         Ok(json!({"configOptions": self.options(agent).await}))
+    }
+
+    /// The client picks the lead behind the thread: one of its folder's,
+    /// or `default`, the lead its first prompt opens as `sonny` would. A
+    /// thread that is no bot yet keeps the pick for its first prompt; a
+    /// lead's thread moves to the lead picked, once its prompt is answered.
+    /// The caller holds `switching`.
+    async fn pick_agent(
+        self: &Arc<Self>,
+        agent: &Arc<Agent>,
+        value: &str,
+    ) -> Result<(), (i64, String)> {
+        let mut state = self.state.lock().await;
+        let known = state.leads.iter().any(|lead| lead == value);
+        if value != DEFAULT && !known && state.bound.as_ref().is_none_or(|b| b.bot != value) {
+            return Err((
+                INVALID_PARAMS,
+                format!("{value} is not a lead of this folder"),
+            ));
+        }
+        let Some(bound) = &state.bound else {
+            state.agent = (value != DEFAULT).then(|| value.to_owned());
+            return Ok(());
+        };
+        if value == DEFAULT || value == bound.bot {
+            return Ok(());
+        }
+        if state.prompt.is_some() {
+            return Err((
+                INVALID_PARAMS,
+                format!("{} is answering; pick another lead once it has", bound.bot),
+            ));
+        }
+        drop(state);
+        let pick = project::Pick::Named(project::lead_short(value).to_owned());
+        self.bind(agent, None, false, &pick)
+            .await
+            .map_err(|error| (FAILED, error))
     }
 
     /// Once the bot is idle, as before a prompt's turn or after a turn:
@@ -890,9 +1070,12 @@ impl Session {
             // words, unless they are `/switch NAME`, which opens one there,
             // or `/new [NAME]`, which makes one so named.
             let chosen = lead_asked(&text);
-            let pick = chosen
-                .clone()
-                .unwrap_or_else(|| project::Pick::Thread(text.clone()));
+            let picked = self.state.lock().await.agent.clone();
+            let pick = match (&chosen, picked) {
+                (Some(chosen), _) => chosen.clone(),
+                (None, Some(lead)) => project::Pick::Named(project::lead_short(&lead).to_owned()),
+                (None, None) => project::Pick::Thread(text.clone()),
+            };
             let claimed = claimed.map(t3::Pinned::named);
             if let Err(error) = self.bind(agent, claimed, task, &pick).await {
                 self.state.lock().await.prompt = None;
@@ -1330,6 +1513,13 @@ impl Session {
                 }
             }
             "approval_requested" | "approval_asked" => {
+                // Calls announced only for the reviewer, as in auto mode,
+                // wait on no person: nothing to list.
+                if event["event"] == "approval_requested"
+                    && !(data["calls"].as_array().into_iter().flatten()).any(for_person)
+                {
+                    return;
+                }
                 drop(state);
                 self.approvals(agent, &client, &bot, turn).await;
             }
@@ -1427,10 +1617,7 @@ impl Session {
             }
         }
         for call in &listed {
-            let person = !call["asked"].is_null()
-                || (call["gates"].as_array())
-                    .is_some_and(|gates| gates.iter().any(|g| g == "manual"));
-            if call["turn"].as_i64() != turn || !person {
+            if call["turn"].as_i64() != turn || !for_person(call) {
                 continue;
             }
             let key = format!(
@@ -1447,6 +1634,16 @@ impl Session {
             tokio::spawn(async move { ask(&agent, &session, &client, &bot, &call).await });
         }
     }
+}
+
+/// Whether `call`, as the daemon lists or announces it, waits on the
+/// person: the gate it waits on is theirs, or the reviewer handed it over.
+fn for_person(call: &Value) -> bool {
+    let asked = match &call["asked"] {
+        Value::Array(asked) => !asked.is_empty(),
+        asked => !asked.is_null(),
+    };
+    asked || (call["gates"].as_array()).is_some_and(|gates| gates.iter().any(|g| g == "manual"))
 }
 
 /// Put one call to the person, and answer it with their choice.
@@ -2050,6 +2247,49 @@ mod tests {
         let edit = tool_call("c2", "edit", &json!({"path": "/src/a.rs"}));
         assert_eq!(edit["locations"], json!([{"path": "/src/a.rs"}]));
         assert_eq!(edit["title"], "Edit /src/a.rs");
+    }
+
+    #[test]
+    fn the_agent_picker_lists_the_folders_leads_and_the_threads_own() {
+        let leads = ["calc.lead".to_owned(), "calc.lead.billing".to_owned()];
+        let picker = agent_option(&leads, DEFAULT);
+        let values: Vec<&str> = (picker["options"].as_array().unwrap().iter())
+            .map(|choice| choice["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(values, ["default", "calc.lead", "calc.lead.billing"]);
+        assert_eq!(
+            (&picker["id"], &picker["currentValue"]),
+            (&json!("agent"), &json!("default"))
+        );
+        // A thread on a bot of another folder still names it.
+        let picker = agent_option(&leads, "shop.fix-cart");
+        assert_eq!(picker["options"].as_array().unwrap().len(), 4);
+        assert_eq!(picker["currentValue"], "shop.fix-cart");
+    }
+
+    #[test]
+    fn a_listed_session_names_a_lead_and_its_identity() {
+        let id = lead_session("calc.lead.billing", 7);
+        assert_eq!(id, "calc.lead.billing#7");
+        let pinned = listed_lead(&id).unwrap();
+        assert_eq!(
+            (pinned.bot.as_str(), pinned.bot_id),
+            ("calc.lead.billing", Some(7))
+        );
+        // Only a lead, and only by its identity.
+        assert!(listed_lead("calc.fix-cart#7").is_none());
+        assert!(listed_lead("calc.lead").is_none());
+        assert!(listed_lead("calc.lead#x").is_none());
+    }
+
+    #[test]
+    fn only_a_call_waiting_on_the_person_is_put_to_them() {
+        assert!(for_person(&json!({"gates": ["manual"]})));
+        assert!(for_person(
+            &json!({"gates": ["auto"], "asked": [{"tag": "auto"}]})
+        ));
+        assert!(!for_person(&json!({"gates": ["auto"]})));
+        assert!(!for_person(&json!({"gates": ["auto"], "asked": []})));
     }
 
     #[test]

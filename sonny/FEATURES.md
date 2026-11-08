@@ -187,7 +187,7 @@ names it: upgrade step `ID`. Both name the release they are deleted in.
 
 | Feature | Status | History | Why | Used? |
 |---|---|---|---|---|
-| Sonny in T3 Code (`sonny acp`) | experimental | added 10-29 #323; reads blocks 10-29 #337; model picker 10-29 #339; tasks as child threads 10-29 #352; model `id` 10-29 #358; effort picker 10-29 #363; provider names 10-30 #377; a resumed thread pinned to its bot's identity and store 10-31 #474 | Sonny's leads and tasks from a GUI | ? |
+| Sonny in T3 Code (`sonny acp`) | experimental | added 10-29 #323; reads blocks 10-29 #337; model picker 10-29 #339; tasks as child threads 10-29 #352; model `id` 10-29 #358; effort picker 10-29 #363; provider names 10-30 #377; a resumed thread pinned to its bot's identity and store 10-31 #474; any ACP client: an Agent picker of the folder's leads (not in T3 Code), `session/list` of leads to reopen, approvals listed only for calls waiting on the person 11-08 | Sonny's leads and tasks from a GUI | ? |
 | Errand support (`/status`'s On Errand, the errand skill) | removed | added 10-26 #146; removed 10-29 #314 | George doesn't plan to use Errand from Sonny | no plans to |
 
 ## Before Sonny
