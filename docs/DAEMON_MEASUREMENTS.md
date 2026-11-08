@@ -7861,3 +7861,29 @@ is booked, and an empty B-tree allocates nothing. The per idle bot row
 moves by itself between runs on the shared runner (1.74 to 1.66 KiB on
 #812's screen, which touched nothing per bot), and the idle and
 after-a-turn RSS both fell here; the drain itself is the table above.
+
+## A session closing visits only the bots it followed
+
+A session closing ran `retain` over the followers of every bot anyone
+followed by name, to find its own: Θ(followed bots) per close, so as many
+sessions closing as bots followed cost Θ(n²) under the hub's lock on the
+daemon's one thread. Sonny's lookout, Sky and tool host follow `*`, so it
+grew with the bots programs and windows follow one by one. Now the hub
+keeps the bots each session follows by name, and closing visits only
+those. Approver tags are still read in full at a close; they number a few.
+
+Wall time of n short sessions closing, each following one bot, beside one
+session following all n, release build, 4-core Linux cloud container (Xeon
+2.1 GHz), main d82ec12 against this change:
+
+| Bots followed | Before | After |
+| ---: | ---: | ---: |
+| 100 | 0.09 ms | 0.04 ms |
+| 1,000 | 10 ms | 0.5 ms |
+| 4,000 | 134 ms | 3.3 ms |
+| 16,000 | 5,887 ms | 18 ms |
+
+About 1 µs per close, growing only with the hash maps' size. Memory: one
+set per session that follows a bot by name, holding those names.
+`a_session_closing_costs_the_same_however_many_bots_others_follow` times
+8,000 and 16,000; with the full scan back it fails.

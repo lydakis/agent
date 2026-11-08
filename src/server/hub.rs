@@ -238,6 +238,9 @@ impl Default for Hub {
 struct HubInner {
     firehose: Vec<(u64, Output)>,
     subs: HashMap<String, Vec<(u64, Sub)>>,
+    /// The bots each session follows by name, so a session closing visits
+    /// only their followers, however many bots others follow.
+    follows: HashMap<u64, HashSet<String>>,
     approvers: HashMap<String, Serving>,
     /// Every entry of `approvers` once, by lease and a deadline no later
     /// than its own, so leases that ran out are found without visiting the
@@ -499,6 +502,11 @@ impl Hub {
         kinds: Option<HashSet<String>>,
     ) -> Sub {
         let mut inner = self.inner.lock().unwrap();
+        inner
+            .follows
+            .entry(session)
+            .or_default()
+            .insert(bot.to_owned());
         let subs = inner.subs.entry(bot.to_owned()).or_default();
         retain_other_session(subs, session);
         let sub = Arc::new(Mutex::new(Subscription {
@@ -515,6 +523,16 @@ impl Hub {
     }
     pub fn unsubscribe(&self, bot: &str, session: u64) {
         let mut inner = self.inner.lock().unwrap();
+        Self::unfollow(&mut inner, bot, session);
+        if let Some(bots) = inner.follows.get_mut(&session) {
+            bots.remove(bot);
+            if bots.is_empty() {
+                inner.follows.remove(&session);
+            }
+        }
+    }
+    /// End `session`'s follow of `bot`.
+    fn unfollow(inner: &mut HubInner, bot: &str, session: u64) {
         if let Some(subs) = inner.subs.get_mut(bot) {
             retain_other_session(subs, session);
             if subs.is_empty() {
@@ -525,10 +543,9 @@ impl Hub {
     pub fn close_session(&self, session: u64) {
         let mut inner = self.inner.lock().unwrap();
         inner.firehose.retain(|(id, _)| *id != session);
-        inner.subs.retain(|_, subs| {
-            retain_other_session(subs, session);
-            !subs.is_empty()
-        });
+        for bot in inner.follows.remove(&session).unwrap_or_default() {
+            Self::unfollow(&mut inner, &bot, session);
+        }
         // A closed session's tags are free at once; nobody is left to tell.
         let HubInner {
             approvers,
@@ -1180,5 +1197,51 @@ mod tests {
         }
         assert!(*output.subscribe_closed().borrow());
         assert!(hub.served().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_session_closing_costs_the_same_however_many_bots_others_follow() {
+        // One session follows every bot by name, as a program watching its
+        // fleet might, and as many short sessions each follow one.
+        let close_all = |bots: u64| {
+            let hub = Hub::default();
+            let output = || Output::writer(tokio::io::sink());
+            for bot in 0..bots {
+                hub.subscribe(&format!("b{bot}"), 1, output(), 0, None);
+                hub.subscribe(&format!("b{bot}"), 2 + bot, output(), 0, None);
+            }
+            let started = std::time::Instant::now();
+            for bot in 0..bots {
+                hub.close_session(2 + bot);
+            }
+            let elapsed = started.elapsed();
+            // The one left still follows every bot, and only it.
+            let inner = hub.inner.lock().unwrap();
+            assert_eq!(inner.subs.len(), bots as usize);
+            assert!(inner.subs.values().all(|subs| subs.len() == 1));
+            assert_eq!(inner.follows.len(), 1);
+            elapsed
+        };
+        let n = 8_000;
+        let grew = crate::doubling::outgrows(|twice| close_all(if twice { 2 * n } else { n }));
+        assert_eq!(grew, None, "{n} bots, then twice as many");
+    }
+
+    #[tokio::test]
+    async fn an_ended_follow_leaves_nothing_for_its_session_to_close() {
+        let hub = Hub::default();
+        let output = || Output::writer(tokio::io::sink());
+        let sub = hub.subscribe("Ann", 1, output(), 0, None);
+        hub.subscribe("Bob", 1, output(), 0, None);
+        hub.subscribe("Bob", 2, output(), 0, None);
+        hub.unsubscribe("Ann", 1);
+        assert!(sub.lock().unwrap().cancelled);
+        assert_eq!(hub.deliveries("Bob", 1), 1);
+        hub.close_session(1);
+        let inner = hub.inner.lock().unwrap();
+        assert!(!inner.subs.contains_key("Ann"));
+        assert_eq!(inner.subs["Bob"].len(), 1);
+        assert_eq!(inner.subs["Bob"][0].0, 2);
+        assert_eq!(inner.follows.keys().collect::<Vec<_>>(), [&2]);
     }
 }
