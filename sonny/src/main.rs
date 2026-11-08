@@ -3749,6 +3749,9 @@ struct App {
     /// the rosters' versions of them, the lineage and the tasks tracked.
     /// Pinned again only once one changes, not every pass of the loop.
     task_asks_read: Option<(u64, u64, usize, usize)>,
+    /// When a lead's window last read whether another window marked it
+    /// done, which sets its own questions aside here too.
+    done_read: Option<Instant>,
     /// What the tasks this window started wait on, as their rows last
     /// read it: with no multiplexer, and so no fleet, their questions are
     /// pinned from it.
@@ -5387,6 +5390,7 @@ impl App {
             sent_answers: Vec::new(),
             task_answers: Vec::new(),
             task_asks_read: None,
+            done_read: None,
             task_needs: Default::default(),
             bot_id: record["bot_id"].as_i64(),
             reactions_key: record["bot_id"].as_i64().map(|id| {
@@ -5865,6 +5869,7 @@ impl App {
             self.follow_tab().await;
             self.count_behind().await;
             self.read_tasks().await;
+            self.done_elsewhere();
             if let Some(fleet) = &mut self.fleet {
                 fleet.rescan().await;
                 // A check's mark lands after its turn's events: what it
@@ -9893,7 +9898,7 @@ impl App {
             {
                 self.notice = Some(error);
             }
-            self.set_aside_own();
+            self.set_aside_own(None);
             return;
         }
         let (Some(task), Some(turn)) = (lead.or_else(|| resolved::call(arguments, project)), turn)
@@ -13566,7 +13571,7 @@ impl App {
             return;
         }
         if asks::moves_on(message, from) {
-            self.set_aside_own();
+            self.set_aside_own(None);
         } else if let Some(id) = asks::answer_of(message, from)
             && let Some((_, answer)) = asks::split(message)
         {
@@ -13577,18 +13582,40 @@ impl App {
     }
 
     /// This agent's own open questions set aside, as words past them or
-    /// its marking itself done leave them; its tasks' wait on the person
-    /// still.
-    fn set_aside_own(&mut self) {
-        let (tasks, own): (Vec<_>, Vec<_>) =
-            (std::mem::take(&mut self.asks).into_iter()).partition(|ask| ask.task.is_some());
-        self.asks = tasks;
+    /// its being marked done leave them, those asked up to its turn
+    /// `upto` if named; its tasks' wait on the person still.
+    fn set_aside_own(&mut self, upto: Option<i64>) {
+        let covered = |ask: &asks::Ask| {
+            ask.task.is_none()
+                && upto.is_none_or(|upto| asks::turn_of(&ask.id).is_some_and(|turn| turn <= upto))
+        };
+        let (own, rest): (Vec<_>, Vec<_>) =
+            (std::mem::take(&mut self.asks).into_iter()).partition(covered);
+        self.asks = rest;
         let keys: Vec<String> = own.iter().map(asks::Ask::key).collect();
         self.aside.extend(own);
         for key in keys {
             self.draw_card(&key);
         }
         self.settle_asks();
+    }
+
+    /// A lead marked done from another window, its outer lead's or a
+    /// side chat's: its own questions asked up to the mark set aside here
+    /// too, as its own call sets them aside. Read at most every two
+    /// seconds, and only while one of its own is open.
+    fn done_elsewhere(&mut self) {
+        if self.options.side.is_some()
+            || !project::is_lead(&self.bot)
+            || !self.asks.iter().any(|ask| ask.task.is_none())
+            || (self.done_read).is_some_and(|at| at.elapsed() < Duration::from_secs(2))
+        {
+            return;
+        }
+        self.done_read = Some(Instant::now());
+        if let Some(mark) = resolved::read(&self.store(), &self.bot) {
+            self.set_aside_own(Some(mark));
+        }
     }
 
     /// The composer's focus on the next open question, or the one
@@ -22771,6 +22798,18 @@ mod tests {
         app.options.store = dir.join("side-store");
         app.resolve(&json!({}), "c3", Some(20), true).await;
         assert_eq!(resolved::read(&app.store(), "web.lead"), Some(7));
+        // That lead's own window sets aside its questions the mark covers,
+        // not one asked after.
+        app.bot = "web.lead".into();
+        app.project = Some("web".into());
+        app.options.side = None;
+        app.aside.clear();
+        app.asked("q2", Some(5), &json!({"question": "Ship it?"}));
+        app.asked("q3", Some(9), &json!({"question": "And the docs?"}));
+        app.done_elsewhere();
+        assert_eq!(app.aside.len(), 1);
+        assert_eq!(app.asks.len(), 1);
+        assert_eq!(asks::turn_of(&app.asks[0].id), Some(9));
         let _ = std::fs::remove_dir_all(dir);
     }
 
