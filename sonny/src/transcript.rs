@@ -2136,7 +2136,7 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 27] = [
+const KEPT: [&str; 28] = [
     "Started",
     "Started a turn for",
     "Steered",
@@ -2145,6 +2145,7 @@ const KEPT: [&str; 27] = [
     "Forked",
     "Interrupted",
     "Removed",
+    "Cleaned up",
     "Waited for",
     "Asked you",
     "Updated the plan",
@@ -2174,7 +2175,7 @@ fn kept(said: &crate::calls::Said) -> bool {
 /// and folded into one when several come in a row: those that start,
 /// message, wait for or change agents and what runs for them, which a
 /// lead often makes a few of at once. What they said opens on a click.
-const FOLDS: [&str; 23] = [
+const FOLDS: [&str; 24] = [
     "Started",
     "Started a turn for",
     "Steered",
@@ -2184,6 +2185,7 @@ const FOLDS: [&str; 23] = [
     "Forked",
     "Interrupted",
     "Removed",
+    "Cleaned up",
     "Discarded",
     "Resolved",
     "Saved to memory",

@@ -2741,6 +2741,12 @@ const PLACES_NOW: Duration = Duration::from_millis(500);
 /// question.
 static REPORTED: std::sync::Mutex<Option<(String, String, bool)>> = std::sync::Mutex::new(None);
 
+/// Whether a lead's call of tool `name` marks the task it names done:
+/// `mark_done`, and `remove_task`, which marks it as it cleans up.
+fn resolves(name: &str) -> bool {
+    name == resolved::TOOL || name == served::REMOVE
+}
+
 /// What the multiplexer is told: a question open says the agent needs the
 /// person (`asking`), as its tab, `/status` and the footer say
 /// ([`needs`]), whatever its turn does; a call waiting on their approval
@@ -8767,7 +8773,7 @@ impl App {
                         if older {
                             continue;
                         }
-                        if name == resolved::TOOL && !failed && !reactions::refused(&item) {
+                        if resolves(&name) && !failed && !reactions::refused(&item) {
                             self.resolve(&arguments, id, turns.get(&node).copied(), false)
                                 .await;
                         }
@@ -9576,10 +9582,7 @@ impl App {
                 {
                     self.ask_closed(&arguments);
                 }
-                if name == resolved::TOOL
-                    && !shown.1
-                    && !reactions::refused(&json!({"output": shown.0}))
-                {
+                if resolves(&name) && !shown.1 && !reactions::refused(&json!({"output": shown.0})) {
                     self.resolve(&arguments, id, turn, true).await;
                 }
                 if self.calls.is_empty() && !self.held.is_empty() {
@@ -20776,7 +20779,7 @@ mod tests {
         assert_eq!(
             rows[2..],
             [
-                "↳ sent to calc.add, calc.neg, calc.div, calc.mul, removed calc.add ▸",
+                "↳ sent to calc.add, calc.neg, calc.div, calc.mul, cleaned up calc.add ▸",
                 "",
                 "• Messaged those.",
                 "",
