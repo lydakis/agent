@@ -8091,3 +8091,58 @@ on main 0b35e4c (daemon unchanged since deaff2c):
 The rest of a turn's start is now writing the item (`insert_node`) and
 building it (`prompt_item`). Openings read the same: the store contract
 tests that read them back pass unchanged.
+
+The hot-path screen (`bench.perf_gate`'s four benches, two alternating
+rounds) on the same 4-CPU Linux container, main 0b35e4c against head:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 41.292 | 36.011 | -12.8% |
+| admission | burst submit p99, ms | 6.888 | 3.926 | -43.0% |
+| completion | release to terminal p99, ms | 12.916 | 9.41 | -27.1% |
+| footprint | idle RSS, MiB | 15.266 | 15.254 | -0.1% |
+| footprint | per idle bot, KiB | 1.766 | 1.776 | +0.6% |
+| footprint | RSS after a turn each, MiB | 25.299 | 28.436 | +12.4% |
+| footprint | CPU per turn, ms | 1.241 | 0.868 | -30.1% |
+| lifecycle | CPU, s | 0.635 | 0.54 | -15.0% |
+| lifecycle | p95 turn, ms | 595.095 | 583.936 | -1.9% |
+| lifecycle | peak RSS, MiB | 22.949 | 23.273 | +1.4% |
+
+The Perf workflow's screen on the pull request (GitHub runner, base
+0b35e4c against head 2321b86):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 41.475 | 35.732 | -13.8% |
+| admission | burst submit p99, ms | 7.162 | 4.532 | -36.7% |
+| completion | release to terminal p99, ms | 14.283 | 10.607 | -25.7% |
+| footprint | idle RSS, MiB | 15.027 | 15.102 | +0.5% |
+| footprint | per idle bot, KiB | 1.862 | 1.872 | +0.5% |
+| footprint | RSS after a turn each, MiB | 25.176 | 27.871 | +10.7% |
+| footprint | CPU per turn, ms | 1.333 | 0.996 | -25.3% |
+| lifecycle | CPU, s | 0.625 | 0.515 | -17.6% |
+| lifecycle | p95 turn, ms | 583.032 | 580.025 | -0.5% |
+| lifecycle | peak RSS, MiB | 22.801 | 23.084 | +1.2% |
+
+It warned on two Sonny rows the change does not touch: lookout note p95 at
+10x100 (2,408 to 2,930 ms) and quiet window CPU (0.76 to 0.98 ms/s). Three
+local rounds of the same screen read them the other way and inside noise
+(note p95 2,900 to 2,519 ms; quiet window 1.19 to 1.16 ms/s), with no
+warning.
+
+Store work per turn is the same (7.37 jobs a turn on both). The footprint
+prompts are two bytes long, so their gain is the cached bot read and
+`UPDATE`s, not the openings.
+
+**RSS after a turn each is glibc's arenas, not held memory.** That row is
+the allocator's high-water mark after 1,000 turns submitted at once. Over
+six fresh-copy runs at 1,000 bots it read 25.1 MiB on main and 27.1 on the
+head. At 3,000 bots the head's growth over the created bots was bimodal: 7
+to 8 MiB like main's in some runs, 15 to 34 MiB in others. With
+`MALLOC_ARENA_MAX=1` every head run read 7.1 to 8.5 MiB (and CPU per turn
+went from about 1.0 to 1.2 ms). A store thread that answers faster meets the
+runtime's threads in malloc more often, and glibc opens another arena for
+them, which keeps what it freed. The head with only the openings change
+(bot read uncached) showed no such run at either size. No live state grows
+with the change: idle RSS and per idle bot are flat. Capping glibc's arenas
+is its own decision (it costs CPU), and macOS's allocator has no arenas.
