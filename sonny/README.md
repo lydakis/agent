@@ -936,7 +936,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   no footer, no names but what needs you or failed. The arrows pick a star
   and Enter puts it in the middle: its maker, what it made and whoever it
   talked to in the last hour on the first ring, two hops on the next, the
-  chat log only its own; the stars glide to their places. Esc lets go of
+  chat log only its own; the stars glide to their places. A click on a
+  star, or on an agent's name in the sky, the list or the chat log, centres
+  on it the same way, and a click on `you` puts you back in the middle,
+  in the pane and in `sonny sky`. Esc lets go of
   the pick, then the centre. With thousands of agents the sky folds: a
   star for every agent that needs you, failed, works or was just lit, and
   for the leads, as many as the pane has room for; the rest are a faint
