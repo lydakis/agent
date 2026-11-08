@@ -43,6 +43,7 @@
 //! task_profile = "worker"       # what every other agent is told, not task
 //! side_chat = "answer"          # calls no tool; "fork", the default, may do anything its agent may
 //! chime = false                 # rings when work ends or waits, the default
+//! steps = true                  # the agent's steps between what is said; words only by default
 //! verbose = true                # every tool call drawn, not the clean view
 //! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
@@ -54,7 +55,7 @@
 //! task_done_check = 24          # hours a task sits idle before a copy says whether it is done, 8 by default; 0 never
 //! commons = false               # agents go without the commons, on by default
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
-//! commons_invite_tokens = 1000000  # what an invite pays for in its thread
+//! commons_invite_tokens = 1000000  # the budget of the turn an invite starts, in tokens of work
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
 //! task_tabs = "every"         # which tasks open in a tab: "asked", the default, those an agent or you asked for; "every", each as its turn starts
 //! task_windows = 64            # task windows a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
@@ -94,7 +95,7 @@
 //! digest = "15m"                # a subscriber hears it at most this often; unset, as it comes
 //! steer = { from = ["boss"] }   # what cuts into a busy subscriber's turn, as a filter is written
 //! watch = ["~/bin/slack-poll"]  # files whose edit starts it again on them; unset, none
-//! icon = "▲"                    # one character /status shows on the row of each agent that follows it
+//! icon = "▲"                    # one character marking it wherever Sonny names it: /status, /background, news rows
 //! wants = "channel"             # a field of its events: the values subscriptions' filters name are written for the command
 //! [sonny.sources.commons]       # Sonny's own source: the commons threads an agent posted in
 //! digest = "15m"                # the default; 0 at once. Takes digest and steer alone
@@ -494,6 +495,10 @@ pub struct Sonny {
     pub side_chat: SideChat,
     /// Whether finished and waiting work rings. Notifications show either way.
     pub chime: bool,
+    /// Whether the conversation shows the agent's steps between what is
+    /// said (calls, news in, messages between agents, how long a turn
+    /// took), or only the person's words and the agent's (the default).
+    pub steps: bool,
     /// Whether every tool call is drawn, or only the bot's words and the
     /// calls that move the work on (the clean view, the default).
     pub verbose: bool,
@@ -531,7 +536,8 @@ pub struct Sonny {
     /// earn more, the square root of the week's agents when that is more:
     /// each answered thread adds one, up to as many again.
     pub commons_invites: u64,
-    /// The tokens an invite pays for in its thread.
+    /// The tokens of work an invite pays for: the budget of the turn it
+    /// starts.
     pub commons_invite_tokens: u64,
     /// The commons as a source, `[sonny.sources.commons]`: its `digest`
     /// and `steer`, as the person's sources take them; it has no command.
@@ -783,6 +789,7 @@ impl Default for Sonny {
             tool_processes: 0,
             lookout_waiting: 1024,
             chime: true,
+            steps: false,
             verbose: false,
             text_width: TEXT_WIDTH,
             start_at_boot: false,
@@ -897,8 +904,9 @@ pub struct Source {
     /// Files whose change starts it again on them, as a service manager
     /// restarts a unit on its new binary: each from `/` or `~/`.
     pub watch: Vec<String>,
-    /// One character cell `/status` shows on the row of each agent that
-    /// follows it.
+    /// One character cell that marks it wherever Sonny names it: on the
+    /// `/status` row of each agent that follows it, its follows in
+    /// `/background`, and the "From your sources" row.
     pub icon: Option<String>,
     /// A field of its events whose values subscriptions' filters name,
     /// as `id` or `meta.repo`: the lookout writes those values to a file
@@ -1417,6 +1425,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "task_profile",
                 "side_chat",
                 "chime",
+                "steps",
                 "verbose",
                 "text_width",
                 "margin_opens",
@@ -1511,6 +1520,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "suggest" => Some(&mut config.sonny.suggest),
                 "needs_check" => Some(&mut config.sonny.needs_check),
                 "commons" => Some(&mut config.sonny.commons),
+                "steps" => Some(&mut config.sonny.steps),
                 "verbose" => Some(&mut config.sonny.verbose),
                 "start_at_boot" => Some(&mut config.sonny.start_at_boot),
                 "sky_haikus" => Some(&mut config.sonny.sky_haikus),
