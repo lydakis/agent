@@ -1315,6 +1315,7 @@ pub fn from_outside(origin: Option<&str>) -> &'static str {
         crate::lookout::TASKS_ORIGIN => return "task updates",
         crate::lookout::sources::ORIGIN => return "its sources",
         crate::lookout::BOUNCE_ORIGIN => return "a returned message",
+        crate::project::START_ORIGIN => return "Sonny's start",
         _ => {}
     }
     match origin.split('.').next() {

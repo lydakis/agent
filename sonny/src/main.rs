@@ -2246,7 +2246,9 @@ async fn run() -> Result<(), String> {
         app.declare = declared::declare(&bot, app.role);
     }
     app.sounds = sound::Sounds::new(options.sound);
-    let settings = settings::Settings::load();
+    let (settings, unread) = settings::Settings::load_said();
+    // Sonny opens on its defaults, said, rather than not at all.
+    app.warnings.extend(unread);
     app.sounds.chime = settings.chime;
     app.schedule = settings.quiet.clone();
     quiet::set_schedule(settings.quiet.clone());
@@ -2313,15 +2315,15 @@ async fn run() -> Result<(), String> {
     if let Some(project) = &project
         && let Err(error) = lookout::subscribe_lead(&app.options.store, &name, project)
     {
-        app.notice = Some(format!("the lookout: {error}"));
+        app.warnings.push(format!("the lookout: {error}"));
     }
     // They answer the tools Sonny gives every agent, a lead or not.
     if let Err(error) = start_companions(&app.client).await {
-        app.notice = Some(error);
+        app.warnings.push(error);
     }
     // The lead told what its folder tells it today (skills and memory added
-    // since it was made), unless its instructions were set some other way.
-    // After the lookout's notice: a skill the lead misses matters more.
+    // since it was made), unless its instructions were set some other way;
+    // a file of the folder's it cannot use is left out, and said.
     if project.is_some()
         && let Some(dir) = moving
             .as_deref()
@@ -2329,12 +2331,19 @@ async fn run() -> Result<(), String> {
     {
         let chosen = project::chosen(&app.options.store, &name);
         match project::review(dir, &bot, &app.lead, fresh, chosen.as_deref()) {
-            Ok(project::Instructions::Stale(text)) => app.instruct = Some(text),
-            Ok(project::Instructions::Current) => {}
-            Ok(project::Instructions::Kept { missing }) => {
-                app.notice = Some(project::Instructions::kept_notice(&missing))
+            Ok((reviewed, left_out)) => {
+                app.warnings.extend(left_out);
+                match reviewed {
+                    project::Instructions::Stale(text) => app.instruct = Some(text),
+                    project::Instructions::Current => {}
+                    project::Instructions::Kept { missing } => {
+                        app.notice = Some(project::Instructions::kept_notice(&missing))
+                    }
+                }
             }
-            Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
+            Err(error) => app
+                .warnings
+                .push(format!("the lead's instructions: {error}")),
         }
     }
     // Said last: it is what the next message does.
@@ -2394,7 +2403,14 @@ async fn run() -> Result<(), String> {
     } else if approvals::reviews(app.mode)
         && let Err(error) = serve_auto(&app.client, &app.model).await
     {
-        app.notice = Some(error);
+        app.warnings.push(error);
+    }
+    // What it opened without matters more than any other notice but what
+    // the next message does. A side chat's agent is not told.
+    if moving.is_none()
+        && let Some(said) = project::warnings_notice(&app.warnings, options.side.is_none())
+    {
+        app.notice = Some(said);
     }
     let result = app.main(&mut terminal, &mut events).await;
     let _ = wipe(&mut terminal);
@@ -3722,6 +3738,9 @@ struct App {
     asked: Option<Value>,
     following: bool,
     notice: Option<String>,
+    /// What this window opened without, and why: said on the notice line
+    /// and told to its agent with its next model call.
+    warnings: Vec<String>,
     /// The pause that holds every agent, if one does, as the daemon told.
     paused: Option<Value>,
     quit: bool,
@@ -5351,6 +5370,7 @@ impl App {
             asked: None,
             following: true,
             notice: None,
+            warnings: Vec::new(),
             paused,
             quit: false,
             switch_to: None,
@@ -5568,6 +5588,7 @@ impl App {
         }
         self.configure().await;
         self.tell_upgrades().await;
+        self.tell_warnings().await;
         // The first message `/new` was given, sent as the person wrote it:
         // a message as it is, never a command or a shell line typed anew.
         if let Some(file) = self.options.send.take() {
@@ -6006,6 +6027,20 @@ impl App {
                 upgrades.back();
                 self.notice = Some(format!("telling of Sonny's upgrade: {error}"));
             }
+        }
+    }
+
+    /// What this window opened without, told to its agent with its next
+    /// model call; a side chat's agent is a copy, and is not.
+    async fn tell_warnings(&mut self) {
+        if self.options.side.is_some() {
+            return;
+        }
+        let warnings = std::mem::take(&mut self.warnings);
+        if let Err(error) = project::tell_warnings(&self.client, &self.bot, &warnings).await {
+            self.notice = Some(format!(
+                "telling the agent what Sonny opened without: {error}"
+            ));
         }
     }
 
@@ -12432,12 +12467,22 @@ impl App {
             }
             let chosen = project::chosen(&self.options.store, &self.bot);
             match project::instructions(std::path::Path::new(&self.workspace), chosen.as_deref()) {
-                Ok(text) => {
-                    self.instruct = Some(text);
+                Ok(composed) => {
+                    self.instruct = Some(composed.text);
                     if self.configure().await {
                         self.notice = Some("the lead has its folder's instructions".into());
                     } else if self.instruct.is_some() {
                         self.notice = Some("applies when idle".into());
+                    }
+                    // What it goes without is said over either, and told.
+                    if let Some(said) = project::warnings_notice(&composed.left_out, true) {
+                        self.notice = Some(said);
+                        if let Err(error) =
+                            project::tell_warnings(&self.client, &self.bot, &composed.left_out)
+                                .await
+                        {
+                            self.notice = Some(format!("the lead's instructions: {error}"));
+                        }
                     }
                 }
                 Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
