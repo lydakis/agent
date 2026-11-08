@@ -171,6 +171,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         images: Vec::new(),
         wait_ms: None,
         output_schema: None,
+        fact: false,
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch, |_, _| {
@@ -4750,7 +4751,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     assert_eq!(
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
-            "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
+            "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"max_drops":3,"approval_hold_ms":2000,"max_output_tokens":null,
             "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
             "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{}})
     );
@@ -5818,6 +5819,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         images: Vec::new(),
         wait_ms: None,
         output_schema: None,
+        fact: false,
     };
     let started = db
         .begin("Bob", "r1", "work", true, &options, allow_provider)
@@ -5953,6 +5955,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         images: Vec::new(),
         wait_ms: None,
         output_schema: None,
+        fact: false,
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options, allow_provider)
@@ -7500,6 +7503,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 images: Vec::new(),
                 wait_ms: None,
                 output_schema: None,
+                fact: false,
             },
             allow_provider,
         )
@@ -17277,4 +17281,56 @@ fn a_declined_prompt_is_noted_as_the_model_is_sent_it() {
     assert_eq!(listed["omitted"][1], json!([1, "[Left out.]"]));
     assert_eq!(listed["history"][2], json!([1, "[Left out.]", 11]));
     assert_eq!(listed["turns"][0][0], json!("something declined"));
+}
+
+#[test]
+fn a_cut_reply_s_note_reaches_its_turn_past_a_steer_that_waits_for_its_own() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "p1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // A steer for another folder waits for a turn of its own, and an
+    // ordinary one behind it waits behind it.
+    let elsewhere = TurnOptions {
+        delivery: Delivery::Steer,
+        workspace: Some("/elsewhere".into()),
+        ..TurnOptions::default()
+    };
+    db.begin("Bob", "p2", "over there", true, &elsewhere, allow_provider)
+        .unwrap();
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    db.begin("Bob", "p3", "and then", true, &steer, allow_provider)
+        .unwrap();
+    db.drop_reply(turn, &json!({"limit":"max_tokens","output_tokens":7}), true)
+        .unwrap();
+    let absorbed = db
+        .absorb(
+            turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap();
+    let taken: Vec<&Value> = (absorbed.entries.iter())
+        .filter(|e| e["event"] == "steered")
+        .map(|e| &e["data"]["origin"])
+        .collect();
+    // The two others stay queued, in order.
+    assert_eq!(taken, [&json!("limit")]);
+    assert_eq!(absorbed.outcomes.len(), 1);
 }

@@ -9367,6 +9367,28 @@ impl App {
             "tool_calls_withheld" => {
                 self.notice = Some("at the round limit: this reply ends the turn".into())
             }
+            "dropped" => {
+                // The model's own output cap cut its reply short: the
+                // daemon kept none of it and told the agent, whose next
+                // call streams afresh. What was shown stays, as a retry's
+                // does, part of it in the scrollback already; the notice
+                // says the agent did not keep it.
+                self.live_item = None;
+                self.end_live(Words::Reply);
+                self.ahead.clear();
+                self.streamed = false;
+                self.said.clear();
+                self.replay = None;
+                self.notice = Some(match data["in"].as_str() {
+                    Some(what) => format!(
+                        "the model's output limit cut its reply short while writing {what}; \
+                         the agent did not keep it and was told"
+                    ),
+                    None => "the model's output limit cut its reply short; \
+                             the agent did not keep it and was told"
+                        .into(),
+                });
+            }
             "retry" => {
                 // Messages written as the next began may come again, or
                 // not: what was shown stays, and the call's own is drawn.
@@ -18795,6 +18817,71 @@ mod tests {
         // Reactions find each message by its node.
         assert!(app.kept(screen::Tag::End(2)));
         assert!(!app.kept(screen::Tag::Streamed(1)));
+    }
+
+    #[tokio::test]
+    async fn a_reply_the_model_s_cap_cut_short_stays_as_shown_and_the_next_follows() {
+        let client = daemon_with(json!({
+            "3": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "Written in parts."}]}
+        }))
+        .await;
+        let mut app = app(client);
+        let event =
+            |event: &str, data: Value| json!({"event": event, "bot": "b", "turn": 1, "data": data});
+        app.daemon(event("accepted", json!({}))).await;
+        let said = |item: u64, text: &str| {
+            let mut delta = event("text_delta", json!({}));
+            (delta["item"], delta["text"]) = (json!(item), json!(text));
+            delta
+        };
+        // Longer than half the screen, so part of it is in the scrollback
+        // before the cut.
+        let long: String = (0..40)
+            .map(|n| format!("Line {n} of the whole file\n"))
+            .collect();
+        app.daemon(said(1, &long)).await;
+        app.daemon(said(1, "and the last")).await;
+        app.daemon(event(
+            "dropped",
+            json!({"limit": "max_tokens", "output_tokens": 32000, "in": "text"}),
+        ))
+        .await;
+        assert!(app.live.is_none() && app.said.is_empty() && app.ahead.is_empty());
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("output limit") && n.contains("writing text"))
+        );
+        app.daemon(said(3, "Written in parts.")).await;
+        app.daemon(event("message", json!({"node": 3}))).await;
+        let open = app.open_rows(80);
+        let drawn: Vec<String> = (app.pending.iter().chain(&open))
+            .map(|line| line.to_string())
+            .collect();
+        // What was shown stays, once each, the last line too; the next
+        // reply follows it.
+        for n in [0, 39] {
+            let line = format!("Line {n} of the whole file");
+            assert_eq!(
+                drawn.iter().filter(|l| l.contains(&line)).count(),
+                1,
+                "{drawn:?}"
+            );
+        }
+        assert_eq!(
+            drawn.iter().filter(|l| l.contains("and the last")).count(),
+            1,
+            "{drawn:?}"
+        );
+        assert_eq!(
+            drawn
+                .iter()
+                .filter(|l| l.contains("Written in parts."))
+                .count(),
+            1,
+            "{drawn:?}"
+        );
     }
 
     #[tokio::test]

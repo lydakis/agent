@@ -5062,6 +5062,7 @@ impl Service {
                     images,
                     wait_ms,
                     output_schema,
+                    fact: false,
                 };
                 // A slot is promised before the commit that may take it, so
                 // admissions queued together cannot start more turns than
