@@ -105,14 +105,14 @@ impl Picker {
     /// What is typed to narrow the list.
     #[cfg(test)]
     pub fn filter(&self) -> &str {
-        &self.list.filter
+        self.list.filter()
     }
 
     /// The agents typing leaves, best first, each with the chars of its
     /// name typed.
     pub fn rows(&self) -> Vec<(&Agent, Vec<usize>)> {
-        (self.list.shown().into_iter())
-            .map(|(at, found)| (&self.agents[at], found))
+        (self.list.shown().iter())
+            .map(|(at, found)| (&self.agents[*at], found.clone()))
             .collect()
     }
 
@@ -125,7 +125,7 @@ impl Picker {
     /// window's own agent.
     pub fn narrow(&mut self, filter: String) {
         self.list.narrow(filter);
-        if !self.list.filter.is_empty()
+        if !self.list.filter().is_empty()
             && let Some(at) = (self.rows().iter()).position(|(agent, _)| agent.name != self.current)
         {
             self.list.pick_at(at);
@@ -135,10 +135,10 @@ impl Picker {
     /// What `event` does, typing narrowing as [`Picker::narrow`] does; an
     /// agent taken is noted so it ranks first next time.
     pub fn event(&mut self, event: &ratatui::crossterm::event::Event) -> crate::list::Act {
-        let before = self.list.filter.clone();
+        let before = self.list.filter().to_owned();
         let act = self.list.event(event);
-        if self.list.filter != before {
-            let filter = self.list.filter.clone();
+        if self.list.filter() != before {
+            let filter = self.list.filter().to_owned();
             self.narrow(filter);
         }
         if let crate::list::Act::Take(_) = act {

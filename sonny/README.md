@@ -292,6 +292,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | The chime, the agent's steps, and every tool call drawn | `[sonny] chime`, `steps`, `verbose` (true or false) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
+| An idea or a tip where no guess is obvious | `[sonny] suggest_ideas` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
@@ -438,7 +439,13 @@ lead when it has none yet), unless those words are `/switch NAME`, which
 binds the thread to that lead of the folder, or `/new [NAME]`, which makes
 one so named, in the project's lead role. A call that
 waits for you is asked in the thread (Allow or Deny); one the reviewer passes
-runs without asking. The turns the lead takes on its own, as when the lookout
+runs without asking. A question the lead puts to you (its `ask`) comes as a
+form, one pick among its options, what a yes covers, why it asks and what
+it recommends; the
+pick goes to the lead as your answer, as a click on its card in Sonny's
+window does, once whichever window answers first. Questions still open when
+a thread reopens come again, back to your own last words, before which a
+question is set aside as in the window. One you dismiss stays open. The turns the lead takes on its own, as when the lookout
 wakes it because a task finished, show in the thread between yours, as work
 the agent started (the protocol's version 2 draft, which T3 Code speaks).
 Each task the lead starts opens as a T3 Code thread with the task's brief as
@@ -469,6 +476,37 @@ own, since T3 Code puts its last pick to every new thread. One made later is
 the lead's from its next turn. A thread offers only its bot's provider family,
 since a bot changes model only within it, and a task's thread keeps the model
 its lead gave the task.
+
+#### Other ACP clients
+
+`sonny acp` serves any client of the Agent Client Protocol the same way, as
+a bridge from a chat app does: start it once and open a session for each
+conversation. A session opened in a folder offers a third picker, Agent,
+which names the lead behind it: "Default", the lead its first prompt opens
+as above, or one of the folder's leads by name. A lead picked before the
+first prompt is the one that prompt goes to; one picked later moves the
+session to that lead once its prompt is answered. T3 Code is not offered
+it, since it puts a thread's picks to every thread it opens next, which
+would put them all on one lead; there `/switch NAME` picks. `session/list`
+lists the leads Sonny can open, the given folder's or every project's, each
+by an id that names the lead, its identity and its store's lineage
+(`calc.lead.billing#7@…`), which `session/resume` reopens; one removed and
+made again under its name, or a lead of another store, is not the one
+listed, and is refused.
+
+A client several people write through names who wrote each prompt in its
+`_meta.person`, a name as the daemon takes one (1 to 128 of
+`A-Z a-z 0-9 . _ -`, so `ana.lopez`, not `Ana Lopez`; another is refused).
+The lead reads `[Written by ana.lopez.]` after the words and their time,
+and Sonny's window shows the name on the message. Their words are not
+yours: they neither end quiet nor say you are back, and the reviewer takes
+none of them as your consent. The client's answer to a call waiting on a
+person may name who chose in its own `_meta.person`, which the call's
+record keeps as who answered (else `acp`). A pick on one of the lead's
+questions that names someone goes to the lead as their words: it reads
+them, but only your own pick answers the question in Sonny's windows.
+Questions come as forms only to a client that says it fills them in
+(`elicitation.form`); one without forms still shows each as the `ask` call.
 
 Enter sends (and steers a running turn), Tab while a turn runs queues what
 you wrote to run after it, as Codex does, Esc interrupts, `y`/`n` answer a
@@ -553,6 +591,29 @@ words. The copy names the source from a fixed set (`earlier`, `margin`,
 `commons`, or an agent's name, which Sonny looks up and a click opens), so a guess about the
 reply you are reading, or a source it made up, shows none, and a window
 too narrow for the whole guess and its source leaves the source out.
+
+When your next message isn't obvious, the copy would say nothing, and the
+composer would show only its hint. Instead, the same call may offer
+something you didn't ask for, labeled as what it is: an `idea` for the
+work, apart from what the conversation is on, or a `tip` for one of Sonny's
+commands or keys that would help right now, as in
+`› /side why did the build slow down  tab  tip` or
+`› alt+t boosts your next message  tip`. A guess always comes first; the
+idea or tip only fills a slot that would be empty, and costs no call, timer
+or tool of its own. A tip names only what the slash menu and `?` list, so it
+stays current, and one naming anything else shows nothing. Each command or
+key is tipped once a window, and never one every composer has (Enter, Esc,
+the arrows) or one that stops or leaves (`/quit`, `/pause`). Tab takes an
+idea or a command as it takes a guess; a key's tip is only read, so Tab
+does what it does otherwise. The label stays however narrow the window,
+the words cut first. `[sonny] suggest_ideas = false` turns ideas and tips
+off and leaves the guess as it was.
+
+![An idea where no guess was obvious, labeled after the key](../docs/sonny/suggest-idea.png)
+
+![A tip for a command, which Tab takes](../docs/sonny/suggest-tip.png)
+
+![A tip for a key, only read](../docs/sonny/suggest-tip-key.png)
 
 ![A guess from a task's news, its source after the key](../docs/sonny/suggest-origin.png)
 
@@ -938,7 +999,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   no footer, no names but what needs you or failed. The arrows pick a star
   and Enter puts it in the middle: its maker, what it made and whoever it
   talked to in the last hour on the first ring, two hops on the next, the
-  chat log only its own; the stars glide to their places. Esc lets go of
+  chat log only its own; the stars glide to their places. A click on a
+  star, or on an agent's name in the sky, the list or the chat log, centres
+  on it the same way, and a click on `you` puts you back in the middle,
+  in the pane and in `sonny sky`. Esc lets go of
   the pick, then the centre. With thousands of agents the sky folds: a
   star for every agent that needs you, failed, works or was just lit, and
   for the leads, as many as the pane has room for; the rest are a faint
@@ -1069,9 +1133,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   task's instructions, with `task.md` after it. Paths in the lead's folder
   that a brief names (through a link too) are turned into the same paths
   in the task's worktree, so the task never writes the lead's folder by
-  its full path. The `remove_task` tool (`task`, `discard`) removes a task
-  that is done and its worktree, refusing while the worktree has
-  uncommitted changes. Its branch is kept unless it is merged.
+  its full path. The `remove_task` tool (`task`, `discard`) cleans up a
+  task that is done: it marks it done, as `mark_done` does, and removes
+  its worktree, refusing while the task is working or the worktree has
+  uncommitted changes. Its branch is kept unless it is merged. The agent
+  and its history stay, so a message reopens it; only the person deletes
+  an agent, with `agent rm`.
 - **Tasks that start their own:** every agent has `start_task` and
   `remove_task`, for help inside its own brief, such as a review or a
   watch on something; separate work still goes to its lead. How deep a
@@ -1468,7 +1535,10 @@ Your own messages sit on a band tinted from the theme's foreground over
 its background, as Codex and Claude Code tint the user's cell, with a
 row of the band above and below the words, so your turns are easy to
 find when you scroll back; a reply that opens with a
-heading takes no `•` before it.
+heading takes no `•` before it. Your words read as the agent's do: their
+Markdown (bold, code, lists, tables, math, pictures) is drawn the one way
+every surface draws it, in your sent messages, in what waits queued or
+steered, and in a message between agents once opened.
 
 ![Your message on its band, and the footer, all muted at rest, saying 76% left](../docs/sonny/message-band.png)
 

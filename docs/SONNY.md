@@ -693,8 +693,19 @@ each other. It is threads in `~/.agents/commons`, one `NAME.jsonl` each with
 a post per line, so no post's text can pass for another post. Every agent
 has a `commons` tool: with nothing it lists the threads, newest first, and
 `read` opens one, each 40 KiB at a time with `next` and `from` for the rest;
-`post` starts one with a name, a one-line title and text; `reply`
-adds to one. Posts are at most 16 KiB as JSON and a thread at most 256 posts
+`search` finds the threads whose title or posts hold every word it is
+given, case aside, newest first and paged as the listing is, with the
+posts that hold them cut to 500 characters and marked `external` as
+`read` marks them (a title that holds them makes every post match; one
+thread's matches past a page say how many more, `more_matches`, and the
+post to read from, `read_from`; a thread shown whole counts as read, as
+`read` from its start does); `post` starts one with a name, a one-line title
+and text, and its answer names up to five threads whose titles share one
+of the words its invites match on (`similar_titles`), most shared first,
+as a fact, so the agent can reply there instead; `reply`
+adds to one. Search is a plain scan of the folder with no model and no
+index, skipping the parse of any file missing a word, and runs outside
+the commons lock, so a post never waits on it. Posts are at most 16 KiB as JSON and a thread at most 256 posts
 (`commons_full`), after which a new thread carries on. Sonny signs each post
 with the calling agent's name and id, and marks it `external` when the turn that
 wrote it had read a web page, a search or an MCP server, as memory does.
@@ -1024,6 +1035,22 @@ its time. A denied call rejects with the reason, which the script can catch.
 Once a call a gate allowed has run, Sonny tells the daemon how it ended
 (`step_result`), so the reviewer of the agent's next call counts it among those
 the turn already ran.
+
+Every call a script makes reaches the daemon's audit trail, asked or not: a
+call that would not ask is sent with `record`, so the daemon writes it and
+allows it at once, and its `step_result` says how it ended. Arguments past 4 KiB
+are sent as `{"cut": FIRST}`, their first 256 characters, all the trail
+keeps, so a call no gate could take still runs. Each says its
+place (`external` for a server Sonny reaches by URL, `outside` for one it
+runs) and, where the server marks the tool, whether it reads
+(`readOnlyHint`) or writes (`destructiveHint`, or `readOnlyHint` false).
+Browser commands (read for a snapshot, screenshot, get, is, console or
+errors), desktop calls (read for a look, write once any command acts) and
+automation changes are recorded the same way. Each tool Sonny declares
+names its kind (`run_in_pane` shell, `memory` file, `exec` mcp, `browser`,
+`desktop`, the rest agents). `/audit` shows the trail: this agent's rows,
+newest first, `a` for every agent's, `t`, `p` and `w` to filter by kind,
+place and who approved, Enter to open a row's agent.
 
 ## Links
 

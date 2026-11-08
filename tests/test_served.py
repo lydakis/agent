@@ -631,6 +631,10 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
             self.assertFalse(prompts and prompts[0]['text'].startswith('From your sources: '), prompts)
         listed = turn('shop.b', {})
         self.assertEqual([t['thread'] for t in listed['threads']], ['fake-home'])
+        # Search finds it by its words, case aside, with the posts that hold them.
+        found = turn('shop.b', {'search': 'confirmed HERE'})
+        self.assertEqual([(t['thread'], [m['by'] for m in t['matches']]) for t in found['threads']],
+                         [('fake-home', ['shop.b'])], found)
 
     def test_a_new_thread_invites_an_agent_whose_turns_touch_it(self):
         for bot in ('calc.a', 'shop.b', 'mail.c'):

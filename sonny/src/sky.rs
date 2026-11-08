@@ -479,6 +479,9 @@ pub struct View {
     centre: Option<String>,
     /// The star picked with the arrows, to centre on with Enter.
     pick: Option<String>,
+    /// Where the last card drew each agent, and the person: what a click
+    /// there centres on.
+    hits: Vec<Hit>,
     /// Where the person is: the middle, or a ring of a centred sky.
     person: Glide,
     /// When the stars last set off for new places.
@@ -767,13 +770,35 @@ impl Replay {
     }
 }
 
+/// Cells of a card a click centres on: a star, its name, its row of the
+/// list, or its name in the chat log; `agent` none for the person's.
+/// By the agent's place, so a frame clones no names.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Hit {
+    row: usize,
+    from: usize,
+    to: usize,
+    agent: Option<usize>,
+}
+
+impl Hit {
+    fn moved(mut self, rows: usize, cols: usize) -> Self {
+        self.row += rows;
+        self.from += cols;
+        self.to += cols;
+        self
+    }
+}
+
 /// A line of the chat log.
 struct Note {
     at: Instant,
     text: String,
     /// The hue of what needs you or failed.
     hue: Option<Color>,
-    /// The agents it is about, so a centred sky keeps only its agent's.
+    /// The agents it is about, so a centred sky keeps only its agent's;
+    /// in the order its words name them, so a click on a name finds its
+    /// own agent where two share a short name.
     about: Vec<String>,
     /// In a replay, when it happened, in Unix ms, which it says for its
     /// time.
@@ -905,6 +930,7 @@ impl View {
             models: false,
             centre: None,
             pick: None,
+            hits: Vec::new(),
             person: Glide::default(),
             moved: None,
             listing: false,
@@ -1422,7 +1448,8 @@ impl View {
         };
         // What the schedule is first, as the log is narrow.
         let said = format!("{whom} {}, by {maker}", said_when(&booking.when));
-        let about: Vec<usize> = std::iter::once(by).chain(to).collect();
+        // In the order the line names them: whom, then its maker.
+        let about: Vec<usize> = to.into_iter().chain(std::iter::once(by)).collect();
         self.say(now, said, None, &about);
         if let Some(to) = to {
             // A spark of its own: no message, so no count of them.
@@ -2785,6 +2812,28 @@ impl View {
         }
     }
 
+    /// A click on the card's `row` at `col`: on a star or an agent's name,
+    /// centred on it, as the arrows and Enter centre on a pick; on `you`,
+    /// the person back in the middle. False when nothing there is one.
+    pub fn click(&mut self, row: usize, col: usize) -> bool {
+        // The last drawn is on top: a name over a star's edge.
+        let Some(hit) = (self.hits.iter().rev())
+            .find(|hit| hit.row == row && (hit.from..hit.to).contains(&col))
+        else {
+            return false;
+        };
+        let name = hit.agent.map(|at| self.agents[at].name.clone());
+        self.centre_clicked(name);
+        true
+    }
+
+    /// Centred on `name`, or the person, as a click on it does: what was
+    /// picked with the arrows is let go.
+    pub fn centre_clicked(&mut self, name: Option<String>) {
+        self.pick = None;
+        self.centre_on(name);
+    }
+
     /// A key the sky takes: the arrows pick a star, Enter centres on it,
     /// `?` the legend, `z` zen, `m` the models' colours. Esc lets go of the
     /// pick, then of the centre; false when there was nothing to let go
@@ -2900,6 +2949,7 @@ impl View {
     /// The sky `cols` wide and `rows` high, what happened under it.
     pub fn card(&mut self, cols: usize, rows: usize) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
+        self.hits.clear();
         // The sky opens whole: until who is here, what they did, what they
         // hold and what they ask are all read, one quiet line, and laid out
         // once, so no star moves for what was only late. A follow lost on
@@ -2929,14 +2979,20 @@ impl View {
                 (false, true) => LEGEND,
                 (false, false) => 2,
             };
-            lines.extend(self.list(now, cols, rows.saturating_sub(under).max(3)));
+            let (list, hits) = self.list(now, cols, rows.saturating_sub(under).max(3));
+            lines.extend(list);
+            self.hits = hits;
             // The list takes the rows; the log, its newest line, the one
             // kept for it under the list's blank.
             if !self.zen {
-                lines.extend(match self.legend {
-                    true => legend(true),
+                let (log, hits) = match self.legend {
+                    true => (legend(true), Vec::new()),
                     false => self.ticked(now, cols, under - 1, false),
-                });
+                };
+                let at = lines.len();
+                self.hits
+                    .extend(hits.into_iter().map(|hit| hit.moved(at, 0)));
+                lines.extend(log);
             }
             return lines;
         }
@@ -2971,7 +3027,15 @@ impl View {
             Some(End::Person) => Style::default().fg(NEEDS).bold(),
             _ => Style::default().bold(),
         };
-        sky.text_at(self.person.at, "you", you);
+        let mut hits = Vec::new();
+        if let Some((row, from, to)) = sky.text_at(self.person.at, "you", you) {
+            hits.push(Hit {
+                row,
+                from,
+                to,
+                agent: None,
+            });
+        }
         // Who made whom: dotted lines, dim, as all that says how things
         // stand rather than what happens.
         for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
@@ -3147,6 +3211,18 @@ impl View {
                 (None, _) => (Ink::Plain, agent.glow(now) > 0.4),
             };
             sky.star(agent.at, ink, big);
+            // Every row it paints: a blob across a row's edge takes two.
+            let (_, cols) = sky.covers(agent.at);
+            let (from, to) = (*cols.start(), cols.end() + 1);
+            for row in sky.painted(agent.at, big).filter(|&row| row < sky_rows) {
+                let agent = Some(index);
+                hits.push(Hit {
+                    row,
+                    from,
+                    to,
+                    agent,
+                });
+            }
         }
         for &(at, radius, ink) in cord.iter().flat_map(|cord| &cord.flares) {
             sky.circle(at, radius, ink);
@@ -3238,10 +3314,17 @@ impl View {
                     None => name_style(agent.state(), agent.glow(now)),
                 },
             };
-            if !sky.label(agent.at, mark, &short(&agent.name), style)
-                && agent.state() == Some(State::NeedsYou)
-            {
-                *unnamed.entry(agent.arm).or_default() += 1;
+            match sky.label(agent.at, mark, &short(&agent.name), style) {
+                Some((row, from, to)) => hits.push(Hit {
+                    row,
+                    from,
+                    to,
+                    agent: Some(at),
+                }),
+                None if agent.state() == Some(State::NeedsYou) => {
+                    *unnamed.entry(agent.arm).or_default() += 1;
+                }
+                None => {}
             }
         }
         for (arm, n) in unnamed {
@@ -3271,6 +3354,7 @@ impl View {
             }
         }
         let drawn = sky.lines();
+        self.hits = hits;
         if beside {
             let column = match self.legend {
                 true => self.key(now, rows),
@@ -3281,7 +3365,10 @@ impl View {
                     // As wide as the haiku over it, so both keep the same
                     // margin from the pane's edge.
                     let room = rows.saturating_sub(1);
-                    let mut column = self.ticked(now, haiku::WIDTH, room, true);
+                    let (mut column, hits) = self.ticked(now, haiku::WIDTH, room, true);
+                    let side = sky_cols + GAP;
+                    self.hits
+                        .extend(hits.into_iter().map(|hit| hit.moved(0, side)));
                     column.push(Line::default());
                     for (row, line) in self.haiku(now).into_iter().enumerate() {
                         let row = HAIKU_TOP + row;
@@ -3304,10 +3391,14 @@ impl View {
         lines.extend(drawn);
         if !self.zen {
             lines.push(Line::default());
-            lines.extend(match self.legend {
-                true => self.legend_under(cols),
+            let (log, hits) = match self.legend {
+                true => (self.legend_under(cols), Vec::new()),
                 false => self.ticked(now, cols, TICKER, false),
-            });
+            };
+            let at = lines.len();
+            self.hits
+                .extend(hits.into_iter().map(|hit| hit.moved(at, 0)));
+            lines.extend(log);
         }
         lines
     }
@@ -3317,9 +3408,17 @@ impl View {
     /// hue. In a column of its own, `tall`, it fills the column with the
     /// newest at the bottom, the newest few plain, older ones muted, the
     /// oldest faint, and a line just come in fades up from faint. Or that
-    /// the follow is lost, or nothing has happened yet.
-    fn ticked(&self, now: Instant, cols: usize, room: usize, tall: bool) -> Vec<Line<'static>> {
+    /// the follow is lost, or nothing has happened yet. With the names in
+    /// it a click centres on, by the lines' rows and columns.
+    fn ticked(
+        &self,
+        now: Instant,
+        cols: usize,
+        room: usize,
+        tall: bool,
+    ) -> (Vec<Line<'static>>, Vec<Hit>) {
         let mut lines = Vec::new();
+        let mut hits = Vec::new();
         // Centred, only what the agent in the middle said or was told.
         let centre = self.centred().map(|at| &self.agents[at].name);
         let kept: Vec<_> = (self.ticker.iter())
@@ -3337,8 +3436,8 @@ impl View {
                 at,
                 text,
                 hue,
+                about,
                 written,
-                ..
             },
         ) in entries.iter().copied().enumerate()
         {
@@ -3371,9 +3470,18 @@ impl View {
                 None => format!("{:>3}  ", ago(now, *at)),
             };
             let room = cols.saturating_sub(when.width());
+            let said = cut(text, room);
+            for (from, to, name) in named(&said, about) {
+                hits.push(Hit {
+                    row: lines.len(),
+                    from: when.width() + from,
+                    to: when.width() + to,
+                    agent: self.agent(name),
+                });
+            }
             lines.push(Line::from(vec![
                 Span::styled(when, age),
-                Span::styled(cut(text, room), words),
+                Span::styled(said, words),
             ]));
         }
         if let Some(why) = &self.down {
@@ -3400,8 +3508,9 @@ impl View {
         if tall {
             let blank = room.saturating_sub(lines.len());
             lines.splice(0..0, std::iter::repeat_n(Line::default(), blank));
+            hits = hits.into_iter().map(|hit| hit.moved(blank, 0)).collect();
         }
-        lines
+        (lines, hits)
     }
 
     /// The legend and the counts, in the chat log's column: what each mark
@@ -3634,7 +3743,7 @@ impl View {
     /// state's mark, and the last it said or was told. When they don't all
     /// fit, what needs the person, what failed, works or is lit come
     /// first, the leads after them.
-    fn list(&self, now: Instant, cols: usize, rows: usize) -> Vec<Line<'static>> {
+    fn list(&self, now: Instant, cols: usize, rows: usize) -> (Vec<Line<'static>>, Vec<Hit>) {
         let picked = self.pick.as_deref().and_then(|name| self.agent(name));
         let rank = |at: usize| {
             let agent = &self.agents[at];
@@ -3658,6 +3767,7 @@ impl View {
             kept.truncate(rows.saturating_sub(1));
         }
         let mut lines = Vec::new();
+        let mut hits = Vec::new();
         for &(at, depth) in self.order.iter().filter(|(at, _)| kept.contains(at)) {
             let agent = &self.agents[at];
             let glow = agent.glow(now);
@@ -3699,14 +3809,22 @@ impl View {
                 let said = format!("{said} · {}", ago(now, *when));
                 spans.push(Span::raw(format!("  {}", cut(&said, cols - used - 2))).dim());
             }
-            lines.push(Line::from(spans));
+            // Its whole row, as a list's row is picked.
+            let line = Line::from(spans);
+            hits.push(Hit {
+                row: lines.len(),
+                from: 0,
+                to: line.width(),
+                agent: Some(at),
+            });
+            lines.push(line);
         }
         if more > 0 {
             let hidden = self.order.len() - kept.len();
             lines.push(Line::from(format!("  … {hidden} more, quiet")).dim());
         }
         lines.push(Line::default());
-        lines
+        (lines, hits)
     }
 
     /// Counts as the footer gives them, each mark with its word: everyone,
@@ -4045,6 +4163,31 @@ fn signature(name: &str, minutes: u64, room: usize) -> Vec<String> {
     }
     let named = format!("{},", cut(name, room.saturating_sub(3)));
     vec![format!("— {named}"), format!("  busiest for {minutes}m")]
+}
+
+/// Where in `said` each of the agents `about` is named, by its short
+/// name as the log writes it: the columns it takes. `about` is in the
+/// order the line names them, so each is looked for after the last one
+/// found: two of one short name each find their own place.
+fn named<'a>(said: &str, about: &'a [String]) -> Vec<(usize, usize, &'a str)> {
+    let edge = |c: Option<char>| c.is_none_or(|c| !(c.is_alphanumeric() || "._-".contains(c)));
+    let mut after = 0;
+    let mut found = Vec::new();
+    for name in about {
+        let short = short(name);
+        let place = (said[after..].match_indices(short.as_str()))
+            .map(|(at, _)| after + at)
+            .find(|&at| {
+                edge(said[..at].chars().next_back())
+                    && edge(said[at + short.len()..].chars().next())
+            });
+        if let Some(at) = place {
+            after = at + short.len();
+            let from = said[..at].width();
+            found.push((from, from + short.width(), name.as_str()));
+        }
+    }
+    found
 }
 
 /// Words cut to `room` columns, an ellipsis saying so.
@@ -4404,6 +4547,15 @@ impl Sky {
         }
     }
 
+    /// The rows a star at a point paints: a blob's dots, half a dot above
+    /// and below it, may fall in the rows either side of its own.
+    fn painted(&self, at: (f32, f32), big: bool) -> std::ops::RangeInclusive<usize> {
+        let (_, y) = self.spot(at);
+        let reach = if big { 0.5 } else { 0.0 };
+        let row = |y: f32| y.max(0.0) as usize / 4;
+        row(y - reach)..=row(y + reach)
+    }
+
     /// The row and columns a star at a point covers.
     fn covers(&self, at: (f32, f32)) -> (usize, std::ops::RangeInclusive<usize>) {
         let (x, y) = self.spot(at);
@@ -4502,7 +4654,7 @@ impl Sky {
         mark: Option<(&str, Style)>,
         words: &str,
         style: Style,
-    ) -> bool {
+    ) -> Option<(usize, usize, usize)> {
         let (_, y) = self.spot(at);
         let row = (y / 4.0) as usize;
         let marked = match mark {
@@ -4512,7 +4664,7 @@ impl Sky {
         let words = marked.as_str();
         let width = words.width();
         if row >= self.rows || width + 2 > self.cols {
-            return false;
+            return None;
         }
         // A blank cell between the words and their star, whichever cells
         // the star covers.
@@ -4532,20 +4684,18 @@ impl Sky {
             .map(|start| (row, start, Some(own.clone()))))
         .chain((row > 0).then(|| (row - 1, centred, None)))
         .chain((row + 1 < self.rows).then(|| (row + 1, centred, None)));
-        let Some((row, start)) = spots.into_iter().find_map(|(row, start, own)| {
+        let (row, start) = spots.into_iter().find_map(|(row, start, own)| {
             (start + width <= self.cols
                 && self.clear_of_stars(row, start, width, own.as_ref())
                 && self.put(row, start, words, style))
             .then_some((row, start))
-        }) else {
-            return false;
-        };
+        })?;
         if let Some((mark, mark_style)) = mark {
             for (cell, ch) in (row * self.cols + start..).zip(mark.chars()) {
                 self.text[cell] = Some((ch, mark_style));
             }
         }
-        true
+        Some((row, start, start + words.chars().count()))
     }
 
     /// No other agent's star in the cells words would take or the blank
@@ -4562,12 +4712,18 @@ impl Sky {
         })
     }
 
-    /// Words centred on a point.
-    fn text_at(&mut self, at: (f32, f32), words: &str, style: Style) {
+    /// Words centred on a point, and the row and columns they took.
+    fn text_at(
+        &mut self,
+        at: (f32, f32),
+        words: &str,
+        style: Style,
+    ) -> Option<(usize, usize, usize)> {
         let (x, y) = self.spot(at);
         let (col, row) = ((x / 2.0) as usize, (y / 4.0) as usize);
         let start = col.saturating_sub(words.width() / 2);
-        self.put(row, start, words, style);
+        (row < self.rows && self.put(row, start, words, style))
+            .then(|| (row, start, start + words.chars().count()))
     }
 
     /// Words put at a place in a row, a blank cell kept either side and
@@ -4699,7 +4855,12 @@ pub fn watch(
     // The theme's colours, so muted reads as the measured gray it is in
     // the conversation, and `NO_COLOR` is honoured here too.
     crate::term::detect();
-    let _ = execute!(std::io::stdout(), EnterAlternateScreen, cursor::Hide);
+    let _ = execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        cursor::Hide,
+        event::EnableMouseCapture
+    );
     let backend = crate::frames::Backend::new(std::io::stdout());
     let drawn = ratatui::Terminal::new(backend)
         .map_err(|e| e.to_string())
@@ -4726,17 +4887,32 @@ pub fn watch(
                 if !event::poll(FRAME).map_err(|e| e.to_string())? {
                     continue;
                 }
-                if let event::Event::Key(key) = event::read().map_err(|e| e.to_string())?
-                    && key.kind != event::KeyEventKind::Release
-                {
-                    // Esc lets go of the pick and the centre before it leaves.
-                    if !view.press(key.code) && quits(&key) {
-                        return Ok(());
+                match event::read().map_err(|e| e.to_string())? {
+                    event::Event::Key(key) if key.kind != event::KeyEventKind::Release => {
+                        // Esc lets go of the pick and the centre before it leaves.
+                        if !view.press(key.code) && quits(&key) {
+                            return Ok(());
+                        }
                     }
+                    // A star or a name centred on: the card is drawn a
+                    // column in and two rows down, under the title.
+                    event::Event::Mouse(mouse)
+                        if mouse.kind == event::MouseEventKind::Down(event::MouseButton::Left)
+                            && mouse.column > 0
+                            && mouse.row > 1 =>
+                    {
+                        view.click(usize::from(mouse.row - 2), usize::from(mouse.column - 1));
+                    }
+                    _ => {}
                 }
             }
         });
-    let _ = execute!(std::io::stdout(), cursor::Show, LeaveAlternateScreen);
+    let _ = execute!(
+        std::io::stdout(),
+        event::DisableMouseCapture,
+        cursor::Show,
+        LeaveAlternateScreen
+    );
     crate::term::restore();
     let _ = terminal::disable_raw_mode();
     drawn
@@ -5826,7 +6002,7 @@ mod tests {
         view.listing = false;
         assert!(view.agent("shop.cart").is_some());
         assert_eq!(view.ticker.len(), 2);
-        let log = text(&view.ticked(Instant::now(), 40, 12, true));
+        let log = text(&view.ticked(Instant::now(), 40, 12, true).0);
         assert!(log.contains(&clock(from + 90_000)), "{log}");
         // Paused, nothing moves; slower and faster halve and double.
         assert!(view.press(KeyCode::Char(' ')));
@@ -6376,6 +6552,115 @@ mod tests {
         for wrong in ["2", "2x", "25:00", "1:61", "", "h"] {
             assert_eq!(replay_from(wrong, now), None, "{wrong}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_click_on_a_star_or_a_name_centres_on_it_and_on_you_lets_go() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+            json!({"name": "shop.cart", "created_by": "shop.login"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        let from = json!({"bot": "shop.cart", "turn": 1});
+        send.send(Feed::Live(
+            json!({"cursor": 1, "event": "accepted", "bot": "shop.login", "turn": 2, "data": {"from": from}}),
+        ))
+        .unwrap();
+        view.drain();
+        // What a hit's cells hold, as the card drew them.
+        let under = |lines: &[Line], hit: &Hit| -> String {
+            let row: String = lines[hit.row]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            row.chars().skip(hit.from).take(hit.to - hit.from).collect()
+        };
+        for (cols, rows) in [(120, 40), (70, 40)] {
+            view.centre_on(None);
+            let lines = view.card(cols, rows);
+            let hits = view.hits.clone();
+            // Each name a click finds is the name drawn there, in the sky
+            // and in the log; a star's cells are its dots.
+            let words: Vec<(String, Option<String>)> = (hits.iter())
+                .map(|hit| {
+                    (
+                        under(&lines, hit),
+                        hit.agent.map(|at| view.agents[at].name.clone()),
+                    )
+                })
+                .filter(|(text, _)| text.chars().any(|c| c.is_alphabetic()))
+                .collect();
+            assert!(words.contains(&("you".into(), None)), "{cols}: {words:?}");
+            for name in ["cart", "login"] {
+                let full = Some(format!("shop.{name}"));
+                let named = words
+                    .iter()
+                    .filter(|(text, of)| text == name && *of == full);
+                // Its label beside its star, and the log's "cart → login".
+                assert_eq!(named.count(), 2, "{cols}: {name} in {words:?}");
+            }
+            for hit in hits.iter().filter(|hit| under(&lines, hit) == "cart") {
+                view.centre_on(None);
+                assert!(view.click(hit.row, hit.from));
+                assert_eq!(view.centre.as_deref(), Some("shop.cart"));
+            }
+            let star = hits.iter().find(|hit| {
+                hit.agent == Some(view.index["shop.login"]) && under(&lines, hit) != "login"
+            });
+            let star = star.expect("login's star");
+            assert!(view.click(star.row, star.to - 1));
+            assert_eq!(view.centre.as_deref(), Some("shop.login"));
+            let you = hits.iter().find(|hit| hit.agent.is_none()).unwrap();
+            assert!(view.click(you.row, you.from));
+            assert_eq!(view.centre, None);
+        }
+        // Off every star and name, a click does nothing.
+        let lines = view.card(120, 40);
+        let blank = (0..lines.len()).find(|&row| view.hits.iter().all(|hit| hit.row != row));
+        assert!(!view.click(blank.unwrap(), 0));
+        // A list's row centres on its agent, the pick let go.
+        view.card(40, 12);
+        view.pick = Some("shop.lead".into());
+        let cart = Some(view.index["shop.cart"]);
+        let row = view.hits.iter().find(|hit| hit.agent == cart);
+        let row = row.unwrap().row;
+        assert!(view.click(row, 3));
+        assert_eq!(
+            (view.centre.as_deref(), view.pick.as_deref()),
+            (Some("shop.cart"), None)
+        );
+    }
+
+    #[test]
+    fn a_big_star_across_a_row_s_edge_is_clicked_in_both_rows_it_paints() {
+        let mut sky = Sky::new(40, 5);
+        let (_, down) = sky.scale();
+        // Its centre a fifth of a dot above the middle row's bottom edge.
+        let at = (0.0, 1.8 / down);
+        assert_eq!(sky.painted(at, true), 2..=3);
+        assert_eq!(sky.painted(at, false), 2..=2);
+        sky.star(at, Ink::Plain, true);
+        let inked = |row: usize| (0..40).any(|col| sky.dots[row * 40 + col] != 0);
+        assert!(inked(2) && inked(3));
+    }
+
+    #[test]
+    fn a_name_in_the_log_is_found_for_its_own_agent_in_the_order_it_is_named() {
+        // Two agents of one short name: each takes its own place.
+        let about = ["shop.cart".to_owned(), "other.cart".to_owned()];
+        let said = "cart at 9:00, by cart";
+        assert_eq!(
+            named(said, &about),
+            vec![(0, 4, "shop.cart"), (17, 21, "other.cart")]
+        );
+        // A name inside a longer word is not it; one not written is skipped.
+        let about = ["shop.cart".to_owned(), "shop.login".to_owned()];
+        assert_eq!(named("carts → cart", &about), vec![(8, 12, "shop.cart")]);
     }
 
     #[tokio::test]
@@ -7935,6 +8220,38 @@ mod scale {
                 "{count:>6} agents: first frame {first:?}, then {frame:?} a frame; list {list:?}"
             );
         }
+    }
+
+    /// The sky opened on a running daemon: `SKY_SOCKET=... cargo test -p
+    /// sonny --release open_on_a_daemon -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn open_on_a_daemon() {
+        let socket = PathBuf::from(std::env::var("SKY_SOCKET").unwrap());
+        let base = rss_kib();
+        let start = Instant::now();
+        let mut view = View::open(socket.clone(), PathBuf::new());
+        let mut most = 0;
+        while view.opening() && start.elapsed() < Duration::from_secs(600) {
+            most = most.max(view.feed.len());
+            view.drain();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        eprintln!(
+            "open: {} agents drawn at {:?}; feed peak {most}; rss +{} KiB",
+            view.agents.len(),
+            start.elapsed(),
+            rss_kib().saturating_sub(base)
+        );
+        let start = Instant::now();
+        view.replay(Some(wall_ms() - 3_600_000));
+        while !view.replay.as_ref().is_some_and(|r| r.ready)
+            && start.elapsed() < Duration::from_secs(600)
+        {
+            view.drain();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        eprintln!("replay of the last hour ready in {:?}", start.elapsed());
     }
 
     /// Resident memory now, in KiB, what was freed given back first so

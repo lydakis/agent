@@ -6,17 +6,21 @@
 //! thread through T3 Code's tools, the lead thread's child while the
 //! person's prompt runs, and that thread is the task's.
 //!
+//! Any other client, such as a bridge from a chat app, is served the same
+//! way: it picks the lead behind a session with the Agent option, and
+//! finds the leads to reopen with `session/list`.
+//!
 //! It speaks the protocol's version 2 draft as T3 Code does: the turns a
 //! bot takes on its own, as when the lookout wakes a lead because a task
 //! finished, reach the thread between the person's prompts, as work the
 //! agent started.
-use crate::{approvals, declared, lookout, plan, project, reactions, t3};
+use crate::{approvals, asks, declared, lookout, plan, project, reactions, t3};
 use agent_client::{Client, Events};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, OnceCell, oneshot};
 
@@ -43,6 +47,9 @@ const FAILED: i64 = -32603;
 /// The model and effort pickers' first choice: what the thread's bot
 /// runs, or what Sonny gives a new lead.
 const DEFAULT: &str = "default";
+
+/// The option that picks the lead behind a thread.
+const AGENT: &str = "agent";
 
 /// `sonny acp [--store PATH] [--socket PATH]`.
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -90,6 +97,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         ready: OnceCell::new(),
         offer: Mutex::new(Offer::default()),
         version: AtomicI64::new(VERSION),
+        forms: AtomicBool::new(false),
     });
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -131,14 +139,24 @@ impl Out {
 
     /// Ask the client: its answer, or `None` when it gave an error or none.
     async fn ask(&self, method: &str, params: Value) -> Option<Value> {
+        Self::answer_to(self.asking(method, params)).await
+    }
+
+    /// Ask the client now, to wait on its answer later: questions put
+    /// together reach it in the order they were put.
+    fn asking(&self, method: &str, params: Value) -> oneshot::Receiver<Value> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         if let Ok(mut waiting) = self.waiting.lock() {
             waiting.insert(id, tx);
         }
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
-        let answer = rx.await.ok()?;
-        answer.get("result").cloned()
+        rx
+    }
+
+    /// The client's answer to what [`Out::asking`] asked.
+    async fn answer_to(asked: oneshot::Receiver<Value>) -> Option<Value> {
+        asked.await.ok()?.get("result").cloned()
     }
 
     fn answered(&self, message: Value) {
@@ -165,6 +183,9 @@ struct Agent {
     offer: Mutex<Offer>,
     /// The version the client asked for, when older.
     version: AtomicI64,
+    /// Whether the client fills in forms (`elicitation/create`), which
+    /// put the lead's questions to the person.
+    forms: AtomicBool,
 }
 
 impl Agent {
@@ -215,6 +236,7 @@ impl Agent {
                 Some(session) => session.prompt(&self, id, params).await,
                 None => Err((INVALID_PARAMS, "no such session".into())),
             },
+            "session/list" => self.listed(params).await,
             "session/set_config_option" => match self.session(params) {
                 Some(session) => session.set_option(&self, params).await,
                 None => Err((INVALID_PARAMS, "no such session".into())),
@@ -257,13 +279,15 @@ impl Agent {
         let asked = params["protocolVersion"].as_i64().unwrap_or(VERSION);
         let version = asked.clamp(1, VERSION);
         self.version.store(version, Ordering::Relaxed);
+        let forms = params["clientCapabilities"]["elicitation"]["form"].is_object();
+        self.forms.store(forms, Ordering::Relaxed);
         json!({
             "protocolVersion": version,
             "agentCapabilities": {
                 "loadSession": false,
                 "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true},
                 "mcpCapabilities": {"http": false, "sse": false, "acp": false},
-                "sessionCapabilities": {"resume": {}, "close": {}}
+                "sessionCapabilities": {"resume": {}, "close": {}, "list": {}}
             },
             "authMethods": [],
             "agentInfo": {"name": "sonny", "title": "Sonny", "version": env!("CARGO_PKG_VERSION")}
@@ -329,7 +353,7 @@ impl Agent {
     /// What the providers list now, as `/model` asks them, with what
     /// the model list says of them and the models only it names. A
     /// listing that does not come in time leaves the file's.
-    async fn list(&self) {
+    async fn list(&self, client: Option<&Client>) {
         let path = agent_client::models::path();
         let file = path
             .as_deref()
@@ -340,7 +364,7 @@ impl Agent {
             .map(agent_client::models::hidden)
             .unwrap_or_default();
         let mut offer = Offer::default();
-        if let Ok((client, _events)) = Client::connect(&self.options.socket).await {
+        if let Some(client) = client {
             offer.providers = client.providers().clone();
             let listing =
                 tokio::time::timeout(LISTING, client.request("provider_models", json!({}))).await;
@@ -363,7 +387,6 @@ impl Agent {
                     }
                 }
             }
-            client.close().await;
         }
         for model in file {
             match offer.models.iter_mut().find(|listed| listed.id == model.id) {
@@ -406,7 +429,17 @@ impl Agent {
             .filter(|cwd| cwd.is_absolute())
             .ok_or((INVALID_PARAMS, "cwd must be an absolute path".to_owned()))?;
         self.ready().await.map_err(|e| (FAILED, e))?;
-        self.list().await;
+        // One connection for what the thread's pickers list.
+        let lister = Client::connect(&self.options.socket).await.ok();
+        let lister = lister.as_ref().map(|(client, _)| client.as_ref());
+        self.list(lister).await;
+        let leads = match lister {
+            Some(client) if self.t3.is_none() => folder_leads(client, &cwd).await,
+            _ => Vec::new(),
+        };
+        if let Some(client) = lister {
+            client.close().await;
+        }
         let id = match resumed {
             Some(id) => id.to_owned(),
             None => crate::unique("sonny"),
@@ -414,7 +447,10 @@ impl Agent {
         let session = Arc::new(Session {
             id: id.clone(),
             cwd,
-            state: AsyncMutex::new(State::default()),
+            state: AsyncMutex::new(State {
+                leads,
+                ..State::default()
+            }),
             follower: Mutex::new(None),
             switching: AsyncMutex::new(()),
         });
@@ -429,7 +465,9 @@ impl Agent {
         }
         // A thread comes back as the bot it was, or not at all.
         let bound = match resumed {
-            Some(id) => match t3::recall(id) {
+            // A listed id names its lead itself, whatever the session was
+            // moved to since.
+            Some(id) => match listed_lead(id).or_else(|| t3::recall(id)) {
                 Some(pinned) => {
                     session
                         .bind(self, Some(pinned), false, &project::Pick::Last)
@@ -451,6 +489,129 @@ impl Agent {
             None => json!({"sessionId": id, "configOptions": options}),
         })
     }
+
+    /// `session/list`: the leads Sonny can open a session on, the one
+    /// folder's when the client names a `cwd`, else every project's, a
+    /// page at a time. Each is listed by an id `session/resume` takes, which
+    /// names the lead and its identity, so a lead removed and made again
+    /// under its name is not the one reopened.
+    async fn listed(&self, params: &Value) -> Reply {
+        self.ready().await.map_err(|e| (FAILED, e))?;
+        let (client, _events) = Client::connect(&self.options.socket)
+            .await
+            .map_err(|e| (FAILED, e.to_string()))?;
+        let cwd = params["cwd"].as_str().map(PathBuf::from);
+        let listing = match &cwd {
+            Some(cwd) if !cwd.is_absolute() => {
+                Err((INVALID_PARAMS, "cwd must be an absolute path".to_owned()))
+            }
+            Some(cwd) => match project::folder_project(cwd) {
+                Ok((project, dir)) => project::leads(&client, &project, &dir)
+                    .await
+                    .map(|leads| (leads, None))
+                    .map_err(|e| (FAILED, e)),
+                // A folder no lead can work in has none.
+                Err(_) => Ok((Vec::new(), None)),
+            },
+            None => project::every_lead(&client, params["cursor"].as_str())
+                .await
+                .map_err(|e| (FAILED, e)),
+        };
+        let store = client.store().map(str::to_owned);
+        client.close().await;
+        let (leads, next) = listing?;
+        let sessions: Vec<Value> = leads
+            .iter()
+            .filter_map(|lead| {
+                let (bot, bot_id) = (lead["name"].as_str()?, lead["bot_id"].as_i64()?);
+                Some(
+                    json!({"sessionId": lead_session(bot, bot_id, store.as_deref()),
+                    "cwd": lead["workspace"], "title": bot}),
+                )
+            })
+            .collect();
+        let mut listed = json!({"sessions": sessions});
+        if let Some(next) = next {
+            listed["nextCursor"] = json!(next);
+        }
+        Ok(listed)
+    }
+}
+
+/// The agent picker: the folder's leads, after `default`, the lead the
+/// thread's first prompt opens as `sonny` opens one there. `current` is
+/// the thread's bot, or the lead picked for it, which is listed whatever
+/// folder it works in.
+fn agent_option(leads: &[String], current: &str) -> Value {
+    let mut choices = vec![json!({"value": DEFAULT, "name": "Default",
+        "description": "A new lead named after your first words, or the folder's first lead when it has none"})];
+    for lead in leads {
+        choices.push(json!({"value": lead, "name": lead}));
+    }
+    if current != DEFAULT && !leads.iter().any(|lead| lead == current) {
+        choices.push(json!({"value": current, "name": current}));
+    }
+    json!({"id": AGENT, "configId": AGENT, "name": "Agent",
+        "description": "The lead behind this thread", "type": "select",
+        "currentValue": current, "options": choices})
+}
+
+/// The id `session/list` gives a lead: its name, its identity, and the
+/// lineage of the store it is in, since identities are a store's own.
+/// Who a client says sent a prompt or chose for a call, by its
+/// `_meta.person`: a name as the daemon takes a prompt's `person`, 1 to
+/// 128 of `A-Z a-z 0-9 . _ -`. The daemon shows the model who wrote it,
+/// and none of it is the daemon's own person's consent.
+fn person(params: &Value) -> Result<Option<&str>, String> {
+    match &params["_meta"]["person"] {
+        Value::Null => Ok(None),
+        Value::String(name)
+            if (1..=128).contains(&name.len())
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) =>
+        {
+            Ok(Some(name))
+        }
+        _ => Err("_meta.person must be 1 to 128 of A-Z a-z 0-9 . _ -".into()),
+    }
+}
+
+fn lead_session(bot: &str, bot_id: i64, store: Option<&str>) -> String {
+    match store {
+        Some(store) => format!("{bot}#{bot_id}@{store}"),
+        None => format!("{bot}#{bot_id}"),
+    }
+}
+
+/// The lead a listed session id names, as `session/resume` reopens it:
+/// that lead of that store, or none.
+fn listed_lead(session: &str) -> Option<t3::Pinned> {
+    let (lead, store) = match session.rsplit_once('@') {
+        Some((lead, store)) => (lead, Some(store.to_owned())),
+        None => (session, None),
+    };
+    let (bot, bot_id) = lead.rsplit_once('#')?;
+    (project::is_lead(bot)).then_some(())?;
+    Some(t3::Pinned {
+        bot: bot.to_owned(),
+        bot_id: Some(bot_id.parse().ok()?),
+        store,
+    })
+}
+
+/// The leads working in the folder `cwd` reaches, by name, first one
+/// first: what the agent picker offers.
+async fn folder_leads(client: &Client, cwd: &Path) -> Vec<String> {
+    let Ok((project, dir)) = project::folder_project(cwd) else {
+        return Vec::new();
+    };
+    (project::leads(client, &project, &dir)
+        .await
+        .unwrap_or_default())
+    .iter()
+    .filter_map(|lead| lead["name"].as_str().map(str::to_owned))
+    .collect()
 }
 
 type Reply = Result<Value, (i64, String)>;
@@ -489,7 +650,8 @@ struct State {
     /// The words of this part sent as they streamed.
     streamed: String,
     calls: HashMap<String, (String, Value)>,
-    /// Calls put to the person, by call and request.
+    /// Calls put to the person, by call and request, and the lead's
+    /// questions, by ask.
     asked: HashSet<String>,
     /// The last of the bot's kept events this thread handled, to follow on
     /// from when its stream drops.
@@ -503,6 +665,11 @@ struct State {
     /// it is next idle; a new lead starts on the model.
     picked: Option<String>,
     effort: Option<String>,
+    /// The lead the client picked for a thread that is no bot yet, which
+    /// its first prompt opens.
+    agent: Option<String>,
+    /// The leads of the thread's folder, as the agent picker lists them.
+    leads: Vec<String>,
     /// Tasks whose threads are opening, as children of the person's prompt
     /// while it runs, and the answers of the prompts whose turns ended
     /// meanwhile, held until they are open.
@@ -656,8 +823,17 @@ impl Session {
             store: client.store().map(str::to_owned),
         };
         t3::remember(&self.id, &pinned);
+        // A lead made just now joins the picker's list.
+        let leads = match agent.t3 {
+            None => Some(folder_leads(&client, &self.cwd).await),
+            Some(_) => None,
+        };
         {
             let mut state = self.state.lock().await;
+            if let Some(leads) = leads {
+                state.leads = leads;
+                state.agent = None;
+            }
             state.running = running;
             state.calls = calls;
             state.cursor = cursor;
@@ -695,8 +871,13 @@ impl Session {
         };
         let follower = self.clone();
         let handle = tokio::spawn(async move {
-            if let Some((client, bot, turn @ Some(_))) = waiting {
-                follower.approvals(&agent, &client, &bot, turn).await;
+            if let Some((client, bot, turn)) = &waiting {
+                if turn.is_some() {
+                    follower.approvals(&agent, client, bot, *turn).await;
+                }
+                if agent.forms.load(Ordering::Relaxed) {
+                    follower.questions(&agent, client, bot).await;
+                }
             }
             follower.follow(&agent, events).await
         });
@@ -718,11 +899,23 @@ impl Session {
         let effort = (state.effort.as_deref())
             .or(bound.and_then(|bound| bound.effort.as_deref()))
             .unwrap_or(DEFAULT);
-        agent.options(
+        let mut options = agent.options(
             model,
             effort,
             bound.map(|bound| (bound.model.as_str(), bound.client.providers())),
-        )
+        );
+        // T3 Code carries a thread's option picks over to the next thread
+        // it opens, which would put every new thread on one lead: there,
+        // `/switch` picks.
+        if agent.t3.is_none()
+            && let Value::Array(options) = &mut options
+        {
+            let current = (bound.map(|bound| bound.bot.as_str()))
+                .or(state.agent.as_deref())
+                .unwrap_or(DEFAULT);
+            options.push(agent_option(&state.leads, current));
+        }
+        options
     }
 
     async fn show_options(&self, agent: &Agent) {
@@ -737,12 +930,16 @@ impl Session {
     /// model of its family only, at once when the bot is idle and with its
     /// next turn when it is not; a thread that is no bot yet keeps it for
     /// the lead it makes.
-    async fn set_option(&self, agent: &Agent, params: &Value) -> Reply {
+    async fn set_option(self: &Arc<Self>, agent: &Arc<Agent>, params: &Value) -> Reply {
         let option = params.get("configId").unwrap_or(&params["id"]);
         let Some(value) = params["value"].as_str() else {
             return Err((INVALID_PARAMS, "an option is picked by its value".into()));
         };
         let _one = self.switching.lock().await;
+        if option == AGENT && agent.t3.is_none() {
+            self.pick_agent(agent, value).await?;
+            return Ok(json!({"configOptions": self.options(agent).await}));
+        }
         if option == "effort" {
             let mut state = self.state.lock().await;
             state.effort = match &state.bound {
@@ -787,6 +984,44 @@ impl Session {
             .await
             .map_err(|error| (INVALID_PARAMS, error))?;
         Ok(json!({"configOptions": self.options(agent).await}))
+    }
+
+    /// The client picks the lead behind the thread: one of its folder's,
+    /// or `default`, the lead its first prompt opens as `sonny` would. A
+    /// thread that is no bot yet keeps the pick for its first prompt; a
+    /// lead's thread moves to the lead picked, once its prompt is answered.
+    /// The caller holds `switching`.
+    async fn pick_agent(
+        self: &Arc<Self>,
+        agent: &Arc<Agent>,
+        value: &str,
+    ) -> Result<(), (i64, String)> {
+        let mut state = self.state.lock().await;
+        let known = state.leads.iter().any(|lead| lead == value);
+        if value != DEFAULT && !known && state.bound.as_ref().is_none_or(|b| b.bot != value) {
+            return Err((
+                INVALID_PARAMS,
+                format!("{value} is not a lead of this folder"),
+            ));
+        }
+        let Some(bound) = &state.bound else {
+            state.agent = (value != DEFAULT).then(|| value.to_owned());
+            return Ok(());
+        };
+        if value == DEFAULT || value == bound.bot {
+            return Ok(());
+        }
+        if state.prompt.is_some() {
+            return Err((
+                INVALID_PARAMS,
+                format!("{} is answering; pick another lead once it has", bound.bot),
+            ));
+        }
+        drop(state);
+        let pick = project::Pick::Named(project::lead_short(value).to_owned());
+        self.bind(agent, None, false, &pick)
+            .await
+            .map_err(|error| (FAILED, error))
     }
 
     /// Once the bot is idle, as before a prompt's turn or after a turn:
@@ -876,6 +1111,7 @@ impl Session {
     }
 
     async fn prompt(self: &Arc<Self>, agent: &Arc<Agent>, id: &Value, params: &Value) -> Reply {
+        let person = person(params).map_err(|error| (INVALID_PARAMS, error))?;
         let (text, images) = words(&params["prompt"]);
         if agent.t3.is_some() && images.is_empty() && t3::is_completion(&text) {
             return Ok(json!({"stopReason": "end_turn"}));
@@ -898,9 +1134,12 @@ impl Session {
             // words, unless they are `/switch NAME`, which opens one there,
             // or `/new [NAME]`, which makes one so named.
             let chosen = lead_asked(&text);
-            let pick = chosen
-                .clone()
-                .unwrap_or_else(|| project::Pick::Thread(text.clone()));
+            let picked = self.state.lock().await.agent.clone();
+            let pick = match (&chosen, picked) {
+                (Some(chosen), _) => chosen.clone(),
+                (None, Some(lead)) => project::Pick::Named(project::lead_short(&lead).to_owned()),
+                (None, None) => project::Pick::Thread(text.clone()),
+            };
             let claimed = claimed.map(t3::Pinned::named);
             if let Err(error) = self.bind(agent, claimed, task, &pick).await {
                 self.state.lock().await.prompt = None;
@@ -957,9 +1196,16 @@ impl Session {
         let steer = state.running.is_some();
         let moving = (!steer).then_some(bound.moving.as_ref()).flatten();
         let mut asked = json!({"bot": bound.bot, "bot_id": bound.bot_id,
-            "request_id": crate::unique("acp"), "prompt": crate::stamp::person(&text, &bound.bot),
+            "request_id": crate::unique("acp"),
+            "prompt": match person {
+                Some(_) => crate::stamp::other(&text),
+                None => crate::stamp::person(&text, &bound.bot),
+            },
             "delivery": if moving.is_some() { "queue" } else { "steer" },
             "images": if images.is_empty() { Value::Null } else { json!(images) }});
+        if let Some(person) = person {
+            asked["person"] = json!(person);
+        }
         if let Some(dir) = moving {
             asked["workspace"] = json!(dir);
         }
@@ -1299,6 +1545,22 @@ impl Session {
                     json!({"sessionUpdate": "tool_call_update", "toolCallId": call,
                     "status": status, "content": [text_content(&cut(&shown))]}),
                 );
+                // A question the lead put, taken: put to the person as a
+                // form, where the client fills them in.
+                if name == asks::TOOL
+                    && !failed
+                    && agent.forms.load(Ordering::Relaxed)
+                    && let Some(turn) = turn
+                    && let Some(ask) = asks::call(&asks::id(turn, &call), &arguments)
+                    && !ask.options.is_empty()
+                    && state.asked.insert(ask.id.clone())
+                {
+                    let asked = out.asking("elicitation/create", form(id, &ask, Some(&call)));
+                    let lead = (bot, state.bound.as_ref().and_then(|b| b.bot_id));
+                    let (agent, session) = (agent.clone(), self.id.clone());
+                    tokio::spawn(async move { elicit(asked, &agent, &session, lead, &ask).await });
+                    return;
+                }
                 // A task the lead started opens as a thread of its own.
                 if name == crate::served::START
                     && !failed
@@ -1343,6 +1605,13 @@ impl Session {
                 }
             }
             "approval_requested" | "approval_asked" => {
+                // Calls announced only for the reviewer, as in auto mode,
+                // wait on no person: nothing to list.
+                if event["event"] == "approval_requested"
+                    && !(data["calls"].as_array().into_iter().flatten()).any(for_person)
+                {
+                    return;
+                }
                 drop(state);
                 self.approvals(agent, &client, &bot, turn).await;
             }
@@ -1440,10 +1709,7 @@ impl Session {
             }
         }
         for call in &listed {
-            let person = !call["asked"].is_null()
-                || (call["gates"].as_array())
-                    .is_some_and(|gates| gates.iter().any(|g| g == "manual"));
-            if call["turn"].as_i64() != turn || !person {
+            if call["turn"].as_i64() != turn || !for_person(call) {
                 continue;
             }
             let key = format!(
@@ -1460,6 +1726,149 @@ impl Session {
             tokio::spawn(async move { ask(&agent, &session, &client, &bot, &call).await });
         }
     }
+}
+
+impl Session {
+    /// The lead's questions still open from before this thread followed
+    /// it, each put to the person as a form. Read back from its history,
+    /// newest first, only to the person's own last words: a question
+    /// before those is set aside, as Sonny's window sets it aside.
+    async fn questions(&self, agent: &Arc<Agent>, client: &Arc<Client>, bot: &str) {
+        let (mut asked, mut open) = (asks::Asked::default(), Vec::new());
+        let _ = crate::said::walk(client, bot, 0, |at, entry| {
+            open.extend(
+                (asked.entry(at, entry).into_iter())
+                    .filter(|(ask, state)| *state == asks::State::Open && !ask.options.is_empty())
+                    .map(|(ask, _)| ask),
+            );
+            asked.moved_on()
+        })
+        .await;
+        // The oldest first, as they were asked.
+        for ask in open.into_iter().rev() {
+            let bot_id = {
+                let mut state = self.state.lock().await;
+                if !state.asked.insert(ask.id.clone()) {
+                    continue;
+                }
+                state.bound.as_ref().and_then(|b| b.bot_id)
+            };
+            let asked = (agent.out).asking("elicitation/create", form(&self.id, &ask, None));
+            let (agent, session, lead) = (agent.clone(), self.id.clone(), (bot.to_owned(), bot_id));
+            tokio::spawn(async move { elicit(asked, &agent, &session, lead, &ask).await });
+        }
+    }
+}
+
+/// The form field a question's pick is in.
+const PICK: &str = "pick";
+
+/// A question the lead put, as a form: the question, what a yes covers,
+/// why it is asked and what the lead recommends, then one pick among its options, each by
+/// its number, as a pick in Sonny's window is.
+fn form(session: &str, ask: &asks::Ask, call: Option<&str>) -> Value {
+    // What a yes covers, as the card and the answer say it, right under
+    // the question: the pick is the person's consent to that alone, so it
+    // is never sent unseen.
+    let mut message = match &ask.covers {
+        Some(covers) => format!("{}\nCovers: {}", ask.question, covers.line()),
+        None => ask.question.clone(),
+    };
+    if !ask.why.is_empty() {
+        message = format!("{message}\n\n{}", ask.why);
+    }
+    if let Some(choice) = ask.recommended.and_then(|at| ask.options.get(at)) {
+        message = match ask.reason.is_empty() {
+            true => format!("{message}\n\nRecommended: {}.", choice.label),
+            false => format!("{message}\n\nRecommended: {}. {}", choice.label, ask.reason),
+        };
+    }
+    let options: Vec<Value> = (ask.options.iter().enumerate())
+        .map(|(at, choice)| {
+            let mut option = json!({"const": (at + 1).to_string(), "title": choice.label});
+            if !choice.explanation.is_empty() {
+                option["description"] = json!(choice.explanation);
+            }
+            option
+        })
+        .collect();
+    let mut params = json!({"sessionId": session, "mode": "form", "message": message,
+        "requestedSchema": {"type": "object", "required": [PICK],
+            "properties": {PICK: {"type": "string", "title": "Pick one", "oneOf": options}}}});
+    if let Some(call) = call {
+        params["toolCallId"] = json!(call);
+    }
+    params
+}
+
+/// Put a question the lead asked to the person as a form, and send their
+/// pick to that lead, by its name and identity, as their answer, once,
+/// whichever window answers first.
+/// A pick by someone the client names is that person's words, as their
+/// prompts are: the lead reads it, but it answers nothing in Sonny's
+/// windows, where only the person answers.
+async fn elicit(
+    asked: oneshot::Receiver<Value>,
+    agent: &Agent,
+    session: &str,
+    (bot, bot_id): (String, Option<i64>),
+    ask: &asks::Ask,
+) {
+    let Some(answer) = Out::answer_to(asked).await else {
+        return;
+    };
+    // Declined or dismissed: the question stays open, there and in
+    // Sonny's windows.
+    let picked = match answer["action"].as_str() {
+        Some("accept") => answer["content"][PICK].as_str().unwrap_or(""),
+        _ => return,
+    };
+    if !asks::picks(ask, picked) {
+        return;
+    }
+    // Someone named by a name the daemon would not take: their pick is
+    // nobody's answer, least of all the person's.
+    let Ok(person) = person(&answer) else {
+        return;
+    };
+    // Through the thread's connection as it is now: the one the question
+    // came on may have dropped while the person chose.
+    let session = (agent.sessions.lock().ok()).and_then(|s| s.get(session).cloned());
+    let Some(session) = session else { return };
+    let Some(client) = (session.state.lock().await.bound.as_ref()).map(|b| b.client.clone()) else {
+        return;
+    };
+    let words = asks::answer(ask, picked);
+    let mut submitted = json!({"bot": bot, "bot_id": bot_id, "delivery": "steer"});
+    let _ = match person {
+        Some(person) => {
+            submitted["prompt"] = json!(crate::stamp::other(&words));
+            submitted["person"] = json!(person);
+            submitted["request_id"] = json!(crate::unique("acp"));
+            client
+                .request("submit", submitted)
+                .await
+                .map(drop)
+                .map_err(|e| e.to_string())
+        }
+        // A pick leaves quiet on, as a click on a card does.
+        None => {
+            submitted["prompt"] = json!(crate::stamp::now(&words, &bot));
+            crate::answer_once(&client, &ask.id, submitted)
+                .await
+                .map(drop)
+        }
+    };
+}
+
+/// Whether `call`, as the daemon lists or announces it, waits on the
+/// person: the gate it waits on is theirs, or the reviewer handed it over.
+fn for_person(call: &Value) -> bool {
+    let asked = match &call["asked"] {
+        Value::Array(asked) => !asked.is_empty(),
+        asked => !asked.is_null(),
+    };
+    asked || (call["gates"].as_array()).is_some_and(|gates| gates.iter().any(|g| g == "manual"))
 }
 
 /// Put one call to the person, and answer it with their choice.
@@ -1513,6 +1922,13 @@ async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Va
         Some(outcome) if outcome["outcome"] == "selected" => "deny",
         _ => return,
     };
+    // The person the client says chose, else the client. Someone named
+    // by a name the daemon would not take chose nothing: the call waits.
+    let by = match answer.as_ref().map(person) {
+        Some(Err(_)) => return,
+        Some(Ok(Some(person))) => person.to_owned(),
+        _ => "acp".to_owned(),
+    };
     // Through the thread's connection as it is now: the one the call was
     // listed on may have dropped while the person chose.
     let Some(session) = agent
@@ -1529,7 +1945,7 @@ async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Va
             .request(
                 "answer",
                 json!({"bot": bot, "turn": call["turn"], "call_id": id, "request": call["request"],
-                    "tag": crate::person_gate(call), "decision": decision, "by": "acp"}),
+                    "tag": crate::person_gate(call), "decision": decision, "by": by}),
             )
             .await
             .is_ok(),
@@ -1613,14 +2029,18 @@ async fn setup_lead(
         .unwrap_or_default()
         .to_owned();
     let mut asked = json!({"bot": lead.bot});
-    if let Ok(project::Instructions::Stale(text)) = project::review(
+    let mut left_out = Vec::new();
+    if let Ok((reviewed, left)) = project::review(
         Path::new(&workspace),
         &record,
         &key,
         lead.new,
         project::chosen(&agent.options.store, &lead.bot).as_deref(),
     ) {
-        asked["instructions"] = json!(text);
+        left_out = left;
+        if let project::Instructions::Stale(text) = reviewed {
+            asked["instructions"] = json!(text);
+        }
     }
     let declare = declared::declare(&record, crate::served::Role::LEAD);
     if let Some(declare) = &declare {
@@ -1673,6 +2093,24 @@ async fn setup_lead(
                 "severity": "warning", "title": format!("{} kept its setup", lead.bot),
                 "description": error.to_string()}),
             ),
+        }
+    }
+    // What it opened without: the thread says so, and the lead is told
+    // with its next model call, as in Sonny's window.
+    if !left_out.is_empty() {
+        agent.out.update(
+            session,
+            json!({"sessionUpdate": "notice", "severity": "warning",
+            "title": format!("{} opened without what it could not use", lead.bot),
+            "description": left_out.join("\n")}),
+        );
+        if let Err(error) = project::tell_warnings(client, &lead.bot, &left_out).await {
+            agent.out.update(
+                session,
+                json!({"sessionUpdate": "notice", "severity": "warning",
+                "title": format!("{} was not told what it opened without", lead.bot),
+                "description": error}),
+            );
         }
     }
     lookout::subscribe_lead(&agent.options.store, &lead.bot, &lead.project)?;
@@ -2066,6 +2504,114 @@ mod tests {
         let edit = tool_call("c2", "edit", &json!({"path": "/src/a.rs"}));
         assert_eq!(edit["locations"], json!([{"path": "/src/a.rs"}]));
         assert_eq!(edit["title"], "Edit /src/a.rs");
+    }
+
+    #[test]
+    fn the_agent_picker_lists_the_folders_leads_and_the_threads_own() {
+        let leads = ["calc.lead".to_owned(), "calc.lead.billing".to_owned()];
+        let picker = agent_option(&leads, DEFAULT);
+        let values: Vec<&str> = (picker["options"].as_array().unwrap().iter())
+            .map(|choice| choice["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(values, ["default", "calc.lead", "calc.lead.billing"]);
+        assert_eq!(
+            (&picker["id"], &picker["currentValue"]),
+            (&json!("agent"), &json!("default"))
+        );
+        // A thread on a bot of another folder still names it.
+        let picker = agent_option(&leads, "shop.fix-cart");
+        assert_eq!(picker["options"].as_array().unwrap().len(), 4);
+        assert_eq!(picker["currentValue"], "shop.fix-cart");
+    }
+
+    #[test]
+    fn a_question_is_a_form_of_one_pick_among_its_options() {
+        let ask = asks::call(
+            "ask:3/c1",
+            &json!({"question": "Which database?", "why": "It decides the schema.",
+                "options": [{"label": "SQLite", "explanation": "One file."}, {"label": "Postgres"}],
+                "recommended": 2, "reason": "It scales.", "if_unanswered": "wait"}),
+        )
+        .unwrap();
+        let form = form("s1", &ask, Some("c1"));
+        assert_eq!(
+            form["message"],
+            "Which database?\n\nIt decides the schema.\n\nRecommended: Postgres. It scales."
+        );
+        assert_eq!(
+            (&form["sessionId"], &form["toolCallId"]),
+            (&json!("s1"), &json!("c1"))
+        );
+        assert_eq!(form["requestedSchema"]["required"], json!([PICK]));
+        assert_eq!(
+            form["requestedSchema"]["properties"][PICK]["oneOf"],
+            json!([{"const": "1", "title": "SQLite", "description": "One file."},
+                {"const": "2", "title": "Postgres"}])
+        );
+        // Put again once the thread follows anew, it names no call.
+        assert!(super::form("s1", &ask, None).get("toolCallId").is_none());
+        // A yes that approves an action says what it covers, as the answer
+        // it sends does.
+        let approving = asks::call(
+            "ask:3/c2",
+            &json!({"question": "Publish the site?", "options": [{"label": "Yes"}, {"label": "No"}],
+                "covers": {"action": "publish", "target": "site", "revision": "3f2a9c1"},
+                "if_unanswered": "wait"}),
+        )
+        .unwrap();
+        let message = super::form("s1", &approving, None)["message"].clone();
+        assert_eq!(
+            message,
+            "Publish the site?\nCovers: publish · site · at 3f2a9c1"
+        );
+        assert!(asks::answer(&approving, "1").contains("\nCovers: publish · site · at 3f2a9c1"));
+    }
+
+    #[test]
+    fn a_client_names_the_person_in_a_name_the_daemon_takes() {
+        assert_eq!(person(&json!({"prompt": []})), Ok(None));
+        assert_eq!(
+            person(&json!({"_meta": {"person": "ana.lopez"}})),
+            Ok(Some("ana.lopez"))
+        );
+        for refused in [
+            json!(""),
+            json!("Ana Lopez"),
+            json!("a".repeat(129)),
+            json!({"name": "ana"}),
+        ] {
+            assert!(
+                person(&json!({"_meta": {"person": refused}})).is_err(),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listed_session_names_a_lead_and_its_identity() {
+        let id = lead_session("calc.lead.billing", 7, Some("00ab"));
+        assert_eq!(id, "calc.lead.billing#7@00ab");
+        let pinned = listed_lead(&id).unwrap();
+        assert_eq!(
+            (pinned.bot.as_str(), pinned.bot_id, pinned.store.as_deref()),
+            ("calc.lead.billing", Some(7), Some("00ab"))
+        );
+        let unstored = listed_lead(&lead_session("calc.lead", 7, None)).unwrap();
+        assert_eq!((unstored.bot.as_str(), unstored.store), ("calc.lead", None));
+        // Only a lead, and only by its identity.
+        assert!(listed_lead("calc.fix-cart#7").is_none());
+        assert!(listed_lead("calc.lead").is_none());
+        assert!(listed_lead("calc.lead#x").is_none());
+    }
+
+    #[test]
+    fn only_a_call_waiting_on_the_person_is_put_to_them() {
+        assert!(for_person(&json!({"gates": ["manual"]})));
+        assert!(for_person(
+            &json!({"gates": ["auto"], "asked": [{"tag": "auto"}]})
+        ));
+        assert!(!for_person(&json!({"gates": ["auto"]})));
+        assert!(!for_person(&json!({"gates": ["auto"], "asked": []})));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::artifact;
+use super::{artifact, audit};
 use crate::rules::{Rules, Ruling};
 use crate::{
     Error, Result,
@@ -29,6 +29,19 @@ const HISTORY_PAGE_BYTES: usize = 256 * 1024;
 /// steer's: a message's pictures may be 5 MiB once decoded.
 const STEER_BATCH_PICTURE_BYTES: usize = 8 * 1024 * 1024;
 
+/// How a bot's newest turn that counts ended: one that ran, or one that
+/// failed before it started. A message steered into a running turn, one
+/// riding the next call, and one cancelled while it waited in line never
+/// count: nothing of theirs ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Ended {
+    pub turn: i64,
+    pub status: String,
+    pub started_ms: Option<i64>,
+    pub finished_ms: Option<i64>,
+    /// The code it failed or was interrupted with, if any.
+    pub error: Option<String>,
+}
 #[derive(Debug, Clone, Serialize)]
 pub struct Bot {
     pub name: String,
@@ -64,6 +77,13 @@ pub struct Bot {
     pub workspace: Option<String>,
     pub status: String,
     pub running_turn: Option<i64>,
+    /// When its running turn started; `None` while none runs.
+    pub started_ms: Option<i64>,
+    /// What its turn waits on while the bot is `waiting`, `paced` or
+    /// `held`: what that turn's own `waiting_on` says. `None` otherwise.
+    pub waiting_on: Option<Box<serde_json::value::RawValue>>,
+    /// Its newest turn that ended having run, or failed before it started.
+    pub last: Option<Ended>,
     pub provider: String,
     pub family: String,
     pub model: String,
@@ -266,6 +286,11 @@ pub struct Settings {
     /// allowed; none bounds them only by the turn's token budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<usize>,
+    /// Replies in a row the model's own output cap may cut short in one of
+    /// its turns, the last ending the turn on it; each before goes dropped,
+    /// the model told. Unset, `MAX_DROPS`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_drops: Option<usize>,
     /// Unix sockets, or folders of them, the only ones a sandbox's commands
     /// reach, each an absolute path
     /// ([`crate::sandbox::Policy::sockets`]).
@@ -310,6 +335,9 @@ pub fn compact_threshold(window: u64) -> u64 {
         .max(MIN_COMPACT_TOKENS)
 }
 const MIN_CONTEXT_ITEMS: usize = 2;
+/// Replies in a row the model's cap may cut short before a turn ends on
+/// the last, unless the bot sets `max_drops`.
+pub const MAX_DROPS: usize = 3;
 impl Settings {
     pub fn context_bytes(&self) -> usize {
         self.context_bytes.unwrap_or(8 << 20)
@@ -338,6 +366,10 @@ impl Settings {
     /// Model calls a turn may make; unset, more than any turn reaches.
     pub fn max_rounds(&self) -> usize {
         self.max_rounds.unwrap_or(usize::MAX / 4)
+    }
+    /// Replies in a row the model's cap may cut before the turn ends on it.
+    pub fn max_drops(&self) -> usize {
+        self.max_drops.unwrap_or(MAX_DROPS)
     }
     pub fn approval_hold_ms(&self) -> u64 {
         self.approval_hold_ms.unwrap_or(2000)
@@ -422,6 +454,9 @@ impl Settings {
         }
         if self.max_rounds == Some(0) {
             return refuse("max_rounds is at least 1");
+        }
+        if self.max_drops == Some(0) {
+            return refuse("max_drops is at least 1");
         }
         if self.keep_turns == Some(0) {
             return refuse("keep_turns is at least 1");
@@ -508,6 +543,7 @@ impl Settings {
             "note_turns":self.note_turns(),"compact_at":self.compact_at(),
             "compact_keep":self.compact_keep(),"compact_tokens":self.compact_tokens,
             "keep_turns":self.keep_turns,"max_rounds":self.max_rounds,
+            "max_drops":self.max_drops(),
             "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
             // Null when never set (five minutes), so a client's default can
             // tell it from five minutes someone chose.
@@ -532,7 +568,7 @@ const INHERITED: [&str; 2] = ["rules", "env"];
 /// The settings that make a bot's sandbox, which change together.
 pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 22] = [
+pub const SETTINGS: [&str; 23] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -552,6 +588,7 @@ pub const SETTINGS: [&str; 22] = [
     "quiet_background",
     "hold_ms",
     "max_rounds",
+    "max_drops",
     "unix_sockets",
     "rules",
     "env",
@@ -1038,6 +1075,10 @@ pub struct TurnOptions {
     /// A JSON Schema, as JSON text, the turn's reply follows: the
     /// provider's structured output. None leaves the reply free text.
     pub output_schema: Option<String>,
+    /// The daemon's own fact for the running turn its strict steer names,
+    /// such as a dropped reply: no budget refuses it, since that turn's
+    /// calls are what the budget bounds, and its last call should read it.
+    pub fact: bool,
 }
 /// An attached message whose wait ran out, delivered now as a steer.
 #[derive(Debug)]
@@ -1126,6 +1167,9 @@ const UNTELLING: &str = "UPDATE processes SET told=0 WHERE id IN (
 /// The origin of the message that tells a bot its background commands
 /// ended.
 pub const BACKGROUND_ORIGIN: &str = "background";
+/// The origin of the message that tells a bot its last reply was dropped:
+/// the model's own output cap cut it short.
+pub const LIMIT_ORIGIN: &str = "limit";
 /// How a background command ended, as its bot is told: its result without
 /// the output, which a `wait` on its handle reads.
 /// The fields of a result that say how its command ended, in the order
@@ -1419,6 +1463,10 @@ struct Verdict {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     by: Option<String>,
     at_ms: i64,
+    /// Given under the lease of the session serving its gate, as that
+    /// session's reviewer gives it; an answer without one is a person's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    leased: bool,
 }
 /// A gate a planned call needs, with the expiry it had when announced.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -1452,6 +1500,20 @@ struct Request {
     step_of: Option<String>,
 }
 impl Request {
+    /// Who decided the call in the audit trail: whoever denied it, else a
+    /// person when any allow was a person's, else the reviewers; nobody
+    /// when no verdict decided it (a gate lapsed, its client left).
+    fn approved(&self, allowed: bool) -> &'static str {
+        let decided: Vec<&Verdict> = match allowed {
+            true => self.verdicts.iter().filter(|v| v.allow).collect(),
+            false => self.denial().into_iter().collect(),
+        };
+        match decided.is_empty() {
+            true => "nobody",
+            false if decided.iter().any(|v| !v.leased) => "person",
+            false => "reviewer",
+        }
+    }
     /// The first deny wins; otherwise every gate needs an allow.
     fn denial(&self) -> Option<&Verdict> {
         self.verdicts.iter().find(|v| !v.allow)
@@ -1625,6 +1687,8 @@ pub struct Decision<'a> {
     pub unreviewed: bool,
     pub reason: Option<&'a str>,
     pub by: Option<&'a str>,
+    /// Given under the serving session's lease.
+    pub leased: bool,
 }
 /// What the service does after an answer commits: wake a live turn's task,
 /// or resume a turn parked on this call.
@@ -1890,6 +1954,9 @@ impl CatchUp {
 /// Where and with which model a turn runs.
 pub struct TurnContext {
     pub model_rounds: usize,
+    /// Replies in a row the model's own output cap cut short, the last
+    /// dropped; a reply the turn keeps sets it back to 0.
+    pub drops: usize,
     /// Whether this turn's last change to the bot's view was a call that
     /// sent it, rather than a summary or elision that rewrote it; `None`
     /// until the turn makes either.
@@ -2308,7 +2375,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 84;
+    pub const SCHEMA: i32 = 88;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2482,7 +2549,9 @@ impl Database {
                 expire_ms INTEGER, expires_at INTEGER,
                 sent_bytes INTEGER, sent_tokens INTEGER, compact_asked INTEGER NOT NULL DEFAULT 0,
                 declared TEXT, work INTEGER NOT NULL DEFAULT 0, work_read INTEGER,
-                budget_counts TEXT, depth INTEGER NOT NULL DEFAULT 0);
+                budget_counts TEXT, depth INTEGER NOT NULL DEFAULT 0,
+                started_ms INTEGER, waiting_on TEXT, last_turn INTEGER, last_status TEXT,
+                last_started_ms INTEGER, last_finished_ms INTEGER, last_error TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -2514,10 +2583,16 @@ impl Database {
                 bot_model TEXT, bot_reasoning TEXT, images TEXT, person TEXT, quotes TEXT, reply_node INTEGER,
                 wait_ms INTEGER, due_ms INTEGER, held TEXT,
                 work INTEGER NOT NULL DEFAULT 0, limited TEXT, budget_counts TEXT, output_schema TEXT,
+                drops INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
             CREATE INDEX IF NOT EXISTS turns_prompt_node ON turns(prompt_node) WHERE prompt_node IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS turn_models(turn INTEGER NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+                model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(turn,model)) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS retained_turns(turn INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
                 bot TEXT NOT NULL REFERENCES bots(name));
             CREATE INDEX IF NOT EXISTS retained_turns_bot ON retained_turns(bot,turn);
@@ -2533,7 +2608,12 @@ impl Database {
             CREATE UNIQUE INDEX IF NOT EXISTS pauses_held ON pauses(ifnull(resumed_ms,0))
                 WHERE resumed_ms IS NULL;
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
-                status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, ruling TEXT, PRIMARY KEY(turn,call_id));
+                status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, ruling TEXT, audit INTEGER,
+                PRIMARY KEY(turn,call_id));
+            CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, at_ms INTEGER NOT NULL,
+                bot_id INTEGER NOT NULL, bot TEXT NOT NULL, turn INTEGER NOT NULL, call_id TEXT NOT NULL,
+                step TEXT, tool TEXT NOT NULL, kind TEXT, place TEXT, approved TEXT NOT NULL,
+                access TEXT NOT NULL, ms INTEGER, outcome TEXT NOT NULL, preview TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, name TEXT NOT NULL, node INTEGER NOT NULL, request INTEGER NOT NULL,
                 announced_ms INTEGER NOT NULL, gates TEXT NOT NULL, verdicts TEXT, arguments TEXT NOT NULL, asked TEXT,
@@ -2960,6 +3040,9 @@ impl Database {
             workspace: r.get(2)?,
             status: r.get(3)?,
             running_turn: r.get(4)?,
+            started_ms: r.get(45)?,
+            waiting_on: raw_json(r, 46)?,
+            last: ended(r, 47)?,
             provider: r.get(5)?,
             family: r.get(6)?,
             model: r.get(7)?,
@@ -3047,7 +3130,7 @@ impl Database {
             },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,last_started_ms,last_finished_ms,last_error";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     /// Its id and depth, read in the same query.
@@ -3469,6 +3552,16 @@ impl Database {
                 "name is a GLOB pattern of 1 to 256 bytes",
             );
         }
+        // The events' high-water mark, read before the bots: a client that
+        // lists and then follows from it misses no change, and one it
+        // replays it saw already only restates a state its next event
+        // replaces. The sequence, not the newest row, which a deleted bot
+        // takes with it, so the cursor never falls behind what was pruned.
+        let cursor: i64 = (self.conn)
+            .prepare_cached("SELECT seq FROM sqlite_sequence WHERE name='events'")?
+            .query_row([], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
         let after = after.unwrap_or("");
         let limit_rows = (limit + 1) as i64;
         let prefix = name.map(glob_prefix);
@@ -3505,7 +3598,8 @@ impl Database {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
                     input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed,expire_ms,expires_at,
-                    work,budget_counts,depth
+                    work,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,
+                    last_started_ms,last_finished_ms,last_error
              FROM bots WHERE {from}{maker}{running} ORDER BY name LIMIT ?2"
         ))?;
         let mut rows = statement.query(values.as_slice())?;
@@ -3516,7 +3610,9 @@ impl Database {
             let bot = json!({"name":r.get::<_, String>(0)?,"bot_id":r.get::<_, i64>(14)?,
                 "head":r.get::<_, Option<i64>>(1)?,
                 "workspace":r.get::<_, Option<String>>(2)?,"status":r.get::<_, String>(3)?,
-                "running_turn":r.get::<_, Option<i64>>(4)?,"provider":r.get::<_, String>(5)?,
+                "running_turn":r.get::<_, Option<i64>>(4)?,
+                "started_ms":r.get::<_, Option<i64>>(24)?,"waiting_on":raw_json(r, 25)?,
+                "last":ended(r, 26)?,"provider":r.get::<_, String>(5)?,
                 "family":r.get::<_, String>(6)?,"model":r.get::<_, String>(7)?,
                 "effort":r.get::<_, Option<String>>(8)?,
                 "budget_tokens":r.get::<_, Option<i64>>(9)?,
@@ -3551,7 +3647,7 @@ impl Database {
             bots.push(bot);
         }
         let next = more.then(|| bots.last().unwrap()["name"].clone());
-        Ok(json!({"bots":bots,"next_after":next}))
+        Ok(json!({"bots":bots,"next_after":next,"cursor":cursor}))
     }
     fn exists(&self, name: &str) -> Result<bool> {
         Ok(self
@@ -3717,6 +3813,7 @@ impl Database {
         // seat a new bot without a request per creation.
         let mut data = json!({"bot_id":id,"provider":binding.provider,"model":binding.model,
             "effort":binding.effort,"workspace":workspace,"status":"idle","running_turn":null,
+            "started_ms":null,"waiting_on":null,"last":null,
             "created_by":binding.created_by,"created_by_id":created_by_id,"depth":depth});
         if let Some(gates) = &gates {
             data["gates"] = serde_json::from_str(gates)?;
@@ -6305,6 +6402,7 @@ impl Database {
                             images: Vec::new(),
                             wait_ms: r.get::<_, Option<i64>>(16)?.map(|n| n as u64),
                             output_schema: r.get(18)?,
+                            fact: false,
                         },
                         r.get(7)?,
                         r.get(13)?,
@@ -6344,6 +6442,8 @@ impl Database {
                 images: _,
                 wait_ms,
                 output_schema,
+                // Admission alone: not kept with the turn.
+                fact: _,
             } = &saved_options;
             let images = saved_images.map(|kept| pictures_digest(&kept));
             let differs = [
@@ -6471,8 +6571,9 @@ impl Database {
             return Err(Error::with("bot_busy", detail)
                 .facts(json!({"running_turn":bot.running_turn,"fork_point":bot.fork_point})));
         }
-        if let Some(budget) =
-            (bot.budget_tokens).filter(|b| bot.spent().of(bot.budget_counts) >= *b)
+        if let Some(budget) = (bot.budget_tokens)
+            .filter(|b| bot.spent().of(bot.budget_counts) >= *b)
+            .filter(|_| !(options.fact && options.expected_turn.is_some()))
         {
             return Err(budget_exhausted(&bot, budget));
         }
@@ -6746,6 +6847,13 @@ impl Database {
             params![turn, serde_json::to_string(&blocked)?, due as i64],
         )?;
         let data = json!({"blocked":blocked,"resume_at_ms":due});
+        // Nothing runs while the turn at the front of its line is held, so
+        // its bot says it is held, and on what.
+        tx.prepare_cached(
+            "UPDATE bots SET status='held',waiting_on=?2
+             WHERE name=?1 AND running_turn IS NULL AND status!='deleting'",
+        )?
+        .execute(params![name, data.to_string()])?;
         let cursor = event(&tx, &name, Some(turn), "turn_held", data.clone())?;
         let next = next_held(&tx, now as i64)?;
         tx.commit()?;
@@ -6873,11 +6981,33 @@ impl Database {
         } else {
             "failed"
         };
+        let finished = epoch_ms();
         let tx = self.conn.savepoint()?;
         tx.execute(
             "UPDATE turns SET status=?,finished_ms=? WHERE id=?",
-            params![ended, epoch_ms(), turn],
+            params![ended, finished, turn],
         )?;
+        // One that failed is its bot's newest ending, and its status when
+        // none runs; one cancelled in line did nothing. Ending the held turn
+        // at the front of the line ends the hold, and the bot says again how
+        // its last turn ended; ending one behind it leaves the hold.
+        if ended == "failed" {
+            record_ended(
+                &tx,
+                &name,
+                turn,
+                ended,
+                None,
+                Some(finished),
+                Some(&error.code),
+            )?;
+        }
+        tx.prepare_cached(
+            "UPDATE bots SET status=COALESCE(last_status,'idle'),waiting_on=NULL
+             WHERE name=?1 AND running_turn IS NULL AND status!='deleting'
+                AND (status!='held' OR ?2)",
+        )?
+        .execute(params![&name, status == "ready"])?;
         if status == "ready" {
             promote(&tx, &name)?;
         }
@@ -6986,7 +7116,8 @@ impl Database {
                     AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
                     AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning)),
                     s.status='attached',length(s.images),
-                    length(CAST(s.prompt AS BLOB))+COALESCE(length(CAST(s.quotes AS BLOB)),0)
+                    length(CAST(s.prompt AS BLOB))+COALESCE(length(CAST(s.quotes AS BLOB)),0),
+                    s.expected_turn IS ?2 AND s.origin IS ?6
                  FROM (SELECT id FROM turns WHERE bot=?1 AND status='queued' AND delivery='steer'
                          AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
                        UNION ALL SELECT id FROM turns WHERE ?5 AND bot=?1 AND status='attached'
@@ -7000,15 +7131,25 @@ impl Database {
                 turn,
                 STEER_BATCH_ITEMS as i64,
                 through,
-                attached
+                attached,
+                LIMIT_ORIGIN
             ])?;
             let (mut bytes, mut picture_bytes) = (0, 0);
+            // Whether a steer for another folder, model or effort waits for
+            // a turn of its own: those after it wait behind it, in order,
+            // but for the daemon's note of a reply this turn dropped, a
+            // fact of this turn's own rounds, which has no later turn.
+            let mut waiting_behind = false;
             while let Some(row) = rows.next()? {
                 let size = row.get::<_, i64>(2)? as usize;
                 // Its words with the words it quotes, which it takes in too.
                 let held = row.get::<_, i64>(6)? as usize;
                 if !row.get::<_, bool>(3)? {
-                    break;
+                    waiting_behind = true;
+                    continue;
+                }
+                if waiting_behind && !row.get::<_, bool>(7)? {
+                    continue;
                 }
                 if size > STEER_BATCH_BYTES.saturating_sub(bytes) {
                     // An oversized store-level prompt must not spin forever.
@@ -7324,7 +7465,7 @@ impl Database {
         // A successful response consumes a round in the same durable commit
         // as its messages and tool plans. Failed requests end the turn.
         tx.execute(
-            "UPDATE turns SET model_rounds=model_rounds+1,view_sent=1,limited=? WHERE id=?",
+            "UPDATE turns SET model_rounds=model_rounds+1,view_sent=1,limited=?,drops=0 WHERE id=?",
             params![limit.map(Limit::as_str), turn],
         )?;
         tx.commit()?;
@@ -7354,6 +7495,59 @@ impl Database {
             params![asked as i64, id, asked as i64],
         )?;
         Ok(changed == 1)
+    }
+    /// Drop a turn's reply that the model's own output cap cut short: none
+    /// of it is recorded. One commit tells the model what cut it, a strict
+    /// steer for this turn from the `limit` origin whose words are
+    /// `{"dropped":facts}`, records the `dropped` event windows read, and,
+    /// when the provider billed nothing for the call (`count`), counts its
+    /// round, as a billed failure's usage counts it.
+    pub fn drop_reply(&mut self, turn: i64, facts: &Value, count: bool) -> Result<()> {
+        let bot = self.active(turn)?;
+        self.conn.execute_batch("SAVEPOINT drop_reply")?;
+        let dropped = (|| {
+            self.conn.execute(
+                "UPDATE turns SET model_rounds=model_rounds+?,drops=drops+1 WHERE id=?",
+                params![count as i64, turn],
+            )?;
+            event(&self.conn, &bot.name, Some(turn), "dropped", facts.clone())?;
+            let rounds: i64 =
+                self.conn
+                    .query_row("SELECT model_rounds FROM turns WHERE id=?", [turn], |r| {
+                        r.get(0)
+                    })?;
+            let options = TurnOptions {
+                delivery: Delivery::Steer,
+                expected_turn: Some(turn),
+                origin: Some(LIMIT_ORIGIN.to_owned()),
+                fact: true,
+                ..TurnOptions::default()
+            };
+            // Not held to the bounds on submissions, as a background note
+            // is not: the turn's own calls bound it.
+            let limits = std::mem::take(&mut self.pending_limits);
+            let begun = self.begin(
+                &bot.name,
+                &format!("{LIMIT_ORIGIN}-{turn}-{rounds}"),
+                &json!({"dropped": facts}).to_string(),
+                false,
+                &options,
+                |_, _| Ok(()),
+            );
+            self.pending_limits = limits;
+            begun.map(|_| ())
+        })();
+        match dropped {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE drop_reply")?;
+                Ok(())
+            }
+            Err(error) => {
+                self.conn
+                    .execute_batch("ROLLBACK TO drop_reply; RELEASE drop_reply")?;
+                Err(error)
+            }
+        }
     }
     /// Record a model call's retry: its attempt, the error it answers and
     /// how long it waits.
@@ -7405,7 +7599,16 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
-    pub fn tool_start(&mut self, turn: i64, call: &ToolCall) -> Result<Value> {
+    /// Start an ungated call: its row in the audit trail says it ran under
+    /// its bot's sandbox when `confined`, and that a command rule decided
+    /// it when `ruled`.
+    pub fn tool_start(
+        &mut self,
+        turn: i64,
+        call: &ToolCall,
+        confined: bool,
+        ruled: bool,
+    ) -> Result<Value> {
         let bot = self.active(turn)?;
         // Every call before it is done, so a gate still undecided is a later
         // call's; once one lapsed, the turn ends before anything else starts.
@@ -7413,9 +7616,11 @@ impl Database {
             return fail_with("approval_expired", "a later call's gate lapsed first");
         }
         let tx = self.conn.savepoint()?;
+        let approved = if ruled { "rule" } else { "nobody" };
+        let row = audit_call(&tx, &bot, turn, call, confined, approved, "unknown")?;
         if tx.execute(
-            "UPDATE tools SET status='executing' WHERE turn=? AND call_id=? AND status='planned'",
-            params![turn, call.call_id],
+            "UPDATE tools SET status='executing',audit=? WHERE turn=? AND call_id=? AND status='planned'",
+            params![row, turn, call.call_id],
         )? != 1
         {
             return fail("invalid_tool_state");
@@ -7453,12 +7658,18 @@ impl Database {
             && outcome.failed
             && !(expiring(&bot) && self.lapsed(turn, epoch_ms().max(0) as u64)?);
         let tx = self.conn.savepoint()?;
-        if tx.execute(
-            "UPDATE tools SET status='completed' WHERE turn=? AND call_id=? AND status='executing'",
-            params![turn, call_id],
-        )? != 1
-        {
+        let row: Option<Option<i64>> = tx
+            .prepare_cached(
+                "UPDATE tools SET status='completed' WHERE turn=? AND call_id=? AND status='executing'
+                 RETURNING audit",
+            )?
+            .query_row(params![turn, call_id], |r| r.get(0))
+            .optional()?;
+        let Some(row) = row else {
             return fail("invalid_tool_state");
+        };
+        if let Some(row) = row {
+            audit::finish(&tx, row, epoch_ms(), outcome.failed)?;
         }
         for (stream, data) in &outcome.artifacts {
             artifact::put(&tx, turn, call_id, stream, data)?;
@@ -7632,7 +7843,16 @@ impl Database {
         let rows = statement.query_map([turn], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
-    pub fn approval_start(&mut self, turn: i64, call: &ToolCall, now_ms: u64) -> Result<Gated> {
+    /// Start a gated call once its gates allow it, or end it denied: its
+    /// row in the audit trail says it ran under its bot's sandbox when
+    /// `confined`, and who decided it.
+    pub fn approval_start(
+        &mut self,
+        turn: i64,
+        call: &ToolCall,
+        confined: bool,
+        now_ms: u64,
+    ) -> Result<Gated> {
         let mut bot = self.active(turn)?;
         let request = self
             .request(turn, &call.call_id)?
@@ -7659,6 +7879,7 @@ impl Database {
                 // Every accepted verdict, so replay keeps each approver's.
                 request.approvals(),
                 false,
+                request.approved(false),
             )?;
             tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
                 .execute([request.id])?;
@@ -7681,9 +7902,18 @@ impl Database {
                 return Ok(Gated::Lapsed);
             }
             let tx = self.conn.savepoint()?;
+            let row = audit_call(
+                &tx,
+                &bot,
+                turn,
+                call,
+                confined,
+                request.approved(true),
+                "unknown",
+            )?;
             if tx.execute(
-                "UPDATE tools SET status='executing' WHERE turn=? AND call_id=? AND status='planned'",
-                params![turn, call.call_id],
+                "UPDATE tools SET status='executing',audit=? WHERE turn=? AND call_id=? AND status='planned'",
+                params![row, turn, call.call_id],
             )? != 1
             {
                 return fail("invalid_tool_state");
@@ -7731,6 +7961,7 @@ impl Database {
                 Some("not reviewed: no verdict"),
                 lapsed,
                 true,
+                "nobody",
             )?;
             tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
                 .execute([request.id])?;
@@ -7815,8 +8046,8 @@ impl Database {
             "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
             params![serde_json::to_string(&waiting)?, turn],
         )?;
-        tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
         let data = json!({"call_id":call.call_id,"approval":true,"deadline_ms":deadline_ms});
+        parked(&tx, &bot.name, "waiting", &data)?;
         event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
         tx.commit()?;
         self.forget_live(turn);
@@ -7879,8 +8110,8 @@ impl Database {
             "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
             params![serde_json::to_string(&waiting)?, turn],
         )?;
-        tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
         let data = json!({"call_id":call.call_id,"load":true,"deadline_ms":deadline_ms});
+        parked(&tx, &bot.name, "waiting", &data)?;
         event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
         tx.commit()?;
         self.forget_live(turn);
@@ -8036,8 +8267,8 @@ impl Database {
             "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
             params![serde_json::to_string(&waiting)?, turn],
         )?;
-        tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
         let data = json!({"call_id":call_id,"answer":tag,"deadline_ms":deadline_ms});
+        parked(&tx, &bot.name, "waiting", &data)?;
         event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
         tx.commit()?;
         self.forget_live(turn);
@@ -8149,6 +8380,12 @@ impl Database {
     /// allowed at once. A step lives as long as the request waiting on it,
     /// so asking for one already waiting is refused.
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// Every step gets a row in the audit trail with the `facts` its client
+    /// gives: at once when it is allowed at once, under no gate or when
+    /// its client only `record`s it (a step it would not put to a gate),
+    /// and once decided otherwise.
+    #[allow(clippy::too_many_arguments)]
     pub fn step_announce(
         &mut self,
         name: &str,
@@ -8157,6 +8394,8 @@ impl Database {
         step: &str,
         tool: &str,
         arguments: Value,
+        record: bool,
+        facts: audit::Facts,
         now_ms: u64,
     ) -> Result<Stepped> {
         self.step_turn(name, turn)?;
@@ -8200,7 +8439,23 @@ impl Database {
                 expire_ms: g.expire_ms,
             })
             .collect();
-        if gates.is_empty() {
+        if record || gates.is_empty() {
+            let tx = self.conn.savepoint()?;
+            audit::insert(
+                &tx,
+                now_ms as i64,
+                bot.bot_id,
+                &bot.name,
+                turn,
+                call_id,
+                Some(step),
+                tool,
+                facts,
+                "nobody",
+                "unknown",
+                &arguments.to_string(),
+            )?;
+            tx.commit()?;
             return Ok(Stepped {
                 step: Step::Decided(json!({"call_id":id,"decision":"allow","approvals":[]})),
                 notify: None,
@@ -8208,8 +8463,9 @@ impl Database {
             });
         }
         // Whole: a step's arguments are bounded when asked, and it has no
-        // item of its own for a reader to find them in.
-        let arguments = json!({"arguments":arguments});
+        // item of its own for a reader to find them in. Its facts wait
+        // with it for its row.
+        let arguments = json!({"arguments":arguments,"audit":facts.to_json()});
         let tx = self.conn.savepoint()?;
         tx.prepare_cached(
             "INSERT INTO approvals(turn,call_id,name,node,request,announced_ms,gates,arguments,step_of)
@@ -8345,7 +8601,20 @@ impl Database {
         if expired {
             data["expired"] = json!(true);
         }
-        let resumed = end_step(&tx, &bot.name, turn, &request, data.clone(), now_ms)?;
+        let approved = match expired {
+            true => "nobody",
+            false => request.approved(allow),
+        };
+        let resumed = end_step(
+            &tx,
+            &bot,
+            turn,
+            &request,
+            data.clone(),
+            now_ms,
+            approved,
+            allow,
+        )?;
         tx.commit()?;
         Ok(self.stepped(&bot, turn, &request, resumed, data))
     }
@@ -8366,7 +8635,16 @@ impl Database {
         let data = json!({"call_id":id,"decision":"deny","reason":"its client stopped waiting",
             "approvals":request.approvals()});
         let tx = self.conn.savepoint()?;
-        let resumed = end_step(&tx, &bot.name, turn, &request, data.clone(), now_ms)?;
+        let resumed = end_step(
+            &tx,
+            &bot,
+            turn,
+            &request,
+            data.clone(),
+            now_ms,
+            "nobody",
+            false,
+        )?;
         tx.commit()?;
         Ok(self.stepped(&bot, turn, &request, resumed, data))
     }
@@ -8383,29 +8661,90 @@ impl Database {
     ) -> Result<Value> {
         self.step_turn(name, turn)?;
         let id = format!("{call_id}/{step}");
-        let (allowed, done): (bool, bool) = self
+        // The step's row in the audit trail, written after its call's own:
+        // read from the newest back to that.
+        let row: Option<(i64, String, String)> = self
             .conn
             .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE turn=?1 AND kind='step_decided'
-                 AND json_extract(data,'$.call_id')=?2 AND json_extract(data,'$.decision')='allow'),
-               EXISTS(SELECT 1 FROM events WHERE turn=?1 AND kind='step_completed'
-                 AND json_extract(data,'$.call_id')=?2)",
+                "SELECT a.id,a.approved,a.outcome FROM audit a
+                 WHERE a.id>(SELECT audit FROM tools WHERE turn=?1 AND call_id=?2)
+                   AND a.turn=?1 AND a.call_id=?2 AND a.step=?3
+                 ORDER BY a.id DESC LIMIT 1",
             )?
-            .query_row(params![turn, id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        if !allowed {
+            .query_row(params![turn, call_id, step], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        if row
+            .as_ref()
+            .is_some_and(|(_, _, outcome)| outcome == "denied")
+        {
             return fail_with(
                 "no_allowed_step",
                 format!("no step {step} of {call_id} was allowed"),
             );
         }
-        if !done {
-            let mut data = json!({"call_id":id,"step_of":call_id});
-            if failed {
-                data["failed"] = json!(true);
+        // A step its gates allowed is among the turn's calls a judge reads,
+        // told by its events, which the person's trim of the trail never
+        // touches: the trail's row, when still there, only records it.
+        let gated = row
+            .as_ref()
+            .is_none_or(|(_, approved, _)| approved != "nobody");
+        let (allowed, done) = match gated {
+            true => self
+                .conn
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE turn=?1 AND kind='step_decided'
+                     AND json_extract(data,'$.call_id')=?2 AND json_extract(data,'$.decision')='allow'),
+                   EXISTS(SELECT 1 FROM events WHERE turn=?1 AND kind='step_completed'
+                     AND json_extract(data,'$.call_id')=?2)",
+                )?
+                .query_row(params![turn, id], |r| Ok((r.get(0)?, r.get(1)?)))?,
+            false => (true, true),
+        };
+        if row.is_none() && !allowed {
+            return fail_with(
+                "no_allowed_step",
+                format!("no step {step} of {call_id} was allowed"),
+            );
+        }
+        // Told twice, the first holds.
+        let unfinished = row
+            .as_ref()
+            .filter(|(_, _, outcome)| outcome == "unknown")
+            .map(|(row, _, _)| *row);
+        if unfinished.is_some() || (gated && allowed && !done) {
+            let tx = self.conn.savepoint()?;
+            if let Some(row) = unfinished {
+                audit::finish(&tx, row, epoch_ms(), failed)?;
             }
-            event(&self.conn, name, Some(turn), "step_completed", data)?;
+            if gated && allowed && !done {
+                let mut data = json!({"call_id":id,"step_of":call_id});
+                if failed {
+                    data["failed"] = json!(true);
+                }
+                event(&tx, name, Some(turn), "step_completed", data)?;
+            }
+            tx.commit()?;
         }
         Ok(json!({"call_id":id}))
+    }
+    /// A page of the audit trail, newest first.
+    pub fn audit(&self, query: &audit::Query) -> Result<Value> {
+        audit::read(&self.conn, query)
+    }
+    /// The id below which a trim deletes: `before` itself, or the first
+    /// row at or after `before_ms`.
+    pub fn audit_bound(&self, before: Option<i64>, before_ms: Option<i64>) -> Result<i64> {
+        audit::trim_bound(&self.conn, before, before_ms)
+    }
+    /// One piece of a trim of the audit trail below id `before`: how many
+    /// rows went.
+    pub fn audit_trim(&mut self, before: i64) -> Result<usize> {
+        let tx = self.conn.savepoint()?;
+        let trimmed = audit::trim(&tx, before)?;
+        tx.commit()?;
+        Ok(trimmed)
     }
     /// The bot's turn a step names, while a call of it can still be
     /// answered.
@@ -8459,10 +8798,27 @@ impl Database {
             .collect::<rusqlite::Result<_>>()?;
         let bot = self.active(turn)?;
         let tx = self.conn.savepoint()?;
+        let now_ms = epoch_ms().max(0) as u64;
         for (approval, id) in &ids {
-            let name: String = tx
-                .prepare_cached("DELETE FROM approvals WHERE id=? RETURNING name")?
-                .query_row([approval], |r| r.get(0))?;
+            let (name, arguments, facts): (String, String, Option<String>) = tx
+                .prepare_cached(
+                    "DELETE FROM approvals WHERE id=? RETURNING name,
+                        json_extract(arguments,'$.arguments'),json_extract(arguments,'$.audit')",
+                )?
+                .query_row([approval], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            audit_step(
+                &tx,
+                &bot,
+                turn,
+                call_id,
+                id,
+                &name,
+                facts.as_deref(),
+                "nobody",
+                "denied",
+                &arguments,
+                now_ms,
+            )?;
             let data = json!({"call_id":id,"step_of":call_id,"name":name,"decision":"deny",
                 "reason":"the call was answered first","approvals":[]});
             event(&tx, &bot.name, Some(turn), "step_decided", data)?;
@@ -8714,6 +9070,7 @@ impl Database {
             reason: answer.reason.map(str::to_owned),
             by: answer.by.map(str::to_owned),
             at_ms,
+            leased: answer.leased,
         };
         request.verdicts.push(verdict.clone());
         let pending: Vec<&str> = if request.denial().is_some() {
@@ -9475,6 +9832,7 @@ impl Database {
             Spend,
             Counts,
             Option<String>,
+            usize,
         );
         let (
             workspace,
@@ -9486,9 +9844,10 @@ impl Database {
             spent,
             counts,
             output_schema,
+            drops,
         ): Row = self.conn.query_row(
             "SELECT workspace,model,model_rounds,view_sent,reasoning,budget_tokens,
-                        input_tokens+output_tokens,work,budget_counts,output_schema
+                        input_tokens+output_tokens,work,budget_counts,output_schema,drops
                FROM turns WHERE id=?",
             [turn],
             |r| {
@@ -9505,6 +9864,7 @@ impl Database {
                     },
                     Counts::from_stored(r.get::<_, Option<String>>(8)?.as_deref()),
                     r.get(9)?,
+                    r.get::<_, u32>(10)? as usize,
                 ))
             },
         )?;
@@ -9534,6 +9894,7 @@ impl Database {
             .flatten();
         Ok(TurnContext {
             model_rounds,
+            drops,
             view_sent,
             workspace: workspace
                 .or(bot.workspace)
@@ -9652,13 +10013,18 @@ impl Database {
         // retention has dropped the turn's events.
         // One that completed on a call a limit sent without tool calls ended
         // at that limit, not failing; one that did not keeps no limit.
+        let finished = epoch_ms();
+        let mut started: Option<i64> = None;
         let limit: Option<String> = tx
             .prepare_cached(&format!(
                 "UPDATE turns SET status=?1,finished_ms=?2,reply_node={REPLY_NODE},
                     limited=CASE WHEN ?1='completed' THEN limited END
-                  WHERE id=?3 RETURNING limited"
+                  WHERE id=?3 RETURNING limited,started_ms"
             ))?
-            .query_row(params![status, epoch_ms(), turn], |r| r.get(0))?;
+            .query_row(params![status, finished, turn], |r| {
+                started = r.get(1)?;
+                r.get(0)
+            })?;
         // A request a safety classifier declined, and the bot's fallback
         // too: what it added since the model last answered goes to later
         // requests as notes in its place, since Anthropic says to remove it
@@ -9736,12 +10102,25 @@ impl Database {
                 }
             }
         }
-        // An expiring bot's clock starts again from this turn's end.
-        tx.execute(
-            "UPDATE bots SET head=?,running_turn=NULL,status=?,closed=NULL,open_calls=NULL,
-                expires_at=?+expire_ms WHERE name=?",
-            params![head, status, epoch_ms(), bot.name],
-        )?;
+        // An expiring bot's clock starts again from this turn's end. It
+        // says how its newest turn ended: this one, or a later message that
+        // failed in line while this one ran.
+        // One statement, as before this kept the ending: each CASE reads
+        // the row as it was.
+        tx.prepare_cached(
+            "UPDATE bots SET head=?1,running_turn=NULL,closed=NULL,open_calls=NULL,
+                started_ms=NULL,waiting_on=NULL,expires_at=?2+expire_ms,
+                status=CASE WHEN last_turn>?4 THEN last_status ELSE ?5 END,
+                last_status=CASE WHEN last_turn>?4 THEN last_status ELSE ?5 END,
+                last_started_ms=CASE WHEN last_turn>?4 THEN last_started_ms ELSE ?6 END,
+                last_finished_ms=CASE WHEN last_turn>?4 THEN last_finished_ms ELSE ?2 END,
+                last_error=CASE WHEN last_turn>?4 THEN last_error ELSE ?7 END,
+                last_turn=CASE WHEN last_turn>?4 THEN last_turn ELSE ?4 END
+             WHERE name=?3",
+        )?
+        .execute(params![
+            head, finished, bot.name, turn, status, started, code
+        ])?;
         promote(&tx, &bot.name)?;
         if status == "completed" {
             tx.execute(
@@ -9862,8 +10241,8 @@ impl Database {
             "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
             params![serde_json::to_string(&waiting)?, turn],
         )?;
-        tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
         let data = json!({"call_id":call_id,"handles":handles,"deadline_ms":deadline_ms,"any":any});
+        parked(&tx, &bot.name, "waiting", &data)?;
         let cursor = event(&tx, &bot.name, Some(turn), "turn_waiting", data.clone())?;
         tx.commit()?;
         self.forget_live(turn);
@@ -9936,7 +10315,7 @@ impl Database {
                 turn
             ],
         )?;
-        tx.execute("UPDATE bots SET status='paced' WHERE name=?", [&bot.name])?;
+        parked(&tx, &bot.name, "paced", &data)?;
         let cursor = event(&tx, &bot.name, Some(turn), "turn_paced", data.clone())?;
         tx.commit()?;
         self.forget_live(turn);
@@ -10085,11 +10464,11 @@ impl Database {
                 turn
             ],
         )?;
-        tx.execute("UPDATE bots SET status='paced' WHERE name=?", [&bot.name])?;
         let data = match stop {
             Halt::Pause => json!({"resume_at_ms":null,"paused":true}),
             Halt::Shutdown => json!({"resume_at_ms":null,"stopped":true}),
         };
+        parked(&tx, &bot.name, "paced", &data)?;
         let cursor = event(&tx, &bot.name, Some(turn), "turn_paced", data.clone())?;
         tx.commit()?;
         self.forget_live(turn);
@@ -10272,7 +10651,10 @@ impl Database {
             "UPDATE turns SET status='running',waiting=NULL,paced_ms=paced_ms+? WHERE id=?",
             params![waiting.paced_elapsed_ms(), turn],
         )?;
-        tx.execute("UPDATE bots SET status='running' WHERE name=?", [&bot.name])?;
+        tx.execute(
+            "UPDATE bots SET status='running',waiting_on=NULL WHERE name=?",
+            [&bot.name],
+        )?;
         let data = json!({"call_id":waiting.call_id});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_resumed", data.clone())?;
         tx.commit()?;
@@ -10919,6 +11301,7 @@ impl Database {
         let mut data = json!({"bot_id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
             "provider":parent.provider,"model":parent.model,"effort":parent.effort,
             "workspace":workspace,"status":"idle","running_turn":null,
+            "started_ms":null,"waiting_on":null,"last":null,
             "created_by":created_by,"created_by_id":created_by_id,"depth":depth});
         if let Some(gates) = &gates {
             data["gates"] = serde_json::from_str(gates)?;
@@ -11980,10 +12363,10 @@ impl Database {
     /// What the turns of the bots whose names match `name` (every bot
     /// when absent) spent, from those started at `since_ms` or later: in
     /// all, by bot (the `limit` that spent most, the rest summed as one),
-    /// by model, by the origin its client gave the turn, and, with
-    /// `bucket_ms`, in buckets of that width from
-    /// `since_ms`. A turn counts wholly where it started. One statement,
-    /// so one snapshot.
+    /// by the model that spent it, with its cache writes, by the origin its
+    /// client gave the turn, and, with `bucket_ms`, in buckets of that
+    /// width from `since_ms`. A turn counts wholly where it started. One
+    /// snapshot.
     pub fn usage(
         &self,
         name: Option<&str>,
@@ -12018,12 +12401,14 @@ impl Database {
             Some(_) => " AND t.bot GLOB ?3 AND t.bot >= ?4 AND t.bot < ?4 || CAST(x'ff' AS TEXT)",
             None => "",
         };
-        let mut statement = self.conn.prepare_cached(&format!(
-            "SELECT t.bot,b.id,COALESCE(t.model,t.bot_model,b.provider||'/'||b.model),
-                    (t.started_ms-?1)/?2,COUNT(*),SUM(t.input_tokens),
+        // A turn counts once in each grouping but by model, where it
+        // counts under every model that spent in it.
+        let snapshot = self.conn.unchecked_transaction()?;
+        let mut statement = snapshot.prepare_cached(&format!(
+            "SELECT t.bot,b.id,(t.started_ms-?1)/?2,COUNT(*),SUM(t.input_tokens),
                     SUM(t.cached_input_tokens),SUM(t.output_tokens),t.origin
              FROM turns t JOIN bots b ON b.name=t.bot
-             WHERE t.started_ms>=?1{glob} GROUP BY 1,3,4,9"
+             WHERE t.started_ms>=?1{glob} GROUP BY 1,3,8"
         ))?;
         let width = bucket_ms.unwrap_or(i64::MAX);
         let mut rows = match name {
@@ -12034,25 +12419,51 @@ impl Database {
         };
         let mut total = Spent::default();
         let mut bots: HashMap<String, (i64, Spent)> = HashMap::new();
-        let mut models: HashMap<String, Spent> = HashMap::new();
         let mut origins: HashMap<Option<String>, Spent> = HashMap::new();
         let mut series: BTreeMap<i64, Spent> = BTreeMap::new();
         while let Some(r) = rows.next()? {
             let spent = Spent {
-                turns: r.get(4)?,
-                input_tokens: r.get(5)?,
-                cached_input_tokens: r.get(6)?,
-                output_tokens: r.get(7)?,
+                turns: r.get(3)?,
+                input_tokens: r.get(4)?,
+                cached_input_tokens: r.get(5)?,
+                output_tokens: r.get(6)?,
             };
             total.add(&spent);
             let bot = bots.entry(r.get(0)?).or_default();
             bot.0 = r.get(1)?;
             bot.1.add(&spent);
-            models.entry(r.get(2)?).or_default().add(&spent);
-            origins.entry(r.get(8)?).or_default().add(&spent);
+            origins.entry(r.get(7)?).or_default().add(&spent);
             if bucket_ms.is_some() {
-                series.entry(r.get(3)?).or_default().add(&spent);
+                series.entry(r.get(2)?).or_default().add(&spent);
             }
+        }
+        drop(rows);
+        let mut statement = snapshot.prepare_cached(&format!(
+            "SELECT m.model,COUNT(*),SUM(m.input_tokens),SUM(m.cached_input_tokens),
+                    SUM(m.output_tokens),SUM(m.cache_write_tokens),SUM(m.cache_write_1h_tokens)
+             FROM turns t CROSS JOIN turn_models m ON m.turn=t.id
+             WHERE t.started_ms>=?1{glob} GROUP BY 1"
+        ))?;
+        let mut rows = match name {
+            Some(pattern) => statement.query(params![
+                since_ms,
+                None::<i64>,
+                pattern,
+                glob_prefix(pattern)
+            ])?,
+            None => statement.query(params![since_ms])?,
+        };
+        // Each model's spend, and its cache writes: 5-minute and hour. The
+        // window's turns lead, each one's rows found by its key.
+        let mut models: Vec<(String, Spent, i64, i64)> = Vec::new();
+        while let Some(r) = rows.next()? {
+            let spent = Spent {
+                turns: r.get(1)?,
+                input_tokens: r.get(2)?,
+                cached_input_tokens: r.get(3)?,
+                output_tokens: r.get(4)?,
+            };
+            models.push((r.get(0)?, spent, r.get(5)?, r.get(6)?));
         }
         let mut bots: Vec<(String, i64, Spent)> = bots
             .into_iter()
@@ -12064,7 +12475,6 @@ impl Database {
         for (_, _, spent) in bots.drain(limit.min(bots.len())..) {
             others.add(&spent);
         }
-        let mut models: Vec<(String, Spent)> = models.into_iter().collect();
         models.sort_by(|a, b| b.1.tokens().cmp(&a.1.tokens()).then_with(|| a.0.cmp(&b.0)));
         let mut origins: Vec<(Option<String>, Spent)> = origins.into_iter().collect();
         origins.sort_by(|a, b| b.1.tokens().cmp(&a.1.tokens()).then_with(|| a.0.cmp(&b.0)));
@@ -12090,9 +12500,11 @@ impl Database {
         };
         out["models"] = models
             .iter()
-            .map(|(model, spent)| {
+            .map(|(model, spent, written, hourly)| {
                 let mut row = spent.json();
                 row["model"] = json!(model);
+                row["cache_write_tokens"] = json!(written);
+                row["cache_write_1h_tokens"] = json!(hourly);
                 row
             })
             .collect();
@@ -12359,6 +12771,7 @@ fn record_usage_for(
         data["purpose"] = json!(purpose);
     }
     let cursor = event(conn, &bot.name, Some(turn), "usage", data.clone())?;
+    spent_by_model(conn, turn, usage)?;
     conn.prepare_cached(
         "UPDATE turns SET input_tokens=input_tokens+?,output_tokens=output_tokens+?,
              cached_input_tokens=cached_input_tokens+?,work=work+? WHERE id=?",
@@ -12385,6 +12798,55 @@ fn record_usage_for(
     Ok(entry(cursor, &bot.name, Some(turn), "usage", data))
 }
 
+/// File a call's spend under the model that spent it: the turn's own,
+/// unless the call names its attempts, as a summary, a refused request's
+/// fallback, or a provider-side fallback does. An attempt that names no
+/// provider binding ran on the turn's. One keyed upsert per model, in the
+/// transaction that records the call.
+fn spent_by_model(conn: &Connection, turn: i64, usage: &Usage) -> Result<()> {
+    let mut upsert = conn.prepare_cached(
+        "INSERT INTO turn_models(turn,model,input_tokens,cached_input_tokens,
+             cache_write_tokens,cache_write_1h_tokens,output_tokens)
+         SELECT id,CASE WHEN ?3 IS NULL THEN model
+                  ELSE COALESCE(?2,substr(model,1,instr(model,'/')-1))||'/'||?3 END,
+                ?4,?5,?6,?7,?8
+         FROM (SELECT t.id,COALESCE(t.model,t.bot_model,b.provider||'/'||b.model) AS model
+               FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=?1)
+         WHERE true
+         ON CONFLICT(turn,model) DO UPDATE SET
+             input_tokens=input_tokens+excluded.input_tokens,
+             cached_input_tokens=cached_input_tokens+excluded.cached_input_tokens,
+             cache_write_tokens=cache_write_tokens+excluded.cache_write_tokens,
+             cache_write_1h_tokens=cache_write_1h_tokens+excluded.cache_write_1h_tokens,
+             output_tokens=output_tokens+excluded.output_tokens",
+    )?;
+    if usage.models.is_empty() {
+        upsert.execute(params![
+            turn,
+            None::<&str>,
+            None::<&str>,
+            usage.input_tokens as i64,
+            usage.cached_input_tokens as i64,
+            usage.cache_write_tokens as i64,
+            usage.cache_write_1h_tokens as i64,
+            usage.output_tokens as i64
+        ])?;
+    }
+    for attempt in &usage.models {
+        upsert.execute(params![
+            turn,
+            attempt.provider.as_deref(),
+            attempt.model.as_str(),
+            attempt.input_tokens as i64,
+            attempt.cached_input_tokens as i64,
+            attempt.cache_write_tokens as i64,
+            attempt.cache_write_1h_tokens as i64,
+            attempt.output_tokens as i64
+        ])?;
+    }
+    Ok(())
+}
+
 fn epoch_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -12392,6 +12854,39 @@ fn epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// A call's row in the audit trail: what kind of tool it is, where it ran
+/// (nowhere, once denied), who `approved` it, and its arguments' start.
+fn audit_call(
+    tx: &Connection,
+    bot: &Bot,
+    turn: i64,
+    call: &ToolCall,
+    confined: bool,
+    approved: &str,
+    outcome: &str,
+) -> Result<i64> {
+    let declared = bot
+        .declared(&call.name)
+        .and_then(|tool| tool.kind.as_deref());
+    let mut facts = audit::of_call(&call.name, declared, confined);
+    if outcome == "denied" {
+        facts.place = None;
+    }
+    audit::insert(
+        tx,
+        epoch_ms(),
+        bot.bot_id,
+        &bot.name,
+        turn,
+        &call.call_id,
+        None,
+        &call.name,
+        facts,
+        approved,
+        outcome,
+        &call.arguments,
+    )
+}
 /// A `tool_started` event's data: the call with its arguments previewed.
 fn started(call: &ToolCall) -> Value {
     let preview: String = call.arguments.chars().take(2048).collect();
@@ -12475,7 +12970,9 @@ fn ask(tx: &Connection, bot: &Bot, turn: i64, call: &ToolCall, data: &mut Value)
     Ok(())
 }
 /// A denied call's result, in the one commit a finished call makes. The
-/// daemon writes the code; the reason is the approver's.
+/// daemon writes the code; the reason is the approver's. Its row in the
+/// audit trail names who `approved` the denial.
+#[allow(clippy::too_many_arguments)]
 fn deny(
     tx: &Connection,
     bot: &Bot,
@@ -12484,8 +12981,10 @@ fn deny(
     reason: Option<&str>,
     approvals: Value,
     expired: bool,
+    approved: &str,
 ) -> Result<()> {
     let call_id = call.call_id.as_str();
+    audit_call(tx, bot, turn, call, false, approved, "denied")?;
     let output = json!({"error":"approval_denied","detail":reason}).to_string();
     let item = bot
         .family()?
@@ -12517,26 +13016,90 @@ fn deny(
     event(tx, &bot.name, Some(turn), "tool_completed", data)?;
     Ok(())
 }
+/// A decided step's row in the audit trail, with the facts its client
+/// gave when it asked (`kept`, as stored with it).
+#[allow(clippy::too_many_arguments)]
+fn audit_step(
+    tx: &Connection,
+    bot: &Bot,
+    turn: i64,
+    parent: &str,
+    id: &str,
+    name: &str,
+    kept: Option<&str>,
+    approved: &str,
+    outcome: &str,
+    arguments: &str,
+    now_ms: u64,
+) -> Result<i64> {
+    let step = id.strip_prefix(parent).and_then(|s| s.strip_prefix('/'));
+    let facts = kept
+        .and_then(|kept| serde_json::from_str::<Value>(kept).ok())
+        .map(|kept| audit::Facts::from_json(&kept))
+        .unwrap_or_default();
+    let facts = audit::Facts {
+        place: facts.place.filter(|_| outcome != "denied"),
+        ..facts
+    };
+    audit::insert(
+        tx,
+        now_ms as i64,
+        bot.bot_id,
+        &bot.name,
+        turn,
+        parent,
+        step,
+        name,
+        facts,
+        approved,
+        outcome,
+        arguments,
+    )
+}
 /// Remove a decided step and record its decision in a `step_decided`
 /// event. True when no other step of its call waits, so the call's time
 /// runs again from where it stopped.
+///
+/// Its row in the audit trail is written with it: `approved` names who
+/// decided it, and a step its gates allowed is `unknown` until its client
+/// says how it ended.
+#[allow(clippy::too_many_arguments)]
 fn end_step(
     tx: &Connection,
-    bot: &str,
+    bot: &Bot,
     turn: i64,
     request: &Request,
     mut data: Value,
     now_ms: u64,
+    approved: &str,
+    allowed: bool,
 ) -> Result<bool> {
     let parent = request
         .step_of
         .as_deref()
         .ok_or(Error::new("invalid_tool_state"))?;
-    let (name, arguments): (String, String) = tx
+    let (id, name, arguments, facts): (String, String, String, Option<String>) = tx
         .prepare_cached(
-            "DELETE FROM approvals WHERE id=? RETURNING name,json_extract(arguments,'$.arguments')",
+            "DELETE FROM approvals WHERE id=? RETURNING call_id,name,
+                json_extract(arguments,'$.arguments'),json_extract(arguments,'$.audit')",
         )?
-        .query_row([request.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        .query_row([request.id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+    audit_step(
+        tx,
+        bot,
+        turn,
+        parent,
+        &id,
+        &name,
+        facts.as_deref(),
+        approved,
+        if allowed { "unknown" } else { "denied" },
+        &arguments,
+        now_ms,
+    )?;
+    let bot = bot.name.as_str();
     data["step_of"] = json!(parent);
     // Previewed as a started call is, for a judge of a later call that
     // weighs what this turn was refused.
@@ -12757,8 +13320,10 @@ fn pending_call(
     if let Some(parent) = &request.step_of {
         entry["step_of"] = json!(parent);
     }
-    // The previews stored when the call was planned.
-    if let (Value::Object(entry), Value::Object(arguments)) = (&mut entry, arguments) {
+    // The previews stored when the call was planned; a step's facts for
+    // the audit trail wait beside them, the trail's alone.
+    if let (Value::Object(entry), Value::Object(mut arguments)) = (&mut entry, arguments) {
+        arguments.remove("audit");
         entry.extend(arguments);
     }
     entry
@@ -12918,6 +13483,61 @@ fn flush(tx: &Connection, turn: i64, live: Option<&Live>) -> Result<()> {
 /// Store an event, written now or, should the clock have gone back, when
 /// the event before it was: times rise with cursors, as a log's time index
 /// keeps them (Kafka's), so a follow from a time skips nothing.
+/// A bot's turn parked: the bot's status says how, and what it waits on is
+/// what the turn's event says, as the turn's own `waiting_on` does.
+fn parked(tx: &Connection, bot: &str, status: &str, on: &Value) -> Result<()> {
+    tx.prepare_cached("UPDATE bots SET status=?2,waiting_on=?3 WHERE name=?1")?
+        .execute(params![bot, status, on.to_string()])?;
+    Ok(())
+}
+/// Keep how `turn` ended as its bot's last, unless a later turn of the bot
+/// ended already: a message that failed in line while this turn ran.
+fn record_ended(
+    tx: &Connection,
+    bot: &str,
+    turn: i64,
+    status: &str,
+    started_ms: Option<i64>,
+    finished_ms: Option<i64>,
+    error: Option<&str>,
+) -> Result<()> {
+    tx.prepare_cached(
+        "UPDATE bots SET last_turn=?2,last_status=?3,last_started_ms=?4,last_finished_ms=?5,
+            last_error=?6 WHERE name=?1 AND (last_turn IS NULL OR last_turn<?2)",
+    )?
+    .execute(params![bot, turn, status, started_ms, finished_ms, error])?;
+    Ok(())
+}
+/// A JSON text column as it was stored, unparsed.
+fn raw_json(
+    r: &rusqlite::Row,
+    at: usize,
+) -> rusqlite::Result<Option<Box<serde_json::value::RawValue>>> {
+    r.get::<_, Option<String>>(at)?
+        .map(|text| {
+            serde_json::value::RawValue::from_string(text).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    at,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
+}
+/// A bot's last ending, from its five columns starting at `at`.
+fn ended(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Option<Ended>> {
+    let Some(turn) = r.get::<_, Option<i64>>(at)? else {
+        return Ok(None);
+    };
+    Ok(Some(Ended {
+        turn,
+        status: r.get(at + 1)?,
+        started_ms: r.get(at + 2)?,
+        finished_ms: r.get(at + 3)?,
+        error: r.get(at + 4)?,
+    }))
+}
 fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Result<i64> {
     conn.prepare_cached(
         "INSERT INTO events(bot,turn,kind,data,written_ms) VALUES (?1,?2,?3,?4,
@@ -13176,21 +13796,23 @@ fn start_locked(
     keep_quotes(tx, turn, quotes.as_deref(), head)?;
     data["node"] = json!(head);
     keep_sender(tx, turn, head, data)?;
+    let now = epoch_ms();
     if prompt.len() >= PROMPT_SHARE_BYTES {
         tx.execute(
             "UPDATE turns SET status='running',started_ms=?,held=NULL,prompt='',prompt_node=? WHERE id=?",
-            params![epoch_ms(), head, turn],
+            params![now, head, turn],
         )?;
     } else {
         tx.execute(
             "UPDATE turns SET status='running',started_ms=?,held=NULL WHERE id=?",
-            params![epoch_ms(), turn],
+            params![now, turn],
         )?;
     }
     // `finish` answers every call, so a turn starts on a closed head.
     tx.execute(
-        "UPDATE bots SET head=?1,status='running',running_turn=?2,closed=?1,open_calls=0 WHERE name=?3",
-        params![head, turn, bot.name],
+        "UPDATE bots SET head=?1,status='running',running_turn=?2,closed=?1,open_calls=0,
+            started_ms=?4,waiting_on=NULL WHERE name=?3",
+        params![head, turn, bot.name, now],
     )?;
     Ok(Some(head))
 }
@@ -14564,6 +15186,105 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             [],
         )?;
     }
+    // Schema 85: a turn's spend is kept by the model that spent it, with
+    // its cache writes. Earlier turns kept one total and no writes, so each
+    // is filed whole under its own model, as `usage` counted it before.
+    if from < 85 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS turn_models(turn INTEGER NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+                model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(turn,model)) WITHOUT ROWID;
+             INSERT OR IGNORE INTO turn_models(turn,model,input_tokens,cached_input_tokens,output_tokens)
+               SELECT t.id,COALESCE(t.model,t.bot_model,b.provider||'/'||b.model),
+                      t.input_tokens,t.cached_input_tokens,t.output_tokens
+               FROM turns t JOIN bots b ON b.name=t.bot
+               WHERE t.input_tokens>0 OR t.output_tokens>0;",
+        )?;
+    }
+    // Schema 86: a turn keeps how many replies in a row the model's cap cut
+    // short, so a park or a restart counts on.
+    if from < 86
+        && !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='drops')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        conn.execute_batch("ALTER TABLE turns ADD COLUMN drops INTEGER NOT NULL DEFAULT 0")?;
+    }
+    // Schema 87: each call keeps the id of its row in the audit trail, a
+    // table of its own the store's batch makes. The trail starts here: the
+    // calls before it are in their bots' histories.
+    if from < 87
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='tools')
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('tools') WHERE name='audit')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        conn.execute("ALTER TABLE tools ADD COLUMN audit INTEGER", [])?;
+    }
+    // Schema 88: a bot carries its whole status, kept with each turn's
+    // transitions: when its running turn started, what it waits on, and how
+    // its newest turn that counts ended, read here from its turns.
+    if from < 88
+        && !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='last_turn')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        migrate_bot_status(conn)?;
+    }
+    Ok(())
+}
+/// 87 -> 88: each bot's status, from the turns it has.
+fn migrate_bot_status(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE bots ADD COLUMN started_ms INTEGER;
+         ALTER TABLE bots ADD COLUMN waiting_on TEXT;
+         ALTER TABLE bots ADD COLUMN last_turn INTEGER;
+         ALTER TABLE bots ADD COLUMN last_status TEXT;
+         ALTER TABLE bots ADD COLUMN last_started_ms INTEGER;
+         ALTER TABLE bots ADD COLUMN last_finished_ms INTEGER;
+         ALTER TABLE bots ADD COLUMN last_error TEXT;
+         UPDATE bots SET started_ms=(SELECT started_ms FROM turns WHERE id=bots.running_turn)
+          WHERE running_turn IS NOT NULL;
+         UPDATE bots SET (last_turn,last_status,last_started_ms,last_finished_ms)=(
+           SELECT id,status,started_ms,finished_ms FROM turns t WHERE t.bot=bots.name
+            AND t.status IN ('completed','failed','interrupted')
+            AND (t.status!='interrupted' OR t.started_ms IS NOT NULL)
+           ORDER BY t.id DESC LIMIT 1);
+         UPDATE bots SET last_error=(SELECT json_extract(data,'$.error') FROM events
+           WHERE turn=bots.last_turn AND kind='turn_finished' ORDER BY id DESC LIMIT 1)
+          WHERE last_status IN ('failed','interrupted');
+         UPDATE bots SET status=last_status
+          WHERE running_turn IS NULL AND last_status IS NOT NULL AND status!='deleting';
+         UPDATE bots SET status='held',waiting_on=(
+           SELECT json_object('blocked',json(t.held),'resume_at_ms',t.due_ms) FROM turns t
+            WHERE t.bot=bots.name AND t.status='ready' AND t.held IS NOT NULL)
+          WHERE running_turn IS NULL AND status!='deleting' AND EXISTS(
+           SELECT 1 FROM turns t WHERE t.bot=bots.name AND t.status='ready' AND t.held IS NOT NULL);",
+    )?;
+    // A parked turn's `waiting_on`, as its view reads it.
+    let parked: Vec<(String, i64)> = conn
+        .prepare(
+            "SELECT name,running_turn FROM bots
+             WHERE status IN ('waiting','paced') AND running_turn IS NOT NULL",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut view = conn.prepare(&format!(
+        "SELECT {TURN_VIEW} FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=?"
+    ))?;
+    let mut update = conn.prepare("UPDATE bots SET waiting_on=? WHERE name=?")?;
+    for (bot, turn) in parked {
+        let on = view.query_row([turn], turn_view)?["waiting_on"].take();
+        update.execute(params![(!on.is_null()).then(|| on.to_string()), bot])?;
+    }
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
@@ -15285,6 +16006,7 @@ mod tests {
             hold_ms: Some(1),
             quiet_background: true,
             max_rounds: Some(1),
+            max_drops: Some(1),
             unix_sockets: vec!["/".into()],
             rules: Some(crate::rules::Policy {
                 invalid: Some("x".into()),

@@ -32,6 +32,8 @@ pub use patch::Patch;
 #[cfg(unix)]
 pub use terminal::POLL_YIELD_MS;
 
+/// Rows of the audit trail one history call reads.
+const AUDIT_ROWS: usize = 50;
 /// Model-facing text per tool result stream.
 pub const PREVIEW_BYTES: usize = 64 * 1024;
 /// Retained output per stream. Past this a stream keeps its first and last
@@ -153,10 +155,15 @@ impl Tool {
                 "required":["input"],"additionalProperties":false}),
             ),
             Tool::History => (
-                "Read a conversation turn: one of yours the context left out (numbered from 1; see the context note), or with bot, another agent's, as it stands, including one still running. With bot and no turn, lists that agent's newest turns, newest first: each one's number, handle, status and prompt. Or give handle alone, a turn handle as run, wait and the listing give it (turn:BOT/N), to read that turn. Returns provider items as JSONL, omitting only encrypted_content from reasoning items; summaries remain. Pages contain at most 64 KiB and may shrink to fit context. Optional limit: 4 to 65536 bytes. Start at offset 0; use next_offset until done. Offsets count UTF-8 bytes of the filtered view. Pages may split records; concatenate text before decoding. With query instead of turn, searches your earlier turns (or with bot, that agent's) for that literal text, ignoring ASCII case, newest first: up to 20 matches, each with its turn, item type, and the JSON text around it; read a turn for all of its matches. When done is false, pass next_before as before to search older turns. With query, bot may also be a pattern of * ? and [...], case-sensitive, such as * for every agent or proj.* for some: it searches every agent it matches at once, newest first; each match then names its bot and its handle.",
+                "Read a conversation turn: one of yours the context left out (numbered from 1; see the context note), or with bot, another agent's, as it stands, including one still running. With bot and no turn, lists that agent's newest turns, newest first: each one's number, handle, status and prompt. Or give handle alone, a turn handle as run, wait and the listing give it (turn:BOT/N), to read that turn. Returns provider items as JSONL, omitting only encrypted_content from reasoning items; summaries remain. Pages contain at most 64 KiB and may shrink to fit context. Optional limit: 4 to 65536 bytes. Start at offset 0; use next_offset until done. Offsets count UTF-8 bytes of the filtered view. Pages may split records; concatenate text before decoding. With query instead of turn, searches your earlier turns (or with bot, that agent's) for that literal text, ignoring ASCII case, newest first: up to 20 matches, each with its turn, item type, and the JSON text around it; read a turn for all of its matches. When done is false, pass next_before as before to search older turns. With query, bot may also be a pattern of * ? and [...], case-sensitive, such as * for every agent or proj.* for some: it searches every agent it matches at once, newest first; each match then names its bot and its handle. With audit instead, reads the audit trail: every agent's tool calls and their steps, or with bot one agent's, newest first, each with its time, turn, call, tool, kind, place, who approved it, access, outcome and the start of its arguments; audit's fields filter it, and next_before passed as before pages older rows.",
                 json!({"type":"object","properties":{"bot":{"type":"string","minLength":1,"maxLength":128},
                 "turn":{"type":"integer","minimum":1},"handle":{"type":"string","minLength":1,"maxLength":256},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":65536},
-                "query":{"type":"string","minLength":1,"maxLength":256},"before":{"type":"integer","minimum":1}},
+                "query":{"type":"string","minLength":1,"maxLength":256},"before":{"type":"integer","minimum":1},
+                "audit":{"type":"object","properties":{"kind":{"enum":crate::store::audit::KINDS},
+                "place":{"enum":crate::store::audit::PLACES},"approved":{"enum":crate::store::audit::APPROVERS},
+                "access":{"enum":crate::store::audit::ACCESS},"outcome":{"enum":crate::store::audit::OUTCOMES},
+                "tool":{"type":"string","minLength":1,"maxLength":512},"since_ms":{"type":"integer","minimum":0}},
+                "additionalProperties":false}},
                 "additionalProperties":false}),
             ),
             Tool::Note => (
@@ -238,6 +245,10 @@ pub struct Declared {
     /// whose nested calls are each approved, as in Codex's code mode.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub steps: bool,
+    /// What kind of tool it is, one of the audit trail's kinds, which its
+    /// calls' rows there name; none when its client says nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 fn declared_result() -> String {
     "ok".into()
@@ -363,6 +374,17 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
         if declared[..index].iter().any(|other| other.name == name) {
             return fail_with("invalid_declare", format!("{name} is declared twice"));
         }
+        if let Some(kind) = &tool.kind
+            && !crate::store::audit::KINDS.contains(&kind.as_str())
+        {
+            return fail_with(
+                "invalid_declare",
+                format!(
+                    "{name}: kind is one of {}",
+                    crate::store::audit::KINDS.join(", ")
+                ),
+            );
+        }
         if tool.parameters["type"] != "object" {
             return fail_with(
                 "invalid_declare",
@@ -428,8 +450,21 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
 /// A declared tool's call checked against its parameters, as far as the
 /// daemon looks: an object, with every required field, no field the
 /// schema closes out, and each listed field of its listed basic type.
+/// The most JSON text an answered call's arguments may take: its client
+/// reads the call whole from a `tool_calls` page, one line of at most
+/// 1 MiB beside its id (`MAX_CALL_ID`) and the rest. A model's reply has no
+/// bound but its own, so a longer call is refused at once, the model told.
+pub const ANSWERED_ARGUMENTS: usize = 768 * 1024;
+
 pub fn check_declared(tool: &Declared, arguments: &str) -> Result<()> {
     let invalid = |detail: String| Error::with("invalid_arguments", detail);
+    if tool.answered_by.is_some() && arguments.len() > ANSWERED_ARGUMENTS {
+        return Err(invalid(format!(
+            "{}: arguments take {} bytes, past the {ANSWERED_ARGUMENTS} its client is sent",
+            tool.name,
+            arguments.len()
+        )));
+    }
     let arguments: serde_json::Value = serde_json::from_str(arguments)
         .map_err(|_| invalid(format!("{}: arguments are not JSON", tool.name)))?;
     let fields = arguments
@@ -1041,6 +1076,9 @@ pub enum Prepared {
         offset: u64,
         limit: usize,
     },
+    /// The audit trail, every agent's or `query.bot`'s. Resolved by the
+    /// runtime, never by the registry.
+    HistoryAudit(crate::store::audit::Query),
     /// Resolved by the runtime, never by the registry.
     HistorySearch {
         /// Another agent's, or the caller's own when `None`.
@@ -1641,6 +1679,18 @@ impl Registry {
             limit: Option<usize>,
             query: Option<String>,
             before: Option<i64>,
+            audit: Option<AuditArgs>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AuditArgs {
+            kind: Option<String>,
+            place: Option<String>,
+            approved: Option<String>,
+            access: Option<String>,
+            outcome: Option<String>,
+            tool: Option<String>,
+            since_ms: Option<i64>,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -1788,6 +1838,32 @@ impl Registry {
                     .is_some_and(|bot| bot.is_empty() || bot.len() > 128)
                 {
                     return fail("invalid_tool_arguments");
+                }
+                if let Some(audit) = args.audit {
+                    if args.turn.is_some()
+                        || args.handle.is_some()
+                        || args.offset != 0
+                        || args.limit.is_some()
+                        || args.query.is_some()
+                        || args.before.is_some_and(|before| before < 1)
+                    {
+                        return fail("invalid_tool_arguments");
+                    }
+                    let query = crate::store::audit::Query {
+                        before: args.before,
+                        since_ms: audit.since_ms,
+                        bot: args.bot,
+                        kind: audit.kind,
+                        place: audit.place,
+                        approved: audit.approved,
+                        access: audit.access,
+                        outcome: audit.outcome,
+                        tool: audit.tool,
+                        limit: Some(AUDIT_ROWS),
+                        ..Default::default()
+                    };
+                    query.check()?;
+                    return Ok(Prepared::HistoryAudit(query));
                 }
                 if let Some(query) = args.query {
                     // A search names no turn to page; the store checks the
@@ -1992,9 +2068,9 @@ impl Registry {
             Prepared::Terminal { .. } | Prepared::WriteStdin { .. } => {
                 fail("terminal_requires_runtime")
             }
-            Prepared::History { .. } | Prepared::HistorySearch { .. } => {
-                fail("history_requires_runtime")
-            }
+            Prepared::History { .. }
+            | Prepared::HistorySearch { .. }
+            | Prepared::HistoryAudit(_) => fail("history_requires_runtime"),
             Prepared::Note { .. } => fail("note_requires_runtime"),
             Prepared::Declared(_) => fail("declared_requires_runtime"),
             Prepared::WebSearch(_) => fail("web_search_requires_runtime"),
@@ -3098,6 +3174,25 @@ async fn shell(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_answered_call_past_what_its_client_is_sent_is_refused() {
+        let tool: Declared = serde_json::from_value(serde_json::json!({
+            "name": "ask", "description": "", "answered_by": "window",
+            "parameters": {"type": "object", "properties": {"text": {"type": "string"}}}
+        }))
+        .unwrap();
+        let call = |n: usize| format!(r#"{{"text":"{}"}}"#, "x".repeat(n));
+        assert!(check_declared(&tool, &call(ANSWERED_ARGUMENTS - 11)).is_ok());
+        let refused = check_declared(&tool, &call(ANSWERED_ARGUMENTS - 10)).unwrap_err();
+        assert_eq!(refused.code, "invalid_arguments");
+        // A tool no client answers takes it: nothing sends it whole.
+        let unanswered = Declared {
+            answered_by: None,
+            ..tool
+        };
+        assert!(check_declared(&unanswered, &call(ANSWERED_ARGUMENTS)).is_ok());
+    }
+
     use super::*;
     #[test]
     fn a_name_matches_a_pattern_s_wildcards_in_any_case() {

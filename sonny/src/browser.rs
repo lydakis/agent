@@ -465,6 +465,9 @@ struct Checked {
 struct Launch {
     confirm: String,
     profile: Option<String>,
+    /// Whose share of Sonny's processes its commands take: the agent's,
+    /// as its other tools' are, not its session's.
+    owner: String,
 }
 
 /// Each session's lock, held through a call, with the confirmations its
@@ -1238,6 +1241,10 @@ async fn run(session: &str, args: &[String], launch: &Launch) -> Ran {
         Some(profile) => command.env("AGENT_BROWSER_PROFILE", profile),
         None => &mut command,
     };
+    // A place among the processes Sonny runs for agents, as a tool call's
+    // `sonny tool` takes one, held while agent-browser runs, from the
+    // agent's own share.
+    let _place = crate::budget::processes().admit(&launch.owner).await;
     match command.output().await {
         Ok(out) => {
             let (stdout, stderr) = (
@@ -1314,7 +1321,11 @@ pub async fn answer(
         ),
         call["bot"].as_str().unwrap_or_default(),
     );
-    drive(&lines, &reach, &session, None, &steps).await
+    // Its share is the one its ordinary tools take (`served::answer`):
+    // a side copy's, its source's.
+    let bot = call["bot"].as_str().unwrap_or_default();
+    let owner = crate::side_copy(&record).unwrap_or(bot);
+    drive(&lines, &reach, &session, owner, None, &steps).await
 }
 
 /// Answer a `browser` call the agent `bot` of the machine `from` made over
@@ -1342,7 +1353,17 @@ pub async fn lent(
         &format!("link\0{from}\0{store}\0{}", payload["bot_id"]),
         bot,
     );
-    drive(&lines, &Reach::lent(), &session, Some(profile), steps).await
+    // An agent of another machine: its share here is its session's, the
+    // only place it takes here.
+    drive(
+        &lines,
+        &Reach::lent(),
+        &session,
+        &session,
+        Some(profile),
+        steps,
+    )
+    .await
 }
 
 /// A call's command lines, 1 to `COMMANDS` of them.
@@ -1367,9 +1388,24 @@ async fn offline(
     lines: &[String],
     steps: &crate::exec::Steps,
 ) -> Result<Option<String>, String> {
+    let asked = json!({"commands": lines, "network": false});
     match reach.network {
         true => Ok(None),
-        false => (steps.ask(NAME, NAME, json!({"commands": lines, "network": false}))).await,
+        false => (steps.ask(NAME, NAME, asked, facts(None), true).await).map(Some),
+    }
+}
+
+/// The commands that only look at a page, and change nothing on it.
+const LOOKS: [&str; 6] = ["snapshot", "screenshot", "get", "is", "console", "errors"];
+
+/// What a step of this tool is in its agent's audit trail: a browser this
+/// machine runs, outside any sandbox, that reads a page with `command`
+/// when it is one that only looks.
+fn facts(command: Option<&str>) -> crate::exec::Facts {
+    crate::exec::Facts {
+        kind: NAME,
+        place: Some("outside"),
+        access: command.filter(|c| LOOKS.contains(c)).map(|_| "read"),
     }
 }
 
@@ -1378,6 +1414,7 @@ async fn drive(
     lines: &[String],
     reach: &Reach,
     session: &str,
+    owner: &str,
     profile: Option<&str>,
     steps: &crate::exec::Steps,
 ) -> Result<Value, (&'static str, String)> {
@@ -1398,6 +1435,7 @@ async fn drive(
     let launch = Launch {
         confirm: confirm.clone(),
         profile: profile.map(str::to_owned),
+        owner: owner.to_owned(),
     };
     // One call at a time in a session, through its confirmations:
     // agent-browser holds one pending action a session and confirms it
@@ -1433,31 +1471,30 @@ async fn drive(
         let asks = command.ask
             || (command.subaction.as_deref())
                 .is_some_and(|action| confirm.split(',').any(|confirmed| confirmed == action));
-        let mut ran = match asks {
-            true => match steps.ask(NAME, NAME, json!({"command": line})).await {
-                Ok(step) => {
-                    let ran = run(&session, &command.args, &launch).await;
-                    if let Some(step) = step {
-                        steps.ran(step, !ran.ok).await;
-                    }
-                    ran
-                }
-                Err(why) => Ran {
-                    said: why,
-                    ok: false,
-                    confirmation: None,
-                },
+        // Each command is told to the agent's daemon before it runs: put to
+        // its gate when it asks, else recorded in its audit trail.
+        let verb = command.args.first().map(String::as_str);
+        let mut ran = match steps
+            .ask(NAME, NAME, json!({"command": line}), facts(verb), asks)
+            .await
+        {
+            Ok(step) => {
+                let ran = run(&session, &command.args, &launch).await;
+                steps.ran(step, !ran.ok).await;
+                ran
+            }
+            Err(why) => Ran {
+                said: why,
+                ok: false,
+                confirmation: None,
             },
-            false => run(&session, &command.args, &launch).await,
         };
         if let Some(id) = ran.confirmation.take() {
             let asked = json!({"command": line, "confirmation": ran.said});
-            match steps.ask(NAME, NAME, asked).await {
+            match steps.ask(NAME, NAME, asked, facts(None), true).await {
                 Ok(step) => {
                     ran = run(&session, &["confirm".into(), id], &launch).await;
-                    if let Some(step) = step {
-                        steps.ran(step, !ran.ok).await;
-                    }
+                    steps.ran(step, !ran.ok).await;
                 }
                 Err(why) => {
                     let _ = run(&session, &["deny".into(), id], &launch).await;
