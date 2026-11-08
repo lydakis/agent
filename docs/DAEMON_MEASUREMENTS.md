@@ -7958,3 +7958,43 @@ all at once, and then every bot gets its next turn, all at once.
   - CPU and the RSS a summary leaves behind roughly double on both builds, about 46 KiB per summarized bot. That is allocator high water from the summary calls, which main shows the same after its next turns.
   - Nothing more is held per idle bot.
 - **Daemon stays responsive.** The slowest `stats` answer stays under 3 ms while 200 summaries run beside the run loop.
+
+**Hot-path screen** (AGENTS.md: `bench.admission_burst` and
+`bench.completion_burst` at `--repeat 5`, `bench.footprint` at `--repeat 2`,
+`bench.lifecycle` socket 32 echo bots), base `main` (3b3a00f) against head,
+two alternating rounds each. The Perf workflow's run on f25b67c (GitHub
+runner); the later commits do not touch the turn's path:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 43.276 | 44.478 | +2.8% |
+| admission | burst submit p99, ms | 7.214 | 7.362 | +2.0% |
+| completion | release to terminal p99, ms | 15.158 | 14.894 | -1.7% |
+| footprint | idle RSS, MiB | 15.391 | 15.203 | -1.2% |
+| footprint | per idle bot, KiB | 1.346 | 1.604 | +19.2% |
+| footprint | RSS after a turn each, MiB | 23.895 | 24.918 | +4.3% |
+| footprint | CPU per turn, ms | 1.391 | 1.403 | +0.9% |
+| lifecycle | CPU, s | 0.67 | 0.67 | +0.0% |
+| lifecycle | p95 turn, ms | 582.072 | 584.937 | +0.5% |
+| lifecycle | peak RSS, MiB | 22.439 | 22.787 | +1.5% |
+
+The same screen on a 4-CPU Linux container, release builds of 3b3a00f and
+132b875:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 41.466 | 40.599 | -2.1% |
+| admission | burst submit p99, ms | 8.013 | 8.265 | +3.2% |
+| completion | release to terminal p99, ms | 14.293 | 14.167 | -0.9% |
+| footprint | idle RSS, MiB | 15.516 | 15.094 | -2.7% |
+| footprint | per idle bot, KiB | 1.572 | 1.75 | +11.3% |
+| footprint | RSS after a turn each, MiB | 25.086 | 25.057 | -0.1% |
+| footprint | CPU per turn, ms | 1.199 | 1.287 | +7.4% |
+| lifecycle | CPU, s | 0.63 | 0.67 | +6.3% |
+| lifecycle | p95 turn, ms | 608.999 | 586.029 | -3.8% |
+| lifecycle | peak RSS, MiB | 22.891 | 22.98 | +0.4% |
+
+- **Store work per turn is unchanged.** The gate counts it, and it passed on both runs. A turn that ends below the threshold adds one comparison and no store job.
+- **Per idle bot moves both ways.** It reads -8.8% on another local round, against +19.2% and +11.3% here, at 1.3 to 1.75 KiB. Nothing new is held per idle bot: the map of summaries running has an entry only while one runs.
+- **A false RSS reading.** A first local footprint and lifecycle run showed head's RSS 2.8 MiB higher. All of the gap was in file-backed pages of the head binary (13.8 MiB resident against 11.1 MiB), and its anonymous memory and heap matched main's to the KiB (1644 KiB each). The head binary had just been built, so more of it sat in the page cache. Fresh copies of the two binaries gave 15.9 and 15.8 MiB idle, and the footprint and lifecycle rows above are from those copies.
+- **CPU and latency** moved both ways within the runner's noise. Under the gate's rule, nothing warned.
