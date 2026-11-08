@@ -18042,6 +18042,27 @@ fn a_bot_carries_its_whole_status_through_every_transition() {
         bob["waiting_on"],
         db.turn_view("Bob", second).unwrap()["waiting_on"]
     );
+    // A message behind the held turn ending leaves the hold.
+    let behind = db
+        .begin(
+            "Bob",
+            "r2b",
+            "behind",
+            false,
+            &TurnOptions {
+                delivery: Delivery::Queue,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.end_queued(behind, &Error::new("cancelled")).unwrap();
+    let (still, _) = listed(&db);
+    assert_eq!(
+        (&still["status"], &still["waiting_on"]),
+        (&bob["status"], &bob["waiting_on"])
+    );
     // Failed before it started: its failure is the bot's last.
     db.end_queued(second, &Error::new("provider_unavailable"))
         .unwrap();
@@ -18074,6 +18095,21 @@ fn a_bot_carries_its_whole_status_through_every_transition() {
         (&bob["status"], &bob["last"]["turn"]),
         (&json!("failed"), &json!(second))
     );
+}
+
+#[test]
+fn a_listings_cursor_never_falls_behind_a_deleted_bots_events() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let (_, before) = listed(&db);
+    // Carol owns the newest events, and takes them with her.
+    db.delete_bot("Carol").unwrap();
+    let (_, after) = listed(&db);
+    assert!(after >= before, "{after} < {before}");
+    // Following from it finds no gap: nothing changed since the listing.
+    let page = db.events_after(after, 64).unwrap();
+    assert_eq!(page["pruned_before"], Value::Null, "{page}");
 }
 
 #[test]

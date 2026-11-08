@@ -3552,12 +3552,16 @@ impl Database {
                 "name is a GLOB pattern of 1 to 256 bytes",
             );
         }
-        // The events' cursor, read before the bots: a client that lists and
-        // then follows from it misses no change, and one it replays it saw
-        // already only restates a state its next event replaces.
+        // The events' high-water mark, read before the bots: a client that
+        // lists and then follows from it misses no change, and one it
+        // replays it saw already only restates a state its next event
+        // replaces. The sequence, not the newest row, which a deleted bot
+        // takes with it, so the cursor never falls behind what was pruned.
         let cursor: i64 = (self.conn)
-            .prepare_cached("SELECT COALESCE(MAX(id),0) FROM events")?
-            .query_row([], |r| r.get(0))?;
+            .prepare_cached("SELECT seq FROM sqlite_sequence WHERE name='events'")?
+            .query_row([], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
         let after = after.unwrap_or("");
         let limit_rows = (limit + 1) as i64;
         let prefix = name.map(glob_prefix);
@@ -6984,8 +6988,9 @@ impl Database {
             params![ended, finished, turn],
         )?;
         // One that failed is its bot's newest ending, and its status when
-        // none runs; one cancelled in line did nothing, and a bot it held
-        // says again how its last turn ended.
+        // none runs; one cancelled in line did nothing. Ending the held turn
+        // at the front of the line ends the hold, and the bot says again how
+        // its last turn ended; ending one behind it leaves the hold.
         if ended == "failed" {
             record_ended(
                 &tx,
@@ -6999,9 +7004,10 @@ impl Database {
         }
         tx.prepare_cached(
             "UPDATE bots SET status=COALESCE(last_status,'idle'),waiting_on=NULL
-             WHERE name=? AND running_turn IS NULL AND status!='deleting'",
+             WHERE name=?1 AND running_turn IS NULL AND status!='deleting'
+                AND (status!='held' OR ?2)",
         )?
-        .execute([&name])?;
+        .execute(params![&name, status == "ready"])?;
         if status == "ready" {
             promote(&tx, &name)?;
         }

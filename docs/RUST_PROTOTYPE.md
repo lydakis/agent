@@ -3425,9 +3425,10 @@ when it is the newer. No transition adds a statement: each widens the
 update of the bot row it already made, and a hold or an ending in line
 adds one update by name inside its own commit.
 
-A `bots` page also returns `cursor`, the events' cursor read before the
-page: list, then `follow` with `after` set to the first page's cursor, and
-no change is missed. An event already reflected in the listing restates a
+A `bots` page also returns `cursor`, the events' high-water mark read
+before the page (the sequence, so a deleted bot's events never move it
+back past what was pruned): list, then `follow` with `after` set to the
+first page's cursor, and no change is missed. An event already reflected in the listing restates a
 state the next event replaces. The upgrade reads each bot's status from its
 turns: its newest that counts, its error from that turn's `turn_finished`
 event while the event is kept.

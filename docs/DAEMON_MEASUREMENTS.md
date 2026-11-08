@@ -7871,7 +7871,7 @@ widen the update of the bot row each already made: no statement is added
 (finishing keeps the newer of two endings with `CASE`s in its one update).
 A hold and an ending in line, which did not touch the row, add one update by
 name in their own commit. `bots` reads seven more columns a row and returns
-the events' cursor, one read of the events' newest id.
+the events' cursor, one read of the events' sequence.
 
 Who gains is a client that shows the fleet. Sonny's `/status` asked every
 agent for its last eight turns at each refresh; it now reads each agent's
