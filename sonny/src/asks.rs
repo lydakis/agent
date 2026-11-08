@@ -1371,6 +1371,11 @@ impl Asked {
             })
             .collect()
     }
+    /// Whether the person wrote words of their own in what was read: the
+    /// questions before those are set aside.
+    pub fn moved_on(&self) -> bool {
+        self.0.moved_on
+    }
 }
 
 /// Whether the ask `asked` by call `call` is still open, read as
