@@ -1280,6 +1280,10 @@ struct Service {
     active: Actives,
     next_task: u64,
     jobs: JoinSet<(String, i64, u64, Result<turn::Exit>)>,
+    /// Per bot, the summary its last turn started as it ended, until it
+    /// is installed; each turn task of the bot takes it from here.
+    aheads: turn::Aheads,
+    tails: Tails,
     replays: JoinSet<()>,
     /// Retention tasks own outputs and must release them before stdout joins.
     retention: JoinSet<()>,
@@ -1332,6 +1336,27 @@ struct Service {
     /// When the first turn held in line on a cause is tried again, kept as
     /// `lapses` is.
     holds: Option<tokio::time::Instant>,
+}
+
+/// Summaries started as their turns ended (see [`turn::Ahead`]): each turn
+/// task hands its own here once its end is committed, and the run loop
+/// runs them beside it. A stopping daemon drops them: the next turn
+/// summarizes as one did before.
+struct Tails {
+    running: JoinSet<()>,
+    sender: mpsc::UnboundedSender<turn::Tail>,
+    started: mpsc::UnboundedReceiver<turn::Tail>,
+}
+
+impl Default for Tails {
+    fn default() -> Self {
+        let (sender, started) = mpsc::unbounded_channel();
+        Tails {
+            running: JoinSet::new(),
+            sender,
+            started,
+        }
+    }
 }
 
 /// Parked turns' wake times, at most one per turn: a turn that parks again
@@ -1939,6 +1964,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         active: Actives::default(),
         next_task: 0,
         jobs: JoinSet::new(),
+        aheads: Default::default(),
+        tails: Default::default(),
         replays: JoinSet::new(),
         retention: JoinSet::new(),
         lane,
@@ -2031,6 +2058,10 @@ pub async fn run(config: Configuration) -> Result<()> {
                     }
                 }
                 _ = service.retention.join_next(), if !service.retention.is_empty() => {}
+                Some(tail) = service.tails.started.recv() => {
+                    service.tails.running.spawn(tail);
+                }
+                _ = service.tails.running.join_next(), if !service.tails.running.is_empty() => {}
                 joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
                     let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
                     service.complete(bot, turn, task, exit).await?;
@@ -2046,7 +2077,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                     // the next start.
                     let running = service.store.op("running_processes", |db| db.running_processes()).await?;
                     let clients = sessions.keys().any(|id| !companion_sessions.contains(id));
-                    if !clients && service.active.is_empty() && service.admissions.is_empty() && running == 0 {
+                    if !clients && service.active.is_empty() && service.admissions.is_empty() && running == 0 && service.tails.running.is_empty() {
                         if last_activity.elapsed() >= idle_exit.unwrap() { break; }
                     } else {
                         last_activity = std::time::Instant::now();
@@ -2311,6 +2342,8 @@ pub async fn run(config: Configuration) -> Result<()> {
     }
     service.replays.abort_all();
     while service.replays.join_next().await.is_some() {}
+    service.tails.running.abort_all();
+    while service.tails.running.join_next().await.is_some() {}
     // Terminals and background commands end with the daemon, and record
     // how on their handles, so no result task keeps the store open below.
     service.registry.end_terminals();
@@ -3397,6 +3430,12 @@ impl Service {
             })
             .slot
             .clone();
+        let ahead = self
+            .aheads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&bot)
+            .cloned();
         let task = Turn {
             bot,
             turn,
@@ -3420,13 +3459,21 @@ impl Service {
             read_results: Default::default(),
             side: Default::default(),
             stopping: self.draining.clone(),
+            ahead,
+            aheads: self.aheads.clone(),
+            after: Default::default(),
+            tailing: Default::default(),
         };
+        let task = Arc::new(task);
+        let tails = self.tails.sender.clone();
         self.jobs.spawn(async move {
             let (bot, id) = (task.bot.clone(), task.turn);
             // Keep the cancellation receiver alive through completion so an
             // interrupt cannot mistake this task for an unreaped parked turn.
             let mut cancelled = cancelled;
+            task.enter_ahead().await;
             let mut exit = task.execute(cancelled.clone()).await;
+            task.leave_ahead().await;
             // An interrupt that came as the turn parked, after it last
             // looked, still ends it: its requester was told it would.
             if !matches!(exit, turn::Exit::Finished(_))
@@ -3437,11 +3484,27 @@ impl Service {
             let result = match &exit {
                 turn::Exit::Finished(error) => {
                     slot.release();
-                    commit_finish(&task.store, &bot, id, error.as_ref(), &mut cancelled)
-                        .await
-                        .map(|()| exit)
+                    let committed =
+                        commit_finish(&task.store, &bot, id, error.as_ref(), &mut cancelled).await;
+                    // The summary it planned as it ended starts once the
+                    // end is committed, holding the turn's own record.
+                    match task.take_after() {
+                        Some(after) if committed.is_ok() => {
+                            let tail = task.clone();
+                            let _ = tails.send(Box::pin(async move { tail.tail(after).await }));
+                        }
+                        Some(after) => {
+                            *task.after.lock().unwrap_or_else(|e| e.into_inner()) = Some(after);
+                            task.drop_after();
+                        }
+                        None => {}
+                    }
+                    committed.map(|()| exit)
                 }
-                _ => Ok(exit),
+                _ => {
+                    task.drop_after();
+                    Ok(exit)
+                }
             };
             drop(cancelled);
             (bot, id, task_id, result)
@@ -6067,6 +6130,8 @@ mod tests {
             }),
             next_task: 1,
             jobs: JoinSet::new(),
+            aheads: Default::default(),
+            tails: Default::default(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
             lane: lane::Lane::new(2, deliver),
@@ -6280,6 +6345,8 @@ mod tests {
             }),
             next_task: 1,
             jobs: JoinSet::new(),
+            aheads: Default::default(),
+            tails: Default::default(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
             lane: lane::Lane::new(2, deliver),
@@ -6570,6 +6637,8 @@ mod tests {
             }),
             next_task: 0,
             jobs: JoinSet::new(),
+            aheads: Default::default(),
+            tails: Default::default(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
             lane: lane::Lane::new(2, deliver),
@@ -6811,6 +6880,8 @@ mod tests {
             active: Actives::default(),
             next_task: 0,
             jobs: JoinSet::new(),
+            aheads: Default::default(),
+            tails: Default::default(),
             replays: JoinSet::new(),
             retention: JoinSet::new(),
             lane: lane::Lane::new(2, deliver),

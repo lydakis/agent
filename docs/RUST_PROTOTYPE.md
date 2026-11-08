@@ -3662,6 +3662,38 @@ turn resumed before it goes on with its calls rather than parking on the
 summarizer's pool. The time the turn waits for it counts toward the turn's
 `summary_ms`.
 
+#### Summaries after the turn
+
+A turn that ends on its reply with the view, that reply included, past the
+threshold plans the next turn's summary as it ends, rather than leaving it
+to that turn's start, where it would hold the turn before its first call.
+Below the threshold the turn ends on one comparison; past it, the view is
+read again and the summary planned as at a boundary, copying the turn's
+last call while its cache is warm. Its call starts once the turn's end is
+committed: the turn is reported finished at once, and the summary runs
+beside the run loop, bounded and billed as one beside a call is, to the
+turn that ended (`model_rounds` and the usage event name that turn; its
+retries are that turn's `retry` events). The `compacted` event's request
+says `"after_turn": true`, and its `turn` is the one that ended; so do
+its `compaction_text_delta` and `compaction_thinking_delta` events, which a
+client keeps off the turn running then. Protocol 58.
+
+It goes in as soon as it lands when no turn of the bot runs. A turn that
+started meanwhile does not wait for it: the turn starts no summary of its
+own while it runs, and takes it in at its first boundary after it lands,
+or as its task ends. The turn waits for it only when its view no longer
+fits beside the reply's estimated size, outgrows the input limit, or a
+client asked for a summary; the wait counts toward the turn's
+`summary_ms`. A bot has at most one such summary at a time: a turn that
+ends while one runs starts none. It is dropped, refused with
+`compaction_stale`, when another summary replaced the view it was planned
+on or the bot's model, summarizer, or compaction instructions changed
+before it went in; it is billed all the same. A stopping daemon drops it,
+as it ends no turn, and the next turn summarizes as before. A daemon whose
+clients are gone stays up until it lands. A summary that cannot be
+planned, under a budget its calls might pass, with the summarizer's pool
+closed, or with no copy to make, is left to the next turn's start.
+
 The result is recorded in one transaction: the summary, the covered turns'
 user prompts verbatim (each up to 2 KiB, with a 16 KiB budget for text plus
 entry metadata, the oldest and newest kept when there are more), and the cut, the prompt node the verbatim
