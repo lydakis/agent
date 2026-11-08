@@ -115,6 +115,22 @@ def main():
     out['gate_share_of_turn'] = dist(shares)
     out['gate_ms_per_gated_turn'] = dist(list(per_turn.values()))
 
+    # From the turn's acceptance to its start (waiting behind another turn,
+    # pacing, a go-later) and to its first finished item, by kind of agent.
+    accepted = {(b, t): ms for b, t, ms in db.execute(
+        "SELECT bot, turn, min(written_ms) FROM events WHERE kind='accepted' AND written_ms >= ? GROUP BY bot, turn",
+        (since,))}
+    first = {(b, t): ms for b, t, ms in db.execute(
+        "SELECT bot, turn, min(written_ms) FROM events WHERE kind='message' AND written_ms >= ? GROUP BY bot, turn",
+        (since,))}
+    starts = collections.defaultdict(list)
+    for b, t, s0 in db.execute('SELECT bot, id, started_ms FROM turns WHERE started_ms >= ?', (since,)):
+        if (b, t) in accepted:
+            starts[kind(b) + ':accepted_to_start'].append(max(0, s0 - accepted[(b, t)]))
+        if (b, t) in first:
+            starts[kind(b) + ':start_to_first_item'].append(max(0, first[(b, t)] - s0))
+    out['turn_start_ms'] = {k: dist(v) for k, v in sorted(starts.items())}
+
     # Approvals rows: announced to last verdict, by gate, as a cross-check.
     acols = {r[1] for r in db.execute('PRAGMA table_info(approvals)')}
     if 'verdicts' in acols:
