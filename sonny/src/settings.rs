@@ -37,8 +37,19 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load() -> Self {
-        let sonny = agent_client::config::load().map(|config| config.sonny);
-        Self::from(sonny.unwrap_or_default())
+        Self::load_said().0
+    }
+
+    /// [`Settings::load`], and why the config did not read when it did
+    /// not: Sonny opens on its defaults, and says so.
+    pub fn load_said() -> (Self, Option<String>) {
+        match agent_client::config::load() {
+            Ok(config) => (Self::from(config.sonny), None),
+            Err(error) => (
+                Self::from(Default::default()),
+                Some(format!("{error}; Sonny uses its defaults until it reads")),
+            ),
+        }
     }
 
     fn from(sonny: agent_client::config::Sonny) -> Self {

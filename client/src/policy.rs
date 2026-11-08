@@ -115,6 +115,28 @@ pub struct Instructions {
     pub memory: Vec<Source>,
     pub skills: Vec<Skill>,
     pub profiles: Vec<Entry>,
+    /// What [`instructions_leaving_out`] could not use and left out, each
+    /// with why; always empty from [`instructions`], which fails instead.
+    pub left_out: Vec<Failure>,
+}
+
+/// What composing does with a file it cannot use: fails on it, or leaves
+/// it out and says so.
+enum Leave {
+    Refuse,
+    Out(Vec<Failure>),
+}
+impl Leave {
+    /// `failure` as an error, or noted and passed over.
+    fn out(&mut self, failure: Failure) -> Result<(), Failure> {
+        match self {
+            Leave::Refuse => Err(failure),
+            Leave::Out(left) => {
+                left.push(failure);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Why the text could not be composed. Both are reported, never worked
@@ -247,6 +269,14 @@ pub fn agents_files(workspace: &Path) -> Result<Vec<PathBuf>, Failure> {
 }
 
 fn agents_files_from(workspace: &Path, home: Option<&Path>) -> Result<Vec<PathBuf>, Failure> {
+    agents_files_in(workspace, home, &mut Leave::Refuse)
+}
+
+fn agents_files_in(
+    workspace: &Path,
+    home: Option<&Path>,
+    leave: &mut Leave,
+) -> Result<Vec<PathBuf>, Failure> {
     let mut chain = Vec::new();
     let start = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     for dir in start.ancestors() {
@@ -261,8 +291,13 @@ fn agents_files_from(workspace: &Path, home: Option<&Path>) -> Result<Vec<PathBu
     let mut files = Vec::new();
     let mut seen = Vec::new();
     for file in chain.into_iter().rev() {
-        if !is_file(&file)? {
-            continue;
+        match is_file(&file) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(failure) => {
+                leave.out(failure)?;
+                continue;
+            }
         }
         let real = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
         if !seen.contains(&real) {
@@ -795,7 +830,7 @@ fn search(workspace: &Path, kind: Kind) -> Vec<PathBuf> {
 }
 
 fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Failure> {
-    scan(dirs, kind, budget, true)
+    scan(dirs, kind, budget, true, &mut Leave::Refuse)
 }
 
 /// Every profile file the person can start an agent in from `workspace`,
@@ -808,13 +843,24 @@ pub fn profiles(workspace: &Path) -> Result<Vec<Entry>, Failure> {
         Kind::Profiles,
         usize::MAX,
         false,
+        &mut Leave::Refuse,
     )
 }
 
 /// The entries in `dirs`, the first directory's winning a clash; with
-/// `hide`, client roles and their variants left out.
-fn scan(dirs: Vec<PathBuf>, kind: Kind, budget: usize, hide: bool) -> Result<Vec<Entry>, Failure> {
+/// `hide`, client roles and their variants left out. One `leave` leaves
+/// out is still the first directory's: the same name in a later one never
+/// stands in for it.
+fn scan(
+    dirs: Vec<PathBuf>,
+    kind: Kind,
+    budget: usize,
+    hide: bool,
+    leave: &mut Leave,
+) -> Result<Vec<Entry>, Failure> {
     let mut found = std::collections::BTreeMap::<String, Entry>::new();
+    // Entries left out, by name, so no later directory's stands in.
+    let mut broken = std::collections::BTreeSet::<String>::new();
     // Profiles that build on a client role: that role's variants, set as
     // a lead's or task's role, not roles to start a peer in.
     let mut hidden = std::collections::BTreeSet::<String>::new();
@@ -822,18 +868,21 @@ fn scan(dirs: Vec<PathBuf>, kind: Kind, budget: usize, hide: bool) -> Result<Vec
     let mut bases = std::collections::BTreeMap::<String, String>::new();
     let mut used = 0usize;
     let mut visited = 0usize;
-    for dir in dirs {
+    'dirs: for dir in dirs {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                not_dangling(&dir)?;
+                if let Err(failure) = not_dangling(&dir) {
+                    leave.out(failure)?;
+                }
                 continue;
             }
             Err(error) => {
-                return Err(Failure::Unreadable {
+                leave.out(Failure::Unreadable {
                     path: dir,
                     reason: error.to_string(),
-                });
+                })?;
+                continue;
             }
         };
         // Do not collect directory contents: the index must fit before any
@@ -841,14 +890,20 @@ fn scan(dirs: Vec<PathBuf>, kind: Kind, budget: usize, hide: bool) -> Result<Vec
         for entry in entries {
             visited += 1;
             if visited > MAX_ENTRIES {
-                return Err(Failure::TooMany { path: dir });
+                // Left out, what was indexed stands and no more is read.
+                leave.out(Failure::TooMany { path: dir })?;
+                break 'dirs;
             }
-            let path = entry
-                .map_err(|error| Failure::Unreadable {
-                    path: dir.clone(),
-                    reason: error.to_string(),
-                })?
-                .path();
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) => {
+                    leave.out(Failure::Unreadable {
+                        path: dir.clone(),
+                        reason: error.to_string(),
+                    })?;
+                    continue;
+                }
+            };
             // A shadowed entry is skipped before its file is probed, so an
             // override can never be undone by the file it overrides.
             let Some(name) = kind.name(&path) else {
@@ -858,11 +913,17 @@ fn scan(dirs: Vec<PathBuf>, kind: Kind, budget: usize, hide: bool) -> Result<Vec
             if hide && matches!(kind, Kind::Profiles) && client_role(&name) {
                 continue;
             }
-            if found.contains_key(&name) || hidden.contains(&name) {
+            if found.contains_key(&name) || hidden.contains(&name) || broken.contains(&name) {
                 continue;
             }
-            let Some(file) = kind.file(&path)? else {
-                continue;
+            let file = match kind.file(&path) {
+                Ok(Some(file)) => file,
+                Ok(None) => continue,
+                Err(failure) => {
+                    leave.out(failure)?;
+                    broken.insert(name);
+                    continue;
+                }
             };
             let mut entry = Entry {
                 name,
@@ -877,19 +938,26 @@ fn scan(dirs: Vec<PathBuf>, kind: Kind, budget: usize, hide: bool) -> Result<Vec
             if minimum > budget {
                 return Err(too_long(minimum));
             }
-            let mut bytes = read_head(&entry.path, SKILL_HEAD)?;
-            bytes.truncate(SKILL_HEAD);
-            let text = match String::from_utf8(bytes) {
-                Ok(text) => text,
-                Err(error) if error.utf8_error().error_len().is_none() => {
-                    let valid = error.utf8_error().valid_up_to();
-                    String::from_utf8_lossy(&error.into_bytes()[..valid]).into_owned()
-                }
-                Err(error) => {
-                    return Err(Failure::Unreadable {
-                        path: entry.path,
+            let read = read_head(&entry.path, SKILL_HEAD).and_then(|mut bytes| {
+                bytes.truncate(SKILL_HEAD);
+                match String::from_utf8(bytes) {
+                    Ok(text) => Ok(text),
+                    Err(error) if error.utf8_error().error_len().is_none() => {
+                        let valid = error.utf8_error().valid_up_to();
+                        Ok(String::from_utf8_lossy(&error.into_bytes()[..valid]).into_owned())
+                    }
+                    Err(error) => Err(Failure::Unreadable {
+                        path: entry.path.clone(),
                         reason: error.utf8_error().to_string(),
-                    });
+                    }),
+                }
+            });
+            let text = match read {
+                Ok(text) => text,
+                Err(failure) => {
+                    leave.out(failure)?;
+                    broken.insert(entry.name);
+                    continue;
                 }
             };
             let (front, body) = front_matter(&text);
@@ -997,7 +1065,34 @@ pub fn profile_with(
     builtins: &[(&str, &str)],
     skills: &[(&str, &str)],
 ) -> Result<Option<Profile>, Failure> {
-    let Some(chain) = chain(workspace, name, builtins)? else {
+    profile_in(
+        &layers(workspace),
+        &search(workspace, Kind::Skills),
+        name,
+        builtins,
+        skills,
+    )
+}
+
+/// [`profile_with`] from the client's own roles and skills alone, none of
+/// the person's files read: the role a client falls back to when the
+/// person's for `name` cannot be used, and says so.
+pub fn shipped_profile(
+    name: &str,
+    builtins: &[(&str, &str)],
+    skills: &[(&str, &str)],
+) -> Result<Option<Profile>, Failure> {
+    profile_in(&[None], &[], name, builtins, skills)
+}
+
+fn profile_in(
+    layers: &[Option<PathBuf>],
+    skill_dirs: &[PathBuf],
+    name: &str,
+    builtins: &[(&str, &str)],
+    skills: &[(&str, &str)],
+) -> Result<Option<Profile>, Failure> {
+    let Some(chain) = chain(layers, name, builtins)? else {
         return Ok(None);
     };
     let mut used: usize = chain.iter().map(|(profile, _)| profile.body.len()).sum();
@@ -1023,7 +1118,7 @@ pub fn profile_with(
     }
     for skill in &skills {
         let room = MAX_INSTRUCTIONS.saturating_sub(used);
-        let text = skill_text(workspace, skill, room, shipped)?;
+        let text = skill_text(skill_dirs, skill, room, shipped)?;
         used += text.len();
         bodies.push(format!("## Skill: {skill}\n\n{text}"));
     }
@@ -1040,7 +1135,7 @@ pub fn lineage(
     name: &str,
     builtins: &[(&str, &str)],
 ) -> Result<Vec<String>, Failure> {
-    Ok((chain(workspace, name, builtins)?
+    Ok((chain(&layers(workspace), name, builtins)?
         .unwrap_or_default()
         .into_iter())
     .map(|(profile, _)| profile.name)
@@ -1049,17 +1144,22 @@ pub fn lineage(
 
 /// The files `name` is built from, itself first, each with its front
 /// matter; `None` when there is no profile `name`.
-fn chain(
-    workspace: &Path,
-    name: &str,
-    builtins: &[(&str, &str)],
-) -> Result<Option<Vec<(Profile, Front)>>, Failure> {
+/// Where profiles are looked for from `workspace`: the folder's, the
+/// person's, then (`None`) the client's own roles, the layer below.
+fn layers(workspace: &Path) -> Vec<Option<PathBuf>> {
     let mut layers: Vec<Option<PathBuf>> = search(workspace, Kind::Profiles)
         .into_iter()
         .map(Some)
         .collect();
-    // The client's own roles: the layer below the person's.
     layers.push(None);
+    layers
+}
+
+fn chain(
+    layers: &[Option<PathBuf>],
+    name: &str,
+    builtins: &[(&str, &str)],
+) -> Result<Option<Vec<(Profile, Front)>>, Failure> {
     let mut chain: Vec<(Profile, Front)> = Vec::new();
     let mut seen: Vec<(String, usize)> = Vec::new();
     // What the role's files hold so far: none is read past what could
@@ -1079,7 +1179,7 @@ fn chain(
             });
         }
         let room = MAX_INSTRUCTIONS.saturating_sub(used);
-        let Some((layer, profile, front)) = find(&layers, &want, from, builtins, room)? else {
+        let Some((layer, profile, front)) = find(layers, &want, from, builtins, room)? else {
             if chain.is_empty() {
                 return Ok(None);
             }
@@ -1165,9 +1265,10 @@ fn role_file(path: &Path, room: usize) -> Result<String, Failure> {
 }
 
 /// The body of the skill `name` a profile carries, if it fits in `room`:
-/// the workspace's, else the user's.
+/// the first of `dirs` that has it (the workspace's, else the user's),
+/// else the client's own.
 fn skill_text(
-    workspace: &Path,
+    dirs: &[PathBuf],
     name: &str,
     room: usize,
     shipped: &[(&str, &str)],
@@ -1178,7 +1279,7 @@ fn skill_text(
             reason: format!("{name:?} is not a skill name"),
         });
     }
-    for dir in search(workspace, Kind::Skills) {
+    for dir in dirs {
         let path = dir.join(name).join("SKILL.md");
         if !is_file(&path)? {
             continue;
@@ -1332,11 +1433,36 @@ pub fn instructions(
     role: Option<&Profile>,
     memory: &[PathBuf],
 ) -> Result<Instructions, Failure> {
+    compose(workspace, role, memory, Leave::Refuse)
+}
+
+/// [`instructions`], with each AGENTS.md, memory index, skill or profile
+/// it cannot read, or that does not fit, left out whole and listed in
+/// `left_out`, for a client that opens anyway and tells the bot and the
+/// person what is missing. Never cut: a file goes in whole or not at all.
+/// Fails only on the role, which a bot is not made without.
+pub fn instructions_leaving_out(
+    workspace: &Path,
+    role: Option<&Profile>,
+    memory: &[PathBuf],
+) -> Result<Instructions, Failure> {
+    compose(workspace, role, memory, Leave::Out(Vec::new()))
+}
+
+fn compose(
+    workspace: &Path,
+    role: Option<&Profile>,
+    memory: &[PathBuf],
+    mut leave: Leave,
+) -> Result<Instructions, Failure> {
     let mut text = preamble();
     let mut sources = Vec::new();
-    for path in agents_files(workspace)? {
+    for path in agents_files_in(workspace, home().as_deref(), &mut leave)? {
         let header = agents_header(&path);
-        sources.extend(append(&mut text, path, &header)?);
+        match append(&mut text, path, &header) {
+            Ok(source) => sources.extend(source),
+            Err(failure) => leave.out(failure)?,
+        }
     }
     // Memory and the role go whole, so they are composed first, and the
     // skill and profile lists take the room they leave: shortened, then
@@ -1348,9 +1474,12 @@ pub fn instructions(
     // is; one not written yet is none.
     let mut indexes = Vec::new();
     for path in memory {
-        match std::fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => not_dangling(path)?,
-            _ => indexes.extend(append_memory(&mut after, path.clone())?),
+        let appended = match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => not_dangling(path),
+            _ => append_memory(&mut after, path.clone()).map(|index| indexes.extend(index)),
+        };
+        if let Err(failure) = appended {
+            leave.out(failure)?;
         }
     }
     // The role comes last: the most specific text a bot is given.
@@ -1370,7 +1499,7 @@ pub fn instructions(
     let tail = after.split_off(text.len());
     let mut lists = Vec::new();
     for kind in [Kind::Skills, Kind::Profiles] {
-        let entries = index(search(workspace, kind), kind, usize::MAX)?;
+        let entries = scan(search(workspace, kind), kind, usize::MAX, true, &mut leave)?;
         let room = MAX_INSTRUCTIONS.saturating_sub(text.len() + tail.len());
         let (block, kept) = fit(kind, entries, room);
         text.push_str(&block);
@@ -1379,12 +1508,17 @@ pub fn instructions(
     text.push_str(&tail);
     let profiles = lists.pop().unwrap_or_default();
     let skills = lists.pop().unwrap_or_default();
+    let left_out = match leave {
+        Leave::Refuse => Vec::new(),
+        Leave::Out(left) => left,
+    };
     Ok(Instructions {
         text,
         sources,
         memory: indexes,
         skills,
         profiles,
+        left_out,
     })
 }
 
@@ -2348,6 +2482,109 @@ mod tests {
         std::fs::write(root.join(".agents/skills/README.md"), "notes").unwrap();
         assert!(instructions(&root, None, &[]).unwrap().skills.is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn leaving_out_composes_without_what_cannot_be_read_and_says_why() {
+        let root = temp("leaving-out");
+        std::fs::create_dir_all(root.join(".agents/skills/good")).unwrap();
+        std::fs::write(
+            root.join(".agents/skills/good/SKILL.md"),
+            "---\ndescription: Use when good\n---\nGood.",
+        )
+        .unwrap();
+        // A skill folder copied as a link to where it no longer is.
+        std::os::unix::fs::symlink("/nowhere/review", root.join(".agents/skills/review")).unwrap();
+        std::os::unix::fs::symlink("gone.md", root.join("AGENTS.md")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/AGENTS.md"), "Kept rule.").unwrap();
+        std::os::unix::fs::symlink("gone", root.join("memory.md")).unwrap();
+        let memory = [root.join("memory.md")];
+        let workspace = root.join("sub");
+        // Nothing changes for a caller that refuses.
+        assert_eq!(
+            instructions(&root, None, &memory).unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        let role = Profile::parse("lead", None, "You lead.");
+        let composed = instructions_leaving_out(&root, Some(&role), &memory).unwrap();
+        let left: Vec<PathBuf> = (composed.left_out.iter())
+            .map(|failure| match failure {
+                Failure::Unreadable { path, .. } => path.clone(),
+                other => panic!("{other}"),
+            })
+            .collect();
+        assert_eq!(
+            left,
+            [
+                root.join("AGENTS.md"),
+                root.join("memory.md"),
+                root.join(".agents/skills/review")
+            ]
+        );
+        assert!(
+            composed.left_out[0]
+                .to_string()
+                .contains("a link to a missing file")
+        );
+        let names: Vec<&str> = composed.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["good"]);
+        assert!(composed.text.contains("# Role: lead\n\nYou lead."));
+        // A deeper folder's rules still go in, whole, the broken one above
+        // left out.
+        let deeper = instructions_leaving_out(&workspace, None, &[]).unwrap();
+        assert!(deeper.text.contains("Kept rule."));
+        assert_eq!(deeper.left_out.len(), 1);
+        // A broken entry keeps its name: a later folder's never stands in.
+        let other = temp("leaving-out-other");
+        std::fs::create_dir_all(other.join("review")).unwrap();
+        std::fs::write(other.join("review/SKILL.md"), "Theirs.").unwrap();
+        let mut leave = Leave::Out(Vec::new());
+        let found = scan(
+            vec![root.join(".agents/skills"), other.clone()],
+            Kind::Skills,
+            usize::MAX,
+            true,
+            &mut leave,
+        )
+        .unwrap();
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["good"]);
+        // A folder that is a broken link is left out, and the rest indexed.
+        std::fs::rename(root.join(".agents/skills"), root.join("skills.real")).unwrap();
+        std::os::unix::fs::symlink("gone", root.join(".agents/skills")).unwrap();
+        let mut leave = Leave::Out(Vec::new());
+        let found = scan(
+            vec![root.join(".agents/skills"), other.clone()],
+            Kind::Skills,
+            usize::MAX,
+            true,
+            &mut leave,
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(matches!(leave, Leave::Out(left) if left.len() == 1));
+        let _ = std::fs::remove_dir_all(&other);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_shipped_profile_reads_none_of_the_persons_files() {
+        let builtins = [("lead", "---\nskills: [coord]\n---\nShipped lead.")];
+        let skills = [("coord", "Shipped coordination.")];
+        let lead = shipped_profile("lead", &builtins, &skills)
+            .unwrap()
+            .unwrap();
+        assert!(lead.path.is_none());
+        assert_eq!(
+            lead.body,
+            "Shipped lead.\n\n## Skill: coord\n\nShipped coordination."
+        );
+        assert!(
+            shipped_profile("other", &builtins, &skills)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
