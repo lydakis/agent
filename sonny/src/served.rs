@@ -775,6 +775,23 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             })
             .map_err(|e| ("follow_refused", e))
         }
+        name if name == crate::resolved::TOOL => {
+            let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
+            let (client, _events) = Client::connect(&socket)
+                .await
+                .map_err(|e| ("not_marked", e.to_string()))?;
+            let by = std::env::var("AGENT_CALL_BOT").unwrap_or_else(|_| caller.clone());
+            let turn = std::env::var("AGENT_TURN")
+                .ok()
+                .and_then(|turn| turn.parse().ok())
+                .ok_or(("not_marked", "AGENT_TURN is not set".to_owned()))?;
+            let call = std::env::var("AGENT_CALL").unwrap_or_default();
+            let marked =
+                crate::resolved::mark(&client, &store, (&caller, &by), (turn, &call), arguments)
+                    .await;
+            client.close().await;
+            marked.map_err(|e| ("not_marked", e))
+        }
         name if name == crate::margin::TOOL => {
             let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
             let (client, _events) = Client::connect(&socket)

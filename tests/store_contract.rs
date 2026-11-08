@@ -17641,7 +17641,7 @@ fn a_tool_hosts_steps_are_kept_with_the_facts_it_declares() {
     })
     .unwrap();
     assert!(matches!(
-        db.step_check("Lead", turn, "c1/2", 0).unwrap().step,
+        db.step_check("Lead", turn, "c1/2", 0, false).unwrap().step,
         Step::Decided(_)
     ));
     // Each report ends its step's row; told twice, the first holds.
@@ -17905,7 +17905,7 @@ fn a_gated_step_is_told_done_once_even_when_its_row_was_trimmed() {
         leased: false,
     })
     .unwrap();
-    db.step_check("Lead", turn, "c1/1", 0).unwrap();
+    db.step_check("Lead", turn, "c1/1", 0, false).unwrap();
     // The person trims the whole trail while the step runs.
     let bound = db.audit_bound(None, Some(i64::MAX)).unwrap();
     assert_eq!(db.audit_trim(bound).unwrap(), 2);
