@@ -30,7 +30,7 @@ and `message`), `remove`, `run` or `show` NAME, or nothing to list them.
 An agent lists and shows only its own: those that wake it, send their answers
 to it, or start an agent it added; `sonny automation list` lists every one.
 A look acts on nothing and runs as any read does, also for an agent whose
-sandbox no one reviews. An add, a removal or a run is a step its gate judges
+sandbox no one reviews. An add, a removal or a run is a step its gate decides
 first (`approve_step`), as a script's calls are, and is refused, as the
 other ways out of its sandbox are, for a confined agent with no gate.
 A row whose last fire sent a turn says how that turn ended, as the daemon
@@ -133,10 +133,10 @@ in the folder `add` ran in, with that folder's composed policy, the
 default tools and Sonny's own a task has: the memory tool, and `exec` while
 an MCP server is on, so an agent no one opens reaches the person's servers
 as one they open does; one an automation made before it had them takes them at
-its next fire, gated as its mode gates the rest), gated by the approver
+its next fire, gated as its mode gates the rest), gated by the reviewer
 and sandboxed to its folder as `sonny --new` makes one (`auto`), with the
 person's fallback for its model: one way to make an agent, so an agent no
-one opens never runs with more reach than one they do. A call the approver
+one opens never runs with more reach than one they do. A call the reviewer
 doubts waits in `/approvals`, as any agent's does. One an automation made
 before then, with no sandbox and no gate, is confined so at its next
 fire; one the person put in `full` stays there. It is made by the agent that added the automation when one did, so
@@ -228,7 +228,7 @@ catch-up fire after sleep reads as late; an
 answer passed on by `--reply-to` starts with the agent and turn it is from.
 Submissions carry `origin: "automation"`, and a passed-on answer carries
 `from: {bot, turn}`, the turn it is; task updates carry `origin:
-"tasks"`. All are automated input, not human consent for the approver.
+"tasks"`. All are automated input, not human consent for the reviewer.
 
 **Adding again.** An automation is named after its agent unless `--name` says
 otherwise. `add` with a name in use and the same definition changes nothing
@@ -1026,14 +1026,14 @@ destructive (`destructiveHint`) unless it also marks it read-only
 (`readOnlyHint`, which wins), and runs the rest; `writes` asks for every
 call but a read-only tool's; `prompt` asks for every call; `approve` never
 asks. Asking puts the call to the agent's own gate, through the daemon's
-`approve_step`: in `full` nothing waits, in `auto` the judge decides it, in
+`approve_step`: in `full` nothing waits, in `auto` the reviewer decides it, in
 `ask` the person does, the call drawn with `a call in a running script`.
 The script waits for the verdict with its 10 minutes stopped and its place
 among the four running given to another, though it stays among the sixteen
 alive; JavaScript it runs meanwhile, beside the waiting call, still spends
 its time. A denied call rejects with the reason, which the script can catch.
 Once a call a gate allowed has run, Sonny tells the daemon how it ended
-(`step_result`), so the judge of the agent's next call counts it among those
+(`step_result`), so the reviewer of the agent's next call counts it among those
 the turn already ran.
 
 Every call a script makes reaches the daemon's audit trail, asked or not: a

@@ -256,6 +256,21 @@ class ConfinedTests(unittest.TestCase):
         for temporary in {Path('/tmp'), Path(tempfile.gettempdir())}:
             self.assertFalse(role_eval.ROOT.resolve().is_relative_to(temporary.resolve()))
 
+    def test_the_reviewer_s_table_is_named_as_the_arm_s_build_reads_it(self):
+        # A build before 0.9.1 reads [judge] and refuses [reviewer]; a
+        # later one the other way round.
+        with tempfile.TemporaryDirectory() as tmp:
+            old = role_eval.setup(Path(tmp) / 'A1', build(tmp), 'chatgpt/gpt-6.1-sol')[0]
+            self.assertIn('\n[judge]\nmodel = "chatgpt/gpt-6.1-sol"\n', (old / '.agent/config.toml').read_text())
+            new = Path(tmp) / 'new'
+            new.mkdir()
+            for name in ('agent', 'sonny'):
+                (new / name).write_text('#!/bin/sh\n# [reviewer]\n')
+            home = role_eval.setup(Path(tmp) / 'B1', new, 'chatgpt/gpt-6.1-sol')[0]
+            config = (home / '.agent/config.toml').read_text()
+            self.assertIn('\n[reviewer]\nmodel = "chatgpt/gpt-6.1-sol"\n', config)
+            self.assertNotIn('[judge]', config)
+
     def test_the_run_writes_its_folder_without_network_and_the_eval_approves(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'A1'

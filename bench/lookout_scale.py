@@ -511,8 +511,8 @@ class Bench:
         self.create(names, tools=('echo', 'shell'), approve=['shell'], approver='auto')
         log = open(self.out / 'approver.out', 'w')
         process = subprocess.Popen(
-            [str(self.sonny), 'approver', '--store', str(self.store), '--socket', str(self.socket),
-             '--judge', 'openai/synthetic-model'],
+            [str(self.sonny), 'reviewer', '--store', str(self.store), '--socket', str(self.socket),
+             '--model', 'openai/synthetic-model'],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=log, env=self.env, text=True,
             start_new_session=True)
         lines = []
@@ -526,13 +526,13 @@ class Bench:
         started = time.monotonic()
         self.control.many([('submit', {'bot': name, 'request_id': 'gate', 'prompt': 'shell:true', 'delivery': 'reject'})
                            for name in names])
-        decided = lambda: [c for l in lines if l.get('event') == 'judged' for c in l['calls']]
+        decided = lambda: [c for l in lines if l.get('event') == 'reviewed' for c in l['calls']]
         while len(decided()) < gated and time.monotonic() - started < 300:
             time.sleep(.25)
         took = time.monotonic() - started
         calls = decided()
         stats = sampler.done()
-        judge_ms = sorted(l['judge_ms'] for l in lines if l.get('event') == 'judged')
+        judge_ms = sorted(l['review_ms'] for l in lines if l.get('event') == 'reviewed')
         alive = process.poll() is None
         (self.out / 'approver.jsonl').write_text(''.join(json.dumps(l) + '\n' for l in lines))
         process.terminate()

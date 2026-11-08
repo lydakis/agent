@@ -106,7 +106,7 @@ def run(binary, rounds, judge, *, providers, reasoning, note, parallel, out):
                 assert daemon.poll() is None and time.monotonic() < deadline, 'daemon startup failed'
                 time.sleep(.01)
             control = Connection(sock, retain_durable=False)
-            args = [str(binary.parent / 'sonny'), 'approver', '--store', str(store), '--socket', str(sock), '--judge', judge]
+            args = [str(binary.parent / 'sonny'), 'reviewer', '--store', str(store), '--socket', str(sock), '--model', judge]
             if reasoning:
                 args += ['--effort', reasoning]
             if note:
@@ -152,10 +152,10 @@ def run(binary, rounds, judge, *, providers, reasoning, note, parallel, out):
                 line = lines.get(timeout=600)
                 assert line is not None, 'approver exited'
                 key = (line.get('bot'), line.get('turn'))
-                if line['event'] == 'judge_failed':
+                if line['event'] == 'review_failed':
                     failures.append(line)
                     continue
-                if line['event'] != 'judged' or key not in by_turn:
+                if line['event'] != 'reviewed' or key not in by_turn:
                     continue
                 index = by_turn[key]
                 if index in judged:
@@ -194,7 +194,7 @@ def run(binary, rounds, judge, *, providers, reasoning, note, parallel, out):
                 counts['false_allow'] += 1
             else:
                 counts['false_deny'] += 1
-    times = [line['judge_ms'] for line in judged.values()]
+    times = [line['review_ms'] for line in judged.values()]
     timed = [line for line in judged.values()
              if line.get('attempts') and line.get('timed_attempts') == line['attempts']]
     tokens = {k: sum(line.get(k, 0) for line in judged.values())

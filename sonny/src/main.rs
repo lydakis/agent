@@ -10,7 +10,6 @@
 //! has run and how to stop it.
 mod acp;
 mod approvals;
-mod approver;
 mod asked;
 mod asks;
 mod attach;
@@ -73,6 +72,7 @@ mod reactions;
 mod recall;
 mod resolved;
 mod responsible;
+mod reviewer;
 mod reviews;
 mod rex;
 mod rules;
@@ -1413,23 +1413,23 @@ fn env_file_provider_at(file: &std::path::Path) -> Option<String> {
     })
 }
 
-/// The daemon's companion that answers an `auto` gate: `sonny approver`,
-/// judged by `model` unless a judge is set, which the daemon then keeps
-/// running for as long as it runs, as it does the lookout. One kept already
-/// keeps the judge it was given first, so leads on other models do not
-/// start it again.
+/// The daemon's companion that answers an `auto` gate: `sonny reviewer`,
+/// reviewing with `model` unless `[reviewer] model` is set, which the
+/// daemon then keeps running for as long as it runs, as it does the
+/// lookout. One kept already keeps the model it was given first, so leads
+/// on other models do not start it again.
 async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
-    keep_approver(client, Some(model)).await
+    keep_reviewer(client, Some(model)).await
 }
 
 /// Sonny's companions in the daemon, so they run for as long as it does,
 /// whether or not a window is open, and come back with the next daemon:
 /// the lookout, `sonny lookout`, which tells leads what happens in their
 /// tasks, and the tool host, `sonny tool-host`, which answers the tools
-/// Sonny gives its agents; and the approver, when one is kept already.
+/// Sonny gives its agents; and the reviewer, when one is kept already.
 /// This Sonny's own build replaces another's: the build is part of what
 /// the daemon keeps, so a Sonny upgraded in place has the daemon start the
-/// new ones, the approver too, with no window in `auto` needed.
+/// new ones, the reviewer too, with no window in `auto` needed.
 async fn start_companions(client: &Client) -> Result<(), String> {
     let me = named::me().map_err(|e| e.to_string())?;
     let build = json!({"SONNY_BUILD": lookout::identity(), named::PROGRAM: me});
@@ -1451,39 +1451,52 @@ async fn start_companions(client: &Client) -> Result<(), String> {
         build,
     )
     .await?;
-    keep_approver(client, None).await
+    keep_reviewer(client, None).await
 }
 
-/// Keep the approver running this Sonny's binary and build: the one kept
-/// already with the judge it has, else, given a `model`, a new one judged
-/// by it. Without one kept or a model, nothing.
-async fn keep_approver(client: &Client, model: Option<&str>) -> Result<(), String> {
+/// Keep the reviewer running this Sonny's binary and build: the one kept
+/// already with the model it has, else, given a `model`, a new one
+/// reviewing with it. Without one kept or a model, nothing.
+async fn keep_reviewer(client: &Client, model: Option<&str>) -> Result<(), String> {
     let me = named::me().map_err(|e| e.to_string())?;
     let listed = client
         .request("companions", json!({}))
         .await
         .map_err(|e| e.to_string())?;
-    let kept =
-        (listed["companions"].as_array().into_iter().flatten()).find(|c| c["name"] == APPROVER);
-    let Some(mut env) = approver_env(kept, model, &lookout::identity()) else {
+    let kept = |name: &str| {
+        (listed["companions"].as_array().into_iter().flatten()).find(|c| c["name"] == name)
+    };
+    // One kept by its name before 0.9.1 is kept again by the reviewer's,
+    // with its model, and goes ([`reviewer::RENAMED`]).
+    let old = kept(OLD_REVIEWER);
+    let Some(mut env) = reviewer_env(kept(REVIEWER).or(old), model, &lookout::identity()) else {
         return Ok(());
     };
     env[named::PROGRAM] = json!(me);
-    let approver = named::named(&me, named::APPROVER);
-    keep(client, APPROVER, &approver, daemon_args("approver"), env).await
+    let program = named::named(&me, named::REVIEWER);
+    keep(client, REVIEWER, &program, daemon_args("reviewer"), env).await?;
+    if old.is_some() {
+        (client
+            .request("companions", json!({"remove": OLD_REVIEWER}))
+            .await)
+            .map_err(|e| format!("{OLD_REVIEWER}: {e}"))?;
+        // Its process name, a link that would keep its old program.
+        let _ = std::fs::remove_file(named::path("sonny-approver"));
+    }
+    Ok(())
 }
 
-/// What the approver runs with: the judge the one `kept` has, else
+/// What the reviewer runs with: the model the one `kept` has, else
 /// `model`, and this Sonny's `build`. `None` when there is neither one kept
 /// nor a model to start one with.
-fn approver_env(kept: Option<&Value>, model: Option<&str>, build: &str) -> Option<Value> {
-    let judge = match kept {
+fn reviewer_env(kept: Option<&Value>, model: Option<&str>, build: &str) -> Option<Value> {
+    let model = match kept {
         Some(kept) => kept["env"]["AGENT_MODEL"].as_str(),
         None => Some(model?),
     };
     let mut env = json!({"SONNY_BUILD": build});
-    if let Some(judge) = judge {
-        env["AGENT_MODEL"] = json!(judge);
+    if let Some(model) = model {
+        env["AGENT_MODEL"] = json!(model);
     }
     Some(env)
 }
@@ -1494,7 +1507,9 @@ const NAME_LOOKUP: Duration = Duration::from_secs(2);
 /// What Sonny names its companions in the daemon.
 const LOOKOUT: &str = "sonny-lookout";
 const TOOL_HOST: &str = "sonny-tool-host";
-const APPROVER: &str = "approver-auto";
+const REVIEWER: &str = "sonny-reviewer";
+/// The reviewer's companion before 0.9.1 ([`reviewer::RENAMED`]).
+const OLD_REVIEWER: &str = "approver-auto";
 
 /// A companion's arguments: its store and socket come from the daemon
 /// that runs it (`AGENT_STORE`, `AGENT_SOCKET`), which may serve the store
@@ -1863,7 +1878,7 @@ fn main() -> std::process::ExitCode {
         }
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         Some((verb, rest)) if verb == tool_host::NAME => tool_host::run(rest),
-        Some((verb, rest)) if verb == "approver" => approver::run(rest),
+        Some((verb, rest)) if verb == "reviewer" => reviewer::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((verb, rest)) if verb == "link" => link::cli(rest),
         Some((verb, rest)) if verb == "rules" => {
@@ -21496,60 +21511,91 @@ mod tests {
     }
 
     #[test]
-    fn the_approver_is_kept_again_with_its_own_judge_and_this_build() {
-        let kept = json!({"name": APPROVER, "command": "/old/Cellar/sonny/0.7.0/bin/sonny",
+    fn the_reviewer_is_kept_again_with_its_own_model_and_this_build() {
+        let kept = json!({"name": REVIEWER, "command": "/old/Cellar/sonny/0.7.0/bin/sonny",
             "env": {"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": "0.7.0 1"}});
-        // A connect with one kept: this binary's build, its judge kept.
+        // A connect with one kept: this binary's build, its model kept.
         assert_eq!(
-            approver_env(Some(&kept), None, "0.8.0 2"),
+            reviewer_env(Some(&kept), None, "0.8.0 2"),
             Some(json!({"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": "0.8.0 2"}))
         );
-        // A lead on another model in auto keeps the first judge too.
+        // A lead on another model in auto keeps the first model too.
         assert_eq!(
-            approver_env(Some(&kept), Some("anthropic/claude-opus-5-5"), "0.8.0 2"),
-            approver_env(Some(&kept), None, "0.8.0 2")
+            reviewer_env(Some(&kept), Some("anthropic/claude-opus-5-5"), "0.8.0 2"),
+            reviewer_env(Some(&kept), None, "0.8.0 2")
         );
-        // None kept: a lead in auto starts one judged by its model; a
+        // None kept: a lead in auto starts one reviewing with its model; a
         // connect alone starts none.
         assert_eq!(
-            approver_env(None, Some("anthropic/claude-opus-5-5"), "0.8.0 2"),
+            reviewer_env(None, Some("anthropic/claude-opus-5-5"), "0.8.0 2"),
             Some(json!({"AGENT_MODEL": "anthropic/claude-opus-5-5", "SONNY_BUILD": "0.8.0 2"}))
         );
-        assert_eq!(approver_env(None, None, "0.8.0 2"), None);
+        assert_eq!(reviewer_env(None, None, "0.8.0 2"), None);
     }
 
-    #[tokio::test]
-    async fn every_start_keeps_the_approver_again_on_this_binary_with_its_judge() {
+    /// The companions `start_companions` adds and removes when the daemon
+    /// keeps `kept`.
+    async fn companions_kept_from(kept: Value) -> (Vec<Value>, Vec<String>) {
         let added = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = added.clone();
+        let removed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, gone) = (added.clone(), removed.clone());
         let client = daemon_answering(move |asked| {
             if let Some(add) = asked["add"].as_object() {
                 seen.lock().unwrap().push(Value::Object(add.clone()));
                 return json!({});
             }
-            json!({"companions": [{"name": APPROVER, "command": "/gone/sonny",
-                "args": ["approver"], "env": {"AGENT_MODEL": "openai/gpt-6"}}]})
+            if let Some(name) = asked["remove"].as_str() {
+                gone.lock().unwrap().push(name.to_owned());
+                return json!({"name": name, "removed": true});
+            }
+            json!({"companions": kept})
         })
         .await;
         start_companions(&client).await.unwrap();
         let added = added.lock().unwrap().clone();
+        let removed = removed.lock().unwrap().clone();
+        (added, removed)
+    }
+
+    #[tokio::test]
+    async fn every_start_keeps_the_reviewer_again_on_this_binary_with_its_model() {
+        let (added, removed) =
+            companions_kept_from(json!([{"name": REVIEWER, "command": "/gone/sonny",
+                "args": ["reviewer"], "env": {"AGENT_MODEL": "openai/gpt-6"}}]))
+            .await;
         let names: Vec<&str> = added.iter().filter_map(|a| a["name"].as_str()).collect();
-        assert_eq!(names, [LOOKOUT, TOOL_HOST, APPROVER]);
+        assert_eq!(names, [LOOKOUT, TOOL_HOST, REVIEWER]);
+        assert!(removed.is_empty());
         // Each by its own name, which is this binary.
         let me = std::env::current_exe().unwrap();
         for (add, name) in added
             .iter()
-            .zip([named::LOOKOUT, named::TOOL_HOST, named::APPROVER])
+            .zip([named::LOOKOUT, named::TOOL_HOST, named::REVIEWER])
         {
             assert_eq!(add["command"], json!(named::named(&me, name)));
             assert_eq!(add["env"][named::PROGRAM], json!(me));
         }
-        assert_eq!(added[2]["args"], json!(["approver"]));
+        assert_eq!(added[2]["args"], json!(["reviewer"]));
         assert_eq!(
             added[2]["env"],
             json!({"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": lookout::identity(),
                 named::PROGRAM: me})
         );
+    }
+
+    #[tokio::test]
+    async fn the_reviewer_kept_by_its_old_name_moves_to_its_own_with_its_model() {
+        let (added, removed) =
+            companions_kept_from(json!([{"name": OLD_REVIEWER, "command": "/gone/sonny",
+                "args": ["approver"], "env": {"AGENT_MODEL": "openai/gpt-6"}}]))
+            .await;
+        let names: Vec<&str> = added.iter().filter_map(|a| a["name"].as_str()).collect();
+        assert_eq!(names, [LOOKOUT, TOOL_HOST, REVIEWER]);
+        assert_eq!(
+            (&added[2]["args"], &added[2]["env"]["AGENT_MODEL"]),
+            (&json!(["reviewer"]), &json!("openai/gpt-6"))
+        );
+        assert_eq!(removed, [OLD_REVIEWER]);
     }
 
     #[tokio::test]

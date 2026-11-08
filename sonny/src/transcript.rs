@@ -1324,7 +1324,7 @@ pub fn from_outside(origin: Option<&str>) -> &'static str {
         Some("commons") => "the commons",
         Some("margin") => "a margin note",
         Some("tasks") => "a task",
-        Some("judge") => "a judge",
+        Some("reviewer") => "the reviewer",
         Some("background") => "a background command",
         Some("limit") => "the model's output limit",
         _ => "outside",
@@ -3158,6 +3158,7 @@ mod tests {
         assert_eq!(from_outside(Some("lookout.bounce")), "a returned message");
         assert_eq!(from_outside(Some("lookout.other")), "the lookout");
         assert_eq!(from_outside(Some("automation.weekly")), "an automation");
+        assert_eq!(from_outside(Some("reviewer")), "the reviewer");
         assert_eq!(
             sender(None, Some("lookout.sources"), None).as_deref(),
             Some("its sources")

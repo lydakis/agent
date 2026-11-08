@@ -266,8 +266,8 @@ def run_socket(binary, arm, *, bots, turns):
                                                    approve=['shell'], approver=tag,
                                                    settings={'approval_hold_ms': 2000})
             if arm != 'socket':
-                args = [str(binary.parent / 'sonny'), 'approver', '--store', str(path / 'state.sqlite'),
-                        '--socket', str(sock), '--judge', 'openai/synthetic-model']
+                args = [str(binary.parent / 'sonny'), 'reviewer', '--store', str(path / 'state.sqlite'),
+                        '--socket', str(sock), '--model', 'openai/synthetic-model']
                 approver = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                             text=True, env=clean_env())
                 threading.Thread(target=lambda: [judged.put(json.loads(line)) for line in approver.stdout],
@@ -339,8 +339,8 @@ def run_socket(binary, arm, *, bots, turns):
     lines = []
     while not judged.empty():
         lines.append(judged.get())
-    judge_ms = [line['judge_ms'] for line in lines if line.get('event') == 'judged']
-    assert arm == 'socket' or all(c['decision'] == 'allow' for line in lines if line.get('event') == 'judged'
+    judge_ms = [line['review_ms'] for line in lines if line.get('event') == 'reviewed']
+    assert arm == 'socket' or all(c['decision'] == 'allow' for line in lines if line.get('event') == 'reviewed'
                                   for c in line['calls']), lines
     jobs = {label: (after[label]['count'] - before.get(label, {}).get('count', 0)) / count for label in after}
     worker_ms = {label: (after[label]['ran_ms'] - before.get(label, {}).get('ran_ms', 0)) / count

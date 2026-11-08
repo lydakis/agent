@@ -1,6 +1,6 @@
-//! The judge `sonny approver` asks about planned calls: which one, picked
-//! in one order, and how it answers. A judge is a `provider/model` the
-//! daemon runs, as a fork of an idle base bot that takes one turn, so
+//! The reviewer model `sonny reviewer` asks about planned calls: which
+//! one, picked in one order, and how it answers. It is a `provider/model`
+//! the daemon runs, as a fork of an idle base bot that takes one turn, so
 //! checks run at once and none sees another. Its reply follows a JSON
 //! Schema the provider enforces, and is checked whole before it counts.
 use crate::{Client, Error};
@@ -17,7 +17,7 @@ pub fn is_model(name: &str) -> bool {
 }
 
 /// Who judges for a bot running `caller`: the judge `named` by the caller
-/// (`--judge`, else the config's `[judge] model`), else the bot's own model. No model is
+/// (`--model`, else the config's `[reviewer] model`), else the bot's own model. No model is
 /// guessed for a provider.
 pub fn pick(named: Option<&str>, caller: Option<&str>) -> Option<String> {
     named.or(caller).map(str::to_owned)
@@ -328,8 +328,8 @@ impl Base {
         match client.request("inspect", json!({"bot": name})).await {
             Ok(bot) if !judge(&bot) => {
                 return Err(Error::with(
-                    "judge_name_taken",
-                    &format!("{name} is a bot that is not a judge; rename it"),
+                    "reviewer_name_taken",
+                    &format!("{name} is a bot that is not a reviewer; rename it"),
                 ));
             }
             Ok(bot) if same(&bot) => {
@@ -361,8 +361,8 @@ impl Base {
                 match judge(&bot) {
                     true => base(&bot),
                     false => Err(Error::with(
-                        "judge_name_taken",
-                        &format!("{name} is a bot that is not a judge; rename it"),
+                        "reviewer_name_taken",
+                        &format!("{name} is a bot that is not a reviewer; rename it"),
                     )),
                 }
             }
@@ -467,7 +467,7 @@ pub async fn turn_with(
             "submit",
             // Said by the judge, not the person: clients draw it so.
             json!({"bot": name, "request_id": name, "prompt": prompt, "delivery": "queue",
-                "origin": "judge", "output_schema": schema}),
+                "origin": "reviewer", "output_schema": schema}),
         )
         .await
     {

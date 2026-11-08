@@ -450,7 +450,7 @@ Handle what cannot wait, then carry on with your turn.
 
 Each event's text is quoted as a JSON string, so it stays one line, and
 its other fields follow as compact JSON, cut at 2,000 characters. The
-note goes with the origin `lookout.sources`, so the approver never reads
+note goes with the origin `lookout.sources`, so the reviewer never reads
 it as the person's words, and Sonny shows it folded, as `↳ From your
 sources · slack 2`. A note names at most 16 events, the ones that steer first, and
 the rest wait for the next, on disk with the rest of what the subscriber is to
@@ -578,11 +578,11 @@ the note until the next turn.
 ## The note
 
 One message, queued (or steered, for the person's words mid-turn), with
-the origin `lookout.tasks`, so the approver reads its words as asking for
+the origin `lookout.tasks`, so the reviewer reads its words as asking for
 nothing. The person's words in a task are not retyped: the note quotes
 their turns (`quotes`), and the daemon copies each in after the note with
 a line naming the turn and who wrote it, so the lead reads the person's
-own words, never a retelling. The approver reads them as the person's but
+own words, never a retelling. The reviewer reads them as the person's but
 not as their word on the lead's calls: the lookout picked them, and only
 words the person sends, or quotes themselves (not the quotes those bring along), consent. A quote the daemon refuses (its task deleted meanwhile, or
 too long) sends the note again naming those turns by their handles alone.
@@ -618,7 +618,7 @@ failed or was stopped is listed with the rest.
 It quotes the person's own words, and each ended turn's final reply (up
 to 32,000 characters and 80 KB as it reads, its two ends kept) marked line
 by line with `>` as the task's own; other messages in a task stay behind their turn's handle. The
-note reaches the approver as the person's words, so the marking is what
+note reaches the reviewer as the person's words, so the marking is what
 tells a task's reply from theirs (George, 2026-10-29: the extra wait round
 on a long-context lead cost more than the risk). A lead reads a turn with
 `wait` only when it needs more than the reply. Sonny shows it folded, as `↳ Task updates`, and a

@@ -16,7 +16,7 @@ pub const DAEMON: &str = "sonny-daemon";
 /// The companions the daemon keeps for Sonny, and the scheduler.
 pub const LOOKOUT: &str = "sonny-lookout";
 pub const TOOL_HOST: &str = "sonny-tool-host";
-pub const APPROVER: &str = "sonny-approver";
+pub const REVIEWER: &str = "sonny-reviewer";
 pub const SCHEDULER: &str = "sonny-scheduler";
 
 /// What a named Sonny process is told its own program is: the `sonny` it

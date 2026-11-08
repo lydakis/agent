@@ -119,6 +119,24 @@ pub fn as_task(dir: &Path, info: &Value, text: &str) -> Result<String, String> {
     })
 }
 
+/// The mark that starts the name of each bot Sonny makes for itself, not
+/// for the person (the reviewer's base and its forks): a leading dot, as
+/// a hidden file has. No project name starts with one
+/// (`agent_client::project::valid_name`), so no agent named from a folder
+/// shares the names, and what lists the person's agents (the sky, /status,
+/// the agent picker) leaves them out by it.
+pub const INTERNAL: &str = ".";
+
+/// `name` as one of Sonny's own bots, under [`INTERNAL`].
+pub fn internal(name: &str) -> String {
+    format!("{INTERNAL}{name}")
+}
+
+/// Whether `bot` is one of Sonny's own, under [`INTERNAL`].
+pub fn is_internal(bot: &str) -> bool {
+    bot.starts_with(INTERNAL)
+}
+
 /// The project `bot` leads: `shop` for its first lead, `shop.lead`, and
 /// for another lead of the same folder, `shop.lead.NAME`; `None` for any
 /// other bot, a lead's side chat (`shop.lead.side-1a2b`) included.
@@ -1242,6 +1260,24 @@ fn picks(arguments: &Value) -> Result<(PathBuf, agent_client::project::Picks), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sonny_s_own_bots_share_no_name_with_a_folder_s() {
+        let base = internal("reviewer.auto");
+        assert!(is_internal(&base) && is_internal(&format!("{base}.4.123.0")));
+        // No project, so none of its agents, starts with the mark.
+        assert!(!agent_client::project::valid_name(&base));
+        assert!(!agent_client::project::valid_name(".reviewer"));
+        for bot in [
+            "reviewer.auto",
+            "shop.lead",
+            "approver.auto",
+            "a.b.reviewer",
+        ] {
+            assert!(!is_internal(bot), "{bot}");
+        }
+        assert_eq!(lead_project(&base), None);
+    }
 
     #[test]
     fn shipped_roles_fit_their_budgets() {
