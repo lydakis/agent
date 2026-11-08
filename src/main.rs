@@ -1,6 +1,8 @@
 mod cli;
 mod client;
 mod client_path;
+#[cfg(test)]
+mod doubling;
 mod server;
 mod sign_in;
 use agent_runtime::{Error, Result, fail_with};
