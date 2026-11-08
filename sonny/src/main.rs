@@ -13310,6 +13310,9 @@ impl App {
             });
             ask
         };
+        // A task's own ask alone: what a check found its reply left
+        // waiting on the person ([`waiting`]) is status, never a card.
+        let asked = |ask: &asks::Ask| !waiting::is_mark(ask);
         // With no multiplexer, the tasks this window started and tracks
         // still, as their rows read them.
         let tracked: std::collections::HashSet<&str> = (self.tasks.values().flatten())
@@ -13319,10 +13322,12 @@ impl App {
             Some(fleet) => (fleet.needs.asks())
                 .filter(|(bot, _)| *bot != self.bot && *bot != fleet.lead)
                 .filter(|(bot, _)| fleet.lineage.contains(*bot))
+                .filter(|(_, ask)| asked(ask))
                 .map(|(bot, ask)| pinned(bot, ask, fleet.short(bot).to_owned()))
                 .collect(),
             None => (self.task_needs.asks())
                 .filter(|(bot, _)| *bot != self.bot && tracked.contains(bot))
+                .filter(|(_, ask)| asked(ask))
                 .map(|(bot, ask)| {
                     let name = (self.project.as_deref())
                         .map_or_else(|| bot.to_owned(), |project| short(bot, project, &self.bot));
@@ -21790,7 +21795,7 @@ mod tests {
         // The agent marks its reply as waiting on the person while no key or
         // event wakes the window: the next look round, at most a frame
         // later, reads it.
-        std::fs::write(&file, r#"{"turn": 3, "for": "a decision"}"#).unwrap();
+        std::fs::write(&file, r#"{"v": 2, "turn": 3, "for": "a decision"}"#).unwrap();
         waiting.read();
         assert!(waiting.holds(false));
         assert_eq!(waiting.mark.as_ref().unwrap().waiting_for, "a decision");
@@ -22640,6 +22645,14 @@ mod tests {
             .map(|(bot, ask)| (bot, ask.question.as_str()))
             .collect();
         assert_eq!(asked, [("calc.plan", "staging or prod")]);
+        // It is status: the lead's window pins no card for it, as it
+        // would for the task's own ask.
+        let mut app = app(client);
+        app.bot = "calc.lead".into();
+        app.fleet = Some(fleet);
+        app.pin_task_asks();
+        assert!(app.asks.is_empty() && app.pending.is_empty());
+        let mut fleet = app.fleet.take().unwrap();
         // Its next turn's check found nothing waiting.
         waiting::keep(&fleet.store, "calc.plan", 4, None).unwrap();
         fleet.rescan().await;

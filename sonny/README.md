@@ -1661,10 +1661,14 @@ small call, its history read from the provider's cache of the turn just
 ended). It is the window's own work, so nothing runs for it while no
 window of the project is open; a task's turn that ended meanwhile is
 checked once a lead's window opens, as it looks over its idle tasks for
-the done check, then never read again until the task moves. A yes is kept beside the store
-(`STORE.waiting/AGENT.json`) until the agent's next turn; its lead's
-window pins it as the task's question, where what you type goes to the
-task, and `/status` says `waits on you for: …`. `[sonny] needs_check = false`
+the done check, then never read again until the task moves. A task's
+reply goes to its lead, which hears every one and asks you itself what
+needs you, so a task's turn waits on you only when it took in words of
+yours, written in its window; a turn its lead or the lookout started
+never does. A yes is kept beside the store (`STORE.waiting/AGENT.json`)
+until the agent's next turn. It is status alone, in the footer, the
+tabs and `/status`, which says `waits on you for: …`: no window draws it
+as a card, as it does a question the agent asked. `[sonny] needs_check = false`
 turns the check off. `sonny status [AGENT] [--json]` prints the project
 `/status` shows, as text or JSON, for an agent's shell or a script: AGENT
 is a lead, a task or a project, and an agent's own shell defaults to it.
