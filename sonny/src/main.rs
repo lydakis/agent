@@ -1979,15 +1979,23 @@ fn where_cli(args: &[String]) -> Result<(), String> {
     let agent = (agent.or_else(|| std::env::var("AGENT_BOT").ok()))
         .filter(|agent| !agent.is_empty())
         .ok_or(format!("name an agent\n{USAGE}"))?;
-    let (_, socket) = daemon_paths(store, socket)?;
+    let (store, socket) = daemon_paths(store, socket)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
     let (socket, project, chain) = runtime.block_on(agents_project_at(&socket, &agent))?;
+    // A sandboxed agent's shell on macOS reaches the daemon by its own
+    // socket, which no Sonny window notes its place under: the windows
+    // note it under the socket they reach the daemon by, the store's own
+    // unless one was named.
+    let noted = std::iter::once(socket.clone())
+        .chain(agent_client::socket::default_socket(&store).ok())
+        .find(|socket| mux::noted(socket, &project))
+        .unwrap_or(socket);
     println!(
         "{}",
-        mux::aim(&socket, &project, &chain, None)?.said(&project)
+        mux::aim(&noted, &project, &chain, None)?.said(&project)
     );
     Ok(())
 }

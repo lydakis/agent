@@ -452,6 +452,12 @@ fn latest_in(file: &Path, alive: impl Fn(u32) -> bool) -> Option<(Window, bool)>
     windows.into_iter().next().map(|window| (window, false))
 }
 
+/// Whether a Sonny window of `project` on the daemon at `socket` has
+/// noted where it is.
+pub fn noted(socket: &Path, project: &str) -> bool {
+    Place::file(socket, project).is_some_and(|file| file.is_file())
+}
+
 pub fn latest(socket: &Path, project: &str) -> Option<(Window, bool)> {
     latest_in(&Place::file(socket, project)?, alive)
 }
