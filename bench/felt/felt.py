@@ -62,6 +62,17 @@ def cpu_rss(pids):
     """CPU seconds and RSS MiB of each live pid, from ps."""
     if not pids:
         return {}
+    if Path('/proc/self/stat').exists():
+        found = {}
+        tick, page = os.sysconf('SC_CLK_TCK'), os.sysconf('SC_PAGE_SIZE')
+        for pid in pids:
+            try:
+                fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+                rss = int(Path(f'/proc/{pid}/statm').read_text().split()[1]) * page / 2**20
+                found[pid] = ((int(fields[11]) + int(fields[12])) / tick, rss)
+            except (OSError, IndexError):
+                pass
+        return found
     out = subprocess.run(['ps', '-o', 'pid=,cputime=,rss=', '-p', ','.join(map(str, pids))],
                          capture_output=True, text=True).stdout
     found = {}

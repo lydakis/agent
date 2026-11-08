@@ -166,6 +166,12 @@ const DRAW_EVERY: Duration = Duration::from_millis(33);
 /// clocks count seconds, and what it reads now and then (counts, tasks,
 /// the margin's files) shows within one.
 const IDLE_FRAME: Duration = Duration::from_secs(1);
+/// How often a window looks round (its jobs' answers, what it reads now
+/// and then, what moves) while something on it moves or it heard from the
+/// person or the daemon within [`LIVELY_FOR`]; otherwise once a frame, so
+/// an idle window wakes once a second, not ten times.
+const LIVELY_TICK: Duration = Duration::from_millis(100);
+const LIVELY_FOR: Duration = Duration::from_secs(5);
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
 /// How much older history is drawn at a time as the view nears its top:
@@ -5483,7 +5489,8 @@ impl App {
                 }
             }
         });
-        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        let mut ticked = Instant::now();
+        let mut heard = Instant::now();
         // A terminal waking with the Mac can be slow to answer the cursor
         // query a resize makes, and a draw then fails; the next tick draws
         // again, and only a terminal that keeps failing ends the client.
@@ -5539,9 +5546,13 @@ impl App {
             if self.quit {
                 return Ok(());
             }
+            let lively = self.moving() || heard.elapsed() < LIVELY_FOR;
+            let next_tick = ticked + if lively { LIVELY_TICK } else { IDLE_FRAME };
+            let mut tick = false;
             tokio::select! {
                 event = events.recv(), if !self.down => {
                     changed = true;
+                    heard = Instant::now();
                     match event {
                         Some(event) => self.daemon(event).await,
                         None => self.dropped(),
@@ -5549,6 +5560,7 @@ impl App {
                 }
                 Some(key) = keys.recv() => {
                     keyed = true;
+                    heard = Instant::now();
                     self.key(key).await
                 }
                 _ = tokio::time::sleep(undrawn.map_or(Duration::ZERO, |at| DRAW_EVERY.saturating_sub(at.elapsed()))), if undrawn.is_some() => {}
@@ -5563,6 +5575,7 @@ impl App {
                     }
                 } => {
                     changed = true;
+                    heard = Instant::now();
                     // What the layout's worker said, between the daemon's events.
                     let event = match news {
                         Ok(event) => event,
@@ -5620,7 +5633,9 @@ impl App {
                         self.fleet_said(said);
                     }
                 }
-                _ = tick.tick() => {
+                _ = tokio::time::sleep_until(next_tick.into()) => {
+                    ticked = Instant::now();
+                    tick = true;
                     if self.project.is_some() {
                         self.done_sweep.look(&self.client, &self.store(), self.scope());
                         // A task the check found done goes as one marked done does.
@@ -5630,10 +5645,15 @@ impl App {
                             }
                         }
                     }
+                    // An idle window's tick is its frame: the clocks move on.
                     changed |= self.moving()
+                        || !lively
                         || drawn.is_none_or(|at| at.elapsed() >= IDLE_FRAME);
                 }
-                _ = self.woken.notified() => changed = true,
+                _ = self.woken.notified() => {
+                    changed = true;
+                    heard = Instant::now();
+                }
                 _ = std::future::ready(()), if reading => {}
             }
             // A window starts quiet once it is due (this check, at most a
@@ -5700,7 +5720,11 @@ impl App {
                     self.waiting.started(turn);
                 }
             }
-            self.waiting.read();
+            // Its file is looked at as the window looks round, not with
+            // each of the daemon's events.
+            if tick {
+                self.waiting.read();
+            }
             self.pin_task_asks();
             self.recheck_task_answers().await;
             self.settle_task_asks().await;
