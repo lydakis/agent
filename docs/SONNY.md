@@ -821,9 +821,11 @@ flags and `--json` ([SKILL.md](../sonny/skills/sonny-setup/SKILL.md));
 `sonny-config`, where the settings live and every key of
 `~/.agent/config.toml` with its values and default, written from the keys
 `/config` lists so it matches the Sonny installed
-([SKILL.md](../sonny/skills/sonny-config/SKILL.md)); and,
-depending on where it runs, `pictures`, `rex-windows`,
-`herdr-panes` or `cmux-tabs`. They are normal skills, real files
+([SKILL.md](../sonny/skills/sonny-config/SKILL.md)); `pictures`; and one
+for each multiplexer the machine has, `rex-windows`, `herdr-panes` and
+`cmux-tabs`, each telling the agent to run `sonny where` first, which
+prints the multiplexer and workspace its `run_in_pane` and `show_agent`
+calls act in now. They are normal skills, real files
 ([skills.rs](../sonny/src/skills.rs)). Sonny notes a fingerprint of each file
 it writes in `~/.agent/sonny/skills` and rewrites or removes a skill only
 while it is as Sonny last wrote it: one the person edited, or one of that
