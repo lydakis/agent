@@ -107,6 +107,16 @@ class Thread:
             if done(message):
                 return seen
 
+    @staticmethod
+    def resumed(test, env, cwd, session):
+        """A new process reopening `session`: its answer."""
+        thread = Thread(test, env, cwd)
+        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        answered = thread.answer_of(thread.ask('session/resume', {'sessionId': session, 'cwd': str(cwd),
+                                                                   'mcpServers': []}))
+        thread.close()
+        return answered
+
     def answer_of(self, request):
         seen = self.until(lambda m: m.get('id') == request and 'method' not in m)
         return seen[-1], [m['params']['update'] for m in seen if m.get('method') == 'session/update']
@@ -435,7 +445,20 @@ class AcpTests(ModelFixture):
             listed, _ = thread.answer_of(thread.ask('session/list', params))
             self.assertEqual([(s['sessionId'], s['title'], s['cwd']) for s in listed['result']['sessions']],
                              [(f'{bot}#{ids[bot]}', bot, str(repo)) for bot in ('calc.lead', 'calc.lead.billing')])
-        # A listed lead reopens; one removed since does not.
+        # A listed lead reopens, as that lead even once a session of that id
+        # was moved to another; one removed since does not.
+        listed = f'calc.lead#{ids["calc.lead"]}'
+        reopened = Thread(self, env, repo)
+        reopened.answer_of(reopened.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        answered, _ = reopened.answer_of(reopened.ask('session/resume', {'sessionId': listed, 'cwd': str(repo),
+                                                                          'mcpServers': []}))
+        self.assertEqual(answered['result']['configOptions'][-1]['currentValue'], 'calc.lead')
+        moved, _ = reopened.answer_of(reopened.ask('session/set_config_option', {
+            'sessionId': listed, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead.billing'}))
+        self.assertEqual(moved['result']['configOptions'][-1]['currentValue'], 'calc.lead.billing')
+        reopened.close()
+        answered, _ = Thread.resumed(self, env, repo, listed)
+        self.assertEqual(answered['result']['configOptions'][-1]['currentValue'], 'calc.lead')
         self.assertIn('result', self.resume(repo, f'calc.lead.billing#{ids["calc.lead.billing"]}'))
         self.assertIn('error', self.resume(repo, f'calc.lead.billing#{ids["calc.lead.billing"] + 100}'))
 

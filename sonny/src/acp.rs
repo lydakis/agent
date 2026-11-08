@@ -441,7 +441,9 @@ impl Agent {
         }
         // A thread comes back as the bot it was, or not at all.
         let bound = match resumed {
-            Some(id) => match t3::recall(id).or_else(|| listed_lead(id)) {
+            // A listed id names its lead itself, whatever the session was
+            // moved to since.
+            Some(id) => match listed_lead(id).or_else(|| t3::recall(id)) {
                 Some(pinned) => {
                     session
                         .bind(self, Some(pinned), false, &project::Pick::Last)
