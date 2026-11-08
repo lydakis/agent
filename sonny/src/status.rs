@@ -230,9 +230,10 @@ pub fn card(
     let mut listed: Vec<&Row> = rows.iter().filter(|r| r.name == "lead").collect();
     for row in &tasks {
         match top(row) {
-            // One that waits on the person's approval is listed there too.
+            // One that waits on the person's approval, or failed, is
+            // listed there too, outside its parent's fold.
             Some(parent) => {
-                if row.state == crate::started::APPROVAL {
+                if row.state == crate::started::APPROVAL || row.group == Group::Failed {
                     listed.push(row);
                 }
                 under.entry(parent).or_default().push(row);
@@ -881,5 +882,20 @@ mod tests {
                 "calc.ask"
             ]
         );
+    }
+
+    #[test]
+    fn a_failed_helper_is_listed_outside_its_parents_fold() {
+        let rows = [
+            row("fix", "idle", Group::Idle),
+            Row {
+                maker: "calc.fix".to_owned(),
+                ..row("tests", "failed", Group::Failed)
+            },
+        ];
+        let lines = text(&card("calc", &rows, 80, &[], Details::Quiet, &[]));
+        assert_eq!(lines[0], "calc · 2 tasks · 1 failed");
+        assert_eq!(lines[2], "Failed · 1");
+        assert!(lines[3].contains("tests"), "{lines:?}");
     }
 }

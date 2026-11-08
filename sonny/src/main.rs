@@ -2895,7 +2895,7 @@ fn status_report(state: &str, bot: &str) {
         }
         Err(_) => false,
     };
-    report_status(shown_status(state, asking), bot);
+    report_status(shown_status(state, asking), state, bot);
 }
 
 /// Whether a question the agent put to the person is open in this window,
@@ -2908,7 +2908,7 @@ fn status_asking(bot: &str, open: bool) {
     else {
         return;
     };
-    report_status(shown_status(&state, open), bot);
+    report_status(shown_status(&state, open), &state, bot);
 }
 
 /// What to say again now that a question is `open` here or not: the
@@ -2938,8 +2938,9 @@ fn asked_now(
 /// Program status (OSC 7501), so a terminal or multiplexer that reads it
 /// (Ghostty, Rex, cmux) can mark this pane working, blocked or done; and
 /// the same to Herdr, which takes it from its own CLI instead. `asking`
-/// is blocked on the person's answer, not their approval.
-fn report_status(state: &str, bot: &str) {
+/// is blocked on the person's answer, not their approval. The title says
+/// `activity`, what the agent's turns and calls do under an open question.
+fn report_status(state: &str, activity: &str, bot: &str) {
     use base64::Engine;
     // A side chat borrows its agent's pane, which keeps saying what the
     // agent itself is doing.
@@ -2967,16 +2968,7 @@ fn report_status(state: &str, bot: &str) {
     // The terminal title, which Rex shows on the block: the bot's name in
     // its project, and what it is doing.
     let name = bot.split_once('.').map_or(bot, |(_, name)| name);
-    let doing = match state {
-        "blocked" => started::APPROVAL,
-        // A question it put to the person ends its turn: it rests.
-        "asking" => started::IDLE,
-        "error" => "failed",
-        // A turn that ended, seen or not yet: it rests.
-        "done" => started::IDLE,
-        "clear" => "",
-        other => other,
-    };
+    let doing = title_doing(activity);
     let title = if doing.is_empty() {
         String::new()
     } else {
@@ -2984,6 +2976,20 @@ fn report_status(state: &str, bot: &str) {
     };
     let _ = write!(stdout, "\x1b]2;{title}\x07");
     let _ = stdout.flush();
+}
+
+/// What a pane's title says its agent does, from its turns and calls
+/// alone: an open question is no state of its own, so one asked while
+/// its turn runs still reads working, and a failed turn failed.
+fn title_doing(activity: &str) -> &str {
+    match activity {
+        "blocked" => started::APPROVAL,
+        "error" => "failed",
+        // A turn that ended, seen or not yet: it rests.
+        "done" => started::IDLE,
+        "clear" => "",
+        other => other,
+    }
 }
 
 /// Read past a follow's replay as it arrives, so a long one cannot fill
@@ -16273,6 +16279,16 @@ mod tests {
             .backend()
             .0
             .assert_buffer_lines(["drawn   ", "        "]);
+    }
+
+    #[test]
+    fn a_panes_title_says_what_its_turn_does_under_an_open_question() {
+        // The multiplexer hears the question; the title, the turn.
+        assert_eq!(title_doing("working"), "working");
+        assert_eq!(title_doing("error"), "failed");
+        assert_eq!(title_doing("done"), started::IDLE);
+        assert_eq!(title_doing("blocked"), started::APPROVAL);
+        assert_eq!(title_doing("clear"), "");
     }
 
     #[test]
