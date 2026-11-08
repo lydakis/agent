@@ -103,8 +103,29 @@ fn resolves(record: &Value) -> bool {
 
 /// The tools the bot `record` describes, in `role`, should declare: its
 /// own with Sonny's, or `None` when it has those already, or when they
-/// would not fit beside its own.
+/// would not fit beside its own ([`too_many`] says so).
 pub fn declare(record: &Value, role: Role) -> Option<Value> {
+    let declared = wanted(record, role)?;
+    fits(&declared).then_some(Value::Array(declared))
+}
+
+/// Why the bot `record` describes cannot take this build's tools in
+/// `role`: its own beside Sonny's are past what the daemon takes. `None`
+/// when they fit, or it has them already.
+pub fn too_many(record: &Value, role: Role) -> Option<String> {
+    let declared = wanted(record, role)?;
+    let bytes = serde_json::to_vec(&declared).map_or(0, |json| json.len());
+    (!fits(&declared)).then(|| {
+        format!(
+            "{} tools of {bytes} bytes, past the {MAX_DECLARED} tools and {DECLARED_BYTES} bytes an agent takes",
+            declared.len()
+        )
+    })
+}
+
+/// The tools [`declare`] would give the bot `record` describes, in
+/// `role`, fitting or not; `None` when it has them already.
+fn wanted(record: &Value, role: Role) -> Option<Vec<Value>> {
     let mut declared = record["declared"].as_array().cloned().unwrap_or_default();
     let mut ours = tools(role);
     // A task resolves itself, as its lead resolves it.
@@ -137,8 +158,13 @@ pub fn declare(record: &Value, role: Role) -> Option<Value> {
     // Any of Sonny's there gives way to these: a lead's only on a lead.
     declared.retain(|other| !sonnys(other));
     declared.extend(ours);
-    let bytes = serde_json::to_vec(&declared).map_or(usize::MAX, |json| json.len());
-    (declared.len() <= MAX_DECLARED && bytes <= DECLARED_BYTES).then_some(Value::Array(declared))
+    Some(declared)
+}
+
+/// Whether `declared` is within what the daemon takes of a bot's tools.
+fn fits(declared: &[Value]) -> bool {
+    let bytes = serde_json::to_vec(declared).map_or(usize::MAX, |json| json.len());
+    declared.len() <= MAX_DECLARED && bytes <= DECLARED_BYTES
 }
 
 /// The `configure` fields that bring a bot Sonny declared on before up
@@ -163,10 +189,19 @@ pub fn refresh(record: &Value) -> Option<Map<String, Value>> {
     {
         return None;
     }
-    let lead = declared
+    fields(record, declared_role(declared))
+}
+
+/// The role of a bot Sonny declared `declared` on: a lead by the tool only
+/// a lead has; any other, a task's.
+pub fn declared_role(declared: &[Value]) -> Role {
+    match declared
         .iter()
-        .any(|tool| tool["name"] == crate::served::PROJECT);
-    fields(record, if lead { Role::LEAD } else { Role::TASK })
+        .any(|tool| tool["name"] == crate::served::PROJECT)
+    {
+        true => Role::LEAD,
+        false => Role::TASK,
+    }
 }
 
 /// The `configure` fields that give Sonny's tools, a task's, to the bot
@@ -215,6 +250,37 @@ mod tests {
     }
     fn a_helper() -> Role {
         Role::TASK
+    }
+
+    #[test]
+    fn tools_past_the_daemon_s_cap_are_said_not_skipped() {
+        let own = |bytes: usize| {
+            json!({"name": "notes", "description": "d".repeat(bytes),
+                "parameters": {"type": "object"}, "result": "ok"})
+        };
+        let small = json!({"declared": [own(10)]});
+        assert!(declare(&small, a_lead()).is_some());
+        assert_eq!(too_many(&small, a_lead()), None);
+        let large = json!({"declared": [own(DECLARED_BYTES)]});
+        assert_eq!(declare(&large, a_lead()), None);
+        let why = too_many(&large, a_lead()).unwrap();
+        assert!(why.contains("bytes an agent takes"), "{why}");
+        // A task that resolves itself, at every size around the cap: what
+        // does not fit is always said, with the tools `declare` would give.
+        let resolving = crate::resolved::tool();
+        let fitted = declare(&json!({"declared": [own(0), resolving.clone()]}), a_task()).unwrap();
+        let base = serde_json::to_vec(&fitted).unwrap().len();
+        let edge = DECLARED_BYTES - base;
+        for bytes in edge - 300..edge + 300 {
+            let task = json!({"declared": [own(bytes), resolving.clone()]});
+            let skipped = declare(&task, a_task()).is_none();
+            assert_eq!(skipped, too_many(&task, a_task()).is_some(), "{bytes}");
+        }
+        assert_eq!(
+            declared_role(&[json!({"name": crate::served::PROJECT})]),
+            a_lead()
+        );
+        assert_eq!(declared_role(&[]), a_task());
     }
 
     #[test]
