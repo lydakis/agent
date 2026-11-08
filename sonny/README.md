@@ -393,9 +393,14 @@ task works on, and `/status` (or its name) opens it again, also after the
 lead starts again (kept in `~/.agent/sonny/aside/`); its `/status` row
 says `window set aside for room`. A task set aside that comes to need you
 opens its window again on its own, as what needs you keeps its window. `--rex-host HOST` puts the session on another Rex
-server; `--no-layout` turns the layout off. Sonny writes the skill for the
-multiplexer it runs in to `~/.agents/skills` (`rex-windows`,
-`herdr-panes` or `cmux-tabs`, from `skills/`), so any agent can run a long command where
+server; `--no-layout` turns the layout off. Sonny writes a skill for each
+multiplexer the machine has to `~/.agents/skills` (`rex-windows`,
+`herdr-panes` and `cmux-tabs`, from `skills/`). Each sends the agent to
+`sonny where` first, which prints the multiplexer and the workspace or
+session its calls act in now, by the rule the tools follow: where the person
+last used a window of the agent's (or of the agent that made it), so a
+project open in Herdr and in cmux at once has its agents act in the one the
+person is typing in. With that, any agent can run a long command where
 the person can watch it, and read it back: the `run_in_pane` tool
 (`name`, `command`, `split` right, left, above, below or float) opens a block
 labelled `AGENT/NAME` in a tab of its own (or on that side of the agent's
@@ -793,7 +798,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   its right edge, dim, its code reviews; one that needs you says what for
   under it. That is all it shows as it opens; `m` shows more and hides it
   again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
-  `icon` in `[sonny.sources.NAME]` shows as that icon), the code reviews
+  `icon` in `[sonny.sources.NAME]` shows as that icon, as it does wherever
+  Sonny names that source: `/background` and the "From your sources" row), the code reviews
   its turns opened or wait on, in any system, as the copy that checks
   each turn names them from its commands' output and reply (`3 reviews · CR-881`; a pull or merge request link its last
   reply holds shows before any is kept), its background work
@@ -1236,7 +1242,9 @@ the version installed, and removes it when agent-browser is gone. Agents
 drive it through the `browser` tool, which the tool host answers outside
 their sandbox: it runs the skill's commands in each agent's own browser
 session, its answers read from agent-browser's JSON, and a screenshot
-comes back as a picture, up to 20 a call. It refuses what would
+without a path comes back as a picture only the agent sees, up to 20 a
+call; the tool tells the agent to show the person one by saving it to a
+path and putting it in its reply as a Markdown image. It refuses what would
 reach past the browser: flags that launch another program or load an
 extension, plugins, the clipboard, the browser's DevTools address, and
 writes outside the agent's folder. It opens `file://` pages anywhere,
@@ -1251,7 +1259,7 @@ desktop`), and agents see and use the person's own desktop through the
 `desktop` tool, which the tool host answers outside their sandbox, since a
 sandboxed process reaches no other app. It runs the skill's commands one
 call at a time across agents, as there is one desktop: what only looks (a
-snapshot, `find`, a screenshot, which comes back as a picture, the apps
+snapshot, `find`, a screenshot, which comes back as a picture only the agent sees, the apps
 and windows) runs at once; a call with a command that acts (a click,
 typing, a key, launching or closing an app, a window, a notification, the
 clipboard) waits for the agent's approvals once. It passes only the flags
