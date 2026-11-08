@@ -1062,16 +1062,32 @@ fn search(
         let title = first["title"].as_str().unwrap_or_default();
         let every = holds(title);
         let mut whole = true;
-        let matches: Vec<Value> = (posts.iter().enumerate())
-            .filter(|(_, post)| every || holds(post["text"].as_str().unwrap_or_default()))
-            .map(|(n, post)| {
-                let text = post["text"].as_str().unwrap_or_default();
-                let cut = snippet(text);
-                whole &= cut.len() == text.len();
-                json!({"post": n, "by": post["by"], "when": when(post["at"].as_i64().unwrap_or(0)),
-                    "text": cut})
-            })
-            .collect();
+        // A thread's matches fit a page on their own: past that, how many
+        // more there are and the post to read from.
+        let (mut matches, mut held, mut more) = (Vec::new(), 0, None);
+        let hits = (posts.iter().enumerate())
+            .filter(|(_, post)| every || holds(post["text"].as_str().unwrap_or_default()));
+        for (n, post) in hits {
+            if let Some((count, _)) = &mut more {
+                *count += 1;
+                continue;
+            }
+            let text = post["text"].as_str().unwrap_or_default();
+            let cut = snippet(text);
+            let mut shown = json!({"post": n, "by": post["by"],
+                "when": when(post["at"].as_i64().unwrap_or(0)), "text": cut});
+            // As `read` marks it: written after reading outside content.
+            if post["external"] == true {
+                shown["external"] = json!(true);
+            }
+            held += shown.to_string().len();
+            if !matches.is_empty() && held > bytes {
+                more = Some((1, n));
+                continue;
+            }
+            whole &= shown["text"].as_str().map(str::len) == Some(text.len());
+            matches.push(shown);
+        }
         // The words may sit in different posts, or outside any text.
         if matches.is_empty() {
             continue;
@@ -1083,9 +1099,13 @@ fn search(
         let last = posts.last().unwrap_or(first);
         let at = last["at"].as_i64().unwrap_or(0);
         whole &= matches.len() == posts.len();
-        let thread = json!({"thread": name, "title": title, "started_by": first["by"],
+        let mut thread = json!({"thread": name, "title": title, "started_by": first["by"],
             "posts": posts.len(), "last_by": last["by"], "last_when": when(at),
             "matches": matches});
+        if let Some((count, from)) = more {
+            thread["more_matches"] = json!(count);
+            thread["read_from"] = json!(from);
+        }
         size += thread.to_string().len();
         if !shown.is_empty() && size > bytes {
             next = Some(found - 1);
@@ -2280,6 +2300,22 @@ mod tests {
         let rest = search(&dir(home), "needle", "d.w", 1, LIST_BYTES).unwrap();
         assert_eq!(rest["threads"].as_array().unwrap().len(), 2);
         assert!(rest.get("next").is_none());
+        // One thread's matches past a page: how many more, and where to
+        // read; a post written after outside content says so, as in read.
+        for external in [true, false, false] {
+            let reply = json!({"reply": {"thread": "t0", "text": long, "external": external}});
+            call(home, "b.y", None, None, &reply).unwrap();
+        }
+        let many = search(&dir(home), "needle", "d.w", 0, 3 * SNIPPET_CHARS).unwrap();
+        let thread = &many["threads"][0];
+        assert_eq!(thread["thread"], "t0");
+        assert_eq!(thread["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(thread["matches"][1]["external"], true);
+        assert!(thread["matches"][0].get("external").is_none());
+        assert_eq!(
+            (thread["more_matches"].clone(), thread["read_from"].clone()),
+            (json!(2), json!(2))
+        );
         // A cut post is not a read.
         let listed = call(home, "e.v", None, None, &json!({})).unwrap();
         assert!(

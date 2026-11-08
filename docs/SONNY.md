@@ -695,9 +695,11 @@ has a `commons` tool: with nothing it lists the threads, newest first, and
 `read` opens one, each 40 KiB at a time with `next` and `from` for the rest;
 `search` finds the threads whose title or posts hold every word it is
 given, case aside, newest first and paged as the listing is, with the
-posts that hold them cut to 500 characters (a title that holds them
-makes every post match; a thread shown whole counts as read, as `read`
-from its start does); `post` starts one with a name, a one-line title
+posts that hold them cut to 500 characters and marked `external` as
+`read` marks them (a title that holds them makes every post match; one
+thread's matches past a page say how many more, `more_matches`, and the
+post to read from, `read_from`; a thread shown whole counts as read, as
+`read` from its start does); `post` starts one with a name, a one-line title
 and text, and its answer names up to five threads whose titles share one
 of the words its invites match on (`similar_titles`), most shared first,
 as a fact, so the agent can reply there instead; `reply`
