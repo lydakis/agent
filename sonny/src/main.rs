@@ -9015,7 +9015,7 @@ impl App {
                             continue;
                         }
                         if resolves(&name) && !failed && !reactions::refused(&item) {
-                            self.resolve(&arguments, id, turns.get(&node).copied(), false)
+                            self.resolve(&arguments, turns.get(&node).copied(), false)
                                 .await;
                         }
                         if name == asks::TOOL && !failed && !reactions::refused(&item) {
@@ -9828,7 +9828,7 @@ impl App {
                     self.ask_closed(&arguments);
                 }
                 if resolves(&name) && !shown.1 && !reactions::refused(&json!({"output": shown.0})) {
-                    self.resolve(&arguments, id, turn, true).await;
+                    self.resolve(&arguments, turn, true).await;
                 }
                 if self.calls.is_empty() && !self.held.is_empty() {
                     let held = std::mem::take(&mut self.held);
@@ -10016,11 +10016,11 @@ impl App {
             .unwrap_or_else(|_| self.options.store.clone())
     }
 
-    /// Note the task a lead's `mark_done` call `call` in `turn` names
-    /// as resolved, up to its newest turn finished by then: `now`, as it
-    /// happens, when its window closes too; replayed, by the time the
-    /// lead's turn ended, unless the mark it made then is kept.
-    async fn resolve(&mut self, arguments: &Value, call: &str, turn: Option<i64>, now: bool) {
+    /// Show what a `mark_done` call in `turn` marked: Sonny's tool host
+    /// kept the mark before answering it, so this window only shows it. A
+    /// lead marking itself sets its own questions aside; a task marked
+    /// done `now`, as it happens, has its window closed.
+    async fn resolve(&mut self, arguments: &Value, turn: Option<i64>, now: bool) {
         // A side chat forked from a lead resolves that lead's tasks.
         let side = (self.options.side.is_some())
             .then(|| side_source(&self.bot))
@@ -10029,61 +10029,22 @@ impl App {
         let Some(project) = self.project.as_deref().or(side).map(str::to_owned) else {
             return;
         };
-        let project = &project;
-        // A lead marks itself done, naming no task, up to the turn that
-        // marks it, which ending leaves it done, its questions set aside.
-        // A side chat marks the lead it came from as a lead marks a task.
         let side = self.options.side.is_some();
         let lead = match side {
             true => side_source(&self.bot).map(str::to_owned),
             false => Some(self.bot.clone()),
         };
         let lead = lead.filter(|lead| project::is_lead(lead) && resolved::itself(arguments, lead));
-        if let (Some(lead), Some(turn), false) = (&lead, turn, side) {
-            if (now || !resolved::made_by(&self.store(), lead, call))
-                && let Err(error) = resolved::keep(&self.store(), lead, turn, call)
-            {
-                self.notice = Some(error);
-            }
+        if turn.is_none() {
+            return;
+        }
+        if lead.is_some() && !side {
             self.set_aside_own(None);
             return;
         }
-        let (Some(task), Some(turn)) = (lead.or_else(|| resolved::call(arguments, project)), turn)
-        else {
+        let Some(task) = lead.or_else(|| resolved::call(arguments, &project)) else {
             return;
         };
-        if !now && resolved::made_by(&self.store(), &task, call) {
-            return;
-        }
-        let clock = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        let at = match now {
-            true => clock,
-            false => self
-                .client
-                .request(
-                    "turns",
-                    json!({"bot": self.bot, "after": turn - 1, "limit": 1}),
-                )
-                .await
-                .ok()
-                .and_then(|page| page["turns"][0]["finished_ms"].as_i64())
-                .unwrap_or(clock),
-        };
-        // A task that is gone has nothing to resolve.
-        let Ok(page) = self
-            .client
-            .request("turns", json!({"bot": task, "newest": true, "limit": 16}))
-            .await
-        else {
-            return;
-        };
-        let upto = resolved::upto(page["turns"].as_array().map_or(&[][..], Vec::as_slice), at);
-        if let Err(error) = resolved::keep(&self.store(), &task, upto, call) {
-            self.notice = Some(error);
-        }
         if now && let Some(fleet) = &mut self.fleet {
             fleet.resolved(&task);
         }
@@ -23237,6 +23198,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_lead_marks_itself_done_and_an_outer_lead_names_a_lead() {
+        // The tool host keeps each mark before answering; the windows show
+        // them.
         let client = daemon_answering(|asked| match asked["op"].as_str() {
             Some("turns") if asked["bot"] == "web.lead" => {
                 json!({"turns": [{"turn": 7, "status": "completed", "finished_ms": 1}]})
@@ -23245,45 +23208,78 @@ mod tests {
         })
         .await;
         let dir = std::env::temp_dir().join(unique("sonny-lead-done"));
-        let mut app = app(client);
+        let store = dir.join("store");
+        let mark = |caller: &'static str, by: &'static str, turn, call, arguments: Value| {
+            let (client, store) = (client.clone(), store.clone());
+            async move { resolved::mark(&client, &store, (caller, by), (turn, call), &arguments).await }
+        };
+        let mut app = app(client.clone());
         app.bot = "calc.lead".into();
         app.project = Some("calc".into());
-        app.options.store = dir.join("store");
+        app.options.store = store.clone();
         // Naming no task, a lead marks itself, up to the turn that marks
         // it, its own open question set aside.
         app.asked("q1", Some(11), &json!({"question": "Tag it?"}));
         assert_eq!(app.asks.len(), 1);
-        app.resolve(&json!({}), "c1", Some(12), true).await;
+        mark("calc.lead", "calc.lead", 12, "c1", json!({}))
+            .await
+            .unwrap();
+        app.resolve(&json!({}), Some(12), true).await;
         assert_eq!(resolved::read(&app.store(), "calc.lead"), Some(12));
-        assert!(resolved::made_by(&app.store(), "calc.lead", "c1"));
         assert!(app.asks.is_empty());
         assert_eq!(app.aside.len(), 1);
         // Another lead's name is that lead, never this one.
-        app.bot = "shop.web.lead".into();
-        app.project = Some("shop.web".into());
-        app.resolve(&json!({"task": "web.lead"}), "c4", Some(14), true)
-            .await;
-        assert_eq!(resolved::read(&app.store(), "shop.web.lead"), None);
-        app.bot = "calc.lead".into();
-        app.project = Some("calc".into());
-        // An outer lead names a lead as it is, up to its newest turn ended.
-        app.resolve(&json!({"task": "web.lead"}), "c2", Some(13), true)
-            .await;
-        assert_eq!(resolved::read(&app.store(), "web.lead"), Some(7));
-        assert_eq!(resolved::read(&app.store(), "calc.web.lead"), None);
+        let said = mark(
+            "shop.web.lead",
+            "shop.web.lead",
+            14,
+            "c4",
+            json!({"task": "web.lead"}),
+        );
+        assert_eq!(said.await.unwrap(), "Marked web.lead done.");
+        assert_eq!(resolved::read(&store, "shop.web.lead"), None);
+        // An outer lead names a lead as it is, up to its newest turn ended,
+        // with no window open.
+        let said = mark(
+            "calc.lead",
+            "calc.lead",
+            13,
+            "c2",
+            json!({"task": "web.lead"}),
+        );
+        assert_eq!(said.await.unwrap(), "Marked web.lead done.");
+        assert_eq!(resolved::read(&store, "web.lead"), Some(7));
+        assert_eq!(resolved::read(&store, "calc.web.lead"), None);
         // A side chat marks the lead it came from up to that lead's newest
         // turn ended, not the side chat's own turn.
-        app.bot = "web.lead.side-1a".into();
-        app.project = None;
-        app.options.side = Some(1);
-        app.options.store = dir.join("side-store");
-        app.resolve(&json!({}), "c3", Some(20), true).await;
-        assert_eq!(resolved::read(&app.store(), "web.lead"), Some(7));
+        let side = dir.join("side-store");
+        resolved::mark(
+            &client,
+            &side,
+            ("web.lead", "web.lead.side-1a"),
+            (20, "c3"),
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved::read(&side, "web.lead"), Some(7));
+        // A task marks only itself.
+        let other = mark(
+            "calc.fix",
+            "calc.fix",
+            21,
+            "c5",
+            json!({"task": "calc.web"}),
+        );
+        assert!(other.await.unwrap_err().contains("marks only itself"));
+        mark("calc.fix", "calc.fix", 21, "c6", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(resolved::read(&store, "calc.fix"), Some(21));
         // That lead's own window sets aside its questions the mark covers,
         // not one asked after.
         app.bot = "web.lead".into();
         app.project = Some("web".into());
-        app.options.side = None;
         app.aside.clear();
         app.asked("q2", Some(5), &json!({"question": "Ship it?"}));
         app.asked("q3", Some(9), &json!({"question": "And the docs?"}));

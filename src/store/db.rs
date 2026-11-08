@@ -8656,7 +8656,19 @@ impl Database {
     /// and nothing more. A decided step is gone, as a started call's
     /// request is, and its call's time runs again once no other step of it
     /// waits.
-    pub fn step_check(&mut self, name: &str, turn: i64, id: &str, now_ms: u64) -> Result<Stepped> {
+    ///
+    /// While the daemon is `held`, paused or shutting down, a step its
+    /// gates would allow waits on, as the turns do, to be checked again
+    /// once the line goes on: nothing new runs during a pause. A denial
+    /// or a lapse still ends it.
+    pub fn step_check(
+        &mut self,
+        name: &str,
+        turn: i64,
+        id: &str,
+        now_ms: u64,
+        held: bool,
+    ) -> Result<Stepped> {
         self.step_turn(name, turn)?;
         let Some(request) = self.request(turn, id)? else {
             return fail("no_pending_step");
@@ -8675,6 +8687,19 @@ impl Database {
                 false,
             )
         } else if request.unanswered().next().is_none() {
+            if held {
+                // Every gate allowed it: no lapse can deny it now, so it
+                // waits on nothing but `resume`.
+                self.steps.insert(request.id, turn);
+                return Ok(Stepped {
+                    step: Step::Pending {
+                        approval: request.id,
+                        expires_ms: None,
+                    },
+                    notify: None,
+                    wake: false,
+                });
+            }
             (true, None, request.approvals(), None, false)
         } else if lapse.is_some_and(|at| now_ms >= at) {
             let mut lapsed = request.approvals();
