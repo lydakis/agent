@@ -5721,8 +5721,8 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         }
     }
     // A done lead's automations wait for a message to reopen it; one the
-    // person runs now runs. Only a lead with a mark costs a look at its
-    // newest turn, and one that can't be looked at runs as ever.
+    // person runs now runs. Only a lead costs a look at its newest turn,
+    // and one that can't be looked at runs as ever.
     if !asked
         && let Target::Bot { name, .. } = &trigger.target
         && crate::project::is_lead(name)
@@ -5730,10 +5730,7 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     {
         let store =
             agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_owned());
-        if crate::resolved::read(&store, name).is_some()
-            && let Ok(Some(why)) =
-                with_daemon(trigger, async |c| lead_paused(c, &store, name).await)
-        {
+        if let Ok(Some(why)) = with_daemon(trigger, async |c| lead_paused(c, &store, name).await) {
             let paused = named(json!({"outcome": "paused", "detail": why}));
             settle(places, trigger, &paused, &kept);
             return;
@@ -5928,13 +5925,21 @@ fn looked(places: &Places, trigger: &Trigger, seen: &Seen) {
 const PAUSE_LOOK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Why the lead `name`'s automations wait now: its mark beside `store`
-/// says it is done and no turn of its since reopened it. None when it
-/// isn't, or its newest turn can't be read.
+/// says it is done and no turn of its since reopened it, or its newest
+/// turn marked it done, which a window keeps only once one is open. None
+/// when it isn't, or its newest turn can't be read.
 async fn lead_paused(client: &Client, store: &Path, name: &str) -> Option<String> {
-    let mark = crate::resolved::read(store, name)?;
     let asked = json!({"bot": name, "newest": true, "limit": 1});
     let page = client.request("turns", asked).await.ok()?;
-    crate::resolved::paused(name, Some(mark), page["turns"][0]["turn"].as_i64())
+    let newest = page["turns"][0]["turn"].as_i64();
+    let mark = crate::resolved::read(store, name);
+    // Its history is read only when no mark says it already.
+    let itself = !crate::resolved::holds(mark, newest, false)
+        && match newest {
+            Some(turn) => crate::needs::resolved_turn(client, name, turn).await,
+            None => false,
+        };
+    crate::resolved::paused(name, mark, newest, itself)
 }
 
 /// Wait while `trigger`'s daemon is paused. A daemon that does not answer
@@ -8824,6 +8829,18 @@ pub(crate) mod tests {
             let turn = seen.load(std::sync::atomic::Ordering::SeqCst);
             match request["op"].as_str() {
                 Some("turns") => json!({"turns": [{"turn": turn}]}),
+                // Turn 11 marked the lead done, with no window open to
+                // keep the mark.
+                Some("history_nodes") => json!({"nodes": [
+                    {"node": 41, "turn": 11}, {"node": 40, "turn": 11}, {"node": 30, "turn": 10}]}),
+                Some("history_items") if request["nodes"][0] == 41 => json!({"items": [
+                    {"node": 41, "item": {"type": "function_call_output", "call_id": "c2",
+                        "output": "Marked done."}},
+                    {"node": 40, "item": {"type": "function_call", "call_id": "c2",
+                        "name": "mark_done", "arguments": "{}"}}]}),
+                Some("history_items") => json!({"items": [
+                    {"node": 30, "item": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "More, please."}]}}]}),
                 _ => json!({}),
             }
         })
@@ -8838,6 +8855,9 @@ pub(crate) mod tests {
         // A message reopened it: it runs again.
         newest.store(10, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(lead_paused(&client, &store, "web.lead").await, None);
+        // It marked itself done again, headless: its history says so.
+        newest.store(11, std::sync::atomic::Ordering::SeqCst);
+        assert!(lead_paused(&client, &store, "web.lead").await.is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -229,6 +229,30 @@ pub async fn items(client: &Client, bot: &str, nodes: &[i64]) -> (Vec<(i64, Valu
     (items, false)
 }
 
+/// How many of an agent's newest nodes are read for whether its newest
+/// turn marked it done: the call comes near a turn's end.
+const LAST_TURN: usize = 64;
+
+/// Whether `bot`'s turn `turn`, its newest, marked it done, as its history
+/// says before any window kept the mark: read from its newest nodes of
+/// that turn. False when the history can't be read.
+pub async fn resolved_turn(client: &Client, bot: &str, turn: i64) -> bool {
+    let asked = json!({"bot": bot, "limit": LAST_TURN});
+    let Ok(page) = client.request("history_nodes", asked).await else {
+        return false;
+    };
+    let nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+        .filter(|n| n["turn"].as_i64() == Some(turn))
+        .filter_map(|n| n["node"].as_i64())
+        .collect();
+    if nodes.is_empty() {
+        return false;
+    }
+    let (read, _) = items(client, bot, &nodes).await;
+    let read: Vec<Value> = read.into_iter().map(|(_, item)| item).collect();
+    resolved_itself(&read, bot)
+}
+
 /// Whether `items`, one turn of `bot`'s, hold a `mark_done` call of its
 /// own that resolved itself and was not refused.
 pub fn resolved_itself(items: &[Value], bot: &str) -> bool {
