@@ -1406,7 +1406,7 @@ impl Turn {
         model: &str,
         output_bytes: Option<usize>,
         reply: ContextUsage,
-        retry_at: u64,
+        (retry_at, route): (u64, &std::sync::OnceLock<String>),
     ) -> Result<()> {
         // Its copy's call and its summary's call take two rounds of their
         // own; a bot allowed fewer summarizes at its next boundary.
@@ -1495,6 +1495,7 @@ impl Turn {
             ahead: now.prefix.bytes.clone(),
             model: model.to_owned(),
             tools: tools.clone(),
+            route: route.clone(),
             handle,
         });
         Ok(())
@@ -1511,7 +1512,7 @@ impl Turn {
         Box::pin(async move { turn.run_tail(after, unlanded).await })
     }
 
-    async fn run_tail(&self, after: After, mut unlanded: Unlanded) {
+    async fn run_tail(&self, after: After, unlanded: Unlanded) {
         self.tailing.store(true, Relaxed);
         let After {
             mut record,
@@ -1521,6 +1522,7 @@ impl Turn {
             ahead,
             model,
             tools,
+            route,
             handle,
         } = after;
         let bot = self.bot.clone();
@@ -1532,8 +1534,11 @@ impl Turn {
         // What the summary is written under: the turn's record, which a
         // change made since does not reach.
         let setup = record.summary_setup();
+        // Its copy goes on the turn's route, to the server holding the
+        // call's cache.
         let mut accounting = Accounting {
             beside: true,
+            route,
             ..Accounting::default()
         };
         let (before, start) = (record.spent(), self.settings().max_rounds() - 2);
@@ -1609,21 +1614,29 @@ impl Turn {
                 })
                 .await;
         }
-        unlanded.0 = None;
-        self.land(&handle, landed, base).await;
+        self.land(&handle, landed, base, unlanded).await;
     }
 
     /// A summary started after this turn lands: held for the bot's turn
     /// task running now, or installed at once with none running. Its own
     /// failure was reported live as it failed; an install that fails is
     /// too, and leaves the view as it was.
-    async fn land(&self, ahead: &Arc<Ahead>, landed: Landed, ended: Option<AfterTurn>) {
+    /// `unlanded` stays armed until the result is handed on, so a tail
+    /// stopped while it waits here still comes to nothing.
+    async fn land(
+        &self,
+        ahead: &Arc<Ahead>,
+        landed: Landed,
+        ended: Option<AfterTurn>,
+        mut unlanded: Unlanded,
+    ) {
         let mut state = ahead.state.lock().await;
-        ahead
-            .landed
-            .store(true, std::sync::atomic::Ordering::Release);
         if state.tasks > 0 {
+            ahead
+                .landed
+                .store(true, std::sync::atomic::Ordering::Release);
             state.result = Some((landed, ended));
+            unlanded.0 = None;
             drop(state);
             ahead.told.notify_waiters();
             return;
@@ -1637,7 +1650,11 @@ impl Turn {
             },
             _ => None,
         };
+        ahead
+            .landed
+            .store(true, std::sync::atomic::Ordering::Release);
         self.forget(ahead);
+        unlanded.0 = None;
         drop(state);
         ahead.told.notify_waiters();
         if let Some(queued) = queued {
@@ -3512,7 +3529,7 @@ impl Turn {
                             on_model,
                             output_bytes,
                             reply,
-                            accounting.summary_retry_at,
+                            (accounting.summary_retry_at, &accounting.route),
                         )
                         .await;
                 }
@@ -6329,6 +6346,8 @@ pub struct After {
     ahead: Bytes,
     model: String,
     tools: Arc<serde_json::value::RawValue>,
+    /// The turn's sticky route, for the copy.
+    route: std::sync::OnceLock<String>,
     handle: Arc<Ahead>,
 }
 

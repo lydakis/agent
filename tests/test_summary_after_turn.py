@@ -240,6 +240,15 @@ class SummaryAfterTurnTests(ModelFixture):
             retries, = db.execute('select retries from turns where id=?', (ended['turn'],)).fetchone()
         self.assertEqual(retries, 1)
 
+    def test_a_summary_after_its_turn_copies_its_last_call_on_that_turns_route(self):
+        self.model.routes = []
+        client = self.start(delay=0)
+        self.past_threshold(client)
+        self.assertEqual(client.summarized('Bob', timeout=10)['data']['request']['form'], 'copy')
+        # Each turn's first call goes without a route; the summary copies
+        # the second turn's call on the route that call was given.
+        self.assertEqual(self.model.routes, [None, None, 'route-2'])
+
     def events(self, client):
         events, after = [], 0
         while page := client.request('events', bot='Bob', after=after, limit=256)['result']['events']:
