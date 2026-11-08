@@ -421,6 +421,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--compact-keep"
                     | "--compact-tokens"
                     | "--max-rounds"
+                    | "--max-drops"
                     | "--max-output-tokens" => {
                         let number = value.parse::<u64>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))

@@ -5,6 +5,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, value::RawValue};
+use std::borrow::Cow;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{future::Future, sync::Arc, time::Duration};
@@ -24,10 +25,56 @@ pub use search::{RUN_NAME, RUN_NAMESPACE, Search};
 pub use pace::Report;
 pub use socket::Sockets;
 
-/// JSON-encoded bytes one response may stream. A full 128,000-token Claude
-/// answer runs about 512 KiB; the bound stays under the 1 MiB event cap so
-/// every stored item and live event remains publishable and readable.
-pub const MAX_OUTPUT: usize = 768 * 1024;
+/// Bytes one response may deliver, over HTTP or a socket: a bound against
+/// an endpoint that never stops, far past what any model writes. The model's
+/// own output cap is what bounds a reply; a cut one comes back as
+/// [`cut_short`] says. Nothing downstream needs a reply in one event: events
+/// carry previews of calls, and a history read answers `item_too_large` for
+/// an item past a line.
+pub const MAX_RESPONSE: usize = 16 * 1024 * 1024;
+
+/// What an output item writes, as a cut reply names it: `text`, `reasoning`,
+/// or the tool it calls. A few fields of the item's opening, read once.
+pub(crate) fn writing(item: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Item<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: Cow<'a, str>,
+        #[serde(borrow)]
+        name: Option<Cow<'a, str>>,
+    }
+    let item: Item<'_> = serde_json::from_str(item).ok()?;
+    Some(writes(&item.kind, item.name.as_deref()))
+}
+
+/// What an output item of `kind`, calling `name` if a call, writes.
+pub(crate) fn writes(kind: &str, name: Option<&str>) -> String {
+    match (kind, name) {
+        (_, Some(name)) => name,
+        ("message", None) => "text",
+        (kind, None) => kind,
+    }
+    .to_owned()
+}
+
+/// The model's own output cap cut its reply short (`detail` names the cap as
+/// the provider does): the facts a turn tells the model after dropping that
+/// reply, and names if the turn ends on it. `in`: what the reply was writing,
+/// when the stream said.
+pub(crate) fn cut_short(detail: &str, output_tokens: u64, writing: Option<String>) -> Error {
+    let mut facts = json!({"limit":"max_tokens","output_tokens":output_tokens});
+    if let Some(writing) = writing {
+        facts["in"] = json!(writing);
+    }
+    Error::with("provider_incomplete", detail).facts(facts)
+}
+
+/// Whether a reply was cut short by the model's own output cap, which a turn
+/// drops and goes on past.
+pub fn was_cut_short(error: &Error) -> bool {
+    error.code == "provider_incomplete"
+        && (error.facts.as_ref()).is_some_and(|facts| facts["limit"] == "max_tokens")
+}
 
 /// JSON-encoded bytes one tool call id may take. Real ids run tens of bytes;
 /// the bound keeps every call listable and answerable: its approval entry
@@ -1270,7 +1317,7 @@ impl Provider {
                 let Some(chunk) = chunk else { break };
                 let chunk = chunk.map_err(|_| Error::new("provider_stream_failed"))?;
                 total += chunk.len();
-                if total > 16 * 1024 * 1024 {
+                if total > MAX_RESPONSE {
                     return fail("provider_response_limit");
                 }
                 if unnamed && frames == 0 && preview.len() < 4096 {

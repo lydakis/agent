@@ -4,7 +4,7 @@
 //! `previous_response_id`. The store stays the only history: the cached
 //! response is an optimization the runtime may lose at any time, and every
 //! call that is not an exact extension sends the full input.
-use super::{Delta, Frame, responses};
+use super::{Delta, Frame, MAX_RESPONSE, responses};
 use crate::{Error, Result};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -29,9 +29,6 @@ const IDLE: Duration = Duration::from_secs(60);
 /// How often idle and aged connections are looked for.
 const SWEEP: Duration = Duration::from_secs(5);
 const CONNECT: Duration = Duration::from_secs(10);
-/// Bytes one response may deliver, as on the HTTP path. Messages and frames
-/// are bounded by it too, so one event cannot allocate past it.
-const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 /// Codex sends this with every socket; OpenAI's guide names no header.
 const BETA: &str = "responses_websockets=2026-02-06";
 

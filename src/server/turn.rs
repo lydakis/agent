@@ -61,6 +61,10 @@ const LOAD_HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
 /// Refusals for pace are spaced by the pool and are not the request's fault,
 /// so they get many more attempts inside the same time budget.
 const MAX_PACED_ATTEMPTS: u32 = 64;
+/// Bytes of streamed text one live event carries. A provider's delta is a
+/// few words; one far longer goes out in pieces, each fitting an event even
+/// with every byte escaped six times over.
+const DELTA_PIECE: usize = 128 * 1024;
 use agent_runtime::provider::pace::MIN_PARK;
 const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
 /// Nodes per piece of a compaction catch-up walk: a few milliseconds of
@@ -2426,6 +2430,9 @@ impl Turn {
         let mut steer_first = false;
         // The view this task's last call sent, for a summary to copy.
         let mut last: Option<LastCall> = None;
+        // Replies in a row the model's own output cap cut short, kept on
+        // the turn so a park or a restart counts on.
+        let mut drops = context.drops;
         // Whether this task has made a call, whose cache a summary beside
         // the next one reads.
         let mut sent_here = false;
@@ -2683,6 +2690,8 @@ impl Turn {
             inherited = false;
             // A summary planned at this boundary runs beside the call.
             let running = beside.take();
+            // Rounds before the call, to tell whether its failure counted one.
+            let rounds_before = model_rounds;
             // The call and its retries count from what is left after the
             // summary's share: its two rounds and the tokens it holds.
             let held = running
@@ -2747,7 +2756,43 @@ impl Turn {
                 context.thinking = record.thinking;
             }
             let response = match called {
-                Ok(Some(response)) => response,
+                Ok(Some(response)) => {
+                    drops = 0;
+                    response
+                }
+                // The model's own output cap cut its reply short. The reply
+                // is dropped, nothing of it recorded, so no partial call can
+                // run; the model is told what cut it, in a steer from the
+                // `limit` origin that the next boundary takes, and the turn
+                // goes on. The round counts, billed or not. The cap cutting
+                // the bot's `max_drops` replies in a row ends the turn on it:
+                // each can cost a whole reply's output.
+                Err(error)
+                    if agent_runtime::provider::was_cut_short(&error)
+                        && drops + 1 < self.settings().max_drops() =>
+                {
+                    let count = model_rounds == rounds_before;
+                    self.join_summary(
+                        running,
+                        landed,
+                        Some(&mut record),
+                        &mut model_rounds,
+                        accounting,
+                    )
+                    .await?;
+                    drops += 1;
+                    if count {
+                        model_rounds += 1;
+                    }
+                    let facts = error
+                        .facts
+                        .map_or(Value::Null, |facts| Value::Object(*facts));
+                    self.store
+                        .op("drop_reply", move |db| db.drop_reply(turn, &facts, count))
+                        .await?;
+                    self.steers.store(true, Relaxed);
+                    continue;
+                }
                 // It lands before the turn parks or fails.
                 called => {
                     let joined = self
@@ -3177,10 +3222,17 @@ impl Turn {
                             Delta::Thinking(index, text) => (if summary { "compaction_thinking_delta" } else { "thinking_delta" }, index, text),
                         };
                         let item = after + index as u64 + 1;
-                        self.hub.live(
-                            &self.bot,
-                            json!({"event":kind,"bot":self.bot,"turn":turn,"durable":false,"item":item,"text":text}),
-                        )
+                        async move {
+                            for text in pieces(&text, DELTA_PIECE) {
+                                self.hub
+                                    .live(
+                                        &self.bot,
+                                        json!({"event":kind,"bot":self.bot,"turn":turn,"durable":false,"item":item,"text":text}),
+                                    )
+                                    .await?;
+                            }
+                            Ok(())
+                        }
                     },
                     &mut accounting.report,
                 );
@@ -5165,6 +5217,22 @@ fn calls_left(record: &agent_runtime::store::Bot, model_rounds: usize) -> bool {
     model_rounds < record.settings.max_rounds() && record.exhausted().is_none()
 }
 
+/// `text` in pieces of at most `most` bytes, cut at character boundaries:
+/// the whole of it, borrowed, for any delta under that, an empty one too.
+fn pieces(text: &str, most: usize) -> impl Iterator<Item = &str> {
+    let mut rest = Some(text);
+    std::iter::from_fn(move || {
+        let text = rest.take()?;
+        let mut at = text.len().min(most);
+        while !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        let (piece, tail) = text.split_at(at);
+        rest = (!tail.is_empty()).then_some(tail);
+        Some(piece)
+    })
+}
+
 /// Failures of the provider's pace, capacity, or transport, none of which say
 /// anything about the request. Every 5xx is one, as Anthropic's SDK treats it
 /// (anthropic-sdk-python 4421d56, `_should_retry`): a CDN's 520 says no more
@@ -5997,6 +6065,21 @@ fn priced_at(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_long_delta_goes_live_in_pieces_cut_between_characters() {
+        fn pieces(text: &str, most: usize) -> Vec<&str> {
+            super::pieces(text, most).collect()
+        }
+        assert_eq!(pieces("", 4), [""]);
+        assert_eq!(pieces("abc", 4), ["abc"]);
+        assert_eq!(pieces("abcdefgh", 4), ["abcd", "efgh"]);
+        // A character is never split: `é` is two bytes.
+        assert_eq!(pieces("abcé", 4), ["abc", "é"]);
+        let long = "é".repeat(super::DELTA_PIECE);
+        let cut = pieces(&long, super::DELTA_PIECE);
+        assert_eq!(cut.concat(), long);
+        assert!(cut.iter().all(|piece| piece.len() <= super::DELTA_PIECE));
+    }
     #[test]
     fn a_stall_waits_seconds_before_its_retry_and_an_overload_holds_the_pool() {
         for code in [

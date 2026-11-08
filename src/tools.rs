@@ -450,8 +450,21 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
 /// A declared tool's call checked against its parameters, as far as the
 /// daemon looks: an object, with every required field, no field the
 /// schema closes out, and each listed field of its listed basic type.
+/// The most JSON text an answered call's arguments may take: its client
+/// reads the call whole from a `tool_calls` page, one line of at most
+/// 1 MiB beside its id (`MAX_CALL_ID`) and the rest. A model's reply has no
+/// bound but its own, so a longer call is refused at once, the model told.
+pub const ANSWERED_ARGUMENTS: usize = 768 * 1024;
+
 pub fn check_declared(tool: &Declared, arguments: &str) -> Result<()> {
     let invalid = |detail: String| Error::with("invalid_arguments", detail);
+    if tool.answered_by.is_some() && arguments.len() > ANSWERED_ARGUMENTS {
+        return Err(invalid(format!(
+            "{}: arguments take {} bytes, past the {ANSWERED_ARGUMENTS} its client is sent",
+            tool.name,
+            arguments.len()
+        )));
+    }
     let arguments: serde_json::Value = serde_json::from_str(arguments)
         .map_err(|_| invalid(format!("{}: arguments are not JSON", tool.name)))?;
     let fields = arguments
@@ -3161,6 +3174,25 @@ async fn shell(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_answered_call_past_what_its_client_is_sent_is_refused() {
+        let tool: Declared = serde_json::from_value(serde_json::json!({
+            "name": "ask", "description": "", "answered_by": "window",
+            "parameters": {"type": "object", "properties": {"text": {"type": "string"}}}
+        }))
+        .unwrap();
+        let call = |n: usize| format!(r#"{{"text":"{}"}}"#, "x".repeat(n));
+        assert!(check_declared(&tool, &call(ANSWERED_ARGUMENTS - 11)).is_ok());
+        let refused = check_declared(&tool, &call(ANSWERED_ARGUMENTS - 10)).unwrap_err();
+        assert_eq!(refused.code, "invalid_arguments");
+        // A tool no client answers takes it: nothing sends it whole.
+        let unanswered = Declared {
+            answered_by: None,
+            ..tool
+        };
+        assert!(check_declared(&unanswered, &call(ANSWERED_ARGUMENTS)).is_ok());
+    }
+
     use super::*;
     #[test]
     fn a_name_matches_a_pattern_s_wildcards_in_any_case() {

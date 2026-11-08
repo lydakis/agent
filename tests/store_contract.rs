@@ -1,7 +1,7 @@
 use agent_runtime::{
     Error, Result,
     codec::Family,
-    provider::{ToolCall, Usage},
+    provider::{ModelTokens, ToolCall, Usage},
     store::{
         Answered, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage, Counts, Database,
         Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Limit, Planning, QuoteRef, Settings,
@@ -171,6 +171,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         images: Vec::new(),
         wait_ms: None,
         output_schema: None,
+        fact: false,
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch, |_, _| {
@@ -4770,7 +4771,7 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     assert_eq!(
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
-            "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
+            "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"max_drops":3,"approval_hold_ms":2000,"max_output_tokens":null,
             "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
             "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{}})
     );
@@ -5844,6 +5845,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         images: Vec::new(),
         wait_ms: None,
         output_schema: None,
+        fact: false,
     };
     let started = db
         .begin("Bob", "r1", "work", true, &options, allow_provider)
@@ -5979,6 +5981,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         images: Vec::new(),
         wait_ms: None,
         output_schema: None,
+        fact: false,
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options, allow_provider)
@@ -7526,6 +7529,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 images: Vec::new(),
                 wait_ms: None,
                 output_schema: None,
+                fact: false,
             },
             allow_provider,
         )
@@ -16263,6 +16267,166 @@ fn usage_sums_turns_by_bot_model_and_bucket_from_where_each_started() {
 }
 
 #[test]
+fn usage_files_each_call_under_the_model_that_spent_it_with_its_cache_writes() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let attempt = |provider: Option<&str>, model: &str, input, written, output| ModelTokens {
+        model: model.to_owned(),
+        provider: provider.map(str::to_owned),
+        input_tokens: input,
+        output_tokens: output,
+        cached_input_tokens: 0,
+        cache_write_tokens: written,
+        cache_write_1h_tokens: 0,
+    };
+    let of = |models: Vec<ModelTokens>| Usage {
+        input_tokens: models.iter().map(|m| m.input_tokens).sum(),
+        output_tokens: models.iter().map(|m| m.output_tokens).sum(),
+        cache_write_tokens: models.iter().map(|m| m.cache_write_tokens).sum(),
+        models,
+        ..Usage::default()
+    };
+    // Two rounds on the turn's own model, one with cache writes.
+    let own = Usage {
+        input_tokens: 1000,
+        cached_input_tokens: 600,
+        cache_write_tokens: 300,
+        cache_write_1h_tokens: 100,
+        output_tokens: 50,
+        ..Usage::default()
+    };
+    db.append(turn, vec![assistant("one")], &[], Some(&own))
+        .unwrap();
+    db.append(turn, vec![assistant("two")], &[], Some(&own))
+        .unwrap();
+    // A summary on another binding's model, a refused request's fallback,
+    // and a provider-side fallback whose attempts name no binding.
+    db.compaction_usage(
+        turn,
+        Some(&of(vec![attempt(
+            Some("bedrock"),
+            "summarizer",
+            400,
+            0,
+            40,
+        )])),
+    )
+    .unwrap();
+    db.failed_usage(
+        turn,
+        &of(vec![attempt(Some("anthropic"), "backup", 200, 20, 10)]),
+        0,
+        None,
+    )
+    .unwrap();
+    db.append(
+        turn,
+        vec![assistant("three")],
+        &[],
+        Some(&of(vec![
+            attempt(None, "synthetic-model", 70, 0, 0),
+            attempt(None, "sturdier-model", 80, 8, 8),
+        ])),
+    )
+    .unwrap();
+    db.finish(turn, None).unwrap();
+
+    let usage = db.usage(None, 0, None, 64).unwrap();
+    assert_eq!(usage["turns"], 1);
+    assert_eq!(
+        usage["input_tokens"], 2750,
+        "every call counts in the total"
+    );
+    let models: Vec<_> = usage["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["model"].as_str().unwrap(),
+                m["input_tokens"].as_i64().unwrap(),
+                m["cached_input_tokens"].as_i64().unwrap(),
+                m["cache_write_tokens"].as_i64().unwrap(),
+                m["cache_write_1h_tokens"].as_i64().unwrap(),
+                m["output_tokens"].as_i64().unwrap(),
+                m["turns"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        models,
+        [
+            ("openai/synthetic-model", 2070, 1200, 600, 200, 100, 1),
+            ("bedrock/summarizer", 400, 0, 0, 0, 40, 1),
+            ("anthropic/backup", 200, 0, 20, 0, 10, 1),
+            ("openai/sturdier-model", 80, 0, 8, 0, 8, 1),
+        ],
+        "most spent first, each under its own binding or the turn's"
+    );
+    assert!(usage["bots"][0].get("cache_write_tokens").is_none());
+}
+
+#[test]
+fn schema_85_files_each_earlier_turn_whole_under_its_own_model() {
+    let path = std::env::temp_dir().join(format!("agent-spend-85-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        for request in ["1", "2"] {
+            let turn = db
+                .begin(
+                    "Bob",
+                    request,
+                    "work",
+                    true,
+                    &TurnOptions::default(),
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            if request == "1" {
+                let usage = Usage {
+                    input_tokens: 500,
+                    cached_input_tokens: 100,
+                    output_tokens: 50,
+                    ..Usage::default()
+                };
+                db.append(turn, vec![assistant("done")], &[], Some(&usage))
+                    .unwrap();
+            }
+            db.finish(turn, None).unwrap();
+        }
+    }
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE turn_models; PRAGMA user_version=84;")
+        .unwrap();
+    let db = Database::initialize(conn).unwrap();
+    let usage = db.usage(None, 0, None, 64).unwrap();
+    assert_eq!(usage["turns"], 2);
+    assert_eq!(
+        usage["models"],
+        json!([{"model":"openai/synthetic-model","turns":1,"input_tokens":500,
+            "cached_input_tokens":100,"output_tokens":50,
+            "cache_write_tokens":0,"cache_write_1h_tokens":0}]),
+        "a turn that spent nothing has no row"
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
     let mut db = db();
     let run = Declared {
@@ -17156,6 +17320,58 @@ fn a_declined_prompt_is_noted_as_the_model_is_sent_it() {
     assert_eq!(listed["omitted"][1], json!([1, "[Left out.]"]));
     assert_eq!(listed["history"][2], json!([1, "[Left out.]", 11]));
     assert_eq!(listed["turns"][0][0], json!("something declined"));
+}
+
+#[test]
+fn a_cut_reply_s_note_reaches_its_turn_past_a_steer_that_waits_for_its_own() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "p1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // A steer for another folder waits for a turn of its own, and an
+    // ordinary one behind it waits behind it.
+    let elsewhere = TurnOptions {
+        delivery: Delivery::Steer,
+        workspace: Some("/elsewhere".into()),
+        ..TurnOptions::default()
+    };
+    db.begin("Bob", "p2", "over there", true, &elsewhere, allow_provider)
+        .unwrap();
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    db.begin("Bob", "p3", "and then", true, &steer, allow_provider)
+        .unwrap();
+    db.drop_reply(turn, &json!({"limit":"max_tokens","output_tokens":7}), true)
+        .unwrap();
+    let absorbed = db
+        .absorb(
+            turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap();
+    let taken: Vec<&Value> = (absorbed.entries.iter())
+        .filter(|e| e["event"] == "steered")
+        .map(|e| &e["data"]["origin"])
+        .collect();
+    // The two others stay queued, in order.
+    assert_eq!(taken, [&json!("limit")]);
+    assert_eq!(absorbed.outcomes.len(), 1);
 }
 
 /// The audit trail, read newest first with no filter.

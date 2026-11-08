@@ -215,23 +215,27 @@ class AccountingTests(ModelFixture):
         tokens = client.request('stats')['result']['tokens']
         self.assertEqual(tokens, {'input_tokens': 200, 'cached_input_tokens': 40, 'output_tokens': 20, 'cache_hit': 0.2})
 
-    def test_incomplete_usage_is_durable_and_exhausts_budget(self):
+    def test_a_cut_reply_s_usage_is_durable_and_the_spent_budget_wraps_its_turn_up(self):
         client = self.client('echo')
         client.request('create', bot='Bob', workspace=str(self.path), budget_tokens=100)
         turn = client.request('submit', bot='Bob', request_id='first', prompt='incomplete')['result']['turn']
         end = client.finished(turn)
-        self.assertEqual(end['data']['error'], 'provider_incomplete')
-        self.assertEqual(client.request('inspect', bot='Bob')['result']['tokens_used'], 110)
+        # The model's cap cut the reply short: it is dropped, its usage kept,
+        # and with the budget spent the turn's one more call, told why, ends it.
+        self.assertEqual((end['data']['status'], end['data']['limit']), ('completed', 'budget'))
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['tokens_used'], 220)
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
-        self.assertEqual(len([e for e in events if e['event'] == 'usage']), 1)
-        self.assertEqual(client.request('stats')['result']['tokens']['input_tokens'], 100)
-        self.assertFalse(any(e['event'] == 'message' for e in events))
+        self.assertEqual(len([e for e in events if e['event'] == 'usage']), 2)
+        self.assertEqual([e['data'] for e in events if e['event'] == 'dropped'],
+                         [{'limit': 'max_tokens', 'output_tokens': 10}])
+        self.assertEqual(client.request('stats')['result']['tokens']['input_tokens'], 200)
+        self.assertEqual(len([e for e in events if e['event'] == 'message']), 1)
         client.close()
         client = self.client('echo')
         self.assertEqual(client.request('submit', bot='Bob', request_id='retry', prompt='hello')['error'],
                          'budget_exhausted')
         row = client.request('turns', bot='Bob')['result']['turns'][0]
-        self.assertEqual((row['input_tokens'], row['output_tokens'], row['model_rounds']), (100, 10, 1))
+        self.assertEqual((row['input_tokens'], row['output_tokens'], row['model_rounds']), (200, 20, 2))
 
     def test_rejected_completion_counts_usage_once_in_daemon_totals(self):
         client = self.client()

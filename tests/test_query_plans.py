@@ -44,7 +44,7 @@ class QueryPlanTests(unittest.TestCase):
         query = next(q for q in statements(source) if q.startswith('SELECT s.id,s.prompt,length('))
         conn = sqlite3.connect(':memory:')
         conn.executescript(ddl)
-        steps = [row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + query, ('Bob', 1, 8, 9, 1))]
+        steps = [row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + query, ('Bob', 1, 8, 9, 1, 'limit'))]
         searches = [s for s in steps if s.startswith('SEARCH turns')]
         self.assertEqual(sorted(searches), ['SEARCH turns USING INDEX turns_attached (bot=? AND id<?)',
                                             'SEARCH turns USING INDEX turns_steers (bot=? AND id<?)'], steps)

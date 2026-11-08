@@ -21,7 +21,7 @@ const COMMANDS: &[Command] = &[
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
         flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --hide-senders --quiet-background --hold --unix-socket --outputs",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --max-drops --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --hide-senders --quiet-background --hold --unix-socket --outputs",
         startup: true,
     },
     Command {
@@ -476,6 +476,10 @@ fn print_flags(flags: &str) {
             "--max-rounds" => (
                 "N",
                 "Model calls each of a new bot's turns may make, the last with no tool call; default unbounded",
+            ),
+            "--max-drops" => (
+                "N",
+                "Replies in a row the model's output cap may cut short in a new bot's turn, the last ending it; default 3",
             ),
             "--note-turns" => (
                 "N",

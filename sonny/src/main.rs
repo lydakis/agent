@@ -209,9 +209,10 @@ fn set_measure(text_width: u64) -> bool {
 }
 
 /// The columns the conversation keeps beside the pane in a window
-/// `window` wide, its gutter with them: its measure where it has one;
-/// half the window when it fills the window (`text_width = 0`), so an
-/// open pane and the conversation share it evenly.
+/// `window` wide, its gutters with them: its measure where it has one;
+/// half the window, past its gutters, when it fills the window
+/// (`text_width = 0`), so an open pane and the conversation share it
+/// evenly.
 fn kept(window: u16) -> u16 {
     kept_at(window, measure())
 }
@@ -219,8 +220,8 @@ fn kept(window: u16) -> u16 {
 /// [`kept`] at `measure`.
 fn kept_at(window: u16, measure: usize) -> u16 {
     match measure {
-        WHOLE => window / 2,
-        measure => measure as u16 + GUTTER,
+        WHOLE => window - window.saturating_sub(2 * GUTTER) / 2 - 1,
+        measure => measure as u16 + 2 * GUTTER,
     }
 }
 
@@ -233,7 +234,10 @@ fn measure_of(text_width: u64) -> usize {
 }
 
 /// The blank columns between the conversation and the line beside it,
-/// matched on the pane's side, as the conversation's own rows open.
+/// matched on the pane's side, as the conversation's own rows open; and
+/// between the conversation and the window's edges, so it sits as far in
+/// from the left edge as from the line or the right edge, as the margin's
+/// text does (#742).
 const GUTTER: u16 = 2;
 /// How long a side chat's copy stays once idle.
 /// What follows a guess at the next message in the composer.
@@ -9371,6 +9375,28 @@ impl App {
             "tool_calls_withheld" => {
                 self.notice = Some("at the round limit: this reply ends the turn".into())
             }
+            "dropped" => {
+                // The model's own output cap cut its reply short: the
+                // daemon kept none of it and told the agent, whose next
+                // call streams afresh. What was shown stays, as a retry's
+                // does, part of it in the scrollback already; the notice
+                // says the agent did not keep it.
+                self.live_item = None;
+                self.end_live(Words::Reply);
+                self.ahead.clear();
+                self.streamed = false;
+                self.said.clear();
+                self.replay = None;
+                self.notice = Some(match data["in"].as_str() {
+                    Some(what) => format!(
+                        "the model's output limit cut its reply short while writing {what}; \
+                         the agent did not keep it and was told"
+                    ),
+                    None => "the model's output limit cut its reply short; \
+                             the agent did not keep it and was told"
+                        .into(),
+                });
+            }
             "retry" => {
                 // Messages written as the next began may come again, or
                 // not: what was shown stays, and the call's own is drawn.
@@ -9956,7 +9982,12 @@ impl App {
             .as_millis() as i64;
         let (query, window) = view.query(now);
         let read = self.client.request("usage", query).await;
-        view.loaded(window, read.map_err(|error| error.to_string()));
+        // The price sheet as its file says now, so an edit shows at the
+        // next read; a sheet that does not parse prices nothing.
+        let prices = agent_client::config::load()
+            .and_then(|config| agent_client::config::prices(&config))
+            .unwrap_or_default();
+        view.loaded(window, read.map_err(|error| error.to_string()), prices);
     }
 
     async fn reread(&mut self) {
@@ -10519,6 +10550,20 @@ impl App {
                         if let Some(program) = &pane.program {
                             let (x, y) = pane.origin();
                             program.mouse(*mouse, x, y);
+                            return true;
+                        }
+                        // A star or a name in `/sky`: centred on, as the
+                        // arrows and Enter do; on `you`, the person again.
+                        // Each card row starts with a space.
+                        if down
+                            && pane.is_card()
+                            && let Some(view) = self.watch.as_mut().and_then(|w| w.sky.as_mut())
+                            && let Some((line, column)) =
+                                pane.screen.line_at(mouse.column, mouse.row)
+                            && column > 0
+                            && view.click(line, column - 1)
+                        {
+                            pane.screen.unselect();
                             return true;
                         }
                         pane.screen.mouse(*mouse)
@@ -11410,14 +11455,16 @@ impl App {
         if pane == area.width {
             return match self.pane_keys {
                 true => (Rect { width: 0, ..area }, Some(area)),
-                false => (area, None),
+                false => (self.centred(area), None),
             };
         }
         // A gutter each side of the line between them: the conversation
         // stops short of it, and the pane, whose rows open with a space of
-        // their own, starts a column after it.
+        // their own, starts a column after it. The conversation starts as
+        // far in from the window's edge.
         let chat = Rect {
-            width: (area.width - pane - 1).saturating_sub(GUTTER),
+            x: area.x + GUTTER,
+            width: (area.width - pane - 1).saturating_sub(2 * GUTTER),
             ..area
         };
         let pane = Rect {
@@ -11429,16 +11476,21 @@ impl App {
     }
 
     /// The conversation alone in the window: in zen, its column in the
-    /// middle, as a reader centres a page; else where it is, on the left.
+    /// middle, as a reader centres a page; else where it is, on the left;
+    /// a gutter in from either edge.
     fn centred(&self, area: Rect) -> Rect {
         let column = measure() as u16;
         match self.zen {
-            Some(_) if area.width > column => Rect {
+            Some(_) if area.width > column + 2 * GUTTER => Rect {
                 x: area.x + (area.width - column) / 2,
                 width: column,
                 ..area
             },
-            _ => area,
+            _ => Rect {
+                x: area.x + GUTTER,
+                width: area.width.saturating_sub(2 * GUTTER),
+                ..area
+            },
         }
     }
 
@@ -18262,12 +18314,14 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut app = rt.block_on(async { app(zen_daemon().await) });
         let wide = Rect::new(0, 0, 160, 40);
-        assert_eq!(app.split(wide).0, wide);
+        // Out of zen, a gutter in from either edge.
+        assert_eq!(app.split(wide).0, Rect::new(2, 0, 156, 40));
         app.zen = Some("the rounding".into());
         assert_eq!(app.split(wide).0, Rect::new(30, 0, 100, 40));
-        // A window narrower than the column keeps all of it.
+        // A window narrower than the column keeps all of it, but its
+        // gutters.
         let narrow = Rect::new(0, 0, 80, 40);
-        assert_eq!(app.split(narrow).0, narrow);
+        assert_eq!(app.split(narrow).0, Rect::new(2, 0, 76, 40));
         // The margin stays away in zen.
         app.pane = Some(pane::Pane::margin());
         assert_eq!(app.split(wide), (Rect::new(30, 0, 100, 40), None));
@@ -18876,6 +18930,71 @@ mod tests {
         // Reactions find each message by its node.
         assert!(app.kept(screen::Tag::End(2)));
         assert!(!app.kept(screen::Tag::Streamed(1)));
+    }
+
+    #[tokio::test]
+    async fn a_reply_the_model_s_cap_cut_short_stays_as_shown_and_the_next_follows() {
+        let client = daemon_with(json!({
+            "3": {"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "Written in parts."}]}
+        }))
+        .await;
+        let mut app = app(client);
+        let event =
+            |event: &str, data: Value| json!({"event": event, "bot": "b", "turn": 1, "data": data});
+        app.daemon(event("accepted", json!({}))).await;
+        let said = |item: u64, text: &str| {
+            let mut delta = event("text_delta", json!({}));
+            (delta["item"], delta["text"]) = (json!(item), json!(text));
+            delta
+        };
+        // Longer than half the screen, so part of it is in the scrollback
+        // before the cut.
+        let long: String = (0..40)
+            .map(|n| format!("Line {n} of the whole file\n"))
+            .collect();
+        app.daemon(said(1, &long)).await;
+        app.daemon(said(1, "and the last")).await;
+        app.daemon(event(
+            "dropped",
+            json!({"limit": "max_tokens", "output_tokens": 32000, "in": "text"}),
+        ))
+        .await;
+        assert!(app.live.is_none() && app.said.is_empty() && app.ahead.is_empty());
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("output limit") && n.contains("writing text"))
+        );
+        app.daemon(said(3, "Written in parts.")).await;
+        app.daemon(event("message", json!({"node": 3}))).await;
+        let open = app.open_rows(80);
+        let drawn: Vec<String> = (app.pending.iter().chain(&open))
+            .map(|line| line.to_string())
+            .collect();
+        // What was shown stays, once each, the last line too; the next
+        // reply follows it.
+        for n in [0, 39] {
+            let line = format!("Line {n} of the whole file");
+            assert_eq!(
+                drawn.iter().filter(|l| l.contains(&line)).count(),
+                1,
+                "{drawn:?}"
+            );
+        }
+        assert_eq!(
+            drawn.iter().filter(|l| l.contains("and the last")).count(),
+            1,
+            "{drawn:?}"
+        );
+        assert_eq!(
+            drawn
+                .iter()
+                .filter(|l| l.contains("Written in parts."))
+                .count(),
+            1,
+            "{drawn:?}"
+        );
     }
 
     #[tokio::test]
@@ -23969,13 +24088,13 @@ mod tests {
     fn the_text_width_sets_the_conversations_measure_and_0_fills_the_window() {
         assert_eq!(measure_of(agent_client::config::TEXT_WIDTH), 100);
         // A wider text keeps its columns, the margin taking the rest.
-        let wide = measure_of(140) as u16 + GUTTER;
-        assert_eq!(pane::margin_width(300, wide), Some(157));
+        let wide = kept_at(300, measure_of(140));
+        assert_eq!(pane::margin_width(300, wide), Some(155));
         assert_eq!(pane::width(160, wide), 160);
         // The window's whole width, wider than any window and a column
         // added to it still fits.
         assert_eq!(measure_of(0), WHOLE);
-        assert!(WHOLE >= u16::MAX as usize / 2 && WHOLE as u16 + GUTTER > WHOLE as u16);
+        assert!(WHOLE >= u16::MAX as usize / 2 && WHOLE as u16 + 2 * GUTTER > WHOLE as u16);
     }
 
     #[test]
@@ -23986,18 +24105,18 @@ mod tests {
             let pane = pane::width(window, kept_at(window, WHOLE));
             match pane == window {
                 true => None,
-                false => Some(((window - pane - 1).saturating_sub(GUTTER), pane - 1)),
+                false => Some(((window - pane - 1).saturating_sub(2 * GUTTER), pane - 1)),
             }
         };
         // Half each, the line and its gutters between them.
-        assert_eq!(split(170), Some((83, 83)));
-        assert_eq!(split(400), Some((198, 198)));
+        assert_eq!(split(170), Some((82, 82)));
+        assert_eq!(split(400), Some((197, 197)));
+        assert_eq!(split(85), Some((40, 39)));
         // Too narrow for two halves of the margin's least, one at a time.
-        assert_eq!(split(82), Some((39, 39)));
-        assert_eq!(split(81), Some((38, 39)));
-        assert_eq!(split(80), None);
-        // A measure of its own is kept as before.
-        assert_eq!(kept_at(170, 100), 102);
+        assert_eq!(split(84), Some((39, 39)));
+        assert_eq!(split(83), None);
+        // A measure of its own is kept as before, with a gutter each side.
+        assert_eq!(kept_at(170, 100), 104);
     }
 
     #[tokio::test]
@@ -24007,10 +24126,14 @@ mod tests {
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
         let (chat, margin) = app.split(Rect::new(0, 0, 170, 40));
-        // The conversation's 100, a gutter each side of the line, the rest.
-        assert_eq!((chat.width, margin.map(|m| m.width)), (100, Some(66)));
+        // The conversation's 100 two columns in, a gutter each side of the
+        // line, the rest.
+        assert_eq!(
+            (chat.x, chat.width, margin.map(|m| m.width)),
+            (2, 100, Some(64))
+        );
         let (chat, margin) = app.split(Rect::new(0, 0, 130, 40));
-        assert_eq!((chat.width, margin), (130, None));
+        assert_eq!((chat.width, margin), (126, None));
         // Asked for with Tab, it has the window to itself, as anything
         // opened in a window too narrow for both does, the conversation
         // a key away.
@@ -24021,7 +24144,7 @@ mod tests {
         // conversation's 100 where there is room for both.
         app.open_pane(pane::Pane::card("status", "esc close"));
         let (chat, pane) = app.split(Rect::new(0, 0, 170, 40));
-        assert_eq!((chat.width, pane.map(|m| m.width)), (100, Some(66)));
+        assert_eq!((chat.width, pane.map(|m| m.width)), (100, Some(64)));
         let (chat, pane) = app.split(Rect::new(0, 0, 130, 40));
         assert_eq!((chat.width, pane.map(|m| m.width)), (0, Some(130)));
         // The conversation back, the footer says how over to the pane,
@@ -24044,7 +24167,7 @@ mod tests {
         // Its ↑ gives the conversation the room back.
         app.follow("sonny:jump/repro");
         let (chat, _) = app.split(Rect::new(0, 0, 130, 40));
-        assert_eq!(chat.width, 130);
+        assert_eq!(chat.width, 126);
     }
 
     #[tokio::test]

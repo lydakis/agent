@@ -7602,7 +7602,85 @@ path changed: lone submit CPU 31.1 → 30.8 ms, burst submit p99 4.54 →
 CPU per turn 0.92 → 0.92 ms, lifecycle p95 turn 697 → 714 ms, the quiet
 window 1.54 → 1.34 ms/s.
 
-## The audit trail (protocol 56, schema 86)
+## Spend kept by the model that spent it (#345)
+
+Every recorded model call now also upserts one `turn_models` row, keyed
+`(turn, model)`, `WITHOUT ROWID`, inside the job and transaction that
+already record the call's usage event, turn totals and bot totals: no new
+store job, no new commit. A call that names its attempts (a summary on
+another model, a refused request's fallback, a provider-side fallback)
+upserts one row per attempt. `usage` adds one grouped scan of the table,
+joined by primary key to the turns its window already reads.
+
+Matched screen, base `main` (3322847) against head, as the Perf workflow
+runs it (`bench.admission_burst` and `bench.completion_burst` at
+`--repeat 5`, `bench.footprint` at `--repeat 2`, `bench.lifecycle` socket
+32 echo bots), two alternating rounds, release builds on a 4-core Linux
+cloud container that was also compiling during the later rounds, so CPU
+and latency are noisier than usual:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 46.051 | 40.404 | -12.3% |
+| admission | burst submit p99, ms | 8.884 | 7.786 | -12.4% |
+| completion | release to terminal p99, ms | 17.546 | 18.826 | +7.3% |
+| footprint | idle RSS, MiB | 15.258 | 15.361 | +0.7% |
+| footprint | per idle bot, KiB | 1.642 | 1.584 | -3.5% |
+| footprint | RSS after a turn each, MiB | 23.965 | 24.703 | +3.1% |
+| footprint | CPU per turn, ms | 1.282 | 1.299 | +1.3% |
+| lifecycle | CPU, s | 0.685 | 0.71 | +3.6% |
+| lifecycle | p95 turn, ms | 679.39 | 660.488 | -2.8% |
+| lifecycle | peak RSS, MiB | 22.986 | 23.07 | +0.4% |
+
+Store work per turn is unchanged (the gate counts it and passed): the
+upsert rides the existing job. Every timing moved both ways within noise.
+
+The upsert alone, on a 1M-turn store with random turn ids (Python
+`sqlite3`, so with its call overhead): 12.8 µs; its plan is two
+primary-key searches. The schema 85 backfill, one `INSERT … SELECT` over
+`turns`, took 1.4 s on 1M turns (398 MB store) and added about 45 bytes a
+turn.
+
+## A reply the model's cap cuts short (#822)
+
+The daemon no longer counts a reply's bytes as it streams: the per-delta
+encoded-length accounting and the per-item counts are gone, and a delta
+costs one length compare before it goes live (in 128 KiB pieces, so one
+piece for every real delta). An output item's start parses two fields of
+it, borrowed, to name what a cut reply was writing. A reply the cap cuts
+costs one store job, `drop_reply` (its `dropped` event, its round, the
+note to the model and the turn's `drops` count, in one commit); a kept
+reply's commit sets `drops` back with the update it already made, and a
+resumed turn reads it in the `context` query it already ran. A bot's
+`max_drops` setting is one more `Option` in its settings JSON. Nothing is
+added to submit, to an ordinary turn's store jobs, or to its events.
+
+The Perf workflow's matched screen of this change against its base
+(`bench.perf_gate`, GitHub runner, head 2fb9a56 against main a53e1eb): store
+work per turn is the same and the gate passed. Release to terminal p99 moved
++6.3% (9.73 to 10.35 ms) inside the runner's spread for it (#771's screen
+moved it -0.3%, #774's +0.0%), with CPU per turn -0.3%; every other daemon
+measure moved under 3%. Sonny's moves are on paths this change does not
+touch (its only change draws a notice on a `dropped` event).
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 30.75 | 31.036 | +0.9% |
+| admission | burst submit p99, ms | 4.566 | 4.497 | -1.5% |
+| completion | release to terminal p99, ms | 9.731 | 10.347 | +6.3% |
+| footprint | idle RSS, MiB | 15.342 | 15.248 | -0.6% |
+| footprint | per idle bot, KiB | 1.666 | 1.62 | -2.8% |
+| footprint | RSS after a turn each, MiB | 24.982 | 24.93 | -0.2% |
+| footprint | CPU per turn, ms | 0.929 | 0.926 | -0.3% |
+| sonny | lookout note p95 at 100x10, ms | 2437.0 | 2441.5 | +0.2% |
+| sonny | quiet window CPU, ms/s | 2.07 | 1.745 | -15.7% |
+| sonny | sky replay CPU per 1k lines, ms | 9.815 | 8.995 | -8.4% |
+| sonny | sky replay RSS, MiB | 88.45 | 74.25 | -16.1% |
+| lifecycle | CPU, s | 0.44 | 0.44 | +0.0% |
+| lifecycle | p95 turn, ms | 579.066 | 578.157 | -0.2% |
+| lifecycle | peak RSS, MiB | 22.469 | 22.502 | +0.1% |
+
+## The audit trail (protocol 57, schema 87)
 
 Each tool call writes one `audit` row inside the commit that starts it (or
 denies it) and updates it inside the commit that records its result, and

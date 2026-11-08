@@ -159,9 +159,13 @@ class Model(http.server.BaseHTTPRequestHandler):
             arrived[user, attempt] = time.monotonic()
             self.server.arrived = arrived
             pace_at = getattr(self.server, 'pace_at', None)
-            if (pace_at is not None and not is_summary(request)
-                    and sum(i.get('type') == 'function_call_output' for i in request['input']) >= pace_at):
-                # Once, after that many results: a 429 that parks the turn.
+            pace = getattr(self.server, 'pace', None)
+            if not is_summary(request) and (
+                    (pace_at is not None
+                     and sum(i.get('type') == 'function_call_output' for i in request['input']) >= pace_at)
+                    or (pace and pace(request, user))):
+                # Once, after that many results, or when `pace` says: a 429
+                # that parks the turn.
                 self.server.pace_at = None
                 body = b'{"error":{"message":"try later"}}'
                 self.send_response(429)
@@ -534,6 +538,16 @@ class Model(http.server.BaseHTTPRequestHandler):
                 events = [{'type': 'response.incomplete', 'response': {'status': 'incomplete',
                     'incomplete_details': {'reason': 'max_output_tokens'}, 'output': [],
                     'usage': {'input_tokens': 100, 'output_tokens': 10}}}]
+            if (cut := getattr(self.server, 'cut_short', None)) and cut(request, user):
+                # The model's own output cap cuts a reply short while it
+                # writes a call, as the endpoint reports it.
+                events = [{'type': 'response.output_item.added', 'output_index': 0,
+                           'item': {'type': 'function_call', 'name': 'write', 'call_id': 'cut-1', 'arguments': ''}},
+                          {'type': 'response.function_call_arguments.delta', 'output_index': 0,
+                           'delta': '{"path":"a.txt","content":"partial'},
+                          {'type': 'response.incomplete', 'response': {
+                              'status': 'incomplete', 'incomplete_details': {'reason': 'max_output_tokens'},
+                              'output': [], 'usage': {'input_tokens': 100, 'output_tokens': 32000}}}]
             if user.startswith('streamlimit:') and attempt == 1:
                 # A rate limit the provider reports inside the stream.
                 events = [{'type': 'response.failed', 'response': {'status': 'failed', 'error': {
@@ -577,7 +591,8 @@ class Model(http.server.BaseHTTPRequestHandler):
                                      indent=2 if getattr(self.server, 'history_multiline', False) else None)
                 frame = (''.join('data: ' + line + '\r\n' for line in encoded.split('\n')) + '\r\n').encode()
                 # Split inside UTF-8 sequences and SSE line boundaries.
-                chunk_size = 8192 if user == 'large-call-id' or user.startswith('budget:') else 7
+                chunk_size = getattr(self.server, 'chunk_size', None) or (
+                    8192 if user == 'large-call-id' or user.startswith('budget:') else 7)
                 for offset in range(0, len(frame), chunk_size):
                     part = frame[offset:offset + chunk_size]
                     self.wfile.write(f'{len(part):x}\r\n'.encode() + part + b'\r\n')
@@ -1327,8 +1342,14 @@ class AnthropicRuntimeTests(unittest.TestCase):
                          'provider_unavailable')
         client.request('create', bot='Capped', workspace=str(path), budget_tokens=10)
         capped = client.request('submit', bot='Capped', request_id='cap', prompt='incomplete')['result']['turn']
-        self.assertEqual(client.finished(capped)['data']['error'], 'provider_incomplete')
-        self.assertEqual(client.request('inspect', bot='Capped')['result']['tokens_used'], 14)  # 5 + 2 cached in, 7 out
+        # Cut short at max_tokens while it wrote words: dropped, and with the
+        # budget spent the turn's one more call, told why, ends it.
+        ended = client.finished(capped)['data']
+        self.assertEqual((ended['status'], ended['limit']), ('completed', 'budget'))
+        dropped = [e['data'] for e in client.request('events', bot='Capped', after=0, limit=256)['result']['events']
+                   if e['event'] == 'dropped']
+        self.assertEqual(dropped, [{'limit': 'max_tokens', 'output_tokens': 7, 'in': 'text'}])
+        self.assertEqual(client.request('inspect', bot='Capped')['result']['tokens_used'], 28)  # twice 5 + 2 cached in, 7 out
         self.assertEqual(client.request('submit', bot='Capped', request_id='retry', prompt='hello')['error'],
                          'budget_exhausted')
         while not model.requests.empty():
@@ -3007,9 +3028,10 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(held['retries'], 0)
         self.assertGreater(held['paced_ms'], 0)
         self.assertGreaterEqual(arrived['hello', 1] - arrived['paced:1', 1], .3)
-        # A response the model could not finish is final, not retried.
+        # A reply the model's own cap cut short is not retried: it is
+        # dropped, and the turn goes on, the model told why.
         data, retries = run('incomplete')
-        self.assertEqual((data['status'], data['error'], retries), ('failed', 'provider_incomplete', []))
+        self.assertEqual((data['status'], data['error'], retries), ('completed', None, []))
         # A refusal that never lifts is bounded: 64 paced attempts, each held
         # for the provider's Retry-After, then the turn is held on it, an
         # outage the person sees, tried again on its own a minute later.

@@ -1981,6 +1981,22 @@ impl Screen {
         Some((at, x.min(self.shown[at].line.width())))
     }
 
+    /// The line pushed, and the column in it, under `(column, row)` on its
+    /// first drawn row: where a card that knows its own lines reads a
+    /// click. None off the drawn rows or on a row wrapped from above.
+    pub fn line_at(&self, column: u16, row: u16) -> Option<(usize, usize)> {
+        if !self.area.contains((column, row).into()) {
+            return None;
+        }
+        let y = (row - self.area.y) as usize;
+        let at = (y < self.drawn).then_some(self.top + y)?;
+        if !self.shown.get(at)?.first {
+            return None;
+        }
+        let line = self.shown[..at].iter().filter(|shown| shown.first).count();
+        Some((line, (column - self.area.x) as usize))
+    }
+
     /// The mouse, over the screen. Presses outside the conversation's
     /// rows let go of the selection.
     pub fn mouse(&mut self, event: ratatui::crossterm::event::MouseEvent) -> Option<Action> {
@@ -3608,6 +3624,27 @@ mod tests {
         ));
         assert_eq!(screen.texts(), ["before", "• Started a, b ▸", "after"]);
         assert!(!screen.replace_tagged(Tag::Group(2), Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn a_click_finds_the_line_pushed_under_it_and_its_column() {
+        let mut screen = Screen::default();
+        screen.push(vec![
+            Line::from("one"),
+            Line::from("two words that wrap"),
+            Line::from("three"),
+        ]);
+        let area = Rect::new(2, 1, 10, 6);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 12, 8));
+        screen.render(area, &mut buf, |_| None);
+        assert_eq!(screen.line_at(2, 1), Some((0, 0)));
+        assert_eq!(screen.line_at(5, 2), Some((1, 3)));
+        // The wrapped part of a line, and past the last, find none.
+        assert_eq!(screen.line_at(5, 3), None);
+        let last = (1..7).rev().find(|&row| screen.line_at(2, row).is_some());
+        assert_eq!(screen.line_at(2, last.unwrap()), Some((2, 0)));
+        assert_eq!(screen.line_at(2, last.unwrap() + 1), None);
+        assert_eq!(screen.line_at(1, 1), None);
     }
 
     #[test]
