@@ -584,13 +584,6 @@ async fn read_status(
         {
             continue;
         }
-        let page = (client)
-            .request("turns", json!({"bot": name, "newest": true, "limit": 8}))
-            .await
-            .ok();
-        let turns = (page.as_ref())
-            .and_then(|page| page["turns"].as_array().cloned())
-            .unwrap_or_default();
         // Its latest items are read again only once its history moved:
         // the same head is the same history. A failed read is kept
         // for none, so the next refresh tries again.
@@ -603,29 +596,24 @@ async fn read_status(
             kept.insert(name.to_owned(), (head, latest.clone()));
         }
         let latest = latest.unwrap_or_default();
-        let turn = turns.first().cloned().unwrap_or(Value::Null);
-        // The turn that runs is the one the daemon names, however many
-        // messages were steered into it or queued after it since; an
-        // idle agent's is the newest that ran ([`last_ran`]).
+        // Its turn, as the listing says: the one the daemon runs, however
+        // many messages were steered into it or queued after it since, or
+        // how its newest that ran (or failed in line) ended.
         let running_turn = bot["running_turn"].as_i64();
         let running = running_turn.is_some();
-        let ran = match running || page.is_some() {
-            true => {
-                let ran = active_turn(client, name, running_turn, page).await;
-                with_error(client, ran.unwrap_or(Value::Null)).await
-            }
-            false => Value::Null,
+        let ran = match running {
+            true => json!({"turn": running_turn, "status": bot["status"],
+                "waiting_on": bot["waiting_on"], "started_ms": bot["started_ms"]}),
+            false => bot["last"].clone(),
         };
         // A turn held on a cause, parked on its call or in line, says so.
-        let blocked_on = (std::iter::once(&ran).chain(&turns)).find_map(|turn| {
-            let blocked = &turn["waiting_on"]["blocked"];
-            blocked.is_object().then(|| {
-                status::held_cause(
-                    blocked["code"].as_str().unwrap_or(""),
-                    blocked["detail"].as_str(),
-                )
-                .0
-            })
+        let blocked = &bot["waiting_on"]["blocked"];
+        let blocked_on = blocked.is_object().then(|| {
+            status::held_cause(
+                blocked["code"].as_str().unwrap_or(""),
+                blocked["detail"].as_str(),
+            )
+            .0
         });
         let state = match (running, ran["status"].as_str()) {
             _ if let Some(what) = &blocked_on => format!("{}{what}", status::HELD),
@@ -649,7 +637,6 @@ async fn read_status(
                 format!("waiting on {}", on.join(", "))
             }
             (true, Some("paced")) => "rate limited".into(),
-            (true, Some("queued")) => "queued".into(),
             (true, _) => "working".into(),
             (false, Some("completed" | "steered")) => started::IDLE.into(),
             (false, Some("failed")) if ran["error"] == EMPTY => started::QUIET.into(),
@@ -677,7 +664,7 @@ async fn read_status(
         // ended, as is whether that turn resolved the task. A running
         // turn shows its work, as its last items say; a question still
         // open shows again once it ends.
-        let seen = match turn["turn"].as_i64() {
+        let seen = match ran["turn"].as_i64() {
             Some(last) if !running => match asks_seen.get(name) {
                 Some((at, seen)) if *at == last => seen.clone(),
                 _ => {
@@ -17091,8 +17078,9 @@ mod tests {
     async fn status_lists_every_page_and_reads_again_only_the_histories_that_moved() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let histories = Arc::new(AtomicUsize::new(0));
+        let turn_reads = Arc::new(AtomicUsize::new(0));
         let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (read, head) = (histories.clone(), moved.clone());
+        let (read, head, turns) = (histories.clone(), moved.clone(), turn_reads.clone());
         let failed = std::sync::atomic::AtomicBool::new(false);
         let bot = |n: usize, head: i64| {
             json!({"name": format!("shop.t{n:03}"), "bot_id": n, "head": head,
@@ -17110,7 +17098,10 @@ mod tests {
                         let last = if head.load(Ordering::SeqCst) { 2 } else { 1 };
                         json!({"bots": [bot(256, last)], "next_after": null})
                     }
-                    "turns" => json!({"turns": [], "next_before": null}),
+                    "turns" => {
+                        turns.fetch_add(1, Ordering::SeqCst);
+                        json!({"turns": [], "next_before": null})
+                    }
                     "history_nodes" => {
                         read.fetch_add(1, Ordering::SeqCst);
                         json!({"nodes": [], "next_from": null})
@@ -17132,8 +17123,9 @@ mod tests {
         assert_eq!(rows.len(), 257);
         assert!(rows.iter().any(|row| row.bot == "shop.t256"));
         assert_eq!(histories.load(Ordering::SeqCst), 257);
-        // No history moved: only the one whose read failed is read again
-        // (and every agent's turns, as queued work moves no record).
+        // Each agent's turn is the listing's: no agent's turns are read.
+        assert_eq!(turn_reads.load(Ordering::SeqCst), 0);
+        // No history moved: only the one whose read failed is read again.
         app.status_rows().await.unwrap();
         assert_eq!(histories.load(Ordering::SeqCst), 258);
         app.status_rows().await.unwrap();
@@ -17142,6 +17134,7 @@ mod tests {
         moved.store(true, Ordering::SeqCst);
         app.status_rows().await.unwrap();
         assert_eq!(histories.load(Ordering::SeqCst), 259);
+        assert_eq!(turn_reads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -17152,8 +17145,10 @@ mod tests {
                 "bots" => json!({"bots": [
                     {"name": "shop.lead", "bot_id": 1, "head": 1, "running_turn": null},
                     {"name": "shop.fix", "bot_id": 2, "head": 1, "running_turn": 4,
+                        "status": "waiting", "waiting_on": {"approval": true},
                         "created_by": "shop.lead"},
                     {"name": "shop.web", "bot_id": 3, "head": 1, "running_turn": 4,
+                        "status": "waiting", "waiting_on": {"approval": true},
                         "created_by": "shop.lead"},
                 ], "next_after": null}),
                 "turns" if asked["bot"] == "shop.lead" => json!({"turns": []}),
@@ -17200,6 +17195,7 @@ mod tests {
                 "bots" => json!({"bots": [
                     {"name": "shop.lead", "bot_id": 1, "head": 1, "running_turn": null},
                     {"name": "shop.fix", "bot_id": 2, "head": 1, "running_turn": null,
+                        "status": "completed", "last": {"turn": 3, "status": "completed"},
                         "created_by": "shop.lead"},
                 ], "next_after": null}),
                 "turns" if asked["bot"] == "shop.fix" => {
@@ -22218,6 +22214,8 @@ mod tests {
                 "bots" => json!({"bots": [
                     {"name": "shop.lead", "bot_id": 1, "head": 1, "running_turn": null},
                     {"name": "shop.fix", "bot_id": 2, "head": 1, "running_turn": null,
+                        "status": "completed",
+                        "last": {"turn": 3, "status": "completed", "finished_ms": 2},
                         "created_by": "shop.lead"},
                 ], "next_after": null}),
                 "turns" if asked["bot"] == "shop.fix" => json!({"turns": [

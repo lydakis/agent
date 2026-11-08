@@ -17917,3 +17917,282 @@ fn a_gated_step_is_told_done_once_even_when_its_row_was_trimmed() {
     assert_eq!(db.last_event_id().unwrap(), before + 1);
     assert!(trail(&db).is_empty());
 }
+
+/// Bob as a `bots` page lists him, with the page's cursor.
+fn listed(db: &Database) -> (Value, i64) {
+    let page = db.list(None, 64, None, false, None).unwrap();
+    let bob = (page["bots"].as_array().unwrap().iter())
+        .find(|bot| bot["name"] == "Bob")
+        .unwrap()
+        .clone();
+    (bob, page["cursor"].as_i64().unwrap())
+}
+
+fn paced(db: &mut Database, turn: i64) {
+    let blocked = Blocked {
+        code: "provider_login_rejected".into(),
+        detail: Some("HTTP 401".into()),
+        since_ms: 5,
+    };
+    db.suspend_paced(
+        turn,
+        99,
+        0,
+        0,
+        0,
+        0,
+        0,
+        false,
+        None,
+        None,
+        None,
+        None,
+        Some(blocked),
+        None,
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_bot_carries_its_whole_status_through_every_transition() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let (bob, before) = listed(&db);
+    assert_eq!(
+        (
+            &bob["status"],
+            &bob["started_ms"],
+            &bob["waiting_on"],
+            &bob["last"]
+        ),
+        (&json!("idle"), &Value::Null, &Value::Null, &Value::Null)
+    );
+    // Running: when it started.
+    let first = db
+        .begin(
+            "Bob",
+            "r1",
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (bob, cursor) = listed(&db);
+    assert!(cursor > before, "the cursor moves with each event");
+    assert_eq!(bob["status"], "running");
+    assert_eq!(bob["running_turn"], first);
+    let started = db.turn_view("Bob", first).unwrap()["started_ms"].clone();
+    assert!(started.is_i64());
+    assert_eq!(bob["started_ms"], started);
+    // Parked: on what, as the turn's own view says; `inspect` says the same.
+    paced(&mut db, first);
+    let (bob, _) = listed(&db);
+    assert_eq!(bob["status"], "paced");
+    assert_eq!(
+        bob["waiting_on"],
+        db.turn_view("Bob", first).unwrap()["waiting_on"]
+    );
+    assert_eq!(
+        bob["waiting_on"]["blocked"]["code"],
+        "provider_login_rejected"
+    );
+    let inspected = serde_json::to_value(db.inspect("Bob").unwrap()).unwrap();
+    assert_eq!(inspected["waiting_on"], bob["waiting_on"]);
+    assert_eq!(inspected["started_ms"], started);
+    db.resume(first).unwrap();
+    let (bob, _) = listed(&db);
+    assert_eq!(
+        (&bob["status"], &bob["waiting_on"]),
+        (&json!("running"), &Value::Null)
+    );
+    // Ended: how, and nothing runs.
+    db.finish(first, None).unwrap();
+    let (bob, _) = listed(&db);
+    let view = db.turn_view("Bob", first).unwrap();
+    assert_eq!(bob["status"], "completed");
+    assert_eq!(bob["started_ms"], Value::Null);
+    assert_eq!(
+        bob["last"],
+        json!({"turn":first,"status":"completed","started_ms":started,
+            "finished_ms":view["finished_ms"],"error":null})
+    );
+    // Held at its start: held, and on what, as the turn's view says.
+    let second = db
+        .begin(
+            "Bob",
+            "r2",
+            "next",
+            false,
+            &TurnOptions {
+                delivery: Delivery::Queue,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.hold(second, &Error::with("provider_unavailable", "openai"))
+        .unwrap()
+        .unwrap();
+    let (bob, _) = listed(&db);
+    assert_eq!(bob["status"], "held");
+    assert_eq!(
+        bob["waiting_on"],
+        db.turn_view("Bob", second).unwrap()["waiting_on"]
+    );
+    // Failed before it started: its failure is the bot's last.
+    db.end_queued(second, &Error::new("provider_unavailable"))
+        .unwrap();
+    let (bob, _) = listed(&db);
+    assert_eq!(
+        (&bob["status"], &bob["waiting_on"]),
+        (&json!("failed"), &Value::Null)
+    );
+    assert_eq!(bob["last"]["turn"], second);
+    assert_eq!(bob["last"]["started_ms"], Value::Null);
+    assert_eq!(bob["last"]["error"], "provider_unavailable");
+    // One cancelled in line did nothing: the last stays.
+    let cancelled = db
+        .begin(
+            "Bob",
+            "r3",
+            "never",
+            false,
+            &TurnOptions {
+                delivery: Delivery::Queue,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.end_queued(cancelled, &Error::new("cancelled")).unwrap();
+    let (bob, _) = listed(&db);
+    assert_eq!(
+        (&bob["status"], &bob["last"]["turn"]),
+        (&json!("failed"), &json!(second))
+    );
+}
+
+#[test]
+fn a_message_failing_in_line_while_a_turn_runs_is_the_bots_last_once_it_ends() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let running = db
+        .begin(
+            "Bob",
+            "r1",
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let queued = db
+        .begin(
+            "Bob",
+            "r2",
+            "then",
+            true,
+            &TurnOptions {
+                delivery: Delivery::Queue,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(queued.status, "queued");
+    db.end_queued(queued.turn, &Error::new("turn_budget_exhausted"))
+        .unwrap();
+    // The running turn still speaks for the bot.
+    let (bob, _) = listed(&db);
+    assert_eq!(bob["status"], "running");
+    assert_eq!(bob["last"]["turn"], queued.turn);
+    // Ending after it, the older turn does not hide the newer failure.
+    db.finish(running, None).unwrap();
+    let (bob, _) = listed(&db);
+    assert_eq!(bob["status"], "failed");
+    assert_eq!(bob["last"]["turn"], queued.turn);
+    assert_eq!(bob["last"]["error"], "turn_budget_exhausted");
+}
+
+#[test]
+fn a_store_before_bot_status_reads_each_bots_status_from_its_turns() {
+    let path = std::env::temp_dir().join(format!("bot-status-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let (done, failed) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        db.create("Ann", Some("/synthetic"), binding()).unwrap();
+        let done = db
+            .begin(
+                "Bob",
+                "r1",
+                "go",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.finish(done, None).unwrap();
+        let failed = db
+            .begin(
+                "Ann",
+                "r1",
+                "go",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.finish(failed, Some(&Error::new("provider_error")))
+            .unwrap();
+        let running = db
+            .begin(
+                "Bob",
+                "r2",
+                "again",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        paced(&mut db, running);
+        (done, failed)
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE bots DROP COLUMN started_ms; ALTER TABLE bots DROP COLUMN waiting_on;
+             ALTER TABLE bots DROP COLUMN last_turn; ALTER TABLE bots DROP COLUMN last_status;
+             ALTER TABLE bots DROP COLUMN last_started_ms; ALTER TABLE bots DROP COLUMN last_finished_ms;
+             ALTER TABLE bots DROP COLUMN last_error; PRAGMA user_version=87;",
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let page = db.list(None, 64, None, false, None).unwrap();
+    let (ann, bob) = (&page["bots"][0], &page["bots"][1]);
+    assert_eq!(ann["status"], "failed");
+    assert_eq!(ann["last"]["turn"], failed);
+    assert_eq!(ann["last"]["error"], "provider_error");
+    assert_eq!(bob["status"], "paced");
+    assert_eq!(bob["last"]["turn"], done);
+    assert_eq!(bob["last"]["status"], "completed");
+    let running = bob["running_turn"].as_i64().unwrap();
+    assert_eq!(
+        bob["waiting_on"],
+        db.turn_view("Bob", running).unwrap()["waiting_on"]
+    );
+    assert_eq!(
+        bob["started_ms"],
+        db.turn_view("Bob", running).unwrap()["started_ms"]
+    );
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}

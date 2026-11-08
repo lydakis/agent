@@ -3402,6 +3402,36 @@ among the calls a judge reads. Approval verdicts now keep `leased` when given un
 session's lease, which is how a row tells a reviewer from a person. The
 upgrade starts the trail empty: calls from before it are in history only.
 
+### Agent status
+
+Protocol version 58 (schema 88) has each bot carry its whole status, kept
+in the same commit as each of its turns' transitions, so one `bots` listing
+says what every agent is doing and a client asks no agent for its turns.
+`inspect`, every `bots` page, and the `created` and `forked` events carry:
+
+| Field | What it is |
+|---|---|
+| `status` | `idle` (never ran), `running`, `waiting`, `paced`, `held` (the turn at the front of its line, refused at its start for a cause a person can fix, keeps its place and is tried again), `completed`, `failed`, `interrupted` (how its newest turn that counts ended), or `deleting` |
+| `running_turn` | The turn running or parked, `null` when none |
+| `started_ms` | When the running turn started, `null` when none runs |
+| `waiting_on` | For `waiting`, `paced` and `held`: what that turn's own `waiting_on` says (its call, approval, answer, load, `resume_at_ms`, `blocked`); `null` otherwise |
+| `last` | `{turn, status, started_ms, finished_ms, error}` for the bot's newest turn that ran, or that failed before it started (`started_ms` null, `error` its code); `null` before any |
+
+A message steered into a running turn, one riding the next call, and one
+cancelled while it waited in line never count: nothing of theirs ran. A
+message that fails in line while another turn runs becomes `last` at once
+and the bot's `status` when that turn ends, which keeps its own ending only
+when it is the newer. No transition adds a statement: each widens the
+update of the bot row it already made, and a hold or an ending in line
+adds one update by name inside its own commit.
+
+A `bots` page also returns `cursor`, the events' cursor read before the
+page: list, then `follow` with `after` set to the first page's cursor, and
+no change is missed. An event already reflected in the listing restates a
+state the next event replaces. The upgrade reads each bot's status from its
+turns: its newest that counts, its error from that turn's `turn_finished`
+event while the event is kept.
+
 ### Tool-result elision
 
 Most of a long tool-using turn is tool output the model has already read.
