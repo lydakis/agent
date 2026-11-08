@@ -647,7 +647,9 @@ async fn call_in(
                 Some(steps) => {
                     let tool = asked["tool"].as_str().unwrap_or_default();
                     let called = asked["called"].as_str().unwrap_or(tool);
-                    steps.ask(tool, called, asked["arguments"].clone()).await
+                    let facts = crate::exec::Facts::of(asked);
+                    let asks = asked["record"] != true;
+                    (steps.ask(tool, called, asked["arguments"].clone(), facts, asks)).await
                 }
                 None => Err(format!("{tool} asks no approval")),
             };
@@ -1094,20 +1096,25 @@ impl Asker {
         tool: &str,
         called: &str,
         arguments: Value,
-    ) -> Result<Option<String>, String> {
+        facts: crate::exec::Facts,
+        asks: bool,
+    ) -> Result<String, String> {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = oneshot::channel();
         self.verdicts.lock().unwrap().insert((self.id, seq), tx);
-        let asked = json!({"id": self.id, "seq": seq,
-            "ask": {"tool": tool, "called": called, "arguments": arguments}});
+        let mut step = json!({"tool": tool, "called": called, "arguments": arguments,
+            "record": !asks});
+        facts.into(&mut step);
+        let asked = json!({"id": self.id, "seq": seq, "ask": step});
         self.out.send(&asked).await;
         let verdict = rx.await;
         self.verdicts.lock().unwrap().remove(&(self.id, seq));
         let verdict =
             verdict.map_err(|_| format!("{called} could not be approved: the link closed"))?;
-        match verdict.get("refused") {
-            Some(why) => Err(why.as_str().unwrap_or("denied").to_owned()),
-            None => Ok(verdict["allowed"].as_str().map(str::to_owned)),
+        match (verdict.get("refused"), verdict["allowed"].as_str()) {
+            (Some(why), _) => Err(why.as_str().unwrap_or("denied").to_owned()),
+            (None, Some(step)) => Ok(step.to_owned()),
+            (None, None) => Err(format!("{called} could not be recorded: no step came back")),
         }
     }
 

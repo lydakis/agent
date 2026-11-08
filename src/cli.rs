@@ -113,6 +113,14 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
+        name: "audit",
+        about: "Every tool call of every bot, newest first: tool, where it ran, who allowed it, how it ended",
+        usage: "audit [--bot NAME] [--turn ID] [--kind KIND] [--place PLACE] [--approved WHO] [--access ACCESS] [--outcome OUTCOME] [--tool NAME] [--since DURATION] [--before ID] [--limit N] | audit trim (--before ID | --older-than DURATION)",
+        flags: "--bot --turn --kind --place --approved --access --outcome --tool --since --before --older-than --limit --pretty --no-spawn",
+        settings: "",
+        startup: true,
+    },
+    Command {
         name: "approvals",
         about: "Tool calls waiting for a verdict",
         usage: "approvals [--bot NAME] [--tag TAG] [--full] [--limit N]",
@@ -567,6 +575,35 @@ fn print_flags(flags: &str) {
                 "Add a series of what was spent every DURATION from --since",
             ),
             "--request" => ("N", "The request number the call was announced with"),
+            "--kind" => (
+                "KIND",
+                "Only calls of this kind of tool: shell, file, mcp, browser, desktop, agents or web",
+            ),
+            "--place" => (
+                "PLACE",
+                "Only calls that ran here: sandbox, outside (this machine, outside a sandbox) or external (a service elsewhere)",
+            ),
+            "--approved" => (
+                "WHO",
+                "Only calls decided by: nobody, person, reviewer or rule",
+            ),
+            "--access" => (
+                "ACCESS",
+                "Only calls that read, write, or are unknown (a command, or a tool that says nothing)",
+            ),
+            "--outcome" => (
+                "OUTCOME",
+                "Only calls that ended so: completed, failed, denied or unknown",
+            ),
+            "--tool" => ("NAME", "Only calls of this tool, or steps of this name"),
+            "--before" => (
+                "ID",
+                "Rows older than this one; for audit trim, delete the rows older than it",
+            ),
+            "--older-than" => (
+                "DURATION",
+                "audit trim: delete the rows written longer ago than this",
+            ),
             "--tag" => (
                 "TAG",
                 "The gate to list or answer; default: the call's only gate, or auto",
@@ -762,6 +799,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--turn"
                     | "--checkpoint"
                     | "--request"
+                    | "--before"
             ) {
                 let max = match flag {
                     "--max-output-tokens" => u32::MAX as u64,
@@ -769,7 +807,8 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--checkpoint"
                     | "--budget-tokens"
                     | "--turn-budget-tokens"
-                    | "--request" => i64::MAX as u64,
+                    | "--request"
+                    | "--before" => i64::MAX as u64,
                     _ => usize::MAX as u64,
                 };
                 if !value.parse::<u64>().is_ok_and(|n| n > 0 && n <= max) {
@@ -824,7 +863,23 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         if positional == 0 {
             return fail_with("usage", "sandbox needs a command after --");
         }
-    } else if !matches!(c.name, "run" | "wait" | "companion") && positional != 0 {
+    } else if c.name == "audit" && positional != 0 {
+        // `audit trim` deletes what it names and nothing else.
+        if positional != 1 {
+            return fail_with("usage", "audit takes at most one word: trim");
+        }
+        if has("--before") == has("--older-than") {
+            return fail_with(
+                "usage",
+                "audit trim needs one of --before ID or --older-than DURATION",
+            );
+        }
+        if let Some(flag) = c.flags.split_whitespace().find(|f| {
+            !matches!(*f, "--before" | "--older-than" | "--pretty" | "--no-spawn") && has(f)
+        }) {
+            return fail_with("usage", format!("audit trim does not take {flag}"));
+        }
+    } else if !matches!(c.name, "run" | "wait" | "companion" | "audit") && positional != 0 {
         return fail_with("usage", format!("{} takes no positional arguments", c.name));
     }
     if has("--budget-counts") && !has("--budget-tokens") && !has("--turn-budget-tokens") {

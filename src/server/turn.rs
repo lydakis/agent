@@ -3636,6 +3636,20 @@ impl Turn {
             // An escape from a sandbox runs unconfined only once a gate
             // allowed it.
             let approved = record.gated(&call, workspace, &self.ruled());
+            let ruling = record.ruling(&call, &self.ruled());
+            // A call its sandbox confines runs in it; one that can't be
+            // confined fails rather than run unconfined. An escape no gate
+            // approved is refused, as Codex refuses one under a policy that
+            // never asks: a command, or a write or edit held to the sandbox.
+            // A command a rule allows runs unconfined, as in Codex; one a
+            // rule asked about runs where it asked to, once allowed.
+            let confined = record.sandboxed()
+                && agent_runtime::sandbox::confinable(&call.name)
+                && !(approved && !record.confines(&call, workspace))
+                && ruling != Ok(Ruling::Allow);
+            // Where its row in the audit trail says it ran: a sandbox holds
+            // writes only, so a sandboxed bot's read is within it.
+            let in_sandbox = confined || (record.sandboxed() && call.name == "read");
             if approved {
                 match self
                     .approve(
@@ -3644,6 +3658,7 @@ impl Turn {
                         announced.take(),
                         record,
                         workspace,
+                        in_sandbox,
                         route,
                         summary_retry_ms,
                     )
@@ -3655,8 +3670,11 @@ impl Turn {
                 }
             } else {
                 let started = call.clone();
+                let ruled = matches!(ruling, Ok(Ruling::Allow | Ruling::Forbidden(_)));
                 self.store
-                    .op("tool_start", move |db| db.tool_start(turn, &started))
+                    .op("tool_start", move |db| {
+                        db.tool_start(turn, &started, in_sandbox, ruled)
+                    })
                     .await?;
             }
             // A tool failure is a result the model can act on. Only the
@@ -3674,7 +3692,6 @@ impl Turn {
             // is refused, and one a rule asks about with no gate to ask is
             // refused too, as Codex refuses it under a policy that never
             // asks.
-            let ruling = record.ruling(&call, &self.ruled());
             let prepared = prepared.and_then(|prepared| match &ruling {
                 Ok(Ruling::Forbidden(why)) => Err(Error::with("command_forbidden", why.as_str())),
                 Ok(Ruling::Prompt(why)) if !approved => {
@@ -3683,17 +3700,7 @@ impl Turn {
                 Err(error) => Err(error.clone()),
                 Ok(_) => Ok(prepared),
             });
-            // A call its sandbox confines runs in it; one that can't be
-            // confined fails rather than run unconfined. An escape no gate
-            // approved is refused, as Codex refuses one under a policy that
-            // never asks: a command, or a write or edit held to the sandbox.
-            // A command a rule allows runs unconfined, as in Codex; one a
-            // rule asked about runs where it asked to, once allowed.
             let mut sandbox = None;
-            let confined = record.sandboxed()
-                && agent_runtime::sandbox::confinable(&call.name)
-                && !(approved && !record.confines(&call, workspace))
-                && ruling != Ok(Ruling::Allow);
             let prepared = match prepared {
                 Ok(Prepared::Shell { .. } | Prepared::Detach(_) | Prepared::Terminal { .. })
                     if confined && !record.confines(&call, workspace) =>
@@ -3943,6 +3950,12 @@ impl Turn {
                         Err(error) => failure(error),
                     }
                 }
+                Ok(Prepared::HistoryAudit(query)) => {
+                    match self.history_audit(&call.call_id, query).await {
+                        Ok(outcome) => outcome,
+                        Err(error) => failure(error),
+                    }
+                }
                 Ok(Prepared::HistorySearch { bot, query, before }) => {
                     match self.history_search(&call.call_id, bot, query, before).await {
                         Ok(outcome) => outcome,
@@ -4096,19 +4109,29 @@ impl Turn {
         environment: &[(String, String)],
     ) -> Result<()> {
         let turn = self.turn;
-        let starting: Vec<ToolCall> = batch.iter().map(|(call, _)| call.clone()).collect();
-        self.store
-            .op("tool_start", move |db| {
-                starting
-                    .iter()
-                    .try_for_each(|call| db.tool_start(turn, call).map(drop))
-            })
-            .await?;
         // A sandboxed bot's commands all run in its one sandbox; when it
         // can't be had, each command fails with why. A command a rule
-        // allows runs unconfined.
+        // allows runs unconfined. A read is within a sandbox, which holds
+        // writes only.
         let ruled = self.ruled();
         let allowed = |call: &ToolCall| record.ruling(call, &ruled) == Ok(Ruling::Allow);
+        let starting: Vec<(ToolCall, bool, bool)> = batch
+            .iter()
+            .map(|(call, _)| {
+                (
+                    call.clone(),
+                    record.sandboxed() && !allowed(call),
+                    allowed(call),
+                )
+            })
+            .collect();
+        self.store
+            .op("tool_start", move |db| {
+                starting.iter().try_for_each(|(call, confined, ruled)| {
+                    db.tool_start(turn, call, *confined, *ruled).map(drop)
+                })
+            })
+            .await?;
         let shells = batch
             .iter()
             .any(|(call, prepared)| matches!(prepared, Prepared::Shell { .. }) && !allowed(call));
@@ -4324,6 +4347,7 @@ impl Turn {
         announced: Option<(Arc<Notify>, tokio::time::Instant)>,
         record: &Bot,
         workspace: &std::path::Path,
+        confined: bool,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
     ) -> Result<Approval> {
@@ -4365,7 +4389,7 @@ impl Turn {
                     match self
                         .store
                         .op("approval_start", move |db| {
-                            db.approval_start(turn, &checked, now_ms())
+                            db.approval_start(turn, &checked, confined, now_ms())
                         })
                         .await?
                     {
@@ -4725,6 +4749,22 @@ impl Turn {
     /// Matches of literal text in a bot's history, or with a GLOB pattern
     /// every matching bot's, newest first; the caller's own turn is left
     /// out of a search that holds it.
+    /// A page of the audit trail for the bot to read, redacted as its
+    /// other reads of history are.
+    async fn history_audit(
+        &self,
+        call_id: &str,
+        query: agent_runtime::store::audit::Query,
+    ) -> Result<Outcome> {
+        let (family, budget) = self.page_budget(2, "history_context_exhausted").await?;
+        let page = self.store.read("audit", move |db| db.audit(&query)).await?;
+        let output = self.registry.redact_text(page.to_string());
+        if family.tool_result_item(call_id, false, &output)?.len() > budget {
+            return fail("history_context_exhausted");
+        }
+        Ok(Outcome::text(output))
+    }
+
     async fn history_search(
         &self,
         call_id: &str,

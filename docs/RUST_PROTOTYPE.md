@@ -2722,6 +2722,7 @@ command reaches another bot's. A request on it:
 | Request | On a bot's own socket |
 |---|---|
 | `configure`, `answer`, `tool_result`, `approve_step`, `step_result`, `serve_approvals`, `renew_approvals`, `shutdown` | `not_permitted`: any of them would let a confined command undo its confinement |
+| `audit_trim` | `not_permitted`: the audit trail is the person's record of what agents did |
 | `create`, `fork` | Made by the caller, whatever `created_by` names (another is `not_permitted`), so the bot inherits its sandbox; its workspace and `writable` folders, and a fork's source's, must be ones the caller may write. A fork with `allow: []`, which only answers, may be of any bot |
 | `submit` | Reads as the caller's: `from` its turn when the request names it (the CLI does, from `AGENT_TURN`), else with its name as `origin`; `from` naming another bot is `not_permitted`. A workspace for a sandboxed bot must be one the caller may write |
 | `delete`, `prune`, `compact`, `interrupt` | The caller itself, or a bot it made; another is `not_permitted` |
@@ -3308,6 +3309,68 @@ calls, `agent answer --bot NAME --turn N --call ID --request R allow|deny
 [--tag T] [--reason TEXT]` decides one and refuses to run inside a bot's
 tool shell, and `run --pretty` prints each pending call with the commands
 that allow or deny it.
+
+### Audit trail
+
+Protocol version 56 (schema 86) keeps a trail of what every agent did: one
+append-only `audit` table, with a row for each tool call that starts or is
+denied, and a row for each step a client puts to the daemon (an MCP call
+inside a script, a browser or desktop command). The daemon records what it
+sees and only that; nothing is guessed. A row holds:
+
+| Field | What it is |
+|---|---|
+| `id`, `at_ms` | Its place in the trail, and when it was written; times rise with ids |
+| `bot_id`, `bot`, `turn`, `call_id`, `step` | Whose call it was (`step` set for a step, as the client named it) |
+| `tool` | The tool's name, or a step's |
+| `kind` | `shell`, `file`, `mcp`, `browser`, `desktop`, `agents` or `web`; for a declared tool, what its client declared, else `null` |
+| `place` | `sandbox` (a shell or file call the bot's sandbox confined), `outside` (one it didn't), `external` (the web, or a remote MCP server), or `null` when the call says nothing of where it ran |
+| `approved` | `nobody` (no gate named it), `rule` (a command rule allowed it), `person` (a verdict given without a session's lease) or `reviewer` (every verdict under one) |
+| `access` | `read` or `write` only where the tool declares which (the daemon's file, web and agents tools; a client's step); `unknown` otherwise, and always for a shell command |
+| `ms`, `outcome` | How long it ran and how it ended: `completed`, `failed`, `denied`, or `unknown` while it runs or when it never said |
+| `preview` | The first 256 characters of its arguments |
+
+A call's row is written in the commit that starts it (or denies it), and
+its end updates the row in the commit that records the result: no store job
+is added to a turn. A step is written when it is decided: at once under no
+gate, or when its gates answer, keeping the facts it was announced with
+until then. Rows outlive their bots, their turns and every retention
+setting: only the person trims them.
+
+`{"op":"audit","before","since_ms","until_ms","bot","bot_id","turn","kind","place","approved","access","outcome","tool","limit"}`
+reads a page newest first, every field optional: `before` an id, the times
+in epoch milliseconds (found by bisecting ids, as times rise with them),
+`bot` a name or a pattern of `*`, `?` and `[...]` as `history_search` takes
+one, and the rest equal to a row's. `limit` is 1 to 500 (100 by default).
+The reply is `{rows, next_before}`; pass `next_before` as `before` for the
+next older page, `null` when there is none. A word outside a field's
+vocabulary is `invalid_audit`, never an empty page. It reads on a reader
+connection, so it waits for no turn.
+
+`{"op":"audit_trim","before"}` or `{"op":"audit_trim","before_ms"}`
+deletes every row older than that id or time, in pieces of 10,000 on the
+retention task, and answers `{trimmed, before}` once done. It is refused on
+a bot's own socket. `agent audit` reads the trail (`--bot`, `--turn`,
+`--kind`, `--place`, `--approved`, `--access`, `--outcome`, `--tool`,
+`--since`, `--before`, `--limit`, `--pretty` for a line each) and
+`agent audit trim --before ID` or `--older-than 30d` trims it.
+
+An agent reads the same trail with its `history` tool: `audit` in place of
+`turn` or `query` (an object of `kind`, `place`, `approved`, `access`,
+`outcome`, `tool` and `since_ms`), with `bot` for one agent's or a pattern,
+and `before` for older rows; 50 rows a call.
+
+A client says what its tools are: a declared tool takes `kind`, one of the
+kinds above (`invalid_declare` otherwise), which its calls' rows carry.
+`approve_step` takes `kind`, `place` and `access` for the step's row
+(`invalid_step` for another word), and `record: true` for a step the
+client lets run without asking: it is written and allowed at once,
+whatever the gates say, so the trail has every step and the gates judge
+only those a client puts to them. A step's `step_result` ends its row;
+told twice, the first holds. A step allowed by nobody is not among the
+calls a judge reads. Approval verdicts now keep `leased` when given under a
+session's lease, which is how a row tells a reviewer from a person. The
+upgrade starts the trail empty: calls from before it are in history only.
 
 ### Tool-result elision
 

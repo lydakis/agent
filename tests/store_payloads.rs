@@ -262,7 +262,7 @@ fn large_artifacts_remain_exact_after_reopen_and_background_completion() {
         };
         db.append(turn, vec![], std::slice::from_ref(&call), None)
             .unwrap();
-        db.tool_start(turn, &call).unwrap();
+        db.tool_start(turn, &call, false, false).unwrap();
         db.tool_finish(
             turn,
             "call",

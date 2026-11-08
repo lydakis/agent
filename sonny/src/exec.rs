@@ -553,9 +553,75 @@ struct Nested {
     asks: bool,
     /// Whether its server says it only reads (`readOnlyHint`).
     reads: bool,
+    /// What its row in the agent's audit trail says it is.
+    facts: Facts,
     /// Whether a call of it is refused outright: in a trigger's shadow
     /// run, whatever does not only read, or would ask.
     refused: bool,
+}
+
+/// What a step is, for its row in its agent's audit trail: only what its
+/// tool declares. `kind` is the trail's word for the tool; `place` where
+/// it runs (on this machine outside any sandbox, or at a service
+/// elsewhere); `access` whether it reads or writes, where the tool says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Facts {
+    pub kind: &'static str,
+    pub place: Option<&'static str>,
+    pub access: Option<&'static str>,
+}
+
+impl Facts {
+    /// Its fields, beside a step's others.
+    pub fn into(self, step: &mut Value) {
+        step["kind"] = json!(self.kind);
+        if let Some(place) = self.place {
+            step["place"] = json!(place);
+        }
+        if let Some(access) = self.access {
+            step["access"] = json!(access);
+        }
+    }
+
+    /// As a step's fields give it, from a machine linked here.
+    pub fn of(step: &Value) -> Facts {
+        let word = |field: &str, words: &[&'static str]| {
+            step[field]
+                .as_str()
+                .and_then(|given| words.iter().copied().find(|word| *word == given))
+        };
+        Facts {
+            kind: word("kind", &KINDS).unwrap_or("mcp"),
+            place: word("place", &["sandbox", "outside", "external"]),
+            access: word("access", &["read", "write", "unknown"]),
+        }
+    }
+}
+
+/// The audit trail's kinds of tool.
+const KINDS: [&str; 7] = [
+    "shell", "file", "mcp", "browser", "desktop", "agents", "web",
+];
+
+/// Where an MCP server's tools run: a server Sonny starts runs on this
+/// machine, one it reaches by address elsewhere.
+fn mcp_place(server: &agent_client::config::McpServer) -> &'static str {
+    match server.url.is_some() {
+        true => "external",
+        false => "outside",
+    }
+}
+
+/// What an MCP tool's annotations say it does: reads by `readOnlyHint`,
+/// writes when that hint says it doesn't only read or `destructiveHint`
+/// says it destroys, and nothing said otherwise.
+fn mcp_access(annotations: &Value) -> Option<&'static str> {
+    match annotations["readOnlyHint"].as_bool() {
+        Some(true) => Some("read"),
+        Some(false) => Some("write"),
+        None if annotations["destructiveHint"] == true => Some("write"),
+        None => None,
+    }
 }
 
 /// Calls answered in this process, so two answerings of one call differ.
@@ -615,15 +681,18 @@ impl Steps {
         }
     }
 
-    /// Put the call of `tool`, which the agent knows as `called`, to the
-    /// agent's gate: none, an allow, or why it may not run. An allow a gate
-    /// gave names the step, to say how it ended once it ran.
+    /// Tell the agent's daemon of the call of `tool`, which the agent
+    /// knows as `called`, before it runs: put to the agent's gate when it
+    /// `asks`, else only recorded in its audit trail with `facts`. The
+    /// step's name to say how it ended once it ran, or why it may not run.
     pub async fn ask(
         &self,
         tool: &str,
         called: &str,
         arguments: Value,
-    ) -> Result<Option<String>, String> {
+        facts: Facts,
+        asks: bool,
+    ) -> Result<String, String> {
         let (client, bot, turn, call_id) = match &self.via {
             Via::Daemon {
                 client,
@@ -631,25 +700,24 @@ impl Steps {
                 turn,
                 call_id,
             } => (client, bot, turn, call_id),
-            Via::Link(asker) => return asker.ask(tool, called, arguments).await,
+            Via::Link(asker) => return asker.ask(tool, called, arguments, facts, asks).await,
         };
         let step = format!(
             "{}.{}",
             self.run,
             self.next.fetch_add(1, Ordering::SeqCst) + 1
         );
-        let asked = json!({"bot": bot, "turn": turn, "call_id": call_id,
-            "step": step, "name": tool, "arguments": arguments});
+        let mut asked = json!({"bot": bot, "turn": turn, "call_id": call_id,
+            "step": step, "name": tool, "arguments": arguments, "record": !asks});
+        facts.into(&mut asked);
         match client.request("approve_step", asked).await {
-            Ok(reply) if reply["decision"] == "allow" => Ok(reply["approvals"]
-                .as_array()
-                .is_some_and(|approvals| !approvals.is_empty())
-                .then_some(step)),
+            Ok(reply) if reply["decision"] == "allow" => Ok(step),
             Ok(reply) => Err(format!(
                 "{called} was not approved: {}",
                 reply["reason"].as_str().unwrap_or("denied")
             )),
-            Err(error) => Err(format!("{called} could not be approved: {error}")),
+            Err(error) if asks => Err(format!("{called} could not be approved: {error}")),
+            Err(error) => Err(format!("{called} could not be recorded: {error}")),
         }
     }
 
@@ -943,6 +1011,11 @@ async fn discover(hub: &Hub) -> (BTreeMap<String, Nested>, Vec<Value>, Vec<Strin
                     description,
                     asks,
                     reads: tool["annotations"]["readOnlyHint"] == true,
+                    facts: Facts {
+                        kind: "mcp",
+                        place: Some(mcp_place(config)),
+                        access: mcp_access(&tool["annotations"]),
+                    },
                     refused: false,
                 },
             );
@@ -1585,27 +1658,28 @@ impl Caller {
             ));
         }
         let arguments: Value = serde_json::from_str(&arguments).map_err(|e| e.to_string())?;
-        // Put to the agent's gate first, with the script's time stopped,
-        // on the host's runtime, where its connection lives.
+        // Told to the agent's daemon first, with the script's time stopped,
+        // on the host's runtime, where its connection lives: put to its
+        // gate when it asks, else recorded in its audit trail.
         let mut allowed = None;
-        if let Some(steps) = self.steps.clone().filter(|_| nested.asks) {
+        if let Some(steps) = self.steps.clone() {
             let asked = match &arguments {
                 Value::Null => json!({}),
                 arguments => arguments.clone(),
             };
             let stopped = self.clock.stop();
             let asking = Arc::clone(&steps);
-            let approval = Abort(
-                self.host
-                    .spawn(async move { asking.ask(&id, &format!("tools.{id}"), asked).await }),
-            );
+            let (facts, asks) = (nested.facts, nested.asks);
+            let approval = Abort(self.host.spawn(async move {
+                (asking.ask(&id, &format!("tools.{id}"), asked, facts, asks)).await
+            }));
             let approved = approval.await;
             // Whatever the verdict, the script runs on from here, its time
             // starting again once it has a place, as a new script's does.
             let placed = self.clock.take_place().await;
             drop(stopped);
             placed?;
-            allowed = (approved.map_err(|e| e.to_string())??).map(|step| (steps, step));
+            allowed = Some((steps, approved.map_err(|e| e.to_string())??));
         }
         // A place among the script's calls in flight, held until its
         // result is the script's.
@@ -2022,11 +2096,10 @@ mod tests {
         .unwrap()
     }
 
-    /// A daemon that only greets and answers `approve_step`: `add` is
-    /// denied, and `slow` allowed after `wait`, with each step it was
-    /// asked sent on.
-    /// A daemon that denies `add` and allows other steps after `wait`, or
-    /// once the test lets one through `go`.
+    /// A daemon that only greets and answers `approve_step`, with each
+    /// request sent on: a step only recorded is allowed at once; of those
+    /// put to its gate, `add` is denied, and the rest allowed after
+    /// `wait`, or once the test lets one through `go`.
     async fn gate(
         dir: &Path,
         wait: Duration,
@@ -2056,6 +2129,10 @@ mod tests {
                 tokio::spawn(async move {
                     let result = match request["name"].as_str() {
                         _ if request["op"] == "step_result" => json!({}),
+                        // Recorded only, as the daemon allows it: at once.
+                        _ if request["record"] == true => {
+                            json!({"decision": "allow", "approvals": []})
+                        }
                         Some("mcp__test__add") => {
                             json!({"decision": "deny", "reason": "no adding"})
                         }
@@ -2130,25 +2207,40 @@ text("done");"#;
             ),
             "{said}"
         );
-        // The step the gate allowed is told how it ended, after the call.
+        // Every call is told to the daemon first: those that ask are put
+        // to the gate, the rest only recorded, with what their server says
+        // of them. Each that ran is told how it ended, after the call.
         let mut asked = Vec::new();
-        while asked.len() < 3 {
+        while asked.len() < 7 {
             asked.push(steps.recv().await.unwrap());
         }
-        let ran: Vec<_> = asked.iter().filter(|s| s["op"] == "step_result").collect();
-        assert_eq!(ran.len(), 1, "{asked:?}");
+        let mut ran: Vec<(String, bool)> = (asked.iter())
+            .filter(|s| s["op"] == "step_result")
+            .map(|s| {
+                let step = s["step"].as_str().unwrap().replace(&answering, "RUN");
+                (step, s["failed"].as_bool().unwrap())
+            })
+            .collect();
+        ran.sort();
         assert_eq!(
-            (ran[0]["step"].as_str(), ran[0]["failed"].as_bool()),
-            (Some(&*format!("{answering}.2")), Some(false))
+            ran,
+            [
+                ("RUN.1".into(), false),
+                ("RUN.3".into(), true),
+                ("RUN.4".into(), false)
+            ],
+            "{asked:?}"
         );
         asked.retain(|s| s["op"] == "approve_step");
-        let seen: Vec<(&str, String, &str, i64, &str)> = asked
+        let seen: Vec<(String, &str, bool, &str, &str, i64, &str)> = asked
             .iter()
             .map(|s| {
                 (
-                    s["op"].as_str().unwrap(),
                     s["step"].as_str().unwrap().replace(&answering, "RUN"),
                     s["name"].as_str().unwrap(),
+                    s["record"].as_bool().unwrap(),
+                    s["kind"].as_str().unwrap(),
+                    s["place"].as_str().unwrap(),
                     s["turn"].as_i64().unwrap(),
                     s["call_id"].as_str().unwrap(),
                 )
@@ -2157,11 +2249,46 @@ text("done");"#;
         assert_eq!(
             seen,
             [
-                ("approve_step", "RUN.1".into(), "mcp__test__add", 7, "c1"),
-                ("approve_step", "RUN.2".into(), "mcp__test__slow", 7, "c1")
+                (
+                    "RUN.1".into(),
+                    "mcp__test__echo",
+                    true,
+                    "mcp",
+                    "outside",
+                    7,
+                    "c1"
+                ),
+                (
+                    "RUN.2".into(),
+                    "mcp__test__add",
+                    false,
+                    "mcp",
+                    "outside",
+                    7,
+                    "c1"
+                ),
+                (
+                    "RUN.3".into(),
+                    "mcp__test__fail",
+                    true,
+                    "mcp",
+                    "outside",
+                    7,
+                    "c1"
+                ),
+                (
+                    "RUN.4".into(),
+                    "mcp__test__slow",
+                    false,
+                    "mcp",
+                    "outside",
+                    7,
+                    "c1"
+                )
             ]
         );
-        assert_eq!(asked[1]["arguments"], json!({"ms": 10}));
+        assert_eq!(asked[0]["access"], "read", "echo says it only reads");
+        assert_eq!(asked[3]["arguments"], json!({"ms": 10}));
         // With no gate to ask, every call runs. Its time is not what this
         // run checks: 300 ms can go waiting for one of the tool host's
         // script slots, shared with every other test running at once.
@@ -2212,7 +2339,20 @@ text("done");"#;
             ),
             "{said}"
         );
-        assert!(steps.try_recv().is_err(), "nothing asked the gate");
+        // The read that ran is recorded, and nothing is put to the gate.
+        let mut told = Vec::new();
+        while let Ok(step) = steps.try_recv() {
+            told.push(step);
+        }
+        assert!(
+            told.iter()
+                .all(|s| s["op"] == "step_result" || s["record"] == true),
+            "nothing asked the gate: {told:?}"
+        );
+        assert!(
+            told.iter().any(|s| s["name"] == "mcp__test__echo"),
+            "{told:?}"
+        );
         // Under `prompt`, a read asks first, so a shadow refuses it too.
         let mut servers = hub.servers();
         servers.get_mut("test").unwrap().default_tools_approval_mode =
@@ -2674,6 +2814,11 @@ text(ALL_TOOLS.map(t => t.name).join(","));"#,
             description: description.into(),
             asks: false,
             reads: false,
+            facts: Facts {
+                kind: "mcp",
+                place: Some("outside"),
+                access: None,
+            },
             refused: false,
         };
         let nested: BTreeMap<String, Nested> = [

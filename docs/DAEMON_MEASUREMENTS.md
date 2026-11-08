@@ -7601,3 +7601,32 @@ path changed: lone submit CPU 31.1 → 30.8 ms, burst submit p99 4.54 →
 4.52 ms, release to terminal p99 9.73 → 9.92 ms, idle RSS 15.2 → 15.3 MiB,
 CPU per turn 0.92 → 0.92 ms, lifecycle p95 turn 697 → 714 ms, the quiet
 window 1.54 → 1.34 ms/s.
+
+## The audit trail (protocol 56, schema 86)
+
+Each tool call writes one `audit` row inside the commit that starts it (or
+denies it) and updates it inside the commit that records its result, and
+each step a client reports writes one when it is decided and updates it on
+`step_result`. No store job is added to a turn: the statements join
+transactions the turn already commits. A row's time is kept monotone with
+one lookup of the newest row by its primary key, so a time bound is found
+by bisecting ids and the table needs no index but its own.
+
+The row's own cost, measured on its statements alone (the insert and the
+update a call makes, 20,000 calls a round inside one transaction, release
+build, 4-core Linux cloud container, a file store in WAL): 2.7 to 3.5 µs a
+call, 5.2 µs in the round where the WAL grew. The store grew about 200
+bytes a row for a shell call of an 85-character command.
+
+A page of 100 rows with 60,000 in the trail reads in about 0.5 ms whether it
+filters by kind, a bot pattern or a time (the time found in about 16 probes
+of the primary key). A filter that matches no recent row scans the trail:
+4.7 ms for 60,000 rows, so about 80 ms a million. That is a read the person
+or an agent asks for on a reader connection, never on a turn's path; an
+index on a category waits for a trail where that read is slow in use.
+
+A step a client would not have put to a gate before (a script's MCP call
+under Full or a read-only tool, a browser command that does not confirm)
+now costs its client an `approve_step` with `record`, answered at once, and
+a `step_result`: two round trips on the socket and two small store jobs,
+against an MCP call's own milliseconds. An ordinary turn sends none.

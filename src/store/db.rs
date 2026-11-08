@@ -1,4 +1,4 @@
-use super::artifact;
+use super::{artifact, audit};
 use crate::rules::{Rules, Ruling};
 use crate::{
     Error, Result,
@@ -1419,6 +1419,10 @@ struct Verdict {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     by: Option<String>,
     at_ms: i64,
+    /// Given under the lease of the session serving its gate, as that
+    /// session's reviewer gives it; an answer without one is a person's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    leased: bool,
 }
 /// A gate a planned call needs, with the expiry it had when announced.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -1452,6 +1456,20 @@ struct Request {
     step_of: Option<String>,
 }
 impl Request {
+    /// Who decided the call in the audit trail: whoever denied it, else a
+    /// person when any allow was a person's, else the reviewers; nobody
+    /// when no verdict decided it (a gate lapsed, its client left).
+    fn approved(&self, allowed: bool) -> &'static str {
+        let decided: Vec<&Verdict> = match allowed {
+            true => self.verdicts.iter().filter(|v| v.allow).collect(),
+            false => self.denial().into_iter().collect(),
+        };
+        match decided.is_empty() {
+            true => "nobody",
+            false if decided.iter().any(|v| !v.leased) => "person",
+            false => "reviewer",
+        }
+    }
     /// The first deny wins; otherwise every gate needs an allow.
     fn denial(&self) -> Option<&Verdict> {
         self.verdicts.iter().find(|v| !v.allow)
@@ -1625,6 +1643,8 @@ pub struct Decision<'a> {
     pub unreviewed: bool,
     pub reason: Option<&'a str>,
     pub by: Option<&'a str>,
+    /// Given under the serving session's lease.
+    pub leased: bool,
 }
 /// What the service does after an answer commits: wake a live turn's task,
 /// or resume a turn parked on this call.
@@ -2308,7 +2328,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 84;
+    pub const SCHEMA: i32 = 86;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2533,7 +2553,12 @@ impl Database {
             CREATE UNIQUE INDEX IF NOT EXISTS pauses_held ON pauses(ifnull(resumed_ms,0))
                 WHERE resumed_ms IS NULL;
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
-                status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, ruling TEXT, PRIMARY KEY(turn,call_id));
+                status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, ruling TEXT, audit INTEGER,
+                PRIMARY KEY(turn,call_id));
+            CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL,
+                bot_id INTEGER NOT NULL, bot TEXT NOT NULL, turn INTEGER NOT NULL, call_id TEXT NOT NULL,
+                step TEXT, tool TEXT NOT NULL, kind TEXT, place TEXT, approved TEXT NOT NULL,
+                access TEXT NOT NULL, ms INTEGER, outcome TEXT NOT NULL, preview TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, name TEXT NOT NULL, node INTEGER NOT NULL, request INTEGER NOT NULL,
                 announced_ms INTEGER NOT NULL, gates TEXT NOT NULL, verdicts TEXT, arguments TEXT NOT NULL, asked TEXT,
@@ -7405,7 +7430,16 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
-    pub fn tool_start(&mut self, turn: i64, call: &ToolCall) -> Result<Value> {
+    /// Start an ungated call: its row in the audit trail says it ran under
+    /// its bot's sandbox when `confined`, and that a command rule decided
+    /// it when `ruled`.
+    pub fn tool_start(
+        &mut self,
+        turn: i64,
+        call: &ToolCall,
+        confined: bool,
+        ruled: bool,
+    ) -> Result<Value> {
         let bot = self.active(turn)?;
         // Every call before it is done, so a gate still undecided is a later
         // call's; once one lapsed, the turn ends before anything else starts.
@@ -7413,9 +7447,11 @@ impl Database {
             return fail_with("approval_expired", "a later call's gate lapsed first");
         }
         let tx = self.conn.savepoint()?;
+        let approved = if ruled { "rule" } else { "nobody" };
+        let row = audit_call(&tx, &bot, turn, call, confined, approved, "unknown")?;
         if tx.execute(
-            "UPDATE tools SET status='executing' WHERE turn=? AND call_id=? AND status='planned'",
-            params![turn, call.call_id],
+            "UPDATE tools SET status='executing',audit=? WHERE turn=? AND call_id=? AND status='planned'",
+            params![row, turn, call.call_id],
         )? != 1
         {
             return fail("invalid_tool_state");
@@ -7453,12 +7489,18 @@ impl Database {
             && outcome.failed
             && !(expiring(&bot) && self.lapsed(turn, epoch_ms().max(0) as u64)?);
         let tx = self.conn.savepoint()?;
-        if tx.execute(
-            "UPDATE tools SET status='completed' WHERE turn=? AND call_id=? AND status='executing'",
-            params![turn, call_id],
-        )? != 1
-        {
+        let row: Option<Option<i64>> = tx
+            .prepare_cached(
+                "UPDATE tools SET status='completed' WHERE turn=? AND call_id=? AND status='executing'
+                 RETURNING audit",
+            )?
+            .query_row(params![turn, call_id], |r| r.get(0))
+            .optional()?;
+        let Some(row) = row else {
             return fail("invalid_tool_state");
+        };
+        if let Some(row) = row {
+            audit::finish(&tx, row, epoch_ms(), outcome.failed)?;
         }
         for (stream, data) in &outcome.artifacts {
             artifact::put(&tx, turn, call_id, stream, data)?;
@@ -7632,7 +7674,16 @@ impl Database {
         let rows = statement.query_map([turn], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
-    pub fn approval_start(&mut self, turn: i64, call: &ToolCall, now_ms: u64) -> Result<Gated> {
+    /// Start a gated call once its gates allow it, or end it denied: its
+    /// row in the audit trail says it ran under its bot's sandbox when
+    /// `confined`, and who decided it.
+    pub fn approval_start(
+        &mut self,
+        turn: i64,
+        call: &ToolCall,
+        confined: bool,
+        now_ms: u64,
+    ) -> Result<Gated> {
         let mut bot = self.active(turn)?;
         let request = self
             .request(turn, &call.call_id)?
@@ -7659,6 +7710,7 @@ impl Database {
                 // Every accepted verdict, so replay keeps each approver's.
                 request.approvals(),
                 false,
+                request.approved(false),
             )?;
             tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
                 .execute([request.id])?;
@@ -7681,9 +7733,18 @@ impl Database {
                 return Ok(Gated::Lapsed);
             }
             let tx = self.conn.savepoint()?;
+            let row = audit_call(
+                &tx,
+                &bot,
+                turn,
+                call,
+                confined,
+                request.approved(true),
+                "unknown",
+            )?;
             if tx.execute(
-                "UPDATE tools SET status='executing' WHERE turn=? AND call_id=? AND status='planned'",
-                params![turn, call.call_id],
+                "UPDATE tools SET status='executing',audit=? WHERE turn=? AND call_id=? AND status='planned'",
+                params![row, turn, call.call_id],
             )? != 1
             {
                 return fail("invalid_tool_state");
@@ -7731,6 +7792,7 @@ impl Database {
                 Some("not reviewed: no verdict"),
                 lapsed,
                 true,
+                "nobody",
             )?;
             tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
                 .execute([request.id])?;
@@ -8149,6 +8211,12 @@ impl Database {
     /// allowed at once. A step lives as long as the request waiting on it,
     /// so asking for one already waiting is refused.
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// Every step gets a row in the audit trail with the `facts` its client
+    /// gives: at once when it is allowed at once, under no gate or when
+    /// its client only `record`s it (a step it would not put to a gate),
+    /// and once decided otherwise.
+    #[allow(clippy::too_many_arguments)]
     pub fn step_announce(
         &mut self,
         name: &str,
@@ -8157,6 +8225,8 @@ impl Database {
         step: &str,
         tool: &str,
         arguments: Value,
+        record: bool,
+        facts: audit::Facts,
         now_ms: u64,
     ) -> Result<Stepped> {
         self.step_turn(name, turn)?;
@@ -8200,7 +8270,23 @@ impl Database {
                 expire_ms: g.expire_ms,
             })
             .collect();
-        if gates.is_empty() {
+        if record || gates.is_empty() {
+            let tx = self.conn.savepoint()?;
+            audit::insert(
+                &tx,
+                now_ms as i64,
+                bot.bot_id,
+                &bot.name,
+                turn,
+                call_id,
+                Some(step),
+                tool,
+                facts,
+                "nobody",
+                "unknown",
+                &arguments.to_string(),
+            )?;
+            tx.commit()?;
             return Ok(Stepped {
                 step: Step::Decided(json!({"call_id":id,"decision":"allow","approvals":[]})),
                 notify: None,
@@ -8208,8 +8294,9 @@ impl Database {
             });
         }
         // Whole: a step's arguments are bounded when asked, and it has no
-        // item of its own for a reader to find them in.
-        let arguments = json!({"arguments":arguments});
+        // item of its own for a reader to find them in. Its facts wait
+        // with it for its row.
+        let arguments = json!({"arguments":arguments,"audit":facts.to_json()});
         let tx = self.conn.savepoint()?;
         tx.prepare_cached(
             "INSERT INTO approvals(turn,call_id,name,node,request,announced_ms,gates,arguments,step_of)
@@ -8345,7 +8432,20 @@ impl Database {
         if expired {
             data["expired"] = json!(true);
         }
-        let resumed = end_step(&tx, &bot.name, turn, &request, data.clone(), now_ms)?;
+        let approved = match expired {
+            true => "nobody",
+            false => request.approved(allow),
+        };
+        let resumed = end_step(
+            &tx,
+            &bot,
+            turn,
+            &request,
+            data.clone(),
+            now_ms,
+            approved,
+            allow,
+        )?;
         tx.commit()?;
         Ok(self.stepped(&bot, turn, &request, resumed, data))
     }
@@ -8366,7 +8466,16 @@ impl Database {
         let data = json!({"call_id":id,"decision":"deny","reason":"its client stopped waiting",
             "approvals":request.approvals()});
         let tx = self.conn.savepoint()?;
-        let resumed = end_step(&tx, &bot.name, turn, &request, data.clone(), now_ms)?;
+        let resumed = end_step(
+            &tx,
+            &bot,
+            turn,
+            &request,
+            data.clone(),
+            now_ms,
+            "nobody",
+            false,
+        )?;
         tx.commit()?;
         Ok(self.stepped(&bot, turn, &request, resumed, data))
     }
@@ -8383,29 +8492,60 @@ impl Database {
     ) -> Result<Value> {
         self.step_turn(name, turn)?;
         let id = format!("{call_id}/{step}");
-        let (allowed, done): (bool, bool) = self
+        // The step's row in the audit trail, written after its call's own:
+        // read from the newest back to that.
+        let row: Option<(i64, String, String)> = self
             .conn
             .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE turn=?1 AND kind='step_decided'
-                 AND json_extract(data,'$.call_id')=?2 AND json_extract(data,'$.decision')='allow'),
-               EXISTS(SELECT 1 FROM events WHERE turn=?1 AND kind='step_completed'
-                 AND json_extract(data,'$.call_id')=?2)",
+                "SELECT a.id,a.approved,a.outcome FROM audit a
+                 WHERE a.id>(SELECT audit FROM tools WHERE turn=?1 AND call_id=?2)
+                   AND a.turn=?1 AND a.call_id=?2 AND a.step=?3
+                 ORDER BY a.id DESC LIMIT 1",
             )?
-            .query_row(params![turn, id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        if !allowed {
+            .query_row(params![turn, call_id, step], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        let Some((row, approved, outcome)) = row.filter(|(_, _, outcome)| outcome != "denied")
+        else {
             return fail_with(
                 "no_allowed_step",
                 format!("no step {step} of {call_id} was allowed"),
             );
-        }
-        if !done {
-            let mut data = json!({"call_id":id,"step_of":call_id});
-            if failed {
-                data["failed"] = json!(true);
+        };
+        // Told twice, the first holds.
+        if outcome == "unknown" {
+            let tx = self.conn.savepoint()?;
+            audit::finish(&tx, row, epoch_ms(), failed)?;
+            // A step its gates allowed is among the turn's calls a judge
+            // reads, done from here.
+            if approved != "nobody" {
+                let mut data = json!({"call_id":id,"step_of":call_id});
+                if failed {
+                    data["failed"] = json!(true);
+                }
+                event(&tx, name, Some(turn), "step_completed", data)?;
             }
-            event(&self.conn, name, Some(turn), "step_completed", data)?;
+            tx.commit()?;
         }
         Ok(json!({"call_id":id}))
+    }
+    /// A page of the audit trail, newest first.
+    pub fn audit(&self, query: &audit::Query) -> Result<Value> {
+        audit::read(&self.conn, query)
+    }
+    /// The id below which a trim deletes: `before` itself, or the first
+    /// row at or after `before_ms`.
+    pub fn audit_bound(&self, before: Option<i64>, before_ms: Option<i64>) -> Result<i64> {
+        audit::trim_bound(&self.conn, before, before_ms)
+    }
+    /// One piece of a trim of the audit trail below id `before`: how many
+    /// rows went.
+    pub fn audit_trim(&mut self, before: i64) -> Result<usize> {
+        let tx = self.conn.savepoint()?;
+        let trimmed = audit::trim(&tx, before)?;
+        tx.commit()?;
+        Ok(trimmed)
     }
     /// The bot's turn a step names, while a call of it can still be
     /// answered.
@@ -8459,10 +8599,27 @@ impl Database {
             .collect::<rusqlite::Result<_>>()?;
         let bot = self.active(turn)?;
         let tx = self.conn.savepoint()?;
+        let now_ms = epoch_ms().max(0) as u64;
         for (approval, id) in &ids {
-            let name: String = tx
-                .prepare_cached("DELETE FROM approvals WHERE id=? RETURNING name")?
-                .query_row([approval], |r| r.get(0))?;
+            let (name, arguments, facts): (String, String, Option<String>) = tx
+                .prepare_cached(
+                    "DELETE FROM approvals WHERE id=? RETURNING name,
+                        json_extract(arguments,'$.arguments'),json_extract(arguments,'$.audit')",
+                )?
+                .query_row([approval], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            audit_step(
+                &tx,
+                &bot,
+                turn,
+                call_id,
+                id,
+                &name,
+                facts.as_deref(),
+                "nobody",
+                "denied",
+                &arguments,
+                now_ms,
+            )?;
             let data = json!({"call_id":id,"step_of":call_id,"name":name,"decision":"deny",
                 "reason":"the call was answered first","approvals":[]});
             event(&tx, &bot.name, Some(turn), "step_decided", data)?;
@@ -8714,6 +8871,7 @@ impl Database {
             reason: answer.reason.map(str::to_owned),
             by: answer.by.map(str::to_owned),
             at_ms,
+            leased: answer.leased,
         };
         request.verdicts.push(verdict.clone());
         let pending: Vec<&str> = if request.denial().is_some() {
@@ -12392,6 +12550,39 @@ fn epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// A call's row in the audit trail: what kind of tool it is, where it ran
+/// (nowhere, once denied), who `approved` it, and its arguments' start.
+fn audit_call(
+    tx: &Connection,
+    bot: &Bot,
+    turn: i64,
+    call: &ToolCall,
+    confined: bool,
+    approved: &str,
+    outcome: &str,
+) -> Result<i64> {
+    let declared = bot
+        .declared(&call.name)
+        .and_then(|tool| tool.kind.as_deref());
+    let mut facts = audit::of_call(&call.name, declared, confined);
+    if outcome == "denied" {
+        facts.place = None;
+    }
+    audit::insert(
+        tx,
+        epoch_ms(),
+        bot.bot_id,
+        &bot.name,
+        turn,
+        &call.call_id,
+        None,
+        &call.name,
+        facts,
+        approved,
+        outcome,
+        &call.arguments,
+    )
+}
 /// A `tool_started` event's data: the call with its arguments previewed.
 fn started(call: &ToolCall) -> Value {
     let preview: String = call.arguments.chars().take(2048).collect();
@@ -12475,7 +12666,9 @@ fn ask(tx: &Connection, bot: &Bot, turn: i64, call: &ToolCall, data: &mut Value)
     Ok(())
 }
 /// A denied call's result, in the one commit a finished call makes. The
-/// daemon writes the code; the reason is the approver's.
+/// daemon writes the code; the reason is the approver's. Its row in the
+/// audit trail names who `approved` the denial.
+#[allow(clippy::too_many_arguments)]
 fn deny(
     tx: &Connection,
     bot: &Bot,
@@ -12484,8 +12677,10 @@ fn deny(
     reason: Option<&str>,
     approvals: Value,
     expired: bool,
+    approved: &str,
 ) -> Result<()> {
     let call_id = call.call_id.as_str();
+    audit_call(tx, bot, turn, call, false, approved, "denied")?;
     let output = json!({"error":"approval_denied","detail":reason}).to_string();
     let item = bot
         .family()?
@@ -12517,26 +12712,90 @@ fn deny(
     event(tx, &bot.name, Some(turn), "tool_completed", data)?;
     Ok(())
 }
+/// A decided step's row in the audit trail, with the facts its client
+/// gave when it asked (`kept`, as stored with it).
+#[allow(clippy::too_many_arguments)]
+fn audit_step(
+    tx: &Connection,
+    bot: &Bot,
+    turn: i64,
+    parent: &str,
+    id: &str,
+    name: &str,
+    kept: Option<&str>,
+    approved: &str,
+    outcome: &str,
+    arguments: &str,
+    now_ms: u64,
+) -> Result<i64> {
+    let step = id.strip_prefix(parent).and_then(|s| s.strip_prefix('/'));
+    let facts = kept
+        .and_then(|kept| serde_json::from_str::<Value>(kept).ok())
+        .map(|kept| audit::Facts::from_json(&kept))
+        .unwrap_or_default();
+    let facts = audit::Facts {
+        place: facts.place.filter(|_| outcome != "denied"),
+        ..facts
+    };
+    audit::insert(
+        tx,
+        now_ms as i64,
+        bot.bot_id,
+        &bot.name,
+        turn,
+        parent,
+        step,
+        name,
+        facts,
+        approved,
+        outcome,
+        arguments,
+    )
+}
 /// Remove a decided step and record its decision in a `step_decided`
 /// event. True when no other step of its call waits, so the call's time
 /// runs again from where it stopped.
+///
+/// Its row in the audit trail is written with it: `approved` names who
+/// decided it, and a step its gates allowed is `unknown` until its client
+/// says how it ended.
+#[allow(clippy::too_many_arguments)]
 fn end_step(
     tx: &Connection,
-    bot: &str,
+    bot: &Bot,
     turn: i64,
     request: &Request,
     mut data: Value,
     now_ms: u64,
+    approved: &str,
+    allowed: bool,
 ) -> Result<bool> {
     let parent = request
         .step_of
         .as_deref()
         .ok_or(Error::new("invalid_tool_state"))?;
-    let (name, arguments): (String, String) = tx
+    let (id, name, arguments, facts): (String, String, String, Option<String>) = tx
         .prepare_cached(
-            "DELETE FROM approvals WHERE id=? RETURNING name,json_extract(arguments,'$.arguments')",
+            "DELETE FROM approvals WHERE id=? RETURNING call_id,name,
+                json_extract(arguments,'$.arguments'),json_extract(arguments,'$.audit')",
         )?
-        .query_row([request.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        .query_row([request.id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+    audit_step(
+        tx,
+        bot,
+        turn,
+        parent,
+        &id,
+        &name,
+        facts.as_deref(),
+        approved,
+        if allowed { "unknown" } else { "denied" },
+        &arguments,
+        now_ms,
+    )?;
+    let bot = bot.name.as_str();
     data["step_of"] = json!(parent);
     // Previewed as a started call is, for a judge of a later call that
     // weighs what this turn was refused.
@@ -12757,8 +13016,10 @@ fn pending_call(
     if let Some(parent) = &request.step_of {
         entry["step_of"] = json!(parent);
     }
-    // The previews stored when the call was planned.
-    if let (Value::Object(entry), Value::Object(arguments)) = (&mut entry, arguments) {
+    // The previews stored when the call was planned; a step's facts for
+    // the audit trail wait beside them, the trail's alone.
+    if let (Value::Object(entry), Value::Object(mut arguments)) = (&mut entry, arguments) {
+        arguments.remove("audit");
         entry.extend(arguments);
     }
     entry
@@ -14563,6 +14824,19 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              WHERE json_extract(settings,'$.keep_warm') IS NOT NULL",
             [],
         )?;
+    }
+    // Schema 86: each call keeps the id of its row in the audit trail, a
+    // table of its own the store's batch makes. The trail starts here: the
+    // calls before it are in their bots' histories.
+    if from < 86
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='tools')
+             AND NOT EXISTS(SELECT 1 FROM pragma_table_info('tools') WHERE name='audit')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        conn.execute("ALTER TABLE tools ADD COLUMN audit INTEGER", [])?;
     }
     Ok(())
 }

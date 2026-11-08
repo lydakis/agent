@@ -1367,9 +1367,24 @@ async fn offline(
     lines: &[String],
     steps: &crate::exec::Steps,
 ) -> Result<Option<String>, String> {
+    let asked = json!({"commands": lines, "network": false});
     match reach.network {
         true => Ok(None),
-        false => (steps.ask(NAME, NAME, json!({"commands": lines, "network": false}))).await,
+        false => (steps.ask(NAME, NAME, asked, facts(None), true).await).map(Some),
+    }
+}
+
+/// The commands that only look at a page, and change nothing on it.
+const LOOKS: [&str; 6] = ["snapshot", "screenshot", "get", "is", "console", "errors"];
+
+/// What a step of this tool is in its agent's audit trail: a browser this
+/// machine runs, outside any sandbox, that reads a page with `command`
+/// when it is one that only looks.
+fn facts(command: Option<&str>) -> crate::exec::Facts {
+    crate::exec::Facts {
+        kind: NAME,
+        place: Some("outside"),
+        access: command.filter(|c| LOOKS.contains(c)).map(|_| "read"),
     }
 }
 
@@ -1433,31 +1448,30 @@ async fn drive(
         let asks = command.ask
             || (command.subaction.as_deref())
                 .is_some_and(|action| confirm.split(',').any(|confirmed| confirmed == action));
-        let mut ran = match asks {
-            true => match steps.ask(NAME, NAME, json!({"command": line})).await {
-                Ok(step) => {
-                    let ran = run(&session, &command.args, &launch).await;
-                    if let Some(step) = step {
-                        steps.ran(step, !ran.ok).await;
-                    }
-                    ran
-                }
-                Err(why) => Ran {
-                    said: why,
-                    ok: false,
-                    confirmation: None,
-                },
+        // Each command is told to the agent's daemon before it runs: put to
+        // its gate when it asks, else recorded in its audit trail.
+        let verb = command.args.first().map(String::as_str);
+        let mut ran = match steps
+            .ask(NAME, NAME, json!({"command": line}), facts(verb), asks)
+            .await
+        {
+            Ok(step) => {
+                let ran = run(&session, &command.args, &launch).await;
+                steps.ran(step, !ran.ok).await;
+                ran
+            }
+            Err(why) => Ran {
+                said: why,
+                ok: false,
+                confirmation: None,
             },
-            false => run(&session, &command.args, &launch).await,
         };
         if let Some(id) = ran.confirmation.take() {
             let asked = json!({"command": line, "confirmation": ran.said});
-            match steps.ask(NAME, NAME, asked).await {
+            match steps.ask(NAME, NAME, asked, facts(None), true).await {
                 Ok(step) => {
                     ran = run(&session, &["confirm".into(), id], &launch).await;
-                    if let Some(step) = step {
-                        steps.ran(step, !ran.ok).await;
-                    }
+                    steps.ran(step, !ran.ok).await;
                 }
                 Err(why) => {
                     let _ = run(&session, &["deny".into(), id], &launch).await;

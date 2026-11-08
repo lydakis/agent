@@ -1025,6 +1025,20 @@ Once a call a gate allowed has run, Sonny tells the daemon how it ended
 (`step_result`), so the judge of the agent's next call counts it among those
 the turn already ran.
 
+Every call a script makes reaches the daemon's audit trail, asked or not: a
+call that would not ask is sent with `record`, so the daemon writes it and
+allows it at once, and its `step_result` says how it ended. Each says its
+place (`external` for a server Sonny reaches by URL, `outside` for one it
+runs) and, where the server marks the tool, whether it reads
+(`readOnlyHint`) or writes (`destructiveHint`, or `readOnlyHint` false).
+Browser commands (read for a snapshot, screenshot, get, is, console or
+errors), desktop calls (read for a look, write once any command acts) and
+automation changes are recorded the same way. Each tool Sonny declares
+names its kind (`run_in_pane` shell, `memory` file, `exec` mcp, `browser`,
+`desktop`, the rest agents). `/audit` shows the trail: this agent's rows,
+newest first, `a` for every agent's, `t`, `p` and `w` to filter by kind,
+place and who approved, Enter to open a row's agent.
+
 ## Links
 
 A link lets the agents of a host use another machine's browser, MCP servers

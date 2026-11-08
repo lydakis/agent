@@ -12,6 +12,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 mod artifact;
+pub mod audit;
 mod context;
 mod db;
 pub use context::{ContextPrefix, ContextUsage, pinned_item, thinking_bytes, without_thinking};

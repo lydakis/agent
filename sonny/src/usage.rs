@@ -668,16 +668,16 @@ const MONTHS: [&str; 12] = [
 
 /// A local wall-clock time, with its weekday (0 is Sunday) and month (0
 /// is January).
-struct Local {
-    month: i64,
-    day: i64,
-    weekday: i64,
-    hour: i64,
-    minute: i64,
-    second: i64,
+pub(crate) struct Local {
+    pub month: i64,
+    pub day: i64,
+    pub weekday: i64,
+    pub hour: i64,
+    pub minute: i64,
+    pub second: i64,
 }
 
-fn local(epoch: i64) -> Local {
+pub(crate) fn local(epoch: i64) -> Local {
     // SAFETY: localtime_r fills the zeroed struct it is given and nothing else.
     let tm = unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
