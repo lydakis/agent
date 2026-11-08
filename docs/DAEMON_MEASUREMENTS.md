@@ -7602,6 +7602,82 @@ path changed: lone submit CPU 31.1 → 30.8 ms, burst submit p99 4.54 →
 CPU per turn 0.92 → 0.92 ms, lifecycle p95 turn 697 → 714 ms, the quiet
 window 1.54 → 1.34 ms/s.
 
+## A waiter leaving touches only its own handles
+
+A waiter (a parked turn, or a client's `wait`) that finished, timed out or
+left took itself off every other waiter's lists: `detach_locked` ran
+`retain` over every handle anyone waited on, so n waiters finishing cost
+Θ(n²), under the registry lock on the daemon's one thread. A session
+closing likewise read every waiter to find its own requests. Now a waiter
+leaves only the lists of its own handles (those still remaining and those
+with results, which together are every one it attached with), and the
+registry keeps each session's requests, so closing reads only those. A
+waiter attached again lets go of its earlier wait first, which also
+returns its share of results it held (they stayed retained before).
+
+Wall time of the registry alone, release build, 4-core Linux cloud
+container (Xeon 2.1 GHz), main d82ec12 against this change. Each parked
+turn waits on a command of its own and on a peer's turn; each wakes on its
+command and leaves:
+
+| Parked turns | Before: all leave | After | Before: one session closes | After |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 0.09 ms | 0.07 ms | 0.23 µs | 0.03 µs |
+| 1,000 | 3.5 ms | 0.48 ms | 2.6 µs | 0.02 µs |
+| 4,000 | 82 ms | 2.9 ms | 12 µs | 0.02 µs |
+| 16,000 | 2,950 ms | 12.6 ms | 40 µs | 0.03 µs |
+
+Per waiter it stays near 0.7 µs from 100 to 16,000. The waiters on one
+handle, and one session's requests, are ordered sets (in the order they
+were made), so many waits on the same handle each leave in a log of how
+many there are: one session pipelining 32,000 waits on one command beside
+32,000 parked turns finishes in well under a second, where lists take
+seconds. Memory: a set per handle someone waits on (a B-tree node, about
+200 bytes, where a list held 64), and one per session with a `wait`
+pending, each removed with its last waiter. The
+tests `a_waiter_leaving_costs_the_same_however_many_others_wait` and
+`a_closing_session_takes_its_own_waits_and_no_one_elses` time 8,000 and
+16,000, and `many_waits_on_one_handle_each_leave_at_the_same_cost` times
+32,000 and 64,000; each fails when twice as many take three times as long,
+and each failed against the scans or lists it replaces.
+
+The Perf workflow's matched screen (`bench.perf_gate`, GitHub runner, head
+e34d148 against main 6a15a54) passed with store work per turn the same and
+nothing past the runner's spread: no measured path parks thousands of
+waiters, so it shows the change costs the light path nothing.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 32.197 | 31.881 | -1.0% |
+| admission | burst submit p99, ms | 4.589 | 4.693 | +2.3% |
+| completion | release to terminal p99, ms | 9.785 | 9.691 | -1.0% |
+| footprint | idle RSS, MiB | 15.324 | 15.207 | -0.8% |
+| footprint | per idle bot, KiB | 1.612 | 1.638 | +1.6% |
+| footprint | CPU per turn, ms | 0.96 | 0.93 | -3.2% |
+| lifecycle | CPU, s | 0.45 | 0.435 | -3.3% |
+| lifecycle | p95 turn, ms | 729.244 | 698.447 | -4.2% |
+| lifecycle | peak RSS, MiB | 23.611 | 23.568 | -0.2% |
+
+On a live daemon, `bench.parked_waits` gives `bots` bots one held turn each
+(8 active slots, the rest queued), sends one client `wait` per turn with
+the same timeout over 8 connections, and times a `stats` request in a loop
+while they give up together; the stall is the slowest of those requests.
+Release builds of main d82ec12 and this change (b33e6e7), same
+4-core container, alternated, two runs each at 8,000 and 16,000:
+
+| Waits | Main: stall | Head: stall | Main: drain | Head: drain | Main: CPU | Head: CPU |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 1.9 ms | 41.5 ms* | 97 ms | 160 ms | 160 ms | 230 ms |
+| 4,000 | 5.4, 6.0 ms | 3.9, 8.1 ms | 314, 291 ms | 313, 299 ms | 380, 410 ms | 360, 380 ms |
+| 8,000 | 53, 101 ms | 2.2, 4.4 ms | 685, 641 ms | 680, 463 ms | 840, 820 ms | 790, 590 ms |
+| 16,000 | 1,177, 1,112 ms | 6.1, 9.0 ms | 1,700, 1,592 ms | 1,195, 1,327 ms | 2,060, 1,970 ms | 1,360, 1,480 ms |
+
+\* one run, a single slow probe; the 4,000 runs show no difference either
+way. Up to about 4,000 waits the registry's share is lost in the cost of
+answering them; at 16,000 the old scan held the daemon's one thread for
+over a second while they gave up, where now no request waits more than
+10 ms, and the drain takes a third less CPU.
+
 ## Spend kept by the model that spent it (#345)
 
 Every recorded model call now also upserts one `turn_models` row, keyed
