@@ -7755,3 +7755,31 @@ touch (its only change draws a notice on a `dropped` event).
 | lifecycle | CPU, s | 0.44 | 0.44 | +0.0% |
 | lifecycle | p95 turn, ms | 579.066 | 578.157 | -0.2% |
 | lifecycle | peak RSS, MiB | 22.469 | 22.502 | +0.1% |
+
+## A parked call admitted beside any number of others
+
+Each call coming back to a provider pool that rate limits it refilled the
+allowance by summing every parked call's booking in each dimension, found a
+due booking by scanning them, and summed them again beside it: Θ(K) per
+admission, so K parked calls draining cost Θ(K²) under the pool's lock on
+the daemon's one thread. Now the bookings are kept soonest due first, with
+running totals per dimension: an admission reads the soonest and the
+totals, and a booking whose grace ran out leaves from the front. A due
+booking is now always the soonest one, where it was the first in the list,
+which a spent booking's swap could reorder.
+
+Wall time of K parked calls coming back, each spending its booking
+(refill, find the due booking, admit), release build, 4-core Linux cloud
+container (Xeon 2.1 GHz), main d82ec12 against this change:
+
+| Parked calls | Before | After |
+| ---: | ---: | ---: |
+| 100 | 0.04 ms | 0.02 ms |
+| 1,000 | 3.5 ms | 0.09 ms |
+| 4,000 | 48 ms | 0.39 ms |
+| 16,000 | 822 ms | 1.7 ms |
+
+About 0.1 µs per admission from 1,000 to 16,000. Memory: a B-tree entry per
+parked call where a vector element was, and three counters per pool.
+`a_parked_call_is_admitted_at_the_same_cost_however_many_are_parked` times
+8,000 and 16,000; with the totals summed per admission again it fails.
