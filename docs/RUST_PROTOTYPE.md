@@ -3689,7 +3689,9 @@ ends while one runs starts none. It is dropped, refused with
 `compaction_stale`, when another summary replaced the view it was planned
 on or the bot's model, summarizer, or compaction instructions changed
 before it went in; it is billed all the same. A stopping daemon drops it,
-as it ends no turn, and the next turn summarizes as before. A daemon whose
+as it ends no turn, and the next turn summarizes as before; so does a
+`pause`, which stops every model call, this one too. Its retries and its
+waits on its pool count toward the turn it is billed to. A daemon whose
 clients are gone stays up until it lands. A summary that cannot be
 planned, under a budget its calls might pass, with the summarizer's pool
 closed, with no copy to make, or for a bot whose `max_rounds` leaves no

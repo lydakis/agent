@@ -2058,8 +2058,12 @@ pub async fn run(config: Configuration) -> Result<()> {
                     }
                 }
                 _ = service.retention.join_next(), if !service.retention.is_empty() => {}
+                // A paused daemon makes no calls: dropped, it comes to
+                // nothing, and the bot's next turn summarizes.
                 Some(tail) = service.tails.started.recv() => {
-                    service.tails.running.spawn(tail);
+                    if service.paused.is_none() {
+                        service.tails.running.spawn(tail);
+                    }
                 }
                 _ = service.tails.running.join_next(), if !service.tails.running.is_empty() => {}
                 joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
@@ -3490,8 +3494,7 @@ impl Service {
                     // end is committed, holding the turn's own record.
                     match task.take_after() {
                         Some(after) if committed.is_ok() => {
-                            let tail = task.clone();
-                            let _ = tails.send(Box::pin(async move { tail.tail(after).await }));
+                            let _ = tails.send(task.tail(after));
                         }
                         Some(after) => {
                             *task.after.lock().unwrap_or_else(|e| e.into_inner()) = Some(after);
@@ -4254,8 +4257,10 @@ impl Service {
                     parked = (self.active.values())
                         .filter(|active| active.cancel(turn::PAUSED))
                         .count();
-                    // And what they started that runs on without them.
+                    // And what they started that runs on without them,
+                    // summaries started as turns ended among it.
                     self.registry.end_running();
+                    self.tails.running.abort_all();
                     self.notices
                         .push(json!({"event": "paused", "pause": pause, "durable": false}));
                 }

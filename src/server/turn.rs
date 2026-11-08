@@ -1504,7 +1504,14 @@ impl Turn {
     /// committed: billed to this turn, its calls bounded as one beside a
     /// call is, and kept off the bot's connection, which the bot's next
     /// turn may hold. It lands in its [`Ahead`].
-    pub async fn tail(&self, after: After) {
+    pub fn tail(self: &Arc<Self>, after: After) -> Tail {
+        // Dropped before it lands, even unstarted, it comes to nothing.
+        let unlanded = Unlanded(Some((self.clone(), after.handle.clone())));
+        let turn = self.clone();
+        Box::pin(async move { turn.run_tail(after, unlanded).await })
+    }
+
+    async fn run_tail(&self, after: After, mut unlanded: Unlanded) {
         self.tailing.store(true, Relaxed);
         let After {
             mut record,
@@ -1516,8 +1523,6 @@ impl Turn {
             tools,
             handle,
         } = after;
-        // Stopped before it lands, it comes to nothing.
-        let unlanded = Unlanded(Some((self, &handle)));
         let bot = self.bot.clone();
         let base = self
             .store
@@ -1592,7 +1597,19 @@ impl Turn {
                 rounds: rounds - start,
             },
         };
-        std::mem::forget(unlanded);
+        // Its retries and waits on its pool count toward the turn it is
+        // billed to, which flushed its own as it ended.
+        let (retries, paced_ms) = accounting.totals();
+        if retries > 0 || paced_ms > 0 {
+            let turn = self.turn;
+            let _ = self
+                .store
+                .op("note_pacing", move |db| {
+                    db.note_pacing(turn, retries, paced_ms, 0)
+                })
+                .await;
+        }
+        unlanded.0 = None;
         self.land(&handle, landed, base).await;
     }
 
@@ -6234,12 +6251,12 @@ impl Drop for Counted<'_> {
 }
 
 /// A summary started after its turn ended that stops before it lands.
-struct Unlanded<'a>(Option<(&'a Turn, &'a Arc<Ahead>)>);
+pub struct Unlanded(Option<(Arc<Turn>, Arc<Ahead>)>);
 
-impl Drop for Unlanded<'_> {
+impl Drop for Unlanded {
     fn drop(&mut self) {
         if let Some((turn, ahead)) = self.0.take() {
-            turn.abandon(ahead);
+            turn.abandon(&ahead);
         }
     }
 }

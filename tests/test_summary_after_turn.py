@@ -214,6 +214,32 @@ class SummaryAfterTurnTests(ModelFixture):
         self.assertTrue(compacted)
         self.assertNotIn('after_turn', compacted[0]['data']['request'])
 
+    def test_a_pause_stops_a_summary_on_its_way_and_the_next_turn_summarizes(self):
+        client = self.start(delay=2.0)
+        self.past_threshold(client)
+        self.wait_for(lambda: getattr(self.model, 'summarizing', False))
+        self.assertTrue(client.request('pause', reason='stop the line')['result']['changed'])
+        # It would have landed by now; stopped, it wrote nothing.
+        time.sleep(2.5)
+        self.assertIsNone(client.request('inspect', bot='Bob')['result']['compaction'])
+        self.assertEqual(self.compacted(client), [])
+        client.request('resume')
+        self.model.summary_delay = 0
+        drain(self.model)
+        self.turn(client, 2, 'small')
+        self.assertTrue(is_summary(drain(self.model)[0]))
+        compacted, = self.compacted(client)
+        self.assertNotIn('after_turn', compacted['data']['request'])
+
+    def test_a_summary_after_its_turn_counts_its_retries_toward_that_turn(self):
+        client = self.start(delay=0)
+        self.model.compaction_refusals, self.model.compaction_retry_after = 1, '0.05'
+        ended = self.past_threshold(client)
+        self.assertEqual(client.summarized('Bob', timeout=10)['event'], 'compacted')
+        with closing(sqlite3.connect(self.path / 'state.sqlite')) as db:
+            retries, = db.execute('select retries from turns where id=?', (ended['turn'],)).fetchone()
+        self.assertEqual(retries, 1)
+
     def events(self, client):
         events, after = [], 0
         while page := client.request('events', bot='Bob', after=after, limit=256)['result']['events']:
