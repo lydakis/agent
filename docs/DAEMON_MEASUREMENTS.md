@@ -7966,3 +7966,93 @@ inside the runner's noise. The screen warned once, on the lookout's CPU per
 this change does not touch past one listing at its start: that measure moves
 in steps of 1.25 ms (one 10 ms CPU tick over 8,000 deltas), and the 10x10
 row moved the same one step while the 10x100 row barely moved.
+
+## A summary written as the turn ends (protocol 59)
+
+A turn that ends with its view past the compaction threshold now writes the
+next turn's summary at once, after its end is committed, rather than
+leaving it to hold the next turn before its first call. On George's Mac
+that hold was 168 s on one lead turn (77% of the turn).
+
+**Cost at a turn's end.** When no summary is due, the turn adds one
+comparison: the view the last call sent plus the reply's bytes and items,
+against the threshold. That is O(1) in the length of the history, and it
+adds no store job. When a summary is due, the turn makes one view read
+(a writer job the next turn's boundary would have made anyway). It then
+registers the summary in a map keyed by bot. The entry, the turn's record
+and the view the summary copies (bytes shared with the last call) are held
+only while the summary is running; they are gone once it lands. An idle bot
+holds nothing.
+
+**One lead** (`bench.summary_after_turn lead`, synthetic provider with 2 s
+summaries, 24 turns of about 6 KiB each in a 64 KiB view compacted at
+half, Linux, 4 CPUs, release). "Gap" is the time between a turn's end and
+the next prompt, standing in for the person reading and answering.
+
+| Build | Gap | Summaries | Turns held | Held in all | Wait p50 | Wait max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| main d34479c | 0 | 14 | 14 | 28.1 s | 2005 ms | 2018 ms |
+| main d34479c | 2.5 s | 14 | 14 | 28.1 s | 2006 ms | 2008 ms |
+| head | 0 | 5 | 4 | 7.6 s | 2.6 ms | 2006 ms |
+| head | 2.5 s | 15 | 0 | 0 | 3.5 ms | 6.9 ms |
+
+- **Gap of 2.5 s** (the person takes longer than the summary): no turn waits.
+- **No gap** (turns back to back, faster than a summary): a turn waits only when the view has grown past what fits while the summary was running. Turns that arrive meanwhile share one summary.
+
+**Many leads** (`bench.summary_after_turn fleet`). Each bot is brought just
+under the threshold. Then every bot gets one turn whose reply crosses it,
+all at once, and then every bot gets its next turn, all at once.
+
+| Build | Bots | Turns end | Summaries landed | Next turns end | Summaries in next turns | CPU through next | RSS after next | `stats` max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| main | 100 | 0.22 s | none started | 2.20 s | 100 | 0.54 s | 23.7 MiB | 1.3 ms |
+| main | 200 | 0.35 s | none started | 2.38 s | 200 | 0.91 s | 28.8 MiB | 1.7 ms |
+| head | 100 | 0.24 s | 100 by 2.31 s | 0.19 s | 0 | 0.50 s | 24.6 MiB | 1.7 ms |
+| head | 200 | 0.49 s | 200 by 2.57 s | 0.51 s | 0 | 1.06 s | 29.6 MiB | 2.8 ms |
+
+- **Same work, done earlier.** Both builds write the same summaries; head writes them while the bots are idle instead of inside their next turns. The next turns drop from 2.2 s to 0.19 s at 100 bots and from 2.4 s to 0.51 s at 200.
+- **Doubling the fleet.**
+  - Settle time stays flat.
+  - CPU and the RSS a summary leaves behind roughly double on both builds, about 46 KiB per summarized bot. That is allocator high water from the summary calls, which main shows the same after its next turns.
+  - Nothing more is held per idle bot.
+- **Daemon stays responsive.** The slowest `stats` answer stays under 3 ms while 200 summaries run beside the run loop.
+
+**Hot-path screen** (AGENTS.md: `bench.admission_burst` and
+`bench.completion_burst` at `--repeat 5`, `bench.footprint` at `--repeat 2`,
+`bench.lifecycle` socket 32 echo bots), base `main` (3b3a00f) against head,
+two alternating rounds each. The Perf workflow's run on f25b67c (GitHub
+runner); the later commits do not touch the turn's path:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 43.276 | 44.478 | +2.8% |
+| admission | burst submit p99, ms | 7.214 | 7.362 | +2.0% |
+| completion | release to terminal p99, ms | 15.158 | 14.894 | -1.7% |
+| footprint | idle RSS, MiB | 15.391 | 15.203 | -1.2% |
+| footprint | per idle bot, KiB | 1.346 | 1.604 | +19.2% |
+| footprint | RSS after a turn each, MiB | 23.895 | 24.918 | +4.3% |
+| footprint | CPU per turn, ms | 1.391 | 1.403 | +0.9% |
+| lifecycle | CPU, s | 0.67 | 0.67 | +0.0% |
+| lifecycle | p95 turn, ms | 582.072 | 584.937 | +0.5% |
+| lifecycle | peak RSS, MiB | 22.439 | 22.787 | +1.5% |
+
+The same screen on a 4-CPU Linux container, release builds of 3b3a00f and
+132b875:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 41.466 | 40.599 | -2.1% |
+| admission | burst submit p99, ms | 8.013 | 8.265 | +3.2% |
+| completion | release to terminal p99, ms | 14.293 | 14.167 | -0.9% |
+| footprint | idle RSS, MiB | 15.516 | 15.094 | -2.7% |
+| footprint | per idle bot, KiB | 1.572 | 1.75 | +11.3% |
+| footprint | RSS after a turn each, MiB | 25.086 | 25.057 | -0.1% |
+| footprint | CPU per turn, ms | 1.199 | 1.287 | +7.4% |
+| lifecycle | CPU, s | 0.63 | 0.67 | +6.3% |
+| lifecycle | p95 turn, ms | 608.999 | 586.029 | -3.8% |
+| lifecycle | peak RSS, MiB | 22.891 | 22.98 | +0.4% |
+
+- **Store work per turn is unchanged.** The gate counts it, and it passed on both runs. A turn that ends below the threshold adds one comparison and no store job.
+- **Per idle bot moves both ways.** It reads -8.8% on another local round, against +19.2% and +11.3% here, at 1.3 to 1.75 KiB. Nothing new is held per idle bot: the map of summaries running has an entry only while one runs.
+- **A false RSS reading.** A first local footprint and lifecycle run showed head's RSS 2.8 MiB higher. All of the gap was in file-backed pages of the head binary (13.8 MiB resident against 11.1 MiB), and its anonymous memory and heap matched main's to the KiB (1644 KiB each). The head binary had just been built, so more of it sat in the page cache. Fresh copies of the two binaries gave 15.9 and 15.8 MiB idle, and the footprint and lifecycle rows above are from those copies.
+- **CPU and latency** moved both ways within the runner's noise. Under the gate's rule, nothing warned.

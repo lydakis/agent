@@ -19,9 +19,9 @@ use agent_runtime::{
     rules::Ruling,
     sandbox::Policy,
     store::{
-        Bot, CallAnswer, Charge, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Halt,
-        Halted, Limit, Settings, Slot, Spend, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window,
-        unserved,
+        AfterTurn, Answer, Bot, CallAnswer, Charge, ContextPrefix, ContextUsage, Database,
+        ElisionPlan, Gated, Halt, Halted, Limit, Settings, Slot, Spend, Store, Strip,
+        TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
     tools::{Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry},
 };
@@ -238,6 +238,15 @@ pub struct Turn {
     /// starts no model call or tool call after it and parks at its next
     /// boundary, for the next start to continue.
     pub stopping: Arc<AtomicBool>,
+    /// Every bot's summary started as one of its turns ended.
+    pub aheads: Aheads,
+    /// This bot's, as this task started: installed at a boundary once it
+    /// lands, waited for only when the view no longer fits.
+    pub ahead: Option<Arc<Ahead>>,
+    /// The summary this turn starts as it ends, for the service to run.
+    pub after: std::sync::Mutex<Option<After>>,
+    /// Set while this turn's summary runs after it ended, which bills it.
+    pub tailing: AtomicBool,
 }
 
 /// A steer waiting for the running turn's next boundary. Armed by `steer`
@@ -1182,41 +1191,21 @@ impl Turn {
         beside: Option<&mut Option<Beside<'a>>>,
         requested: bool,
     ) -> Result<Compaction> {
-        if record.compaction_instructions.is_none() {
+        let Some(Due {
+            keeps: (keep, keep_items),
+            at,
+            reason,
+            reserve,
+            fits,
+        }) = self.due(
+            record,
+            tools,
+            (context.pressure(), context.prefix_usage()),
+            output_bytes,
+            requested,
+        )
+        else {
             return Ok(Compaction::Skipped);
-        }
-        let pressure = context.pressure();
-        let limit = self.input_limit();
-        let reserve = output_bytes.unwrap_or(0).min(limit.bytes / 4);
-        let budget = self.soft_bytes(record, record.instructions.len() + tools.get().len());
-        if !requested
-            && pressure.bytes
-                < (budget / 100 * self.settings().compact_at()).min(limit.bytes - reserve)
-            && pressure.items
-                < (self.settings().context_items() * self.settings().compact_at() / 100)
-                    .min(limit.items)
-        {
-            return Ok(Compaction::Skipped);
-        }
-        let (keep, keep_items) = if requested {
-            (1, 1)
-        } else {
-            (
-                (budget / 100 * self.settings().compact_keep())
-                    .min(
-                        limit.bytes.saturating_sub(context.prefix.bytes.len())
-                            * self.settings().compact_keep()
-                            / self.settings().compact_at(),
-                    )
-                    .max(1) as i64,
-                (self.settings().context_items() * self.settings().compact_keep() / 100)
-                    .min(
-                        limit.items.saturating_sub(context.prefix.items)
-                            * self.settings().compact_keep()
-                            / self.settings().compact_at(),
-                    )
-                    .max(1) as i64,
-            )
         };
         let ahead = Some(context.prefix.bytes.clone());
         let sent = match last {
@@ -1236,7 +1225,6 @@ impl Turn {
         // reopens, while the view and the reply still fit; one that
         // outgrows the limit summarizes first, and so does one a client
         // asked for, which parks on the pool rather than wait unasked.
-        let fits = pressure.bytes + reserve < limit.bytes && pressure.items < limit.items;
         if fits && !requested && now_ms() < accounting.summary_retry_at {
             return Ok(Compaction::Skipped);
         }
@@ -1249,12 +1237,6 @@ impl Turn {
         let mut spent = Accounting {
             route: accounting.route.clone(),
             ..Accounting::default()
-        };
-        let at = (budget / 100 * self.settings().compact_at()).min(limit.bytes - reserve);
-        let reason = match () {
-            _ if requested => "requested",
-            _ if pressure.bytes >= at => "bytes",
-            _ => "items",
         };
         let trigger = self.trigger(
             record,
@@ -1346,6 +1328,505 @@ impl Turn {
                 .await?;
         }
         Ok(compaction)
+    }
+
+    /// Whether `context` is past the compaction threshold, or a summary
+    /// was `requested`: the bytes and items the summary keeps, the
+    /// threshold in bytes and why it was passed, the room kept for the
+    /// reply, and whether the view and the reply still fit the input limit.
+    /// `None` without compaction instructions, or below the threshold.
+    fn due(
+        &self,
+        record: &agent_runtime::store::Bot,
+        tools: &serde_json::value::RawValue,
+        (pressure, ahead): (ContextUsage, ContextUsage),
+        output_bytes: Option<usize>,
+        requested: bool,
+    ) -> Option<Due> {
+        record.compaction_instructions.as_ref()?;
+        let limit = self.input_limit();
+        let reserve = output_bytes.unwrap_or(0).min(limit.bytes / 4);
+        let budget = self.soft_bytes(record, record.instructions.len() + tools.get().len());
+        let at = (budget / 100 * self.settings().compact_at()).min(limit.bytes - reserve);
+        if !requested
+            && pressure.bytes < at
+            && pressure.items
+                < (self.settings().context_items() * self.settings().compact_at() / 100)
+                    .min(limit.items)
+        {
+            return None;
+        }
+        let keeps = if requested {
+            (1, 1)
+        } else {
+            (
+                (budget / 100 * self.settings().compact_keep())
+                    .min(
+                        limit.bytes.saturating_sub(ahead.bytes) * self.settings().compact_keep()
+                            / self.settings().compact_at(),
+                    )
+                    .max(1) as i64,
+                (self.settings().context_items() * self.settings().compact_keep() / 100)
+                    .min(
+                        limit.items.saturating_sub(ahead.items) * self.settings().compact_keep()
+                            / self.settings().compact_at(),
+                    )
+                    .max(1) as i64,
+            )
+        };
+        let reason = match () {
+            _ if requested => "requested",
+            _ if pressure.bytes >= at => "bytes",
+            _ => "items",
+        };
+        Some(Due {
+            keeps,
+            at,
+            reason,
+            reserve,
+            fits: pressure.bytes + reserve < limit.bytes && pressure.items < limit.items,
+        })
+    }
+
+    /// As the turn ends on its reply: when the view, with that reply, is
+    /// past the compaction threshold, plan to summarize it now, while the
+    /// last call's cache is warm, rather than before the bot's next call.
+    /// The turn ends as it would; the service starts the summary once the
+    /// end is committed (see [`Ahead`]). `sent` is the view the last call
+    /// sent, on `model`; the reply added `reply` to it. None while
+    /// another such summary runs for the bot, while the summarizer's pool
+    /// is closed, or under a budget its calls might pass: the next turn's
+    /// first boundary summarizes then, as before.
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_after(
+        &self,
+        record: &agent_runtime::store::Bot,
+        tools: &Arc<serde_json::value::RawValue>,
+        sent: &Context,
+        model: &str,
+        output_bytes: Option<usize>,
+        reply: ContextUsage,
+        (retry_at, route): (u64, &std::sync::OnceLock<String>),
+    ) -> Result<()> {
+        // Its copy's call and its summary's call take two rounds of their
+        // own; a bot allowed fewer summarizes at its next boundary.
+        if record.compaction_instructions.is_none()
+            || self.stopping.load(Relaxed)
+            || now_ms() < retry_at
+            || self.settings().max_rounds() <= 2
+        {
+            return Ok(());
+        }
+        // Below the threshold with the reply added, the view is not read
+        // again: the turn ends on one comparison.
+        let grown = ContextUsage {
+            bytes: sent.pressure().bytes + reply.bytes,
+            items: sent.pressure().items + reply.items,
+        };
+        let ahead = sent.prefix_usage();
+        if self
+            .due(record, tools, (grown, ahead), output_bytes, false)
+            .is_none()
+        {
+            return Ok(());
+        }
+        let now = match self
+            .context(
+                self.settings().context_bytes(),
+                self.settings().context_items(),
+                self.settings().context_bytes() * 2 / 3,
+            )
+            .await
+        {
+            Ok(now) => now,
+            // The next turn makes room as one does.
+            Err(error) if error.code == "context_limit" => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let Some(Due {
+            keeps,
+            at,
+            reason,
+            reserve,
+            ..
+        }) = self.due(
+            record,
+            tools,
+            (now.pressure(), now.prefix_usage()),
+            output_bytes,
+            false,
+        )
+        else {
+            return Ok(());
+        };
+        let Some(last) = LastCall::of(sent, true) else {
+            return Ok(());
+        };
+        let Some(share) = self
+            .summary_bound(record, now.usage().bytes.max(sent.usage().bytes), tools)
+            .filter(|share| record.left().holds(*share))
+        else {
+            return Ok(());
+        };
+        let handle = {
+            let mut aheads = self.aheads.lock().unwrap_or_else(|e| e.into_inner());
+            if aheads.contains_key(&self.bot) {
+                return Ok(());
+            }
+            let handle = Ahead::new(share);
+            aheads.insert(self.bot.clone(), handle.clone());
+            handle
+        };
+        let trigger = self.trigger(
+            record,
+            reason,
+            Some(at),
+            record.instructions.len() + tools.get().len(),
+            reserve,
+            keeps.0,
+        );
+        let mut record = record.clone();
+        record.cap_at(share);
+        *self.after.lock().unwrap_or_else(|e| e.into_inner()) = Some(After {
+            record,
+            keeps,
+            trigger,
+            last,
+            ahead: now.prefix.bytes.clone(),
+            model: model.to_owned(),
+            tools: tools.clone(),
+            route: route.clone(),
+            handle,
+        });
+        Ok(())
+    }
+
+    /// The summary planned as this turn ended, run once the end is
+    /// committed: billed to this turn, its calls bounded as one beside a
+    /// call is, and kept off the bot's connection, which the bot's next
+    /// turn may hold. It lands in its [`Ahead`].
+    pub fn tail(self: &Arc<Self>, after: After) -> Tail {
+        // Dropped before it lands, even unstarted, it comes to nothing.
+        let unlanded = Unlanded(Some((self.clone(), after.handle.clone())));
+        let turn = self.clone();
+        Box::pin(async move { turn.run_tail(after, unlanded).await })
+    }
+
+    async fn run_tail(&self, after: After, unlanded: Unlanded) {
+        self.tailing.store(true, Relaxed);
+        let After {
+            mut record,
+            keeps,
+            trigger,
+            last,
+            ahead,
+            model,
+            tools,
+            route,
+            handle,
+        } = after;
+        let bot = self.bot.clone();
+        let base = self
+            .store
+            .read("inspect", move |db| db.inspect(&bot))
+            .await
+            .map(|bot| bot.compaction);
+        // What the summary is written under: the turn's record, which a
+        // change made since does not reach.
+        let setup = record.summary_setup();
+        // Its copy goes on the turn's route, to the server holding the
+        // call's cache.
+        let mut accounting = Accounting {
+            beside: true,
+            route,
+            ..Accounting::default()
+        };
+        let (before, start) = (record.spent(), self.settings().max_rounds() - 2);
+        let mut rounds = start;
+        let (base, result) = match base {
+            Err(error) => (None, Err(error)),
+            Ok(base) => (
+                Some(AfterTurn {
+                    turn: self.turn,
+                    base,
+                    setup,
+                }),
+                {
+                    let sent = Sent {
+                        view: SentView::Call(&last),
+                        model: &model,
+                        ahead: Some(ahead),
+                    };
+                    let work = async {
+                        match self
+                            .plan(
+                                &mut record,
+                                self.turn,
+                                &mut accounting,
+                                &tools,
+                                keeps,
+                                false,
+                                Some(sent),
+                            )
+                            .await
+                        {
+                            Ok(Some(mut planned)) => {
+                                planned.choice.trigger = trigger;
+                                self.summarize(
+                                    planned,
+                                    &mut record,
+                                    &mut rounds,
+                                    self.turn,
+                                    &mut accounting,
+                                    &tools,
+                                )
+                                .await
+                            }
+                            Ok(None) => Ok(Summary::Skipped),
+                            Err(error) => Err(error),
+                        }
+                    };
+                    // A pause or the bot's deletion stops its call; the
+                    // calls it finished were billed as they finished.
+                    tokio::select! {
+                        result = work => result,
+                        () = handle.halted() => Err(Error::new(PAUSED)),
+                    }
+                },
+            ),
+        };
+        let result = result.map(|summary| match summary {
+            Summary::Written(mut written) => {
+                written.request["beside"] = false.into();
+                written.request["after_turn"] = true.into();
+                Summary::Written(written)
+            }
+            other => other,
+        });
+        let landed = Landed {
+            result,
+            spent: Spent {
+                spend: record.spent().minus(before),
+                rounds: rounds - start,
+            },
+        };
+        // Landed first: what it wrote is billed as it goes in. Its
+        // retries and waits on its pool then count toward the turn it is
+        // billed to, which flushed its own as it ended.
+        let (retries, paced_ms) = accounting.totals();
+        self.land(&handle, landed, base, unlanded).await;
+        if retries > 0 || paced_ms > 0 {
+            let turn = self.turn;
+            let _ = self
+                .store
+                .op("note_pacing", move |db| {
+                    db.note_pacing(turn, retries, paced_ms, 0)
+                })
+                .await;
+        }
+    }
+
+    /// A summary started after this turn lands: held for the bot's turn
+    /// task running now, or installed at once with none running. Its own
+    /// failure was reported live as it failed; an install that fails is
+    /// too, and leaves the view as it was.
+    /// `unlanded` stays armed until the result is handed on, so a tail
+    /// stopped while it waits here still comes to nothing.
+    async fn land(
+        &self,
+        ahead: &Arc<Ahead>,
+        landed: Landed,
+        ended: Option<AfterTurn>,
+        mut unlanded: Unlanded,
+    ) {
+        let mut state = ahead.state.lock().await;
+        if state.tasks > 0 {
+            ahead
+                .landed
+                .store(true, std::sync::atomic::Ordering::Release);
+            state.result = Some((landed, ended));
+            unlanded.0 = None;
+            drop(state);
+            ahead.told.notify_waiters();
+            return;
+        }
+        // Queued while no task of the bot can start reading its view, so
+        // the next one reads the view it leaves.
+        let queued = match (landed.result, ended) {
+            (Ok(Summary::Written(written)), Some(ended)) => match self.store.slot().await {
+                Ok(slot) => Some(self.queue_install(slot, *written, Some(ended))),
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        ahead
+            .landed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.forget(ahead);
+        unlanded.0 = None;
+        drop(state);
+        ahead.told.notify_waiters();
+        if let Some(queued) = queued {
+            let _ = self.installed(queued).await;
+        }
+    }
+
+    /// Count this task among the bot's running ones for the summary its
+    /// last turn started, so one landing while it runs waits for it.
+    pub async fn enter_ahead(&self) {
+        if let Some(ahead) = &self.ahead {
+            ahead.state.lock().await.tasks += 1;
+        }
+    }
+
+    /// As this task ends: a summary that landed while it ran and was not
+    /// installed yet is installed now, while the turn still holds the bot.
+    pub async fn leave_ahead(&self) {
+        let Some(ahead) = &self.ahead else {
+            return;
+        };
+        let mut state = ahead.state.lock().await;
+        state.tasks -= 1;
+        if state.tasks > 0 {
+            return;
+        }
+        let Some((landed, ended)) = state.result.take() else {
+            return;
+        };
+        self.forget(ahead);
+        let queued = match (landed.result, ended) {
+            (Ok(Summary::Written(written)), Some(ended)) => match self.store.slot().await {
+                Ok(slot) => Some(self.queue_install(slot, *written, Some(ended))),
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        drop(state);
+        if let Some(queued) = queued {
+            let _ = self.installed(queued).await;
+        }
+    }
+
+    /// At a boundary: the summary the bot's last turn started, installed
+    /// once it has landed, and waited for first when `wait`. Whether one
+    /// was installed.
+    async fn settle_ahead(
+        &self,
+        record: &mut agent_runtime::store::Bot,
+        wait: bool,
+    ) -> Result<bool> {
+        let Some(ahead) = &self.ahead else {
+            return Ok(false);
+        };
+        if wait && ahead.pending() {
+            let _held = Held::from_now(&self.side.summary_ms);
+            ahead.wait().await;
+        }
+        if ahead.state.lock().await.result.is_none() {
+            return Ok(false);
+        }
+        // Taken once its install can be queued at once, so a turn
+        // cancelled meanwhile leaves it for the task's end.
+        let slot = self.store.slot().await?;
+        let queued = {
+            let mut state = ahead.state.lock().await;
+            let Some((landed, ended)) = state.result.take() else {
+                return Ok(false);
+            };
+            self.forget(ahead);
+            match (landed.result, ended) {
+                (Ok(Summary::Written(written)), Some(ended)) => {
+                    Some(self.queue_install(slot, *written, Some(ended)))
+                }
+                _ => None,
+            }
+        };
+        // Installed first: the install job is what bills a summary that
+        // was written, so its spend is in the store once it is answered.
+        let installed = match queued {
+            Some(queued) => matches!(self.installed(queued).await?, Compaction::Done),
+            None => false,
+        };
+        // What it spent is on the bot as the store keeps it, and on this
+        // turn's record unless the record was read before it was spent:
+        // that part counts now, toward the bot's caps and not this turn's.
+        let bot = self.bot.clone();
+        let unseen = self
+            .store
+            .op("inspect", move |db| db.inspect(&bot))
+            .await?
+            .spent()
+            .minus(record.spent());
+        record.add(unseen);
+        if let Some(cap) = &mut record.turn_budget {
+            cap.until = cap.until.saturating_add(unseen.of(cap.counts));
+        }
+        Ok(installed)
+    }
+
+    /// The summary this turn planned as it ended, started once its end is
+    /// committed.
+    pub fn take_after(&self) -> Option<After> {
+        self.after.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// An end that did not commit starts no summary: the next turn of the
+    /// bot plans its own.
+    pub fn drop_after(&self) {
+        if let Some(after) = self.take_after() {
+            self.abandon(&after.handle);
+        }
+    }
+
+    /// `ahead` comes to nothing: whoever waits for it goes on without it.
+    fn abandon(&self, ahead: &Arc<Ahead>) {
+        ahead
+            .landed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.forget(ahead);
+        ahead.told.notify_waiters();
+    }
+
+    /// A client's request for a summary, answered by one that landed.
+    async fn take_request(&self, record: &mut agent_runtime::store::Bot) -> Result<()> {
+        record.compaction_requested = false;
+        self.compact.store(false, Relaxed);
+        let bot = self.bot.clone();
+        self.store
+            .op("request_compaction", move |db| {
+                db.request_compaction(&bot, None, false)
+            })
+            .await
+            .map(drop)
+    }
+
+    /// Whether the summary the bot's last turn started still runs: this
+    /// task starts none of its own meanwhile.
+    fn ahead_pending(&self) -> bool {
+        self.ahead.as_ref().is_some_and(|ahead| ahead.pending())
+    }
+
+    /// The share of the bot's budget the summary its last turn started may
+    /// spend, until it is installed or comes to nothing: held against the
+    /// bot's caps, not this turn's, so the two cannot spend the same room.
+    fn ahead_share(&self) -> Option<Spend> {
+        let ahead = self.ahead.as_ref()?;
+        let aheads = self.aheads.lock().unwrap_or_else(|e| e.into_inner());
+        aheads
+            .get(&self.bot)
+            .filter(|held| Arc::ptr_eq(held, ahead))
+            .map(|_| ahead.share)
+    }
+
+    /// Done with `ahead`: the bot's next turn may start another.
+    fn forget(&self, ahead: &Arc<Ahead>) {
+        let mut aheads = self.aheads.lock().unwrap_or_else(|e| e.into_inner());
+        if aheads
+            .get(&self.bot)
+            .is_some_and(|held| Arc::ptr_eq(held, ahead))
+        {
+            aheads.remove(&self.bot);
+        }
     }
 
     /// The most a summary's two calls may add to a bot's or turn's work:
@@ -1514,7 +1995,9 @@ impl Turn {
             .summarize(planned, record, model_rounds, turn, accounting, tools)
             .await?
         {
-            Summary::Written(written) => self.install(self.store.slot().await?, *written).await,
+            Summary::Written(written) => {
+                self.install(self.store.slot().await?, *written, None).await
+            }
             Summary::Parked(until) => Ok(Compaction::Parked(until)),
             Summary::Skipped => Ok(Compaction::Skipped),
         }
@@ -1778,11 +2261,7 @@ impl Turn {
             } else {
                 break (summary, usage);
             };
-            self.store
-                .op("compaction_usage", move |db| {
-                    db.compaction_usage(turn, usage.as_ref())
-                })
-                .await?;
+            self.summary_usage(turn, usage).await?;
             // A summary longer than the limit is asked for again, in a
             // request of its own, at half the size it was asked for, as
             // long as each comes back shorter than the one before: a model
@@ -1856,7 +2335,7 @@ impl Turn {
         };
         spent.count(record, model_rounds);
         let installed = match (result, slot) {
-            (Ok(Summary::Written(written)), Some(slot)) => self.install(slot, *written).await,
+            (Ok(Summary::Written(written)), Some(slot)) => self.install(slot, *written, None).await,
             (Ok(Summary::Written(_)), None) => unreachable!("a written summary reserves a slot"),
             (Ok(Summary::Parked(until)), _) => {
                 accounting.summary_retry_at = until;
@@ -1871,8 +2350,24 @@ impl Turn {
     /// Record a summary as the new context start, at a boundary: the view
     /// changes only between calls. One job holds the install and, when it
     /// fails, the summary's bill, so once `slot` sends it no cancellation
-    /// can lose either.
-    async fn install(&self, slot: Slot<'_>, written: Written) -> Result<Compaction> {
+    /// can lose either. One started `after` a turn ended bills that turn.
+    async fn install(
+        &self,
+        slot: Slot<'_>,
+        written: Written,
+        after: Option<AfterTurn>,
+    ) -> Result<Compaction> {
+        let installed = self.queue_install(slot, written, after);
+        self.installed(installed).await
+    }
+
+    /// Queue a summary's install, to wait for with `installed`.
+    fn queue_install(
+        &self,
+        slot: Slot<'_>,
+        written: Written,
+        after: Option<AfterTurn>,
+    ) -> Answer<Value> {
         let Written {
             plan,
             summary,
@@ -1882,9 +2377,9 @@ impl Turn {
         let (bot, turn) = (self.bot.clone(), self.turn);
         let note_turns = self.settings().note_turns();
         let input_limit = self.input_limit();
-        let installed = slot
-            .op("compact", move |db| {
-                let installed = db.compact(
+        slot.op("compact", move |db| {
+            let installed = match after {
+                None => db.compact(
                     &bot,
                     &plan,
                     &summary,
@@ -1892,19 +2387,41 @@ impl Turn {
                     note_turns,
                     input_limit,
                     request,
-                );
-                if installed.is_err() {
-                    db.compaction_usage(turn, usage.as_ref())?;
+                ),
+                Some(after) => db.compact_after(
+                    &bot,
+                    &plan,
+                    &summary,
+                    usage.as_ref(),
+                    note_turns,
+                    input_limit,
+                    request,
+                    after,
+                ),
+            };
+            if installed.is_err() {
+                match after {
+                    None => db.compaction_usage(turn, usage.as_ref())?,
+                    Some(after) => db.compaction_usage_after(after.turn, usage.as_ref())?,
                 }
-                installed
-            })
-            .await;
-        if let Err(error) = installed {
+            }
+            installed
+        })
+    }
+
+    /// How a queued install went: a summary that no longer fits the view,
+    /// or was planned on a view another replaced since, is reported live
+    /// and skipped.
+    async fn installed(&self, installed: Answer<Value>) -> Result<Compaction> {
+        if let Err(error) = installed.await {
             if matches!(
                 error.code.as_str(),
-                "compaction_not_smaller" | "compaction_context_limit" | "compaction_version_shared"
+                "compaction_not_smaller"
+                    | "compaction_context_limit"
+                    | "compaction_version_shared"
+                    | "compaction_stale"
             ) {
-                self.compaction_failed(turn, &error).await?;
+                self.compaction_failed(self.turn, &error).await?;
                 return Ok(Compaction::Skipped);
             }
             return Err(error);
@@ -2408,6 +2925,8 @@ impl Turn {
         }
         let mut model_rounds = context.model_rounds;
         let called = context.model.as_str();
+        // The model a summary written as the turn ends finds the cache on.
+        let on_model = called;
         // This bot's tools, encoded once per distinct selection and shared.
         let tools = self.registry.encoded(
             provider.family(),
@@ -2496,6 +3015,14 @@ impl Turn {
                 .await
             {
                 Ok(context) => context,
+                // A summary on its way is what makes room.
+                Err(error)
+                    if error.code == "context_limit"
+                        && self.settle_ahead(&mut record, true).await? =>
+                {
+                    (last, inherited, resume_window) = (None, false, resuming);
+                    continue;
+                }
                 Err(error) if error.code == "context_limit" => match self
                     .overflow(
                         &mut record,
@@ -2523,6 +3050,34 @@ impl Turn {
                 && *ahead == context.prefix.bytes
             {
                 context.prefix.bytes = ahead.clone();
+            }
+            // The summary the bot's last turn started as it ended goes in
+            // once it lands. This boundary waits for it only when the view
+            // cannot go on without one, or a client asked for one; while it
+            // runs, this task starts no summary of its own.
+            if !resuming && self.ahead.is_some() {
+                let requested = record.compaction_requested || self.compact.load(Relaxed);
+                let wait = self.ahead_pending()
+                    && (requested
+                        || self
+                            .due(
+                                &record,
+                                &tools,
+                                (context.pressure(), context.prefix_usage()),
+                                output_bytes,
+                                false,
+                            )
+                            .is_some_and(|due| !due.fits));
+                if self.settle_ahead(&mut record, wait).await? {
+                    if requested {
+                        self.take_request(&mut record).await?;
+                    }
+                    if capped.is_some() {
+                        self.steers.store(true, Relaxed);
+                    }
+                    (last, inherited, resume_window) = (None, false, resuming);
+                    continue;
+                }
             }
             // Steers go in before this call, measured against what this
             // view must send ahead of the turn: its summary, pinned context,
@@ -2576,7 +3131,7 @@ impl Turn {
                     last = LastCall::of(&sent, false);
                 }
             }
-            if !resuming && !std::mem::take(&mut steer_first) {
+            if !resuming && !std::mem::take(&mut steer_first) && !self.ahead_pending() {
                 // A client's request stays recorded until its summary ends:
                 // one that parks finds it again as the turn resumes.
                 let requested = std::mem::take(&mut record.compaction_requested)
@@ -2652,6 +3207,16 @@ impl Turn {
             // of it: the same forced recovery, then the steps again.
             let mut context = match self.fit_context(context, self.input_limit()).await {
                 Ok(context) => context,
+                Err(error)
+                    if error.code == "context_limit"
+                        && self.settle_ahead(&mut record, true).await? =>
+                {
+                    if capped.is_some() {
+                        self.steers.store(true, Relaxed);
+                    }
+                    (last, inherited, resume_window) = (None, false, resuming);
+                    continue;
+                }
                 Err(error) if error.code == "context_limit" => match self
                     .overflow(
                         &mut record,
@@ -2701,6 +3266,12 @@ impl Turn {
                 model_rounds += rounds;
                 record.add(share);
             }
+            // So does the share of a summary the bot's last turn started
+            // and this turn has not installed, against the bot's caps.
+            let behind = self.ahead_share();
+            if let Some(share) = behind {
+                hold_for_bot(&mut record, share, true);
+            }
             // The round limit's last call goes with the tools shown but no
             // call allowed, so the turn ends on a reply rather than failing
             // with its work done and unreported; so does the call after one
@@ -2747,6 +3318,9 @@ impl Turn {
             if let Some((rounds, share)) = held {
                 model_rounds -= rounds;
                 record.take_back(share);
+            }
+            if let Some(share) = behind {
+                hold_for_bot(&mut record, share, false);
             }
             // A call that withheld its replayed thinking recorded that on
             // the bot; the context keeps what it sent.
@@ -2818,6 +3392,10 @@ impl Turn {
                 (added, through)
             });
             let items = response.items;
+            let reply = ContextUsage {
+                bytes: items.iter().map(Bytes::len).sum(),
+                items: items.len(),
+            };
             let calls: Vec<ToolCall> = response.calls.clone();
             let usage = response.usage.clone();
             // What the view cost in tokens, for the token threshold. One
@@ -2946,6 +3524,23 @@ impl Turn {
                     };
                     steer_first = whole;
                     continue;
+                }
+                // Past the threshold with this reply, the next turn's
+                // summary is written now, while this call's cache is warm,
+                // and lands before that turn needs it. One that cannot be
+                // planned leaves it to that turn, as before.
+                if !installed {
+                    let _ = self
+                        .plan_after(
+                            &record,
+                            &tools,
+                            &context,
+                            on_model,
+                            output_bytes,
+                            reply,
+                            (accounting.summary_retry_at, &accounting.route),
+                        )
+                        .await;
                 }
                 return Ok(Round::Finished);
             }
@@ -3363,11 +3958,7 @@ impl Turn {
                 if let Some(usage) = usage {
                     let reference = summarizer(record);
                     let usage = priced_at(usage, split_model(&reference)?.0, model);
-                    self.store
-                        .op("compaction_usage", move |db| {
-                            db.compaction_usage(turn, Some(&usage))
-                        })
-                        .await?;
+                    self.summary_usage(turn, Some(usage)).await?;
                 }
             } else {
                 self.failed_usage(usage, failed).await?;
@@ -3562,9 +4153,29 @@ impl Turn {
 
     /// Record a retry as the turn's event, so it outlives the live stream.
     async fn retried(&self, data: Value) -> Result<()> {
-        let turn = self.turn;
+        let (turn, ended) = (self.turn, self.tailing.load(Relaxed));
         self.store
-            .op("retried", move |db| db.retried(turn, data))
+            .op("retried", move |db| match ended {
+                false => db.retried(turn, data),
+                true => db.retried_after(turn, data),
+            })
+            .await
+    }
+
+    /// Charge a summarizer's response, to the turn running it or, for one
+    /// started as this turn ended, to this turn after it.
+    async fn summary_usage(
+        &self,
+        turn: i64,
+        usage: Option<agent_runtime::provider::Usage>,
+    ) -> Result<()> {
+        let ended = self.tailing.load(Relaxed);
+        // Kept: a summary stopped while this waits for room still bills it.
+        self.store
+            .op_kept("compaction_usage", move |db| match ended {
+                false => db.compaction_usage(turn, usage.as_ref()),
+                true => db.compaction_usage_after(turn, usage.as_ref()),
+            })
             .await
     }
 
@@ -3580,7 +4191,7 @@ impl Turn {
         if let Some(usage) = usage {
             let turn = self.turn;
             self.store
-                .op("failed_usage", move |db| {
+                .op_kept("failed_usage", move |db| {
                     db.failed_usage(turn, &usage, added, read)
                 })
                 .await?;
@@ -5575,6 +6186,13 @@ impl Context {
             w.unsummarized.with_prefix(&self.prefix)
         })
     }
+    /// What goes ahead of the window.
+    fn prefix_usage(&self) -> ContextUsage {
+        ContextUsage {
+            bytes: self.prefix.bytes.len(),
+            items: self.prefix.items,
+        }
+    }
     /// Whether the window sends more pictures than a request takes.
     fn overpictured(&self) -> bool {
         self.window.as_ref().is_some_and(|w| {
@@ -5659,10 +6277,164 @@ impl Drop for Counted<'_> {
     }
 }
 
+/// A summary started after its turn ended that stops before it lands.
+pub struct Unlanded(Option<(Arc<Turn>, Arc<Ahead>)>);
+
+impl Drop for Unlanded {
+    fn drop(&mut self) {
+        if let Some((turn, ahead)) = self.0.take() {
+            turn.abandon(&ahead);
+        }
+    }
+}
+
+/// A summary started after its turn ended, run beside the run loop.
+pub type Tail = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// Every bot's summary started as one of its turns ended, by bot, from
+/// when that turn plans it until it is installed or comes to nothing.
+pub type Aheads = Arc<std::sync::Mutex<HashMap<String, Arc<Ahead>>>>;
+
+/// The summary `bot`'s last turn started, if one is running, comes to
+/// nothing: its call stops, whoever waits for it goes on without it, and
+/// a bot made later under the name does not find it.
+pub fn drop_ahead(aheads: &Aheads, bot: &str) {
+    let dropped = aheads.lock().unwrap_or_else(|e| e.into_inner()).remove(bot);
+    if let Some(ahead) = dropped {
+        ahead.stop();
+        ahead
+            .landed
+            .store(true, std::sync::atomic::Ordering::Release);
+        ahead.told.notify_waiters();
+    }
+}
+
+/// Every summary started as a turn ended stops its call; each still bills
+/// what it spent and lands with nothing written.
+pub fn stop_aheads(aheads: &Aheads) {
+    for ahead in aheads.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        ahead.stop();
+    }
+}
+
+/// A summary started as one of the bot's turns ended, while that call's
+/// cache is warm, for the view the bot's next turn sends. A turn task of
+/// the bot running when it lands installs it at its next boundary, or as
+/// it leaves; with none running, it installs itself as it lands. A turn
+/// waits for it only when its view no longer fits or a client asked for a
+/// summary, and starts no summary of its own while it runs.
+pub struct Ahead {
+    state: tokio::sync::Mutex<AheadState>,
+    /// The most it may spend, under the bot's budget.
+    share: Spend,
+    /// Set when a pause or the bot's deletion stops its call.
+    stopped: AtomicBool,
+    halt: Notify,
+    /// Set once, under `state`, as it lands.
+    landed: AtomicBool,
+    told: Notify,
+}
+
+#[derive(Default)]
+struct AheadState {
+    /// The bot's turn tasks running now.
+    tasks: usize,
+    /// What it wrote, landed while a task ran, until one installs it, and
+    /// the bot's summary when it was planned.
+    result: Option<(Landed, Option<AfterTurn>)>,
+}
+
+impl Ahead {
+    fn new(share: Spend) -> Arc<Self> {
+        Arc::new(Self {
+            state: Default::default(),
+            share,
+            stopped: AtomicBool::new(false),
+            halt: Notify::new(),
+            landed: AtomicBool::new(false),
+            told: Notify::new(),
+        })
+    }
+    fn pending(&self) -> bool {
+        !self.landed.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.halt.notify_waiters();
+    }
+    async fn halted(&self) {
+        loop {
+            let halt = self.halt.notified();
+            tokio::pin!(halt);
+            halt.as_mut().enable();
+            if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            halt.await;
+        }
+    }
+    async fn wait(&self) {
+        loop {
+            let told = self.told.notified();
+            tokio::pin!(told);
+            told.as_mut().enable();
+            if !self.pending() {
+                return;
+            }
+            told.await;
+        }
+    }
+}
+
+/// What a summary started at a turn's end needs once the turn is gone: the
+/// bot's record, under the share of its budget the summary may spend; what
+/// it keeps and what started it; the view the turn's last call sent, on
+/// `model`, for a copy, and what goes ahead of the view now.
+pub struct After {
+    record: agent_runtime::store::Bot,
+    keeps: (i64, i64),
+    trigger: Value,
+    last: LastCall,
+    ahead: Bytes,
+    model: String,
+    tools: Arc<serde_json::value::RawValue>,
+    /// The turn's sticky route, for the copy.
+    route: std::sync::OnceLock<String>,
+    handle: Arc<Ahead>,
+}
+
+/// A view past the compaction threshold: the bytes and items its summary
+/// keeps, the threshold in bytes and why it was passed, the room kept for
+/// the reply, and whether the view and the reply still fit the input limit.
+struct Due {
+    keeps: (i64, i64),
+    at: usize,
+    reason: &'static str,
+    reserve: usize,
+    fits: bool,
+}
+
 /// How a summary beside the call ended, and what it spent.
 struct Landed {
     result: Result<Summary>,
     spent: Spent,
+}
+
+/// Hold `share` against the bot's caps in `record`, or give it back: the
+/// turn's own cap moves with it, so the turn's room stays as it was.
+fn hold_for_bot(record: &mut agent_runtime::store::Bot, share: Spend, hold: bool) {
+    let moved = |until: u64, by: u64| match hold {
+        true => until.saturating_add(by),
+        false => until.saturating_sub(by),
+    };
+    match hold {
+        true => record.add(share),
+        false => record.take_back(share),
+    }
+    if let Some(cap) = &mut record.turn_budget {
+        cap.until = moved(cap.until, share.of(cap.counts));
+    }
 }
 
 /// Milliseconds since `started`.
@@ -6312,6 +7084,10 @@ mod tests {
             .await;
         let (cancel, cancelled) = watch::channel(None);
         let task = Turn {
+            aheads: Default::default(),
+            ahead: None,
+            after: Default::default(),
+            tailing: Default::default(),
             identity: 0,
             bot: "Bob".into(),
             turn,
@@ -6494,6 +7270,10 @@ mod tests {
         let (_cancel, cancelled) = watch::channel(None);
         // Nothing listens there: the turn must park before any call.
         let task = Turn {
+            aheads: Default::default(),
+            ahead: None,
+            after: Default::default(),
+            tailing: Default::default(),
             identity: 0,
             bot: "Bob".into(),
             turn,
@@ -6657,6 +7437,10 @@ mod tests {
         )
         .unwrap();
         let task = Turn {
+            aheads: Default::default(),
+            ahead: None,
+            after: Default::default(),
+            tailing: Default::default(),
             identity: 0,
             bot: "Bob".into(),
             turn,

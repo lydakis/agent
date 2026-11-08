@@ -787,6 +787,20 @@ pub struct TurnBudget {
     pub counts: Counts,
 }
 impl Bot {
+    /// What a summary is written for: the bot's model, its summarizer, and
+    /// the summarizer's instructions. One planned under another is stale.
+    pub fn summary_setup(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (
+            &self.provider,
+            &self.model,
+            &self.compaction_model,
+            &self.compaction_instructions,
+        )
+            .hash(&mut hasher);
+        hasher.finish()
+    }
     /// What its calls spent, in both measures.
     pub fn spent(&self) -> Spend {
         Spend {
@@ -1840,6 +1854,15 @@ pub struct ElisionPlan {
     pub through: i64,
     pub results: i64,
     pub saved_bytes: i64,
+}
+/// A summary started as `turn` ended, planned while the bot's summary
+/// was `base` and its model and summarizer were `setup`
+/// ([`Bot::summary_setup`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AfterTurn {
+    pub turn: i64,
+    pub base: Option<i64>,
+    pub setup: u64,
 }
 /// What a compaction has to summarize, chosen at a turn boundary.
 #[derive(Debug, Clone)]
@@ -5026,7 +5049,66 @@ impl Database {
         input_limit: super::ContextUsage,
         request: Value,
     ) -> Result<Value> {
+        self.compact_for(
+            name,
+            plan,
+            summary,
+            usage,
+            note_turns,
+            input_limit,
+            request,
+            None,
+        )
+    }
+    /// Record a compaction made after `after`'s turn ended, for the view
+    /// it planned on: the bot's summary was then `after.base`. It bills
+    /// that turn, as does the event, whether or not another turn runs now;
+    /// one planned on a view another summary has since replaced is refused
+    /// with `compaction_stale`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compact_after(
+        &mut self,
+        name: &str,
+        plan: &CompactionPlan,
+        summary: &str,
+        usage: Option<&Usage>,
+        note_turns: usize,
+        input_limit: super::ContextUsage,
+        request: Value,
+        after: AfterTurn,
+    ) -> Result<Value> {
+        self.compact_for(
+            name,
+            plan,
+            summary,
+            usage,
+            note_turns,
+            input_limit,
+            request,
+            Some(after),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn compact_for(
+        &mut self,
+        name: &str,
+        plan: &CompactionPlan,
+        summary: &str,
+        usage: Option<&Usage>,
+        note_turns: usize,
+        input_limit: super::ContextUsage,
+        request: Value,
+        ended: Option<AfterTurn>,
+    ) -> Result<Value> {
         let bot = self.inspect(name)?;
+        if let Some(ended) = ended
+            && (bot.compaction != ended.base || bot.summary_setup() != ended.setup)
+        {
+            return fail_with(
+                "compaction_stale",
+                "another summary, model, or summarizer replaced the one this was planned for",
+            );
+        }
         if let Some(head) = bot.head
             && bot.compaction == Some(head)
             && compaction_shared(&self.conn, head, name)?
@@ -5197,7 +5279,10 @@ impl Database {
             "trigger":trigger,"room_bytes":room,
             "request":request});
         // Successful summaries and their accounting share one fsync/commit.
-        if let Some(turn) = bot.running_turn {
+        // One made after a turn ended bills that turn, and the view the
+        // running turn, or else that turn, sent is no longer the bot's.
+        let billed = ended.map(|ended| ended.turn).or(bot.running_turn);
+        if let Some(turn) = billed {
             if let Some(usage) = usage {
                 record_usage_for(
                     &tx,
@@ -5210,13 +5295,28 @@ impl Database {
                 )?;
             }
             tx.execute(
-                "UPDATE turns SET model_rounds=model_rounds+1,view_sent=0 WHERE id=?",
-                [turn],
+                "UPDATE turns SET model_rounds=model_rounds+1,
+                     view_sent=CASE WHEN ?2 THEN 0 ELSE view_sent END WHERE id=?1",
+                params![turn, bot.running_turn.is_none_or(|running| running == turn)],
             )?;
         }
-        let cursor = event(&tx, name, bot.running_turn, "compacted", data.clone())?;
+        if let Some(running) = bot.running_turn.filter(|&running| Some(running) != billed) {
+            tx.execute("UPDATE turns SET view_sent=0 WHERE id=?", [running])?;
+        }
+        // Nor is the view any turn since sent: one that ended while it was
+        // written is the one the next turn reads.
+        if let Some(ended) = ended {
+            tx.execute(
+                "UPDATE turns SET view_sent=0 WHERE bot=?1 AND id>?2 AND view_sent IS 1",
+                params![name, ended.turn],
+            )?;
+        }
+        let cursor = event(&tx, name, billed, "compacted", data.clone())?;
+        if let Some(ended) = ended {
+            retain_late(&tx, ended.turn, name)?;
+        }
         tx.commit()?;
-        Ok(entry(cursor, name, bot.running_turn, "compacted", data))
+        Ok(entry(cursor, name, billed, "compacted", data))
     }
     /// Whether the active turn, cut to the least it can be, still fits
     /// beside a new compaction's pinned prefix. Catch-up may leave an
@@ -7556,6 +7656,15 @@ impl Database {
         event(&self.conn, &bot.name, Some(turn), "retry", data)?;
         Ok(())
     }
+    /// A retry of a summary made after `turn` ended, as that turn's event.
+    pub fn retried_after(&mut self, turn: i64, data: Value) -> Result<()> {
+        let bot = self.ended(turn)?;
+        let tx = self.conn.savepoint()?;
+        event(&tx, &bot.name, Some(turn), "retry", data)?;
+        retain_late(&tx, turn, &bot.name)?;
+        tx.commit()?;
+        Ok(())
+    }
     /// Charge an unsuccessful provider call without accepting its output.
     /// A failed call's usage: its request sent `added` input tokens new,
     /// and its history read through node `read`.
@@ -7580,11 +7689,28 @@ impl Database {
     /// Charge a summarizer response without adding it to the transcript.
     pub fn compaction_usage(&mut self, turn: i64, usage: Option<&Usage>) -> Result<()> {
         let bot = self.active(turn)?;
+        self.bill_summary(&bot, turn, usage, false)
+    }
+    /// Charge a summarizer response made after `turn` ended to that turn.
+    pub fn compaction_usage_after(&mut self, turn: i64, usage: Option<&Usage>) -> Result<()> {
+        let bot = self.ended(turn)?;
+        self.bill_summary(&bot, turn, usage, true)
+    }
+    fn bill_summary(
+        &mut self,
+        bot: &Bot,
+        turn: i64,
+        usage: Option<&Usage>,
+        late: bool,
+    ) -> Result<()> {
         let tx = self.conn.savepoint()?;
+        if late {
+            retain_late(&tx, turn, &bot.name)?;
+        }
         if let Some(usage) = usage {
             record_usage_for(
                 &tx,
-                &bot,
+                bot,
                 turn,
                 usage,
                 Some("compaction"),
@@ -9918,6 +10044,18 @@ impl Database {
             bot: bot.name,
             bot_id: bot.bot_id,
         })
+    }
+    /// The bot of a turn that has ended, for what a summary made after it
+    /// bills it.
+    fn ended(&self, turn: i64) -> Result<Bot> {
+        let name: String =
+            self.conn
+                .query_row("SELECT bot FROM turns WHERE id=?", [turn], |r| r.get(0))?;
+        let bot = self.inspect(&name)?;
+        if bot.running_turn == Some(turn) {
+            return fail("turn_running");
+        }
+        Ok(bot)
     }
     fn active(&self, turn: i64) -> Result<Bot> {
         let name: String =
@@ -15497,6 +15635,15 @@ fn migrate_unanswered_tools(conn: &Connection, bot: &str, turn: i64) -> Result<(
         "INSERT OR IGNORE INTO retained_turns(turn,bot) VALUES (?,?)",
         params![turn, bot],
     )?;
+    Ok(())
+}
+
+/// Events a summary started as `turn` ended writes after it: retention may
+/// have pruned the turn meanwhile, and prunes find a turn's events only
+/// through its entry here, so the entry comes back with them.
+fn retain_late(conn: &rusqlite::Connection, turn: i64, bot: &str) -> Result<()> {
+    conn.prepare_cached("INSERT OR IGNORE INTO retained_turns(turn,bot) VALUES (?,?)")?
+        .execute(params![turn, bot])?;
     Ok(())
 }
 

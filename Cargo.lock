@@ -3800,6 +3800,7 @@ dependencies = [
  "resvg",
  "rmcp",
  "rquickjs",
+ "serde",
  "serde_json",
  "sha2",
  "shell-words",

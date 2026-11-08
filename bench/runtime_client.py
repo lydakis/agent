@@ -108,6 +108,21 @@ class Client:
     def finished(self, turn, timeout=5):
         return self.receive(lambda m: m.get('event') == 'turn_finished' and m.get('turn') == turn, timeout)
 
+    def summarized(self, bot, timeout=5):
+        """Wait for the summary a turn of `bot` started as it ended to land,
+        installed or not. The message stays among the saved ones."""
+        def landed(message):
+            if message.get('bot') != bot:
+                return False
+            if message.get('event') == 'compaction_failed':
+                # One a request of its own follows is not the end of it.
+                return not message.get('fallback')
+            request = (message.get('data') or {}).get('request') or {}
+            return message.get('event') == 'compacted' and request.get('after_turn') is True
+        message = self.receive(landed, timeout)
+        self.saved.append(message)
+        return message
+
     def close(self, kill=False):
         if self.process.poll() is None:
             if kill:
