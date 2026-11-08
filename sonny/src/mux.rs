@@ -1352,22 +1352,111 @@ pub fn here(project: &str, host: Option<&str>) -> Option<Layout> {
     Some(Layout::new(backend))
 }
 
-/// The project's home, for an agent's call, from the tool host answering it,
-/// whose multiplexer variables would name the terminal Sonny started it
-/// in: where the project's Sonny window the person used last is, in that
+/// Where an agent's calls act, before anything there is opened: the
+/// multiplexer, by the CLI that drives it, and the home in it that a
+/// window of the project's is in, or `None` for the project's own home
+/// there, found or made.
+#[derive(Debug, PartialEq)]
+pub enum Aim {
+    Herdr {
+        bin: PathBuf,
+        workspace: Option<String>,
+    },
+    Cmux {
+        bin: PathBuf,
+        workspace: Option<String>,
+    },
+    Rex {
+        bin: PathBuf,
+        host: Option<String>,
+        session: Option<String>,
+    },
+}
+
+impl Aim {
+    /// One line for `sonny where`: the multiplexer and the home in it.
+    pub fn said(&self, project: &str) -> String {
+        let own = |home: &str| format!("{project}'s own {home}, found or made at the first call");
+        match self {
+            Self::Herdr { workspace, .. } => match workspace {
+                Some(workspace) => format!("Herdr, workspace {workspace}"),
+                None => format!("Herdr, {}", own("workspace")),
+            },
+            Self::Cmux { workspace, .. } => match workspace {
+                Some(workspace) => format!("cmux, workspace {workspace}"),
+                None => format!("cmux, {}", own("workspace")),
+            },
+            Self::Rex { host, session, .. } => {
+                let home = match session {
+                    Some(session) => format!("Rex, session {session}"),
+                    None => format!("Rex, {}", own("session")),
+                };
+                match host {
+                    Some(host) => format!("{home}, on {host}"),
+                    None => home,
+                }
+            }
+        }
+    }
+}
+
+/// Where an agent's call acts, from the tool host answering it, whose
+/// multiplexer variables would name the terminal Sonny started it in:
+/// where the project's Sonny window the person used last is, in that
 /// multiplexer; when that window is open in a terminal in none, nowhere,
 /// since another terminal is not where they look. Without a window, in
 /// Herdr or cmux when the project's lead is in a Herdr pane or a cmux tab,
-/// else in the multiplexer project `like`'s home is in, made when needed.
-/// With none of these, the lead is in no multiplexer, and neither is
-/// anything it would see.
-pub fn for_agent(
+/// else in the multiplexer project `like`'s home is in. With none of
+/// these, the lead is in no multiplexer, and neither is anything it would
+/// see. Reads the project's places file, and asks a multiplexer only when
+/// no window of the project's is known.
+pub fn aim(
     socket: &Path,
     project: &str,
     chain: &[String],
     like: Option<&str>,
-) -> Result<Layout, String> {
-    let kept = match latest_for(socket, project, chain) {
+) -> Result<Aim, String> {
+    let like = like
+        .and_then(|like| latest(socket, like))
+        .and_then(|(window, _)| window.place);
+    let found = Found {
+        herdr: crate::herdr::find(),
+        cmux: crate::cmux::find(),
+        rex: crate::rex::find(),
+    };
+    let has_lead = |kind: Kind| match kind {
+        Kind::Herdr(bin) => crate::herdr::has_lead(&bin, project),
+        Kind::Cmux(bin) => crate::cmux::has_lead(&bin, project),
+        Kind::Rex(_) => false,
+    };
+    aimed(
+        project,
+        latest_for(socket, project, chain),
+        like,
+        found,
+        has_lead,
+    )
+}
+
+/// The multiplexers' CLIs this machine has.
+struct Found {
+    herdr: Option<PathBuf>,
+    cmux: Option<PathBuf>,
+    rex: Option<PathBuf>,
+}
+
+/// [`aim`], from the window the agent acts in, if any, and whether it is
+/// open; where project `like`'s home is; and which of the multiplexers
+/// this machine has hold the project's lead, asked only when no window
+/// says.
+fn aimed(
+    project: &str,
+    window: Option<(Window, bool)>,
+    like: Option<Place>,
+    found: Found,
+    has_lead: impl Fn(Kind) -> bool,
+) -> Result<Aim, String> {
+    let kept = match window {
         Some((Window { place: None, .. }, true)) => {
             return Err(format!(
                 "{project}'s Sonny was used last in a terminal outside Rex, Herdr and cmux, \
@@ -1377,44 +1466,42 @@ pub fn for_agent(
         Some((window, _)) => window.place,
         None => None,
     };
-    let like = like
-        .and_then(|like| latest(socket, like))
-        .and_then(|(window, _)| window.place);
-    let herdr = crate::herdr::find();
-    let cmux = crate::cmux::find();
-    let rex = crate::rex::find();
-    let backend: Box<dyn Backend> = match (kept, herdr, cmux, rex) {
-        (Some(Place::Herdr { workspace }), Some(herdr), _, _) => Box::new(
-            crate::herdr::Herdr::open(herdr, project, None, Some(&workspace))?,
-        ),
-        (Some(Place::Cmux { workspace }), _, Some(cmux), _) => Box::new(crate::cmux::Cmux::open(
-            cmux,
-            project,
-            None,
-            Some(&workspace),
-        )?),
-        (Some(Place::Rex { session, host }), _, _, Some(rex)) => Box::new(crate::rex::Rex::open(
-            rex,
-            host.as_deref(),
-            project,
-            false,
-            Some(&session),
-        )?),
-        (_, Some(herdr), _, _)
-            if crate::herdr::has_lead(&herdr, project)
-                || matches!(like, Some(Place::Herdr { .. })) =>
+    let Found { herdr, cmux, rex } = found;
+    Ok(match (kept, herdr, cmux, rex) {
+        (Some(Place::Herdr { workspace }), Some(bin), _, _) => Aim::Herdr {
+            bin,
+            workspace: Some(workspace),
+        },
+        (Some(Place::Cmux { workspace }), _, Some(bin), _) => Aim::Cmux {
+            bin,
+            workspace: Some(workspace),
+        },
+        (Some(Place::Rex { session, host }), _, _, Some(bin)) => Aim::Rex {
+            bin,
+            host,
+            session: Some(session),
+        },
+        (_, Some(bin), _, _)
+            if matches!(like, Some(Place::Herdr { .. })) || has_lead(Kind::Herdr(bin.clone())) =>
         {
-            Box::new(crate::herdr::Herdr::open(herdr, project, None, None)?)
+            Aim::Herdr {
+                bin,
+                workspace: None,
+            }
         }
-        (_, _, Some(cmux), _)
-            if crate::cmux::has_lead(&cmux, project)
-                || matches!(like, Some(Place::Cmux { .. })) =>
+        (_, _, Some(bin), _)
+            if matches!(like, Some(Place::Cmux { .. })) || has_lead(Kind::Cmux(bin.clone())) =>
         {
-            Box::new(crate::cmux::Cmux::open(cmux, project, None, None)?)
+            Aim::Cmux {
+                bin,
+                workspace: None,
+            }
         }
-        (_, _, _, Some(rex)) if let Some(Place::Rex { host, .. }) = &like => Box::new(
-            crate::rex::Rex::open(rex, host.as_deref(), project, false, None)?,
-        ),
+        (_, _, _, Some(bin)) if let Some(Place::Rex { host, .. }) = like => Aim::Rex {
+            bin,
+            host,
+            session: None,
+        },
         // A home no one watches would hide what it runs: the person
         // reads this project's work in its lead's Sonny instead.
         _ => {
@@ -1422,42 +1509,91 @@ pub fn for_agent(
                 "{project}'s lead is not in Rex, Herdr or cmux, so nothing opened there would be seen"
             ));
         }
+    })
+}
+
+/// The project's home for an agent's call, where [`aim`] says, made when
+/// needed.
+pub fn for_agent(
+    socket: &Path,
+    project: &str,
+    chain: &[String],
+    like: Option<&str>,
+) -> Result<Layout, String> {
+    let backend: Box<dyn Backend> = match aim(socket, project, chain, like)? {
+        Aim::Herdr { bin, workspace } => Box::new(crate::herdr::Herdr::open(
+            bin,
+            project,
+            None,
+            workspace.as_deref(),
+        )?),
+        Aim::Cmux { bin, workspace } => Box::new(crate::cmux::Cmux::open(
+            bin,
+            project,
+            None,
+            workspace.as_deref(),
+        )?),
+        Aim::Rex { bin, host, session } => Box::new(crate::rex::Rex::open(
+            bin,
+            host.as_deref(),
+            project,
+            false,
+            session.as_deref(),
+        )?),
     };
     Ok(Layout::new(backend))
 }
 
 /// The skills that let any agent run long work where the person can see
-/// it, for the multiplexer this terminal is in (the others' taken out, so
-/// agents read one), and show the person pictures. Each names this
-/// machine's multiplexer CLI.
-pub fn install_skill(host: Option<&str>) {
+/// it, one for each multiplexer this machine has (one it no longer has
+/// goes), and show the person pictures. Each names its multiplexer's CLI
+/// and sends the agent to `sonny where` first: windows of one project in
+/// two multiplexers are each where their agents' work goes, so no one
+/// multiplexer is every agent's.
+pub fn install_skill() {
     crate::skills::install("pictures", include_str!("../skills/pictures/SKILL.md"));
-    let quoted = |path: &Path| format!("\"{}\"", path.to_string_lossy());
-    let skill =
-        |name, text: &str, bin: &str, path: PathBuf| (name, text.replace(bin, &quoted(&path)));
-    let rex = |bin| {
-        let text = include_str!("../skills/rex-windows/SKILL.md");
-        skill("rex-windows", text, "REX_BIN", bin)
+    let found = Found {
+        herdr: crate::herdr::find(),
+        cmux: crate::cmux::find(),
+        rex: crate::rex::find(),
     };
-    let (name, text) = match current(host) {
-        Some(Kind::Herdr(bin)) => {
-            let text = include_str!("../skills/herdr-panes/SKILL.md");
-            skill("herdr-panes", text, "HERDR_BIN", bin)
-        }
-        Some(Kind::Cmux(bin)) => {
-            let text = include_str!("../skills/cmux-tabs/SKILL.md");
-            skill("cmux-tabs", text, "CMUX_BIN", bin)
-        }
-        Some(Kind::Rex(bin)) => rex(bin),
-        // Out of every multiplexer, none is installed: nothing opened in
-        // one would be seen. One installed stays, for another project's
-        // Sonny still in its multiplexer.
-        None => return,
-    };
-    crate::skills::install(name, &text);
-    for other in ["rex-windows", "herdr-panes", "cmux-tabs"] {
-        if other != name {
-            crate::skills::remove(other);
+    multiplexer_skills(found, crate::skills::install, crate::skills::remove);
+}
+
+/// Each multiplexer's skill installed, naming its CLI, when this machine
+/// has it, and removed when not.
+fn multiplexer_skills<T>(
+    found: Found,
+    mut install: impl FnMut(&str, &str) -> T,
+    mut remove: impl FnMut(&str),
+) {
+    let skills = [
+        (
+            "rex-windows",
+            include_str!("../skills/rex-windows/SKILL.md"),
+            "REX_BIN",
+            found.rex,
+        ),
+        (
+            "herdr-panes",
+            include_str!("../skills/herdr-panes/SKILL.md"),
+            "HERDR_BIN",
+            found.herdr,
+        ),
+        (
+            "cmux-tabs",
+            include_str!("../skills/cmux-tabs/SKILL.md"),
+            "CMUX_BIN",
+            found.cmux,
+        ),
+    ];
+    for (name, text, placeholder, bin) in skills {
+        match bin {
+            Some(bin) => {
+                let quoted = format!("\"{}\"", bin.to_string_lossy());
+                install(name, &text.replace(placeholder, &quoted));
+            }
+            None => remove(name),
         }
     }
 }
@@ -2241,6 +2377,113 @@ mod tests {
             Some(2)
         );
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// One agent shown in a Herdr window and a cmux window: its calls, and
+    /// `sonny where`, go to the one the person used last, and follow them
+    /// when they switch; every multiplexer this machine has keeps its
+    /// skill, whichever window started last.
+    #[test]
+    fn an_agent_in_herdr_and_cmux_acts_in_the_one_used_last() {
+        let file = std::env::temp_dir().join(format!("sonny-two-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let herdr = Window {
+            pid: 1,
+            bot: "shop.lead".into(),
+            used_ms: 100,
+            place: Some(Place::Herdr {
+                workspace: "w1".into(),
+            }),
+        };
+        let cmux = Window {
+            pid: 2,
+            bot: "shop.lead".into(),
+            used_ms: 200,
+            place: Some(Place::Cmux {
+                workspace: "workspace:3".into(),
+            }),
+        };
+        mark_in(&file, herdr.clone(), |_| true);
+        mark_in(&file, cmux.clone(), |_| true);
+        let found = || Found {
+            herdr: Some("/bin/herdr".into()),
+            cmux: Some("/bin/cmux".into()),
+            rex: Some("/bin/rex".into()),
+        };
+        let asked = |_: Kind| panic!("a window says where; no multiplexer is asked");
+        let task = ["shop.fix".to_owned(), "shop.lead".to_owned()];
+        let aim = |file: &Path| {
+            let window = latest_for_in(file, &task, |_| true);
+            aimed("shop", window, None, found(), asked).unwrap()
+        };
+        let in_cmux = aim(&file);
+        assert_eq!(
+            in_cmux,
+            Aim::Cmux {
+                bin: "/bin/cmux".into(),
+                workspace: Some("workspace:3".into()),
+            }
+        );
+        assert_eq!(in_cmux.said("shop"), "cmux, workspace workspace:3");
+        // Back in Herdr: the next call goes there.
+        mark_in(
+            &file,
+            Window {
+                used_ms: 300,
+                ..herdr
+            },
+            |_| true,
+        );
+        assert_eq!(aim(&file).said("shop"), "Herdr, workspace w1");
+        let mut skills = Vec::new();
+        multiplexer_skills(
+            found(),
+            |name, text| skills.push((name.to_owned(), text.contains("sonny where"))),
+            |name| panic!("{name} is on this machine"),
+        );
+        let installed = [
+            ("rex-windows".to_owned(), true),
+            ("herdr-panes".to_owned(), true),
+            ("cmux-tabs".to_owned(), true),
+        ];
+        assert_eq!(skills, installed);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// With no window to go by, an agent's calls go where the project's
+    /// lead is, asking only the multiplexers this machine has; a window
+    /// open outside every multiplexer, or a lead in none, is nowhere.
+    #[test]
+    fn an_agent_with_no_window_acts_where_its_lead_is_or_nowhere() {
+        let found = |cmux: bool| Found {
+            herdr: Some("/bin/herdr".into()),
+            cmux: cmux.then(|| "/bin/cmux".into()),
+            rex: None,
+        };
+        let in_cmux = |kind: Kind| matches!(kind, Kind::Cmux(_));
+        let aim = aimed("shop", None, None, found(true), in_cmux).unwrap();
+        assert_eq!(
+            aim.said("shop"),
+            "cmux, shop's own workspace, found or made at the first call"
+        );
+        let nowhere = aimed("shop", None, None, found(false), in_cmux).unwrap_err();
+        assert!(nowhere.contains("not in Rex, Herdr or cmux"), "{nowhere}");
+        let bare = Window {
+            pid: 1,
+            bot: "shop.lead".into(),
+            used_ms: 1,
+            place: None,
+        };
+        let outside = aimed("shop", Some((bare, true)), None, found(true), in_cmux).unwrap_err();
+        assert!(outside.contains("outside Rex, Herdr and cmux"), "{outside}");
+        // A multiplexer this machine no longer has loses its skill.
+        let mut removed = Vec::new();
+        multiplexer_skills(
+            found(false),
+            |_, _| (),
+            |name| removed.push(name.to_owned()),
+        );
+        assert_eq!(removed, ["rex-windows", "cmux-tabs"]);
     }
 
     /// A task's window, opened in the lead's home, takes that home as its
