@@ -398,6 +398,8 @@ pub fn clean(reply: &str) -> Option<String> {
         || ["stay silent", "stays silent", "staying silent"].iter().any(|s| lower.contains(s))
         || lower.trim_matches(|c: char| !c.is_alphanumeric()) == "silence"
         || wrapped(text)
+        // A command's slash with nothing after it, as `/ copy`.
+        || text.starts_with('/') && text[1..].starts_with(char::is_whitespace)
         || ["api error:", "prompt is too long", "request timed out", "invalid api key"]
             .iter()
             .any(|s| lower.starts_with(s))
@@ -590,6 +592,7 @@ mod tests {
             "continue with the remaining eleven steps of the plan as we discussed earlier",
             "tests",
             "API error: overloaded",
+            "/ copy",
         ] {
             assert_eq!(clean(said), None, "{said}");
         }
