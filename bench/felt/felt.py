@@ -140,7 +140,14 @@ class Window:
         try:
             os.kill(self.pid, signal.SIGTERM)
         except ProcessLookupError:
-            pass
+            return
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if os.waitpid(self.pid, os.WNOHANG)[0]:
+                return
+            time.sleep(.05)
+        os.kill(self.pid, signal.SIGKILL)
+        os.waitpid(self.pid, 0)
 
 
 def main():
@@ -252,52 +259,57 @@ def run(args, out, logs, home, ws, store, sock, env):
                     break
                 time.sleep(.1)
 
-    for phase in args.phases.split(','):
-        started = time.time()
-        stop.clear()
-        worker = None
-        if phase == 'busy':
-            worker = threading.Thread(target=busy_loop, args=(['ws.lead'], ['stream:40:25', 'shell:true']))
-        elif phase == 'fleet':
-            worker = threading.Thread(target=busy_loop, args=(
-                [f'fleet.t{t}' for t in range(args.tasks)], ['stream:20:50']))
-        elif phase == 'source':
-            # A scripted source, as a poller is written: print what is new,
-            # exit. The lookout reads its settings every 15 s.
-            (home / '.agent' / 'config.toml').write_text(
-                '[sonny.sources.ticker]\n'
-                'command = "date +\'{\\"id\\":\\"%s\\",\\"text\\":\\"tick %s\\"}\'"\n'
-                'every = "10s"\n')
-            folder = Path(str(store) + '.lookout')
-            folder.mkdir(exist_ok=True)
-            (folder / 'ws.lead.json').write_text(json.dumps(
-                {'subscriptions': [{'name': 'tick', 'sources': ['ticker']}]}))
-            time.sleep(16)
-        if worker:
-            worker.start()
-        time.sleep(3)  # the phase's load under way before counting
-        started = time.time()
-        pids = [int(p.stem) for p in logs.glob('*.log')]
-        before = cpu_rss(pids)
-        time.sleep(args.seconds)
-        pids = [int(p.stem) for p in logs.glob('*.log')]
-        after = cpu_rss(pids)
-        ended = time.time()
-        # Key to echo under the same load, after the counted window: typing
-        # notes the window as used, which writes, and is not idle cost.
-        echo = window.probe()
-        stop.set()
-        if worker:
-            worker.join(30)
-        phases.append({'phase': phase, 'from_ms': int(started * 1000), 'to_ms': int(ended * 1000),
-                       'cpu': {pid: round(after[pid][0] - before.get(pid, (0, 0))[0], 3)
-                               for pid in after},
-                       'cpu_before': {pid: before[pid][0] for pid in before},
-                       'rss_mib': {pid: round(after[pid][1], 1) for pid in after},
-                       'echo_ms': echo})
-        time.sleep(3)  # let the last turn's echoes settle between phases
+    # A failed or interrupted run still stops its load and closes the
+    # window, so nothing keeps running into the next measurement.
+    try:
+        for phase in args.phases.split(','):
+            started = time.time()
+            stop.clear()
+            worker = None
+            if phase == 'busy':
+                worker = threading.Thread(daemon=True, target=busy_loop, args=(['ws.lead'], ['stream:40:25', 'shell:true']))
+            elif phase == 'fleet':
+                worker = threading.Thread(daemon=True, target=busy_loop, args=(
+                    [f'fleet.t{t}' for t in range(args.tasks)], ['stream:20:50']))
+            elif phase == 'source':
+                # A scripted source, as a poller is written: print what is new,
+                # exit. The lookout reads its settings every 15 s.
+                (home / '.agent' / 'config.toml').write_text(
+                    '[sonny.sources.ticker]\n'
+                    'command = "date +\'{\\"id\\":\\"%s\\",\\"text\\":\\"tick %s\\"}\'"\n'
+                    'every = "10s"\n')
+                folder = Path(str(store) + '.lookout')
+                folder.mkdir(exist_ok=True)
+                (folder / 'ws.lead.json').write_text(json.dumps(
+                    {'subscriptions': [{'name': 'tick', 'sources': ['ticker']}]}))
+                time.sleep(16)
+            if worker:
+                worker.start()
+            time.sleep(3)  # the phase's load under way before counting
+            started = time.time()
+            pids = [int(p.stem) for p in logs.glob('*.log')]
+            before = cpu_rss(pids)
+            time.sleep(args.seconds)
+            pids = [int(p.stem) for p in logs.glob('*.log')]
+            after = cpu_rss(pids)
+            ended = time.time()
+            # Key to echo under the same load, after the counted window: typing
+            # notes the window as used, which writes, and is not idle cost.
+            echo = window.probe()
+            stop.set()
+            if worker:
+                worker.join(30)
+            phases.append({'phase': phase, 'from_ms': int(started * 1000), 'to_ms': int(ended * 1000),
+                           'cpu': {pid: round(after[pid][0] - before.get(pid, (0, 0))[0], 3)
+                                   for pid in after},
+                           'cpu_before': {pid: before[pid][0] for pid in before},
+                           'rss_mib': {pid: round(after[pid][1], 1) for pid in after},
+                           'echo_ms': echo})
+            time.sleep(3)  # let the last turn's echoes settle between phases
 
-    window.close()
+    finally:
+        stop.set()
+        window.close()
     (out / 'phases.json').write_text(json.dumps(phases, indent=1))
 
 
