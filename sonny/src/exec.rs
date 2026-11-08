@@ -56,9 +56,15 @@ const OUTPUT_BYTES: usize = 1 << 20;
 /// the results held outside its memory cap are at most these many of
 /// `RESULT_BYTES`.
 const CALLS: usize = 8;
-/// The bytes of tool declarations the description holds, about 3,000
-/// tokens as Pi's code mode allows; the rest are found from the script.
+/// The bytes of servers' own words and tool declarations the description
+/// holds, about 3,000 tokens as Pi's code mode allows; the rest are found
+/// from the script. Bounded whole, since the daemon caps an agent's
+/// declared tools and a description past it leaves the agent without them.
 const DECLARATIONS: usize = 12_000;
+
+/// The most of one server's own words the description holds, so one
+/// server's long instructions leave room for the others'.
+const ABOUT: usize = 1_500;
 
 const DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose MCP tool calls
 - Evaluates the provided JavaScript code in a fresh QuickJS context as the body of an async function, so `await` works at the top level.
@@ -215,8 +221,12 @@ fn declare(
             .as_deref()
             .or(known.instructions.as_deref())
         {
-            section.push('\n');
-            section.push_str(about.trim());
+            let about = cut(about.trim(), ABOUT.min(*left));
+            *left -= about.len();
+            if !about.is_empty() {
+                section.push('\n');
+                section.push_str(&about);
+            }
         }
         if known.tools.is_empty() {
             section.push_str("\nIts tools are listed in `ALL_TOOLS` once it starts.");
@@ -237,6 +247,25 @@ fn declare(
         }
     }
     collided.into_values().collect()
+}
+
+/// `text` within `most` bytes: whole, or cut at a character and marked so.
+fn cut(text: &str, most: usize) -> String {
+    const MARK: &str = " …";
+    if text.len() <= most {
+        return text.to_owned();
+    }
+    let Some(room) = most.checked_sub(MARK.len()) else {
+        return String::new();
+    };
+    let end = (0..=room)
+        .rev()
+        .find(|&n| text.is_char_boundary(n))
+        .unwrap_or(0);
+    match end {
+        0 => String::new(),
+        _ => format!("{}{MARK}", text[..end].trim_end()),
+    }
 }
 
 /// The identifiers two or more tools of `listings` would share, each with
@@ -2080,6 +2109,59 @@ mod tests {
         // A server not listed yet is still named.
         let unlisted: BTreeMap<String, Known> = [("test".to_owned(), Known::default())].into();
         assert!(description(&servers, &unlisted, &[]).contains("once it starts"));
+    }
+
+    #[test]
+    fn long_server_instructions_stay_within_the_description_budget() {
+        // Five servers of a linked machine, each with long instructions
+        // and many tools: the description stays bounded however much they
+        // say, so the agent's tools fit under the daemon's cap.
+        let tool = |n: usize| {
+            json!({"name": format!("tool{n}"), "description": "x".repeat(300),
+            "inputSchema": {"type": "object"}})
+        };
+        let servers: BTreeMap<String, crate::link::Lent> = (0..5)
+            .map(|n| {
+                let lent = crate::link::Lent {
+                    description: Some(format!("Server {n}. {}", "y".repeat(8_000))),
+                    tools: (0..15).map(tool).collect(),
+                };
+                (format!("server{n}"), lent)
+            })
+            .collect();
+        let machine = crate::link::Machine {
+            name: "mac".into(),
+            servers,
+            ..Default::default()
+        };
+        let own: Servers = [(
+            "notes".to_owned(),
+            McpServer {
+                description: Some("é".repeat(5_000)),
+                ..McpServer::default()
+            },
+        )]
+        .into();
+        let known: BTreeMap<String, Known> = [("notes".to_owned(), Known::default())].into();
+        let text = description(&own, &known, std::slice::from_ref(&machine));
+        let fixed = DESCRIPTION.len() + TYPES.len();
+        // Headers and the machine's own paragraph are small and fixed.
+        assert!(text.len() <= fixed + DECLARATIONS + 2_000, "{}", text.len());
+        // Every server is still named, its words cut and marked so.
+        for n in 0..5 {
+            assert!(text.contains(&format!("## server{n}")), "server{n}");
+        }
+        assert!(text.contains("## notes\n"));
+        assert!(text.contains(" …"));
+        assert!(text.contains("more tools are in `ALL_TOOLS`."));
+    }
+
+    #[test]
+    fn cut_keeps_whole_characters() {
+        assert_eq!(cut("short", 10), "short");
+        assert_eq!(cut("ééééé", 6), "é …");
+        assert_eq!(cut("abc", 2), "");
+        assert_eq!(cut("anything", 0), "");
     }
 
     fn scratch(name: &str) -> PathBuf {

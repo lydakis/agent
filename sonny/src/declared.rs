@@ -137,8 +137,35 @@ pub fn declare(record: &Value, role: Role) -> Option<Value> {
     // Any of Sonny's there gives way to these: a lead's only on a lead.
     declared.retain(|other| !sonnys(other));
     declared.extend(ours);
-    let bytes = serde_json::to_vec(&declared).map_or(usize::MAX, |json| json.len());
-    (declared.len() <= MAX_DECLARED && bytes <= DECLARED_BYTES).then_some(Value::Array(declared))
+    fits(&declared).then_some(Value::Array(declared))
+}
+
+/// Whether `declared` is within what the daemon takes of a bot's tools.
+fn fits(declared: &[Value]) -> bool {
+    let bytes = serde_json::to_vec(declared).map_or(usize::MAX, |json| json.len());
+    declared.len() <= MAX_DECLARED && bytes <= DECLARED_BYTES
+}
+
+/// Why the bot `record` describes cannot take this build's tools in its
+/// role: its own beside Sonny's are past what the daemon takes. `None`
+/// when they fit.
+pub fn too_many(record: &Value, role: Role) -> Option<String> {
+    let names = tools(Role::ALL);
+    let mut declared: Vec<Value> = (record["declared"].as_array().cloned().unwrap_or_default())
+        .into_iter()
+        .filter(|other| {
+            other["answered_by"] != crate::served::TAG
+                && !names.iter().any(|tool| tool["name"] == other["name"])
+        })
+        .collect();
+    declared.extend(tools(role));
+    let bytes = serde_json::to_vec(&declared).map_or(0, |json| json.len());
+    (!fits(&declared)).then(|| {
+        format!(
+            "{} tools of {bytes} bytes, past the {MAX_DECLARED} tools and {DECLARED_BYTES} bytes an agent takes",
+            declared.len()
+        )
+    })
 }
 
 /// The `configure` fields that bring a bot Sonny declared on before up
@@ -163,10 +190,19 @@ pub fn refresh(record: &Value) -> Option<Map<String, Value>> {
     {
         return None;
     }
-    let lead = declared
+    fields(record, declared_role(declared))
+}
+
+/// The role of a bot Sonny declared `declared` on: a lead by the tool only
+/// a lead has; any other, a task's.
+pub fn declared_role(declared: &[Value]) -> Role {
+    match declared
         .iter()
-        .any(|tool| tool["name"] == crate::served::PROJECT);
-    fields(record, if lead { Role::LEAD } else { Role::TASK })
+        .any(|tool| tool["name"] == crate::served::PROJECT)
+    {
+        true => Role::LEAD,
+        false => Role::TASK,
+    }
 }
 
 /// The `configure` fields that give Sonny's tools, a task's, to the bot
@@ -215,6 +251,26 @@ mod tests {
     }
     fn a_helper() -> Role {
         Role::TASK
+    }
+
+    #[test]
+    fn tools_past_the_daemon_s_cap_are_said_not_skipped() {
+        let own = |bytes: usize| {
+            json!({"name": "notes", "description": "d".repeat(bytes),
+                "parameters": {"type": "object"}, "result": "ok"})
+        };
+        let small = json!({"declared": [own(10)]});
+        assert!(declare(&small, a_lead()).is_some());
+        assert_eq!(too_many(&small, a_lead()), None);
+        let large = json!({"declared": [own(DECLARED_BYTES)]});
+        assert_eq!(declare(&large, a_lead()), None);
+        let why = too_many(&large, a_lead()).unwrap();
+        assert!(why.contains("bytes an agent takes"), "{why}");
+        assert_eq!(
+            declared_role(&[json!({"name": crate::served::PROJECT})]),
+            a_lead()
+        );
+        assert_eq!(declared_role(&[]), a_task());
     }
 
     #[test]

@@ -2352,6 +2352,13 @@ async fn run() -> Result<(), String> {
             None => declared::role(&bot),
         };
         app.declare = declared::declare(&bot, app.role);
+        // Opened all the same, without the tools that do not fit, and said.
+        if app.declare.is_none()
+            && let Some(why) = declared::too_many(&bot, app.role)
+        {
+            app.warnings
+                .push(format!("this agent keeps the tools it had: {why}"));
+        }
     }
     app.sounds = sound::Sounds::new(options.sound);
     let (settings, unread) = settings::Settings::load_said();

@@ -199,6 +199,16 @@ async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
             record["name"] = bot["name"].clone();
             record["bot_id"] = bot["bot_id"].clone();
             let Some(fields) = crate::declared::refresh(&record) else {
+                // Said, not skipped in silence: the agent goes on without
+                // the tools added since.
+                let declared = record["declared"].as_array().cloned().unwrap_or_default();
+                let role = crate::declared::declared_role(&declared);
+                if let Some(why) = crate::declared::too_many(&record, role) {
+                    println!(
+                        "{}",
+                        json!({"event": "tools_refresh_failed", "bot": bot["name"], "error": "tools_too_large", "why": why})
+                    );
+                }
                 continue;
             };
             match client.request("configure", Value::Object(fields)).await {
