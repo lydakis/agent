@@ -7614,8 +7614,11 @@ by bisecting ids and the table needs no index but its own.
 
 The row's own cost, measured on its statements alone (the insert and the
 update a call makes, 20,000 calls a round inside one transaction, release
-build, 4-core Linux cloud container, a file store in WAL): 2.7 to 3.5 µs a
-call, 5.2 µs in the round where the WAL grew. The store grew about 200
+build, 4-core Linux cloud container, a file store in WAL): 3.0 to 3.2 µs a
+call, up to 5.2 µs in a round where the WAL grew. Ids are `AUTOINCREMENT`, so
+a call still running when the trail is trimmed never finishes another's row;
+that bookkeeping row did not move the cost past the runs without it (2.7 to
+5.2 µs). The store grew about 200
 bytes a row for a shell call of an 85-character command.
 
 A page of 100 rows with 60,000 in the trail reads in about 0.5 ms whether it

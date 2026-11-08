@@ -17633,3 +17633,26 @@ fn schema_84_starts_the_trail_empty() {
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn a_trim_under_a_running_call_never_hands_its_row_to_another() {
+    let mut db = db();
+    let turn = tooled_turn(&mut db);
+    let (first, second) = (read_call("r1"), read_call("r2"));
+    db.append(turn, vec![], &[first.clone(), second.clone()], None)
+        .unwrap();
+    db.tool_start(turn, &first, false, false).unwrap();
+    // The whole trail goes while the first call runs; the next call's row
+    // takes a new id, so the first one's end changes nothing of it.
+    let bound = db.audit_bound(None, Some(i64::MAX)).unwrap();
+    assert_eq!(db.audit_trim(bound).unwrap(), 1);
+    db.tool_start(turn, &second, false, false).unwrap();
+    db.tool_finish(turn, "r1", &result("ok")).unwrap();
+    let rows = trail(&db);
+    assert_eq!(
+        rows.iter()
+            .map(|r| json!([r["call_id"], r["outcome"]]))
+            .collect::<Vec<_>>(),
+        [json!(["r2", "unknown"])]
+    );
+}

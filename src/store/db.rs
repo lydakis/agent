@@ -2555,7 +2555,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 status TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0, ruling TEXT, audit INTEGER,
                 PRIMARY KEY(turn,call_id));
-            CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL,
+            CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, at_ms INTEGER NOT NULL,
                 bot_id INTEGER NOT NULL, bot TEXT NOT NULL, turn INTEGER NOT NULL, call_id TEXT NOT NULL,
                 step TEXT, tool TEXT NOT NULL, kind TEXT, place TEXT, approved TEXT NOT NULL,
                 access TEXT NOT NULL, ms INTEGER, outcome TEXT NOT NULL, preview TEXT NOT NULL);

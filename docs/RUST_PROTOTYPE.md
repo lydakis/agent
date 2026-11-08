@@ -3320,7 +3320,7 @@ sees and only that; nothing is guessed. A row holds:
 
 | Field | What it is |
 |---|---|
-| `id`, `at_ms` | Its place in the trail, and when it was written; times rise with ids |
+| `id`, `at_ms` | Its place in the trail, never reused even after a trim, and when it was written; times rise with ids |
 | `bot_id`, `bot`, `turn`, `call_id`, `step` | Whose call it was (`step` set for a step, as the client named it) |
 | `tool` | The tool's name, or a step's |
 | `kind` | `shell`, `file`, `mcp`, `browser`, `desktop`, `agents` or `web`; for a declared tool, what its client declared, else `null` |
