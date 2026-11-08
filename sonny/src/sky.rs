@@ -7902,6 +7902,38 @@ mod scale {
         }
     }
 
+    /// The sky opened on a running daemon: `SKY_SOCKET=... cargo test -p
+    /// sonny --release open_on_a_daemon -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn open_on_a_daemon() {
+        let socket = PathBuf::from(std::env::var("SKY_SOCKET").unwrap());
+        let base = rss_kib();
+        let start = Instant::now();
+        let mut view = View::open(socket.clone(), PathBuf::new());
+        let mut most = 0;
+        while view.opening() && start.elapsed() < Duration::from_secs(600) {
+            most = most.max(view.feed.len());
+            view.drain();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        eprintln!(
+            "open: {} agents drawn at {:?}; feed peak {most}; rss +{} KiB",
+            view.agents.len(),
+            start.elapsed(),
+            rss_kib().saturating_sub(base)
+        );
+        let start = Instant::now();
+        view.replay(Some(wall_ms() - 3_600_000));
+        while !view.replay.as_ref().is_some_and(|r| r.ready)
+            && start.elapsed() < Duration::from_secs(600)
+        {
+            view.drain();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        eprintln!("replay of the last hour ready in {:?}", start.elapsed());
+    }
+
     /// Resident memory now, in KiB, what was freed given back first so
     /// this counts what is held; none where it can't be read.
     #[cfg(target_os = "linux")]

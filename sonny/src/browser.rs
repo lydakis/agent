@@ -1238,6 +1238,10 @@ async fn run(session: &str, args: &[String], launch: &Launch) -> Ran {
         Some(profile) => command.env("AGENT_BROWSER_PROFILE", profile),
         None => &mut command,
     };
+    // A place among the processes Sonny runs for agents, as a tool call's
+    // `sonny tool` takes one, held while agent-browser runs: an agent's
+    // own share, its calls one at a time already.
+    let _place = crate::budget::processes().admit(session).await;
     match command.output().await {
         Ok(out) => {
             let (stdout, stderr) = (

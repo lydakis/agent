@@ -24217,4 +24217,25 @@ mod tests {
             }
         }
     }
+
+    /// A `/status` refresh against a running daemon, cold then warm:
+    /// `STATUS_SOCKET=… STATUS_LEAD=p0.lead cargo test -p sonny --release
+    /// status_refresh_against_a_daemon -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn status_refresh_against_a_daemon() {
+        let socket = std::env::var("STATUS_SOCKET").expect("STATUS_SOCKET");
+        let (client, _events) = Client::connect(Path::new(&socket)).await.unwrap();
+        let mut app = app(client);
+        app.bot = std::env::var("STATUS_LEAD").expect("STATUS_LEAD");
+        for refresh in 0..4 {
+            let start = std::time::Instant::now();
+            let (_, rows) = app.status_rows().await.unwrap();
+            eprintln!(
+                "STATUS refresh {refresh}: {} rows in {:?}",
+                rows.len(),
+                start.elapsed()
+            );
+        }
+    }
 }
