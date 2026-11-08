@@ -384,10 +384,9 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
     }
     // As long as the config says, or the daemon's own when it says none.
     let hold = given.config.hold_ms.unwrap_or(agent_client::HOLD_MS);
-    if record["settings"]["hold_ms"]
-        .as_u64()
-        .is_some_and(|ms| ms != hold)
-    {
+    // None is the daemon's own: a reset kept for the turn's end, say.
+    let held = record["settings"]["hold_ms"].as_u64();
+    if held.unwrap_or(agent_client::HOLD_MS) != hold {
         settings.insert("hold_ms".into(), json!(given.config.hold_ms));
     }
     // A trigger's shadow copy keeps the rules it was made with: the
@@ -426,6 +425,8 @@ fn taken(record: &Value, pending: &serde_json::Map<String, Value>) -> Value {
                     taken["model"] = json!(model);
                 }
             }
+            // What `configure` declares, `inspect` reads as declared.
+            ("declare", _) => taken["declared"] = value.clone(),
             _ => taken[key] = value.clone(),
         }
     }
@@ -492,6 +493,16 @@ mod tests {
             .insert("anthropic/claude".into(), "anthropic/other".into());
         config.hide_senders = true;
         assert_eq!(configured(&busy, &given(&config)), None);
+        // A hold reset kept for the turn's end, and then a hold of its own
+        // in the file: the file's goes over the reset.
+        let mut held = agent(json!("anthropic/other"), true);
+        held["settings"]["hold_ms"] = json!(agent_client::HOLD_MS);
+        held["configure_pending"] = json!({"settings": {"hold_ms": null}});
+        config.hold_ms = Some(5);
+        assert_eq!(
+            configured(&held, &given(&config)).map(Value::Object),
+            Some(json!({"settings": {"hold_ms": 5}}))
+        );
         let config = agent_client::config::Config::default();
         // Another client's bot is its own.
         let mut other = agent(json!("x/y"), true);

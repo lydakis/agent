@@ -852,7 +852,13 @@ pub fn regate(
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect();
-    let fields = gate(mode, &gateable(&tools, &record["declared"]));
+    // The tools a change the daemon keeps for the turn's end declares are
+    // the ones the gate meets once it is taken.
+    let declared = match &record["configure_pending"]["declare"] {
+        Value::Null => &record["declared"],
+        kept => kept,
+    };
+    let fields = gate(mode, &gateable(&tools, declared));
     let wanted = match fields.get("approver") {
         Some(tag) => vec![json!({"tag": tag, "tools": fields["approve"]})],
         None => Vec::new(),
@@ -955,6 +961,35 @@ mod tests {
                 &mut Sandboxes::default()
             )
             .is_some()
+        );
+        // A gate goes over the tools the kept change declares, not those
+        // it takes away: `exec` gone with the last MCP server, say.
+        let mut served = kept.clone();
+        served["declared"] = json!([{"name": "exec", "answered_by": crate::served::TAG}]);
+        assert!(
+            regate(
+                &served,
+                "auto",
+                "stated.fix.check",
+                &mut Sandboxes::default()
+            )
+            .unwrap()["approve"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("exec"))
+        );
+        served["configure_pending"] = json!({"declare": []});
+        let gated = regate(
+            &served,
+            "auto",
+            "stated.fix.check",
+            &mut Sandboxes::default(),
+        );
+        assert!(
+            !gated.unwrap()["approve"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("exec"))
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
