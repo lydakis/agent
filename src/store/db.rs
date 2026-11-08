@@ -161,6 +161,11 @@ pub struct Bot {
     pub sent: Option<(u64, u64)>,
     /// A client asked for a summary before the bot's next model call.
     pub compaction_requested: bool,
+    /// A `configure` accepted while a turn ran, which the daemon takes
+    /// when the turn ends, before the bot's next turn: the fields given,
+    /// later ones merged over earlier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configure_pending: Option<Value>,
     /// Its context, history and approval settings, reported as they apply.
     #[serde(serialize_with = "resolved_settings")]
     pub settings: Settings,
@@ -2398,7 +2403,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 88;
+    pub const SCHEMA: i32 = 89;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2574,7 +2579,8 @@ impl Database {
                 declared TEXT, work INTEGER NOT NULL DEFAULT 0, work_read INTEGER,
                 budget_counts TEXT, depth INTEGER NOT NULL DEFAULT 0,
                 started_ms INTEGER, waiting_on TEXT, last_turn INTEGER, last_status TEXT,
-                last_started_ms INTEGER, last_finished_ms INTEGER, last_error TEXT);
+                last_started_ms INTEGER, last_finished_ms INTEGER, last_error TEXT,
+                configure_pending TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -3141,6 +3147,16 @@ impl Database {
                 _ => None,
             },
             compaction_requested: r.get::<_, i64>(39)? != 0,
+            configure_pending: match r.get::<_, Option<String>>(52)? {
+                None => None,
+                Some(text) => Some(serde_json::from_str(&text).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        52,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?),
+            },
             declared: match r.get::<_, Option<String>>(40)? {
                 None => Vec::new(),
                 Some(text) => serde_json::from_str(&text).map_err(|error| {
@@ -3153,7 +3169,7 @@ impl Database {
             },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,last_started_ms,last_finished_ms,last_error";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,last_started_ms,last_finished_ms,last_error,configure_pending";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     /// Its id and depth, read in the same query.
@@ -7595,6 +7611,114 @@ impl Database {
             params![asked as i64, id, asked as i64],
         )?;
         Ok(changed == 1)
+    }
+    /// Keep `pending`, a `configure` accepted while turn `running` of the
+    /// bot with identity `id` runs, for the daemon to take when it ends,
+    /// and say so durably. Its answer, which the event repeats.
+    pub fn keep_configure(
+        &mut self,
+        name: &str,
+        id: i64,
+        running: i64,
+        pending: &Value,
+    ) -> Result<Value> {
+        // The same change kept again is said once.
+        let kept = self
+            .conn
+            .prepare_cached(
+                "UPDATE bots SET configure_pending=?1 WHERE id=?2 AND configure_pending IS NOT ?1",
+            )?
+            .execute(params![pending.to_string(), id])?;
+        let answer = json!({"bot":name,"bot_id":id,"running_turn":running,
+            "configure_pending":pending});
+        if kept == 0 {
+            return Ok(answer);
+        }
+        event(
+            &self.conn,
+            name,
+            None,
+            "configure_pending",
+            json!({"bot_id":id,"running_turn":running,"configure_pending":pending}),
+        )?;
+        Ok(answer)
+    }
+    /// The `configure` kept for the bot with identity `id`, if any.
+    pub fn kept_configure(&self, id: i64) -> Result<Option<Value>> {
+        let text: Option<String> = self
+            .conn
+            .prepare_cached("SELECT configure_pending FROM bots WHERE id=?")?
+            .query_row([id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(text.map(|text| serde_json::from_str(&text)).transpose()?)
+    }
+    /// Let go of the `configure` kept for the bot with identity `id`: it
+    /// was taken. With `rules_only`, a change of `rules` alone taken while
+    /// the turn runs, only the rules it kept go, which are older.
+    pub fn taken_configure(&mut self, id: i64, rules_only: bool) -> Result<()> {
+        let sql = match rules_only {
+            true => {
+                "UPDATE bots SET configure_pending=json_remove(configure_pending,'$.settings.rules')
+                 WHERE id=? AND configure_pending IS NOT NULL"
+            }
+            false => {
+                "UPDATE bots SET configure_pending=NULL WHERE id=? AND configure_pending IS NOT NULL"
+            }
+        };
+        self.conn.prepare_cached(sql)?.execute([id])?;
+        Ok(())
+    }
+    /// A kept `configure` that could not be taken when its turn ended:
+    /// let go of, and said durably with why.
+    pub fn configure_failed(&mut self, name: &str, error: &Error) -> Result<()> {
+        let Some((id, pending)) = self
+            .conn
+            .prepare_cached(
+                "SELECT id,configure_pending FROM bots WHERE name=? AND status!='deleting'",
+            )?
+            .query_row([name], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .optional()?
+        else {
+            return Ok(());
+        };
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let pending: Value = serde_json::from_str(&pending)?;
+        self.conn
+            .prepare_cached("UPDATE bots SET configure_pending=NULL WHERE id=?")?
+            .execute([id])?;
+        event(
+            &self.conn,
+            name,
+            None,
+            "configure_failed",
+            json!({"bot_id":id,"configure_pending":pending,"code":error.code,
+                "detail":error.detail}),
+        )?;
+        Ok(())
+    }
+    /// The bots with a `configure` kept, by name.
+    pub fn configures_kept(&self) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT name FROM bots WHERE configure_pending IS NOT NULL AND status!='deleting'",
+        )?;
+        let names = statement
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(names)
+    }
+    /// Run `f` and undo whatever it wrote, keeping its answer: a change
+    /// checked as the store would take it, without taking it.
+    pub fn trial<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("SAVEPOINT trial")?;
+        let tried = f(self);
+        self.conn
+            .execute_batch("ROLLBACK TO trial; RELEASE trial")?;
+        tried
     }
     /// Drop a turn's reply that the model's own output cap cut short: none
     /// of it is recorded. One commit tells the model what cut it, a strict
@@ -15401,6 +15525,16 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         )?
     {
         migrate_bot_status(conn)?;
+    }
+    if from < 89
+        && !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='configure_pending')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        // 88 -> 89: a `configure` kept while a turn runs. None was.
+        conn.execute_batch("ALTER TABLE bots ADD COLUMN configure_pending TEXT;")?;
     }
     Ok(())
 }

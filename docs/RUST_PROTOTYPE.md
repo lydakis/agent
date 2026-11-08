@@ -1488,10 +1488,26 @@ fields (`model`, `instructions`, `gates`, `declared`, `fallback`,
 name, the sandbox's four as `sandbox`) that differed; the same request again
 changes nothing, so a resend is harmless. A change is told to the bot's
 followers as a live `configured` event with the same fields, which is not
-kept, so a client that attaches later reads the bot as it is. It is refused with `bot_busy`
-while a turn runs or waits parked, except a change of `rules` alone, which
-the running turn's next round takes ([command rules](#command-rules));
-otherwise the next turn sends the
+kept, so a client that attaches later reads the bot as it is. While a
+turn runs or waits parked, a change of `rules` alone reaches the running
+turn's next round ([command rules](#command-rules)); since protocol 61 any
+other change is kept for the turn's end instead of refused `bot_busy`
+(Astra's review, 11-08: a change a client was told it made must not live
+only in a window). It is checked as the store would take it, every check
+above, then kept with the bot, merged over one kept before: each field
+given replaces the older's, a `model` takes its `effort` with it (absent
+is the model's default), a gate its approver and expiry, `settings` go by
+name with `sandbox` taking the rest of the sandbox, and a change of
+`rules` alone taken meanwhile lets go of the older rules kept. It answers
+`{bot, bot_id, running_turn, configure_pending}`, the whole change kept,
+which `inspect` shows as `configure_pending` and a durable
+`configure_pending` event tells (once per change). When the turn ends,
+before the bot's next turn starts, and at the daemon's start for a turn
+that ended while it was down, the daemon takes it as `configure` takes a
+change, with the live `configured` event; one that can no longer be taken
+(its provider gone from the config, say) is let go with a durable
+`configure_failed` event naming the change, `code` and `detail`.
+Otherwise the next turn sends the
 new instructions: the provider's cache of the old ones is not read again,
 replayed thinking written after them is withheld as when any context in
 front of it changes, and a fork keys its own prompt cache from then on.
