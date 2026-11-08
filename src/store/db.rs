@@ -266,6 +266,11 @@ pub struct Settings {
     /// allowed; none bounds them only by the turn's token budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<usize>,
+    /// Replies in a row the model's own output cap may cut short in one of
+    /// its turns, the last ending the turn on it; each before goes dropped,
+    /// the model told. Unset, `MAX_DROPS`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_drops: Option<usize>,
     /// Unix sockets, or folders of them, the only ones a sandbox's commands
     /// reach, each an absolute path
     /// ([`crate::sandbox::Policy::sockets`]).
@@ -310,6 +315,9 @@ pub fn compact_threshold(window: u64) -> u64 {
         .max(MIN_COMPACT_TOKENS)
 }
 const MIN_CONTEXT_ITEMS: usize = 2;
+/// Replies in a row the model's cap may cut short before a turn ends on
+/// the last, unless the bot sets `max_drops`.
+pub const MAX_DROPS: usize = 3;
 impl Settings {
     pub fn context_bytes(&self) -> usize {
         self.context_bytes.unwrap_or(8 << 20)
@@ -338,6 +346,10 @@ impl Settings {
     /// Model calls a turn may make; unset, more than any turn reaches.
     pub fn max_rounds(&self) -> usize {
         self.max_rounds.unwrap_or(usize::MAX / 4)
+    }
+    /// Replies in a row the model's cap may cut before the turn ends on it.
+    pub fn max_drops(&self) -> usize {
+        self.max_drops.unwrap_or(MAX_DROPS)
     }
     pub fn approval_hold_ms(&self) -> u64 {
         self.approval_hold_ms.unwrap_or(2000)
@@ -422,6 +434,9 @@ impl Settings {
         }
         if self.max_rounds == Some(0) {
             return refuse("max_rounds is at least 1");
+        }
+        if self.max_drops == Some(0) {
+            return refuse("max_drops is at least 1");
         }
         if self.keep_turns == Some(0) {
             return refuse("keep_turns is at least 1");
@@ -508,6 +523,7 @@ impl Settings {
             "note_turns":self.note_turns(),"compact_at":self.compact_at(),
             "compact_keep":self.compact_keep(),"compact_tokens":self.compact_tokens,
             "keep_turns":self.keep_turns,"max_rounds":self.max_rounds,
+            "max_drops":self.max_drops(),
             "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
             // Null when never set (five minutes), so a client's default can
             // tell it from five minutes someone chose.
@@ -532,7 +548,7 @@ const INHERITED: [&str; 2] = ["rules", "env"];
 /// The settings that make a bot's sandbox, which change together.
 pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
 /// Every setting's name, as `create` and `configure` take it.
-pub const SETTINGS: [&str; 22] = [
+pub const SETTINGS: [&str; 23] = [
     "context_bytes",
     "context_items",
     "note_turns",
@@ -552,6 +568,7 @@ pub const SETTINGS: [&str; 22] = [
     "quiet_background",
     "hold_ms",
     "max_rounds",
+    "max_drops",
     "unix_sockets",
     "rules",
     "env",
@@ -1897,6 +1914,9 @@ impl CatchUp {
 /// Where and with which model a turn runs.
 pub struct TurnContext {
     pub model_rounds: usize,
+    /// Replies in a row the model's own output cap cut short, the last
+    /// dropped; a reply the turn keeps sets it back to 0.
+    pub drops: usize,
     /// Whether this turn's last change to the bot's view was a call that
     /// sent it, rather than a summary or elision that rewrote it; `None`
     /// until the turn makes either.
@@ -2315,7 +2335,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 84;
+    pub const SCHEMA: i32 = 85;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2521,6 +2541,7 @@ impl Database {
                 bot_model TEXT, bot_reasoning TEXT, images TEXT, person TEXT, quotes TEXT, reply_node INTEGER,
                 wait_ms INTEGER, due_ms INTEGER, held TEXT,
                 work INTEGER NOT NULL DEFAULT 0, limited TEXT, budget_counts TEXT, output_schema TEXT,
+                drops INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
@@ -7335,7 +7356,7 @@ impl Database {
         // A successful response consumes a round in the same durable commit
         // as its messages and tool plans. Failed requests end the turn.
         tx.execute(
-            "UPDATE turns SET model_rounds=model_rounds+1,view_sent=1,limited=? WHERE id=?",
+            "UPDATE turns SET model_rounds=model_rounds+1,view_sent=1,limited=?,drops=0 WHERE id=?",
             params![limit.map(Limit::as_str), turn],
         )?;
         tx.commit()?;
@@ -7376,12 +7397,10 @@ impl Database {
         let bot = self.active(turn)?;
         self.conn.execute_batch("SAVEPOINT drop_reply")?;
         let dropped = (|| {
-            if count {
-                self.conn.execute(
-                    "UPDATE turns SET model_rounds=model_rounds+1 WHERE id=?",
-                    [turn],
-                )?;
-            }
+            self.conn.execute(
+                "UPDATE turns SET model_rounds=model_rounds+?,drops=drops+1 WHERE id=?",
+                params![count as i64, turn],
+            )?;
             event(&self.conn, &bot.name, Some(turn), "dropped", facts.clone())?;
             let rounds: i64 =
                 self.conn
@@ -9541,6 +9560,7 @@ impl Database {
             Spend,
             Counts,
             Option<String>,
+            usize,
         );
         let (
             workspace,
@@ -9552,9 +9572,10 @@ impl Database {
             spent,
             counts,
             output_schema,
+            drops,
         ): Row = self.conn.query_row(
             "SELECT workspace,model,model_rounds,view_sent,reasoning,budget_tokens,
-                        input_tokens+output_tokens,work,budget_counts,output_schema
+                        input_tokens+output_tokens,work,budget_counts,output_schema,drops
                FROM turns WHERE id=?",
             [turn],
             |r| {
@@ -9571,6 +9592,7 @@ impl Database {
                     },
                     Counts::from_stored(r.get::<_, Option<String>>(8)?.as_deref()),
                     r.get(9)?,
+                    r.get::<_, u32>(10)? as usize,
                 ))
             },
         )?;
@@ -9600,6 +9622,7 @@ impl Database {
             .flatten();
         Ok(TurnContext {
             model_rounds,
+            drops,
             view_sent,
             workspace: workspace
                 .or(bot.workspace)
@@ -14630,6 +14653,17 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             [],
         )?;
     }
+    // Schema 85: a turn keeps how many replies in a row the model's cap cut
+    // short, so a park or a restart counts on.
+    if from < 85
+        && !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='drops')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        conn.execute_batch("ALTER TABLE turns ADD COLUMN drops INTEGER NOT NULL DEFAULT 0")?;
+    }
     Ok(())
 }
 /// 53 -> 54: a turn's denial count became a window of its last decided
@@ -15351,6 +15385,7 @@ mod tests {
             hold_ms: Some(1),
             quiet_background: true,
             max_rounds: Some(1),
+            max_drops: Some(1),
             unix_sockets: vec!["/".into()],
             rules: Some(crate::rules::Policy {
                 invalid: Some("x".into()),

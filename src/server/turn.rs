@@ -65,12 +65,6 @@ const MAX_PACED_ATTEMPTS: u32 = 64;
 /// few words; one far longer goes out in pieces, each fitting an event even
 /// with every byte escaped six times over.
 const DELTA_PIECE: usize = 128 * 1024;
-/// Replies in a row the model's own output cap may cut short in a turn: each
-/// before the last is dropped and the turn goes on; the last ends the turn
-/// on it. Each can cost a whole reply's output, so this bounds what a model
-/// that writes the same too-long reply again spends, as the attempts bound a
-/// call's retries.
-const MAX_DROPS: u32 = 3;
 use agent_runtime::provider::pace::MIN_PARK;
 const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
 /// Nodes per piece of a compaction catch-up walk: a few milliseconds of
@@ -2436,8 +2430,9 @@ impl Turn {
         let mut steer_first = false;
         // The view this task's last call sent, for a summary to copy.
         let mut last: Option<LastCall> = None;
-        // Replies in a row the model's own output cap cut short.
-        let mut drops = 0;
+        // Replies in a row the model's own output cap cut short, kept on
+        // the turn so a park or a restart counts on.
+        let mut drops = context.drops;
         // Whether this task has made a call, whose cache a summary beside
         // the next one reads.
         let mut sent_here = false;
@@ -2770,9 +2765,11 @@ impl Turn {
                 // run; the model is told what cut it, in a steer from the
                 // `limit` origin that the next boundary takes, and the turn
                 // goes on. The round counts, billed or not. The cap cutting
-                // `MAX_DROPS` replies in a row ends the turn on it.
+                // the bot's `max_drops` replies in a row ends the turn on it:
+                // each can cost a whole reply's output.
                 Err(error)
-                    if agent_runtime::provider::was_cut_short(&error) && drops + 1 < MAX_DROPS =>
+                    if agent_runtime::provider::was_cut_short(&error)
+                        && drops + 1 < self.settings().max_drops() =>
                 {
                     let count = model_rounds == rounds_before;
                     self.join_summary(

@@ -159,9 +159,13 @@ class Model(http.server.BaseHTTPRequestHandler):
             arrived[user, attempt] = time.monotonic()
             self.server.arrived = arrived
             pace_at = getattr(self.server, 'pace_at', None)
-            if (pace_at is not None and not is_summary(request)
-                    and sum(i.get('type') == 'function_call_output' for i in request['input']) >= pace_at):
-                # Once, after that many results: a 429 that parks the turn.
+            pace = getattr(self.server, 'pace', None)
+            if not is_summary(request) and (
+                    (pace_at is not None
+                     and sum(i.get('type') == 'function_call_output' for i in request['input']) >= pace_at)
+                    or (pace and pace(request, user))):
+                # Once, after that many results, or when `pace` says: a 429
+                # that parks the turn.
                 self.server.pace_at = None
                 body = b'{"error":{"message":"try later"}}'
                 self.send_response(429)

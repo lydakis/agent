@@ -514,6 +514,7 @@ when it sets either.
 | `compact_keep` (`--compact-keep`) | Target percent of either context envelope kept verbatim: as newest whole turns by compaction, as newest items by elision. Reduced when pinned context leaves less room. Must be below `compact_at`. | 25 |
 | `compact_tokens` (`--compact-tokens`) | Input tokens per request that start elision and compaction too, whichever of this and `compact_at` comes first (see [compaction](#compaction)). 0 leaves only `compact_at`; otherwise at least 1,024. | from the model's context window |
 | `max_rounds` (`--max-rounds`) | Model calls each turn may make; the last goes with no tool call allowed, and the turn fails `tool_round_limit` past it. | none |
+| `max_drops` (`--max-drops`) | Replies in a row the model's own output cap may cut short in a turn; each before the last is dropped and the model told, and the last ends the turn `provider_incomplete`. | 3 |
 | `keep_turns` (`--keep-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)), and a terminal read waits live for its output before its turn parks. 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
@@ -2200,9 +2201,11 @@ it takes any steer. Its words are the facts, and the event's data the same:
 `in` is what the reply was writing when cut, `text`, `reasoning`, or the tool
 it called, when the stream said. No budget refuses that steer: the turn's
 calls are what the budget bounds, and a spent one still makes the turn's last
-call, which reads it. The cap cutting three replies of a turn in a row ends
-the turn on the third, `provider_incomplete` with the same facts on its
-`turn_finished`, since each can cost a whole reply's output. The daemon puts
+call, which reads it. The cap cutting `max_drops` replies of a turn in a row
+(unset, three) ends the turn on the last, `provider_incomplete` with the same
+facts on its `turn_finished`, since each can cost a whole reply's output. The
+turn keeps the count, so a park or a restart counts on; a reply it keeps sets
+it back to none. The daemon puts
 no bound of its own on a reply under the 16 MiB response stream: events carry
 previews of calls (2 KiB of arguments), text streams live in pieces of at most
 128 KiB, and a history read answers `item_too_large` for one item past a line.

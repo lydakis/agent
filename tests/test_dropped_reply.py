@@ -93,6 +93,33 @@ class DroppedReplyTests(ModelFixture):
         self.assertEqual(len(sent), 3)
         self.assertEqual([len(notes(r)) for r in sent], [0, 1, 2])
 
+    def test_the_count_in_a_row_holds_across_a_park_and_a_restart(self):
+        # Cut, then parked on a rate limit and the daemon restarted, then cut
+        # twice more: the third cut in a row ends the turn.
+        self.model.cut_short = lambda request, user: True
+        paced = []
+        self.model.pace = lambda request, user: (
+            len(notes(request)) == 1 and not paced and not paced.append(1))
+        client = self.client()
+        turn = self.turn(client)
+        client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn, timeout=30)
+        client.close(kill=True)
+        client = self.client()
+        end = client.finished(turn, timeout=30)['data']
+        self.assertEqual((end['status'], end['error']), ('failed', 'provider_incomplete'))
+        # Three cut, one parked.
+        self.assertEqual([len(notes(r)) for r in self.requests()], [0, 1, 1, 2])
+
+    def test_a_bot_sets_how_many_cuts_in_a_row_end_its_turn(self):
+        self.model.cut_short = lambda request, user: True
+        client = self.client(settings={'max_drops': 1})
+        turn = self.turn(client)
+        end = client.finished(turn)['data']
+        self.assertEqual((end['status'], end['error']), ('failed', 'provider_incomplete'))
+        self.assertEqual(len(self.requests()), 1)
+        refused = client.request('configure', bot='Bob', settings={'max_drops': 0})
+        self.assertEqual(refused['error'], 'invalid_setting', refused)
+
 
 if __name__ == '__main__':
     unittest.main()
