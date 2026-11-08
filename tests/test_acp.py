@@ -478,6 +478,61 @@ class AcpTests(ModelFixture):
         other = f'{lead}@{"0" * 16 if store != "0" * 16 else "1" * 16}'
         self.assertIn('another store', self.resume(repo, other)['error']['message'])
 
+    def test_a_task_the_lead_starts_is_a_thread_a_client_opens(self):
+        """Any client, not only T3 Code: a task the lead starts comes with
+        the session id that opens it, `session/list` lists it under its
+        lead, and `session/resume` opens it, as it opens no other bot."""
+        repo = self.repo()
+        self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('start_task', inherit=False)])
+        env = {k: v for k, v in self.env.items() if not k.startswith('T3_')}
+        thread = Thread(self, env, repo)
+        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {},
+                                                   'clientInfo': {'name': 'slack-bridge'}}))
+        opened, _ = thread.answer_of(thread.ask('session/new', {'cwd': str(repo), 'mcpServers': []}))
+        session = opened['result']['sessionId']
+        thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead'}))
+        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix calc.py.'})]
+        answered, updates = thread.answer_of(thread.ask('session/prompt', {
+            'sessionId': session, 'prompt': [{'type': 'text', 'text': 'script'}]}))
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        fix = self.daemon.request('inspect', bot='calc.fix')['result']
+        lead_id = self.daemon.request('inspect', bot='calc.lead')['result']['bot_id']
+        # The call that started it names it, before the prompt is answered.
+        [task] = [u['_meta']['task'] for u in updates
+                  if u['sessionUpdate'] == 'tool_call_update' and 'task' in u.get('_meta', {})]
+        name, store = task['sessionId'].rsplit('@', 1)
+        self.assertEqual(name, f'calc.fix#{fix["bot_id"]}')
+        self.assertRegex(store, r'^[0-9a-f]{16}$')
+        self.assertEqual((task['title'], task['cwd']), ('calc.fix', fix['workspace']))
+        # Listed by folder under its lead, which it names; in all, leads only.
+        listed, _ = thread.answer_of(thread.ask('session/list', {'cwd': str(repo)}))
+        sessions = listed['result']['sessions']
+        self.assertEqual([(s['title'], s.get('_meta')) for s in sessions],
+                         [('calc.lead', None), ('calc.fix', {'lead': f'calc.lead#{lead_id}@{store}'})])
+        self.assertEqual((sessions[1]['sessionId'], sessions[1]['cwd']), (task['sessionId'], fix['workspace']))
+        listed, _ = thread.answer_of(thread.ask('session/list', {}))
+        self.assertEqual([s['title'] for s in listed['result']['sessions']], ['calc.lead'])
+        # It opens as the task, and a prompt there is the task's.
+        reopened = Thread(self, env, repo)
+        reopened.answer_of(reopened.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        answered, _ = reopened.answer_of(reopened.ask('session/resume', {
+            'sessionId': task['sessionId'], 'cwd': str(repo), 'mcpServers': []}))
+        self.assertEqual(answered['result']['configOptions'][-1]['currentValue'], 'calc.fix')
+        before = len(self.daemon.request('turns', bot='calc.fix')['result']['turns'])
+        answered, _ = reopened.answer_of(reopened.ask('session/prompt', {
+            'sessionId': task['sessionId'], 'prompt': [{'type': 'text', 'text': 'how is it going?'}]}))
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        self.assertEqual(len(self.daemon.request('turns', bot='calc.fix')['result']['turns']), before + 1)
+        reopened.close()
+        # A bot no lead started does not open, by any id.
+        self.daemon.request('create', bot='calc.loose', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Loose.')
+        loose = self.daemon.request('inspect', bot='calc.loose')['result']['bot_id']
+        refused = self.resume(repo, f'calc.loose#{loose}@{store}')
+        self.assertIn('does not know', refused['error']['message'])
+
     def test_a_client_names_who_wrote_each_prompt_and_who_answered_for_a_call(self):
         """A client several people write through, as a team's chat bridge:
         `_meta.person` names who wrote a prompt, which the lead reads, and
@@ -516,6 +571,106 @@ class AcpTests(ModelFixture):
         events = self.daemon.request('events', bot='calc.lead', after=0, limit=256)['result']['events']
         [denied] = [e['data'] for e in events if e['event'] == 'tool_completed']
         self.assertEqual([(v['by'], v['allow']) for v in denied['approvals']], [('bo', False)])
+
+    def test_the_leads_questions_are_forms_and_a_pick_answers_them(self):
+        """A client that fills in forms gets each question the lead puts,
+        live or still open from before it followed the lead; a pick goes
+        to the lead as the person's answer, or as the words of the person
+        the client names."""
+        repo = self.repo()
+        self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Lead.')
+        env = {k: v for k, v in self.env.items() if not k.startswith('T3_')}
+
+        def asked(question, first, second):
+            return ('ask', {'question': question, 'why': 'It decides the schema.',
+                            'options': [{'label': first, 'explanation': f'{first} it is.'},
+                                        {'label': second, 'explanation': f'{second} it is.'}],
+                            'recommended': 1, 'reason': 'Simplest.', 'if_unanswered': 'wait'})
+
+        self.model.call_script = [[asked('Which database?', 'SQLite', 'Postgres'),
+                                   asked('Which cache?', 'None', 'Redis')]]
+        # Asked while no client that fills in forms follows the lead.
+        thread = Thread(self, env, repo)
+        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        opened, _ = thread.answer_of(thread.ask('session/new', {'cwd': str(repo), 'mcpServers': []}))
+        session = opened['result']['sessionId']
+        prompt = thread.ask('session/prompt', {'sessionId': session, 'prompt': [{'type': 'text', 'text': 'script'}]})
+        seen = thread.until(lambda m: m.get('id') == prompt and 'method' not in m)
+        self.assertEqual(seen[-1].get('result'), {'stopReason': 'end_turn'}, seen[-1])
+        self.assertNotIn('elicitation/create', [m.get('method') for m in seen])
+        thread.close()
+        # A client that does, reopening the thread: both are put to it, the
+        # oldest first.
+        thread = Thread(self, env, repo)
+        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2,
+                                                   'clientCapabilities': {'elicitation': {'form': {}}}}))
+        thread.answer_of(thread.ask('session/resume', {'sessionId': session, 'cwd': str(repo), 'mcpServers': []}))
+        forms = []
+
+        def both(message):
+            if message.get('method') == 'elicitation/create':
+                forms.append(message)
+            return len(forms) == 2
+        thread.until(both)
+        self.assertEqual([f['params']['message'].split('\n')[0] for f in forms], ['Which database?', 'Which cache?'])
+        database = forms[0]['params']
+        self.assertEqual(database['mode'], 'form')
+        self.assertEqual(database['message'],
+                         'Which database?\n\nIt decides the schema.\n\nRecommended: SQLite. Simplest.')
+        self.assertNotIn('toolCallId', database)
+        pick = database['requestedSchema']['properties']['pick']
+        self.assertEqual(database['requestedSchema']['required'], ['pick'])
+        self.assertEqual(pick['oneOf'], [{'const': '1', 'title': 'SQLite', 'description': 'SQLite it is.'},
+                                         {'const': '2', 'title': 'Postgres', 'description': 'Postgres it is.'}])
+        # The person picks for the first; a teammate the client names for
+        # the second.
+        thread.send({'id': forms[0]['id'], 'result': {'action': 'accept', 'content': {'pick': '2'}}})
+        thread.send({'id': forms[1]['id'], 'result': {'action': 'accept', 'content': {'pick': '1'},
+                                                      '_meta': {'person': 'ana'}}})
+        sent = []
+        deadline = time.monotonic() + 30
+        while not ('Postgres' in ''.join(sent) and 'Written by ana' in ''.join(sent)):
+            self.assertLess(time.monotonic(), deadline, sent)
+            try:
+                sent.append(json.dumps(self.model.requests.get(timeout=1)['input']))
+            except queue.Empty:
+                pass
+        texts = {part['text'] for request in sent for item in json.loads(request)
+                 if item.get('role') == 'user' and isinstance(item.get('content'), list)
+                 for part in item['content'] if 'text' in part}
+        database_answer = next(t for t in texts if t.startswith('You asked (') and 'Which database?' in t)
+        self.assertRegex(database_answer, r'^You asked \(ask:\d+/script-0\): Which database\?\n\nPostgres\n\n\[Sent ')
+        cache_answer = next(t for t in texts if t.startswith('You asked (') and 'Which cache?' in t)
+        self.assertRegex(cache_answer, r'^You asked \(ask:\d+/script-0\.1\): Which cache\?\n\nNone\n\n\[Sent ')
+        self.assertIn('[Written by ana.]', texts)
+        # Once the person's answers are in, a question asked live comes as a
+        # form on the call that put it; declined, it waits on.
+        deadline = time.monotonic() + 30
+        while any(t['status'] in ('running', 'queued') for t in
+                  self.daemon.request('turns', bot='calc.lead')['result']['turns']):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        self.model.call_script.append(asked('Which queue?', 'None', 'SQS'))
+        thread.ask('session/prompt', {'sessionId': session, 'prompt': [{'type': 'text', 'text': 'script'}]})
+        [live] = [m for m in thread.until(lambda m: m.get('method') == 'elicitation/create')
+                  if m.get('method') == 'elicitation/create']
+        self.assertEqual(live['params']['message'].split('\n')[0], 'Which queue?')
+        self.assertEqual(live['params']['toolCallId'], 'script-1')
+        # A pick naming someone by a name the daemon would not take answers
+        # nothing, and is nobody's words.
+        thread.send({'id': live['id'], 'result': {'action': 'accept', 'content': {'pick': '2'},
+                                                  '_meta': {'person': 'Ana Lopez'}}})
+        hello = thread.ask('session/prompt', {'sessionId': session, 'prompt': [{'type': 'text', 'text': 'hello'}]})
+        thread.until(lambda m: m.get('id') == hello and 'method' not in m)
+        later = []
+        while True:
+            try:
+                later.append(json.dumps(self.model.requests.get_nowait()['input']))
+            except queue.Empty:
+                break
+        self.assertTrue(any('hello' in request for request in later))
+        self.assertFalse(any('script-1): Which queue' in request for request in later))
 
     def test_t3_code_threads_pick_their_lead_by_words_not_by_an_option(self):
         """T3 Code carries option picks over to the next thread it opens."""

@@ -411,10 +411,13 @@ def setup(root, bin_dir, model, spec=None):
     bin_dir = own
     py = sys.executable
     provider = model.split('/', 1)[0]
+    # Builds before 0.9.1 named the reviewer's table [judge], and each
+    # build refuses the other's, so an arm of one still compares.
+    reviewer = 'reviewer' if b'[reviewer]' in (own / 'sonny').read_bytes() else 'judge'
     (home / '.agent/config.toml').write_text(f'''model = "{model}"
 provider = "{spec or provider}"
 
-[judge]
+[{reviewer}]
 model = "{model}"
 
 [sonny]

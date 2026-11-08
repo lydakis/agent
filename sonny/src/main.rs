@@ -10,7 +10,6 @@
 //! has run and how to stop it.
 mod acp;
 mod approvals;
-mod approver;
 mod asked;
 mod asks;
 mod attach;
@@ -25,6 +24,7 @@ mod calls;
 mod cmux;
 mod commons;
 mod config;
+mod context;
 mod declared;
 mod desktop;
 mod diff;
@@ -73,6 +73,7 @@ mod reactions;
 mod recall;
 mod resolved;
 mod responsible;
+mod reviewer;
 mod reviews;
 mod rex;
 mod rules;
@@ -1112,7 +1113,11 @@ struct TaskAnswer {
 /// first answer to an ask and refuses another. One taken back from the
 /// queue before the agent read it answered nothing, so the next goes as
 /// the next attempt.
-async fn answer_once(client: &Client, ask: &str, submitted: Value) -> Result<Value, String> {
+pub(crate) async fn answer_once(
+    client: &Client,
+    ask: &str,
+    submitted: Value,
+) -> Result<Value, String> {
     let bot = submitted["bot"].as_str().unwrap_or_default().to_owned();
     let mut attempt = 0;
     loop {
@@ -1515,23 +1520,23 @@ fn env_file_provider_at(file: &std::path::Path) -> Option<String> {
     })
 }
 
-/// The daemon's companion that answers an `auto` gate: `sonny approver`,
-/// judged by `model` unless a judge is set, which the daemon then keeps
-/// running for as long as it runs, as it does the lookout. One kept already
-/// keeps the judge it was given first, so leads on other models do not
-/// start it again.
+/// The daemon's companion that answers an `auto` gate: `sonny reviewer`,
+/// reviewing with `model` unless `[reviewer] model` is set, which the
+/// daemon then keeps running for as long as it runs, as it does the
+/// lookout. One kept already keeps the model it was given first, so leads
+/// on other models do not start it again.
 async fn serve_auto(client: &Client, model: &str) -> Result<(), String> {
-    keep_approver(client, Some(model)).await
+    keep_reviewer(client, Some(model)).await
 }
 
 /// Sonny's companions in the daemon, so they run for as long as it does,
 /// whether or not a window is open, and come back with the next daemon:
 /// the lookout, `sonny lookout`, which tells leads what happens in their
 /// tasks, and the tool host, `sonny tool-host`, which answers the tools
-/// Sonny gives its agents; and the approver, when one is kept already.
+/// Sonny gives its agents; and the reviewer, when one is kept already.
 /// This Sonny's own build replaces another's: the build is part of what
 /// the daemon keeps, so a Sonny upgraded in place has the daemon start the
-/// new ones, the approver too, with no window in `auto` needed.
+/// new ones, the reviewer too, with no window in `auto` needed.
 async fn start_companions(client: &Client) -> Result<(), String> {
     let me = named::me().map_err(|e| e.to_string())?;
     let build = json!({"SONNY_BUILD": lookout::identity(), named::PROGRAM: me});
@@ -1553,39 +1558,52 @@ async fn start_companions(client: &Client) -> Result<(), String> {
         build,
     )
     .await?;
-    keep_approver(client, None).await
+    keep_reviewer(client, None).await
 }
 
-/// Keep the approver running this Sonny's binary and build: the one kept
-/// already with the judge it has, else, given a `model`, a new one judged
-/// by it. Without one kept or a model, nothing.
-async fn keep_approver(client: &Client, model: Option<&str>) -> Result<(), String> {
+/// Keep the reviewer running this Sonny's binary and build: the one kept
+/// already with the model it has, else, given a `model`, a new one
+/// reviewing with it. Without one kept or a model, nothing.
+async fn keep_reviewer(client: &Client, model: Option<&str>) -> Result<(), String> {
     let me = named::me().map_err(|e| e.to_string())?;
     let listed = client
         .request("companions", json!({}))
         .await
         .map_err(|e| e.to_string())?;
-    let kept =
-        (listed["companions"].as_array().into_iter().flatten()).find(|c| c["name"] == APPROVER);
-    let Some(mut env) = approver_env(kept, model, &lookout::identity()) else {
+    let kept = |name: &str| {
+        (listed["companions"].as_array().into_iter().flatten()).find(|c| c["name"] == name)
+    };
+    // One kept by its name before 0.9.1 is kept again by the reviewer's,
+    // with its model, and goes ([`reviewer::RENAMED`]).
+    let old = kept(OLD_REVIEWER);
+    let Some(mut env) = reviewer_env(kept(REVIEWER).or(old), model, &lookout::identity()) else {
         return Ok(());
     };
     env[named::PROGRAM] = json!(me);
-    let approver = named::named(&me, named::APPROVER);
-    keep(client, APPROVER, &approver, daemon_args("approver"), env).await
+    let program = named::named(&me, named::REVIEWER);
+    keep(client, REVIEWER, &program, daemon_args("reviewer"), env).await?;
+    if old.is_some() {
+        (client
+            .request("companions", json!({"remove": OLD_REVIEWER}))
+            .await)
+            .map_err(|e| format!("{OLD_REVIEWER}: {e}"))?;
+        // Its process name, a link that would keep its old program.
+        let _ = std::fs::remove_file(named::path("sonny-approver"));
+    }
+    Ok(())
 }
 
-/// What the approver runs with: the judge the one `kept` has, else
+/// What the reviewer runs with: the model the one `kept` has, else
 /// `model`, and this Sonny's `build`. `None` when there is neither one kept
 /// nor a model to start one with.
-fn approver_env(kept: Option<&Value>, model: Option<&str>, build: &str) -> Option<Value> {
-    let judge = match kept {
+fn reviewer_env(kept: Option<&Value>, model: Option<&str>, build: &str) -> Option<Value> {
+    let model = match kept {
         Some(kept) => kept["env"]["AGENT_MODEL"].as_str(),
         None => Some(model?),
     };
     let mut env = json!({"SONNY_BUILD": build});
-    if let Some(judge) = judge {
-        env["AGENT_MODEL"] = json!(judge);
+    if let Some(model) = model {
+        env["AGENT_MODEL"] = json!(model);
     }
     Some(env)
 }
@@ -1596,7 +1614,9 @@ const NAME_LOOKUP: Duration = Duration::from_secs(2);
 /// What Sonny names its companions in the daemon.
 const LOOKOUT: &str = "sonny-lookout";
 const TOOL_HOST: &str = "sonny-tool-host";
-const APPROVER: &str = "approver-auto";
+const REVIEWER: &str = "sonny-reviewer";
+/// The reviewer's companion before 0.9.1 ([`reviewer::RENAMED`]).
+const OLD_REVIEWER: &str = "approver-auto";
 
 /// A companion's arguments: its store and socket come from the daemon
 /// that runs it (`AGENT_STORE`, `AGENT_SOCKET`), which may serve the store
@@ -1965,7 +1985,7 @@ fn main() -> std::process::ExitCode {
         }
         Some((lookout, rest)) if lookout == "lookout" => lookout::run(rest),
         Some((verb, rest)) if verb == tool_host::NAME => tool_host::run(rest),
-        Some((verb, rest)) if verb == "approver" => approver::run(rest),
+        Some((verb, rest)) if verb == "reviewer" => reviewer::run(rest),
         Some((verb, rest)) if verb == "mcp" => mcp::cli(rest),
         Some((verb, rest)) if verb == "link" => link::cli(rest),
         Some((verb, rest)) if verb == "rules" => {
@@ -2335,6 +2355,7 @@ async fn run() -> Result<(), String> {
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = caught.context;
     app.window = caught.window;
+    app.compacted = caught.compacted.clone();
     app.paused = caught.paused(&app.client);
     app.turn_began().await;
     if options.side.is_some() {
@@ -2358,7 +2379,9 @@ async fn run() -> Result<(), String> {
         app.declare = declared::declare(&bot, app.role);
     }
     app.sounds = sound::Sounds::new(options.sound);
-    let settings = settings::Settings::load();
+    let (settings, unread) = settings::Settings::load_said();
+    // Sonny opens on its defaults, said, rather than not at all.
+    app.warnings.extend(unread);
     app.sounds.chime = settings.chime;
     app.schedule = settings.quiet.clone();
     quiet::set_schedule(settings.quiet.clone());
@@ -2425,15 +2448,15 @@ async fn run() -> Result<(), String> {
     if let Some(project) = &project
         && let Err(error) = lookout::subscribe_lead(&app.options.store, &name, project)
     {
-        app.notice = Some(format!("the lookout: {error}"));
+        app.warnings.push(format!("the lookout: {error}"));
     }
     // They answer the tools Sonny gives every agent, a lead or not.
     if let Err(error) = start_companions(&app.client).await {
-        app.notice = Some(error);
+        app.warnings.push(error);
     }
     // The lead told what its folder tells it today (skills and memory added
-    // since it was made), unless its instructions were set some other way.
-    // After the lookout's notice: a skill the lead misses matters more.
+    // since it was made), unless its instructions were set some other way;
+    // a file of the folder's it cannot use is left out, and said.
     if project.is_some()
         && let Some(dir) = moving
             .as_deref()
@@ -2441,12 +2464,19 @@ async fn run() -> Result<(), String> {
     {
         let chosen = project::chosen(&app.options.store, &name);
         match project::review(dir, &bot, &app.lead, fresh, chosen.as_deref()) {
-            Ok(project::Instructions::Stale(text)) => app.instruct = Some(text),
-            Ok(project::Instructions::Current) => {}
-            Ok(project::Instructions::Kept { missing }) => {
-                app.notice = Some(project::Instructions::kept_notice(&missing))
+            Ok((reviewed, left_out)) => {
+                app.warnings.extend(left_out);
+                match reviewed {
+                    project::Instructions::Stale(text) => app.instruct = Some(text),
+                    project::Instructions::Current => {}
+                    project::Instructions::Kept { missing } => {
+                        app.notice = Some(project::Instructions::kept_notice(&missing))
+                    }
+                }
             }
-            Err(error) => app.notice = Some(format!("the lead's instructions: {error}")),
+            Err(error) => app
+                .warnings
+                .push(format!("the lead's instructions: {error}")),
         }
     }
     // Said last: it is what the next message does.
@@ -2506,7 +2536,14 @@ async fn run() -> Result<(), String> {
     } else if approvals::reviews(app.mode)
         && let Err(error) = serve_auto(&app.client, &app.model).await
     {
-        app.notice = Some(error);
+        app.warnings.push(error);
+    }
+    // What it opened without matters more than any other notice but what
+    // the next message does. A side chat's agent is not told.
+    if moving.is_none()
+        && let Some(said) = project::warnings_notice(&app.warnings, options.side.is_none())
+    {
+        app.notice = Some(said);
     }
     let result = app.main(&mut terminal, &mut events).await;
     let _ = wipe(&mut terminal);
@@ -2853,6 +2890,12 @@ const PLACES_NOW: Duration = Duration::from_millis(500);
 /// question.
 static REPORTED: std::sync::Mutex<Option<(String, String, bool)>> = std::sync::Mutex::new(None);
 
+/// Whether a lead's call of tool `name` marks the task it names done:
+/// `mark_done`, and `remove_task`, which marks it as it cleans up.
+fn resolves(name: &str) -> bool {
+    name == resolved::TOOL || name == served::REMOVE
+}
+
 /// What the multiplexer is told: a question open says the agent needs the
 /// person (`asking`), as its tab, `/status` and the footer say
 /// ([`needs`]), whatever its turn does; a call waiting on their approval
@@ -2985,6 +3028,7 @@ async fn caught_up(events: &mut Events) -> Caught {
             match event["event"].as_str() {
                 Some("paused") => caught.pause = Some(event["pause"].clone()),
                 Some("resumed") => caught.pause = Some(Value::Null),
+                Some("compacted") => caught.compacted = Some(event["data"].clone()),
                 _ => {}
             }
         }
@@ -3000,6 +3044,7 @@ async fn caught_up(events: &mut Events) -> Caught {
 struct Caught {
     context: Option<u64>,
     window: Option<u64>,
+    compacted: Option<Value>,
     pause: Option<Value>,
 }
 
@@ -3481,7 +3526,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 29] = [
+const COMMANDS: [(&str, &str); 30] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -3523,6 +3568,7 @@ const COMMANDS: [(&str, &str); 29] = [
         "/audit",
         "Show every tool call the agents made: where it ran, who allowed it",
     ),
+    ("/context", "Show what fills the agent's context"),
     ("/pause", "Stop every agent until /resume, saying why"),
     ("/resume", "Let the agents go on after a pause"),
     ("/mcp", "List the MCP servers agents' scripts call"),
@@ -3541,6 +3587,32 @@ const COMMANDS: [(&str, &str); 29] = [
     ("/copy", "Copy the last reply as Markdown"),
     ("/open", "Open the last HTML page in your browser"),
     ("/quit", "Quit; the agents keep working"),
+];
+
+/// Every key Sonny takes and what it does, as `?` lists them; a tip in
+/// the empty composer names only these.
+const SHORTCUTS: [(&str, &str); 21] = [
+    ("enter", "send, or steer the running turn"),
+    ("tab", "queue for after the running turn"),
+    ("↑↓", "earlier prompts, past the first or last row"),
+    ("ctrl+r", "find an earlier prompt"),
+    ("shift+enter", "new line (alt+enter, ctrl+j)"),
+    ("esc", "interrupt, or stop a ! command"),
+    ("/", "commands"),
+    ("!", "run a command of your own"),
+    ("ctrl+o", "open or fold every row that folds"),
+    ("ctrl+f", "find in the conversation"),
+    ("home end", "first turn, newest turn"),
+    ("pgup pgdn", "scroll"),
+    ("tab", "with nothing typed, keys to the pane"),
+    ("ctrl+\\", "keys to the pane and back"),
+    ("ctrl+[ ctrl+]", "hide the pane, show it again"),
+    ("ctrl+g", "open the pane's agent in the main view"),
+    ("ctrl+t", "go to the pane's agent's own tab"),
+    ("alt+t ctrl+x", "boost the next message; again for more"),
+    ("ctrl+v", "paste a picture"),
+    ("ctrl+c", "copy the selection, clear, or quit"),
+    ("ctrl+l", "draw the screen again"),
 ];
 
 /// The slash menu's keys, while it is open: Tab completes the pick's name
@@ -3716,6 +3788,9 @@ struct App {
     context: Option<u64>,
     /// The model's context window, as the daemon says it with each round.
     window: Option<u64>,
+    /// The last `compacted` event's data, its summary and room (#718),
+    /// for `/context`.
+    compacted: Option<Value>,
     input: prompt::Prompt,
     /// The prompts sent before, which Up and Down bring back.
     recall: recall::Recall<Vec<Option<attach::Picture>>>,
@@ -3813,6 +3888,9 @@ struct App {
     asked: Option<Value>,
     following: bool,
     notice: Option<String>,
+    /// What this window opened without, and why: said on the notice line
+    /// and told to its agent with its next model call.
+    warnings: Vec<String>,
     /// The pause that holds every agent, if one does, as the daemon told.
     paused: Option<Value>,
     quit: bool,
@@ -3865,6 +3943,9 @@ struct App {
     /// steer until the running turn takes it in, a prompt until its turn
     /// starts. Drawn above the status row until they land.
     staged: Vec<(i64, String)>,
+    /// Their rows as last drawn, by turn, width and the mark they wait
+    /// with, so a frame draws a long one's Markdown once, not each time.
+    staged_drawn: std::cell::RefCell<Vec<StagedDrawn>>,
     /// The staged turns sent with Tab to run after the running one, which
     /// they do not join.
     queued: Vec<i64>,
@@ -4211,6 +4292,9 @@ struct App {
     suggesting: Option<tokio::task::JoinHandle<Option<suggest::Guess>>>,
     /// The guess, shown in the empty composer for Tab to take.
     suggestion: Option<suggest::Guess>,
+    /// The commands and keys tips have named in this window, so a tip
+    /// shows each once.
+    tipped: Vec<String>,
 }
 
 /// What a job of the lead's layout has to say: a line in the lead's view,
@@ -5391,6 +5475,7 @@ impl App {
             speed: speed(record),
             context: None,
             window: None,
+            compacted: None,
             input: prompt::Prompt::default(),
             recall: recall::Recall::default(),
             pending: Vec::new(),
@@ -5442,6 +5527,7 @@ impl App {
             asked: None,
             following: true,
             notice: None,
+            warnings: Vec::new(),
             paused,
             quit: false,
             switch_to: None,
@@ -5461,6 +5547,7 @@ impl App {
             yours: None,
             suggesting: None,
             suggestion: None,
+            tipped: Vec::new(),
             asks_seen: HashMap::new(),
             checks_set: HashMap::new(),
             running_heads: HashMap::new(),
@@ -5471,6 +5558,7 @@ impl App {
             needs_pulse: std::cell::Cell::default(),
             said: String::new(),
             staged: Vec::new(),
+            staged_drawn: std::cell::RefCell::default(),
             queued: Vec::new(),
             steering: Vec::new(),
             pictures: Vec::new(),
@@ -5659,6 +5747,7 @@ impl App {
         }
         self.configure().await;
         self.tell_upgrades().await;
+        self.tell_warnings().await;
         // The first message `/new` was given, sent as the person wrote it:
         // a message as it is, never a command or a shell line typed anew.
         if let Some(file) = self.options.send.take() {
@@ -6101,6 +6190,20 @@ impl App {
         }
     }
 
+    /// What this window opened without, told to its agent with its next
+    /// model call; a side chat's agent is a copy, and is not.
+    async fn tell_warnings(&mut self) {
+        if self.options.side.is_some() {
+            return;
+        }
+        let warnings = std::mem::take(&mut self.warnings);
+        if let Err(error) = project::tell_warnings(&self.client, &self.bot, &warnings).await {
+            self.notice = Some(format!(
+                "telling the agent what Sonny opened without: {error}"
+            ));
+        }
+    }
+
     /// The lead's instructions as composed on attach, sent once no turn
     /// runs; the next turn reads them.
     /// Whether what was picked is now the bot's: false while it waits
@@ -6338,7 +6441,7 @@ impl App {
             self.boost = None;
         }
         if let Some(workspace) = record["workspace"].as_str() {
-            self.workspace = workspace.to_owned();
+            self.set_workspace(workspace);
         }
         self.speed = speed(record);
         self.mode = approvals::mode(record);
@@ -6686,6 +6789,7 @@ impl App {
             self.notice = None;
             self.context = caught.context.or(self.context);
             self.window = caught.window.or(self.window);
+            self.compacted = caught.compacted.clone().or(self.compacted.take());
             self.history_after(self.seen_node.max(self.options.side.unwrap_or(0)))
                 .await;
             self.unstage_landed().await;
@@ -7461,7 +7565,8 @@ impl App {
         };
         // Shut, it is its fold row alone.
         let open = self.screen.count_tagged(screen::Tag::More(node)) == 1;
-        let rows = transcript::prompt_more(&text(&item), self.prose(), open);
+        let folder = std::path::PathBuf::from(&self.workspace);
+        let rows = transcript::prompt_more(&text(&item), self.prose(), open, Some(&folder));
         let last = rows.len().saturating_sub(1);
         self.flush();
         self.screen.replace_tagged(
@@ -7735,15 +7840,13 @@ impl App {
             }
         } else {
             let prose = self.prose();
-            let lines = match older {
-                true => landed(said, &mut Vec::new(), prose),
-                false => landed(said, &mut self.ran_here, prose),
+            let folder = std::path::PathBuf::from(&self.workspace);
+            // A long message's fold row opens the rest of it.
+            let (lines, fold) = match older {
+                true => landed(said, &mut Vec::new(), prose, &folder),
+                false => landed(said, &mut self.ran_here, prose, &folder),
             };
             if !lines.is_empty() {
-                // A long message's fold row opens the rest of it.
-                let fold = (user_shell::read(said).is_none())
-                    .then(|| transcript::prompt_fold(said, prose))
-                    .flatten();
                 let lines = match quotes.is_empty() {
                     true => lines,
                     false => transcript::with_quotes(lines, quotes, prose),
@@ -8899,7 +9002,7 @@ impl App {
                         if older {
                             continue;
                         }
-                        if name == resolved::TOOL && !failed && !reactions::refused(&item) {
+                        if resolves(&name) && !failed && !reactions::refused(&item) {
                             self.resolve(&arguments, id, turns.get(&node).copied(), false)
                                 .await;
                         }
@@ -8972,10 +9075,25 @@ impl App {
         self.staged.retain(|(turn, _)| waiting.contains(turn));
     }
 
+    /// The folder the agent works in, where its pictures' paths start:
+    /// staged rows drawn from the old one are drawn again.
+    fn set_workspace(&mut self, workspace: &str) {
+        if self.workspace != workspace {
+            self.workspace = workspace.to_owned();
+            self.staged_drawn.get_mut().clear();
+        }
+    }
+
     /// What was sent and has not landed yet, dim, the way it will read
     /// once it does: a blank row above each, as in the history, and one
     /// under the last, so the status row does not touch it.
     fn staged_rows(&self, width: usize) -> Vec<Line<'static>> {
+        let mut drawn = self.staged_drawn.borrow_mut();
+        let folder = std::path::Path::new(&self.workspace);
+        // Kept for those still waiting alone, at the width drawn now.
+        drawn.retain(|((turn, at, _), _)| {
+            *at == width && self.staged.iter().any(|(staged, _)| staged == turn)
+        });
         let mut rows: Vec<Line<'static>> = self
             .staged
             .iter()
@@ -8988,38 +9106,16 @@ impl App {
                     _ if self.steering.contains(turn) && self.running.is_some() => Some(STEERING),
                     _ => None,
                 };
-                let (first, rest) = match waits {
-                    Some(mark) => (format!("›{mark} "), "   "),
-                    None => ("› ".to_owned(), "  "),
-                };
-                let shown: Vec<Line<'static>> = match user_shell::read(prompt) {
-                    Some(ran) => user_shell::header(&ran.command, width, true),
-                    None => {
-                        // An answer shows as itself, under the question it answers.
-                        let (asked, prompt) = match asks::split(prompt) {
-                            Some((question, answer)) => {
-                                (Some(asks::answering(question, width)), answer)
-                            }
-                            None => (None, prompt.as_str()),
-                        };
-                        asked
-                            .into_iter()
-                            .chain(prompt.split('\n').enumerate().flat_map(|(at, line)| {
-                                let lead = if at == 0 {
-                                    first.clone()
-                                } else {
-                                    rest.to_owned()
-                                };
-                                transcript::wrap(
-                                    Line::from(line.to_owned()).dim(),
-                                    width,
-                                    Span::raw(lead).dim(),
-                                    Span::raw(rest),
-                                )
-                            }))
-                            .collect()
-                    }
-                };
+                let key = (*turn, width, waits);
+                let shown = drawn
+                    .iter()
+                    .find(|(at, _)| *at == key)
+                    .map(|(_, rows)| rows.clone())
+                    .unwrap_or_else(|| {
+                        let rows = staged_body(prompt, width, waits, folder);
+                        drawn.push((key, rows.clone()));
+                        rows
+                    });
                 std::iter::once(Line::default()).chain(shown)
             })
             .collect();
@@ -9307,7 +9403,7 @@ impl App {
                 // What this turn runs on and in: the bot may have moved, or
                 // a client chosen another model for it.
                 if let Some(workspace) = data["workspace"].as_str() {
-                    self.workspace = workspace.to_owned();
+                    self.set_workspace(workspace);
                 }
                 if let Some(model) = data["model"].as_str() {
                     self.model = model.to_owned();
@@ -9526,7 +9622,10 @@ impl App {
                     running.phase = "Compacting".into();
                 }
             }
-            "compacted" => self.notice = Some("compacted the conversation".into()),
+            "compacted" => {
+                self.compacted = Some(data.clone());
+                self.notice = Some("compacted the conversation".into());
+            }
             "compaction_failed" => {
                 self.notice = Some(format!(
                     "compaction failed: {}",
@@ -9708,10 +9807,7 @@ impl App {
                 {
                     self.ask_closed(&arguments);
                 }
-                if name == resolved::TOOL
-                    && !shown.1
-                    && !reactions::refused(&json!({"output": shown.0}))
-                {
+                if resolves(&name) && !shown.1 && !reactions::refused(&json!({"output": shown.0})) {
                     self.resolve(&arguments, id, turn, true).await;
                 }
                 if self.calls.is_empty() && !self.held.is_empty() {
@@ -10052,6 +10148,44 @@ impl App {
             more: false,
         });
         self.open_pane(pane::Pane::card("background", STATUS_KEYS));
+    }
+
+    /// What fills this agent's context, read-only: `/context` in the
+    /// pane, as `/mcp` is, until Esc. Its record is read once, now.
+    async fn context_card(&mut self) {
+        let record = match self
+            .client
+            .request("inspect", json!({"bot": self.bot}))
+            .await
+        {
+            Ok(record) => record,
+            Err(error) => {
+                self.notice = Some(format!("could not read {}: {error}", self.bot));
+                return;
+            }
+        };
+        let mut parts = context::Parts::from_record(&record);
+        (parts.used, parts.window) = (self.context, self.window);
+        // The compaction the record names: the one this window saw, or,
+        // in a fork (a side chat too), its source's, made before the fork
+        // and so in no event of this agent's.
+        parts.compacted = match record["compaction"].as_i64() {
+            None => None,
+            Some(version)
+                if self
+                    .compacted
+                    .as_ref()
+                    .is_some_and(|data| data["version"].as_i64() == Some(version)) =>
+            {
+                self.compacted.clone()
+            }
+            Some(version) => compaction_named(&self.options.socket, version).await,
+        };
+        let lines = context::card(&self.bot, &parts);
+        self.watch = None;
+        let mut pane = pane::Pane::card("context", "esc close");
+        pane.set_card(lines, "esc close");
+        self.open_pane(pane);
     }
 
     /// The tokens the project's agents spent, or every agent's, over
@@ -11238,29 +11372,7 @@ impl App {
     /// or being found in the conversation let go.
     /// Every key Sonny takes, beside the conversation.
     fn shortcuts(&mut self) {
-        let rows = [
-            ("enter", "send, or steer the running turn"),
-            ("tab", "queue for after the running turn"),
-            ("↑↓", "earlier prompts, past the first or last row"),
-            ("ctrl+r", "find an earlier prompt"),
-            ("shift+enter", "new line (alt+enter, ctrl+j)"),
-            ("esc", "interrupt, or stop a ! command"),
-            ("/", "commands"),
-            ("!", "run a command of your own"),
-            ("ctrl+o", "open or fold every row that folds"),
-            ("ctrl+f", "find in the conversation"),
-            ("home end", "first turn, newest turn"),
-            ("pgup pgdn", "scroll"),
-            ("tab", "with nothing typed, keys to the pane"),
-            ("ctrl+\\", "keys to the pane and back"),
-            ("ctrl+[ ctrl+]", "hide the pane, show it again"),
-            ("ctrl+g", "open the pane's agent in the main view"),
-            ("ctrl+t", "go to the pane's agent's own tab"),
-            ("alt+t ctrl+x", "boost the next message; again for more"),
-            ("ctrl+v", "paste a picture"),
-            ("ctrl+c", "copy the selection, clear, or quit"),
-            ("ctrl+l", "draw the screen again"),
-        ];
+        let rows = SHORTCUTS;
         let width = rows.iter().map(|(key, _)| key.width()).max().unwrap_or(0);
         let lines = rows
             .iter()
@@ -11916,7 +12028,7 @@ impl App {
             && key.kind != KeyEventKind::Release
             && key.code == KeyCode::Tab
             && !self.pane_keys
-            && let Some(guess) = self.suggested()
+            && let Some(guess) = self.suggested().filter(|guess| guess.takes())
         {
             // Only its words: where it came from is not part of it.
             let guess = guess.text.clone();
@@ -12574,6 +12686,11 @@ impl App {
             }
             return;
         }
+        if prompt == "/context" {
+            self.input.clear();
+            self.context_card().await;
+            return;
+        }
         if prompt == "/mcp" {
             self.input.clear();
             let lines = mcp::card();
@@ -12643,12 +12760,22 @@ impl App {
             }
             let chosen = project::chosen(&self.options.store, &self.bot);
             match project::instructions(std::path::Path::new(&self.workspace), chosen.as_deref()) {
-                Ok(text) => {
-                    self.instruct = Some(text);
+                Ok(composed) => {
+                    self.instruct = Some(composed.text);
                     if self.configure().await {
                         self.notice = Some("the lead has its folder's instructions".into());
                     } else if self.instruct.is_some() {
                         self.notice = Some("applies when idle".into());
+                    }
+                    // What it goes without is said over either, and told.
+                    if let Some(said) = project::warnings_notice(&composed.left_out, true) {
+                        self.notice = Some(said);
+                        if let Err(error) =
+                            project::tell_warnings(&self.client, &self.bot, &composed.left_out)
+                                .await
+                        {
+                            self.notice = Some(format!("the lead's instructions: {error}"));
+                        }
                     }
                 }
                 Err(error) => self.notice = Some(format!("the lead's instructions: {error}")),
@@ -13472,6 +13599,9 @@ impl App {
             });
             ask
         };
+        // A task's own ask alone: what a check found its reply left
+        // waiting on the person ([`waiting`]) is status, never a card.
+        let asked = |ask: &asks::Ask| !waiting::is_mark(ask);
         // With no multiplexer, the tasks this window started and tracks
         // still, as their rows read them.
         let tracked: std::collections::HashSet<&str> = (self.tasks.values().flatten())
@@ -13481,10 +13611,12 @@ impl App {
             Some(fleet) => (fleet.needs.asks())
                 .filter(|(bot, _)| *bot != self.bot && *bot != fleet.lead)
                 .filter(|(bot, _)| fleet.lineage.contains(*bot))
+                .filter(|(_, ask)| asked(ask))
                 .map(|(bot, ask)| pinned(bot, ask, fleet.short(bot).to_owned()))
                 .collect(),
             None => (self.task_needs.asks())
                 .filter(|(bot, _)| *bot != self.bot && tracked.contains(bot))
+                .filter(|(_, ask)| asked(ask))
                 .map(|(bot, ask)| {
                     let name = (self.project.as_deref())
                         .map_or_else(|| bot.to_owned(), |project| short(bot, project, &self.bot));
@@ -13846,22 +13978,27 @@ impl App {
     }
 
     /// A guess at the person's next message, after a turn of theirs ended
-    /// well, made by a copy of this bot on this window's model; unless the
-    /// config's `[sonny] suggest` is off, or the bot asked a question,
-    /// which its own card answers, or it is in zen: the guess reads all
-    /// the agent holds back, and could tell it.
+    /// well, made by a copy of this bot on this window's model, or an idea
+    /// or a tip where it has none unless `[sonny] suggest_ideas` is off;
+    /// unless the config's `[sonny] suggest` is off, or the bot asked a
+    /// question, which its own card answers, or it is in zen: the guess
+    /// reads all the agent holds back, and could tell it.
     fn suggest(&mut self) {
         self.suggestion = None;
-        if !self.asks.is_empty()
-            || self.zen.is_some()
-            || !agent_client::config::load().is_ok_and(|c| c.sonny.suggest)
-        {
+        let Some(ideas) = (agent_client::config::load().ok())
+            .filter(|c| c.sonny.suggest)
+            .map(|c| c.sonny.suggest_ideas.then(|| self.tipped.clone()))
+        else {
+            return;
+        };
+        if !self.asks.is_empty() || self.zen.is_some() {
             return;
         }
         self.suggesting = Some(tokio::spawn(suggest::guess(
             self.client.clone(),
             self.bot.clone(),
             self.turn_model.clone(),
+            ideas,
         )));
     }
 
@@ -13880,11 +14017,18 @@ impl App {
         {
             let job = self.suggesting.take().unwrap();
             self.suggestion = job.await.ok().flatten();
+            // A tip shows each command or key once in a window.
+            if let Some(guess) = &self.suggestion
+                && guess.cue == Some(suggest::Cue::Tip)
+                && let Some(first) = suggest::tipped_by(&guess.text)
+            {
+                self.tipped.push(first);
+            }
             // The agent it came from, found kept there: its name opens it.
-            if let Some(suggest::Origin::Agent(name)) = self
+            if let Some(suggest::Cue::Agent(name)) = self
                 .suggestion
                 .as_ref()
-                .and_then(|guess| guess.from.as_ref())
+                .and_then(|guess| guess.cue.as_ref())
             {
                 self.names.get_mut().learn(name.clone(), true);
             }
@@ -14699,7 +14843,7 @@ impl App {
         // Where the pane's program has its cursor.
         let mut pane_cursor = None;
         // Tab takes a guess at the next message while one shows.
-        let switch = match self.suggested() {
+        let switch = match self.suggested().filter(|guess| guess.takes()) {
             Some(_) => "ctrl+\\",
             None => "tab",
         };
@@ -15057,8 +15201,8 @@ impl App {
             // The agent the guess came from opens it, as its name does
             // wherever it is drawn: its last word, once it is an agent's.
             let cue = (self.suggested())
-                .and_then(|guess| match &guess.from {
-                    Some(suggest::Origin::Agent(name)) => Some(name),
+                .and_then(|guess| match &guess.cue {
+                    Some(suggest::Cue::Agent(name)) => Some(name),
                     _ => None,
                 })
                 .and_then(|name| {
@@ -15182,28 +15326,44 @@ impl App {
         if let Some(guess) = self.suggested() {
             // Where it came from, when not the reply just read, after the
             // key, so it reads as apart from what Tab takes; only beside
-            // the whole guess, which a narrow window gives the room.
-            let cue = (guess.from.as_ref())
-                .map(|from| (from, format!("  ↳ {}", from.name())))
-                .filter(|(_, cue)| {
-                    width >= prompt::LEAD + guess.text.width() + TAB.width() + cue.width()
+            // the whole guess, which a narrow window gives the room. An
+            // idea or a tip says so in a word of its own, without the
+            // arrow, as it came from nowhere, and keeps it however
+            // narrow: its words are cut first.
+            let cue = (guess.cue.as_ref())
+                .map(|cue| match cue.labels() {
+                    true => (cue, format!("  {}", cue.name())),
+                    false => (cue, format!("  ↳ {}", cue.name())),
+                })
+                .filter(|(cue, words)| {
+                    cue.labels()
+                        || width >= prompt::LEAD + guess.text.width() + TAB.width() + words.width()
                 });
+            // A tip for a key is only read: no key takes it.
+            let tab = match guess.takes() {
+                true => TAB,
+                false => "",
+            };
             let room = width.saturating_sub(
-                prompt::LEAD + TAB.width() + cue.as_ref().map_or(0, |(_, cue)| cue.width()),
+                prompt::LEAD + tab.width() + cue.as_ref().map_or(0, |(_, words)| words.width()),
             );
             let mut spans = vec![
                 Span::raw("› ").bold(),
                 // Italic too: a side chat's screen, read through vt100,
                 // loses the dim.
                 Span::raw(transcript::cut(&guess.text, room)).dim().italic(),
-                Span::raw(TAB).dim(),
+                Span::raw(tab).dim(),
             ];
-            if let Some((from, _)) = cue {
-                spans.push(Span::raw("  ↳ ").dim());
+            if let Some((cue, _)) = cue {
                 // An agent by its name, which opens it as anywhere (the
                 // draw links it); the margin, the commons and "earlier" in
                 // words.
-                spans.push(Span::raw(from.name().to_owned()).dim());
+                if !cue.labels() {
+                    spans.push(Span::raw("  ↳ ").dim());
+                } else {
+                    spans.push(Span::raw("  ").dim());
+                }
+                spans.push(Span::raw(cue.name().to_owned()).dim());
             }
             return (vec![Line::from(spans)], (0, prompt::LEAD));
         }
@@ -15927,9 +16087,68 @@ fn short(bot: &str, project: &str, lead: &str) -> String {
         .to_owned()
 }
 
-/// A message as it lands in the conversation. A command the person ran
-/// is by name only when `shown` holds it (this window showed its output
-/// when it ran, and lets it go), else whole.
+/// A staged message's rows by its turn, the width and the mark it
+/// waits with ([`App::staged_drawn`]).
+type StagedDrawn = ((i64, usize, Option<char>), Vec<Line<'static>>);
+
+/// The last `compacted` event's data for compaction `version`, of any
+/// agent: a fork's compaction is its source's, recorded under the source.
+/// On a connection of its own, closed once read, as `/sky`'s past is; the
+/// daemon reads only `compacted` events for it, by their own index.
+async fn compaction_named(socket: &Path, version: i64) -> Option<Value> {
+    let (client, mut events) = Client::connect(socket).await.ok()?;
+    let follow = json!({"bot": "*", "after": 0, "kinds": ["compacted"]});
+    client.request("follow", follow).await.ok()?;
+    let mut found = None;
+    while let Some(event) = events.recv().await {
+        match event["event"].as_str() {
+            // One merged into another at the same head says so again.
+            Some("compacted") if event["data"]["version"].as_i64() == Some(version) => {
+                found = Some(event["data"].clone());
+            }
+            Some("follow_live") => return found,
+            Some("lagged" | "follow_lagged") => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A message sent and not landed, dim, drawn as it will read once it
+/// does, its pictures found in `folder` as the landed one's are: an answer under the question it answers, a command by name,
+/// words as every surface draws Markdown, after `›` and what it waits
+/// for.
+fn staged_body(
+    prompt: &str,
+    width: usize,
+    waits: Option<char>,
+    folder: &std::path::Path,
+) -> Vec<Line<'static>> {
+    if let Some(ran) = user_shell::read(prompt) {
+        return user_shell::header(&ran.command, width, true);
+    }
+    let (first, rest) = match waits {
+        Some(mark) => (format!("›{mark} "), "   "),
+        None => ("› ".to_owned(), "  "),
+    };
+    let (asked, prompt) = match asks::split(prompt) {
+        Some((question, answer)) => (Some(asks::answering(question, width)), answer),
+        None => (None, prompt),
+    };
+    let leads = (Line::from(Span::raw(first)), Line::from(rest));
+    // Its pictures' paths start where the landed message's do.
+    let words = transcript::markdown(
+        &mut transcript::Markdown::in_folder(folder),
+        prompt,
+        width,
+        leads,
+    );
+    asked
+        .into_iter()
+        .chain(words.into_iter().map(|row| row.dim()))
+        .collect()
+}
+
 /// A message's first line, cut to quote it.
 fn first_words(text: &str) -> String {
     let first = text
@@ -15939,17 +16158,27 @@ fn first_words(text: &str) -> String {
     transcript::cut(first.trim(), QUOTED)
 }
 
-fn landed(text: &str, shown: &mut Vec<user_shell::Ran>, width: usize) -> Vec<Line<'static>> {
+/// A message as it lands in the conversation, with where it folds. A
+/// command the person ran is by name only when `shown` holds it (this
+/// window showed its output when it ran, and lets it go), else whole,
+/// and never folds.
+fn landed(
+    text: &str,
+    shown: &mut Vec<user_shell::Ran>,
+    width: usize,
+    folder: &std::path::Path,
+) -> (Vec<Line<'static>>, Option<usize>) {
     let Some(ran) = user_shell::read(text) else {
-        return transcript::prompt(text, None, width);
+        return transcript::prompt(text, width, Some(folder));
     };
-    match shown.iter().position(|seen| *seen == ran) {
+    let rows = match shown.iter().position(|seen| *seen == ran) {
         Some(at) => {
             shown.remove(at);
             user_shell::header(&ran.command, width, true)
         }
         None => user_shell::lines(&ran, width),
-    }
+    };
+    (rows, None)
 }
 
 fn first_line(text: &str) -> String {
@@ -17811,45 +18040,48 @@ mod tests {
         std::fs::remove_dir_all(home).unwrap();
     }
 
+    /// The guess a copy makes after a turn of the person's, given what it
+    /// says.
+    async fn guessed(said: &'static str) -> App {
+        let client = daemon_answering(move |asked| {
+            match (asked["op"].as_str(), asked["bot"].as_str()) {
+                (Some("fork"), _) => json!({"bot_id": 9, "head": 4}),
+                (Some("submit"), Some("b")) => json!({"turn": 1}),
+                (Some("submit"), _) => json!({"turn": 1, "handle": "turn:copy/1"}),
+                (Some("wait"), _) => json!({"results": {"turn:copy/1":
+                    {"status": "completed", "text": said}}}),
+                // Only shop.pricing is an agent the daemon keeps.
+                (Some("bots"), _) => match asked["name"].as_str() {
+                    Some("shop.pricing") => json!({"bots": [{"name": "shop.pricing"}]}),
+                    _ => json!({"bots": []}),
+                },
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        app.input.set("what changed in the cart?");
+        app.submit().await;
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        for _ in 0..200 {
+            app.suggested_now().await;
+            if app.suggestion.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        app
+    }
+
     #[tokio::test]
     async fn a_guess_from_news_says_where_from_after_the_key_and_tab_takes_only_its_words() {
         // The guess the copy makes, given what it says.
-        async fn guessed(said: &'static str) -> App {
-            let client = daemon_answering(move |asked| {
-                match (asked["op"].as_str(), asked["bot"].as_str()) {
-                    (Some("fork"), _) => json!({"bot_id": 9, "head": 4}),
-                    (Some("submit"), Some("b")) => json!({"turn": 1}),
-                    (Some("submit"), _) => json!({"turn": 1, "handle": "turn:copy/1"}),
-                    (Some("wait"), _) => json!({"results": {"turn:copy/1":
-                        {"status": "completed", "text": said}}}),
-                    // Only shop.pricing is an agent the daemon keeps.
-                    (Some("bots"), _) => match asked["name"].as_str() {
-                        Some("shop.pricing") => json!({"bots": [{"name": "shop.pricing"}]}),
-                        _ => json!({"bots": []}),
-                    },
-                    _ => json!({}),
-                }
-            })
-            .await;
-            let mut app = app(client);
-            app.input.set("what changed in the cart?");
-            app.submit().await;
-            app.daemon(turn_event("accepted", 1, json!({}))).await;
-            app.daemon(turn_event(
-                "turn_finished",
-                1,
-                json!({"status": "completed"}),
-            ))
-            .await;
-            for _ in 0..200 {
-                app.suggested_now().await;
-                if app.suggestion.is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            app
-        }
         let row = |app: &App, width| -> String {
             let (rows, _) = app.composer(width);
             rows[0].spans.iter().map(|s| s.content.as_ref()).collect()
@@ -17884,8 +18116,59 @@ mod tests {
             "push it",
         ] {
             let app = guessed(said).await;
-            assert_eq!(app.suggestion.as_ref().unwrap().from, None, "{said}");
+            assert_eq!(app.suggestion.as_ref().unwrap().cue, None, "{said}");
             assert!(row(&app, 80).ends_with("  tab"), "{said}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_idea_or_a_tip_says_so_in_a_word_kept_however_narrow() {
+        let row = |app: &App, width| -> String {
+            let (rows, _) = app.composer(width);
+            rows[0].spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let tab = || {
+            Event::Key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+            ))
+        };
+        // An idea: its word after the key, no arrow, as it came from
+        // nowhere; Tab takes its words.
+        let mut app = guessed("add a cold start benchmark\nidea").await;
+        assert_eq!(
+            app.suggestion.as_ref().unwrap().cue,
+            Some(suggest::Cue::Idea)
+        );
+        assert_eq!(row(&app, 80), "› add a cold start benchmark  tab  idea");
+        // Too narrow: the words are cut, the label kept.
+        let narrow = row(&app, 24);
+        assert!(narrow.ends_with("…  tab  idea"), "{narrow}");
+        app.key(tab()).await;
+        assert_eq!(&*app.input, "add a cold start benchmark");
+        // A tip for a command: Tab takes it, Enter would run it.
+        let mut app = guessed("/side why did the build slow down\ntip").await;
+        assert_eq!(
+            row(&app, 80),
+            "› /side why did the build slow down  tab  tip"
+        );
+        app.key(tab()).await;
+        assert_eq!(&*app.input, "/side why did the build slow down");
+        // A tip for a key is only read: no `tab`, and Tab does what it
+        // does otherwise.
+        let mut app = guessed("ctrl+r finds that earlier prompt\ntip").await;
+        assert_eq!(row(&app, 80), "› ctrl+r finds that earlier prompt  tip");
+        // Each command or key is tipped once in a window.
+        assert_eq!(app.tipped, ["ctrl+r"]);
+        app.key(tab()).await;
+        assert!(app.input.is_empty());
+        // A tip for what Sonny does not have shows nothing.
+        for said in [
+            "/teleport to the release branch\ntip",
+            "ctrl+z undoes the last turn\ntip",
+        ] {
+            let app = guessed(said).await;
+            assert_eq!(app.suggestion, None, "{said}");
         }
     }
 
@@ -17926,7 +18209,7 @@ mod tests {
             app.suggested().map(|g| g.text.as_str()),
             Some("run the tests")
         );
-        assert_eq!(app.suggested().unwrap().from, None);
+        assert_eq!(app.suggested().unwrap().cue, None);
         let (rows, _) = app.composer(80);
         let row: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(row, "› run the tests  tab");
@@ -19079,15 +19362,18 @@ mod tests {
         }
         app.shell_ran().await;
         assert_eq!(sent.lock().unwrap()[1]["delivery"], "steer");
-        let landed_here: Vec<String> = landed(prompt, &mut app.ran_here, 80)
-            .iter()
-            .map(|l| l.to_string())
-            .collect();
+        let landed_here: Vec<String> =
+            landed(prompt, &mut app.ran_here, 80, std::path::Path::new("."))
+                .0
+                .iter()
+                .map(|l| l.to_string())
+                .collect();
         assert_eq!(landed_here, ["! echo hello"]);
         let left: Vec<&str> = app.ran_here.iter().map(|r| r.command.as_str()).collect();
         assert_eq!(left, ["true"]);
         // Run in another window: shown whole.
-        let elsewhere: Vec<String> = landed(prompt, &mut Vec::new(), 80)
+        let elsewhere: Vec<String> = landed(prompt, &mut Vec::new(), 80, std::path::Path::new("."))
+            .0
             .iter()
             .map(|l| l.to_string())
             .collect();
@@ -19179,6 +19465,55 @@ mod tests {
         // One alone over it is still kept: the daemon says if it is too much.
         hold(&mut unsent, "y".repeat(UNSENT_BYTES * 2));
         assert_eq!(unsent.len(), 1);
+    }
+
+    #[test]
+    fn a_staged_message_finds_its_pictures_where_the_agent_works() {
+        let dir = std::env::temp_dir().join(format!("sonny-staged-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shot.png"), b"not drawn in tests").unwrap();
+        let shown = |folder: &std::path::Path| {
+            let rows = staged_body("![A shot](shot.png)", 80, None, folder);
+            rows.iter()
+                .map(|row| row.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Found there, it keeps its path, as the landed message does.
+        assert!(shown(&dir).contains("A shot (shot.png)"), "{}", shown(&dir));
+        let elsewhere = dir.join("elsewhere");
+        assert!(!shown(&elsewhere).contains("(shot.png)"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_staged_message_reads_as_it_will_land_and_is_drawn_once() {
+        let mut app = app(daemon_answering(|_| json!({"turn": 2})).await);
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.input
+            .set("Use **bold** and `code`:\n\n| a | b |\n|---|---|\n| 1 | 2 |");
+        app.submit().await;
+        let rows = app.staged_rows(80);
+        let shown: Vec<String> = rows.iter().map(|l| l.to_string()).collect();
+        assert_eq!(shown[1], "›↪ Use bold and code:", "{shown:?}");
+        assert!(
+            shown.iter().any(|row| row.contains("│ 1 │ 2 │")),
+            "{shown:?}"
+        );
+        assert!(
+            rows[1..rows.len() - 1]
+                .iter()
+                .filter(|row| row.width() > 0)
+                .all(|row| row.style.add_modifier.contains(Modifier::DIM))
+        );
+        // Drawn again only when its width or what it waits for changes.
+        app.staged_rows(80);
+        assert_eq!(app.staged_drawn.borrow().len(), 1);
+        app.staged_rows(60);
+        assert_eq!(app.staged_drawn.borrow().len(), 1, "the old width let go");
+        app.staged.clear();
+        app.staged_rows(60);
+        assert!(app.staged_drawn.borrow().is_empty());
     }
 
     #[tokio::test]
@@ -21158,7 +21493,7 @@ mod tests {
         assert_eq!(
             rows[2..],
             [
-                "↳ sent to calc.add, calc.neg, calc.div, calc.mul, removed calc.add ▸",
+                "↳ sent to calc.add, calc.neg, calc.div, calc.mul, cleaned up calc.add ▸",
                 "",
                 "• Messaged those.",
                 "",
@@ -21637,60 +21972,91 @@ mod tests {
     }
 
     #[test]
-    fn the_approver_is_kept_again_with_its_own_judge_and_this_build() {
-        let kept = json!({"name": APPROVER, "command": "/old/Cellar/sonny/0.7.0/bin/sonny",
+    fn the_reviewer_is_kept_again_with_its_own_model_and_this_build() {
+        let kept = json!({"name": REVIEWER, "command": "/old/Cellar/sonny/0.7.0/bin/sonny",
             "env": {"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": "0.7.0 1"}});
-        // A connect with one kept: this binary's build, its judge kept.
+        // A connect with one kept: this binary's build, its model kept.
         assert_eq!(
-            approver_env(Some(&kept), None, "0.8.0 2"),
+            reviewer_env(Some(&kept), None, "0.8.0 2"),
             Some(json!({"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": "0.8.0 2"}))
         );
-        // A lead on another model in auto keeps the first judge too.
+        // A lead on another model in auto keeps the first model too.
         assert_eq!(
-            approver_env(Some(&kept), Some("anthropic/claude-opus-5-5"), "0.8.0 2"),
-            approver_env(Some(&kept), None, "0.8.0 2")
+            reviewer_env(Some(&kept), Some("anthropic/claude-opus-5-5"), "0.8.0 2"),
+            reviewer_env(Some(&kept), None, "0.8.0 2")
         );
-        // None kept: a lead in auto starts one judged by its model; a
+        // None kept: a lead in auto starts one reviewing with its model; a
         // connect alone starts none.
         assert_eq!(
-            approver_env(None, Some("anthropic/claude-opus-5-5"), "0.8.0 2"),
+            reviewer_env(None, Some("anthropic/claude-opus-5-5"), "0.8.0 2"),
             Some(json!({"AGENT_MODEL": "anthropic/claude-opus-5-5", "SONNY_BUILD": "0.8.0 2"}))
         );
-        assert_eq!(approver_env(None, None, "0.8.0 2"), None);
+        assert_eq!(reviewer_env(None, None, "0.8.0 2"), None);
     }
 
-    #[tokio::test]
-    async fn every_start_keeps_the_approver_again_on_this_binary_with_its_judge() {
+    /// The companions `start_companions` adds and removes when the daemon
+    /// keeps `kept`.
+    async fn companions_kept_from(kept: Value) -> (Vec<Value>, Vec<String>) {
         let added = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = added.clone();
+        let removed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, gone) = (added.clone(), removed.clone());
         let client = daemon_answering(move |asked| {
             if let Some(add) = asked["add"].as_object() {
                 seen.lock().unwrap().push(Value::Object(add.clone()));
                 return json!({});
             }
-            json!({"companions": [{"name": APPROVER, "command": "/gone/sonny",
-                "args": ["approver"], "env": {"AGENT_MODEL": "openai/gpt-6"}}]})
+            if let Some(name) = asked["remove"].as_str() {
+                gone.lock().unwrap().push(name.to_owned());
+                return json!({"name": name, "removed": true});
+            }
+            json!({"companions": kept})
         })
         .await;
         start_companions(&client).await.unwrap();
         let added = added.lock().unwrap().clone();
+        let removed = removed.lock().unwrap().clone();
+        (added, removed)
+    }
+
+    #[tokio::test]
+    async fn every_start_keeps_the_reviewer_again_on_this_binary_with_its_model() {
+        let (added, removed) =
+            companions_kept_from(json!([{"name": REVIEWER, "command": "/gone/sonny",
+                "args": ["reviewer"], "env": {"AGENT_MODEL": "openai/gpt-6"}}]))
+            .await;
         let names: Vec<&str> = added.iter().filter_map(|a| a["name"].as_str()).collect();
-        assert_eq!(names, [LOOKOUT, TOOL_HOST, APPROVER]);
+        assert_eq!(names, [LOOKOUT, TOOL_HOST, REVIEWER]);
+        assert!(removed.is_empty());
         // Each by its own name, which is this binary.
         let me = std::env::current_exe().unwrap();
         for (add, name) in added
             .iter()
-            .zip([named::LOOKOUT, named::TOOL_HOST, named::APPROVER])
+            .zip([named::LOOKOUT, named::TOOL_HOST, named::REVIEWER])
         {
             assert_eq!(add["command"], json!(named::named(&me, name)));
             assert_eq!(add["env"][named::PROGRAM], json!(me));
         }
-        assert_eq!(added[2]["args"], json!(["approver"]));
+        assert_eq!(added[2]["args"], json!(["reviewer"]));
         assert_eq!(
             added[2]["env"],
             json!({"AGENT_MODEL": "openai/gpt-6", "SONNY_BUILD": lookout::identity(),
                 named::PROGRAM: me})
         );
+    }
+
+    #[tokio::test]
+    async fn the_reviewer_kept_by_its_old_name_moves_to_its_own_with_its_model() {
+        let (added, removed) =
+            companions_kept_from(json!([{"name": OLD_REVIEWER, "command": "/gone/sonny",
+                "args": ["approver"], "env": {"AGENT_MODEL": "openai/gpt-6"}}]))
+            .await;
+        let names: Vec<&str> = added.iter().filter_map(|a| a["name"].as_str()).collect();
+        assert_eq!(names, [LOOKOUT, TOOL_HOST, REVIEWER]);
+        assert_eq!(
+            (&added[2]["args"], &added[2]["env"]["AGENT_MODEL"]),
+            (&json!(["reviewer"]), &json!("openai/gpt-6"))
+        );
+        assert_eq!(removed, [OLD_REVIEWER]);
     }
 
     #[tokio::test]
@@ -21867,6 +22233,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_reads_the_agent_s_record_and_keeps_its_last_compaction() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            match request["op"].as_str() {
+                Some("inspect") => {
+                    json!({"name": "b", "instructions": "be brief", "tools": ["shell"],
+                    "declared": [], "compaction": 7})
+                }
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        let compacted = json!({"event": "compacted", "bot": "b", "turn": 3,
+            "data": {"version": 7, "summary_bytes": 400, "covered_turns": [1, 3], "reclaimed_bytes": 9000}});
+        app.daemon(compacted).await;
+        assert_eq!(app.compacted.as_ref().unwrap()["summary_bytes"], 400);
+        app.input.set("/context");
+        app.submit().await;
+        let inspect = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r["op"] == "inspect")
+            .cloned();
+        assert_eq!(inspect.unwrap()["bot"], "b");
+        assert_eq!(app.pane.as_ref().map(|pane| pane.title()), Some("context"));
+        let card = app.pane.as_ref().unwrap().card_text();
+        assert!(
+            card.iter().any(|row| row.contains("turns 1 to 3")),
+            "{card:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fork_s_compaction_is_read_from_its_source_s_events() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("sonny-compacted-{}", unique("t")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (read, mut write) = stream.into_split();
+                let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+                write
+                    .write_all(format!("{ready}\n").as_bytes())
+                    .await
+                    .unwrap();
+                let mut lines = BufReader::new(read).lines();
+                let Ok(Some(line)) = lines.next_line().await else {
+                    continue;
+                };
+                let asked: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(asked["kinds"], json!(["compacted"]));
+                let mut out = vec![json!({"id": asked["id"], "result": {"following": "*"}})];
+                let compacted = |version: i64, bytes: u64| {
+                    json!({"event": "compacted", "bot": "shop.lead",
+                        "data": {"version": version, "summary_bytes": bytes}})
+                };
+                // Merged at the same head, it says so again: the last counts.
+                out.extend([compacted(5, 50), compacted(9, 100), compacted(9, 200)]);
+                out.push(json!({"event": "follow_live", "bot": "*"}));
+                for event in out {
+                    write
+                        .write_all(format!("{event}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                while let Ok(Some(_)) = lines.next_line().await {}
+            }
+        });
+        let found = compaction_named(&socket, 9).await.unwrap();
+        assert_eq!(found["summary_bytes"], 200);
+        assert!(compaction_named(&socket, 4).await.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn held_words_survive_a_dropped_connection_and_a_narrower_pane() {
         let client = daemon_answering(|_| json!({})).await;
         let mut app = app(client);
@@ -21936,7 +22386,7 @@ mod tests {
         // The agent marks its reply as waiting on the person while no key or
         // event wakes the window: the next look round, at most a frame
         // later, reads it.
-        std::fs::write(&file, r#"{"turn": 3, "for": "a decision"}"#).unwrap();
+        std::fs::write(&file, r#"{"v": 2, "turn": 3, "for": "a decision"}"#).unwrap();
         waiting.read();
         assert!(waiting.holds(false));
         assert_eq!(waiting.mark.as_ref().unwrap().waiting_for, "a decision");
@@ -22786,6 +23236,14 @@ mod tests {
             .map(|(bot, ask)| (bot, ask.question.as_str()))
             .collect();
         assert_eq!(asked, [("calc.plan", "staging or prod")]);
+        // It is status: the lead's window pins no card for it, as it
+        // would for the task's own ask.
+        let mut app = app(client);
+        app.bot = "calc.lead".into();
+        app.fleet = Some(fleet);
+        app.pin_task_asks();
+        assert!(app.asks.is_empty() && app.pending.is_empty());
+        let mut fleet = app.fleet.take().unwrap();
         // Its next turn's check found nothing waiting.
         waiting::keep(&fleet.store, "calc.plan", 4, None).unwrap();
         fleet.rescan().await;
@@ -23617,7 +24075,7 @@ mod tests {
         app.input.clear();
         app.suggestion = Some(suggest::Guess {
             text: "run the tests".into(),
-            from: None,
+            cue: None,
         });
         app.key(ctrl('r')).await;
         app.key(key(KeyCode::Tab)).await;
@@ -23657,7 +24115,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         app.input.set("/co");
-        assert_eq!(first(&app), ["/compact", "/commons", "/config", "/copy"]);
+        assert_eq!(first(&app), ["/compact", "/commons", "/context", "/config"]);
         let keys = |app: &App| menu_keys(&app.menu(), app.pick, &app.input);
         assert_eq!(
             keys(&app),

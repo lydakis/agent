@@ -602,7 +602,7 @@ mod tests {
             {"name": "sonny-tool-host", "running": true, "started_ms": now - 3_600_000,
                 "restarts": 1, "last_exit": {"code": 1}},
             // A removed binary: down, waiting for its next start.
-            {"name": "approver-auto", "running": false, "started_ms": null, "restarts": 14,
+            {"name": "sonny-reviewer", "running": false, "started_ms": null, "restarts": 14,
                 "last_exit": {"error": "spawn_failed", "detail": "No such file"}},
             // Up again only seconds ago, after dying on a signal.
             {"name": "helper", "running": true, "started_ms": now - 5_000, "restarts": 1,
@@ -613,13 +613,13 @@ mod tests {
         assert_eq!(
             said,
             [
-                "approver-auto keeps restarting · could not start · 14 restarts",
+                "sonny-reviewer keeps restarting · could not start · 14 restarts",
                 "helper keeps restarting · killed by signal 9 · 1 restart",
             ]
         );
         assert_eq!(
             alerts[0].detail,
-            "its log: ~/.agent/state.sqlite.companions/approver-auto.log"
+            "its log: ~/.agent/state.sqlite.companions/sonny-reviewer.log"
         );
         let lines = alert_lines(&alerts[0], 80);
         let mark = (lines[0].spans.iter())
@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(mark.style.fg, Some(Color::Red));
         assert_eq!(
             lines[1].to_string(),
-            "  its log: ~/.agent/state.sqlite.companions/approver-auto.log"
+            "  its log: ~/.agent/state.sqlite.companions/sonny-reviewer.log"
         );
     }
 

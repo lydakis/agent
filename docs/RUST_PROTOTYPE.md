@@ -392,8 +392,8 @@ only that it is an object of at most 64 KiB as JSON
 say, as a failed call. It is stored on the turn (`turns.output_schema`,
 schema 81), so a resumed turn asks for it too and a resend naming another is
 an `idempotency_conflict`. It shapes the turn it starts: with `steer` or
-`attach` it is `invalid_delivery`. The judge `sonny approver` runs asks its
-verdict this way.
+`attach` it is `invalid_delivery`. The reviewer model `sonny reviewer` runs
+asks its verdict this way.
 
 `submit` also accepts `images`, pictures sent with the prompt: up to 20 of
 `{"media_type", "data"}`, the type one of `image/png`, `image/jpeg`,
@@ -3329,11 +3329,11 @@ tools instead, and `fork` takes both. `full`, the default, gates nothing.
 `auto` gates the same tools but `read`, tagged `auto`, with a 105 s
 expiry (the approver's 90 s review budget plus margin), and refuses with
 `approver_not_serving`, before any bot is made, when no session serves
-`auto`: the CLI judges nothing. The approver is a client of its own,
-`sonny approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL]
-[--note FILE]`, which Sonny keeps as the daemon's companion: it serves a
-tag and has a judge decide every call waiting on it, printing one JSON line
-per round ([APPROVALS.md](APPROVALS.md#automatic-mode)). `agent approvals [--bot NAME] [--tag TAG]` lists pending
+`auto`: the CLI decides nothing. The approver is a client of its own,
+Sonny's reviewer, `sonny reviewer [--tag TAG] [--model PROVIDER/MODEL]
+[--effort LEVEL] [--note FILE]`, which Sonny keeps as the daemon's
+companion: it serves a tag and has a model decide every call waiting on it,
+printing one JSON line per round ([sonny/REVIEWER.md](../sonny/REVIEWER.md)). `agent approvals [--bot NAME] [--tag TAG]` lists pending
 calls, `agent answer --bot NAME --turn N --call ID --request R allow|deny
 [--tag T] [--reason TEXT]` decides one and refuses to run inside a bot's
 tool shell, and `run --pretty` prints each pending call with the commands

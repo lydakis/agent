@@ -1,12 +1,13 @@
-//! `sonny approver`: serve a gate tag and have a judge model decide every
-//! call waiting on it, in one request a round. The policy (what the judge is
-//! told, the verdicts, what it sees, and redaction) is
-//! `agent_client::approver` and the judge's transport `agent_client::judge`;
-//! this is the loop. Sonny keeps it as the daemon's companion; the daemon
-//! holds only the gates it serves.
+//! `sonny reviewer`: serve a gate tag and have a reviewer model decide
+//! every call waiting on it, in one request a round. The policy (what the
+//! reviewer is told, the verdicts, what it sees, and redaction) is
+//! `agent_client::approver` and the reviewer's transport
+//! `agent_client::judge`; this is the loop. Sonny keeps it as the daemon's
+//! companion, the daemon's approver for the tag; the daemon holds only the
+//! gates it serves.
 //! As in Codex, a denial goes back to the model at once, and a round the
-//! judge never assessed is denied as a review failure; only a call too long
-//! to show is handed to a person, where one can be asked.
+//! reviewer never assessed is denied as a review failure; only a call too
+//! long to show is handed to a person, where one can be asked.
 use agent_client::Error;
 use agent_client::{
     Client,
@@ -28,15 +29,15 @@ use tokio::sync::Notify;
 pub struct Settings {
     pub socket: PathBuf,
     pub tag: String,
-    /// The judge `--judge` or the config's `[judge] model` names, if either
-    /// does.
-    pub judge: Option<String>,
-    /// The model the bots being judged run, `AGENT_MODEL`, when no judge
-    /// is named: the last in the order a judge is picked in.
+    /// The model `--model` or the config's `[reviewer] model` names, if
+    /// either does.
+    pub model: Option<String>,
+    /// The model the bots being reviewed run, `AGENT_MODEL`, when no model
+    /// is named: the last in the order the reviewer's is picked in.
     pub caller: Option<String>,
-    /// A model judge's effort.
+    /// The reviewer's effort.
     pub effort: Option<String>,
-    /// The environment note the judge always sees.
+    /// The environment note the reviewer always sees.
     pub note: Option<String>,
 }
 
@@ -64,9 +65,15 @@ const FILE_BYTES: u64 = 48 * 1024;
 /// this the rest is left out, and the judge is told.
 const HISTORY_NODES: usize = 2_000;
 const HISTORY_PAGE: usize = 50;
-/// A judge fork is `approver.TAG` and the fork's suffix, and every bot
-/// name fits 128 bytes.
-const JUDGE_NAME_ROOM: usize = 128 - "approver.".len() - judge::FORK_SUFFIX;
+/// A reviewer's fork is its base, `.reviewer.TAG`, and the fork's suffix,
+/// and every bot name fits 128 bytes.
+const JUDGE_NAME_ROOM: usize = 128 - ".reviewer.".len() - judge::FORK_SUFFIX;
+
+/// The base bot the reviewer serving `tag` forks for each round: one of
+/// Sonny's own, by its reserved mark.
+pub fn base_name(tag: &str) -> String {
+    crate::project::internal(&format!("reviewer.{tag}"))
+}
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -80,15 +87,15 @@ fn epoch_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
-const USAGE: &str = "usage: sonny approver [--tag TAG] [--judge PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--store PATH] [--socket PATH]";
+const USAGE: &str = "usage: sonny reviewer [--tag TAG] [--model PROVIDER/MODEL] [--effort LEVEL] [--note FILE] [--store PATH] [--socket PATH]";
 
-/// `sonny approver`: the flags over the person's `[judge]` in
-/// ~/.agent/config.toml, then `AGENT_MODEL` for the judge, and
-/// `AGENT_APPROVER_NOTE` for the note.
+/// `sonny reviewer`: the flags over the person's `[reviewer]` in
+/// ~/.agent/config.toml, then `AGENT_MODEL` for the model, and
+/// `AGENT_REVIEWER_NOTE` for the note.
 pub fn run(args: &[String]) -> std::result::Result<(), String> {
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-    let (mut store, mut socket, mut tag, mut judge, mut effort) = (None, None, None, None, None);
-    let mut note = env("AGENT_APPROVER_NOTE").map(PathBuf::from);
+    let (mut store, mut socket, mut tag, mut model, mut effort) = (None, None, None, None, None);
+    let mut note = env("AGENT_REVIEWER_NOTE").map(PathBuf::from);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let (flag, inline) = match arg.split_once('=') {
@@ -100,7 +107,7 @@ pub fn run(args: &[String]) -> std::result::Result<(), String> {
             "--store" => store = Some(PathBuf::from(value()?)),
             "--socket" => socket = Some(PathBuf::from(value()?)),
             "--tag" => tag = Some(value()?),
-            "--judge" => judge = Some(value()?),
+            "--model" => model = Some(value()?),
             "--effort" => effort = Some(value()?),
             "--note" => note = Some(PathBuf::from(value()?)),
             _ => return Err(USAGE.into()),
@@ -112,9 +119,9 @@ pub fn run(args: &[String]) -> std::result::Result<(), String> {
     let settings = Settings {
         socket,
         tag: tag.unwrap_or_else(|| "auto".into()),
-        judge: judge.or(config.judge.model),
+        model: model.or(config.reviewer.model),
         caller: env("AGENT_MODEL"),
-        effort: effort.or(config.judge.effort),
+        effort: effort.or(config.reviewer.effort),
         note,
     };
     main(settings).map(drop).map_err(|error| {
@@ -122,7 +129,7 @@ pub fn run(args: &[String]) -> std::result::Result<(), String> {
     })
 }
 
-/// The note file, which the judge sees whole: refused past what it reads.
+/// The note file, which the reviewer sees whole: refused past what it reads.
 fn read_note(path: &Path) -> std::result::Result<String, String> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
@@ -142,7 +149,7 @@ fn read_note(path: &Path) -> std::result::Result<String, String> {
         .map_err(|_| unreadable())?;
     if note.len() > limit {
         return Err(format!(
-            "{} is over {limit} bytes, more than a judge sees",
+            "{} is over {limit} bytes, more than the reviewer sees",
             path.display()
         ));
     }
@@ -155,6 +162,25 @@ pub fn main(settings: Settings) -> Result<i32> {
         .build()
         .map_err(|e| Error::with("io", &e.to_string()))?
         .block_on(serve(settings))
+}
+
+/// The migration that names the reviewer's base and companion by the
+/// reviewer's name (0.9.1).
+pub const RENAMED: &str = "reviewer-names";
+
+/// Before 0.9.1 the base was `approver.TAG`, which a folder's agents
+/// could be named too: one still there that is a reviewer's base goes.
+/// A base runs no turns of its own (each round is a fork, removed once
+/// answered), so it holds no history: what it holds is made again from
+/// the instructions, as a base whose model changed already is.
+/// [`RENAMED`]
+async fn retire_old_base(client: &Client, tag: &str) {
+    let old = format!("approver.{tag}");
+    if let Ok(bot) = client.request("inspect", json!({"bot": old})).await
+        && judge::is_judge(&bot, policy::JUDGE_INSTRUCTIONS)
+    {
+        let _ = client.request("delete", json!({"bot": old})).await;
+    }
 }
 
 /// What a judge request came back with.
@@ -232,24 +258,24 @@ async fn serve(settings: Settings) -> Result<i32> {
     let (client, mut events) = Client::connect(&settings.socket).await?;
     client.bound(IN_FLIGHT);
     let named =
-        judge::pick(settings.judge.as_deref(), settings.caller.as_deref()).ok_or_else(|| {
+        judge::pick(settings.model.as_deref(), settings.caller.as_deref()).ok_or_else(|| {
             Error::with(
-                "judge_required",
-                "auto needs a judge: pass --judge PROVIDER/MODEL, or set [judge] model in ~/.agent/config.toml or AGENT_MODEL",
+                "model_required",
+                "auto needs a reviewer model: pass --model PROVIDER/MODEL, or set [reviewer] model in ~/.agent/config.toml or AGENT_MODEL",
             )
         })?;
     // An approver the daemon refuses the tag never replaces the base of
     // the one serving it.
     if !judge::is_model(&named) {
         return Err(Error::with(
-            "invalid_judge",
+            "invalid_model",
             &format!("{named} is not PROVIDER/MODEL"),
         ));
     }
     if tag.len() > JUDGE_NAME_ROOM {
         return Err(Error::with(
             "invalid_tag",
-            &format!("a judge's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"),
+            &format!("a reviewer's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"),
         ));
     }
     let served = client
@@ -265,7 +291,7 @@ async fn serve(settings: Settings) -> Result<i32> {
     // It looks before it answers only where a sandbox keeps it read-only,
     // as Codex's guardian does: the daemon refuses the sandbox where none
     // runs.
-    let name = format!("approver.{tag}");
+    let name = base_name(&tag);
     let make = |tools: &'static [&'static str]| {
         judge::Base::make(
             &client,
@@ -280,6 +306,7 @@ async fn serve(settings: Settings) -> Result<i32> {
         Err(error) if error.code == "sandbox_unavailable" => make(&[]).await?,
         made => made?,
     };
+    retire_old_base(&client, &tag).await;
     let shared = Arc::new(Shared {
         client,
         judge: Judge {
@@ -297,7 +324,7 @@ async fn serve(settings: Settings) -> Result<i32> {
     // The CLI that started this process waits for this line: the judge is
     // ready, not just the lease held.
     report(
-        json!({"event":"serving","tag":tag,"lease":lease,"judge":named,
+        json!({"event":"serving","tag":tag,"lease":lease,"model":named,
         "pid":std::process::id()}),
     );
     let mut rounds = tokio::task::JoinSet::new();
@@ -552,8 +579,8 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
     }
     let timing = spent.timing;
     report(
-        json!({"event":"judged","bot":bot,"turn":turn,"calls":answered,
-        "judge_ms":judge_ms,"input_tokens":usage.input,"cached_tokens":usage.cached,
+        json!({"event":"reviewed","bot":bot,"turn":turn,"calls":answered,
+        "review_ms":judge_ms,"input_tokens":usage.input,"cached_tokens":usage.cached,
         "output_tokens":usage.output,"attempts":attempts,"timed_attempts":spent.timed,
         "evidence_ms":spent.evidence.as_millis() as u64,"queued_ms":timing.queued_ms,
         "looking_ms":timing.looking_ms,"tools_ms":timing.tools_ms,
@@ -673,7 +700,7 @@ async fn judge(
             spent.judged(timing.as_ref());
             let reply = reply.map(|reply| logged_reply(&shared.redactor, &reply));
             report(
-                json!({"event":"judge_failed","bot":bot,"turn":turn,"detail":why,
+                json!({"event":"review_failed","bot":bot,"turn":turn,"detail":why,
                 "reply":reply}),
             );
             Err(Unreviewed::Failed(why))

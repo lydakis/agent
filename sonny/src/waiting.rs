@@ -3,7 +3,10 @@
 //! the person can take. Once a turn of an agent of a Sonny project ends
 //! with words and no question open, the window of its project that sees it
 //! end asks a copy of the agent, with no tools, whether that reply waits on
-//! the person, and for what ([`spawn`]). The copy runs at once, so it reads
+//! the person, and for what ([`spawn`]). A task's reply goes to its lead,
+//! which hears every one and brings the person what needs them in its own
+//! reply, so a task's turn waits on the person only when it took in their
+//! own words, written in its window. The copy runs at once, so it reads
 //! the history while the provider's cache of the turn just ended is warm.
 //! The answer is kept beside the store, `STORE.waiting/BOT.json`, holding
 //! the turn it covers and, with a yes, what the person is waited on for
@@ -16,8 +19,9 @@
 //!
 //! Every surface that counts what waits on the person reads a yes as that
 //! agent's open question while no later turn of its started
-//! ([`crate::needs::Seen::open`]): the footer, `/status`, the agent's tab
-//! and its lead's window, where a word typed under it goes to the agent.
+//! ([`crate::needs::Seen::open`]): the footer, `/status` and the agent's
+//! tab. It is status alone: no window draws it as a card in its
+//! conversation, as it does a question the agent asked.
 //! The same copy names the code reviews its turn opened, updated or waits
 //! on, in whatever system holds them, as its commands' output or its reply
 //! say ([`crate::reviews`]): a copy reads a homegrown tool as the agent
@@ -41,6 +45,8 @@ const EXPIRE: Duration = Duration::from_secs(180);
 /// The most of what the person is waited on for a mark keeps, in
 /// characters.
 const FOR_CHARS: usize = 200;
+/// What a mark is kept as now: one kept otherwise holds nothing.
+const KEPT: u64 = 2;
 /// What the copy is asked.
 const ASK: &str = "[A CHECK FROM SONNY, answered in JSON alone; nothing here reaches the person.] \
     Read your last reply as the person will. Does it leave something only they can give before \
@@ -102,9 +108,12 @@ pub fn read(store: &Path, bot: &str) -> Option<Mark> {
     read_file(&file(store, bot))
 }
 
-/// The mark kept in `file`, if any.
+/// The mark kept in `file`, if any. One without [`KEPT`] is 0.9.0's,
+/// which read a task's turn its lead started as waiting on the person
+/// too, and holds nothing.
 pub fn read_file(file: &Path) -> Option<Mark> {
     let kept: Value = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
+    (kept["v"] == KEPT).then_some(())?;
     Some(Mark {
         turn: kept["turn"].as_i64()?,
         waiting_for: kept["for"].as_str()?.to_owned(),
@@ -120,7 +129,7 @@ pub fn keep(store: &Path, bot: &str, turn: i64, mark: Option<&Mark>) -> Result<(
             return Ok(());
         }
         let kept = match mark {
-            Some(mark) => json!({"turn": mark.turn, "for": mark.waiting_for}),
+            Some(mark) => json!({"v": KEPT, "turn": mark.turn, "for": mark.waiting_for}),
             None => json!({"turn": turn}),
         };
         replace(&file(store, bot), kept.to_string().as_bytes())
@@ -353,11 +362,44 @@ async fn waiting_for(
     crate::reviews::note(store, bot, bot_id, turn, &reviews(&reply))?;
     let waiting = answer(&reply)
         .ok_or_else(|| format!("the check's reply was not the JSON asked for: {reply}"))?;
+    if waiting.is_none() {
+        return Ok(None);
+    }
+    if !crate::project::is_lead(bot) && !heard_the_person(client, bot, turn).await? {
+        return Ok(None);
+    }
     let asked = crate::needs::scan(client, bot, Some(turn))
         .await
         .is_some_and(|seen| seen.ask.is_some());
     Ok(waiting.filter(|_| !asked))
 }
+
+/// Whether `bot`'s turn `turn` took in the person's own words: its prompt
+/// or a message steered into it, theirs, not another agent's, a client's
+/// or another person's. The daemon reads a turn's words whole however
+/// long it ran; past [`PROMPTS`] bytes of them it is read again whole.
+/// Words past even that may be theirs: unsure, it counts them, as a mark
+/// is status alone, and one wrongly withheld would be kept for good.
+async fn heard_the_person(client: &Client, bot: &str, turn: i64) -> Result<bool, String> {
+    for bytes in [PROMPTS, PROMPTS_MOST] {
+        let read = client
+            .request("prompts", json!({"bot": bot, "turn": turn, "bytes": bytes}))
+            .await
+            .map_err(|e| e.to_string())?;
+        let theirs = (read["prompts"].as_array().into_iter().flatten()).any(|words| {
+            words["from"].is_null() && words["origin"].is_null() && words["person"].is_null()
+        });
+        if theirs || read["prompts_more"] != true {
+            return Ok(theirs);
+        }
+    }
+    Ok(true)
+}
+
+/// How many bytes of a turn's words [`heard_the_person`] reads first, and
+/// at most: the daemon's own bound.
+const PROMPTS: usize = 16 * 1024;
+const PROMPTS_MOST: usize = 256 * 1024;
 
 /// Ask a copy of `bot`, with no tools, whether its turn `turn`'s reply
 /// waits on the person, and what reviews it named: its reply, in JSON
@@ -531,6 +573,11 @@ mod tests {
         keep(&store, "calc.a", 3, None).unwrap();
         assert_eq!(read(&store, "calc.a"), Some(mark(4)));
         let kept = read(&store, "calc.a").unwrap();
+        // 0.9.0's mark, kept without its version, holds nothing.
+        let old = json!({"turn": 4, "for": "which branch"}).to_string();
+        std::fs::write(file(&store, "calc.a"), old).unwrap();
+        assert_eq!(read(&store, "calc.a"), None);
+        keep(&store, "calc.a", 4, Some(&mark(4))).unwrap();
         assert!(holds(&kept, Some(4), false));
         assert!(!holds(&kept, Some(4), true));
         assert!(!holds(&kept, Some(5), false));
@@ -612,6 +659,20 @@ mod tests {
                     {"status": "completed", "text": " "}}}),
                 Some("wait") => json!({"results": {handle: {"status": "completed",
                     "text": r#"{"waiting": true, "for": "staging or prod", "reviews": ["CR-881"]}"#}}}),
+                // calc.plan's turn 3 started with its lead's brief and took
+                // in the person's words as a steer, its long brief read
+                // whole on a second read; calc.told's only its lead's,
+                // which hears its reply.
+                Some("prompts") => {
+                    let lead = json!({"turn": 3, "text": "brief", "from": {"bot": "calc.lead", "turn": 2}});
+                    match (request["bot"].as_str(), request["bytes"].as_u64()) {
+                        (Some("calc.told"), _) => json!({"prompts": [lead], "prompts_more": false}),
+                        (Some("calc.long"), _) => json!({"prompts": [lead], "prompts_more": true}),
+                        (_, Some(16384)) => json!({"prompts": [lead], "prompts_more": true}),
+                        _ => json!({"prompts": [lead, {"turn": 4, "text": "Ship it.", "steer": true}],
+                            "prompts_more": false}),
+                    }
+                }
                 // Turn 3 ended at node 12; a later turn began since.
                 Some("history_nodes") => json!({"nodes": [{"node": 14, "turn": 4},
                     {"node": 12, "turn": 3}, {"node": 11, "turn": 3}]}),
@@ -629,6 +690,25 @@ mod tests {
             .join("store");
         assert_eq!(
             waiting_for(&client, &store, "calc.plan", 5, 3).await,
+            Ok(Some("staging or prod".into()))
+        );
+        // A task's turn its lead started replies to the lead, which takes
+        // to the person what needs them: nothing waits on them here, while
+        // the reviews it named are still kept.
+        assert_eq!(
+            waiting_for(&client, &store, "calc.told", 6, 3).await,
+            Ok(None)
+        );
+        assert_eq!(crate::reviews::read(&store, "calc.told", 6), ["CR-881"]);
+        // Words past even the daemon's bound may be the person's: unsure,
+        // they count, as a mark is status alone.
+        assert_eq!(
+            waiting_for(&client, &store, "calc.long", 8, 3).await,
+            Ok(Some("staging or prod".into()))
+        );
+        // A lead's reply is the person's to read, whoever started its turn.
+        assert_eq!(
+            waiting_for(&client, &store, "calc.lead", 7, 3).await,
             Ok(Some("staging or prod".into()))
         );
         // The review the copy says its reply named, in any system, is

@@ -98,6 +98,14 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // The daemon's binary in an agent's shell; in a terminal, the one
     // Sonny would start.
     let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+    // A task cleaned up keeps its agent, and so its name; one that can't
+    // be read is left to the start, which says what it found.
+    if bot_record(&agent, &start.env, name).is_some_and(|bot| bot["name"] == name) {
+        return Err(format!(
+            "{name} is a task already, done or not: message it to give it more work, or give \
+             this one another name"
+        ));
+    }
     // With the provider keys the app keeps, should this start the daemon;
     // read before the folder is made, so a bad env file leaves nothing.
     let mut command = crate::agent_command(&agent)?;
@@ -159,7 +167,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // The lead's mode, whose sandbox the task works in, and Sonny's git for
     // it in a sandbox too unless the lead has none; and the lead's state
     // folder, which the task writes as the lead does.
-    let lead = lead_record(&agent, &start.env, starter);
+    let lead = bot_record(&agent, &start.env, starter);
     let mode = (lead.as_ref())
         .and_then(crate::approvals::mode)
         .unwrap_or_else(crate::approvals::default);
@@ -939,8 +947,8 @@ fn ends_name(after: &str, part_of_name: impl Fn(char) -> bool) -> bool {
     }
 }
 
-/// The lead `name` as `inspect` gives it: none when it can't be read.
-fn lead_record(agent: &Path, env: &[(String, String)], name: &str) -> Option<Value> {
+/// The bot `name` as `inspect` gives it: none when it can't be read.
+fn bot_record(agent: &Path, env: &[(String, String)], name: &str) -> Option<Value> {
     let output = Command::new(agent)
         .envs(env.iter().map(|(key, value)| (key, value)))
         .args(["inspect", "--bot", name])
@@ -1093,11 +1101,8 @@ fn own(bots: &[Value], lead: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn listed(agent: &Path, name: &str) -> bool {
-    listed_on(agent, &[], name)
-}
-
-/// [`listed`], on the daemon `env` names when it names one.
+/// Whether the daemon `env` names, or this shell's, lists `name`: so when
+/// it can't be read, to keep a task's folder.
 fn listed_on(agent: &Path, env: &[(String, String)], name: &str) -> bool {
     let Ok(output) = Command::new(agent)
         .envs(env.iter().map(|(key, value)| (key, value)))
@@ -1638,13 +1643,20 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
 
-/// A `remove_task` call: remove the task and the worktree Sonny made it,
-/// once its changes are committed, its branch kept unless merged; a folder
-/// of its own only with `discard`, once the task says its work is pushed.
-/// `discard` removes them anyway. An agent still working is not removed,
-/// and then neither is anything else. Says what was removed and what was
-/// kept.
-pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> {
+/// A `remove_task` call: mark the task done, as `mark_done` does, and
+/// remove the worktree Sonny made it, once its changes are committed, its
+/// branch kept unless merged; a folder of its own only with `discard`, once
+/// the task says its work is pushed. `discard` removes them anyway. The
+/// agent and its history stay: only the person deletes those, by hand. A
+/// task still working is left as it is. For a task no longer there, removes
+/// the folder it left. Says what was done and what was kept; the mark is
+/// kept beside `store`, made by the call `call`.
+pub fn remove(
+    here: &Path,
+    name: &str,
+    discard: bool,
+    (store, call): (&Path, &str),
+) -> Result<String, String> {
     let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
     let branch = format!("agent/{name}");
     let path = home_dir()?.join(".agent/worktrees").join(name);
@@ -1675,8 +1687,7 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
             ));
         }
     };
-    // What would be lost, checked while the task can still be kept, and again
-    // once it is gone and can write no more.
+    // What would be lost, checked before anything changes.
     let kept = || -> Result<(), String> {
         if !discard
             && let Some((_, path)) = &worktree
@@ -1720,18 +1731,30 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
         Ok(())
     };
     kept()?;
-    if listed(&agent, name) {
-        let output = crate::agent_command(&agent)?
-            .args(["rm", "--bot", name])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("running {}: {e}", agent.display()))?;
-        if !output.status.success() {
-            let said = String::from_utf8_lossy(&output.stderr);
-            return Err(not_removed(name, said.trim()));
-        }
-        kept().map_err(|e| format!("{name}'s bot was removed, but {e}"))?;
+    // Its newest turns while it is there: one not finished, running or
+    // waiting to, keeps the task as it is.
+    let bot = listing(&agent, name)?;
+    // The turn the daemon says runs, however many messages steered into it
+    // since, each a turn of its own already ended.
+    if let Some(running) = bot.as_ref().and_then(|bot| bot["running_turn"].as_i64()) {
+        return Err(busy(name, running));
     }
+    let turns = match bot {
+        Some(_) => Some(turns_of(&agent, name)?),
+        None => None,
+    };
+    if let Some(turn) = (turns.iter().flatten()).find(|turn| turn["finished_ms"].is_null()) {
+        return Err(busy(name, turn["turn"].as_i64().unwrap_or(0)));
+    }
+    // Done first, so a removal cut short leaves a task done, which a call
+    // again tidies.
+    if let Some(turns) = &turns {
+        crate::resolved::keep(store, name, crate::resolved::upto(turns, i64::MAX), call)?;
+    }
+    let did = |what: &str| match turns {
+        Some(_) => format!("Marked {name} done and {what} its"),
+        None => format!("{} {name}'s", capitalized(what)),
+    };
     if let Some((repo, path)) = &worktree {
         // Checked for changes and submodules above, in the sandbox: git's own check would
         // run the repository's fsmonitor and filters as the person, so it
@@ -1747,46 +1770,81 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
             .ok()
             .and_then(|top| std::fs::canonicalize(top).ok())
             .is_some_and(|top| &top == repo);
+        let did = did("removed");
         if crate::git::plain(repo, &["branch", delete, &branch]).is_err() {
             return Ok(match ours {
                 true => format!(
-                    "Removed {name}. {branch} is kept, since it has commits not merged here; \
+                    "{did} worktree. {branch} is kept, since it has commits not merged here; \
                      `git branch -D {branch}` deletes it."
                 ),
                 false => format!(
-                    "Removed {name}. {branch} is kept in {}, since it has commits not merged \
+                    "{did} worktree. {branch} is kept in {}, since it has commits not merged \
                      there; `git -C {} branch -D {branch}` deletes it.",
                     repo.display(),
                     shell_quote(repo)
                 ),
             });
         }
+        return Ok(format!("{did} worktree."));
     }
     if let Some(path) = &folder {
         std::fs::remove_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))?;
         if let Ok(record) = record_of(name) {
             let _ = std::fs::remove_file(record);
         }
+        return Ok(format!("{} folder.", did("deleted")));
     }
-    Ok(format!("Removed {name}."))
+    match turns {
+        Some(_) => Ok(format!("Marked {name} done.")),
+        None => Err(format!("no task or folder of a task is named {name}")),
+    }
 }
 
-/// Why `agent rm` did not remove `name`, from what it wrote to stderr: a
-/// task at work is removed only once its turn ends, which says how.
-fn not_removed(name: &str, said: &str) -> String {
-    let error: Value = serde_json::from_str(said).unwrap_or_default();
-    match error["error"].as_str() {
-        Some("bot_busy") => {
-            let turn = (error["running_turn"].as_i64())
-                .map_or(String::new(), |turn| format!(" (turn {turn})"));
-            format!(
-                "{name} was not removed: it is working{turn}, and only an idle agent is \
-                 removed. Its update reaches you when the turn ends; remove it then, or end the \
-                 turn first with `agent interrupt --bot {name}`"
-            )
-        }
-        _ => format!("{name} was not removed: {said}"),
+fn capitalized(word: &str) -> String {
+    let mut chars = word.chars();
+    chars.next().map_or(String::new(), |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+/// The newest turns of `name`, as `agent turns` lists them, newest first.
+fn turns_of(agent: &Path, name: &str) -> Result<Vec<Value>, String> {
+    let output = crate::agent_command(agent)?
+        .args(["turns", "--bot", name, "--newest", "--limit", "16"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("running {}: {e}", agent.display()))?;
+    let said = String::from_utf8_lossy(&output.stderr);
+    match serde_json::from_slice::<Value>(&output.stdout) {
+        Ok(Value::Array(turns)) if output.status.success() => Ok(turns),
+        _ => Err(format!("{name}'s turns could not be read: {}", said.trim())),
     }
+}
+
+/// `name` as `agent ls` lists it, none when it is not there.
+fn listing(agent: &Path, name: &str) -> Result<Option<Value>, String> {
+    let output = Command::new(agent)
+        .args(["ls", "--name", name])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("running {}: {e}", agent.display()))?;
+    match serde_json::from_slice::<Value>(&output.stdout) {
+        Ok(Value::Array(bots)) => Ok(bots.into_iter().find(|bot| bot["name"] == name)),
+        _ => Err(format!(
+            "whether {name} is there could not be read: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// Why `name`, whose turn `turn` has not ended, is left as it is: a task
+/// is cleaned up once it is idle, which says how.
+fn busy(name: &str, turn: i64) -> String {
+    format!(
+        "{name} was left as it is: its turn {turn} has not ended, and only an idle task is cleaned up. \
+         Its update reaches you when the turn ends; clean it up then, or end the turn first \
+         with `agent interrupt --bot {name}`"
+    )
 }
 
 #[cfg(test)]
@@ -1794,15 +1852,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_task_at_work_is_not_removed_and_says_how_it_can_be() {
-        let busy = r#"{"error":"bot_busy","detail":"turn 4 of fix is running","running_turn":4}"#;
-        let said = not_removed("fix", busy);
-        assert!(said.contains("it is working (turn 4)"), "{said}");
+    fn a_task_at_work_is_left_as_it_is_and_says_how_it_can_be_cleaned_up() {
+        let said = busy("fix", 4);
+        assert!(said.contains("its turn 4 has not ended"), "{said}");
         assert!(said.contains("`agent interrupt --bot fix`"), "{said}");
-        assert_eq!(
-            not_removed("fix", "bot_not_found"),
-            "fix was not removed: bot_not_found"
-        );
+        assert_eq!(capitalized("removed"), "Removed");
     }
 
     /// Agent's binary built beside these tests, when it runs a sandbox

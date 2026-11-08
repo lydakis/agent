@@ -32,7 +32,7 @@ program. The daemon holds the conversation history, calls the model
 providers, runs the tools, and keeps the approval gates a client sets.
 
 Sonny is a client of that socket. It makes a lead bot for a folder and
-tasks under it, runs the daemon's companions (the automatic approver, the
+tasks under it, runs the daemon's companions (the reviewer, the
 lookout, the tool host), schedules triggers with the system's scheduler,
 keeps memory, skills and the commons under `~/.agents`, reaches the
 person's MCP servers, and drives a browser. Everything Sonny adds runs as
@@ -157,21 +157,22 @@ vulnerability, whether or not the code's own documentation agrees.
 - The daemon holds the mechanism and no policy: a gate names tools whose
   calls wait for a verdict from whoever serves its tag. A call needs an
   allow from every gate, the first deny denies it, and who decided is
-  recorded on the call. A gate's expiry denies a call nobody judged. The
+  recorded on the call. A gate's expiry denies a call nobody decided. The
   daemon's default is no gate.
 - Only a bot's client can set or replace its gates; a sandboxed bot's own
   commands cannot. A fork keeps its source's gates, and a bot another bot
   makes takes its creator's.
-- Under a sandbox, only a call that leaves it is judged; a confined call
+- Under a sandbox, only a call that leaves it is gated; a confined call
   runs without a verdict. Sonny's served tools wait for one too, since
   they act outside the sandbox.
-- Sonny's automatic approver (`auto`, the row a new lead starts in) sends
-  every gated call to a judge model with Codex's guardian policy and
-  denies what the judge calls dangerous or unclear, what it could not
-  assess, and a round the judge never answered. Known secrets in what the
-  judge is shown are redacted before they leave the machine. Three
+- Sonny's reviewer (`auto`, the row a new lead starts in; `sonny reviewer`,
+  [sonny/REVIEWER.md](sonny/REVIEWER.md)) sends every gated call to a
+  reviewer model with Codex's guardian policy and denies what the model
+  calls dangerous or unclear, what it could not assess, and a round it
+  never answered. Known secrets in what the
+  reviewer is shown are redacted before they leave the machine. Three
   denials in a row, or ten among the last fifty, trip a breaker that
-  interrupts the turn. The judge reads `AGENTS.md` files as the person's
+  interrupts the turn. The reviewer reads `AGENTS.md` files as the person's
   standing instructions, so a checkout's `AGENTS.md` is as trusted as the
   checkout.
 - Any agent can pull the andon cord (`pause`), which cancels running turns
@@ -198,7 +199,7 @@ vulnerability, whether or not the code's own documentation agrees.
   `[shell_environment_policy]` in `config.toml` leaves them out: as in
   Codex, `*KEY*`, `*SECRET*` and `*TOKEN*` are withheld only with
   `ignore_default_excludes = false`, and `exclude` names more. The
-  daemon's companions (Sonny's approver, lookout and tool host) inherit
+  daemon's companions (Sonny's reviewer, lookout and tool host) inherit
   its environment whole, provider keys included.
 - A secret found while importing an MCP server goes to `~/.agent/env`,
   never to `config.toml`. Sonny's home backup leaves `~/.agent/env`,
@@ -364,7 +365,7 @@ is built.
   daemon's own socket and so full daemon authority. A rule matches a
   command's first words, so `allow` on `git` lets out every `git`
   subcommand, and the program is found on the daemon's `PATH`.
-- A judge model is a model. The automatic approver reduces, and does not
+- A reviewer model is a model. Sonny's reviewer reduces, and does not
   remove, the chance that an injected instruction is carried out.
 - `web_fetch` reaches the daemon host's own networks.
 - Nothing in the store is encrypted at rest, and nothing on the daemon's
