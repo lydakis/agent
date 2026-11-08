@@ -62,7 +62,7 @@ pub async fn listing(client: &Client, bot: Option<&str>) -> agent_client::Result
 /// What an agent's history says: the question it has open, whole,
 /// whether its last turn resolved it, and that turn, the newest its
 /// history holds.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Seen {
     pub ask: Option<crate::asks::Ask>,
     pub itself: bool,
