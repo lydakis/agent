@@ -223,6 +223,11 @@ pub async fn items(client: &Client, bot: &str, nodes: &[i64]) -> (Vec<(i64, Valu
                     if let Some(quotes) = quotes.as_ref().filter(|_| item["role"] == "user") {
                         item["quotes"] = quotes.clone();
                     }
+                    // When a message joined the history, which the window
+                    // shows on hover.
+                    if item["role"].is_string() && entry["written_ms"].is_i64() {
+                        item["written_ms"] = entry["written_ms"].clone();
+                    }
                     (node, item)
                 })
         }));

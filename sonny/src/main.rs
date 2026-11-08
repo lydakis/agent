@@ -8163,6 +8163,14 @@ impl App {
         self.pending.len() - count
     }
 
+    /// When the message at `node` was written, as the daemon dated `item`,
+    /// for the window to show over it under the mouse.
+    fn dated(&mut self, node: i64, item: &Value) {
+        if let Some(ms) = item["written_ms"].as_i64() {
+            self.screen.date(node, ms);
+        }
+    }
+
     /// The bot's words at `node`, as replayed: their last row tagged,
     /// and the person's reactions to them right under it.
     fn commit_said(&mut self, node: i64, lines: Vec<Line<'static>>) {
@@ -8757,6 +8765,7 @@ impl App {
                                 }
                             }
                         }
+                        self.dated(node, &item);
                         self.land(
                             node,
                             (&text(&item), &quotes_of(&item)),
@@ -8773,6 +8782,7 @@ impl App {
                                 std::path::Path::new(&self.workspace),
                             );
                             said = Some((node, lines));
+                            self.dated(node, &item);
                             if !older {
                                 self.saw_reply(node, &reply);
                                 self.last_reply = reply;
@@ -9291,6 +9301,7 @@ impl App {
                     && !quiet_message(&text(item))
                 {
                     self.elsewhere |= transcript::relays(&text(item), item["from"].as_str());
+                    self.dated(node, item);
                     self.land(
                         node,
                         (&text(item), &quotes_of(item)),
@@ -9317,6 +9328,7 @@ impl App {
                     if !transcript::relays(&text(item), item["from"].as_str()) {
                         self.elsewhere = false;
                     }
+                    self.dated(node, item);
                     self.land(
                         node,
                         (&text(item), &quotes_of(item)),
@@ -9431,6 +9443,7 @@ impl App {
                     self.last_reply = text(item);
                     if let Some(node) = data["node"].as_i64() {
                         self.saw_reply(node, &text(item));
+                        self.dated(node, item);
                     }
                 }
                 // Words written when the next item began are this message.
@@ -18117,6 +18130,33 @@ mod tests {
             _ => json!({}),
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn a_message_drawn_keeps_when_the_daemon_wrote_it_for_the_mouse() {
+        let entries = json!([
+            {"node": 2, "written_ms": 2_000, "item": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Both checks pass."}]}},
+            {"node": 1, "written_ms": 1_000, "item": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Check the tally work"}]}},
+        ]);
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => json!({"nodes": [{"node": 2, "turn": 1, "written_ms": 2_000},
+                {"node": 1, "turn": 1, "written_ms": 1_000}], "next_from": null}),
+            Some("history_items") => json!({"items": entries.as_array().into_iter().flatten()
+                .filter(|entry| asked["nodes"].as_array().into_iter().flatten()
+                    .any(|node| *node == entry["node"]))
+                .cloned()
+                .collect::<Vec<_>>()}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 100;
+        app.history().await;
+        drawn(&mut app);
+        assert_eq!(app.screen.dated(1), Some(1_000));
+        assert_eq!(app.screen.dated(2), Some(2_000));
     }
 
     #[tokio::test]

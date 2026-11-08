@@ -247,7 +247,13 @@ pub struct Screen {
     /// The react mark drawn last, where the reactions under the agent's
     /// message under the mouse go: its row and column, and the node.
     react: Option<(u16, u16, i64)>,
+    /// When each message was written, by its node, in Unix milliseconds:
+    /// shown over the message under the mouse.
+    dates: HashMap<i64, i64>,
 }
+
+/// The columns before a message's words: its bullet or arrow and a space.
+const GUTTER: u16 = 2;
 
 /// The mark a message's gutter shows under the mouse: a click answers it.
 pub const REPLY: &str = "↩";
@@ -384,6 +390,16 @@ impl Screen {
     }
 
     /// `mark` on the last row pushed; whether there was one.
+    /// When the message at `node` was written, `ms` in Unix milliseconds.
+    pub fn date(&mut self, node: i64, ms: i64) {
+        self.dates.insert(node, ms);
+    }
+
+    #[cfg(test)]
+    pub fn dated(&self, node: i64) -> Option<i64> {
+        self.dates.get(&node).copied()
+    }
+
     pub fn mark_last(&mut self, mark: Mark) -> bool {
         let laid = self.wrapped == self.rows.len();
         let Some(row) = self.rows.last_mut() else {
@@ -884,6 +900,7 @@ impl Screen {
             },
         );
         self.placed = None;
+        self.dates.extend(older.dates);
         self.swap(0, older.rows);
         self.let_go(None);
     }
@@ -933,6 +950,7 @@ impl Screen {
             return;
         };
         self.pages[page].drawn = true;
+        self.dates.extend(older.dates);
         self.swap(page, older.rows);
         self.let_go(Some(page));
     }
@@ -1693,6 +1711,23 @@ impl Screen {
                 .set_symbol(REPLY)
                 .set_style(Style::new().add_modifier(Modifier::DIM));
             self.reply = Some((y, area.x, node));
+            // When it was written, muted where its words start, on the row
+            // over them: only a row on screen with nothing on it, the gap
+            // over an agent's words or the band's over the person's, so
+            // the time never covers anything and no row is made wider.
+            if at > top
+                && self.shown[at - 1].line.width() == 0
+                && let Some(&ms) = self.dates.get(&node)
+                && area.width > GUTTER
+            {
+                buf.set_stringn(
+                    area.x + GUTTER,
+                    y - 1,
+                    crate::stamp::written(ms),
+                    (area.width - GUTTER) as usize,
+                    Style::new().add_modifier(Modifier::DIM),
+                );
+            }
         }
         // An agent's message under the mouse shows the react mark where
         // its reactions go, after any there, muted as the reply mark is.
@@ -2562,6 +2597,56 @@ mod tests {
         screen.mouse(mouse(MouseEventKind::Moved, 3, 6));
         let buf = draw(&mut screen);
         assert!(row(&buf, 6).starts_with("↩ thanks"), "{:?}", row(&buf, 6));
+    }
+
+    #[test]
+    fn the_message_under_the_mouse_shows_when_it_was_written_on_the_empty_row_over_it() {
+        let mut screen = Screen::default();
+        screen.push(vec![Line::from("• The tests pass.")]);
+        screen.mark_last(Mark::Tag(Tag::End(5)));
+        screen.push(vec![Line::default(), Line::from("› thanks")]);
+        screen.mark_last(Mark::Tag(Tag::End(6)));
+        // Words right under a step, no blank row between them.
+        screen.push(vec![
+            Line::from("  ran the tests"),
+            Line::from("• Tagged it."),
+        ]);
+        screen.mark_last(Mark::Tag(Tag::End(7)));
+        let ms = 1_794_042_780_000;
+        for node in [5, 6, 7] {
+            screen.date(node, ms);
+        }
+        let when = crate::stamp::written(ms);
+        let area = Rect::new(0, 0, 40, 6);
+        let draw = |screen: &mut Screen| {
+            let mut buf = Buffer::empty(area);
+            screen.render(area, &mut buf, |_| None);
+            buf
+        };
+        // Nothing at rest.
+        let buf = draw(&mut screen);
+        assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
+        // Over a message, its time where its words start, on the blank row
+        // over them, muted.
+        screen.mouse(mouse(MouseEventKind::Moved, 4, 2));
+        let buf = draw(&mut screen);
+        assert_eq!(row(&buf, 1).trim_end(), format!("  {when}"));
+        assert!(buf[(2, 1)].modifier.contains(Modifier::DIM));
+        assert!(row(&buf, 2).starts_with("↩ thanks"));
+        // The first row on screen has no row over it: no time.
+        screen.mouse(mouse(MouseEventKind::Moved, 4, 0));
+        let buf = draw(&mut screen);
+        assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
+        // A row with words on it over the message is left as it is.
+        screen.mouse(mouse(MouseEventKind::Moved, 4, 4));
+        let buf = draw(&mut screen);
+        assert!(
+            row(&buf, 4).starts_with("↩ Tagged it."),
+            "{:?}",
+            row(&buf, 4)
+        );
+        assert_eq!(row(&buf, 3).trim_end(), "  ran the tests");
+        assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
     }
 
     #[test]
