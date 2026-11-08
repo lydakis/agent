@@ -81,6 +81,12 @@ pub enum Completion {
     },
 }
 
+/// The waiters on one handle, or of one session: in the order they were
+/// made (turns by id, then requests by counter), each found in a log of
+/// how many there are, so however many wait on one handle, each leaves
+/// at the same cost.
+type Waiters = BTreeSet<Waiter>;
+
 /// Who is waiting: parked turns are keyed by turn id, requests by a counter.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Waiter {
@@ -117,10 +123,10 @@ struct Inner {
     waiters: HashMap<Waiter, Waiting>,
     /// Who waits on each handle. A waiter is listed under its own handles
     /// only, so leaving touches those and no one else's.
-    by_turn: HashMap<(String, i64), Vec<Waiter>>,
-    by_process: HashMap<i64, Vec<Waiter>>,
+    by_turn: HashMap<(String, i64), Waiters>,
+    by_process: HashMap<i64, Waiters>,
     /// Each session's request waiters, so a session closing finds its own.
-    by_session: HashMap<u64, Vec<Waiter>>,
+    by_session: HashMap<u64, Waiters>,
     // Only immutable, durable outcomes, retained while a waiter needs them.
     retained: HashMap<String, Retained>,
     // Answers still reading their pending turns, each holding its session's
@@ -442,16 +448,17 @@ impl Handles {
             // storage, so an error resolves it instead of stranding the wait.
             let remaining = handles.iter().cloned().collect();
             if let Completion::Respond { session, .. } = completion {
-                inner.by_session.entry(session).or_default().push(waiter);
+                inner.by_session.entry(session).or_default().insert(waiter);
             }
             for handle in parsed.iter().flatten() {
                 match handle {
-                    Handle::Turn { bot, turn } => inner
-                        .by_turn
-                        .entry((bot.clone(), *turn))
-                        .or_default()
-                        .push(waiter),
-                    Handle::Process(id) => inner.by_process.entry(*id).or_default().push(waiter),
+                    Handle::Turn { bot, turn } => {
+                        let key = (bot.clone(), *turn);
+                        inner.by_turn.entry(key).or_default().insert(waiter);
+                    }
+                    Handle::Process(id) => {
+                        inner.by_process.entry(*id).or_default().insert(waiter);
+                    }
                 }
             }
             inner.waiters.insert(
@@ -701,9 +708,9 @@ impl Handles {
 }
 
 /// Take `waiter` off the list under `key`, and the list once it is empty.
-fn unlist<K: std::hash::Hash + Eq>(lists: &mut HashMap<K, Vec<Waiter>>, key: K, waiter: Waiter) {
+fn unlist<K: std::hash::Hash + Eq>(lists: &mut HashMap<K, Waiters>, key: K, waiter: Waiter) {
     if let std::collections::hash_map::Entry::Occupied(mut list) = lists.entry(key) {
-        list.get_mut().retain(|w| *w != waiter);
+        list.get_mut().remove(&waiter);
         if list.get().is_empty() {
             list.remove();
         }
@@ -771,8 +778,8 @@ mod tests {
                     deadline: None,
                 },
             );
-            inner.by_process.insert(2, vec![Waiter::Request(1)]);
-            inner.by_process.insert(1, vec![Waiter::Request(1)]);
+            inner.by_process.insert(2, [Waiter::Request(1)].into());
+            inner.by_process.insert(1, [Waiter::Request(1)].into());
         }
         handles.process_finished(2, json!({"exit_code":0}));
         {
@@ -813,7 +820,7 @@ mod tests {
                     deadline: None,
                 },
             );
-            inner.by_process.insert(2, vec![Waiter::Request(1)]);
+            inner.by_process.insert(2, [Waiter::Request(1)].into());
         }
         // The reader is busy, so the answer's read of its pending turn waits.
         let (started, busy) = std::sync::mpsc::channel();
@@ -916,7 +923,7 @@ mod tests {
                     },
                 );
                 for process in [1, 2] {
-                    inner.by_process.entry(process).or_default().push(waiter);
+                    inner.by_process.entry(process).or_default().insert(waiter);
                 }
             }
         }
@@ -965,9 +972,9 @@ mod tests {
                     deadline: None,
                 },
             );
-            inner.by_process.entry(turn).or_default().push(waiter);
+            inner.by_process.entry(turn).or_default().insert(waiter);
             let peer = ("Peer".to_owned(), turn);
-            inner.by_turn.entry(peer).or_default().push(waiter);
+            inner.by_turn.entry(peer).or_default().insert(waiter);
         }
         drop(inner);
         handles
@@ -1014,8 +1021,8 @@ mod tests {
             let handles_ = ["proc:9001".to_owned()];
             {
                 let mut inner = handles.inner.lock().unwrap();
-                inner.by_process.entry(9001).or_default().push(waiter);
-                inner.by_session.entry(session).or_default().push(waiter);
+                inner.by_process.entry(9001).or_default().insert(waiter);
+                inner.by_session.entry(session).or_default().insert(waiter);
                 inner.waiters.insert(
                     waiter,
                     Waiting {
@@ -1035,7 +1042,7 @@ mod tests {
         handles.close_session(7);
         {
             let inner = handles.inner.lock().unwrap();
-            assert_eq!(inner.by_process[&9001], [second]);
+            assert_eq!(inner.by_process[&9001], [second].into());
             assert!(!inner.by_session.contains_key(&7));
             assert_eq!(inner.waiters.len(), 8_001);
         }
@@ -1063,6 +1070,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn many_waits_on_one_handle_each_leave_at_the_same_cost() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-one-handle-test-{}", std::process::id()));
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        // One session sends `n` waits on one command, as a controller
+        // pipelining them might, and as many parked turns wait on it too.
+        let finish = |n: u64| {
+            let handles = Handles::new(mpsc::unbounded_channel().0);
+            let output = Output::writer(tokio::io::sink());
+            {
+                let mut inner = handles.inner.lock().unwrap();
+                for id in 1..=n {
+                    for (waiter, completion) in [
+                        (
+                            Waiter::Request(id),
+                            Completion::Respond {
+                                session: 7,
+                                output: output.clone(),
+                                request: json!(id),
+                                reader: store.reader(),
+                            },
+                        ),
+                        (
+                            Waiter::Turn(id as i64),
+                            Completion::Resume {
+                                bot: "Bob".into(),
+                                turn: id as i64,
+                            },
+                        ),
+                    ] {
+                        inner.by_process.entry(1).or_default().insert(waiter);
+                        if let Waiter::Request(_) = waiter {
+                            inner.by_session.entry(7).or_default().insert(waiter);
+                        }
+                        let remaining = ["proc:1".to_owned()].into();
+                        inner.waiters.insert(
+                            waiter,
+                            Waiting {
+                                generation: 0,
+                                any: false,
+                                remaining,
+                                results: BTreeMap::new(),
+                                completion,
+                                deadline: None,
+                            },
+                        );
+                    }
+                }
+            }
+            let started = std::time::Instant::now();
+            // Half the turns leave before it ends; the rest wake with the
+            // requests, and leave.
+            for turn in (1..=n as i64).step_by(2) {
+                handles.forget(Waiter::Turn(turn));
+            }
+            handles.process_finished(1, json!({"exit_code":0}));
+            for turn in (2..=n as i64).step_by(2) {
+                handles.take(turn);
+            }
+            let elapsed = started.elapsed();
+            let inner = handles.inner.lock().unwrap();
+            assert!(inner.waiters.is_empty() && inner.by_session.is_empty());
+            assert!(inner.by_process.is_empty() && inner.retained.is_empty());
+            elapsed
+        };
+        let n = 32_000;
+        let grew = crate::doubling::outgrows(|twice| finish(if twice { 2 * n } else { n }));
+        assert_eq!(grew, None, "{n} waits on one handle, then twice as many");
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_waiter_attached_again_lets_go_of_what_it_held() {
         let dir = std::env::temp_dir().join(format!("agent-reattach-test-{}", std::process::id()));
         let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
@@ -1085,7 +1165,7 @@ mod tests {
                 },
             );
             for process in [1, 2] {
-                inner.by_process.entry(process).or_default().push(waiter);
+                inner.by_process.entry(process).or_default().insert(waiter);
             }
         }
         handles.process_finished(1, json!({"exit_code":0}));

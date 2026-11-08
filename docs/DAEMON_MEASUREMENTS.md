@@ -7627,9 +7627,16 @@ command and leaves:
 | 4,000 | 82 ms | 2.9 ms | 12 µs | 0.02 µs |
 | 16,000 | 2,950 ms | 12.6 ms | 40 µs | 0.03 µs |
 
-Per waiter it stays near 0.7 µs from 100 to 16,000. Memory: one map entry
-per session with a `wait` pending, removed with its last request. The
+Per waiter it stays near 0.7 µs from 100 to 16,000. The waiters on one
+handle, and one session's requests, are ordered sets (in the order they
+were made), so many waits on the same handle each leave in a log of how
+many there are: one session pipelining 32,000 waits on one command beside
+32,000 parked turns finishes in well under a second, where lists take
+seconds. Memory: a set per handle someone waits on (a B-tree node, about
+200 bytes, where a list held 64), and one per session with a `wait`
+pending, each removed with its last waiter. The
 tests `a_waiter_leaving_costs_the_same_however_many_others_wait` and
 `a_closing_session_takes_its_own_waits_and_no_one_elses` time 8,000 and
-16,000 and fail when twice as many take three times as long; both failed
-against the old scans (16,000 took minutes in a debug build).
+16,000, and `many_waits_on_one_handle_each_leave_at_the_same_cost` times
+32,000 and 64,000; each fails when twice as many take three times as long,
+and each failed against the scans or lists it replaces.
