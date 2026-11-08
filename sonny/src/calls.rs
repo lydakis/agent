@@ -772,7 +772,7 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
         crate::served::REMOVE => Some(said(
             match arguments["discard"] == true {
                 true => "Discarded",
-                false => "Removed",
+                false => "Cleaned up",
             },
             field("task")?,
         )),
@@ -1201,7 +1201,7 @@ Keep the rest.'"#,
         );
         assert_eq!(
             call("remove_task", serde_json::json!({"task": "fix"})),
-            "Removed fix"
+            "Cleaned up fix"
         );
         assert_eq!(
             call(

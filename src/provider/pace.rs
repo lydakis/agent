@@ -123,7 +123,7 @@ struct State {
     /// limit, oldest first, for a provider that leaves cache reads out.
     counted: std::collections::VecDeque<u32>,
     /// Allowance set aside for calls parked until it refills.
-    booked: Vec<Booking>,
+    booked: Booked,
 }
 
 /// The scale of a counted-input share: parts per million.
@@ -132,12 +132,77 @@ const SHARE: u64 = 1_000_000;
 /// A parked call's share of the allowance, taken when it parked so each
 /// later call parks behind it, and spent by the first call to arrive once it
 /// is due. One no call spends returns to the allowance after `BOOKING_GRACE`.
-#[derive(Debug)]
-struct Booking {
-    due: Instant,
-    costs: [u64; DIMS],
-}
 const BOOKING_GRACE: Duration = Duration::from_secs(5);
+
+/// Where a booking stands among the others: when it is due, then the order
+/// it was made in.
+type BookingKey = (Instant, u64);
+
+/// Every parked call's booking, soonest due first, and what they hold
+/// together in each dimension, so an admission reads the soonest and the
+/// totals without visiting the rest, however many calls are parked.
+#[derive(Debug, Default)]
+struct Booked {
+    by_due: std::collections::BTreeMap<BookingKey, [u64; DIMS]>,
+    held: [u64; DIMS],
+    next: u64,
+}
+impl Booked {
+    fn len(&self) -> usize {
+        self.by_due.len()
+    }
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.by_due.is_empty()
+    }
+    /// What every booking holds in dimension `index`.
+    fn held(&self, index: usize) -> u64 {
+        self.held[index]
+    }
+    fn book(&mut self, due: Instant, costs: [u64; DIMS]) {
+        self.next += 1;
+        self.by_due.insert((due, self.next), costs);
+        for (held, cost) in self.held.iter_mut().zip(costs) {
+            *held += cost;
+        }
+    }
+    /// The soonest booking, if it is due by `by`.
+    fn due_by(&self, by: Instant) -> Option<BookingKey> {
+        let (&key, _) = self.by_due.first_key_value()?;
+        (key.0 <= by).then_some(key)
+    }
+    fn costs(&self, key: BookingKey) -> [u64; DIMS] {
+        self.by_due[&key]
+    }
+    /// Set what a booking holds, keeping the totals.
+    fn hold(&mut self, key: BookingKey, costs: [u64; DIMS]) {
+        let old = std::mem::replace(self.by_due.get_mut(&key).expect("a booking"), costs);
+        for ((held, old), new) in self.held.iter_mut().zip(old).zip(costs) {
+            *held = *held - old + new;
+        }
+    }
+    /// Move a booking to a later due, keeping its place among those made
+    /// at the same time.
+    fn defer(&mut self, key: BookingKey, due: Instant) {
+        if let Some(costs) = self.by_due.remove(&key) {
+            self.by_due.insert((due, key.1), costs);
+        }
+    }
+    fn cancel(&mut self, key: BookingKey) -> Option<[u64; DIMS]> {
+        let costs = self.by_due.remove(&key)?;
+        for (held, cost) in self.held.iter_mut().zip(costs) {
+            *held -= cost;
+        }
+        Some(costs)
+    }
+    /// Take off the bookings whose grace ran out by `now`, soonest first.
+    fn lapsed(&mut self, now: Instant) -> impl Iterator<Item = [u64; DIMS]> + '_ {
+        std::iter::from_fn(move || {
+            let key = self.due_by(now.checked_sub(BOOKING_GRACE)?)?;
+            self.cancel(key)
+        })
+    }
+}
 
 /// The output and counted-input estimates follow this many of the latest
 /// calls, once they have `OUTPUT_KNOWN` of them.
@@ -192,7 +257,7 @@ impl State {
         }
         for (index, dim) in self.tokens.iter_mut().enumerate() {
             if let Some(limit) = dim.bucket.per_minute {
-                let held = self.booked.iter().map(|b| b.costs[index]).sum::<u64>() as f64;
+                let held = self.booked.held(index) as f64;
                 dim.bucket.available = dim.bucket.available.min(limit - held);
             }
         }
@@ -200,16 +265,12 @@ impl State {
     /// Return to the allowance what parked calls booked and none spent.
     fn unbook_expired(&mut self, now: Instant) {
         let (requests, tokens) = (&mut self.requests, &mut self.tokens);
-        self.booked.retain(|booking| {
-            let keep = booking.due + BOOKING_GRACE > now;
-            if !keep {
-                requests.give(1.0);
-                for (dim, cost) in tokens.iter_mut().zip(booking.costs) {
-                    dim.bucket.give(cost as f64);
-                }
+        for costs in self.booked.lapsed(now) {
+            requests.give(1.0);
+            for (dim, cost) in tokens.iter_mut().zip(costs) {
+                dim.bucket.give(cost as f64);
             }
-            keep
-        });
+        }
     }
     /// How long a call of `costs` waits: zero once it is admitted, having
     /// taken its estimate, or the booking `due` that pays for it. A wait no
@@ -219,7 +280,7 @@ impl State {
     fn admit_or_book(
         &mut self,
         costs: [u64; DIMS],
-        due: Option<usize>,
+        due: Option<BookingKey>,
         now: Instant,
         park_for: &mut Option<Duration>,
     ) -> crate::Result<Duration> {
@@ -233,7 +294,7 @@ impl State {
         if due.is_some() {
             request -= self.booked.len() as f64;
             for (index, need) in need.iter_mut().enumerate() {
-                *need -= self.booked.iter().map(|b| b.costs[index]).sum::<u64>() as f64;
+                *need -= self.booked.held(index) as f64;
             }
         }
         let mut wait = self.requests.shortfall(request);
@@ -258,16 +319,12 @@ impl State {
                     dim.bucket.take(cost as f64);
                 }
                 if park {
-                    self.booked.push(Booking {
-                        due: now + refill,
-                        costs,
-                    });
+                    self.booked.book(now + refill, costs);
                 }
             }
             Some(at) => {
-                let booking = &mut self.booked[at];
-                for ((dim, cost), held) in self.tokens.iter_mut().zip(costs).zip(&mut booking.costs)
-                {
+                let mut booking = self.booked.costs(at);
+                for ((dim, cost), held) in self.tokens.iter_mut().zip(costs).zip(&mut booking) {
                     match cost.checked_sub(*held) {
                         Some(grew) => {
                             dim.bucket.take(grew as f64);
@@ -278,9 +335,10 @@ impl State {
                         None => {}
                     }
                 }
+                self.booked.hold(at, booking);
                 match park {
-                    true => booking.due = now + refill,
-                    false => drop(self.booked.swap_remove(at)),
+                    true => self.booked.defer(at, now + refill),
+                    false => drop(self.booked.cancel(at)),
                 }
             }
         }
@@ -529,9 +587,8 @@ impl Pace {
                     _ => {
                         state.blocked_until = None;
                         state.refill(now);
-                        let due = state.booked.iter().position(|b| b.due <= now + MIN_PARK);
-                        let left =
-                            due.map(|at| state.booked[at].due.saturating_duration_since(now));
+                        let due = state.booked.due_by(now + MIN_PARK);
+                        let left = due.map(|(at, _)| at.saturating_duration_since(now));
                         let wait = match left {
                             Some(left) if !left.is_zero() => left,
                             _ => state.admit_or_book(costs, due, now, park_for)?,
@@ -750,7 +807,7 @@ impl Pace {
             // includes them. Put both on the same basis before taking the
             // conservative minimum. Every reservation is returned exactly
             // once, even on cancellation.
-            let booked: u64 = state.booked.iter().map(|b| b.costs[index]).sum();
+            let booked = state.booked.held(index);
             let dim = &mut state.tokens[index];
             dim.bucket
                 .learn(limit, remaining - (dim.reserved + booked) as f64, now);
@@ -1710,5 +1767,63 @@ mod tests {
         drop(unreported);
         assert_eq!(pace.state.lock().unwrap().tokens[TOTAL].reserved, 0);
         assert_eq!(pace.snapshot().3, 180.0);
+    }
+
+    #[test]
+    fn a_parked_call_is_admitted_at_the_same_cost_however_many_are_parked() {
+        // `parked` calls booked behind a known allowance, each due now and
+        // each spending its booking as it comes back.
+        let drain = |parked: u64| {
+            let now = Instant::now();
+            let mut state = State::default();
+            state.requests.per_minute = Some(1e9);
+            for dim in state.tokens.iter_mut() {
+                dim.bucket.per_minute = Some(1e12);
+            }
+            state.refill(now);
+            for _ in 0..parked {
+                state.booked.book(now, [10, 5, 5]);
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..parked {
+                state.refill(now);
+                let due = state.booked.due_by(now + MIN_PARK);
+                assert!(due.is_some());
+                let wait = state.admit_or_book([10, 5, 5], due, now, &mut None);
+                assert_eq!(wait.unwrap(), Duration::ZERO);
+            }
+            let elapsed = started.elapsed();
+            assert!(state.booked.is_empty());
+            assert_eq!(state.booked.held, [0; DIMS]);
+            elapsed
+        };
+        let n = 8_000;
+        let grew = crate::doubling::outgrows(|twice| drain(if twice { 2 * n } else { n }));
+        assert_eq!(grew, None, "{n} parked calls, then twice as many");
+    }
+
+    #[test]
+    fn bookings_keep_their_totals_and_go_soonest_due_first() {
+        let now = Instant::now();
+        let mut booked = Booked::default();
+        let later = now + Duration::from_secs(2);
+        booked.book(later, [10, 4, 6]);
+        booked.book(now, [20, 20, 0]);
+        booked.book(later, [1, 1, 0]);
+        assert_eq!(booked.held, [31, 25, 6]);
+        // The soonest goes first; among those due together, the first made.
+        let soonest = booked.due_by(now).unwrap();
+        assert_eq!(booked.costs(soonest), [20, 20, 0]);
+        booked.hold(soonest, [5, 5, 0]);
+        assert_eq!(booked.held, [16, 10, 6]);
+        booked.defer(soonest, now + Duration::from_secs(3));
+        assert_eq!(booked.due_by(now), None);
+        let next = booked.due_by(later).unwrap();
+        assert_eq!(booked.costs(next), [10, 4, 6]);
+        // Grace runs out for the two due at `later` and not yet the third.
+        let lapsed: Vec<_> = booked.lapsed(later + BOOKING_GRACE).collect();
+        assert_eq!(lapsed, [[10, 4, 6], [1, 1, 0]]);
+        assert_eq!(booked.held, [5, 5, 0]);
+        assert_eq!(booked.len(), 1);
     }
 }
