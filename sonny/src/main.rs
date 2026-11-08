@@ -698,10 +698,15 @@ async fn read_status(
                 Some((at, seen)) if *at == last => seen.clone(),
                 _ => {
                     fresh = true;
-                    let seen =
-                        (needs::scan(client, name, ran["turn"].as_i64()).await).unwrap_or_default();
-                    asks_seen.insert(name.to_owned(), (last, seen.clone()));
-                    seen
+                    // A read that failed is kept for none: the next
+                    // refresh, or window, reads it again.
+                    match needs::scan(client, name, ran["turn"].as_i64()).await {
+                        Some(seen) => {
+                            asks_seen.insert(name.to_owned(), (last, seen.clone()));
+                            seen
+                        }
+                        None => Seen::default(),
+                    }
                 }
             },
             _ => Seen {
@@ -17426,6 +17431,43 @@ mod tests {
         open().await;
         assert_eq!(histories.load(Ordering::SeqCst), 10);
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_question_read_that_failed_is_read_again_and_never_kept() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let scans = Arc::new(AtomicUsize::new(0));
+        let read = scans.clone();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => json!({"bots": [{"name": "shop.t1", "bot_id": 1, "head": 1,
+                "status": "completed", "running_turn": null,
+                "last": {"turn": 1, "status": "completed"}}], "next_after": null}),
+                    // The question's read asks for more nodes than the latest
+                    // items'; its first one fails.
+                    "history_nodes" if asked["limit"].as_u64() > Some(4) => {
+                        match read.fetch_add(1, Ordering::SeqCst) {
+                            0 => json!({"error": "storage_error", "detail": "a failed read"}),
+                            _ => json!({"nodes": [], "next_from": null}),
+                        }
+                    }
+                    "history_nodes" => json!({"nodes": [], "next_from": null}),
+                    "history_items" => json!({"items": []}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.status_rows().await.unwrap();
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        assert!(!app.asks_seen.contains_key("shop.t1"));
+        app.status_rows().await.unwrap();
+        assert_eq!(scans.load(Ordering::SeqCst), 2);
+        assert!(app.asks_seen.contains_key("shop.t1"));
+        app.status_rows().await.unwrap();
+        assert_eq!(scans.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
