@@ -967,6 +967,18 @@ impl Session {
             (state.bound.as_ref()).map(|b| (b.client.clone(), b.bot.clone(), state.running))
         };
         let follower = self.clone();
+        // A lead's tasks' questions come to its thread too, as Sonny's lead
+        // window pins them; T3 Code shows each task's in its own thread.
+        let tasks = match &waiting {
+            Some((_, bot, _))
+                if agent.forms.load(Ordering::Relaxed)
+                    && agent.t3.is_none()
+                    && project::is_lead(bot) =>
+            {
+                Some(bot.clone()).zip(bot_id)
+            }
+            _ => None,
+        };
         let handle = tokio::spawn(async move {
             if let Some((client, bot, turn)) = &waiting {
                 if turn.is_some() {
@@ -976,7 +988,13 @@ impl Session {
                     follower.questions(&agent, client, bot).await;
                 }
             }
-            follower.follow(&agent, events).await
+            match tasks {
+                Some(lead) => {
+                    let watching = follower.clone().watch_tasks(&agent, lead);
+                    tokio::join!(follower.follow(&agent, events), watching);
+                }
+                None => follower.follow(&agent, events).await,
+            }
         });
         if let Ok(mut old) = session.follower.lock()
             && let Some(old) = old.replace(handle.abort_handle())
@@ -1877,6 +1895,167 @@ impl Session {
     }
 }
 
+impl Session {
+    /// Put each question the lead's tasks have open to the person as a
+    /// form, "From TASK", whose pick answers it in that task: those open
+    /// now, then each as it is asked, from tasks the lead starts since
+    /// too. On a connection of its own, which follows only the calls of
+    /// the lead and its tasks, from now; once the daemon drops it, it is
+    /// made again and what is open read again.
+    async fn watch_tasks(self: Arc<Self>, agent: &Arc<Agent>, (lead, lead_id): (String, i64)) {
+        loop {
+            let _ = self.tasks_asked(agent, &lead, lead_id).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+
+    async fn tasks_asked(
+        &self,
+        agent: &Arc<Agent>,
+        lead: &str,
+        lead_id: i64,
+    ) -> Result<(), String> {
+        let (client, mut events) = Client::connect(&agent.options.socket)
+            .await
+            .map_err(|e| e.to_string())?;
+        let since = now_ms();
+        let follow = |bot: &str| json!({"bot": bot, "since_ms": since, "kinds": ["tool_started", "tool_completed"]});
+        client
+            .request("follow", follow(lead))
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut watched = HashSet::new();
+        let store = agent_client::socket::canonical_store(&agent.options.store)
+            .unwrap_or_else(|_| agent.options.store.clone());
+        // Followed before they are read, so none asked between is missed.
+        let tasks = tasks_of(&client, lead_id).await?;
+        for task in &tasks {
+            if let Some(bot) = task["name"].as_str()
+                && watched.insert(bot.to_owned())
+            {
+                client
+                    .request("follow", follow(bot))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        for task in tasks.iter().filter(|task| lately(task, since)) {
+            self.task_asked(agent, &client, &store, task).await;
+        }
+        // Calls started, by bot and call: the lead's `start_task`, a task's ask.
+        let mut started = HashSet::new();
+        while let Some(event) = events.recv().await {
+            if event["event"] == "follow_lagged" {
+                break;
+            }
+            let (Some(bot), Some(call)) =
+                (event["bot"].as_str(), event["data"]["call_id"].as_str())
+            else {
+                continue;
+            };
+            let data = &event["data"];
+            let key = (bot.to_owned(), call.to_owned());
+            match event["event"].as_str() {
+                Some("tool_started") => {
+                    let name = data["name"].as_str();
+                    if (bot == lead && name == Some(crate::served::START))
+                        || (bot != lead && name == Some(asks::TOOL))
+                    {
+                        started.insert(key);
+                    }
+                }
+                Some("tool_completed") if started.remove(&key) => {
+                    if data["failed"] == true || data["denied"] == true {
+                        continue;
+                    }
+                    // A task started: followed from now on.
+                    if bot == lead {
+                        for task in tasks_of(&client, lead_id).await? {
+                            if let Some(bot) = task["name"].as_str()
+                                && watched.insert(bot.to_owned())
+                            {
+                                client
+                                    .request("follow", follow(bot))
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                            }
+                        }
+                        continue;
+                    }
+                    let task = client
+                        .request("inspect", json!({"bot": bot}))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    self.task_asked(agent, &client, &store, &task).await;
+                }
+                _ => {}
+            }
+        }
+        client.close().await;
+        Ok(())
+    }
+
+    /// The question `task`, as `bots` or `inspect` gives it, has open, put
+    /// to the person once.
+    async fn task_asked(&self, agent: &Arc<Agent>, client: &Client, store: &Path, task: &Value) {
+        let (Some(bot), Some(bot_id)) = (task["name"].as_str(), task["bot_id"].as_i64()) else {
+            return;
+        };
+        let running = task["running_turn"].is_i64();
+        let Some(seen) = crate::needs::scan(client, bot, None).await else {
+            return;
+        };
+        let Some(ask) = seen
+            .open(store, bot, running)
+            .filter(|ask| !ask.options.is_empty())
+        else {
+            return;
+        };
+        if !self
+            .state
+            .lock()
+            .await
+            .asked
+            .insert(format!("{bot} {}", ask.id))
+        {
+            return;
+        }
+        let asked = (agent.out).asking("elicitation/create", task_form(&self.id, bot, &ask));
+        let (agent, session, task) = (
+            agent.clone(),
+            self.id.clone(),
+            (bot.to_owned(), Some(bot_id)),
+        );
+        tokio::spawn(async move { elicit(asked, &agent, &session, task, &ask).await });
+    }
+}
+
+/// How far back a task's question is looked for when a thread comes:
+/// one idle longer has none the person is waited on for, as `sonny ask
+/// list` reads it.
+const LATELY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Whether `task`, as `bots` lists it, ran lately, before `now` (ms).
+fn lately(task: &Value, now: i64) -> bool {
+    task["running_turn"].is_i64()
+        || task["last"]["finished_ms"]
+            .as_i64()
+            .is_some_and(|ended| now - ended <= LATELY_MS)
+}
+
+fn now_ms() -> i64 {
+    (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// A task's question, as a form that says whose it is.
+fn task_form(session: &str, task: &str, ask: &asks::Ask) -> Value {
+    let mut params = form(session, ask, None);
+    let message = params["message"].as_str().unwrap_or_default();
+    params["message"] = json!(format!("From {task}\n\n{message}"));
+    params
+}
+
 /// The form field a question's pick is in.
 const PICK: &str = "pick";
 
@@ -2714,6 +2893,29 @@ mod tests {
         assert!(listed_bot("calc.lead").is_none());
         assert!(listed_bot("calc.lead#x").is_none());
         assert!(listed_bot("#7").is_none());
+    }
+
+    #[test]
+    fn a_tasks_question_says_whose_it_is_and_only_lately_ones_are_read() {
+        let ask = asks::call(
+            "ask:3/c1",
+            &json!({"question": "Ship it?", "why": "", "options": [{"label": "Yes"}, {"label": "No"}]}),
+        )
+        .unwrap();
+        let put = task_form("s", "calc.fix", &ask);
+        assert_eq!(put["message"], "From calc.fix\n\nShip it?");
+        assert!(put.get("toolCallId").is_none());
+        let now = 10 * LATELY_MS;
+        assert!(lately(&json!({"running_turn": 4}), now));
+        assert!(lately(
+            &json!({"last": {"finished_ms": now - LATELY_MS}}),
+            now
+        ));
+        assert!(!lately(
+            &json!({"last": {"finished_ms": now - LATELY_MS - 1}}),
+            now
+        ));
+        assert!(!lately(&json!({"running_turn": null}), now));
     }
 
     #[test]
