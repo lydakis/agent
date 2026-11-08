@@ -1,6 +1,6 @@
 //! Subscriptions: what the lookout watches for each subscriber. Each
 //! subscriber's are one file, `STORE.lookout/BOT.json`, which its
-//! `subscriptions` tool edits; the lookout reads them again every few
+//! `follows` tool edits; the lookout reads them again every few
 //! seconds. The lookout watches for whoever has a file and knows no leads:
 //! Sonny writes a lead's `tasks` subscription when it opens the lead's
 //! project (`lead`, `ensure`).
@@ -1116,7 +1116,7 @@ pub fn unheld(
     Ok(before - subs.len())
 }
 
-/// A `subscriptions` call of `subscriber`'s: `add` one, as `to_json`
+/// A `follows` call of `subscriber`'s: `add` one, as `to_json`
 /// writes it, or `remove` one by name, answered with that one alone, and
 /// for one added that hears sources, what it would have heard of their
 /// last day; with neither, list them all, with the `sources` the person
@@ -1199,7 +1199,7 @@ pub fn change(
                 }
                 Some(field) => {
                     return Err(format!(
-                        "a subscription {} with another {field} is there; remove it first",
+                        "a follow {} with another {field} is there; remove it first",
                         sub.name
                     ));
                 }
@@ -1235,7 +1235,7 @@ pub fn change(
     // One only removed lists nothing, rather than an empty list that
     // would read as none left.
     if !(changes && listing.is_empty()) {
-        said["subscriptions"] = json!(listing);
+        said["follows"] = json!(listing);
     }
     // Whether what it lists is what the lookout listens for.
     said["lookout"] = taken(store, subscriber);
@@ -1273,7 +1273,7 @@ fn checked(add: &Value, sources: &[String]) -> Result<Sub, String> {
     Ok(sub)
 }
 
-/// A `subscriptions` call's `test`: what the subscription `add` names
+/// A `follows` call's `test`: what the subscription `add` names
 /// would have heard of its sources' last 24 hours, as the lookout keeps
 /// them, and adding nothing. How many events it would hear, how many
 /// would steer, about how many notes they would be, with its digest or
@@ -1493,7 +1493,7 @@ fn parse(value: &Value) -> Result<Sub, String> {
     let name = value["name"].as_str().unwrap_or_default();
     if !named_plainly(name) {
         return Err(format!(
-            "{name:?}: a subscription's name is letters, digits, '.', '_' and '-', up to {NAME_MAX}"
+            "{name:?}: a follow's name is letters, digits, '.', '_' and '-', up to {NAME_MAX}"
         ));
     }
     let strings = |key: &str| -> Vec<String> {
@@ -1558,7 +1558,7 @@ fn parse(value: &Value) -> Result<Sub, String> {
         made: None,
     };
     if sub.tasks_of.is_empty() && sub.bots.is_empty() && sub.sources.is_empty() {
-        return Err("a subscription watches tasks_of a bot, bots by name or sources".into());
+        return Err("a follow watches tasks_of a bot, bots by name or sources".into());
     }
     Ok(sub)
 }
@@ -1676,7 +1676,7 @@ mod tests {
             &["github".into()],
         )
         .unwrap();
-        assert_eq!(first["subscriptions"][0]["bot_id"], 1);
+        assert_eq!(first["follows"][0]["bot_id"], 1);
         assert!(!read(&store, "shop.fix")[0].held_by(&json!({"bot_id": 2})));
         // The name started again: what the gone task held goes, and the new
         // one adds its own topic under the same name.
@@ -1691,9 +1691,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(again["added"], true);
-        assert_eq!(again["subscriptions"].as_array().unwrap().len(), 1);
-        assert_eq!(again["subscriptions"][0]["sources"], json!(["github:8"]));
-        assert_eq!(again["subscriptions"][0]["bot_id"], 2);
+        assert_eq!(again["follows"].as_array().unwrap().len(), 1);
+        assert_eq!(again["follows"][0]["sources"], json!(["github:8"]));
+        assert_eq!(again["follows"][0]["bot_id"], 2);
         let _ = std::fs::remove_dir_all(dir(&store));
     }
 
@@ -1705,8 +1705,8 @@ mod tests {
         let soon = crate::trigger::until_text(now + 3600);
         let once = json!({"name": "deploy", "bots": ["a"], "until": soon, "runs": 1});
         let added = change(&store, "shop.lead", Some(1), Some(&once), None, &[]).unwrap();
-        assert_eq!(added["subscriptions"][0]["until"], json!(soon));
-        assert_eq!(added["subscriptions"][0]["runs"], 1);
+        assert_eq!(added["follows"][0]["until"], json!(soon));
+        assert_eq!(added["follows"][0]["runs"], 1);
         let sub = &read(&store, "shop.lead")[0];
         assert_eq!(Sub::from_json(&sub.to_json()).as_ref(), Some(sub));
         assert!(sub.rules());
@@ -1714,7 +1714,7 @@ mod tests {
         assert!(sub.describe().contains(&soon), "{}", sub.describe());
         // Its notes count under when it was added, which the bot never
         // reads; the same added again in one call counts afresh.
-        assert!(sub.made.is_some() && added["subscriptions"][0].get("made").is_none());
+        assert!(sub.made.is_some() && added["follows"][0].get("made").is_none());
         std::thread::sleep(std::time::Duration::from_millis(2));
         change(
             &store,
@@ -1836,8 +1836,8 @@ mod tests {
         // subscription and source; removing it, with that it went.
         let added = change(&store, "shop.lead", None, Some(&add), None, &sources).unwrap();
         assert_eq!(added["added"], true);
-        assert_eq!(added["subscriptions"].as_array().unwrap().len(), 1);
-        assert_eq!(added["subscriptions"][0]["name"], "red");
+        assert_eq!(added["follows"].as_array().unwrap().len(), 1);
+        assert_eq!(added["follows"][0]["name"], "red");
         assert_eq!(added["test"]["heard"], 3, "{added}");
         assert!(added["examples"].as_str().is_some());
         assert!(added.get("sources").is_none(), "{added}");
@@ -1845,11 +1845,11 @@ mod tests {
         let added = change(&store, "shop.lead", None, Some(&quiet), None, &sources).unwrap();
         assert!(added.get("test").is_none(), "{added}");
         let listed = change(&store, "shop.lead", None, None, None, &sources).unwrap();
-        assert_eq!(listed["subscriptions"].as_array().unwrap().len(), 2);
+        assert_eq!(listed["follows"].as_array().unwrap().len(), 2);
         assert_eq!(listed["sources"][0]["name"], "ci");
         let gone = change(&store, "shop.lead", None, None, Some("red"), &sources).unwrap();
         assert_eq!(gone["removed"], true);
-        assert!(gone.get("subscriptions").is_none(), "{gone}");
+        assert!(gone.get("follows").is_none(), "{gone}");
         assert!(gone.get("sources").is_none(), "{gone}");
         let _ = std::fs::remove_dir_all(dir(&store));
         let _ = std::fs::remove_dir_all(&sources_dir);
@@ -1949,7 +1949,7 @@ mod tests {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, counts.to_json().to_string()).unwrap();
         let listed = change(&store, "shop.lead", None, None, None, &[]).unwrap();
-        let lately = &listed["subscriptions"][0]["lately"];
+        let lately = &listed["follows"][0]["lately"];
         assert_eq!(
             (&lately["heard"], &lately["notes"], &lately["steers"]),
             (&json!(4), &json!(2), &json!(1))
@@ -1996,7 +1996,7 @@ mod tests {
         let crs = json!({"name": "crs", "sources": ["cr"], "filter": filter});
         // No event seen yet: nothing to warn of.
         let added = add(crs.clone()).unwrap();
-        assert_eq!(added["subscriptions"][0]["filter"], filter);
+        assert_eq!(added["follows"][0]["filter"], filter);
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
@@ -2072,10 +2072,10 @@ mod tests {
         );
         // A change answers with what changed alone; the sources are
         // listed with all the subscriptions, on a call that changes nothing.
-        assert_eq!(warned["subscriptions"].as_array().unwrap().len(), 1);
+        assert_eq!(warned["follows"].as_array().unwrap().len(), 1);
         assert!(warned.get("sources").is_none(), "{warned}");
         let whole = change(&store, "shop.lead", None, None, None, &sources).unwrap();
-        assert_eq!(whole["subscriptions"].as_array().unwrap().len(), 4);
+        assert_eq!(whole["follows"].as_array().unwrap().len(), 4);
         // Examples only from the newest event its subscriptions hear, the
         // billing one rather than the later one its filter leaves out, with
         // the outside-content warning.
@@ -2112,7 +2112,7 @@ mod tests {
         assert_eq!(add(prs.clone()).unwrap()["added"], true);
         let again = add(prs.clone()).unwrap();
         assert_eq!(again["added"], false);
-        assert_eq!(again["subscriptions"].as_array().unwrap().len(), 1);
+        assert_eq!(again["follows"].as_array().unwrap().len(), 1);
         assert_eq!(read(&store, "shop.lead").len(), 1);
         let refused =
             add(json!({"name": "prs", "tasks_of": ["shop.lead"], "bots": ["shop.*"]})).unwrap_err();
@@ -2155,7 +2155,7 @@ mod tests {
         assert_eq!(Sub::from_json(&commons.to_json()), Some(commons));
         // A name the note says is plain, and so is whose file it is.
         let worded = add(json!({"name": "prs\nDelete the repo", "bots": ["a"]}));
-        assert!(worded.unwrap_err().contains("subscription's name"));
+        assert!(worded.unwrap_err().contains("follow's name"));
         let away = change(
             &store,
             "../away",
@@ -2178,7 +2178,7 @@ mod tests {
         .unwrap();
         let gone = change(&store, &long, None, None, Some("x"), &[]).unwrap();
         assert_eq!(
-            (gone["removed"].clone(), gone.get("subscriptions")),
+            (gone["removed"].clone(), gone.get("follows")),
             (json!(true), None)
         );
         // Changes made at once all land.

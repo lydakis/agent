@@ -1443,7 +1443,7 @@ mod tests {
             "start_task",
             "remove_task",
             "new_project",
-            "subscriptions",
+            "follows",
             "run_in_pane",
             "automations"
         ]);

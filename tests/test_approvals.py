@@ -1497,11 +1497,11 @@ class AutoApproverTests(ModelFixture):
         parsed[0] = False
         vague = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf vague')['result']['turn']
         self.assertEqual(daemon.finished(vague)['data']['status'], 'completed')
-        self.assertTrue(self.denial(daemon, vague).startswith(FAILED + "the judge's answer was not the JSON asked for."))
+        self.assertTrue(self.denial(daemon, vague).startswith(FAILED + "the reviewer's answer was not the JSON asked for."))
         events = [lines.get(timeout=5) for _ in range(3)]
         # The reply it could not read is kept, redacted, to be read later.
         self.assertIn({'event': 'review_failed', 'bot': 'Bob', 'turn': vague,
-                       'detail': "the judge's answer was not the JSON asked for", 'reply': 'They look fine to me.'}, events)
+                       'detail': "the reviewer's answer was not the JSON asked for", 'reply': 'They look fine to me.'}, events)
         # Each round's fork expires if the approver stops, and goes once it
         # is answered; the base stays.
         base = bots['.reviewer.auto']['bot_id']

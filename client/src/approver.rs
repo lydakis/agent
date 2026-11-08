@@ -250,7 +250,7 @@ pub enum Verdict {
 /// exactly once, with an `outcome` of allow or deny, and no other. Else
 /// why not, a failed check.
 pub fn assessments(reply: &str, ids: &[&str]) -> Result<Map<String, Value>, String> {
-    let malformed = || "the judge's answer was not the JSON asked for".to_owned();
+    let malformed = || "the reviewer's answer was not the JSON asked for".to_owned();
     let given: Value = serde_json::from_str(reply).map_err(|_| malformed())?;
     let listed = given["assessments"].as_array().ok_or_else(malformed)?;
     let mut kept = Map::new();
@@ -260,15 +260,15 @@ pub fn assessments(reply: &str, ids: &[&str]) -> Result<Map<String, Value>, Stri
             return Err(malformed());
         }
         if !ids.contains(&id) {
-            return Err("the judge's answer named a call it was not asked about".into());
+            return Err("the reviewer's answer named a call it was not asked about".into());
         }
         if kept.insert(id.to_owned(), assessment.clone()).is_some() {
-            return Err("the judge's answer assessed a call twice".into());
+            return Err("the reviewer's answer assessed a call twice".into());
         }
     }
     match ids.iter().all(|id| kept.contains_key(*id)) {
         true => Ok(kept),
-        false => Err("the judge's answer left out a call".into()),
+        false => Err("the reviewer's answer left out a call".into()),
     }
 }
 
@@ -286,7 +286,7 @@ pub fn verdict(assessment: &Value) -> Option<Verdict> {
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
                 .map_or(
-                    Cow::Borrowed("The judge denied the action without a specific rationale."),
+                    Cow::Borrowed("The reviewer denied the action without a specific rationale."),
                     |text| clip(text, RATIONALE_BYTES),
                 );
             let level = |key: &str, levels: &[&str]| {
@@ -1448,7 +1448,9 @@ mod tests {
         let Some(Verdict::Deny(bare)) = verdict(&json!({"outcome":"deny"})) else {
             panic!()
         };
-        assert!(bare.contains("Reason: The judge denied the action without a specific rationale."));
+        assert!(
+            bare.contains("Reason: The reviewer denied the action without a specific rationale.")
+        );
         // However long the rationale, or odd the levels, the reason fits
         // the daemon's limit, and only known levels are named.
         let long = json!({"risk_level":"x".repeat(20_000),"user_authorization":"high",
@@ -1502,7 +1504,7 @@ mod tests {
         assert_eq!(assessments(&both, &ids).unwrap().len(), 2);
         assert_eq!(
             why(&reply(vec![one("c1", "allow")])),
-            "the judge's answer left out a call"
+            "the reviewer's answer left out a call"
         );
         assert_eq!(
             why(&reply(vec![
@@ -1510,7 +1512,7 @@ mod tests {
                 one("c2", "allow"),
                 one("c9", "deny")
             ])),
-            "the judge's answer named a call it was not asked about"
+            "the reviewer's answer named a call it was not asked about"
         );
         assert_eq!(
             why(&reply(vec![
@@ -1518,11 +1520,11 @@ mod tests {
                 one("c2", "allow"),
                 one("c1", "deny")
             ])),
-            "the judge's answer assessed a call twice"
+            "the reviewer's answer assessed a call twice"
         );
         // Only the whole reply as the schema's JSON counts: no object found
         // inside prose, no other shape, no outcome outside the two.
-        let malformed = "the judge's answer was not the JSON asked for";
+        let malformed = "the reviewer's answer was not the JSON asked for";
         assert_eq!(
             why(&format!("Here you go:\n```json\n{both}\n```")),
             malformed
@@ -1569,14 +1571,13 @@ mod tests {
 
     #[test]
     fn a_review_that_never_assessed_is_labeled_and_a_long_call_goes_to_a_person() {
-        let Verdict::Unreviewed(failed) = not_reviewed("the judge's answer did not parse") else {
+        let Verdict::Unreviewed(failed) = not_reviewed("the reviewer's answer did not parse")
+        else {
             panic!()
         };
-        assert!(
-            failed.starts_with(
-                "Automatic approval review failed: the judge's answer did not parse.\n"
-            )
-        );
+        assert!(failed.starts_with(
+            "Automatic approval review failed: the reviewer's answer did not parse.\n"
+        ));
         assert!(failed.contains("not a determination that the action is unsafe"));
         // A provider's long refusal still fits the daemon's 16 KiB reason.
         let Verdict::Unreviewed(long) = not_reviewed(&"拒".repeat(6_000)) else {
@@ -1595,7 +1596,7 @@ mod tests {
         );
         assert_eq!(
             handed_over(&failed),
-            "Automatic approval review failed: the judge's answer did not parse, \
+            "Automatic approval review failed: the reviewer's answer did not parse, \
              so this waits for you."
         );
         assert!(matches!(

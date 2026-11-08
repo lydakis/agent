@@ -94,11 +94,11 @@
 //! [sonny.sources.slack]         # what Sonny's lookout runs for news
 //! command = "~/bin/slack-poll"  # run with sh -c; each line it prints is one event
 //! every = "1m"                  # how long after it exits it runs again
-//! digest = "15m"                # a subscriber hears it at most this often; unset, as it comes
-//! steer = { from = ["boss"] }   # what cuts into a busy subscriber's turn, as a filter is written
+//! digest = "15m"                # a follower hears it at most this often; unset, as it comes
+//! steer = { from = ["boss"] }   # what cuts into a busy follower's turn, as a filter is written
 //! watch = ["~/bin/slack-poll"]  # files whose edit starts it again on them; unset, none
 //! icon = "▲"                    # one character marking it wherever Sonny names it: /status, /background, news rows
-//! wants = "channel"             # a field of its events: the values subscriptions' filters name are written for the command
+//! wants = "channel"             # a field of its events: the values follows' filters name are written for the command
 //! [sonny.sources.commons]       # Sonny's own source: the commons threads an agent posted in
 //! digest = "15m"                # the default; 0 at once. Takes digest and steer alone
 //! ```

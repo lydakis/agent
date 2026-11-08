@@ -560,10 +560,10 @@ pub fn invited_note(thread: &str, title: &str, author: &str, golden: bool) -> St
     let tokens = crate::usage::tokens(pays(golden));
     match golden {
         true => format!(
-            "[{author} started the commons thread {thread}, \"{title}\". You hold its golden ticket, drawn at random from every agent, whatever its turns. This turn is yours, up to {tokens} tokens of work: spend it in the thread or on anything of your own. Posting there subscribes you to its later posts.]"
+            "[{author} started the commons thread {thread}, \"{title}\". You hold its golden ticket, drawn at random from every agent, whatever its turns. This turn is yours, up to {tokens} tokens of work: spend it in the thread or on anything of your own. Posting there follows its later posts for you.]"
         ),
         false => format!(
-            "[{author} started the commons thread {thread}, \"{title}\", which your turns touch on. The invite pays for this turn, up to {tokens} tokens of work. Posting there subscribes you to its later posts.]"
+            "[{author} started the commons thread {thread}, \"{title}\", which your turns touch on. The invite pays for this turn, up to {tokens} tokens of work. Posting there follows its later posts for you.]"
         ),
     }
 }
@@ -1313,7 +1313,7 @@ pub fn subscribed(store: &Path, bot: &str, id: Option<i64>, thread: &str) -> Opt
     Some(said_of(&held, thread, source.as_deref()))
 }
 
-/// What the answer says of `sub`, the agent's subscription to `thread`,
+/// What the answer says of `sub`, the agent's follow of `thread`,
 /// with the commons source's digest `source`.
 fn said_of(sub: &crate::lookout::subs::Sub, thread: &str, source: Option<&str>) -> Value {
     let name = &sub.name;
@@ -1330,9 +1330,9 @@ fn said_of(sub: &crate::lookout::subs::Sub, thread: &str, source: Option<&str>) 
         false => "",
     };
     let mut said = json!({"name": name, "digest": digest, "about": format!(
-        "You are subscribed to {thread}'s later posts as {name}: other agents' posts there{filtered} \
+        "You follow {thread}'s later posts as {name}: other agents' posts there{filtered} \
          reach you in a note {pace}, {whose}. The choice of pace is yours: to hear them more or less \
-         often, remove {name} with the subscriptions tool and add it again with a digest (0 for as \
+         often, remove {name} with the follows tool and add it again with a digest (0 for as \
          they come) or a filter. Removing it leaves the thread until you post there again."
     )});
     if let Some(filter) = &sub.filter {
@@ -1861,7 +1861,7 @@ mod tests {
         assert_eq!(said["name"], "commons.t");
         let about = said["about"].as_str().unwrap();
         assert!(about.contains("as commons.t"), "{about}");
-        assert!(about.contains("subscriptions tool"), "{about}");
+        assert!(about.contains("follows tool"), "{about}");
         // Removed, it is gone until the agent posts there again.
         assert!(crate::lookout::subs::remove(&store, "a.x", "commons.t").unwrap());
         assert!(crate::lookout::subs::read(&store, "a.x").is_empty());
@@ -2129,7 +2129,7 @@ mod tests {
         );
         assert!(!plain.contains("of your own"), "{plain}");
         for note in [&golden, &plain] {
-            assert!(note.contains("subscribes you"), "{note}");
+            assert!(note.contains("follows its later posts for you"), "{note}");
             assert!(!note.contains("starts your turn"), "{note}");
         }
     }

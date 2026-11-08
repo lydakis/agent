@@ -750,7 +750,7 @@ fn rex(words: &[String], output: &str, failed: bool) -> Option<Said> {
 /// A call of a tool Sonny declares, said as what it does: a question to
 /// the person with its choices, the plan it sets, a task it started,
 /// removed or resolved, where a window or pane went, the project it made,
-/// or the subscription it changed.
+/// or the follow it changed.
 pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
     let field = |key: &str| arguments[key].as_str().map(str::trim);
     let said = |verb: &str, what: &str| Said {
@@ -804,7 +804,8 @@ pub fn declared(name: &str, arguments: &Value, failed: bool) -> Option<Said> {
             Some(said)
         }
         crate::served::PROJECT => Some(said("Added the project", field("folder")?)),
-        crate::served::SUBSCRIPTIONS => {
+        // `subscriptions`, as before 0.9.1, in history.
+        crate::served::FOLLOWS | "subscriptions" => {
             Some(match (arguments["add"]["name"].as_str(), field("remove")) {
                 (Some(added), _) => said("Followed", added),
                 (None, Some(removed)) => said("Unfollowed", removed),
@@ -1220,10 +1221,14 @@ Keep the rest.'"#,
         );
         assert_eq!(
             call(
-                "subscriptions",
+                "follows",
                 serde_json::json!({"add": {"name": "prs", "bots": ["a"]}})
             ),
             "Followed prs"
+        );
+        assert_eq!(
+            call("subscriptions", serde_json::json!({"remove": "prs"})),
+            "Unfollowed prs"
         );
         // An agent that runs no Sonny tool is said some other way.
         assert!(declared("start_task", &serde_json::json!({}), false).is_none());

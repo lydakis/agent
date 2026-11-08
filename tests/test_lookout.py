@@ -256,22 +256,22 @@ class LookoutTests(ModelFixture):
     def test_a_bot_that_is_no_lead_hears_what_it_subscribed_to(self):
         # It subscribes with the tool Sonny gives it, which the tool host
         # answers, to its own file only.
-        tool = {'name': 'subscriptions', 'description': 'Subscribe.', 'answered_by': 'sonny',
+        tool = {'name': 'follows', 'description': 'Follow.', 'answered_by': 'sonny',
                 'parameters': {'type': 'object', 'properties': {'add': {'type': 'object'}}}}
         self.make('reviewer', declare=[tool])
         self.make('ops.deploy')
         self.start()
         self.host()
-        self.model.call_script = [('subscriptions', {'add': {'name': 'deploys', 'bots': ['ops.*']}})]
+        self.model.call_script = [('follows', {'add': {'name': 'deploys', 'bots': ['ops.*']}})]
         turn = self.daemon.request('submit', bot='reviewer', request_id='s', prompt='script')['result']['turn']
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         events = self.daemon.request('events', bot='reviewer', after=0, limit=256)['result']['events']
         done = next(e for e in events if e['event'] == 'tool_completed')
         listed = json.loads(node_item(self.daemon, 'reviewer', done['data']['node'])['result']['output'])
         self.assertEqual(listed['added'], True)
-        self.assertEqual(listed['subscriptions'][0]['bots'], ['ops.*'])
+        self.assertEqual(listed['follows'][0]['bots'], ['ops.*'])
         saved = json.loads((self.path / 'state.sqlite.lookout' / 'reviewer.json').read_text())
-        self.assertEqual(saved['subscriptions'], listed['subscriptions'])
+        self.assertEqual(saved['subscriptions'], listed['follows'])
         # Heard from the next event on, with no wait for a reread.
         self.daemon.request('submit', bot='ops.deploy', request_id='d', prompt='ship it')
         woke = self.note_for('reviewer')
@@ -280,7 +280,7 @@ class LookoutTests(ModelFixture):
         self.assertIn(' completed, asked by the person', woke)
 
     def test_a_changed_subscription_is_said_once_read_and_its_listing_says_when(self):
-        tool = {'name': 'subscriptions', 'description': 'Subscribe.', 'answered_by': 'sonny',
+        tool = {'name': 'follows', 'description': 'Follow.', 'answered_by': 'sonny',
                 'parameters': {'type': 'object', 'properties': {'add': {'type': 'object'}}}}
         self.make('reviewer', declare=[tool])
         self.make('ops.deploy')
@@ -291,7 +291,7 @@ class LookoutTests(ModelFixture):
         script, after = [], [0]
 
         def listed(arguments):
-            script.append(('subscriptions', arguments))
+            script.append(('follows', arguments))
             self.model.call_script = list(script)
             turn = self.daemon.request('submit', bot='reviewer', request_id=f'{time.monotonic()}',
                                        prompt='script')['result']['turn']

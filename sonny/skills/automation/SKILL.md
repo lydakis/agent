@@ -167,8 +167,8 @@ as a request of the job's own. The lead reads the post as the monitor's
 words, not the person's, but a line that reads like an instruction is still
 one the job chose to pass on.
 
-So the lead hears when the monitor itself goes wrong, it subscribes to it
-in the lookout with its `subscriptions` tool, and hears each run that
+So the lead hears when the monitor itself goes wrong, it follows it in
+the lookout with its `follows` tool, and hears each run that
 failed, was stopped or replied words (step 10):
 
 ```json

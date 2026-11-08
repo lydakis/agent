@@ -269,7 +269,7 @@ fn note(told: &updates::Told, steer: Option<&Steer>) -> String {
                 .to_owned()
         }
         Some(Steer::Rule(sub)) => format!(
-            "This cuts into your turn because your subscription {sub} says it steers: act on it \
+            "This cuts into your turn because your follow {sub} says it steers: act on it \
             where it changes what you or a task is doing, then carry on with your turn."
         ),
         Some(Steer::News) => "This joins your turn as it runs: act on it where it changes \
@@ -860,7 +860,7 @@ struct Service {
     /// that changed.
     files: subs::Read,
     /// Which revision of each subscriber's file the lookout took and when,
-    /// kept beside the store ([`subs::taken`]) for its `subscriptions`
+    /// kept beside the store ([`subs::taken`]) for its `follows`
     /// listing to show.
     read_at: HashMap<String, subs::Took>,
     /// The subscribers' names, one set every lookout shares (Kubernetes'
@@ -914,7 +914,7 @@ struct Service {
     /// Not connected yet since it started: its stream starts again where
     /// the last lookout's would.
     started: bool,
-    /// The `subscriptions` and `commons` calls under way, by bot, turn and
+    /// The `follows` and `commons` calls under way, by bot, turn and
     /// ID, whose end means the files the lookout reads changed.
     rewriting: HashSet<(String, i64, String)>,
 }
@@ -1180,7 +1180,7 @@ impl Service {
                         println!("{}", json!({"event": "lagged", "reason": event["reason"]}));
                     }
                     let event = whole_call(&client, event).await;
-                    // A `subscriptions` or `commons` call the tool
+                    // A `follows` or `commons` call the tool
                     // host answered counts from the next event on: its end
                     // is in the stream before any event that follows it.
                     if self.rewrote(&event) {
@@ -1726,7 +1726,7 @@ impl Service {
     }
 
     /// Whether `event` ends a call of Sonny's that wrote files the lookout
-    /// reads, a `subscriptions` or `commons` call (posting
+    /// reads, a `follows` or `commons` call (posting
     /// subscribes), which the tool host answers. A turn that ends forgets the calls it left under way.
     fn rewrote(&mut self, event: &Value) -> bool {
         let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) else {
@@ -1743,7 +1743,7 @@ impl Service {
         match event["event"].as_str() {
             Some("tool_started")
                 if data["answered_by"] == crate::served::TAG
-                    && (data["name"] == crate::served::SUBSCRIPTIONS
+                    && (data["name"] == crate::served::FOLLOWS
                         || data["name"] == crate::served::COMMONS) =>
             {
                 self.rewriting.insert(call());
@@ -4217,9 +4217,7 @@ mod tests {
         let told = lookout.updates.take_at(now);
         let steered = note(&told, Some(&Steer::Rule("tasks".into())));
         assert!(
-            steered.contains(
-                "This cuts into your turn because your subscription tasks says it steers"
-            ),
+            steered.contains("This cuts into your turn because your follow tasks says it steers"),
             "{steered}"
         );
         // The person's own words still read as theirs.
@@ -5503,14 +5501,14 @@ mod tests {
                 json!({"name": name, "answered_by": "sonny"}),
             )
         };
-        assert!(!service.rewrote(&started("subscriptions", "a")));
+        assert!(!service.rewrote(&started("follows", "a")));
         assert!(!service.rewrote(&started("memory", "b")));
         assert!(!service.rewrote(&event("tool_started", "c", json!({"name": "memory"}))));
         assert!(!service.rewrote(&event("tool_completed", "b", json!({}))));
         assert!(service.rewrote(&event("tool_completed", "a", json!({}))));
         assert!(!service.rewrote(&event("tool_completed", "a", json!({}))));
         // A turn that ends forgets a call it never ended.
-        assert!(!service.rewrote(&started("subscriptions", "d")));
+        assert!(!service.rewrote(&started("follows", "d")));
         assert!(!service.rewrote(&event("turn_finished", "", json!({}))));
         assert!(service.rewriting.is_empty());
         // Posting in the commons subscribes the poster.

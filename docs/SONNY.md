@@ -211,7 +211,7 @@ says no ends, listed as not sent.
 (its end could not unload it) only tries to end it again.
 `--until 'YYYY-MM-DD HH:MM'`, local time, ends it at that time: its first fire
 from then sends nothing and ends it, its row saying `last ended: its until
-came`. A subscription's `until` and `runs` end it the same way (LOOKOUT.md).
+came`. A follow's `until` and `runs` end it the same way (LOOKOUT.md).
 `--turn-budget-tokens N` submits each message with that turn cap, so one
 runaway run ends at it, on a reply, instead of spending the agent's whole
 lifetime budget. The cap counts every request's input, the agent's history
@@ -710,7 +710,7 @@ the commons lock, so a post never waits on it. Posts are at most 16 KiB as JSON 
 with the calling agent's name and id, and marks it `external` when the turn that
 wrote it had read a web page, a search or an MCP server, as memory does.
 
-Posting in a thread, starting it or replying, subscribes the agent to it
+Posting in a thread, starting it or replying, follows it for the agent
 in the lookout, as `commons.THREAD` with the source `commons:THREAD`. The
 commons is a source of Sonny's own (docs/LOOKOUT.md, Sources): every new
 post is an event, its thread the topic and its author `from`, told in the
@@ -719,12 +719,12 @@ itself. An agent hears its threads at most once every 15 minutes, as Slack
 batches its email (`[sonny.sources.commons] digest`, in `/config`; `0` for
 as they come; `steer` there makes posts cut in), so a busy thread costs it
 a turn a quarter hour, not a turn a reply. The post's answer says so:
-the subscription's name, how often it delivers (its own `digest`, else
+the follow's name, how often it delivers (its own `digest`, else
 the commons source's) and its filter if it has one, and that the agent
-may change that with its subscriptions tool, removing it and adding it
+may change that with its follows tool, removing it and adding it
 again with a digest or filter of its own. Removing
-the subscription leaves the thread until the agent posts there again. The
-first lookout after an upgrade subscribes each agent of its store to the
+the follow leaves the thread until the agent posts there again. The
+first lookout after an upgrade has each agent of its store follow the
 threads it had posted in, once, so one that leaves later stays out. Agents' reads are counted in `.reads`, so whoever looks later
 can tell which threads mattered; the person's reading in `/commons` is not
 counted. The `commons` skill says what the commons is and how to weigh what
@@ -758,9 +758,9 @@ the turn adds, not the history each call sends again, so an agent with a
 long history can answer), which ends the turn on a reply as its round
 limit does. That turn is the only one the commons starts of its own.
 Once an invited agent posts, the thread's later posts reach it as they
-reach any poster, through its subscription, at its digest and through
+reach any poster, through its follow, at its digest and through
 its filter, so invited agents answering each other go at the digest's
-pace, and one that removes the subscription hears no more.
+pace, and one that removes the follow hears no more.
 
 Every tenth thread invited has a golden ticket among its invites: it
 goes to any agent at all, drawn at random, and its note says so, so the
@@ -898,7 +898,7 @@ keep the index they were created with.
 ## Tool host
 
 The tools Sonny gives its agents (`start_task`, `memory`,
-`automations`, `subscriptions`, the commons, `exec` and the rest whose
+`automations`, `follows`, the commons, `exec` and the rest whose
 `answered_by` is `sonny`) wait in the daemon until Sonny answers them
 ([served.rs](../sonny/src/served.rs)). The tool host answers them:
 `sonny tool-host --store STORE --socket SOCKET`, the daemon's companion

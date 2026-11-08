@@ -23,7 +23,7 @@ pub fn pick(named: Option<&str>, caller: Option<&str>) -> Option<String> {
     named.or(caller).map(str::to_owned)
 }
 
-/// Each id asked, and the judge's answer for it.
+/// Each id asked, and the reviewer's answer for it.
 pub type Answers = Map<String, Value>;
 
 /// What a judge read and wrote for one check, in tokens, as its provider
@@ -238,7 +238,7 @@ pub struct Failed {
     /// answers: whole, so whoever logs it redacts it before [`excerpt`]
     /// cuts it, and no secret is cut where redaction would miss it.
     pub reply: Option<String>,
-    /// Where the judge's turn spent its time, when it ended: none for one
+    /// Where the reviewer's turn spent its time, when it ended: none for one
     /// that never started or was still running when the check gave up.
     pub timing: Option<Timing>,
 }
@@ -406,7 +406,7 @@ impl Base {
             }
             forked => forked,
         };
-        forked.map_err(|error| failed(format!("the judge could not start: {}", error.code)))?;
+        forked.map_err(|error| failed(format!("the reviewer could not start: {}", error.code)))?;
         let (answered, running) = turn_with(client, &name, prompt, ids, reply, deadline).await;
         remove(client, &name, running).await;
         answered
@@ -457,7 +457,7 @@ pub async fn turn_with(
     deadline: Instant,
 ) -> (Result<(Answers, Usage), Failed>, Option<i64>) {
     let Ok(schema) = serde_json::from_str::<Value>(reply.schema) else {
-        return (Err(failed("the judge's reply schema is not JSON")), None);
+        return (Err(failed("the reviewer's reply schema is not JSON")), None);
     };
     // Queued when every slot is taken: it starts when one frees, within
     // the deadline.
@@ -473,13 +473,13 @@ pub async fn turn_with(
     {
         Ok(submitted) => submitted,
         Err(error) => {
-            let why = format!("the judge's turn was refused: {}", error.code);
+            let why = format!("the reviewer's turn was refused: {}", error.code);
             return (Err(failed(why)), None);
         }
     };
     let (Some(turn), Some(handle)) = (submitted["turn"].as_i64(), submitted["handle"].as_str())
     else {
-        return (Err(failed("the judge's turn was not started")), None);
+        return (Err(failed("the reviewer's turn was not started")), None);
     };
     let left = deadline.saturating_duration_since(Instant::now());
     let waited = match client
@@ -491,7 +491,7 @@ pub async fn turn_with(
     {
         Ok(waited) => waited,
         Err(error) => {
-            let why = format!("the judge could not be waited on: {}", error.code);
+            let why = format!("the reviewer could not be waited on: {}", error.code);
             return (Err(failed(why)), Some(turn));
         }
     };
@@ -502,7 +502,7 @@ pub async fn turn_with(
     let usage = usage(client, name, turn, submitted_ms).await;
     if outcome["status"] != "completed" {
         let why = format!(
-            "the judge's turn {}: {}",
+            "the reviewer's turn {}: {}",
             outcome["status"].as_str().unwrap_or("ended"),
             outcome["error"].as_str().unwrap_or("no answer")
         );
@@ -514,7 +514,7 @@ pub async fn turn_with(
     }
     let text = outcome["text"].as_str().unwrap_or_default();
     let parsed = match outcome["text_truncated"] == true {
-        true => Err("the judge's answer was cut off".to_owned()),
+        true => Err("the reviewer's answer was cut off".to_owned()),
         false => (reply.parse)(text, ids),
     };
     let answers = match parsed {

@@ -588,7 +588,7 @@ def words_of(text):
 
 # Sonny's own tools that wait on the eval in the `ask` row, and when a call
 # of each keeps its effects in the run. The day needs tasks, the lookout's
-# subscriptions and automations. A start makes a worktree of the lead's
+# follows and automations. A start makes a worktree of the lead's
 # repository, whose .git every sandbox keeps read-only, and its setup runs
 # the lead's .agents/setup, read-only too, which the eval never writes. A
 # start at another `folder` is denied: Sonny runs git there outside the
@@ -600,11 +600,13 @@ def words_of(text):
 NATIVE = {
     'start_task': lambda a: 'folder' not in a,
     'remove_task': lambda a: True,
-    'subscriptions': lambda a: True,
+    'follows': lambda a: True,
     'automations': lambda a: not (isinstance(a.get('add'), dict) and {'if', 'start'} & set(a['add'])),
 }
 # Builds before 0.8.0 named them triggers, so an arm of one compares.
 NATIVE['triggers'] = NATIVE['automations']
+# Builds before 0.9.1 named follows subscriptions.
+NATIVE['subscriptions'] = NATIVE['follows']
 
 
 def determinable(home, request):

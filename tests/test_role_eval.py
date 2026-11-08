@@ -163,6 +163,7 @@ class ConfinedTests(unittest.TestCase):
         for name, arguments in [('start_task', {'name': 'export', 'brief': 'b', 'setup': True}),
                                 ('start_task', {'name': 'x', 'brief': 'b', 'own_folder': True}),
                                 ('remove_task', {'task': 'export'}),
+                                ('follows', {'add': {'name': 'news', 'sources': ['chat']}}),
                                 ('subscriptions', {'add': {'name': 'news', 'sources': ['chat']}}),
                                 ('automations', {'add': {'every': '10m', 'message': 'check'}}),
                                 ('automations', {'remove': 'watch'})]:
