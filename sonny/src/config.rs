@@ -88,13 +88,13 @@ pub const SETTINGS: &[Setting] = &[
         default: "shown",
     },
     Setting {
-        key: "judge.model",
-        about: "the reviewer for auto approvals (provider/model)",
+        key: "reviewer.model",
+        about: "the model that reviews calls in Auto (provider/model)",
         values: &[],
         default: "the agent's own model",
     },
     Setting {
-        key: "judge.effort",
+        key: "reviewer.effort",
         about: "the reviewer's effort",
         values: EFFORTS,
         default: "the model's own",
@@ -325,9 +325,12 @@ pub const SETTINGS: &[Setting] = &[
 
 /// The migration that moves `[sonny] task_depth` to `[daemon] depth`.
 pub const DEPTH: &str = "task-depth-daemon";
+/// The migration that renames `[judge]` to `[reviewer]`.
+pub const REVIEWER: &str = "judge-reviewer";
 
-/// At start, once, before the config is read: a line depth the person set
-/// for Sonny moved to the daemon, which bounds it now.
+/// At start, once each, before the config is read: a line depth the
+/// person set for Sonny moved to the daemon, which bounds it now; and the
+/// reviewer's model and effort under the reviewer's name.
 pub fn at_start() {
     let (Some(home), Some(path)) = (
         std::env::var_os("HOME").map(PathBuf::from),
@@ -339,21 +342,21 @@ pub fn at_start() {
     if !path.exists() {
         return;
     }
-    crate::upgrade::once(&home.join(".agent/sonny/migrated"), DEPTH, || {
-        config_depth(&path)
-    });
+    let migrated = home.join(".agent/sonny/migrated");
+    crate::upgrade::once(&migrated, DEPTH, || rewrite(&path, depth_moved));
+    crate::upgrade::once(&migrated, REVIEWER, || rewrite(&path, reviewer_named));
 }
 
-/// The config at `path` with `[sonny] task_depth` moved, each other line
-/// as the person wrote it. Whether it is done: one it can't move cleanly
-/// is left as it is, for the config's own error to say where the key went,
+/// The config at `path` as `change` rewrites it, each other line as the
+/// person wrote it. Whether it is done: one it can't change cleanly is
+/// left as it is, for the config's own error to say where the key went,
 /// and tried again next time.
-fn config_depth(path: &std::path::Path) -> bool {
+fn rewrite(path: &std::path::Path, change: fn(&str) -> Result<Option<String>, ()>) -> bool {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
     };
-    match depth_moved(&text) {
+    match change(&text) {
         Err(()) => false,
         Ok(None) => true,
         Ok(Some(moved)) => {
@@ -364,7 +367,7 @@ fn config_depth(path: &std::path::Path) -> bool {
     }
 }
 
-/// `text` as [`config_depth`] writes it: none when `[sonny]` sets no
+/// `text` as [`rewrite`] writes it for [`DEPTH`]: none when `[sonny]` sets no
 /// `task_depth`. Its line goes, and `depth` joins `[daemon]`, made at the
 /// end when there is none, unless the file sets it there already. What is
 /// written must parse to the config with only that key moved, so a key
@@ -421,6 +424,42 @@ fn depth_moved(text: &str) -> Result<Option<String>, ()> {
     }
     match new.parse::<toml::Table>() {
         Ok(parsed) if removed && parsed == expected => Ok(Some(new)),
+        _ => Err(()),
+    }
+}
+
+/// `text` as [`rewrite`] writes it for [`REVIEWER`]: none when it has no
+/// `[judge]`. Its heading becomes `[reviewer]`, its keys and comments as
+/// written. What is written must parse to the config with only the table
+/// renamed, so a `[reviewer]` the file has already, or a `judge` lines
+/// can't rename (a dotted key, an inline table), is an error.
+fn reviewer_named(text: &str) -> Result<Option<String>, ()> {
+    let old: toml::Table = text.parse().map_err(drop)?;
+    let Some(judge) = old.get("judge") else {
+        return Ok(None);
+    };
+    if old.contains_key("reviewer") {
+        return Err(());
+    }
+    let mut expected = old.clone();
+    expected.remove("judge");
+    expected.insert("reviewer".into(), judge.clone());
+    let mut renamed = 0;
+    let lines: Vec<String> = (text.split_inclusive('\n'))
+        .map(|raw| {
+            let indent = &raw[..raw.len() - raw.trim_start().len()];
+            match raw.trim_start().strip_prefix("[judge]") {
+                Some(rest) if rest.trim().is_empty() || rest.trim_start().starts_with('#') => {
+                    renamed += 1;
+                    format!("{indent}[reviewer]{rest}")
+                }
+                _ => raw.to_owned(),
+            }
+        })
+        .collect();
+    let new = lines.concat();
+    match new.parse::<toml::Table>() {
+        Ok(parsed) if renamed == 1 && parsed == expected => Ok(Some(new)),
         _ => Err(()),
     }
 }
@@ -778,6 +817,27 @@ mod tests {
         assert_eq!(depth_moved("[sonny]\nchime = true\n"), Ok(None));
         // A key lines can't move is left for the reader's error.
         assert_eq!(depth_moved("sonny.task_depth = 3\n"), Err(()));
+    }
+
+    #[test]
+    fn the_judge_table_is_renamed_the_reviewer_s() {
+        // Its heading only: keys, comments and the rest as written.
+        let text = "# mine\nmodel = \"a/b\"\n\n[judge] # cheap\nmodel = \"c/d\"\neffort = \"low\"\n\n[sonny]\nchime = true\n";
+        assert_eq!(
+            reviewer_named(text),
+            Ok(Some(
+                "# mine\nmodel = \"a/b\"\n\n[reviewer] # cheap\nmodel = \"c/d\"\neffort = \"low\"\n\n[sonny]\nchime = true\n".into()
+            ))
+        );
+        // Nothing to rename.
+        assert_eq!(reviewer_named("[sonny]\nchime = true\n"), Ok(None));
+        // Lines can't rename these: left for the reader's error.
+        assert_eq!(reviewer_named("judge.model = \"c/d\"\n"), Err(()));
+        assert_eq!(reviewer_named("judge = { model = \"c/d\" }\n"), Err(()));
+        assert_eq!(
+            reviewer_named("[judge]\nmodel = \"c/d\"\n[reviewer]\neffort = \"low\"\n"),
+            Err(())
+        );
     }
 
     #[test]

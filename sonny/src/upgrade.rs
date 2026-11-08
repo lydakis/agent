@@ -54,7 +54,7 @@ impl Step {
 /// `sonny/upgrades` and a row here, named in its feature's history.
 pub const STEPS: &[Step] = &[
     // A reviewer model set as `AGENT_JUDGE` in ~/.agent/env, unread since
-    // 0.8.0, moves to `[judge] model` (0.9.0).
+    // 0.8.0, moves to `[reviewer] model` (0.9.0).
     Step {
         id: "judge-env",
         text: include_str!("../upgrades/judge-env.md"),
@@ -80,7 +80,7 @@ pub const STEPS: &[Step] = &[
 ];
 
 /// Whether `~/.agent/env` sets no `AGENT_JUDGE`, the reviewer's model
-/// before 0.8.0 read it from `[judge] model`.
+/// before 0.8.0, which is `[reviewer] model` now.
 fn judge_env_done() -> bool {
     agent_client::env_file::path().is_none_or(|file| no_judge_in(&file))
 }
@@ -180,6 +180,17 @@ pub const MIGRATIONS: &[Migration] = &[
     // go (0.9.0).
     Migration {
         id: crate::git::NO_SNAPSHOTS,
+        retire: "0.11.0",
+    },
+    // `[judge]` in ~/.agent/config.toml becomes `[reviewer]` (0.9.1).
+    Migration {
+        id: crate::config::REVIEWER,
+        retire: "0.11.0",
+    },
+    // The reviewer's companion `approver-auto` becomes `sonny-reviewer`,
+    // and its base bot `approver.TAG` Sonny's own `.reviewer.TAG` (0.9.1).
+    Migration {
+        id: crate::reviewer::RENAMED,
         retire: "0.11.0",
     },
     // Sonny's own nightly memory cleanup, scheduled before each run started

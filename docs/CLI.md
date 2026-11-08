@@ -188,10 +188,11 @@ tries its held turns at once.
   passing them while continuing an existing named bot is an error.
 - `run --new --approval MODE` chooses whether a
   new bot's tool calls wait for a verdict: `full` runs every allowed call (no
-  gate), `manual` waits for an answer from any client, and `auto` has a
-  judge model decide each call. The CLI judges nothing itself: an
-  approver must serve the `auto` tag, such as `sonny approver`, which Sonny
-  keeps as the daemon's companion. For `auto`, and whenever `run` continues
+  gate), `manual` waits for an answer from any client, and `auto` has the
+  approver serving the `auto` tag decide each call. The CLI decides
+  nothing itself: an approver must serve the tag, such as Sonny's
+  reviewer model (`sonny reviewer`), which Sonny keeps as the daemon's
+  companion. For `auto`, and whenever `run` continues
   or `fork` copies a bot an `auto` gate answers, the CLI refuses with
   `approver_not_serving` when none does, before any bot is made, and gives
   a call 105 s before its gate lapses (the approver's 90 s review budget,
@@ -262,8 +263,8 @@ dependency is required.
 ## Companions
 
 A companion is a command the daemon keeps running for as long as it runs:
-a client's helper that agents wait on, such as Sonny's lookout or the
-approver, so it lives as long as the daemon whoever started either. The
+a client's helper that agents wait on, such as Sonny's lookout or its
+reviewer, so it lives as long as the daemon whoever started either. The
 daemon knows nothing of what one is.
 
 ```sh
@@ -463,7 +464,7 @@ turn ended with. It repeats, up to 64, the quotes a quoted prompt brings
 counted. The daemon copies the words, so the model reads what was written
 and by whom, never the sender's retelling; a turn without those words is
 refused (`quote_not_found`, `quote_unfinished`, `quote_too_large`). Sonny's
-approver takes a quote of the person's words as consent only when the
+reviewer takes a quote of the person's words as consent only when the
 person sent the quoting prompt: an agent could otherwise quote an old
 "yes" for a new ask.
 `run --instructions` and `--instructions-file` set a new bot's instructions,

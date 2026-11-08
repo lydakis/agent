@@ -1297,7 +1297,7 @@ fn answered_by_auto(bot: &Value) -> bool {
 }
 
 /// An `auto` bot needs an approver serving `auto`, such as the one Sonny
-/// keeps as the daemon's companion (`sonny approver`): the CLI judges
+/// keeps as the daemon's companion (`sonny reviewer`): the CLI decides
 /// nothing itself, so without one its calls could only wait and be denied.
 fn require_approver(connection: &mut Connection) -> Result<()> {
     let stats = connection.request("stats", json!({}))?;

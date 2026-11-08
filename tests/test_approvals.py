@@ -1336,7 +1336,7 @@ FAILED = 'Automatic approval review failed: '
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class AutoApproverTests(ModelFixture):
-    """`sonny approver` serves `auto`: a judge model decides every call."""
+    """`sonny reviewer` serves `auto`: a reviewer model decides every call."""
 
     def setUp(self):
         super().setUp()
@@ -1355,8 +1355,8 @@ class AutoApproverTests(ModelFixture):
         """The stand-in judge, unless `judge` names another model the
         daemon serves."""
         process = subprocess.Popen(
-            [str(self.binary.parent / 'sonny'), 'approver', '--store', str(self.path / 'state.sqlite'),
-             '--socket', str(daemon.socket_path), '--judge', judge or f'openai/{Judge.model}'],
+            [str(self.binary.parent / 'sonny'), 'reviewer', '--store', str(self.path / 'state.sqlite'),
+             '--socket', str(daemon.socket_path), '--model', judge or f'openai/{Judge.model}'],
             env={**clean_env(), **(env or {})},
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.addCleanup(lambda: (process.kill(), process.wait(), process.stdout.close()))
@@ -1392,7 +1392,7 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(state['planned_calls'][0]['arguments']['command'], 'printf safe > out')
         self.assertEqual(state['workspace'], str(self.path))
         judged = lines.get(timeout=5)
-        self.assertEqual((judged['event'], judged['calls'][0]['decision']), ('judged', 'allow'))
+        self.assertEqual((judged['event'], judged['calls'][0]['decision']), ('reviewed', 'allow'))
         # A risky call nobody asked for is denied with the reason; the
         # turn's earlier call shows as already allowed, and it succeeded.
         risky_turn = daemon.request('submit', bot='Bob', request_id='b',
@@ -1420,38 +1420,42 @@ class AutoApproverTests(ModelFixture):
         self.model.models = ('synthetic-model', 'judge-model')
         daemon = self.daemon(tools='echo,shell,wait,read')
         # A bot that only has the judge's name is refused, not replaced.
-        daemon.request('create', bot='approver.auto', workspace='/', model='openai/old-judge',
+        daemon.request('create', bot='.reviewer.auto', workspace='/', model='openai/old-judge',
                        instructions='Help with the repo.', tools=[])
         refused = subprocess.run(
-            [str(self.binary.parent / 'sonny'), 'approver', '--store', str(self.path / 'state.sqlite'),
-             '--socket', str(daemon.socket_path), '--judge', 'openai/judge-model'],
+            [str(self.binary.parent / 'sonny'), 'reviewer', '--store', str(self.path / 'state.sqlite'),
+             '--socket', str(daemon.socket_path), '--model', 'openai/judge-model'],
             env=clean_env(), capture_output=True, text=True, timeout=30)
         self.assertNotEqual(refused.returncode, 0)
-        self.assertIn('judge_name_taken', refused.stderr)
-        self.assertEqual(daemon.request('inspect', bot='approver.auto')['result']['instructions'],
+        self.assertIn('reviewer_name_taken', refused.stderr)
+        self.assertEqual(daemon.request('inspect', bot='.reviewer.auto')['result']['instructions'],
                          'Help with the repo.')
-        self.assertIn('result', daemon.request('delete', bot='approver.auto'))
+        self.assertIn('result', daemon.request('delete', bot='.reviewer.auto'))
         # An approver that stopped leaves its judge and a fork from mid-round:
         # the next one makes the judge afresh, the daemon deletes the fork
         # once it has been idle long enough, and a bot that only shares the
         # judge's prefix is kept.
         # So is an older version of the judge, its policy since changed.
+        older = 'You judge tool calls an AI agent has planned, before they run. An older policy.'
+        daemon.request('create', bot='.reviewer.auto', workspace='/', model='openai/old-judge',
+                       instructions=older, tools=[])
+        # The base by its name before 0.9.1 goes; it never ran a turn.
         daemon.request('create', bot='approver.auto', workspace='/', model='openai/old-judge',
-                       instructions='You judge tool calls an AI agent has planned, before they run. '
-                       'An older policy.', tools=[])
+                       instructions=older, tools=[])
         old, _ = self.approver(daemon, judge='openai/old-judge')
         self.assertIn('# Outcome policy',
-                      daemon.request('inspect', bot='approver.auto')['result']['instructions'])
+                      daemon.request('inspect', bot='.reviewer.auto')['result']['instructions'])
+        self.assertEqual(daemon.request('inspect', bot='approver.auto')['error'], 'bot_not_found')
         old.kill()
         old.wait()
         deadline = time.monotonic() + 5
         while daemon.request('stats')['result']['approvers']:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.05)
-        old_id = daemon.request('inspect', bot='approver.auto')['result']['bot_id']
-        daemon.request('fork', source='approver.auto', bot=f'approver.auto.{old_id}.1.0',
-                       created_by='approver.auto', expire_ms=1000)
-        daemon.request('create', bot='approver.auto.notes', workspace='/', model='openai/synthetic-model',
+        old_id = daemon.request('inspect', bot='.reviewer.auto')['result']['bot_id']
+        daemon.request('fork', source='.reviewer.auto', bot=f'.reviewer.auto.{old_id}.1.0',
+                       created_by='.reviewer.auto', expire_ms=1000)
+        daemon.request('create', bot='.reviewer.auto.notes', workspace='/', model='openai/synthetic-model',
                        tools=['shell'])
         forks = Connection(daemon.socket_path)
         self.addCleanup(forks.close)
@@ -1462,10 +1466,10 @@ class AutoApproverTests(ModelFixture):
         while len(bots := {b['name']: b for b in daemon.request('bots')['result']['bots']}) != 3:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.05)
-        self.assertEqual(sorted(bots), ['Bob', 'approver.auto', 'approver.auto.notes'])
-        self.assertIn('result', daemon.request('delete', bot='approver.auto.notes'))
-        self.assertEqual((bots['approver.auto']['model'], bots['approver.auto']['tools'],
-                          bots['approver.auto']['gates']), ('judge-model', LOOKING, []))
+        self.assertEqual(sorted(bots), ['.reviewer.auto', '.reviewer.auto.notes', 'Bob'])
+        self.assertIn('result', daemon.request('delete', bot='.reviewer.auto.notes'))
+        self.assertEqual((bots['.reviewer.auto']['model'], bots['.reviewer.auto']['tools'],
+                          bots['.reviewer.auto']['gates']), ('judge-model', LOOKING, []))
         safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['turn']
         self.assertEqual(daemon.finished(safe)['data']['status'], 'completed')
         self.assertEqual((self.path / 'out').read_text(), 'safe')
@@ -1482,7 +1486,7 @@ class AutoApproverTests(ModelFixture):
         self.assertIn('# Outcome policy', json.dumps(request))
         judged = lines.get(timeout=5)
         self.assertEqual((judged['event'], judged['calls'][0]['decision'], judged['input_tokens']),
-                         ('judged', 'allow', 100))
+                         ('reviewed', 'allow', 100))
         risky_turn = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf DANGER')['result']['turn']
         self.assertEqual(daemon.finished(risky_turn)['data']['status'], 'completed')
         reason = self.denial(daemon, risky_turn)
@@ -1496,16 +1500,16 @@ class AutoApproverTests(ModelFixture):
         self.assertTrue(self.denial(daemon, vague).startswith(FAILED + "the judge's answer was not the JSON asked for."))
         events = [lines.get(timeout=5) for _ in range(3)]
         # The reply it could not read is kept, redacted, to be read later.
-        self.assertIn({'event': 'judge_failed', 'bot': 'Bob', 'turn': vague,
+        self.assertIn({'event': 'review_failed', 'bot': 'Bob', 'turn': vague,
                        'detail': "the judge's answer was not the JSON asked for", 'reply': 'They look fine to me.'}, events)
         # Each round's fork expires if the approver stops, and goes once it
         # is answered; the base stays.
-        base = bots['approver.auto']['bot_id']
+        base = bots['.reviewer.auto']['bot_id']
         forked = forks.receive(lambda e: e.get('event') == 'forked')
-        self.assertRegex(forked['bot'], rf'^approver\.auto\.{base}\.\d+\.0$')
+        self.assertRegex(forked['bot'], rf'^\.reviewer\.auto\.{base}\.\d+\.0$')
         self.assertEqual(forked['data']['expire_ms'], 60000)
         deadline = time.monotonic() + 5
-        while sorted(b['name'] for b in daemon.request('bots')['result']['bots']) != ['Bob', 'approver.auto']:
+        while sorted(b['name'] for b in daemon.request('bots')['result']['bots']) != ['.reviewer.auto', 'Bob']:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.05)
 
@@ -1530,7 +1534,7 @@ class AutoApproverTests(ModelFixture):
                        approve_expire_ms=15000,
                        settings={'sandbox': 'workspace-write', 'network': True})
         self.approver(daemon, judge='openai/judge-model')
-        base = daemon.request('inspect', bot='approver.auto')['result']
+        base = daemon.request('inspect', bot='.reviewer.auto')['result']
         self.assertEqual((base['tools'], base['settings']['sandbox']), (['shell', 'read'], 'read-only'))
         calls = [['shell', {'command': 'printf escaped > out', 'sandbox_permissions': 'require_escalated',
                             'justification': 'Do you want to write out?'}]]
@@ -1552,14 +1556,14 @@ class AutoApproverTests(ModelFixture):
         self.model.models = ('synthetic-model', 'judge-model', 'other-model')
         daemon = self.daemon()
         self.approver(daemon, judge='openai/judge-model')
-        base = daemon.request('inspect', bot='approver.auto')['result']
+        base = daemon.request('inspect', bot='.reviewer.auto')['result']
         refused = subprocess.run(
-            [str(self.binary.parent / 'sonny'), 'approver', '--store', str(self.path / 'state.sqlite'),
-             '--socket', str(daemon.socket_path), '--judge', 'openai/other-model'],
+            [str(self.binary.parent / 'sonny'), 'reviewer', '--store', str(self.path / 'state.sqlite'),
+             '--socket', str(daemon.socket_path), '--model', 'openai/other-model'],
             env=clean_env(), capture_output=True, text=True, timeout=30)
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn('approvals_served', refused.stderr)
-        kept = daemon.request('inspect', bot='approver.auto')['result']
+        kept = daemon.request('inspect', bot='.reviewer.auto')['result']
         self.assertEqual((kept['bot_id'], kept['model']), (base['bot_id'], 'judge-model'))
         safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['turn']
         self.assertEqual(daemon.finished(safe)['data']['status'], 'completed')
@@ -1655,7 +1659,7 @@ class AutoApproverTests(ModelFixture):
         # is, labeled, and leaves the breaker's count where it was.
         self.judge.failures = 3
         unchecked = daemon.request('submit', bot='Carol', request_id='c', prompt='shell:printf ok')['result']['turn']
-        judged = next(line for line in iter(lambda: lines.get(timeout=5), None) if line['event'] == 'judged')
+        judged = next(line for line in iter(lambda: lines.get(timeout=5), None) if line['event'] == 'reviewed')
         self.assertEqual((judged['turn'], judged['calls'][0]['decision']), (unchecked, 'ask'))
         self.assertTrue(judged['calls'][0]['reason'].startswith(FAILED), judged)
         self.assertTrue(judged['calls'][0]['reason'].endswith('so this waits for you.'), judged)
@@ -1864,7 +1868,7 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(agent('start', *common[:4]).returncode, 0)
         # With no judge named, the caller's model judges, through the daemon.
         approver = subprocess.Popen(
-            [str(self.binary.parent / 'sonny'), 'approver', '--store', str(store)],
+            [str(self.binary.parent / 'sonny'), 'reviewer', '--store', str(store)],
             env={**env, 'AGENT_MODEL': 'openai/synthetic-model'},
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.addCleanup(lambda: (approver.kill(), approver.wait(), approver.stdout.close()))
@@ -1876,7 +1880,7 @@ class AutoApproverTests(ModelFixture):
         bots = {b['name']: b for b in json.loads(agent('ls', '--store', str(store)).stdout)}
         # Reads run unjudged in auto.
         self.assertEqual(bots['Bob']['gates'], [{'tag': 'auto', 'tools': ['shell'], 'expire_ms': 105000}])
-        self.assertEqual((bots['approver.auto']['model'], bots['approver.auto']['tools']), ('synthetic-model', LOOKING))
+        self.assertEqual((bots['.reviewer.auto']['model'], bots['.reviewer.auto']['tools']), ('synthetic-model', LOOKING))
         stats = json.loads(agent('stats', '--store', str(store)).stdout)
         self.assertEqual(stats['approvers'], ['auto'])
 

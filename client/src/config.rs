@@ -27,9 +27,9 @@
 //! "bedrock/*openai.*" = 1000000 # every OpenAI model on Bedrock
 //! "anthropic/claude-opus-5-5" = 500000  # lower than the model's own on purpose
 //!
-//! [judge]
-//! model = "openai/gpt-6-luna"   # who judges for the approver and the lookout
-//! effort = "low"                # a model judge's effort
+//! [reviewer]
+//! model = "openai/gpt-6-luna"   # the model that reviews calls in auto, `sonny reviewer`
+//! effort = "low"                # the reviewer's effort
 //!
 //! [shell_environment_policy]    # what tool shells leave out, as in Codex
 //! ignore_default_excludes = false  # also *KEY*, *SECRET* and *TOKEN*; true, the default, keeps them
@@ -151,7 +151,7 @@ pub struct Config {
     /// Unset, the provider's listing, else the daemon's own default. The
     /// agent CLI starts the daemon with them.
     pub context_windows: BTreeMap<String, u64>,
-    pub judge: Judge,
+    pub reviewer: ReviewerModel,
     pub shell_environment_policy: ShellEnvironmentPolicy,
     pub sonny: Sonny,
     /// `[daemon]`: each limit the agent CLI starts a daemon with, by key,
@@ -461,10 +461,10 @@ pub enum WebSearch {
     Disabled,
 }
 
-/// The judge `sonny approver` and Sonny's lookout ask.
+/// `[reviewer]`: the model `sonny reviewer` asks about each call in auto.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Judge {
-    /// `provider/model`; unset, the judged bot's own model.
+pub struct ReviewerModel {
+    /// `provider/model`; unset, the reviewed bot's own model.
     pub model: Option<String>,
     pub effort: Option<String>,
 }
@@ -1413,7 +1413,7 @@ fn parse(text: &str) -> Result<Config, String> {
             continue;
         }
         let keys: &[&str] = match name.as_str() {
-            "judge" => &["model", "effort"],
+            "reviewer" => &["model", "effort"],
             "shell_environment_policy" => &["ignore_default_excludes", "exclude"],
             "sonny" => &[
                 "lead_effort",
@@ -1681,10 +1681,10 @@ fn parse(text: &str) -> Result<Config, String> {
                 };
                 continue;
             }
-            // The daemon judges models and levels when the agents are made.
+            // The daemon checks models and levels when the agents are made.
             *match (name.as_str(), key.as_str()) {
-                ("judge", "model") => &mut config.judge.model,
-                ("judge", "effort") => &mut config.judge.effort,
+                ("reviewer", "model") => &mut config.reviewer.model,
+                ("reviewer", "effort") => &mut config.reviewer.effort,
                 ("sonny", "lead_effort") => &mut config.sonny.lead_effort,
                 ("sonny", "lead_profile") => &mut config.sonny.lead_profile,
                 ("sonny", "task_profile") => &mut config.sonny.task_profile,
@@ -2308,11 +2308,11 @@ mod tests {
     fn the_file_sets_what_it_names_and_refuses_the_rest() {
         assert_eq!(parse("").unwrap(), Config::default());
         let config = parse(
-            "# mine\n[judge]\nmodel = \"openai/luna\"\n\n[sonny]\nlead_effort = \"medium\"\ntask_effort = \"high\"\nunsandboxed = [\"mcpx\", \"docker compose\"]\n",
+            "# mine\n[reviewer]\nmodel = \"openai/luna\"\n\n[sonny]\nlead_effort = \"medium\"\ntask_effort = \"high\"\nunsandboxed = [\"mcpx\", \"docker compose\"]\n",
         )
         .unwrap();
-        assert_eq!(config.judge.model.as_deref(), Some("openai/luna"));
-        assert_eq!(config.judge.effort, None);
+        assert_eq!(config.reviewer.model.as_deref(), Some("openai/luna"));
+        assert_eq!(config.reviewer.effort, None);
         assert_eq!(config.sonny.lead_effort.as_deref(), Some("medium"));
         assert_eq!(config.sonny.task_effort.as_deref(), Some("high"));
         assert_eq!(config.sonny.lead_profile, None);
@@ -2494,8 +2494,11 @@ mod tests {
             ("model = 3", "model must be a string"),
             ("[web]\nsearch = true", "unknown table [web]"),
             ("[sonny]\neffort = \"low\"", "unknown key sonny.effort"),
-            ("[judge]\neffort = 3", "judge.effort must be a string"),
-            ("[judge]\nmodel = \"\"", "judge.model must not be empty"),
+            ("[reviewer]\neffort = 3", "reviewer.effort must be a string"),
+            (
+                "[reviewer]\nmodel = \"\"",
+                "reviewer.model must not be empty",
+            ),
             (
                 "[sonny]\nunsandboxed = \"mcpx\"",
                 "sonny.unsandboxed must be a list of commands",
@@ -2507,7 +2510,7 @@ mod tests {
         ] {
             assert_eq!(parse(text).unwrap_err(), error, "{text}");
         }
-        assert!(parse("[judge").is_err());
+        assert!(parse("[reviewer").is_err());
     }
 
     #[test]
@@ -2851,7 +2854,7 @@ mod tests {
         );
         std::fs::write(
             &file,
-            "# mine\nmodel = \"a/b\"\n\n[judge]\neffort = \"low\" # cheap\n\n[sonny]\nlead_effort = \"low\"\n",
+            "# mine\nmodel = \"a/b\"\n\n[reviewer]\neffort = \"low\" # cheap\n\n[sonny]\nlead_effort = \"low\"\n",
         )
         .unwrap();
         set(
@@ -2859,18 +2862,18 @@ mod tests {
             &[
                 ("model", "c/d"),
                 ("provider", "bedrock"),
-                ("judge.model", "e/f"),
+                ("reviewer.model", "e/f"),
                 ("sonny.task_effort", "high"),
             ],
         )
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            "# mine\nmodel = \"c/d\"\nprovider = \"bedrock\"\n\n[judge]\neffort = \"low\" # cheap\nmodel = \"e/f\"\n\n[sonny]\nlead_effort = \"low\"\ntask_effort = \"high\"\n"
+            "# mine\nmodel = \"c/d\"\nprovider = \"bedrock\"\n\n[reviewer]\neffort = \"low\" # cheap\nmodel = \"e/f\"\n\n[sonny]\nlead_effort = \"low\"\ntask_effort = \"high\"\n"
         );
         let config = read(&file).unwrap();
         assert_eq!(config.provider.as_deref(), Some("bedrock"));
-        assert_eq!(config.judge.model.as_deref(), Some("e/f"));
+        assert_eq!(config.reviewer.model.as_deref(), Some("e/f"));
         // A key the reader does not know is refused, and the file kept.
         assert!(
             set(&file, &[("colour", "red")])
@@ -2887,12 +2890,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let file = dir.join("config.toml");
         // Nothing to take out leaves no file and no table behind.
-        write(&file, &[("judge.model", None)]).unwrap();
+        write(&file, &[("reviewer.model", None)]).unwrap();
         assert!(!file.exists());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             &file,
-            "# mine\nmodel = \"a/b\"\n\n[judge]\neffort = \"low\"\n\n[sonny]\nlead_effort = \"low\" # cheap\nside_chat = \"fork\"\n",
+            "# mine\nmodel = \"a/b\"\n\n[reviewer]\neffort = \"low\"\n\n[sonny]\nlead_effort = \"low\" # cheap\nside_chat = \"fork\"\n",
         )
         .unwrap();
         write(
@@ -2902,7 +2905,7 @@ mod tests {
                 ("sonny.task_effort", Some("high".into())),
                 ("sonny.chime", Some(false.into())),
                 ("model", None),
-                ("judge.effort", None),
+                ("reviewer.effort", None),
             ],
         )
         .unwrap();
@@ -2930,7 +2933,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             &file,
-            "# mine\n[sonny]\nlead_effort = \"low\"\n\n[sonny.mcp_servers.docs]\nurl = \"https://a\"\n\n[sonny.mcp_servers.docs.http_headers]\nX = \"1\"\n\n[judge]\neffort = \"low\"\n",
+            "# mine\n[sonny]\nlead_effort = \"low\"\n\n[sonny.mcp_servers.docs]\nurl = \"https://a\"\n\n[sonny.mcp_servers.docs.http_headers]\nX = \"1\"\n\n[reviewer]\neffort = \"low\"\n",
         )
         .unwrap();
         let mut keys = toml::Table::new();
@@ -2946,7 +2949,7 @@ mod tests {
         set_table(&file, "sonny.mcp_servers.files", Some(&keys)).unwrap();
         set_table(&file, "sonny.mcp_servers.docs", None).unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
-        assert!(text.starts_with("# mine\n[sonny]\nlead_effort = \"low\"\n\n[judge]\neffort = \"low\"\n\n[sonny.mcp_servers.files]\n"), "{text}");
+        assert!(text.starts_with("# mine\n[sonny]\nlead_effort = \"low\"\n\n[reviewer]\neffort = \"low\"\n\n[sonny.mcp_servers.files]\n"), "{text}");
         let config = read(&file).unwrap();
         assert!(!config.sonny.mcp_servers.contains_key("docs"));
         let files = &config.sonny.mcp_servers["files"];
@@ -2955,7 +2958,7 @@ mod tests {
             (Some("npx"), &["-y".to_owned(), "x".to_owned()][..])
         );
         assert_eq!(files.env["K"], "v");
-        assert_eq!(config.judge.effort.as_deref(), Some("low"));
+        assert_eq!(config.reviewer.effort.as_deref(), Some("low"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

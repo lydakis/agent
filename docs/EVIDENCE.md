@@ -132,7 +132,7 @@ more turns is not here, because its work changes with its speed; it is under
   about 12 s p99 and 25.4 s at the worst, against its 30 s deadline; about
   438k input and 33k output tokens a pass. No check failed in either.
   Because every call should run, this says nothing about false allows.
-  [Record](APPROVALS.md#measure-before-building).
+  [Record](../sonny/REVIEWER.md#measured).
 - **Five harnesses, same synthetic work.** 32 agents, three turns each adding
   64 KiB: Agent 30.4 MiB peak and 0.75 s CPU, Pi 1.4.0 155 MiB and 2.0 s,
   Codex 0.166.0 368 MiB and 9.3 s, opencode 1.19.5 869 MiB and 13.8 s, Claude

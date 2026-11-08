@@ -52,8 +52,14 @@ impl Picker {
             }
         };
         let mut rows: Vec<&Value> = (bots.iter())
-            // Side chats go once idle; they are never switched to.
-            .filter(|bot| bot["expire_ms"].is_null() && bot["name"].is_string())
+            // Side chats go once idle; they are never switched to, nor
+            // Sonny's own bots.
+            .filter(|bot| bot["expire_ms"].is_null())
+            .filter(|bot| {
+                bot["name"]
+                    .as_str()
+                    .is_some_and(|n| !crate::project::is_internal(n))
+            })
             .collect();
         rows.sort_by(|a, b| {
             (rank(a).cmp(&rank(b))).then_with(|| {
@@ -165,6 +171,7 @@ mod tests {
             json!({"name": "shop.lead.web", "workspace": "/w/shop", "running_turn": null}),
             json!({"name": "shop.lead.side-1", "workspace": "/w/shop", "expire_ms": 9}),
             json!({"name": "notes", "workspace": "/w/notes", "running_turn": null}),
+            json!({"name": ".reviewer.auto", "workspace": "/", "running_turn": null}),
         ]
     }
 

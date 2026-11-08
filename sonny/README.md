@@ -119,7 +119,7 @@ skills and memory of the folder are the same for all of them.
 keys, and `AWS_PROFILE` for Bedrock, which Sonny applies over your shell's to
 the daemon it starts; it does not set providers, so an `AGENT_PROVIDER` there
 is passed over and Sonny says to move it to `provider` in
-`~/.agent/config.toml`; the approver and the lookout run as that daemon's
+`~/.agent/config.toml`; the reviewer and the lookout run as that daemon's
 companions, with its environment, so they live as long as it does whether
 or not a window is open. Settings go in
 `~/.agent/config.toml`, as Codex keeps them: `provider` (the daemon's
@@ -287,7 +287,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's model | (the lead's) | `threads_model` |
 | Each new task's effort | `[sonny] task_effort` | `threads_effort` |
 | Each new task's speed (`standard`, `fast` or `ultrafast`) | `[sonny] task_speed` | `threads_speed` |
-| The approver's judge | `[judge] model`, `effort` | |
+| The reviewer's model, for agents in Auto ([REVIEWER.md](REVIEWER.md)) | `[reviewer] model`, `effort` | |
 | What `/side`'s copy may do | `[sonny] side_chat` (`fork`, the default, or `answer`) | |
 | The chime, the agent's steps, and every tool call drawn | `[sonny] chime`, `steps`, `verbose` (true or false) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
@@ -338,7 +338,7 @@ notifies, `herdr agent wait` and `herdr agent prompt` reach it by name
 0.9.2 lists Sonny but takes no command to restart it). Sonny reports from a
 pane of the Herdr server on its own machine: one reached by plain `ssh` from a
 Herdr pane is not listed, one in a remote machine Herdr itself connects to is.
-The daemon Sonny starts, and the lookout and approver it keeps, run in a session of their own,
+The daemon Sonny starts, and the lookout and reviewer it keeps, run in a session of their own,
 so closing their pane or stopping Herdr leaves them and their turns running.
 In cmux, which reads OSC 7501 and OSC 777 itself, the workspace's sidebar row
 shows which task is working, waiting on you or done, and a
@@ -629,7 +629,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   `senders`, `side_chat`, `chime`, `steps`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
   `start_at_boot`) through them
   and its default; Enter types one that takes a name (`model`, `provider`,
-  `judge.model`, the profiles), empty for its default; ⌫
+  `reviewer.model`, the profiles), empty for its default; ⌫
   takes a key back to its default. Each change is written at once, the
   file's comments and order kept, and a file that does not read is
   refused by name, as every reader refuses it. What the file gives an
@@ -681,7 +681,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   read-only. Reads run without asking in every row. A call that leaves
   the sandbox waits for whoever approves; while the reviewer looks at one
   the status row says `Reviewing approval request` (Sonny keeps
-  `sonny approver` as the daemon's companion when nothing serves it), and
+  `sonny reviewer` as the daemon's companion when nothing serves it), and
   a denied call is drawn as `✗ Request denied for …` with the reviewer's
   reason, in either view; one you allow is drawn as `✓ Request allowed
   for …`, as Codex records each decision. The status row above the
@@ -786,7 +786,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   approval, asking you a question, held on something only you can fix,
   such as a ChatGPT sign-in, or failed),
   **Working** (a turn running, queued, rate limited, waiting on other
-  tasks, or `waiting on its reviewer` while the approver weighs a call), **Idle**
+  tasks, or `waiting on its reviewer` while the reviewer weighs a call), **Idle**
   (its turn ended, stopped, or never started, with nothing open; a pull
   request its last reply linked shows on its row), and **Done** (marked
   done). Each agent is one line: its mark, name, state and time, and at
@@ -840,8 +840,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   restarting (down and waiting for its next start, or up for less than a
   minute after a restart), with how it exits and its log, and turns held
   on something only you can fix, with how to fix it. When all is well it
-  says nothing; the lookout's own line is in `/background`. Each Sonny start keeps the approver again on its own binary
-  and build, with the judge it has, so an upgrade restarts it with the
+  says nothing; the lookout's own line is in `/background`. Each Sonny start keeps the reviewer again on its own binary
+  and build, with the model it has, so an upgrade restarts it with the
   lookout and the tool host.
 
 - `/background` (or `/automations`, `/lookout`) lists, in the pane beside the
@@ -896,9 +896,11 @@ way `/react` does, and each note in the margin has its own `↩`.
   the order they started,
   each arm as wide as the square root of its size, and the agents that made
   none sit on the outer edge, as a tree's leaves do, so the sky fills to
-  its rim. Throwaway copies, such as the approver's judges or a
+  its rim. Throwaway copies, such as a side chat or a
   suggestion's writer, get no star: what they are told and do lights the
-  agent that made them; a judge's question to its copy is not drawn. A
+  agent that made them. Sonny's own bots, whose names start with a dot
+  (the reviewer's `.reviewer.auto` and its copies), are not drawn at all;
+  the reviewer's verdicts streak from the edge onto the agent. A
   reviewer's verdict is: a red streak onto the agent whose call it
   denied, a yellow one when it hands the call to you, nothing for an
   allow, whose call runs. What comes in from no agent flies in from the
@@ -1188,7 +1190,7 @@ every Sonny window closed; a call nobody answers in time ends as
 `tool_unserved`, and the agent goes on. All but `show_agent` wait for a
 verdict wherever the agent's other calls do (`/permissions`): a start runs
 the folder's setup script, a new project makes a lead, a removal can drop
-work, a subscription sends other bots' words to the subscriber's judge,
+work, a follow sends other agents' words to the agent that follows,
 a pane runs a command outside the agent's sandbox, and an automation runs as
 you, from Sonny's scheduler, outside any sandbox. An agent whose
 gate Sonny did not set, as another client's, goes without these until the
@@ -1214,7 +1216,7 @@ the view (`steps` and `verbose`, both off by default), besides the efforts and t
 above. `/config` lists the keys under their table's name, a value set in
 the file plain and a default muted, so what you changed stands out.
 
-![/config: keys under agent, [judge] and [sonny], set values plain and defaults muted](../docs/sonny/config-grouped.png)
+![/config: keys under agent, [reviewer] and [sonny], set values plain and defaults muted](../docs/sonny/config-reviewer.png)
 
 At each start Sonny writes what every agent leans on: the
 `memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
@@ -1573,7 +1575,7 @@ marked as the roster and `/status` mark them, each mark its own shape so
 the counts read without colour, and a click on the count
 opens `/status`. Every surface reads what needs you one way: an agent
 needs you while a call of its waits on your approval (gated for you, or
-handed to you by the approver) or a question it asked you is still open,
+handed to you by the reviewer) or a question it asked you is still open,
 read from the daemon whole when Sonny starts or reconnects, so a restart
 loses neither, and kept current by its events after. A question left in a
 reply's words counts too: once an agent's turn ends with words and no

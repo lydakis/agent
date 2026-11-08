@@ -1325,7 +1325,7 @@ mod tests {
         // Nothing to move: a switch already, none, or elsewhere.
         assert_eq!(dailied("[sonny]\nsky_haikus = true\n"), Ok(None));
         assert_eq!(dailied("[sonny]\nchime = true\n"), Ok(None));
-        assert_eq!(dailied("[judge]\nmodel = \"x\"\n"), Ok(None));
+        assert_eq!(dailied("[reviewer]\nmodel = \"x\"\n"), Ok(None));
         // A key lines can't move is left for the config's own error.
         assert_eq!(dailied("sonny.sky_haikus = 4\n"), Err(()));
         assert_eq!(dailied("sonny = { sky_haikus = 4 }\n"), Err(()));

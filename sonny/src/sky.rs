@@ -490,7 +490,7 @@ pub struct View {
     replay: Option<Replay>,
     /// Throwaway copies, by name, and the agent each copies (its name,
     /// and its id when known): what one
-    /// does is drawn on its agent, as the approver's judgments light it.
+    /// does is drawn on its agent, as the reviewer's verdicts light it.
     copies: HashMap<String, (String, Option<i64>)>,
     /// Who is busiest, by the rule, and the haiku each holder writes.
     title: haiku::Title,
@@ -1770,10 +1770,17 @@ impl View {
 
     fn seat(&mut self, bot: &Value) -> Option<usize> {
         let name = bot["name"].as_str()?;
+        // The sky holds what the person made: Sonny's own bots, by their
+        // mark, are no stars, and what they do is no one's. The
+        // reviewer's verdicts streak from the edge onto the agent whose
+        // call it was.
+        if crate::project::is_internal(name) {
+            return None;
+        }
         // A copy the daemon throws away once idle is no star of its own:
-        // what one an agent made does is drawn on that agent, as the
-        // approver's judgments are; Sonny's own, a guess at the next
-        // message or a haiku, made by no agent, are not drawn at all.
+        // what one an agent made does is drawn on that agent; Sonny's own,
+        // a guess at the next message or a haiku, made by no agent, are
+        // not drawn at all.
         if !bot["expire_ms"].is_null() {
             if let Some(by) = bot["created_by"].as_str().filter(|by| !by.is_empty()) {
                 let id = bot["created_by_id"].as_i64();
@@ -1898,11 +1905,6 @@ impl View {
         let lent = matches!(kind, "queued" | "accepted" | "steered" | "tool_started");
         let own = self.agent(name).is_some();
         if !own && !lent {
-            return;
-        }
-        // A reviewer's question to its own copy is no one's message: its
-        // verdict, on the agent whose call it was, is what the sky draws.
-        if !own && data["origin"] == "judge" && kind != "tool_started" {
             return;
         }
         let turn = event["turn"].as_i64().unwrap_or(-1);
@@ -6669,7 +6671,7 @@ mod tests {
     async fn a_reviewer_s_no_streaks_red_onto_the_agent_and_a_hand_off_yellow() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![
-            json!({"name": "approver.auto"}),
+            json!({"name": ".reviewer.auto"}),
             json!({"name": "shop.lead"}),
         ]))
         .unwrap();
@@ -6802,30 +6804,23 @@ mod tests {
     async fn a_throwaway_copy_lends_its_agent_what_it_is_told_and_no_star_of_its_own() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![
-            json!({"name": "approver.auto", "bot_id": 1}),
             json!({"name": "shop.lead", "bot_id": 2}),
             json!({"name": "shop.lead.suggest-1", "bot_id": 3, "expire_ms": 60_000}),
         ]))
         .unwrap();
         send.send(Feed::Ready).unwrap();
         send.send(Feed::Live(
-            json!({"event": "forked", "bot": "approver.auto.1.9.0",
-            "data": {"bot_id": 4, "created_by": "approver.auto", "expire_ms": 120_000}}),
+            json!({"event": "forked", "bot": "shop.lead.side-1",
+            "data": {"bot_id": 4, "created_by": "shop.lead", "expire_ms": 120_000}}),
         ))
         .unwrap();
         view.drain();
-        assert!(view.agent("approver.auto.1.9.0").is_none());
+        assert!(view.agent("shop.lead.side-1").is_none());
         assert!(view.agent("shop.lead.suggest-1").is_none());
-        let auto = view.index["approver.auto"];
-        // A reviewer's question to its copy: no one's message, not drawn.
+        let lead = view.index["shop.lead"];
+        // Its turn's end is the copy's, not its agent's.
         send.send(Feed::Live(
-            json!({"event": "accepted", "bot": "approver.auto.1.9.0",
-            "turn": 1, "data": {"origin": "judge"}}),
-        ))
-        .unwrap();
-        // Its turn's end is the copy's, not the approver's.
-        send.send(Feed::Live(
-            json!({"event": "turn_finished", "bot": "approver.auto.1.9.0",
+            json!({"event": "turn_finished", "bot": "shop.lead.side-1",
             "turn": 1, "data": {"status": "failed", "error": "x"}}),
         ))
         .unwrap();
@@ -6837,14 +6832,54 @@ mod tests {
         .unwrap();
         view.drain();
         assert!(view.sparks.is_empty());
-        assert_eq!(view.agents[auto].state(), None);
-        assert!(!text(&view.ticked(Instant::now(), 40, 12, true)).contains("a judge"));
+        assert_eq!(view.agents[lead].state(), None);
         send.send(Feed::Live(
-            json!({"event": "deleted", "bot": "approver.auto.1.9.0"}),
+            json!({"event": "deleted", "bot": "shop.lead.side-1"}),
         ))
         .unwrap();
         view.drain();
         assert!(view.copies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sonny_s_own_bots_are_no_stars_and_draw_nothing() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": ".reviewer.auto", "bot_id": 1}),
+            json!({"name": "shop.lead", "bot_id": 2}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        // The reviewer's base made after the sky opened, and a fork of it
+        // for one round.
+        send.send(Feed::Live(
+            json!({"event": "created", "bot": ".reviewer.other",
+            "data": {"bot_id": 3}}),
+        ))
+        .unwrap();
+        send.send(Feed::Live(
+            json!({"event": "forked", "bot": ".reviewer.auto.1.9.0",
+            "data": {"bot_id": 4, "created_by": ".reviewer.auto", "expire_ms": 120_000}}),
+        ))
+        .unwrap();
+        for (kind, data) in [
+            ("accepted", json!({"origin": "reviewer"})),
+            ("tool_started", json!({"call_id": "c1", "tool": "read"})),
+            ("turn_finished", json!({"status": "failed", "error": "x"})),
+        ] {
+            send.send(Feed::Live(
+                json!({"event": kind, "bot": ".reviewer.auto.1.9.0", "turn": 1, "data": data}),
+            ))
+            .unwrap();
+        }
+        view.drain();
+        let names: Vec<&str> = view.agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["shop.lead"]);
+        assert!(view.copies.is_empty());
+        assert!(view.sparks.is_empty());
+        assert_eq!(view.agents[view.index["shop.lead"]].state(), None);
+        let drawn = text(&view.ticked(Instant::now(), 40, 12, true));
+        assert!(!drawn.contains("reviewer"), "{drawn}");
     }
 
     #[tokio::test]
