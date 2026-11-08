@@ -1170,7 +1170,14 @@ group, is no longer the daemon's to find), and from
 then no turn starts: a `reject`
 submission answers `daemon_paused`, `queue` and `steer` submissions are
 recorded and wait, automations' runs and notes with them, and parked and paced turns
-stay parked. An `attach` is taken as usual. The answer is `{pause, changed,
+stay parked. Nothing a client runs starts either: `take_call` answers
+`daemon_paused` and the call waits untaken, `approve_step` answers
+`daemon_paused` and puts no step to a gate or the audit trail, and a step
+already waiting on its gates that every gate allows waits on until `resume`,
+which checks each waiting step again (a denial or a lapse still ends one).
+Results for what already ran, `tool_result` and `step_result`, are taken as
+usual. While the daemon drains for a shutdown the same holds, answered
+`daemon_draining` (protocol 60). An `attach` is taken as usual. The answer is `{pause, changed,
 parked}`, where `pause` is `{id, reason, by, at_ms, parked}` and the
 reply's `parked` counts the running turns it parked. The pause's own `parked`
 is `{bots, total}`: the agents whose running turns it parked, the first 64 by
