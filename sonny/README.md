@@ -1486,7 +1486,10 @@ Your own messages sit on a band tinted from the theme's foreground over
 its background, as Codex and Claude Code tint the user's cell, with a
 row of the band above and below the words, so your turns are easy to
 find when you scroll back; a reply that opens with a
-heading takes no `•` before it.
+heading takes no `•` before it. Your words read as the agent's do: their
+Markdown (bold, code, lists, tables, math, pictures) is drawn the one way
+every surface draws it, in your sent messages, in what waits queued or
+steered, and in a message between agents once opened.
 
 ![Your message on its band, and the footer, all muted at rest, saying 76% left](../docs/sonny/message-band.png)
 

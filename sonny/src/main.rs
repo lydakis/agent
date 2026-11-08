@@ -3719,6 +3719,9 @@ struct App {
     /// steer until the running turn takes it in, a prompt until its turn
     /// starts. Drawn above the status row until they land.
     staged: Vec<(i64, String)>,
+    /// Their rows as last drawn, by turn, width and the mark they wait
+    /// with, so a frame draws a long one's Markdown once, not each time.
+    staged_drawn: std::cell::RefCell<Vec<StagedDrawn>>,
     /// The staged turns sent with Tab to run after the running one, which
     /// they do not join.
     queued: Vec<i64>,
@@ -5323,6 +5326,7 @@ impl App {
             needs_pulse: std::cell::Cell::default(),
             said: String::new(),
             staged: Vec::new(),
+            staged_drawn: std::cell::RefCell::default(),
             queued: Vec::new(),
             steering: Vec::new(),
             pictures: Vec::new(),
@@ -7295,7 +7299,8 @@ impl App {
         };
         // Shut, it is its fold row alone.
         let open = self.screen.count_tagged(screen::Tag::More(node)) == 1;
-        let rows = transcript::prompt_more(&text(&item), self.prose(), open);
+        let folder = std::path::PathBuf::from(&self.workspace);
+        let rows = transcript::prompt_more(&text(&item), self.prose(), open, Some(&folder));
         let last = rows.len().saturating_sub(1);
         self.flush();
         self.screen.replace_tagged(
@@ -7569,15 +7574,13 @@ impl App {
             }
         } else {
             let prose = self.prose();
-            let lines = match older {
-                true => landed(said, &mut Vec::new(), prose),
-                false => landed(said, &mut self.ran_here, prose),
+            let folder = std::path::PathBuf::from(&self.workspace);
+            // A long message's fold row opens the rest of it.
+            let (lines, fold) = match older {
+                true => landed(said, &mut Vec::new(), prose, &folder),
+                false => landed(said, &mut self.ran_here, prose, &folder),
             };
             if !lines.is_empty() {
-                // A long message's fold row opens the rest of it.
-                let fold = (user_shell::read(said).is_none())
-                    .then(|| transcript::prompt_fold(said, prose))
-                    .flatten();
                 let lines = match quotes.is_empty() {
                     true => lines,
                     false => transcript::with_quotes(lines, quotes, prose),
@@ -8810,6 +8813,11 @@ impl App {
     /// once it does: a blank row above each, as in the history, and one
     /// under the last, so the status row does not touch it.
     fn staged_rows(&self, width: usize) -> Vec<Line<'static>> {
+        let mut drawn = self.staged_drawn.borrow_mut();
+        // Kept for those still waiting alone, at the width drawn now.
+        drawn.retain(|((turn, at, _), _)| {
+            *at == width && self.staged.iter().any(|(staged, _)| staged == turn)
+        });
         let mut rows: Vec<Line<'static>> = self
             .staged
             .iter()
@@ -8822,38 +8830,16 @@ impl App {
                     _ if self.steering.contains(turn) && self.running.is_some() => Some(STEERING),
                     _ => None,
                 };
-                let (first, rest) = match waits {
-                    Some(mark) => (format!("›{mark} "), "   "),
-                    None => ("› ".to_owned(), "  "),
-                };
-                let shown: Vec<Line<'static>> = match user_shell::read(prompt) {
-                    Some(ran) => user_shell::header(&ran.command, width, true),
-                    None => {
-                        // An answer shows as itself, under the question it answers.
-                        let (asked, prompt) = match asks::split(prompt) {
-                            Some((question, answer)) => {
-                                (Some(asks::answering(question, width)), answer)
-                            }
-                            None => (None, prompt.as_str()),
-                        };
-                        asked
-                            .into_iter()
-                            .chain(prompt.split('\n').enumerate().flat_map(|(at, line)| {
-                                let lead = if at == 0 {
-                                    first.clone()
-                                } else {
-                                    rest.to_owned()
-                                };
-                                transcript::wrap(
-                                    Line::from(line.to_owned()).dim(),
-                                    width,
-                                    Span::raw(lead).dim(),
-                                    Span::raw(rest),
-                                )
-                            }))
-                            .collect()
-                    }
-                };
+                let key = (*turn, width, waits);
+                let shown = drawn
+                    .iter()
+                    .find(|(at, _)| *at == key)
+                    .map(|(_, rows)| rows.clone())
+                    .unwrap_or_else(|| {
+                        let rows = staged_body(prompt, width, waits);
+                        drawn.push((key, rows.clone()));
+                        rows
+                    });
                 std::iter::once(Line::default()).chain(shown)
             })
             .collect();
@@ -15570,9 +15556,34 @@ fn short(bot: &str, project: &str, lead: &str) -> String {
         .to_owned()
 }
 
-/// A message as it lands in the conversation. A command the person ran
-/// is by name only when `shown` holds it (this window showed its output
-/// when it ran, and lets it go), else whole.
+/// A staged message's rows by its turn, the width and the mark it
+/// waits with ([`App::staged_drawn`]).
+type StagedDrawn = ((i64, usize, Option<char>), Vec<Line<'static>>);
+
+/// A message sent and not landed, dim, drawn as it will read once it
+/// does: an answer under the question it answers, a command by name,
+/// words as every surface draws Markdown, after `›` and what it waits
+/// for.
+fn staged_body(prompt: &str, width: usize, waits: Option<char>) -> Vec<Line<'static>> {
+    if let Some(ran) = user_shell::read(prompt) {
+        return user_shell::header(&ran.command, width, true);
+    }
+    let (first, rest) = match waits {
+        Some(mark) => (format!("›{mark} "), "   "),
+        None => ("› ".to_owned(), "  "),
+    };
+    let (asked, prompt) = match asks::split(prompt) {
+        Some((question, answer)) => (Some(asks::answering(question, width)), answer),
+        None => (None, prompt),
+    };
+    let leads = (Line::from(Span::raw(first)), Line::from(rest));
+    let words = transcript::markdown(&mut transcript::Markdown::default(), prompt, width, leads);
+    asked
+        .into_iter()
+        .chain(words.into_iter().map(|row| row.dim()))
+        .collect()
+}
+
 /// A message's first line, cut to quote it.
 fn first_words(text: &str) -> String {
     let first = text
@@ -15582,17 +15593,27 @@ fn first_words(text: &str) -> String {
     transcript::cut(first.trim(), QUOTED)
 }
 
-fn landed(text: &str, shown: &mut Vec<user_shell::Ran>, width: usize) -> Vec<Line<'static>> {
+/// A message as it lands in the conversation, with where it folds. A
+/// command the person ran is by name only when `shown` holds it (this
+/// window showed its output when it ran, and lets it go), else whole,
+/// and never folds.
+fn landed(
+    text: &str,
+    shown: &mut Vec<user_shell::Ran>,
+    width: usize,
+    folder: &std::path::Path,
+) -> (Vec<Line<'static>>, Option<usize>) {
     let Some(ran) = user_shell::read(text) else {
-        return transcript::prompt(text, None, width);
+        return transcript::prompt(text, width, Some(folder));
     };
-    match shown.iter().position(|seen| *seen == ran) {
+    let rows = match shown.iter().position(|seen| *seen == ran) {
         Some(at) => {
             shown.remove(at);
             user_shell::header(&ran.command, width, true)
         }
         None => user_shell::lines(&ran, width),
-    }
+    };
+    (rows, None)
 }
 
 fn first_line(text: &str) -> String {
@@ -18549,15 +18570,18 @@ mod tests {
         }
         app.shell_ran().await;
         assert_eq!(sent.lock().unwrap()[1]["delivery"], "steer");
-        let landed_here: Vec<String> = landed(prompt, &mut app.ran_here, 80)
-            .iter()
-            .map(|l| l.to_string())
-            .collect();
+        let landed_here: Vec<String> =
+            landed(prompt, &mut app.ran_here, 80, std::path::Path::new("."))
+                .0
+                .iter()
+                .map(|l| l.to_string())
+                .collect();
         assert_eq!(landed_here, ["! echo hello"]);
         let left: Vec<&str> = app.ran_here.iter().map(|r| r.command.as_str()).collect();
         assert_eq!(left, ["true"]);
         // Run in another window: shown whole.
-        let elsewhere: Vec<String> = landed(prompt, &mut Vec::new(), 80)
+        let elsewhere: Vec<String> = landed(prompt, &mut Vec::new(), 80, std::path::Path::new("."))
+            .0
             .iter()
             .map(|l| l.to_string())
             .collect();
@@ -18649,6 +18673,36 @@ mod tests {
         // One alone over it is still kept: the daemon says if it is too much.
         hold(&mut unsent, "y".repeat(UNSENT_BYTES * 2));
         assert_eq!(unsent.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_staged_message_reads_as_it_will_land_and_is_drawn_once() {
+        let mut app = app(daemon_answering(|_| json!({"turn": 2})).await);
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        app.input
+            .set("Use **bold** and `code`:\n\n| a | b |\n|---|---|\n| 1 | 2 |");
+        app.submit().await;
+        let rows = app.staged_rows(80);
+        let shown: Vec<String> = rows.iter().map(|l| l.to_string()).collect();
+        assert_eq!(shown[1], "›↪ Use bold and code:", "{shown:?}");
+        assert!(
+            shown.iter().any(|row| row.contains("│ 1 │ 2 │")),
+            "{shown:?}"
+        );
+        assert!(
+            rows[1..rows.len() - 1]
+                .iter()
+                .filter(|row| row.width() > 0)
+                .all(|row| row.style.add_modifier.contains(Modifier::DIM))
+        );
+        // Drawn again only when its width or what it waits for changes.
+        app.staged_rows(80);
+        assert_eq!(app.staged_drawn.borrow().len(), 1);
+        app.staged_rows(60);
+        assert_eq!(app.staged_drawn.borrow().len(), 1, "the old width let go");
+        app.staged.clear();
+        app.staged_rows(60);
+        assert!(app.staged_drawn.borrow().is_empty());
     }
 
     #[tokio::test]

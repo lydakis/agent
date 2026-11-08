@@ -1202,17 +1202,20 @@ fn words(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// A prompt, as the person (or another bot) sent it.
-pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>> {
+/// A prompt, as the person sent it, its pictures read from `folder`
+/// (the agent's workspace), with where it folds: its fold row's place
+/// among its rows, none for one that shows whole.
+pub fn prompt(
+    text: &str,
+    width: usize,
+    folder: Option<&std::path::Path>,
+) -> (Vec<Line<'static>>, Option<usize>) {
     let mut out = Vec::new();
     // What Sonny (or the app) told the lead of its tasks, or what the
     // lookout woke it for: news, not words of the person's, kept to one
     // quiet row; the lead's answer says the rest.
     if let Some(news) = news(text) {
-        return vec![news_row(&news, width)];
-    }
-    if let Some(from) = from {
-        out.push(Line::from(format!("  from {from}")).dim());
+        return (vec![news_row(&news, width)], None);
     }
     // An answer to the lead's question says which over the answer, on
     // its band, as a reply in a chat quotes what it replies to and as
@@ -1222,19 +1225,19 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
         None => (None, text),
     };
     // A long paste shows its start, and a row a click opens to the rest.
-    let lines: Vec<&str> = text.lines().collect();
-    let shown = shown_lines(lines.len());
+    let (rows, more) = prompt_rows(text, width, folder);
     // On its band with a row of it above and below, as the composer it
     // was written in: the words sit in the middle, not on an edge.
     let band = crate::look::BAND;
     out.push(Line::default().bg(band));
     out.extend(answering.map(|row| row.bg(band)));
-    out.extend(prompt_rows(&lines[..shown], 0, width));
-    if lines.len() > shown {
-        out.extend(prompt_rest(lines.len() - shown, None, width));
-    }
+    out.extend(rows);
+    let fold = (!more.is_empty()).then(|| {
+        out.push(fold_row(more.len(), false));
+        out.len() - 1
+    });
     out.push(Line::default().bg(band));
-    out
+    (out, fold)
 }
 
 /// How many of a prompt's `count` lines show while it is folded: all of
@@ -1246,59 +1249,54 @@ fn shown_lines(count: usize) -> usize {
     }
 }
 
-/// A prompt's `lines` on its band, the first of them its `at`th.
-fn prompt_rows(lines: &[&str], at: usize, width: usize) -> Vec<Line<'static>> {
+/// A prompt's words on its band, drawn as every surface draws Markdown,
+/// after the person's `›`: the rows of the lines it shows folded, and
+/// those of the rest.
+fn prompt_rows(
+    text: &str,
+    width: usize,
+    folder: Option<&std::path::Path>,
+) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let band = crate::look::BAND;
-    let mut out = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let lead = if at + i == 0 { "› " } else { "  " };
-        out.extend(wrap(
-            Line::from(line.to_string()).bg(band),
-            width,
-            Span::raw(lead).bold().fg(Color::Magenta),
-            Span::raw("  "),
-        ));
-    }
-    out
+    let mut reader = match folder {
+        Some(folder) => Markdown::in_folder(folder),
+        None => Markdown::default(),
+    };
+    let first = Line::from(Span::raw("› ").bold().fg(Color::Magenta));
+    let shown = shown_lines(text.lines().count());
+    let leads = (first, Line::from("  "));
+    let (rows, more) = markdown_at(&mut reader, text, width, leads, shown);
+    let band = |rows: Vec<Line<'static>>| rows.into_iter().map(|row| row.bg(band)).collect();
+    (band(rows), band(more))
 }
 
-/// The rows of a long prompt past its first lines, `more` of them: its
-/// fold row alone while shut (`open` none), and open, those lines
-/// (`open`, from its first hidden one) and the row under them, which a
-/// click shuts again.
-fn prompt_rest(more: usize, open: Option<&[&str]>, width: usize) -> Vec<Line<'static>> {
-    let band = crate::look::BAND;
-    let mut out = match open {
-        Some(lines) => prompt_rows(lines, PROMPT_LINES, width),
-        None => Vec::new(),
-    };
+/// A long prompt's fold row: `more` rows past its first lines, shut or open.
+fn fold_row(more: usize, open: bool) -> Line<'static> {
     let row = match open {
-        Some(_) => format!("  +{more} lines ▾"),
-        None => format!("  … +{more} lines ▸"),
+        true => format!("  +{more} lines ▾"),
+        false => format!("  … +{more} lines ▸"),
     };
-    out.push(Line::from(row).dim().bg(band));
+    Line::from(row).dim().bg(crate::look::BAND)
+}
+
+/// A long prompt's rows past its first, open or shut: what replaces its
+/// fold row (or those rows) when the row is clicked. Shut, its fold row
+/// alone; open, those rows and the row under them, which a click shuts.
+pub fn prompt_more(
+    text: &str,
+    width: usize,
+    open: bool,
+    folder: Option<&std::path::Path>,
+) -> Vec<Line<'static>> {
+    let (_, body) = crate::asks::split(text).unwrap_or(("", text));
+    let (_, more) = prompt_rows(body, width, folder);
+    let count = more.len();
+    let mut out = match open {
+        true => more,
+        false => Vec::new(),
+    };
+    out.push(fold_row(count, open));
     out
-}
-
-/// Where a prompt drawn by [`prompt`] folds: its fold row's place among
-/// its rows, at `width`; none for one that shows whole.
-pub fn prompt_fold(text: &str, width: usize) -> Option<usize> {
-    let (_, body) = crate::asks::split(text).unwrap_or(("", text));
-    let count = body.lines().count();
-    if shown_lines(count) == count || news(text).is_some() {
-        return None;
-    }
-    // Its last row is the band's; the fold row is right over it.
-    Some(prompt(text, None, width).len() - 2)
-}
-
-/// A long prompt's rows past its first lines, open or shut: what
-/// replaces its fold row (or those rows) when the row is clicked.
-pub fn prompt_more(text: &str, width: usize, open: bool) -> Vec<Line<'static>> {
-    let (_, body) = crate::asks::split(text).unwrap_or(("", text));
-    let lines: Vec<&str> = body.lines().collect();
-    let shown = shown_lines(lines.len());
-    prompt_rest(lines.len() - shown, open.then_some(&lines[shown..]), width)
 }
 
 /// Whether a message is from another bot or tells the lead of its tasks:
@@ -1374,8 +1372,14 @@ fn quote_rows(text: &str, width: usize, cap: Option<usize>) -> Vec<Line<'static>
     let mut lines = text.lines().peekable();
     while let Some(line) = lines.next() {
         let Some(quoted) = quote_line(line) else {
-            let line = Line::from(line.to_string());
-            out.extend(wrap(line, width, Span::raw("  "), Span::raw("  ")));
+            // Its own words, as every surface draws Markdown.
+            let mut words = line.to_string();
+            while let Some(line) = lines.next_if(|line| quote_line(line).is_none()) {
+                words.push('\n');
+                words.push_str(line);
+            }
+            let leads = (Line::from("  "), Line::from("  "));
+            out.extend(markdown(&mut Markdown::default(), &words, width, leads));
             continue;
         };
         let mut words = quoted.to_string();
@@ -1954,13 +1958,30 @@ pub fn markdown(
     markdown: &mut Markdown,
     text: &str,
     width: usize,
-    (first, rest): (Line<'static>, Line<'static>),
+    leads: (Line<'static>, Line<'static>),
 ) -> Vec<Line<'static>> {
+    markdown_at(markdown, text, width, leads, usize::MAX).0
+}
+
+/// [`markdown`] in two parts: the rows its first `lines` lines drew,
+/// and the rest, as one reading of it draws them, so a table or a fence
+/// that runs past them draws whole, after.
+pub fn markdown_at(
+    markdown: &mut Markdown,
+    text: &str,
+    width: usize,
+    (first, rest): (Line<'static>, Line<'static>),
+    lines: usize,
+) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let width = width.min(crate::measure());
     let wide = first.width().max(rest.width());
     let inner = (width + 2).saturating_sub(wide).max(10);
     let mut rows = Vec::new();
-    for line in text.lines() {
+    let mut before = None;
+    for (at, line) in text.lines().enumerate() {
+        if at == lines {
+            before = Some(rows.len());
+        }
         rows.extend(markdown.feed(line, inner, false));
     }
     rows.extend(markdown.end(inner, false));
@@ -1969,7 +1990,8 @@ pub fn markdown(
         let lead = if at == 0 { &first } else { &rest };
         out.push(relead(row, lead));
     }
-    out
+    let after = out.split_off(before.unwrap_or(out.len()));
+    (out, after)
 }
 
 /// `row` with its first two columns, the lead Markdown draws, swapped
@@ -3390,14 +3412,85 @@ mod tests {
     }
 
     #[test]
+    fn the_person_s_words_read_as_a_reply_reads_on_their_band() {
+        let said =
+            "Ship **it** with `cargo test`:\n\n- one\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |";
+        let (rows, fold) = prompt(said, 80, None);
+        assert_eq!(fold, None);
+        // The marks read as what they mean, as in the agent's reply.
+        let shown = text(&rows);
+        assert_eq!(shown[1], "› Ship it with cargo test:", "{shown:?}");
+        assert!(shown.iter().any(|row| row == "  - one"), "{shown:?}");
+        assert!(!shown.iter().any(|row| row.contains("|---|")), "{shown:?}");
+        let bold = rows[1].spans.iter().find(|span| span.content == "it");
+        assert!(bold.unwrap().style.add_modifier.contains(Modifier::BOLD));
+        // Every row on the band, the first after the person's mark.
+        assert!(
+            rows.iter()
+                .all(|row| row.style.bg == Some(crate::look::BAND))
+        );
+        let mark = rows[1].spans.iter().find(|span| span.content == "› ");
+        assert_eq!(mark.unwrap().style.fg, Some(Color::Magenta));
+        // The same words drawn as the agent's reply draws them, but its lead.
+        let reply = text(&reply(said, 80, std::path::Path::new(".")));
+        let body: Vec<String> = shown[1..shown.len() - 1]
+            .iter()
+            .map(|row| row.chars().skip(2).collect::<String>())
+            .collect();
+        let reply: Vec<String> = reply
+            .iter()
+            .map(|row| row.chars().skip(2).collect::<String>())
+            .collect();
+        assert_eq!(
+            body.iter().map(|r| r.trim_end()).collect::<Vec<_>>(),
+            reply.iter().map(|r| r.trim_end()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_message_between_agents_opens_to_its_markdown_drawn_and_its_quotes_behind_a_bar() {
+        let said = "Done: **3 fixed**, see `calc.rs`.\n\n> what you asked\n\n- one\n- two";
+        let shown = text(&relayed(said, Some("shop.cart"), true, 80));
+        assert_eq!(shown[0], "↳ From shop.cart ▾");
+        assert_eq!(shown[1], "  Done: 3 fixed, see calc.rs.", "{shown:?}");
+        assert!(
+            shown.iter().any(|row| row == "  ▌ what you asked"),
+            "{shown:?}"
+        );
+        assert!(shown.iter().any(|row| row == "  - two"), "{shown:?}");
+    }
+
+    #[test]
+    fn a_long_message_folds_by_the_rows_it_draws_and_opens_to_the_rest() {
+        let said: String = (1..=12).map(|n| format!("- item {n}\n")).collect();
+        let (rows, fold) = prompt(&said, 80, None);
+        let fold = fold.unwrap();
+        assert_eq!(fold, rows.len() - 2);
+        assert_eq!(rows[fold].to_string(), "  … +6 lines ▸");
+        let shown = text(&rows);
+        assert_eq!(shown[1], "› - item 1");
+        assert_eq!(shown[fold - 1], "  - item 6");
+        let open = text(&prompt_more(&said, 80, true, None));
+        assert_eq!(open.first().unwrap(), "  - item 7");
+        assert_eq!(open.last().unwrap(), "  +6 lines ▾");
+        assert_eq!(
+            text(&prompt_more(&said, 80, false, None)),
+            ["  … +6 lines ▸"]
+        );
+        // A short one shows whole.
+        assert_eq!(prompt("- a\n- b", 80, None).1, None);
+    }
+
+    #[test]
     fn an_answer_shows_itself_under_the_question_it_answers() {
-        let shown: Vec<String> = prompt("You asked (c1): Ship it?\n\nNot yet", None, 80)
+        let shown: Vec<String> = prompt("You asked (c1): Ship it?\n\nNot yet", 80, None)
+            .0
             .iter()
             .map(|row| row.to_string())
             .collect();
         // On the answer's band, over it, as the composer showed it.
         assert_eq!(shown, ["", "  answering “Ship it?”", "› Not yet", ""]);
-        let rows = prompt("You asked (c1): Ship **it**?\n\nNot yet", None, 80);
+        let rows = prompt("You asked (c1): Ship **it**?\n\nNot yet", 80, None).0;
         assert_eq!(rows[1].to_string(), "  answering “Ship it?”");
         // The band's role, made the theme's band as each frame is drawn,
         // so a light/dark switch reaches these rows without drawing them
@@ -3418,11 +3511,11 @@ mod tests {
                     Memory changed since you last heard; each fact is a file, read before relying on it:\n\
                     - saved: /m/flow.md: Reviews go through gft";
         assert_eq!(
-            text(&super::prompt(told, None, 90)),
+            text(&super::prompt(told, 90, None).0),
             ["↳ Task updates · shop.fix failed · shop.docs completed · +2 more · memory changed"]
         );
         assert_eq!(
-            text(&super::prompt(told, None, 40)),
+            text(&super::prompt(told, 40, None).0),
             ["↳ Task updates · shop.fix failed · shop…"]
         );
         let note = "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
@@ -3434,7 +3527,7 @@ mod tests {
              A quoted message is the person's own words.\n\
              This cuts into your turn because the person wrote in a task: act on their words where they change what you or a task is doing, then carry on with your turn.";
         assert_eq!(
-            text(&super::prompt(note, None, 160)),
+            text(&super::prompt(note, 160, None).0),
             [
                 "↳ Task updates · shop.fix failed · you wrote in shop.docs · shop.fix wrote in shop.api · 2 messages in shop.web · +1 more"
             ]
@@ -3450,7 +3543,7 @@ mod tests {
              - shop.api: turn:shop.api/3 has printed nothing for 30 minutes\n\
              - shop.db: turn:shop.db/4, put a question to the person, which they answer in shop.db:\n  > Keep it?";
         assert_eq!(
-            text(&super::prompt(note, None, 160)),
+            text(&super::prompt(note, 160, None).0),
             [
                 "↳ Task updates · shop.fix noted · shop.web took a note away · shop.docs needs you · shop.api quiet · shop.db asks you"
             ]
@@ -3517,7 +3610,7 @@ mod tests {
             crate::skills::UPGRADED
         );
         assert_eq!(
-            text(&super::prompt(&note, None, 90)),
+            text(&super::prompt(&note, 90, None).0),
             ["↳ Sonny upgraded · lead role edited · plan skill edited"]
         );
         let note = format!(
@@ -3530,7 +3623,7 @@ mod tests {
             crate::skills::UPGRADED
         );
         assert_eq!(
-            text(&super::prompt(&note, None, 90)),
+            text(&super::prompt(&note, 90, None).0),
             ["↳ Sonny upgraded · what's new · set up backup"]
         );
         let note = format!(
@@ -3541,7 +3634,7 @@ mod tests {
             crate::skills::UPGRADED
         );
         assert_eq!(
-            text(&super::prompt(&note, None, 90)),
+            text(&super::prompt(&note, 90, None).0),
             ["↳ Sonny upgraded · move-rows"]
         );
     }
@@ -3556,7 +3649,7 @@ mod tests {
              - 40 more events from chat and ci came between 9 minutes ago and 1 minute ago, and they were not kept: 1024 were waiting for you already\n\
              Act where something changes your work.";
         assert_eq!(
-            text(&super::prompt(note, None, 90)),
+            text(&super::prompt(note, 90, None).0),
             ["↳ From your sources · slack 2 · mail · +3 more · 40 not kept"]
         );
         // A source with an icon is marked by it, as `/status` marks its
