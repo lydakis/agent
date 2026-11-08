@@ -1327,6 +1327,7 @@ pub fn from_outside(origin: Option<&str>) -> &'static str {
         Some("tasks") => "a task",
         Some("judge") => "a judge",
         Some("background") => "a background command",
+        Some("limit") => "the model's output limit",
         _ => "outside",
     }
 }
@@ -1351,7 +1352,7 @@ pub fn sender(bot: Option<&str>, origin: Option<&str>, person: Option<&str>) -> 
 /// row with `▾` and the whole message under it.
 pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<Line<'static>> {
     if !open {
-        return relayed_shut(&relayed_head(text, from), from, width);
+        return relayed_shut(&relayed_head(text, from), width);
     }
     let head = match (news(text), from) {
         (Some(parts), _) => parts[0].clone(),
@@ -1449,24 +1450,13 @@ pub fn relayed_head(text: &str, from: Option<&str>) -> String {
 /// short of the window, so a row is read at a glance.
 pub const GLANCE: usize = 48;
 
-/// The shut row of words between agents, from [`relayed_head`].
-pub fn relayed_shut(head: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>> {
+/// The shut row of words between agents, from [`relayed_head`]. Who
+/// sent it is a word like any other: a name that is an agent's opens it,
+/// in the agents' color, as wherever an agent is named.
+pub fn relayed_shut(head: &str, width: usize) -> Vec<Line<'static>> {
     // Cut apart from its arrow, which a narrow window would cut too.
     let head = cut(head, width.saturating_sub(4));
-    // Who said it in the agents' color.
-    let mut spans = vec![Span::raw("↳ ")];
-    let rest = head.as_str();
-    // Only a bot's name takes the agents' color: what sent words from
-    // outside ("the commons") is named in words, with spaces.
-    match from.filter(|from| rest == format!("From {from}") && !from.contains(' ')) {
-        Some(from) => {
-            spans.push(Span::raw("From "));
-            spans.push(Span::raw(from.to_owned()).fg(Color::Blue));
-        }
-        None => spans.push(Span::raw(rest.to_owned())),
-    }
-    spans.push(Span::raw(" ▸"));
-    vec![Line::from(spans).dim()]
+    vec![Line::from(format!("↳ {head} ▸")).dim()]
 }
 
 /// What words attached to a call are, as the row that gathers several
@@ -1512,7 +1502,7 @@ pub fn relayed_kind(text: &str, from: Option<&str>) -> &'static str {
 pub fn relayed_names(text: &str, from: Option<&str>) -> Vec<String> {
     // News names whom it is about, not what sent it ("task updates").
     if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
-        return (sourced(rest).into_iter().skip(1))
+        return (sourced(rest, &Default::default()).into_iter().skip(1))
             .filter(|source| !source.starts_with('+'))
             .collect();
     }
@@ -1704,7 +1694,7 @@ const FROM_SOURCES: &str = "From your sources: ";
 /// sources said, as its kind and a few words for each thing it tells.
 fn news(text: &str) -> Option<Vec<String>> {
     if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
-        return Some(sourced(rest));
+        return Some(sourced(rest, &crate::background::source_icons()));
     }
     // "- the lead role: theirs at …" is the lead role, "- set up backup: …"
     // the backup, "- do move; …" the step it asks, and a register's rows
@@ -1779,8 +1769,9 @@ fn news(text: &str) -> Option<Vec<String>> {
 }
 
 /// What each source said, counted: "- slack, from \"ana\" (for your
-/// chat): \"lunch?\"" is one from slack.
-fn sourced(rest: &str) -> Vec<String> {
+/// chat): \"lunch?\"" is one from slack, marked by its `icon` when it has
+/// one, as `/status` and `/background` mark it.
+fn sourced(rest: &str, icons: &std::collections::HashMap<String, String>) -> Vec<String> {
     let mut counts: Vec<(String, usize)> = Vec::new();
     let (mut more, mut unkept) = (None, None);
     for item in rest.lines().filter_map(|line| line.strip_prefix("- ")) {
@@ -1801,9 +1792,19 @@ fn sourced(rest: &str) -> Vec<String> {
         }
     }
     let mut parts = vec!["From your sources".to_owned()];
-    parts.extend(counts.into_iter().map(|(source, n)| match n {
-        1 => source,
-        n => format!("{source} {n}"),
+    parts.extend(counts.into_iter().map(|(source, n)| {
+        // A topic's news names it `SOURCE:TOPIC`; the icon is the source's.
+        let of = source
+            .split_once(':')
+            .map_or(source.as_str(), |(name, _)| name);
+        let named = match icons.get(of) {
+            Some(icon) => format!("{icon} {source}"),
+            None => source,
+        };
+        match n {
+            1 => named,
+            n => format!("{named} {n}"),
+        }
     }));
     parts.extend(more);
     parts.extend(unkept);
@@ -3186,11 +3187,12 @@ mod tests {
     }
 
     #[test]
-    fn who_sent_words_between_agents_shows_in_the_agents_color() {
+    fn who_sent_words_between_agents_is_named_whole_and_never_colored_here() {
         let rows = relayed("Tests pass.", Some("calc.neg"), false, 80);
         assert_eq!(text(&rows), ["↳ From calc.neg ▸"]);
-        let sender = rows[0].spans.iter().find(|s| s.content == "calc.neg");
-        assert_eq!(sender.and_then(|s| s.style.fg), Some(Color::Blue));
+        // The color is the link's, which the screen draws once the name
+        // is an agent's: never one a name that opens nothing keeps.
+        assert!(rows[0].spans.iter().all(|s| s.style.fg.is_none()));
         // A window too narrow for any of it still draws the arrow.
         for width in 0..8 {
             relayed("Tests pass.", Some("calc.neg"), false, width);
@@ -3556,6 +3558,16 @@ mod tests {
         assert_eq!(
             text(&super::prompt(note, None, 90)),
             ["↳ From your sources · slack 2 · mail · +3 more · 40 not kept"]
+        );
+        // A source with an icon is marked by it, as `/status` marks its
+        // followers; one without stays its name.
+        let rest = note.strip_prefix(FROM_SOURCES).unwrap();
+        let icons = [("slack".to_owned(), "▲".to_owned())].into();
+        assert_eq!(super::sourced(rest, &icons)[1..3], ["▲ slack 2", "mail"]);
+        // One topic of it, too.
+        assert_eq!(
+            super::sourced("- slack:deploys (for your chat): \"ship it\"", &icons)[1],
+            "▲ slack:deploys"
         );
     }
 

@@ -85,7 +85,7 @@ class DaemonTests(ModelFixture):
         self.assertEqual(refused['error'], 'web_search_unavailable')
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), tools=['echo']))
 
-    def test_a_patch_is_a_custom_tool_call_answered_in_kind(self):
+    def test_a_patch_is_a_function_off_openai_and_a_custom_call_is_answered_in_kind(self):
         patch = ('*** Begin Patch\n*** Add File: notes.md\n+# Notes\n'
                  '*** Update File: calc.py\n@@\n-x = 1\n+x = 2\n*** End Patch')
         call = dict(type='custom_tool_call', id='ctc_1', call_id='p1', name='apply_patch', input=patch)
@@ -117,11 +117,13 @@ class DaemonTests(ModelFixture):
                 client.request('create', bot='Bob', workspace=str(root))
                 turn = client.request('submit', bot='Bob', request_id='patch', prompt='patch it')['result']['turn']
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-                # Declared as a grammar-constrained custom tool.
+                # Off OpenAI's own API, declared as a function taking the
+                # patch: other endpoints refuse custom tools.
                 tool, = requests[0]['tools']
-                self.assertEqual((tool['type'], tool['name'], tool['format']['syntax']), ('custom', 'apply_patch', 'lark'))
-                # The call goes back as the model made it, answered by a
-                # custom tool call output.
+                self.assertEqual((tool['type'], tool['name'], tool['parameters']['required']),
+                                 ('function', 'apply_patch', ['input']))
+                # A custom call still goes back as the model made it,
+                # answered by a custom tool call output.
                 *_, sent, answer = requests[1]['input']
                 self.assertEqual(sent, call)
                 self.assertEqual(answer, dict(type='custom_tool_call_output', call_id='p1',

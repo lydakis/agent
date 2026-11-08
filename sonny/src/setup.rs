@@ -1182,6 +1182,7 @@ const TEMPLATE: &str = "\
 #                           openrouter, or NAME=FAMILY,URL,KEY_ENV; unset, the
 #                           providers whose keys are set
 # web_search = \"disabled\"   new agents search and fetch the web unless this says so
+# web_search_off = [\"bedrock-openai/xai.*\"]   models a new agent gets no search on
 #
 # [sonny]
 # lead_effort, task_effort   a new lead's and each new task's effort: low, medium,

@@ -239,6 +239,33 @@ fn last_lead(store: Option<&str>, dir: &Path) -> Option<String> {
     Some(text.trim().to_owned()).filter(|bot| is_lead(bot))
 }
 
+/// The project whose leads work in `dir`, and the folder they work in:
+/// the one `open` opens a lead of.
+pub fn folder_project(dir: &Path) -> Result<(String, PathBuf), String> {
+    let dir = folder_of(&dir.canonicalize().map_err(|e| e.to_string())?)?;
+    Ok((default_name(&dir)?, dir))
+}
+
+/// One page of every project's leads, by name from past `after`, and the
+/// name the next page starts past: the daemon's own paging.
+pub async fn every_lead(
+    client: &Client,
+    after: Option<&str>,
+) -> Result<(Vec<Value>, Option<String>), String> {
+    let page = client
+        .request(
+            "bots",
+            json!({"name": "*.lead*", "limit": 256, "after": after}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let leads = (page["bots"].as_array().into_iter().flatten())
+        .filter(|bot| is_lead(bot["name"].as_str().unwrap_or("")))
+        .cloned()
+        .collect();
+    Ok((leads, page["next_after"].as_str().map(str::to_owned)))
+}
+
 /// Every lead of `project` working in `dir`, first one first, then by name.
 pub async fn leads(client: &Client, project: &str, dir: &Path) -> Result<Vec<Value>, String> {
     let at = dir.to_str().unwrap_or("");
@@ -577,8 +604,7 @@ pub async fn open(
     model: Option<&str>,
     pick: &Pick,
 ) -> Result<Lead, String> {
-    let dir = folder_of(&dir.canonicalize().map_err(|e| e.to_string())?)?;
-    let project = default_name(&dir)?;
+    let (project, dir) = folder_project(dir)?;
     let first = format!("{project}.lead");
     let chosen = match pick {
         Pick::Made { profile, .. } => profile.as_deref(),
@@ -911,6 +937,7 @@ async fn create(
         model: Some(model),
         effort: (config.sonny.lead_effort.clone()).or(effort.filter(|e| !e.is_empty())),
         web_search: config.web_search,
+        web_search_off: config.web_search_off,
         fallbacks: config.fallbacks,
         ..Default::default()
     };
@@ -937,10 +964,15 @@ async fn make(
         // lead doesn't get is left out there.
         None => {
             let model = picks.model.as_deref().or(role.model.as_deref());
-            agent_client::default_tools(client.providers(), model.unwrap_or(""), picks.web_search)
-                .into_iter()
-                .map(String::from)
-                .collect()
+            agent_client::default_tools(
+                client.providers(),
+                model.unwrap_or(""),
+                picks.web_search,
+                &picks.web_search_off,
+            )
+            .into_iter()
+            .map(String::from)
+            .collect()
         }
     };
     let declare = json!(crate::declared::tools(crate::served::Role::LEAD));
@@ -987,6 +1019,7 @@ pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
         picks.effort = config.sonny.lead_effort;
     }
     picks.web_search = config.web_search;
+    picks.web_search_off = config.web_search_off;
     picks.fallbacks = config.fallbacks;
     let socket = std::env::var_os("AGENT_SOCKET")
         .map(PathBuf::from)

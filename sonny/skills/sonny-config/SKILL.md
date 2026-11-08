@@ -49,6 +49,15 @@ each setting is; what to set is the person's call.
   wildcards (`"bedrock/*openai.*" = 1000000`), over what its provider
   lists; the most specific pattern wins, and it may be lower on purpose.
   Read when the daemon starts.
+- The price sheet, `~/.agent/prices.toml`, or the file the config's
+  `prices = "~/path/sheet.toml"` names: what a million tokens cost, which
+  `/usage` turns into each model's cost and a total, by `PROVIDER/MODEL`
+  with `*` wildcards, the most specific pattern winning, one row each:
+  `"anthropic/claude-opus-5*" = { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25 }`.
+  `input` and `output` are required; `cached` and `cache_write` are
+  `input`'s when unset, `cache_write_1h` is `cache_write`'s. Nothing is
+  bundled: take the numbers from the provider's own pricing page. Read at
+  each `/usage` refresh.
 - Command rules are not in the config: `~/.agent/rules/*.rules` holds
   Codex-style `prefix_rule(pattern = ["mcpx"], decision = "allow")` lines
   (`allow` runs outside the sandbox without asking, `prompt` always asks,
@@ -110,6 +119,7 @@ A key `table.key` goes under `[table]`; a bare key goes at the top.
 | `effort` | a new lead's effort | `sonny.lead_effort` |
 | `threads_model` | each new task's model | the lead's |
 | `threads_effort` | each new task's effort | `sonny.task_effort` |
+| `threads_speed` | each new task's speed: `standard`, `fast` or `ultrafast` | `sonny.task_speed` |
 | `profile` | the profile the lead runs as | `sonny.lead_profile` |
 | `threads_profile` | the profile every other agent is told | `sonny.task_profile` |
 | `subfolders = "project"` | folders below open this project's lead | |

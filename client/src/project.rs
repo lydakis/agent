@@ -1,7 +1,7 @@
 //! A project is a folder, its coordinator bot `NAME.lead`, and
 //! `.agents/project.toml` in that folder, which holds mechanics only: the
-//! name, the coordinator's model and effort level, and its tasks' model and
-//! effort and whether they work in their own worktrees or the project
+//! name, the coordinator's model and effort level, and its tasks' model,
+//! effort and speed and whether they work in their own worktrees or the project
 //! folder, the profiles its coordinator and its tasks run as, and whether
 //! the folders below it are the project's too. Clients
 //! read it, and write it when they make a project; the
@@ -14,7 +14,7 @@ pub const FILE: &str = ".agents/project.toml";
 /// The largest project file the reader takes.
 pub const LIMIT: u64 = 64 * 1024;
 /// Every key the file may hold; anything else is a mistake, not ignored.
-const KEYS: [&str; 10] = [
+const KEYS: [&str; 11] = [
     "name",
     "coordinator",
     "model",
@@ -22,6 +22,7 @@ const KEYS: [&str; 10] = [
     "profile",
     "threads_model",
     "threads_effort",
+    "threads_speed",
     "threads_profile",
     "threads_in",
     "subfolders",
@@ -97,7 +98,8 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         return Ok(json!({
             "dir": dir, "name": name, "coordinator": format!("{name}.lead"),
             "model": null, "effort": null, "profile": null, "threads_model": null,
-            "threads_effort": null, "threads_profile": null, "threads_in": "worktree",
+            "threads_effort": null, "threads_speed": null, "threads_profile": null,
+            "threads_in": "worktree",
             "subfolders": "own", "file": false,
         }));
     };
@@ -143,6 +145,15 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         said("threads_model")?,
         said("threads_effort")?,
     );
+    let threads_speed = said("threads_speed")?;
+    if threads_speed
+        .as_deref()
+        .is_some_and(|speed| !crate::config::SPEEDS.contains(&speed))
+    {
+        return Err(invalid(
+            "threads_speed must be \"standard\", \"fast\" or \"ultrafast\"",
+        ));
+    }
     // Profiles are looked up when the agents are made.
     let named = |key: &str| {
         let value = field(key)?;
@@ -168,8 +179,9 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     Ok(json!({
         "dir": dir, "name": name, "coordinator": coordinator, "model": model,
         "effort": effort, "profile": profile, "threads_model": threads_model,
-        "threads_effort": threads_effort, "threads_profile": threads_profile,
-        "threads_in": threads_in, "subfolders": subfolders, "file": true,
+        "threads_effort": threads_effort, "threads_speed": threads_speed,
+        "threads_profile": threads_profile, "threads_in": threads_in,
+        "subfolders": subfolders, "file": true,
     }))
 }
 
@@ -297,6 +309,8 @@ pub struct Picks {
     pub threads: Option<ThreadPicks>,
     /// The person's `web_search`, for a coordinator its role gives no tools.
     pub web_search: crate::config::WebSearch,
+    /// The person's `web_search_off`, models it gets no search on.
+    pub web_search_off: Vec<String>,
     /// The person's fallback for each model, from their config.
     pub fallbacks: std::collections::BTreeMap<String, String>,
 }
@@ -400,7 +414,7 @@ pub async fn create(
         "instructions": instructions, "starts_line": true,
         "compaction_instructions": policy["compaction_instructions"],
         "tools": match &policy["tools"] {
-            Value::Null => json!(crate::default_tools(providers, model, picks.web_search)),
+            Value::Null => json!(crate::default_tools(providers, model, picks.web_search, &picks.web_search_off)),
             tools => tools.clone(),
         },
     });
@@ -565,6 +579,7 @@ mod tests {
                 in_project: true,
             }),
             web_search: Default::default(),
+            web_search_off: Vec::new(),
             fallbacks: [("alpha/one".into(), "alpha/two".into())].into(),
         };
         let made = make(&daemon, &dir, &policy, &picks).unwrap();
@@ -809,6 +824,7 @@ mod tests {
             effort: Some("max".into()),
             threads: None,
             web_search: Default::default(),
+            web_search_off: Vec::new(),
             fallbacks: [("alpha/one".into(), "alpha/two".into())].into(),
         };
         let made = make(&daemon, &dir, &json!({"instructions": "rules"}), &picks).unwrap();

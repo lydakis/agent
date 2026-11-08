@@ -112,6 +112,12 @@ pub const SETTINGS: &[Setting] = &[
         default: "its lead's",
     },
     Setting {
+        key: "sonny.task_speed",
+        about: "each new task's speed, where its provider serves it",
+        values: &agent_client::config::SPEEDS,
+        default: "its starter's on the same model",
+    },
+    Setting {
         key: "sonny.lead_profile",
         about: "the profile a new lead runs as",
         values: &[],
@@ -134,6 +140,12 @@ pub const SETTINGS: &[Setting] = &[
         about: "whether finished and waiting work rings; notifications show either way",
         values: SWITCH,
         default: "true",
+    },
+    Setting {
+        key: "sonny.steps",
+        about: "the agent's steps between what is said (calls, news in, messages between agents, how long a turn took), or only your words and the agent's",
+        values: SWITCH,
+        default: "false",
     },
     Setting {
         key: "sonny.verbose",
@@ -209,7 +221,7 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "sonny.commons_invite_tokens",
-        about: "the tokens of work an invite pays for in its thread: its turn, and the turns replies there start while any are left; a turn started runs to its end",
+        about: "the tokens of work an invite pays for: the budget of the one turn it starts, a golden ticket's twice that; later replies reach the agent through its subscription",
         values: &[],
         default: "1000000",
     },
@@ -852,13 +864,19 @@ mod tests {
         view.values = view.read().unwrap();
         assert_eq!(view.values[6].as_deref(), Some("low"));
         // The side chat: one that answers, then its default again either way.
-        view.pick = 10;
+        view.pick = 11;
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[10].as_deref(), Some("answer"));
+        assert_eq!(view.values[11].as_deref(), Some("answer"));
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[10], None);
+        assert_eq!(view.values[11], None);
         press(&mut view, KeyCode::Left);
-        assert_eq!(view.values[10].as_deref(), Some("answer"));
+        assert_eq!(view.values[11].as_deref(), Some("answer"));
+        // A task's speed steps through the tiers, taken back to its starter's.
+        view.pick = 8;
+        press(&mut view, KeyCode::Right);
+        assert_eq!(view.values[8].as_deref(), Some("standard"));
+        press(&mut view, KeyCode::Backspace);
+        assert_eq!(view.values[8], None);
         // Efforts step through every level.
         view.pick = 5;
         press(&mut view, KeyCode::Left);
@@ -887,9 +905,9 @@ mod tests {
             "# mine\n[sonny]\nside_chat = \"answer\"\n"
         );
         // A switch is written as TOML's own.
-        view.pick = 11;
+        view.pick = 12;
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[11].as_deref(), Some("false"));
+        assert_eq!(view.values[12].as_deref(), Some("false"));
         assert!(!agent_client::config::read(&path).unwrap().sonny.chime);
         assert!(
             std::fs::read_to_string(&path)
@@ -897,7 +915,7 @@ mod tests {
                 .ends_with("chime = false\n")
         );
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[11], None);
+        assert_eq!(view.values[12], None);
         // A value the reader refuses is said, and the file kept.
         view.pick = 7;
         view.typing = None;

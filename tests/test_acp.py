@@ -107,6 +107,16 @@ class Thread:
             if done(message):
                 return seen
 
+    @staticmethod
+    def resumed(test, env, cwd, session):
+        """A new process reopening `session`: its answer."""
+        thread = Thread(test, env, cwd)
+        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        answered = thread.answer_of(thread.ask('session/resume', {'sessionId': session, 'cwd': str(cwd),
+                                                                   'mcpServers': []}))
+        thread.close()
+        return answered
+
     def answer_of(self, request):
         seen = self.until(lambda m: m.get('id') == request and 'method' not in m)
         return seen[-1], [m['params']['update'] for m in seen if m.get('method') == 'session/update']
@@ -396,6 +406,121 @@ class AcpTests(ModelFixture):
         self.assertIn('result', self.daemon.request('delete', bot='calc.lead'))
         fifth, session = self.open(repo)
         self.adopt(fifth, session, 'again')
+
+    def test_a_client_picks_the_lead_behind_a_thread_and_lists_the_leads_to_reopen(self):
+        """Any client, not only T3 Code: the agent picker names the folder's
+        leads, and `session/list` lists them by ids `session/resume`
+        takes."""
+        repo = self.repo()
+        made = {'workspace': str(repo), 'model': 'openai/synthetic-model', 'instructions': 'Lead.'}
+        for bot in ('calc.lead', 'calc.lead.billing'):
+            self.assertIn('result', self.daemon.request('create', bot=bot, **made))
+        env = {k: v for k, v in self.env.items() if not k.startswith('T3_')}
+        thread = Thread(self, env, repo)
+        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {},
+                                                   'clientInfo': {'name': 'slack-bridge'}}))
+        opened, _ = thread.answer_of(thread.ask('session/new', {'cwd': str(repo), 'mcpServers': []}))
+        session = opened['result']['sessionId']
+        picker = opened['result']['configOptions'][-1]
+        self.assertEqual((picker['id'], picker['currentValue']), ('agent', 'default'))
+        self.assertEqual([c['value'] for c in picker['options']], ['default', 'calc.lead', 'calc.lead.billing'])
+        # Picked before the first prompt: that prompt goes to that lead.
+        picked, _ = thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead.billing'}))
+        self.assertEqual(picked['result']['configOptions'][-1]['currentValue'], 'calc.lead.billing')
+        hello = [{'type': 'text', 'text': 'hello'}]
+        answered, _ = thread.answer_of(thread.ask('session/prompt', {'sessionId': session, 'prompt': hello}))
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        self.assertEqual(len(self.daemon.request('turns', bot='calc.lead.billing')['result']['turns']), 1)
+        self.assertEqual(self.daemon.request('turns', bot='calc.lead')['result']['turns'], [])
+        # Picked once the thread is a lead's: it moves to the one picked.
+        moved, _ = thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead'}))
+        self.assertEqual(moved['result']['configOptions'][-1]['currentValue'], 'calc.lead')
+        answered, _ = thread.answer_of(thread.ask('session/prompt', {'sessionId': session, 'prompt': hello}))
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        self.assertEqual(len(self.daemon.request('turns', bot='calc.lead')['result']['turns']), 1)
+        refused, _ = thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead.gone'}))
+        self.assertEqual(refused['error']['code'], -32602)
+        # Listed by folder and in all: each by its name, its identity and its
+        # store's lineage.
+        ids = {bot: self.daemon.request('inspect', bot=bot)['result']['bot_id']
+               for bot in ('calc.lead', 'calc.lead.billing')}
+        for params in ({'cwd': str(repo)}, {}):
+            listed, _ = thread.answer_of(thread.ask('session/list', params))
+            sessions = listed['result']['sessions']
+            self.assertEqual([(s['title'], s['cwd']) for s in sessions],
+                             [(bot, str(repo)) for bot in ('calc.lead', 'calc.lead.billing')])
+            for found in sessions:
+                lead, store = found['sessionId'].rsplit('@', 1)
+                self.assertEqual(lead, f'{found["title"]}#{ids[found["title"]]}')
+                self.assertRegex(store, r'^[0-9a-f]{16}$')
+        first, billing = (s['sessionId'] for s in sessions)
+        # A listed lead reopens, as that lead even once a session of that id
+        # was moved to another.
+        reopened = Thread(self, env, repo)
+        reopened.answer_of(reopened.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        answered, _ = reopened.answer_of(reopened.ask('session/resume', {'sessionId': first, 'cwd': str(repo),
+                                                                          'mcpServers': []}))
+        self.assertEqual(answered['result']['configOptions'][-1]['currentValue'], 'calc.lead')
+        moved, _ = reopened.answer_of(reopened.ask('session/set_config_option', {
+            'sessionId': first, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead.billing'}))
+        self.assertEqual(moved['result']['configOptions'][-1]['currentValue'], 'calc.lead.billing')
+        reopened.close()
+        answered, _ = Thread.resumed(self, env, repo, first)
+        self.assertEqual(answered['result']['configOptions'][-1]['currentValue'], 'calc.lead')
+        self.assertIn('result', self.resume(repo, billing))
+        # One removed since, or of another store, does not.
+        lead, store = billing.rsplit('@', 1)
+        stale = f'calc.lead.billing#{ids["calc.lead.billing"] + 100}@{store}'
+        self.assertIn('error', self.resume(repo, stale))
+        other = f'{lead}@{"0" * 16 if store != "0" * 16 else "1" * 16}'
+        self.assertIn('another store', self.resume(repo, other)['error']['message'])
+
+    def test_a_client_names_who_wrote_each_prompt_and_who_answered_for_a_call(self):
+        """A client several people write through, as a team's chat bridge:
+        `_meta.person` names who wrote a prompt, which the lead reads, and
+        who chose Allow or Deny, which the daemon keeps."""
+        repo = self.repo()
+        self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('start_task', inherit=False)],
+                            approve=['start_task'], approver='manual')
+        env = {k: v for k, v in self.env.items() if not k.startswith('T3_')}
+        thread = Thread(self, env, repo)
+        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {},
+                                                   'clientInfo': {'name': 'slack-bridge'}}))
+        opened, _ = thread.answer_of(thread.ask('session/new', {'cwd': str(repo), 'mcpServers': []}))
+        session = opened['result']['sessionId']
+        thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead'}))
+        # A name the daemon does not take is refused before anything is sent.
+        refused, _ = thread.answer_of(thread.ask('session/prompt', {
+            'sessionId': session, 'prompt': [{'type': 'text', 'text': 'hi'}], '_meta': {'person': 'Ana Lopez'}}))
+        self.assertEqual(refused['error']['code'], -32602)
+        self.assertEqual(self.daemon.request('turns', bot='calc.lead')['result']['turns'], [])
+        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix calc.py.'})]
+        prompt = thread.ask('session/prompt', {'sessionId': session, 'prompt': [{'type': 'text', 'text': 'script'}],
+                                               '_meta': {'person': 'ana'}})
+        [asked] = [m for m in thread.until(lambda m: m.get('method') == 'session/request_permission')
+                   if m.get('method') == 'session/request_permission']
+        # The model read who wrote it, after the words and their time.
+        content = self.model.requests.get(timeout=5)['input'][-1]['content']
+        self.assertRegex(content[0]['text'], SENT)
+        self.assertTrue(content[0]['text'].startswith('script\n\n'))
+        self.assertEqual(content[1]['text'], '[Written by ana.]')
+        thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'deny'},
+                                                   '_meta': {'person': 'bo'}}})
+        answered, _ = thread.answer_of(prompt)
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        events = self.daemon.request('events', bot='calc.lead', after=0, limit=256)['result']['events']
+        [denied] = [e['data'] for e in events if e['event'] == 'tool_completed']
+        self.assertEqual([(v['by'], v['allow']) for v in denied['approvals']], [('bo', False)])
+
+    def test_t3_code_threads_pick_their_lead_by_words_not_by_an_option(self):
+        """T3 Code carries option picks over to the next thread it opens."""
+        thread, _ = self.open(self.repo())
+        self.assertEqual([o['id'] for o in self.opened['result']['configOptions']], ['model', 'effort'])
 
     def resume(self, cwd, session):
         thread = Thread(self, self.env, cwd)

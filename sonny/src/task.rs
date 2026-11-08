@@ -346,9 +346,22 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             ));
         }
     }
-    let lead_picks = (env_of(start, "AGENT_MODEL"), env_of(start, "AGENT_EFFORT"));
+    // The starter's speed is a setting of its own, which its record holds.
+    let speed = (lead.as_ref())
+        .and_then(|lead| lead["settings"]["speed"].as_str())
+        .map(str::to_owned);
+    let lead_picks = Picks {
+        model: env_of(start, "AGENT_MODEL"),
+        effort: env_of(start, "AGENT_EFFORT"),
+        speed,
+    };
+    let task_picks = Picks {
+        model: None,
+        effort: config.sonny.task_effort,
+        speed: config.sonny.task_speed,
+    };
     let flags: Vec<&String> = flags.iter().collect();
-    let flags = with_defaults(&info, &flags, lead_picks, config.sonny.task_effort);
+    let flags = with_defaults(&info, &flags, lead_picks, task_picks);
     let flags: Vec<&String> = flags.iter().collect();
     // Roles are the lead's project's, which `info` names, as its files are
     // now: the ones the lead or the person picked from, even uncommitted,
@@ -387,25 +400,45 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         Some((from, to)) => in_copy(&brief, from, to),
         None => (brief, 0),
     };
-    command.args(["run", "--detach", "--new"]);
-    if let Some(lead) = &start.made_by {
-        for key in ["AGENT_BOT", "AGENT_BOT_ID", "AGENT_TURN"] {
-            command.env_remove(key);
+    let brief = brief.join(" ");
+    let run = |mut command: Command, flags: &[String]| {
+        command.args(["run", "--detach", "--new"]);
+        if let Some(lead) = &start.made_by {
+            for key in ["AGENT_BOT", "AGENT_BOT_ID", "AGENT_TURN"] {
+                command.env_remove(key);
+            }
+            command.args(["--created-by", lead]);
         }
-        command.args(["--created-by", lead]);
+        // The brief goes in on stdin, never as an argument: Linux refuses an
+        // argument of 128 KiB or more, and a pasted brief can be longer.
+        command
+            .args(["--bot", name, "--workspace"])
+            .arg(&place.dir)
+            .args(flags)
+            .args(["--", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|child| given(child, brief.clone()))
+    };
+    let mut output = run(command, &flags);
+    // A speed the task's provider does not serve is refused before the
+    // task is made: it starts at standard instead, and says so.
+    let mut slowed = None;
+    if let Ok(refused) = &output
+        && !refused.status.success()
+        && refused_speed(&refused.stderr)
+        && let Some(standard) = without_speed(&flags)
+    {
+        slowed = Some(String::from_utf8_lossy(&refused.stderr).trim().to_owned());
+        let mut again = match crate::agent_command(&agent) {
+            Ok(command) => command,
+            Err(error) => return failed(&place, false, error),
+        };
+        again.envs(start.env.iter().map(|(key, value)| (key, value)));
+        output = run(again, &standard);
     }
-    // The brief goes in on stdin, never as an argument: Linux refuses an
-    // argument of 128 KiB or more, and a pasted brief can be longer.
-    let output = command
-        .args(["--bot", name, "--workspace"])
-        .arg(&place.dir)
-        .args(flags)
-        .args(["--", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|child| given(child, brief.join(" ")));
     let output = match output {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
@@ -438,6 +471,11 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         String::from_utf8_lossy(&output.stdout).trim()
     )];
     said.extend(place.note.clone());
+    if let Some(refusal) = slowed {
+        said.push(format!(
+            "It runs at standard speed: its provider refused the speed it was to have ({refusal})."
+        ));
+    }
     if let (Some((from, to)), 1..) = (&place.copy, moved) {
         said.push(format!(
             "The brief named {} {moved} time{}; it names the task's copy {} instead.",
@@ -562,18 +600,36 @@ fn env_of(start: &Start, key: &str) -> Option<String> {
         .or_else(|| std::env::var(key).ok())
 }
 
-/// The run flags with the task's model and effort, unless they name their
-/// own: the project's `threads_model`, else the lead's (`lead`, its
-/// AGENT_MODEL and AGENT_EFFORT), so a role (--profile) never swaps it;
-/// and the project's `threads_effort`, else `task_effort`
-/// (the config's `[sonny] task_effort`), else the lead's own when the task
-/// runs its model.
-fn with_defaults(
-    info: &Value,
-    flags: &[&String],
-    lead: (Option<String>, Option<String>),
-    task_effort: Option<String>,
-) -> Vec<String> {
+/// A model, effort and speed a task may start with.
+#[derive(Default)]
+struct Picks {
+    model: Option<String>,
+    effort: Option<String>,
+    speed: Option<String>,
+}
+
+/// Whether `run` refused the task for a speed its provider does not serve:
+/// its stderr is the CLI's one JSON object.
+fn refused_speed(stderr: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(stderr).is_ok_and(|error| error["error"] == "invalid_speed")
+}
+
+/// The run flags without `--speed`, or None when they name none.
+fn without_speed(flags: &[String]) -> Option<Vec<String>> {
+    let at = flags.iter().position(|flag| flag == "--speed")?;
+    let mut flags = flags.to_vec();
+    flags.drain(at..(at + 2).min(flags.len()));
+    Some(flags)
+}
+
+/// The run flags with the task's model, effort and speed, unless they
+/// name their own: the project's `threads_model`, else the lead's (`lead`,
+/// its AGENT_MODEL and AGENT_EFFORT, and the speed its record holds), so a
+/// role (--profile) never swaps it; the project's `threads_effort`, else
+/// the config's `[sonny] task_effort` (`task`), else the lead's own when
+/// the task runs its model; and the speed the same way, from
+/// `threads_speed` and `[sonny] task_speed`. Standard needs no flag.
+fn with_defaults(info: &Value, flags: &[&String], lead: Picks, task: Picks) -> Vec<String> {
     let mut flags: Vec<String> = flags.iter().map(|flag| flag.to_string()).collect();
     // A value flag is --flag VALUE or --flag=VALUE.
     let value = |flags: &[String], name: &str| -> Option<Option<String>> {
@@ -585,7 +641,11 @@ fn with_defaults(
             None => flags.get(at + 1).cloned(),
         })
     };
-    let (lead_model, lead_effort) = lead;
+    let Picks {
+        model: lead_model,
+        effort: lead_effort,
+        speed: lead_speed,
+    } = lead;
     let model = match value(&flags, "--model") {
         Some(model) => model,
         None => {
@@ -603,10 +663,20 @@ fn with_defaults(
         let effort = info["threads_effort"]
             .as_str()
             .map(str::to_owned)
-            .or(task_effort)
+            .or(task.effort)
             .or(lead_effort.filter(|_| model.is_some() && model == lead_model));
         if let Some(effort) = effort {
             flags.extend(["--effort".to_owned(), effort]);
+        }
+    }
+    if value(&flags, "--speed").is_none() {
+        let speed = info["threads_speed"]
+            .as_str()
+            .map(str::to_owned)
+            .or(task.speed)
+            .or(lead_speed.filter(|_| model.is_some() && model == lead_model));
+        if let Some(speed) = speed.filter(|speed| speed != "standard") {
+            flags.extend(["--speed".to_owned(), speed]);
         }
     }
     flags
@@ -1965,13 +2035,16 @@ mod tests {
     fn a_task_runs_as_the_person_set_tasks_up() {
         let run = |info: Value, flags: &[&str], task: Option<&str>| {
             let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
-            let lead = (Some("a/lead".to_owned()), Some("high".to_owned()));
-            with_defaults(
-                &info,
-                &flags.iter().collect::<Vec<_>>(),
-                lead,
-                task.map(str::to_owned),
-            )
+            let lead = Picks {
+                model: Some("a/lead".to_owned()),
+                effort: Some("high".to_owned()),
+                speed: None,
+            };
+            let task = Picks {
+                effort: task.map(str::to_owned),
+                ..Picks::default()
+            };
+            with_defaults(&info, &flags.iter().collect::<Vec<_>>(), lead, task)
         };
         let none = serde_json::json!({});
         // Nothing set: the lead's own model and effort, as before.
@@ -2010,6 +2083,77 @@ mod tests {
             run(none, &["--model", "a/lead"], None),
             ["--model", "a/lead", "--effort", "high"]
         );
+    }
+
+    #[test]
+    fn a_task_runs_at_its_starters_speed_on_its_model() {
+        let run = |info: Value, flags: &[&str], lead: Option<&str>, task: Option<&str>| {
+            let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            let lead = Picks {
+                model: Some("a/lead".to_owned()),
+                speed: lead.map(str::to_owned),
+                ..Picks::default()
+            };
+            let task = Picks {
+                speed: task.map(str::to_owned),
+                ..Picks::default()
+            };
+            with_defaults(&info, &flags.iter().collect::<Vec<_>>(), lead, task)
+        };
+        let none = serde_json::json!({});
+        // A fast lead's task on its model is fast too.
+        assert_eq!(
+            run(none.clone(), &[], Some("fast"), None),
+            ["--model", "a/lead", "--speed", "fast"]
+        );
+        // Standard is the daemon's own: no flag.
+        assert_eq!(
+            run(none.clone(), &[], Some("standard"), None),
+            ["--model", "a/lead"]
+        );
+        // Another model leaves the lead's speed, which its provider or
+        // model may not serve.
+        assert_eq!(
+            run(none.clone(), &["--model", "b/other"], Some("fast"), None),
+            ["--model", "b/other"]
+        );
+        let other = serde_json::json!({"threads_model": "b/other"});
+        assert_eq!(
+            run(other.clone(), &[], Some("fast"), None),
+            ["--model", "b/other"]
+        );
+        // The config's task speed applies on any model.
+        assert_eq!(
+            run(other, &[], Some("fast"), Some("ultrafast")),
+            ["--model", "b/other", "--speed", "ultrafast"]
+        );
+        // The project's file over the config and the lead, standard too.
+        let file = serde_json::json!({"threads_speed": "standard"});
+        assert_eq!(
+            run(file, &[], Some("fast"), Some("ultrafast")),
+            ["--model", "a/lead"]
+        );
+        let file = serde_json::json!({"threads_speed": "ultrafast"});
+        assert_eq!(
+            run(file, &[], None, Some("fast")),
+            ["--model", "a/lead", "--speed", "ultrafast"]
+        );
+    }
+
+    #[test]
+    fn a_refused_speed_is_dropped_for_standard() {
+        let refusal = br#"{"error":"invalid_speed","detail":"this provider serves anthropic at standard speed only","speeds":[]}"#;
+        assert!(refused_speed(refusal));
+        assert!(!refused_speed(br#"{"error":"model_required"}"#));
+        assert!(!refused_speed(b"not json"));
+        let flags: Vec<String> = ["--model", "a/b", "--speed", "fast", "--effort", "high"]
+            .map(str::to_owned)
+            .into();
+        assert_eq!(
+            without_speed(&flags).unwrap(),
+            ["--model", "a/b", "--effort", "high"]
+        );
+        assert!(without_speed(&flags[..2]).is_none());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # CLI contract
 
 Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
-`inspect`, `turns`, `usage`, `rm`, `prune`, `approvals`, `answer`, `held`, `retry`, `models`, `companion`, `start`, `stats`,
+`inspect`, `turns`, `usage`, `audit`, `rm`, `prune`, `approvals`, `answer`, `held`, `retry`, `models`, `companion`, `start`, `stats`,
 `shutdown`, and `serve`. All named
 bots use the same commands. There is no parent/child command hierarchy.
 
@@ -238,10 +238,22 @@ tries its held turns at once.
   end, so `turns --bot NAME --newest --limit 3` is a bot's last three turns.
 - `usage` prints what the bots' turns spent as one JSON object: tokens in
   all, by bot (the `--limit` that spent most, 64 by default, the rest summed),
-  and by model. `--name GLOB` keeps the bots `ls --name` would, `--since 7d`
+  and by the model that spent them, with each model's cache writes, so a
+  summary or fallback on another model counts under that model. `--name GLOB` keeps the bots `ls --name` would, `--since 7d`
   counts only turns started that long ago or since, and `--bucket 6h` adds a
   `series` of what was spent every six hours from then. Durations take `ms`,
   `s`, `m`, `h` or `d`.
+- `audit` prints the [audit trail](RUST_PROTOTYPE.md#audit-trail), newest
+  first, as one JSON array: a row for every tool call and client step of
+  every agent, with its kind, where it ran, who approved it, whether it read
+  or wrote, and how it ended. `--bot` (a name or GLOB), `--turn`, `--kind`,
+  `--place`, `--approved`, `--access`, `--outcome` and `--tool` keep the
+  rows that match, `--since 1d` the newer ones, `--before ID` the older,
+  `--limit` (100 by default) how many; `--pretty` prints a line each.
+  `audit trim --before ID` or `audit trim --older-than 90d` deletes the
+  older rows, which nothing else ever does; inside an agent's shell it is
+  refused (`trim_in_tool_shell`), and a sandboxed agent's socket refuses
+  the request whatever sends it.
 - `--keep-turns N` means the same on `prune` and `run`: keep the newest N
   turns' records. `prune` applies it once; on `run --new` it is the bot's
   setting, applied after each of its turns.
@@ -472,7 +484,9 @@ with the CLI's built-in text as the default; the daemon has none. `run
 default `shell,write_stdin,read,write,wait,history` with the file editor its model
 family is trained on: `apply_patch` for a Responses model, else `edit`, and
 `web_search` where the provider offers it and `web_fetch` for any, unless
-`~/.agent/config.toml` sets `web_search = "disabled"`. An
+`~/.agent/config.toml` sets `web_search = "disabled"` (or names the model in
+`web_search_off`, `PROVIDER/MODEL` patterns with `*` and `?`, which leaves
+search out and keeps `web_fetch`). An
 existing bot keeps its own,
 so `--tools` while continuing one is a usage error.
 `run --fallback PROVIDER/MODEL` gives a new bot a model, in its family, that

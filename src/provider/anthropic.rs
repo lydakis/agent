@@ -2,8 +2,7 @@
 //! content-block events and stored as one native item, including thinking
 //! signatures so tool-using turns can continue.
 use super::{
-    Completion, Delta, Frame, MAX_OUTPUT, ModelTokens, ToolCall, Usage, detail_of, encoded_len,
-    unparsed, valid_call_id,
+    Completion, Delta, Frame, ModelTokens, ToolCall, Usage, detail_of, unparsed, valid_call_id,
 };
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
@@ -83,7 +82,6 @@ fn tokens(usage: &Value, hour: bool) -> (u64, u64, (u64, u64)) {
 #[derive(Default)]
 pub struct State {
     blocks: Vec<Block>,
-    bytes: usize,
     stop_reason: Option<String>,
     usage: Usage,
     saw_usage: bool,
@@ -104,13 +102,6 @@ impl State {
             hour,
             ..Self::default()
         }
-    }
-    fn account(&mut self, len: usize) -> Result<()> {
-        self.bytes += len;
-        if self.bytes > MAX_OUTPUT {
-            return fail("output_limit");
-        }
-        Ok(())
     }
     fn block(&mut self, index: &Value) -> Result<&mut Block> {
         index
@@ -135,9 +126,6 @@ impl State {
                 if event["index"].as_u64() != Some(self.blocks.len() as u64) {
                     return fail("invalid_content_index");
                 }
-                if self.blocks.len() >= 64 {
-                    return fail("output_limit");
-                }
                 let block = &event["content_block"];
                 let string = |key: &str| {
                     block[key]
@@ -147,9 +135,6 @@ impl State {
                 };
                 let kind = block["type"].as_str().unwrap_or_default();
                 let result = kind.ends_with("_tool_result");
-                if matches!(kind, "redacted_thinking" | "fallback" | "server_tool_use") || result {
-                    self.account(frame.len())?;
-                }
                 let started = match block["type"].as_str() {
                     Some("text") => Block::Text {
                         text: String::new(),
@@ -178,10 +163,7 @@ impl State {
                     }
                     _ if result => Block::ServerResult(block.clone()),
                     Some("tool_use") => {
-                        // Stored in the item, and a gated call's id again in
-                        // its announcement, so they count like any output.
                         let (id, name) = (string("id")?, string("name")?);
-                        self.account(encoded_len(&id) + encoded_len(&name))?;
                         Block::ToolUse {
                             id,
                             name,
@@ -212,7 +194,6 @@ impl State {
                         if !citation.is_object() {
                             return fail("invalid_content");
                         }
-                        self.account(frame.len())?;
                         return match self.block(&event["index"])? {
                             Block::Text { citations, .. } => {
                                 citations.push(citation);
@@ -223,12 +204,6 @@ impl State {
                     }
                     _ => return Ok(Frame::Quiet),
                 };
-                // Partial JSON and signatures are stored as they arrive;
-                // text and thinking are escaped again when stored.
-                self.account(match kind.as_str() {
-                    "text_delta" | "thinking_delta" => encoded_len(&part),
-                    _ => part.len(),
-                })?;
                 // Every block is kept in the one assistant message, the
                 // response's only output item.
                 match (kind.as_str(), self.block(&event["index"])?) {
@@ -386,7 +361,23 @@ impl State {
         let paused = self.stop_reason.as_deref() == Some("pause_turn");
         match self.stop_reason.as_deref() {
             Some("end_turn" | "stop_sequence" | "tool_use" | "pause_turn") => {}
-            Some("max_tokens") => return fail_with("provider_incomplete", "max_tokens"),
+            Some("max_tokens") => {
+                let writing = self.blocks.last().map(|block| {
+                    match block {
+                        Block::Text { .. } => "text",
+                        Block::Thinking { .. } | Block::Redacted(_) => "reasoning",
+                        Block::ToolUse { name, .. } => name,
+                        Block::ServerTool { block, .. } => {
+                            block["name"].as_str().unwrap_or_default()
+                        }
+                        Block::Fallback(_) => "fallback",
+                        Block::ServerResult(_) => "tool_result",
+                    }
+                    .to_owned()
+                });
+                let tokens = self.usage.output_tokens;
+                return Err(super::cut_short("max_tokens", tokens, writing));
+            }
             // With a fallback requested, the whole chain declined.
             Some("refusal") => {
                 // The models already switched to ran and are billed too, so
@@ -509,29 +500,6 @@ mod tests {
             }
         }
         deltas
-    }
-    #[test]
-    fn tool_use_ids_count_toward_the_output_limit() {
-        let mut state = State::default();
-        state
-            .frame(br#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#)
-            .unwrap();
-        // Each id is within its own bound; together they pass the output's.
-        let mut failed = None;
-        for index in 0..=MAX_OUTPUT / MAX_CALL_ID {
-            let id = format!("{index:02}{}", "c".repeat(MAX_CALL_ID - 2));
-            let start = json!({"type":"content_block_start","index":index,
-                "content_block":{"type":"tool_use","id":id,"name":"shell","input":{}}});
-            if let Err(error) = state.frame(start.to_string().as_bytes()) {
-                failed = Some((index, error.code));
-                break;
-            }
-        }
-        // Twelve ids alone fill the limit, so the twelfth block's name passes it.
-        assert_eq!(
-            failed,
-            Some((MAX_OUTPUT / MAX_CALL_ID - 1, "output_limit".to_owned()))
-        );
     }
     #[test]
     fn a_tool_use_id_over_the_bound_fails() {
@@ -829,26 +797,37 @@ mod tests {
         );
     }
     #[test]
-    fn the_output_bound_counts_text_as_it_will_be_encoded() {
-        let mut state = State::default();
-        feed(
-            &mut state,
-            &[
-                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
-            ],
-        );
-        // Each quote takes two bytes once stored, so this fits decoded but
-        // not encoded.
-        let quotes = "\\\"".repeat(MAX_OUTPUT / 2 + 1);
-        let frame = format!(
-            r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{quotes}"}}}}"#
-        );
+    fn a_reply_cut_at_max_tokens_names_what_it_was_writing() {
+        let cut = |block: &str| {
+            let mut state = State::default();
+            let start =
+                format!(r#"{{"type":"content_block_start","index":0,"content_block":{block}}}"#);
+            feed(
+                &mut state,
+                &[
+                    r#"{"type":"message_start","message":{"usage":{"input_tokens":12}}}"#,
+                    &start,
+                    r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":32000}}"#,
+                    r#"{"type":"message_stop"}"#,
+                ],
+            );
+            let error = state.finish().unwrap_err();
+            assert!(super::super::was_cut_short(&error));
+            (error.detail.unwrap(), Value::Object(*error.facts.unwrap()))
+        };
         assert_eq!(
-            state.frame(frame.as_bytes()).unwrap_err().code,
-            "output_limit"
+            cut(r#"{"type":"tool_use","id":"toolu_1","name":"write","input":{}}"#),
+            (
+                "max_tokens".to_owned(),
+                json!({"limit":"max_tokens","output_tokens":32000,"in":"write"})
+            )
+        );
+        assert_eq!(cut(r#"{"type":"text","text":""}"#).1["in"], "text");
+        assert_eq!(
+            cut(r#"{"type":"thinking","thinking":""}"#).1["in"],
+            "reasoning"
         );
     }
-
     #[test]
     fn truncated_or_errored_streams_never_complete() {
         let mut state = State::default();

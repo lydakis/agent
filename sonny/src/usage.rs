@@ -3,8 +3,12 @@
 //! agent (or project), by model, and by what started the turns: the
 //! commons, a trigger, the margin, or a prompt. One daemon read, `usage`, each time
 //! the view changes and every minute while it is open: it reads every
-//! matching turn, so it is not asked for often.
+//! matching turn, so it is not asked for often. With the person's price
+//! sheet (`~/.agent/prices.toml`, or the file config's `prices` names),
+//! each model's cost and their sum, priced here from the sheet as it
+//! stands at each read; the daemon counts tokens only.
 use crate::background::Scope;
+use agent_client::config::Price;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     style::{Color, Style, Stylize},
@@ -70,6 +74,10 @@ pub struct Spent {
     pub output: u64,
     pub fresh: u64,
     pub cached: u64,
+    /// What the priced models in it cost.
+    pub cost: f64,
+    /// How many of the models in it the price sheet names no price for.
+    pub unpriced: u64,
 }
 
 impl Spent {
@@ -81,6 +89,7 @@ impl Spent {
             output: row["output_tokens"].as_u64().unwrap_or(0),
             fresh: input - cached,
             cached,
+            ..Self::default()
         }
     }
     fn add(&mut self, other: Spent) {
@@ -88,6 +97,27 @@ impl Spent {
         self.output += other.output;
         self.fresh += other.fresh;
         self.cached += other.cached;
+        self.cost += other.cost;
+        self.unpriced += other.unpriced;
+    }
+    /// A model's `row`, priced from `prices` by its `PROVIDER/MODEL`.
+    fn priced(row: &Value, prices: &[(String, Price)]) -> Self {
+        let mut spent = Self::of(row);
+        let id = row["model"].as_str().unwrap_or("");
+        match agent_client::config::price(prices, id) {
+            Some(price) => {
+                let count = |key: &str| row[key].as_u64().unwrap_or(0);
+                spent.cost = price.cost(
+                    count("input_tokens"),
+                    count("cached_input_tokens"),
+                    count("cache_write_tokens"),
+                    count("cache_write_1h_tokens"),
+                    count("output_tokens"),
+                );
+            }
+            None => spent.unpriced = 1,
+        }
+        spent
     }
     /// Its parts, bottom up, the cached reads left out when `cached` is.
     fn parts(&self, cached: bool) -> [(u64, Color); 3] {
@@ -122,6 +152,8 @@ pub struct View {
     error: Option<String>,
     /// When it was read last; none until it is, or once it must be again.
     at: Option<Instant>,
+    /// The price sheet as it was at the last read; none, no costs.
+    prices: Vec<(String, Price)>,
     /// Rows scrolled past on its own screen, inline; the pane scrolls
     /// itself.
     pub scroll: usize,
@@ -146,6 +178,7 @@ impl View {
             read: None,
             error: None,
             at: None,
+            prices: Vec::new(),
             scroll: 0,
         }
     }
@@ -166,9 +199,16 @@ impl View {
         (query, (since, bucket, buckets))
     }
 
-    /// What the read asked with `window` came back with.
-    pub fn loaded(&mut self, window: (i64, i64, usize), usage: Result<Value, String>) {
+    /// What the read asked with `window` came back with, priced at
+    /// `prices`.
+    pub fn loaded(
+        &mut self,
+        window: (i64, i64, usize),
+        usage: Result<Value, String>,
+        prices: Vec<(String, Price)>,
+    ) {
         self.at = Some(Instant::now());
+        self.prices = prices;
         match usage {
             Ok(usage) => {
                 let (since, bucket, buckets) = window;
@@ -302,6 +342,31 @@ impl View {
         if let Some(share) = (total.cached * 100).checked_div(input) {
             head.push(Span::raw(format!(" · {share}% of input from cache")));
         }
+        // Each model priced by its own id, before ids of one model share
+        // a row.
+        let mut models: Vec<Row> = Vec::new();
+        let mut spent = Spent::default();
+        for row in usage["models"].as_array().into_iter().flatten() {
+            let id = row["model"].as_str().unwrap_or("?");
+            let provider = crate::models::provider(id).unwrap_or_default();
+            let name = crate::models::label(id);
+            let priced = Spent::priced(row, &self.prices);
+            spent.add(priced);
+            add(&mut models, name, provider.to_owned(), priced);
+        }
+        let costs = !self.prices.is_empty();
+        if costs {
+            head.push(Span::raw(" · "));
+            head.push(Span::raw(money(spent.cost)).bold());
+            if spent.unpriced > 0 {
+                let noun = if spent.unpriced == 1 {
+                    "model"
+                } else {
+                    "models"
+                };
+                head.push(Span::raw(format!(" · {} {noun} not priced", spent.unpriced)).dim());
+            }
+        }
         out.push(Line::from(head));
         out.push(Line::default());
         out.extend(self.chart(read, width));
@@ -338,17 +403,10 @@ impl View {
             (n, false) => rows.push((format!("{n} more {noun}"), String::new(), rest)),
             (_, true) => rows.push(("the rest".to_owned(), String::new(), rest)),
         }
-        out.extend(self.bars(heading, &rows, &total, width));
+        out.extend(self.bars(heading, &rows, &total, width, false));
         // Each model by its name, its provider beside it: ids that name
         // the same model from one provider, as two Bedrock regions' or a
         // longer window's, are one row.
-        let mut models: Vec<Row> = Vec::new();
-        for row in usage["models"].as_array().into_iter().flatten() {
-            let id = row["model"].as_str().unwrap_or("?");
-            let provider = crate::models::provider(id).unwrap_or_default();
-            let name = crate::models::label(id);
-            add(&mut models, name, provider.to_owned(), Spent::of(row));
-        }
         self.sort(&mut models);
         if models.len() > LISTED {
             let mut more = Spent::default();
@@ -359,7 +417,7 @@ impl View {
             models.push((format!("{n} more models"), String::new(), more));
         }
         out.push(Line::default());
-        out.extend(self.bars("By model", &models, &total, width));
+        out.extend(self.bars("By model", &models, &total, width, costs));
         // What Sonny's own features started, by the origin it gave their
         // turns; one with none was a prompt, a person's or an agent's.
         // An automation's turns from before 0.8.0 say `trigger`: one row.
@@ -376,7 +434,7 @@ impl View {
         }
         if origins.iter().any(|(origin, _, _)| origin != "prompts") {
             out.push(Line::default());
-            out.extend(self.bars("By what started it", &origins, &total, width));
+            out.extend(self.bars("By what started it", &origins, &total, width, false));
         }
         out
     }
@@ -468,8 +526,17 @@ impl View {
     }
 
     /// `rows` as stacked bars under `heading`, each its share of `total`;
-    /// a row's detail, a model's provider, muted in a column of its own.
-    fn bars(&self, heading: &str, rows: &[Row], total: &Spent, width: usize) -> Vec<Line<'static>> {
+    /// a row's detail, a model's provider, muted in a column of its own;
+    /// with `costs`, what each cost after its share, or that it is not
+    /// priced.
+    fn bars(
+        &self,
+        heading: &str,
+        rows: &[Row],
+        total: &Spent,
+        width: usize,
+        costs: bool,
+    ) -> Vec<Line<'static>> {
         let mut out = vec![Line::from(heading.to_owned()).bold()];
         let mut name_width = rows
             .iter()
@@ -492,7 +559,7 @@ impl View {
         // The name, its detail, the bar, then the tokens and share, in
         // `width`: a narrow card cuts the detail and then the name, so the
         // bar keeps its least and no row wraps.
-        let figures = 13;
+        let figures = if costs { 13 + 1 + COST } else { 13 };
         let least = 4;
         let words = width.saturating_sub(figures + least);
         let over = (name_width + 2 + detail_width + 2).saturating_sub(words);
@@ -527,6 +594,12 @@ impl View {
             spans.extend(hbar(&spent.parts(self.cached), most, room));
             spans.push(Span::raw(format!(" {:>7}", tokens(sum))));
             spans.push(Span::raw(format!(" {:>3}%", sum * 100 / all)).dim());
+            if costs {
+                spans.push(match spent.unpriced {
+                    0 => Span::raw(format!(" {:>COST$}", money(spent.cost))),
+                    _ => Span::raw(format!(" {:>COST$}", "no price")).dim(),
+                });
+            }
             out.push(Line::from(spans));
         }
         out
@@ -633,6 +706,22 @@ fn legend(total: &Spent, cached: bool) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The columns a cost takes on a model's row.
+const COST: usize = 8;
+
+/// A cost in a few characters: $0.42, $123, $12.3k, and under a cent
+/// that is not nothing, <$0.01.
+fn money(cost: f64) -> String {
+    match cost {
+        c if c <= 0.0 => "$0".to_owned(),
+        c if c < 0.01 => "<$0.01".to_owned(),
+        c if c < 100.0 => format!("${c:.2}"),
+        c if c < 10_000.0 => format!("${c:.0}"),
+        c if c < 1e6 => format!("${:.1}k", c / 1e3),
+        c => format!("${:.1}M", c / 1e6),
+    }
+}
+
 /// A count of tokens in a few characters: 950, 12.3k, 4.5M.
 pub fn tokens(n: u64) -> String {
     let f = n as f64;
@@ -668,16 +757,16 @@ const MONTHS: [&str; 12] = [
 
 /// A local wall-clock time, with its weekday (0 is Sunday) and month (0
 /// is January).
-struct Local {
-    month: i64,
-    day: i64,
-    weekday: i64,
-    hour: i64,
-    minute: i64,
-    second: i64,
+pub(crate) struct Local {
+    pub month: i64,
+    pub day: i64,
+    pub weekday: i64,
+    pub hour: i64,
+    pub minute: i64,
+    pub second: i64,
 }
 
-fn local(epoch: i64) -> Local {
+pub(crate) fn local(epoch: i64) -> Local {
     // SAFETY: localtime_r fills the zeroed struct it is given and nothing else.
     let tm = unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
@@ -786,6 +875,7 @@ mod tests {
                 "origins": [],
                 "series": [],
             })),
+            prices("\"bedrock/*\" = { input = 5, output = 25 }\n"),
         );
         // The sentence over the bars wraps as prose; a bar row would
         // wrap its share away from its bar.
@@ -821,7 +911,7 @@ mod tests {
             ("Opus 5.5".into(), "gw".into(), spent),
             ("Opus 5.5".into(), "ap".into(), spent),
         ];
-        let card = text(&view.bars("By model", &rows, &spent, 80));
+        let card = text(&view.bars("By model", &rows, &spent, 80, false));
         assert!(card.contains("Opus 5.5  gw  "), "{card}");
         assert!(card.contains("Opus 5.5  ap  "), "{card}");
     }
@@ -859,6 +949,7 @@ mod tests {
                     {"at_ms": since + 23 * bucket, "turns": 2, "input_tokens": 2000, "cached_input_tokens": 1500, "output_tokens": 200},
                 ],
             })),
+            Vec::new(),
         );
         assert!(!view.due());
         let card = text(&view.card(60));
@@ -902,6 +993,99 @@ mod tests {
         let (query, window) = view.query(now);
         assert_eq!((query["bucket_ms"].as_i64(), window.2), (Some(DAY), 30));
         assert_eq!(view.key(KeyEvent::from(KeyCode::Esc)), Key::Close);
+    }
+
+    fn prices(sheet: &str) -> Vec<(String, Price)> {
+        let dir = std::env::temp_dir().join(format!("sonny-prices-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{:x}.toml", sheet.len()));
+        std::fs::write(&path, sheet).unwrap();
+        let config = agent_client::config::Config {
+            prices: Some(path.display().to_string()),
+            ..Default::default()
+        };
+        let prices = agent_client::config::prices(&config).unwrap();
+        let _ = std::fs::remove_file(&path);
+        prices
+    }
+
+    #[test]
+    fn each_model_is_priced_from_the_sheet_and_one_it_does_not_name_says_so() {
+        let mut view = View::new(scope());
+        let (_, window) = view.query(1_800_000_000_000);
+        let usage = json!({
+            "turns": 2, "input_tokens": 3_000_000, "cached_input_tokens": 1_000_000, "output_tokens": 300_000,
+            "bots": [{"bot": "p.lead", "turns": 2, "input_tokens": 3_000_000, "cached_input_tokens": 1_000_000, "output_tokens": 300_000}],
+            "other_bots": null,
+            "models": [
+                // Two regions' ids of one model, each priced, on one row.
+                {"model": "bedrock/us.anthropic.claude-opus-5-5-v1:0", "turns": 1, "input_tokens": 1_000_000,
+                 "cached_input_tokens": 500_000, "cache_write_tokens": 200_000, "cache_write_1h_tokens": 100_000, "output_tokens": 100_000},
+                {"model": "bedrock/global.anthropic.claude-opus-5-5-v1:0", "turns": 1, "input_tokens": 1_000_000,
+                 "cached_input_tokens": 500_000, "cache_write_tokens": 0, "cache_write_1h_tokens": 0, "output_tokens": 100_000},
+                {"model": "openai/gpt-6-sol", "turns": 1, "input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 100_000},
+            ],
+            "origins": [],
+            "series": [],
+        });
+        // Without a sheet, tokens alone, as before.
+        view.loaded(window, Ok(usage.clone()), Vec::new());
+        let card = text(&view.card(80));
+        assert!(!card.contains('$'), "{card}");
+        view.loaded(
+            window,
+            Ok(usage),
+            prices(
+                "\"bedrock/*anthropic.claude-opus-5*\" = \
+                 { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25 }\n",
+            ),
+        );
+        let card = text(&view.card(80));
+        // 0.3M fresh, 0.5M read, 0.1M written for five minutes and 0.1M for
+        // an hour, 0.1M out; then 0.5M fresh, 0.5M read, 0.1M out.
+        let opus = 0.3 * 5.0
+            + 0.5 * 0.5
+            + 0.1 * 6.25
+            + 0.1 * 10.0
+            + 0.1 * 25.0
+            + 0.5 * 5.0
+            + 0.5 * 0.5
+            + 0.1 * 25.0;
+        assert_eq!(money(opus), "$11.12");
+        assert!(
+            card.contains(
+                "3.3M tokens · 2 turns · 33% of input from cache · $11.12 · 1 model not priced"
+            ),
+            "{card}"
+        );
+        let models: Vec<&str> = (card.lines())
+            .skip_while(|line| *line != "By model")
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+            .collect();
+        assert_eq!(models.len(), 2, "{card}");
+        assert!(models[0].starts_with("Opus 5.5"), "{card}");
+        assert!(models[0].ends_with("  $11.12"), "{card}");
+        assert!(models[1].ends_with("no price"), "{card}");
+        // Agents are not priced: a turn may span models.
+        let lead = card.lines().find(|line| line.starts_with("lead ")).unwrap();
+        assert!(lead.ends_with('%'), "{card}");
+    }
+
+    #[test]
+    fn a_cost_reads_in_a_few_characters() {
+        for (cost, text) in [
+            (0.0, "$0"),
+            (0.004, "<$0.01"),
+            (0.42, "$0.42"),
+            (99.5, "$99.50"),
+            (123.4, "$123"),
+            (12_345.0, "$12.3k"),
+            (2_500_000.0, "$2.5M"),
+        ] {
+            assert_eq!(money(cost), text);
+            assert!(text.len() <= COST);
+        }
     }
 
     #[test]

@@ -1064,6 +1064,9 @@ impl Service {
         }
         subs::steer_files(&self.store);
         subs::goals_gone(&self.store);
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            crate::commons::woken_gone(&home);
+        }
         crate::git::drop_snapshot_indexes(&self.store);
         let revisions = subs::revisions(&self.store);
         self.subscribers = subs::all(&self.store).into_iter().collect();
@@ -2016,7 +2019,7 @@ pub(crate) fn held(path: &Path) -> bool {
     !taken && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
 }
 
-/// One line on the lookout for a subscriber, as `/status` shows it:
+/// One line on the lookout for a subscriber, as `/background` shows it:
 /// whether one runs and watches it, and today's notes.
 pub fn status(store: &std::path::Path, lead: &str) -> String {
     if !running(store) {
@@ -3175,7 +3178,7 @@ impl Lookout {
     /// or its source and topic, whose filter, if any, matches it. What the
     /// subscriber itself said is no news to it.
     fn hearing(&self, event: &sources::Event) -> Vec<String> {
-        if event.from.as_deref() == Some(self.lead.as_str()) || event.told.contains(&self.lead) {
+        if event.from.as_deref() == Some(self.lead.as_str()) {
             return Vec::new();
         }
         (self.subs.iter())
@@ -5783,7 +5786,6 @@ mod tests {
             steer_by: None,
             digest: None,
             fields: std::sync::Arc::new(json!({"text": text})),
-            told: Vec::new(),
             lookout: false,
             at_ms: 1,
             seq: 0,
@@ -5922,12 +5924,6 @@ mod tests {
         assert_eq!(lookout.hearing(&post("other", "b.y")), ["all"]);
         // What the subscriber said itself is no news to it.
         assert!(lookout.hearing(&post("flaky", "calc.lead")).is_empty());
-        // Nor what the source says it was told another way.
-        let woken = sources::Event {
-            told: vec!["calc.lead".into()],
-            ..post("flaky", "b.y")
-        };
-        assert!(lookout.hearing(&woken).is_empty());
         let untopical = sources::Event {
             source: "commons".into(),
             ..slack("x", false)

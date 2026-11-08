@@ -47,6 +47,18 @@ fn startup_remaining(deadline: Instant) -> Result<Duration> {
         .ok_or_else(|| Error::new("daemon_start_timeout"))
 }
 
+#[derive(Default)]
+struct AuditFilters {
+    kind: Option<String>,
+    place: Option<String>,
+    approved: Option<String>,
+    access: Option<String>,
+    outcome: Option<String>,
+    tool: Option<String>,
+    before: Option<i64>,
+    older_than_ms: Option<u64>,
+}
+
 struct Options {
     /// The command being run; `run` treats `--model` as the turn's model.
     command: String,
@@ -94,6 +106,8 @@ struct Options {
     limit: Option<usize>,
     /// `usage --since`: how far back, and `--bucket`: the series' step.
     since_ms: Option<u64>,
+    /// `audit`'s filters, each one of the trail's words, and its bounds.
+    audit: AuditFilters,
     bucket_ms: Option<u64>,
     pretty: bool,
     new: bool,
@@ -190,6 +204,7 @@ fn parse(args: &[String]) -> Result<Options> {
         timeout_ms: None,
         grace_ms: 0,
         since_ms: None,
+        audit: AuditFilters::default(),
         bucket_ms: None,
         budget_tokens: None,
         turn_budget_tokens: None,
@@ -286,6 +301,22 @@ fn parse(args: &[String]) -> Result<Options> {
                         )
                     }
                     "--tag" => options.tag = Some(value),
+                    "--kind" => options.audit.kind = Some(value),
+                    "--place" => options.audit.place = Some(value),
+                    "--approved" => options.audit.approved = Some(value),
+                    "--access" => options.audit.access = Some(value),
+                    "--outcome" => options.audit.outcome = Some(value),
+                    "--tool" => options.audit.tool = Some(value),
+                    "--before" => {
+                        options.audit.before = Some(
+                            value
+                                .parse()
+                                .map_err(|_| Error::with("usage", "--before needs an integer"))?,
+                        )
+                    }
+                    "--older-than" => {
+                        options.audit.older_than_ms = Some(crate::cli::duration_ms(flag, &value)?)
+                    }
                     "--name" => options.name = Some(value),
                     "--created-by" => options.created_by = Some(value),
                     "--limit" => {
@@ -390,6 +421,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--compact-keep"
                     | "--compact-tokens"
                     | "--max-rounds"
+                    | "--max-drops"
                     | "--max-output-tokens" => {
                         let number = value.parse::<u64>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
@@ -1095,21 +1127,9 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     if let Some(file) = agent_client::config::path().filter(|_| options.providers_from_config) {
         command.arg("--provider-config").arg(file);
     }
-    // Discovery's catalog beside the person's model list, rewritten by
-    // every start of the daemon of the home store beside it
-    // (`state.sqlite`); a daemon on another store (a test, a side daemon,
-    // another file in the same folder) leaves it alone. The folder is
-    // compared resolved, so an alias of it counts.
-    if let Some(models) = agent_client::models::path().filter(|models| {
-        let place = |path: &Path| {
-            Some((
-                std::fs::canonicalize(path.parent()?).ok()?,
-                path.file_name()?.to_owned(),
-            ))
-        };
-        let home = place(&models.with_file_name("state.sqlite"));
-        home.is_some() && home == place(&options.store)
-    }) {
+    // Discovery's catalog, rewritten by every start of the home store's
+    // daemon; a daemon on another store leaves it alone.
+    if let Some(models) = home_models(&options.store) {
         command
             .arg("--models")
             .arg(agent_client::models::discovered(&models));
@@ -1414,6 +1434,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "prune" => prune(&options),
         "compact" => compact(&options),
         "approvals" => approvals(&options),
+        "audit" => audit(&options),
         "answer" => answer(&options),
         "companion" => companion(&options),
         "models" => models(&options),
@@ -1605,11 +1626,34 @@ fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
 /// discovery's catalog beside it; reading them needs no daemon.
 /// `--discover` rewrites the catalog from the listings of the providers the
 /// daemon runs, as every daemon start does, and says on stderr what changed.
+/// The person's model list, when `store` is the home store beside it
+/// (`state.sqlite`): only that store's daemon writes discovery's catalog,
+/// so a test, a side daemon or another file in the same folder never
+/// replaces it. The folder is compared resolved, so an alias of it counts.
+fn home_models(store: &Path) -> Option<PathBuf> {
+    agent_client::models::path().filter(|models| {
+        let place = |path: &Path| {
+            Some((
+                std::fs::canonicalize(path.parent()?).ok()?,
+                path.file_name()?.to_owned(),
+            ))
+        };
+        let home = place(&models.with_file_name("state.sqlite"));
+        home.is_some() && home == place(store)
+    })
+}
+
 fn models(options: &Options) -> Result<i32> {
     let path = agent_client::models::path().ok_or(Error::with("usage", "set HOME"))?;
     if options.discover {
-        let catalog = agent_client::models::discovered(&path);
         let mut connection = ensure_daemon(options)?;
+        if home_models(&options.store).is_none() {
+            return fail_with(
+                "usage",
+                "--discover rewrites the home store's catalog; this store is another one (--store or AGENT_STORE), and its daemon's provider_models lists what its providers serve",
+            );
+        }
+        let catalog = agent_client::models::discovered(&path);
         let listing = connection.request("provider_models", json!({}))?;
         let refreshed = agent_client::models::refresh(&catalog, &listing).map_err(Error::from)?;
         for (provider, said) in &refreshed.refused {
@@ -1765,11 +1809,16 @@ fn run(options: &Options) -> Result<i32> {
         let tools: Vec<String> = match role.as_ref().and_then(|r| r.tools.clone()) {
             Some(tools) if !options.tools_explicit => tools,
             _ if !options.tools_explicit => {
-                let search = config()?.web_search;
-                agent_client::default_tools(&connection.ready["providers"], &model, search)
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect()
+                let config = config()?;
+                agent_client::default_tools(
+                    &connection.ready["providers"],
+                    &model,
+                    config.web_search,
+                    &config.web_search_off,
+                )
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
             }
             _ => options
                 .tools
@@ -2235,6 +2284,135 @@ fn wait(options: &Options) -> Result<i32> {
 /// Calls waiting for a verdict, paged through completely or up to
 /// `--limit`; JSON array or one line per call with the command that
 /// answers it.
+/// The audit trail, newest first, page by page up to `--limit`; or with
+/// `trim`, delete its rows older than a row or a time.
+fn audit(options: &Options) -> Result<i32> {
+    let filters = &options.audit;
+    let mut connection = ensure_existing_daemon(options)?;
+    match options.positional.first().map(String::as_str) {
+        None => {}
+        Some("trim") => {
+            // As answer's: a bot's own shell does not trim by accident. A
+            // sandboxed bot's socket refuses it whatever runs.
+            if std::env::var("AGENT_SHELL_CONTEXT").as_deref() == Ok("1")
+                || std::env::var("AGENT_BOT").is_ok_and(|bot| !bot.is_empty())
+            {
+                return fail_with(
+                    "trim_in_tool_shell",
+                    "agent audit trim does not run inside a bot's tool shell",
+                );
+            }
+            let before_ms = match filters.older_than_ms {
+                Some(ago) => Some(
+                    std::time::SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|_| Error::new("clock_before_epoch"))?
+                        .as_millis()
+                        .saturating_sub(ago as u128) as i64,
+                ),
+                None => None,
+            };
+            let trimmed = connection.request(
+                "audit_trim",
+                json!({"before":filters.before,"before_ms":before_ms}),
+            )?;
+            print_json(&trimmed, options.pretty)?;
+            return Ok(0);
+        }
+        Some(other) => return fail_with("usage", format!("audit has no {other}; trim is one")),
+    }
+    let mut before = json!(filters.before);
+    let mut left = options.limit.unwrap_or(100);
+    let mut first = true;
+    if !options.pretty {
+        say_raw!("[");
+    }
+    while left > 0 {
+        let page = connection.request(
+            "audit",
+            json!({"before":before,"since_ms":since_ms(options)?,"bot":options.bot,
+                "turn":options.turn,"kind":filters.kind,"place":filters.place,
+                "approved":filters.approved,"access":filters.access,"outcome":filters.outcome,
+                "tool":filters.tool,"limit":left.min(500)}),
+        )?;
+        let rows = page["rows"]
+            .as_array()
+            .ok_or(Error::new("daemon_protocol_mismatch"))?;
+        left -= rows.len();
+        for row in rows {
+            if options.pretty {
+                say!("{}", audit_line(row));
+            } else {
+                if !first {
+                    say_raw!(",");
+                }
+                say_raw!("{row}");
+                first = false;
+            }
+        }
+        before = page["next_before"].clone();
+        if before.is_null() {
+            break;
+        }
+    }
+    if !options.pretty {
+        say_raw!("]\n");
+    }
+    Ok(0)
+}
+
+/// One row of the trail on a line: when, which call of which bot, what it
+/// was and where it ran, who let it, how it ended, and its start.
+fn audit_line(row: &Value) -> String {
+    let at = row["at_ms"].as_i64().unwrap_or(0);
+    let step = row["step"]
+        .as_str()
+        .map_or(String::new(), |step| format!("/{step}"));
+    let word = |field: &str| row[field].as_str().unwrap_or("-").to_owned();
+    let ms = row["ms"]
+        .as_i64()
+        .map_or("-".to_owned(), |ms| format!("{ms}ms"));
+    format!(
+        "{:>8} {} {} t{} {}{} {} {}/{}/{} by {} {} {} {}",
+        row["id"],
+        utc(at),
+        word("bot"),
+        row["turn"],
+        word("call_id"),
+        step,
+        word("tool"),
+        word("kind"),
+        word("place"),
+        word("access"),
+        word("approved"),
+        word("outcome"),
+        ms,
+        word("preview").replace(['\n', '\r'], " "),
+    )
+}
+
+/// `ms` since the epoch as UTC `YYYY-MM-DDTHH:MM:SSZ`.
+fn utc(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
 fn approvals(options: &Options) -> Result<i32> {
     let mut connection = ensure_existing_daemon(options)?;
     let mut after = json!(0);

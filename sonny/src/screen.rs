@@ -851,8 +851,21 @@ impl Screen {
     /// The view is a few screens from the first row, or nearer, and the
     /// rows above it can still be drawn: time to ask for older ones.
     pub fn near_top(&self) -> bool {
+        self.wants_older(false)
+    }
+
+    /// Whether to draw older rows above the view: once it is [`AHEAD`]
+    /// screens from the first row or nearer, as the wheel would soon wait
+    /// there; and, `idle` between the person's keys while they read back,
+    /// once it is less than [`NEAR`] screens from it. Never past rows
+    /// trimmed away.
+    pub fn wants_older(&self, idle: bool) -> bool {
         let height = self.area.height as usize;
-        !self.trimmed && self.back + AHEAD * height >= self.most(height)
+        let screens = match idle && self.back > 0 {
+            true => NEAR,
+            false => AHEAD,
+        };
+        !self.trimmed && self.back + screens * height >= self.most(height)
     }
 
     /// The rows `older` was written with drawn above the first row, older
@@ -1966,6 +1979,22 @@ impl Screen {
         let at = (self.top + y).min(self.shown.len() - 1);
         let x = column.saturating_sub(self.area.x) as usize;
         Some((at, x.min(self.shown[at].line.width())))
+    }
+
+    /// The line pushed, and the column in it, under `(column, row)` on its
+    /// first drawn row: where a card that knows its own lines reads a
+    /// click. None off the drawn rows or on a row wrapped from above.
+    pub fn line_at(&self, column: u16, row: u16) -> Option<(usize, usize)> {
+        if !self.area.contains((column, row).into()) {
+            return None;
+        }
+        let y = (row - self.area.y) as usize;
+        let at = (y < self.drawn).then_some(self.top + y)?;
+        if !self.shown.get(at)?.first {
+            return None;
+        }
+        let line = self.shown[..at].iter().filter(|shown| shown.first).count();
+        Some((line, (column - self.area.x) as usize))
     }
 
     /// The mouse, over the screen. Presses outside the conversation's
@@ -3122,6 +3151,21 @@ mod tests {
     }
 
     #[test]
+    fn older_rows_are_wanted_further_ahead_between_keys_while_reading_back() {
+        let (mut screen, _) = screen(rows(0..200), 20, 5);
+        // Following the newest, nothing is read ahead.
+        assert!(!screen.wants_older(true));
+        // Read back, older rows are wanted eight screens from the first
+        // row between keys, and three while keys wait.
+        screen.scroll(160);
+        assert!(screen.wants_older(true));
+        assert!(!screen.wants_older(false));
+        screen.scroll(20);
+        assert!(screen.wants_older(false));
+        assert!(screen.near_top());
+    }
+
+    #[test]
     fn older_rows_drawn_above_stay_at_another_width() {
         let (mut screen, _) = screen(rows(13_000..13_100), 20, 5);
         screen.prepend(0, written(rows(0..13_000)));
@@ -3580,6 +3624,27 @@ mod tests {
         ));
         assert_eq!(screen.texts(), ["before", "• Started a, b ▸", "after"]);
         assert!(!screen.replace_tagged(Tag::Group(2), Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn a_click_finds_the_line_pushed_under_it_and_its_column() {
+        let mut screen = Screen::default();
+        screen.push(vec![
+            Line::from("one"),
+            Line::from("two words that wrap"),
+            Line::from("three"),
+        ]);
+        let area = Rect::new(2, 1, 10, 6);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 12, 8));
+        screen.render(area, &mut buf, |_| None);
+        assert_eq!(screen.line_at(2, 1), Some((0, 0)));
+        assert_eq!(screen.line_at(5, 2), Some((1, 3)));
+        // The wrapped part of a line, and past the last, find none.
+        assert_eq!(screen.line_at(5, 3), None);
+        let last = (1..7).rev().find(|&row| screen.line_at(2, row).is_some());
+        assert_eq!(screen.line_at(2, last.unwrap()), Some((2, 0)));
+        assert_eq!(screen.line_at(2, last.unwrap() + 1), None);
+        assert_eq!(screen.line_at(1, 1), None);
     }
 
     #[test]

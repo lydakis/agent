@@ -1188,6 +1188,38 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual((error['error'], error['depth'], error['max_depth']), ('depth_limit', 3, 2), error)
         self.assertEqual(control.request('inspect', bot='Deeper')['error'], 'bot_not_found')
 
+    def test_the_audit_trail_keeps_each_call_and_only_the_person_trims_it(self):
+        self.agent('run', *self.common[:-1], 'echo,shell,history', '--new', '--bot', 'Bob', 'shell:echo hi')
+        store = ['--store', str(self.store)]
+        audit = lambda *flags: json.loads(self.agent('audit', *store, *flags).stdout)
+        rows = audit()
+        self.assertEqual([(r['bot'], r['tool'], r['kind'], r['approved'], r['access'], r['outcome']) for r in rows],
+                         [('Bob', 'shell', 'shell', 'nobody', 'unknown', 'completed')])
+        self.assertEqual(audit('--kind', 'web'), [])
+        self.assertEqual(audit('--bot', 'B*', '--since', '1h'), rows)
+        self.assertIn(' Bob ', self.agent('audit', *store, '--pretty').stdout)
+        bad = self.agent('audit', *store, '--kind', 'disk', check=False)
+        self.assertEqual(json.loads(bad.stderr)['error'], 'invalid_audit')
+        # The agent reads it through its history tool, as the person does.
+        read = self.agent('run', *self.again, '--bot', 'Bob', 'calls:[["history", {"audit": {"kind": "shell"}}]]')
+        events = [json.loads(line) for line in read.stdout.splitlines()]
+        node = next(e for e in events if e['event'] == 'tool_completed')['data']['node']
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        item = control.request('history_items', bot='Bob', nodes=[node])['result']['items'][0]['item']
+        output = json.loads(item['output'])
+        self.assertEqual([r['call_id'] for r in output['rows']], [rows[0]['call_id']])
+        # Trimming is the person's: not from an agent's shell.
+        refused = self.agent('sandbox', *store, '--bot', 'Bob', '--', '/bin/sh', '-c',
+                             '"$AGENT_BIN" audit trim --before 100', check=False)
+        self.assertIn('trim_in_tool_shell', refused.stderr)
+        self.assertEqual(len(audit()), 2)
+        for flags in ((), ('--before', '1', '--older-than', '1d'), ('--before', '1', '--kind', 'shell')):
+            usage = self.agent('audit', *store, 'trim', *flags, check=False)
+            self.assertEqual((usage.returncode, json.loads(usage.stderr)['error']), (2, 'usage'), flags)
+        self.assertEqual(json.loads(self.agent('audit', *store, 'trim', '--older-than', '0s').stdout)['trimmed'], 2)
+        self.assertEqual(audit(), [])
+
     def test_large_shell_output_is_previewed_and_retained_as_an_artifact(self):
         run = self.agent('run', *self.common, '--new', '--bot', 'Bob',
                          'shell:head -c 1048576 /dev/zero | tr "\\0" y')
@@ -1850,6 +1882,11 @@ class ModelListTests(ModelFixture):
         time.sleep(1)
         self.assertFalse(self.catalog.exists())
         self.assertEqual(getattr(self.model, 'listings', 0), 0)
+        # Nor does --discover through one: it refuses and writes nothing.
+        refused = self.agent('models', '--discover', *other, check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('another one', refused.stderr)
+        self.assertFalse(self.catalog.exists())
 
     def test_an_edit_to_the_config_s_providers_applies_without_a_restart(self):
         config = self.home / '.agent' / 'config.toml'

@@ -5,6 +5,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, value::RawValue};
+use std::borrow::Cow;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{future::Future, sync::Arc, time::Duration};
@@ -24,10 +25,56 @@ pub use search::{RUN_NAME, RUN_NAMESPACE, Search};
 pub use pace::Report;
 pub use socket::Sockets;
 
-/// JSON-encoded bytes one response may stream. A full 128,000-token Claude
-/// answer runs about 512 KiB; the bound stays under the 1 MiB event cap so
-/// every stored item and live event remains publishable and readable.
-pub const MAX_OUTPUT: usize = 768 * 1024;
+/// Bytes one response may deliver, over HTTP or a socket: a bound against
+/// an endpoint that never stops, far past what any model writes. The model's
+/// own output cap is what bounds a reply; a cut one comes back as
+/// [`cut_short`] says. Nothing downstream needs a reply in one event: events
+/// carry previews of calls, and a history read answers `item_too_large` for
+/// an item past a line.
+pub const MAX_RESPONSE: usize = 16 * 1024 * 1024;
+
+/// What an output item writes, as a cut reply names it: `text`, `reasoning`,
+/// or the tool it calls. A few fields of the item's opening, read once.
+pub(crate) fn writing(item: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Item<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: Cow<'a, str>,
+        #[serde(borrow)]
+        name: Option<Cow<'a, str>>,
+    }
+    let item: Item<'_> = serde_json::from_str(item).ok()?;
+    Some(writes(&item.kind, item.name.as_deref()))
+}
+
+/// What an output item of `kind`, calling `name` if a call, writes.
+pub(crate) fn writes(kind: &str, name: Option<&str>) -> String {
+    match (kind, name) {
+        (_, Some(name)) => name,
+        ("message", None) => "text",
+        (kind, None) => kind,
+    }
+    .to_owned()
+}
+
+/// The model's own output cap cut its reply short (`detail` names the cap as
+/// the provider does): the facts a turn tells the model after dropping that
+/// reply, and names if the turn ends on it. `in`: what the reply was writing,
+/// when the stream said.
+pub(crate) fn cut_short(detail: &str, output_tokens: u64, writing: Option<String>) -> Error {
+    let mut facts = json!({"limit":"max_tokens","output_tokens":output_tokens});
+    if let Some(writing) = writing {
+        facts["in"] = json!(writing);
+    }
+    Error::with("provider_incomplete", detail).facts(facts)
+}
+
+/// Whether a reply was cut short by the model's own output cap, which a turn
+/// drops and goes on past.
+pub fn was_cut_short(error: &Error) -> bool {
+    error.code == "provider_incomplete"
+        && (error.facts.as_ref()).is_some_and(|facts| facts["limit"] == "max_tokens")
+}
 
 /// JSON-encoded bytes one tool call id may take. Real ids run tens of bytes;
 /// the bound keeps every call listable and answerable: its approval entry
@@ -257,6 +304,8 @@ pub struct Provider {
     /// A Bedrock endpoint, however it authenticates: it takes no fallback
     /// credit and serves no WebSocket.
     bedrock: bool,
+    /// Bedrock Mantle, the one Bedrock endpoint that hosts server-side tools.
+    mantle: bool,
     /// The models this provider last listed, shared by every clone.
     listing: Arc<models::Listing>,
     /// The windows the person set, with the name this provider is bound
@@ -512,7 +561,9 @@ impl Provider {
             Family::Anthropic => "messages",
         };
         url.set_path(&format!("{}/{route}", url.path().trim_end_matches('/')));
-        let bedrock = aws::endpoint(&url).is_some();
+        let endpoint = aws::endpoint(&url);
+        let bedrock = endpoint.is_some();
+        let mantle = endpoint.is_some_and(|(_, service)| service == "bedrock-mantle");
         Ok(Self {
             transport,
             pools: Arc::new(pace::Pools::default()),
@@ -527,6 +578,7 @@ impl Provider {
             sockets: None,
             aws: None,
             bedrock,
+            mantle,
             listing: Arc::default(),
             windows: None,
         })
@@ -572,6 +624,14 @@ impl Provider {
         if let Some(sockets) = &self.sockets {
             sockets.recorded(bot, ids);
         }
+    }
+    /// Whether the endpoint takes OpenAI's custom tools, whose call is
+    /// free-form text a grammar shapes: OpenAI's own API, on a key or the
+    /// ChatGPT plan. Other Responses endpoints may serve OpenAI's models
+    /// but refuse the tool for others (Grok on Bedrock, 2026-11-07), so
+    /// there a grammar tool is a function taking its text.
+    pub fn grammars(&self) -> bool {
+        self.family == Family::Responses && self.url.host_str() == Some("api.openai.com")
     }
     pub fn family(&self) -> Family {
         self.family
@@ -1257,7 +1317,7 @@ impl Provider {
                 let Some(chunk) = chunk else { break };
                 let chunk = chunk.map_err(|_| Error::new("provider_stream_failed"))?;
                 total += chunk.len();
-                if total > 16 * 1024 * 1024 {
+                if total > MAX_RESPONSE {
                     return fail("provider_response_limit");
                 }
                 if unnamed && frames == 0 && preview.len() < 4096 {
@@ -2370,7 +2430,7 @@ mod tests {
                 Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
             let schemas = crate::tools::Registry::all()
                 .unwrap()
-                .encoded(family, &["echo".into()], &[], false)
+                .encoded(family, false, &["echo".into()], &[], false)
                 .unwrap();
             for allow in [true, false] {
                 for tools in [&*schemas, &*none()] {
@@ -2431,7 +2491,9 @@ mod tests {
         for family in [Family::Anthropic, Family::Responses] {
             let provider =
                 Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
-            let schemas = tools.encoded(family, &["echo".into()], &[], false).unwrap();
+            let schemas = tools
+                .encoded(family, false, &["echo".into()], &[], false)
+                .unwrap();
             let body = |output_schema, reasoning| {
                 let mut prefix = provider
                     .prefix(&Request {

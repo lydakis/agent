@@ -79,7 +79,7 @@ const RECENT_EVENTS: usize = 2_000;
 const RECENT_BYTES: u64 = 4 * 1024 * 1024;
 const RECENT_EVENT_BYTES: usize = 16 * 1024;
 /// The fields every event has, which the note says on its own.
-const OWN: [&str; 7] = ["text", "id", "topic", "from", "url", "steer", "told"];
+const OWN: [&str; 6] = ["text", "id", "topic", "from", "url", "steer"];
 /// How the note to the subscriber starts, which Sonny shows folded.
 pub const FROM_SOURCES: &str = "From your sources: ";
 /// What a `subscriptions` answer says of the examples it shows.
@@ -178,9 +178,6 @@ pub struct Event {
     /// Every field it printed, as filters match them: the object, or
     /// `{"text": line}` for a line of plain text.
     pub fields: Arc<Value>,
-    /// Subscribers the source says were told it another way, who do not
-    /// hear it again: the commons' invite holders, woken with the reply.
-    pub told: Vec<String>,
     /// The lookout's own word about the source, never something it
     /// printed: that it is down or works again. Every subscription to the
     /// source hears it, whatever its topic or filter.
@@ -215,7 +212,6 @@ impl Event {
             steer_by: None,
             digest: None,
             fields: Arc::new(fields),
-            told: Vec::new(),
             lookout: false,
             at_ms,
             seq: next_seq(),
@@ -247,13 +243,7 @@ impl Event {
         let topic = said("topic")
             .filter(|topic| !topic.contains(':') && !topic.chars().any(char::is_control));
         let (id, from, url) = (said("id"), said("from"), said("url"));
-        let told = (object["told"].as_array().into_iter().flatten())
-            .filter_map(|bot| bot.as_str().map(|bot| cut(bot, FIELD_CHARS)))
-            .take(64)
-            .collect();
-        let mut parsed = event(&text, id, topic, from, url, steer, object);
-        parsed.told = told;
-        Some(parsed)
+        Some(event(&text, id, topic, from, url, steer, object))
     }
 
     /// The lookout's word about `source`: `kind` (`down` or `back`),
@@ -275,7 +265,6 @@ impl Event {
             steer_by: None,
             digest: digest(source),
             fields: Arc::new(fields),
-            told: Vec::new(),
             lookout: true,
             at_ms,
             seq: next_seq(),
@@ -298,7 +287,7 @@ impl Event {
         let mut kept = json!({"source": self.source, "id": self.id, "topic": self.topic,
             "text": self.text, "from": self.from, "url": self.url, "steer": self.steer,
             "digest": self.digest.map(|d| d.as_secs()), "at_ms": self.at_ms as u64, "seq": self.seq,
-            "told": self.told, "fields": *self.fields});
+            "fields": *self.fields});
         if let Some(by) = &self.steer_by {
             kept["steer_by"] = json!(by);
         }
@@ -326,9 +315,6 @@ impl Event {
             }),
             at_ms: u128::from(value["at_ms"].as_u64()?),
             seq: value["seq"].as_u64()?,
-            told: (value["told"].as_array().into_iter().flatten())
-                .filter_map(|bot| bot.as_str().map(str::to_owned))
-                .collect(),
             lookout: value["lookout"] == true,
         })
     }
@@ -1969,7 +1955,6 @@ mod tests {
             steer_by: None,
             digest: None,
             fields: Arc::new(json!({"text": text})),
-            told: Vec::new(),
             lookout: false,
             at_ms: 0,
             seq: 0,

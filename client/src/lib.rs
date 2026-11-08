@@ -73,11 +73,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// `providers` is `ready.providers`; a model whose provider it does not
 /// name gets `edit`. Web search comes too where the provider offers it,
 /// unless `search` is the person's `web_search = "disabled"`, as Codex
-/// turns it on.
+/// turns it on, or `off` (their `web_search_off`) names the model.
 pub fn default_tools(
     providers: &Value,
     model: &str,
     search: config::WebSearch,
+    off: &[String],
 ) -> Vec<&'static str> {
     let provider = model
         .split_once('/')
@@ -98,7 +99,9 @@ pub fn default_tools(
     if search == config::WebSearch::Live {
         // Search is the provider's to offer; the daemon fetches a page
         // for any.
-        if providers[provider]["web_search"] == true {
+        if providers[provider]["web_search"] == true
+            && !off.iter().any(|pattern| config::matches(pattern, model))
+        {
             tools.push("web_search");
         }
         tools.push("web_fetch");
@@ -108,7 +111,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 55;
+pub const PROTOCOL: u64 = 57;
 /// How long the daemon holds a turn on a cause a person can fix before it
 /// fails with it, for a bot that sets no `hold_ms`: five days, as mail is
 /// retried (RFC 5321 suggests four to five) before it is returned.
@@ -537,7 +540,7 @@ mod tests {
             "anthropic": {"family": "anthropic", "web_search": true}});
         let live = config::WebSearch::Live;
         assert_eq!(
-            default_tools(&providers, "chatgpt/gpt-6-sol", live),
+            default_tools(&providers, "chatgpt/gpt-6-sol", live, &[]),
             [
                 "shell",
                 "write_stdin",
@@ -552,7 +555,7 @@ mod tests {
         // Search comes where the provider offers it, and fetch everywhere,
         // unless turned off.
         assert_eq!(
-            default_tools(&providers, "anthropic/claude-opus-5-5", live),
+            default_tools(&providers, "anthropic/claude-opus-5-5", live, &[]),
             [
                 "shell",
                 "write_stdin",
@@ -569,9 +572,24 @@ mod tests {
             &providers,
             "anthropic/claude-opus-5-5",
             config::WebSearch::Disabled,
+            &[],
         );
         assert!(!off.contains(&"web_search") && !off.contains(&"web_fetch"));
-        assert_eq!(default_tools(&providers, "unknown/model", live)[4], "edit");
+        // A model the person's web_search_off names keeps fetch alone.
+        let named = default_tools(
+            &providers,
+            "anthropic/claude-opus-5-5",
+            live,
+            &["Anthropic/claude-*".into()],
+        );
+        assert!(!named.contains(&"web_search") && named.contains(&"web_fetch"));
+        let other = ["anthropic/claude-haiku-*".into()];
+        let unnamed = default_tools(&providers, "anthropic/claude-opus-5-5", live, &other);
+        assert!(unnamed.contains(&"web_search"));
+        assert_eq!(
+            default_tools(&providers, "unknown/model", live, &[])[4],
+            "edit"
+        );
     }
 
     #[tokio::test]

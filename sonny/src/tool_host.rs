@@ -67,7 +67,7 @@ pub fn running(store: &Path) -> bool {
     crate::lookout::held(&beside(store, &format!(".{NAME}.lock")))
 }
 
-/// The lookout's line on `/status`, told too when no tool host answers
+/// The lookout's line on `/background`, told too when no tool host answers
 /// the tools Sonny gives its agents, which then wait.
 pub fn with_status(lookout: String, store: &Path) -> String {
     match (running(store), lookout.is_empty()) {

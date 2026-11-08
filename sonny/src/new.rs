@@ -231,21 +231,21 @@ impl Making {
         use crate::list::Item;
         match &self.step {
             Step::Profile(list) => {
-                let items = (list.shown().into_iter())
-                    .map(|(at, found)| {
+                let items = (list.shown().iter())
+                    .map(|&(at, ref found)| {
                         let profile = &self.profiles[at];
                         Item::new(profile.name.clone(), profile.about.clone())
                             .current(profile.default)
-                            .found(&found)
+                            .found(found)
                     })
                     .collect();
                 Some((items, list))
             }
             Step::Place(list) => {
-                let items = (list.shown().into_iter())
-                    .map(|(at, found)| {
+                let items = (list.shown().iter())
+                    .map(|&(at, ref found)| {
                         let place = self.places[at];
-                        Item::new(place.label(), place.about()).found(&found)
+                        Item::new(place.label(), place.about()).found(found)
                     })
                     .collect();
                 Some((items, list))

@@ -7601,3 +7601,213 @@ path changed: lone submit CPU 31.1 → 30.8 ms, burst submit p99 4.54 →
 4.52 ms, release to terminal p99 9.73 → 9.92 ms, idle RSS 15.2 → 15.3 MiB,
 CPU per turn 0.92 → 0.92 ms, lifecycle p95 turn 697 → 714 ms, the quiet
 window 1.54 → 1.34 ms/s.
+
+## A waiter leaving touches only its own handles
+
+A waiter (a parked turn, or a client's `wait`) that finished, timed out or
+left took itself off every other waiter's lists: `detach_locked` ran
+`retain` over every handle anyone waited on, so n waiters finishing cost
+Θ(n²), under the registry lock on the daemon's one thread. A session
+closing likewise read every waiter to find its own requests. Now a waiter
+leaves only the lists of its own handles (those still remaining and those
+with results, which together are every one it attached with), and the
+registry keeps each session's requests, so closing reads only those. A
+waiter attached again lets go of its earlier wait first, which also
+returns its share of results it held (they stayed retained before).
+
+Wall time of the registry alone, release build, 4-core Linux cloud
+container (Xeon 2.1 GHz), main d82ec12 against this change. Each parked
+turn waits on a command of its own and on a peer's turn; each wakes on its
+command and leaves:
+
+| Parked turns | Before: all leave | After | Before: one session closes | After |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 0.09 ms | 0.07 ms | 0.23 µs | 0.03 µs |
+| 1,000 | 3.5 ms | 0.48 ms | 2.6 µs | 0.02 µs |
+| 4,000 | 82 ms | 2.9 ms | 12 µs | 0.02 µs |
+| 16,000 | 2,950 ms | 12.6 ms | 40 µs | 0.03 µs |
+
+Per waiter it stays near 0.7 µs from 100 to 16,000. The waiters on one
+handle, and one session's requests, are ordered sets (in the order they
+were made), so many waits on the same handle each leave in a log of how
+many there are: one session pipelining 32,000 waits on one command beside
+32,000 parked turns finishes in well under a second, where lists take
+seconds. Memory: a set per handle someone waits on (a B-tree node, about
+200 bytes, where a list held 64), and one per session with a `wait`
+pending, each removed with its last waiter. The
+tests `a_waiter_leaving_costs_the_same_however_many_others_wait` and
+`a_closing_session_takes_its_own_waits_and_no_one_elses` time 8,000 and
+16,000, and `many_waits_on_one_handle_each_leave_at_the_same_cost` times
+32,000 and 64,000; each fails when twice as many take three times as long,
+and each failed against the scans or lists it replaces.
+
+The Perf workflow's matched screen (`bench.perf_gate`, GitHub runner, head
+e34d148 against main 6a15a54) passed with store work per turn the same and
+nothing past the runner's spread: no measured path parks thousands of
+waiters, so it shows the change costs the light path nothing.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 32.197 | 31.881 | -1.0% |
+| admission | burst submit p99, ms | 4.589 | 4.693 | +2.3% |
+| completion | release to terminal p99, ms | 9.785 | 9.691 | -1.0% |
+| footprint | idle RSS, MiB | 15.324 | 15.207 | -0.8% |
+| footprint | per idle bot, KiB | 1.612 | 1.638 | +1.6% |
+| footprint | CPU per turn, ms | 0.96 | 0.93 | -3.2% |
+| lifecycle | CPU, s | 0.45 | 0.435 | -3.3% |
+| lifecycle | p95 turn, ms | 729.244 | 698.447 | -4.2% |
+| lifecycle | peak RSS, MiB | 23.611 | 23.568 | -0.2% |
+
+On a live daemon, `bench.parked_waits` gives `bots` bots one held turn each
+(8 active slots, the rest queued), sends one client `wait` per turn with
+the same timeout over 8 connections, and times a `stats` request in a loop
+while they give up together; the stall is the slowest of those requests.
+Release builds of main d82ec12 and this change (b33e6e7), same
+4-core container, alternated, two runs each at 8,000 and 16,000:
+
+| Waits | Main: stall | Head: stall | Main: drain | Head: drain | Main: CPU | Head: CPU |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 1.9 ms | 41.5 ms* | 97 ms | 160 ms | 160 ms | 230 ms |
+| 4,000 | 5.4, 6.0 ms | 3.9, 8.1 ms | 314, 291 ms | 313, 299 ms | 380, 410 ms | 360, 380 ms |
+| 8,000 | 53, 101 ms | 2.2, 4.4 ms | 685, 641 ms | 680, 463 ms | 840, 820 ms | 790, 590 ms |
+| 16,000 | 1,177, 1,112 ms | 6.1, 9.0 ms | 1,700, 1,592 ms | 1,195, 1,327 ms | 2,060, 1,970 ms | 1,360, 1,480 ms |
+
+\* one run, a single slow probe; the 4,000 runs show no difference either
+way. Up to about 4,000 waits the registry's share is lost in the cost of
+answering them; at 16,000 the old scan held the daemon's one thread for
+over a second while they gave up, where now no request waits more than
+10 ms, and the drain takes a third less CPU.
+
+## Spend kept by the model that spent it (#345)
+
+Every recorded model call now also upserts one `turn_models` row, keyed
+`(turn, model)`, `WITHOUT ROWID`, inside the job and transaction that
+already record the call's usage event, turn totals and bot totals: no new
+store job, no new commit. A call that names its attempts (a summary on
+another model, a refused request's fallback, a provider-side fallback)
+upserts one row per attempt. `usage` adds one grouped scan of the table,
+joined by primary key to the turns its window already reads.
+
+Matched screen, base `main` (3322847) against head, as the Perf workflow
+runs it (`bench.admission_burst` and `bench.completion_burst` at
+`--repeat 5`, `bench.footprint` at `--repeat 2`, `bench.lifecycle` socket
+32 echo bots), two alternating rounds, release builds on a 4-core Linux
+cloud container that was also compiling during the later rounds, so CPU
+and latency are noisier than usual:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 46.051 | 40.404 | -12.3% |
+| admission | burst submit p99, ms | 8.884 | 7.786 | -12.4% |
+| completion | release to terminal p99, ms | 17.546 | 18.826 | +7.3% |
+| footprint | idle RSS, MiB | 15.258 | 15.361 | +0.7% |
+| footprint | per idle bot, KiB | 1.642 | 1.584 | -3.5% |
+| footprint | RSS after a turn each, MiB | 23.965 | 24.703 | +3.1% |
+| footprint | CPU per turn, ms | 1.282 | 1.299 | +1.3% |
+| lifecycle | CPU, s | 0.685 | 0.71 | +3.6% |
+| lifecycle | p95 turn, ms | 679.39 | 660.488 | -2.8% |
+| lifecycle | peak RSS, MiB | 22.986 | 23.07 | +0.4% |
+
+Store work per turn is unchanged (the gate counts it and passed): the
+upsert rides the existing job. Every timing moved both ways within noise.
+
+The upsert alone, on a 1M-turn store with random turn ids (Python
+`sqlite3`, so with its call overhead): 12.8 µs; its plan is two
+primary-key searches. The schema 85 backfill, one `INSERT … SELECT` over
+`turns`, took 1.4 s on 1M turns (398 MB store) and added about 45 bytes a
+turn.
+
+## A reply the model's cap cuts short (#822)
+
+The daemon no longer counts a reply's bytes as it streams: the per-delta
+encoded-length accounting and the per-item counts are gone, and a delta
+costs one length compare before it goes live (in 128 KiB pieces, so one
+piece for every real delta). An output item's start parses two fields of
+it, borrowed, to name what a cut reply was writing. A reply the cap cuts
+costs one store job, `drop_reply` (its `dropped` event, its round, the
+note to the model and the turn's `drops` count, in one commit); a kept
+reply's commit sets `drops` back with the update it already made, and a
+resumed turn reads it in the `context` query it already ran. A bot's
+`max_drops` setting is one more `Option` in its settings JSON. Nothing is
+added to submit, to an ordinary turn's store jobs, or to its events.
+
+The Perf workflow's matched screen of this change against its base
+(`bench.perf_gate`, GitHub runner, head 2fb9a56 against main a53e1eb): store
+work per turn is the same and the gate passed. Release to terminal p99 moved
++6.3% (9.73 to 10.35 ms) inside the runner's spread for it (#771's screen
+moved it -0.3%, #774's +0.0%), with CPU per turn -0.3%; every other daemon
+measure moved under 3%. Sonny's moves are on paths this change does not
+touch (its only change draws a notice on a `dropped` event).
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 30.75 | 31.036 | +0.9% |
+| admission | burst submit p99, ms | 4.566 | 4.497 | -1.5% |
+| completion | release to terminal p99, ms | 9.731 | 10.347 | +6.3% |
+| footprint | idle RSS, MiB | 15.342 | 15.248 | -0.6% |
+| footprint | per idle bot, KiB | 1.666 | 1.62 | -2.8% |
+| footprint | RSS after a turn each, MiB | 24.982 | 24.93 | -0.2% |
+| footprint | CPU per turn, ms | 0.929 | 0.926 | -0.3% |
+| sonny | lookout note p95 at 100x10, ms | 2437.0 | 2441.5 | +0.2% |
+| sonny | quiet window CPU, ms/s | 2.07 | 1.745 | -15.7% |
+| sonny | sky replay CPU per 1k lines, ms | 9.815 | 8.995 | -8.4% |
+| sonny | sky replay RSS, MiB | 88.45 | 74.25 | -16.1% |
+| lifecycle | CPU, s | 0.44 | 0.44 | +0.0% |
+| lifecycle | p95 turn, ms | 579.066 | 578.157 | -0.2% |
+| lifecycle | peak RSS, MiB | 22.469 | 22.502 | +0.1% |
+
+## The audit trail (protocol 57, schema 87)
+
+Each tool call writes one `audit` row inside the commit that starts it (or
+denies it) and updates it inside the commit that records its result, and
+each step a client reports writes one when it is decided and updates it on
+`step_result`. No store job is added to a turn: the statements join
+transactions the turn already commits. A row's time is kept monotone with
+one lookup of the newest row by its primary key, so a time bound is found
+by bisecting ids and the table needs no index but its own.
+
+The row's own cost, measured on its statements alone (the insert and the
+update a call makes, 20,000 calls a round inside one transaction, release
+build, 4-core Linux cloud container, a file store in WAL): 3.0 to 3.2 µs a
+call, up to 5.2 µs in a round where the WAL grew. Ids are `AUTOINCREMENT`, so
+a call still running when the trail is trimmed never finishes another's row;
+that bookkeeping row did not move the cost past the runs without it (2.7 to
+5.2 µs). The store grew about 200
+bytes a row for a shell call of an 85-character command.
+
+A page of 100 rows with 60,000 in the trail reads in about 0.5 ms whether it
+filters by kind, a bot pattern or a time (the time found in about 16 probes
+of the primary key). A filter that matches no recent row scans the trail:
+4.7 ms for 60,000 rows, so about 80 ms a million. That is a read the person
+or an agent asks for on a reader connection, never on a turn's path; an
+index on a category waits for a trail where that read is slow in use.
+
+A step a client would not have put to a gate before (a script's MCP call
+under Full or a read-only tool, a browser command that does not confirm)
+now costs its client an `approve_step` with `record`, answered at once, and
+a `step_result`: two round trips on the socket and two small store jobs,
+against an MCP call's own milliseconds. An ordinary turn sends none.
+
+The Perf workflow's matched screen of this change against its base
+(`bench.perf_gate`, GitHub runner, head 22ac1a7 against main d11cdd8):
+store work per turn is the same and the gate passed. Every daemon measure
+moved under 5%: burst submit p99 +4.5%, inside the runner's spread for it,
+with lone submit CPU -0.3% and CPU per turn -0.6%. Sonny's lookout at 10x1
+reads 0 on a run too short for its 10 ms CPU ticks.
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 35.709 | 35.598 | -0.3% |
+| admission | burst submit p99, ms | 5.876 | 6.139 | +4.5% |
+| completion | release to terminal p99, ms | 12.384 | 11.995 | -3.1% |
+| footprint | idle RSS, MiB | 15.443 | 15.465 | +0.1% |
+| footprint | per idle bot, KiB | 1.536 | 1.556 | +1.3% |
+| footprint | RSS after a turn each, MiB | 24.199 | 24.35 | +0.6% |
+| footprint | CPU per turn, ms | 1.155 | 1.148 | -0.6% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 4.685 | 4.625 | -1.3% |
+| sonny | lookout note p95 at 100x10, ms | 2879.5 | 2869.0 | -0.4% |
+| sonny | quiet window CPU, ms/s | 1.73 | 1.73 | +0.0% |
+| sonny | sky replay CPU per 1k lines, ms | 11.77 | 11.77 | +0.0% |
+| lifecycle | CPU, s | 0.51 | 0.51 | +0.0% |
+| lifecycle | p95 turn, ms | 580.477 | 581.998 | +0.3% |
+| lifecycle | peak RSS, MiB | 22.75 | 22.775 | +0.1% |

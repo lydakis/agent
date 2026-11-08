@@ -4,8 +4,7 @@
 //! completion; the terminal output stands in only when none streamed. The
 //! ChatGPT Codex endpoint streams items and leaves the terminal output empty.
 use super::{
-    Completion, Delta, Frame, MAX_OUTPUT, ToolCall, Usage, detail_of, encoded_len, unparsed,
-    valid_call_id,
+    Completion, Delta, Frame, ToolCall, Usage, detail_of, unparsed, valid_call_id, writing,
 };
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
@@ -31,11 +30,10 @@ struct Event<'a> {
 #[derive(Default)]
 pub struct State {
     text: String,
-    /// JSON-encoded bytes of the streamed text and reasoning summaries.
-    text_bytes: usize,
-    thinking: usize,
     items: Vec<Bytes>,
-    item_bytes: usize,
+    /// What the newest output item writes, as a cut reply names it: `text`,
+    /// `reasoning`, or the tool it calls.
+    writing: Option<String>,
     completion: Option<Completion>,
     usage: Option<Usage>,
     /// The completed response's id, for a socket's `previous_response_id`.
@@ -44,17 +42,35 @@ pub struct State {
 
 impl State {
     pub fn frame(&mut self, frame: &[u8]) -> Result<Frame> {
-        let event: Event<'_> = serde_json::from_slice(frame).map_err(|e| unparsed(e, frame))?;
+        let event: Event<'_> = match serde_json::from_slice(frame) {
+            Ok(event) => event,
+            // An error in a shape of the endpoint's own is still its error,
+            // its message under `error` or at the top, with no `type` or
+            // with fields of other types than OpenAI's.
+            Err(error) => {
+                let value = serde_json::from_slice::<Value>(frame).unwrap_or(Value::Null);
+                let kind = match value.get("type") {
+                    None => "error",
+                    Some(kind) => kind.as_str().unwrap_or_default(),
+                };
+                let said = detail_of(&value)
+                    .or_else(|| detail_of(&value["response"]))
+                    .is_some();
+                return match kind {
+                    "error" | "response.failed" | "response.incomplete" if said => {
+                        let kind = kind.to_owned();
+                        self.failed(&kind, value)
+                    }
+                    _ => Err(unparsed(error, frame)),
+                };
+            }
+        };
         if self.completion.is_some() {
             return fail("event_after_completion");
         }
         match event.kind {
             "response.output_text.delta" => {
                 let part = event.delta.ok_or(Error::new("missing_text_delta"))?;
-                self.text_bytes += encoded_len(&part);
-                if self.text_bytes + self.thinking > MAX_OUTPUT {
-                    return fail("output_limit");
-                }
                 self.text.push_str(&part);
                 Ok(Frame::Delta(Delta::Text(
                     event.output_index,
@@ -63,10 +79,6 @@ impl State {
             }
             "response.reasoning_summary_text.delta" => {
                 let part = event.delta.ok_or(Error::new("missing_text_delta"))?;
-                self.thinking += encoded_len(&part);
-                if self.text_bytes + self.thinking > MAX_OUTPUT {
-                    return fail("output_limit");
-                }
                 Ok(Frame::Delta(Delta::Thinking(
                     event.output_index,
                     part.into_owned(),
@@ -74,12 +86,13 @@ impl State {
             }
             "response.output_item.done" => {
                 let item = event.item.ok_or(Error::new("missing_output_item"))?;
-                self.item_bytes += item.get().len();
-                if self.item_bytes > MAX_OUTPUT || self.items.len() >= 64 {
-                    return fail("output_limit");
-                }
                 self.items
                     .push(Bytes::copy_from_slice(item.get().as_bytes()));
+                Ok(Frame::Quiet)
+            }
+            // An item begins: a few bytes before its content streams.
+            "response.output_item.added" => {
+                self.writing = event.item.and_then(|item| writing(item.get()));
                 Ok(Frame::Quiet)
             }
             "response.completed" => {
@@ -96,67 +109,84 @@ impl State {
             }
             "error" | "response.failed" | "response.incomplete" => {
                 let value: Value = serde_json::from_slice(frame).unwrap_or(Value::Null);
-                self.usage = value["response"]
-                    .get("usage")
-                    .filter(|v| !v.is_null())
-                    .map(|usage| Usage {
-                        served_model: value["response"]["model"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_owned(),
-                        ..parse_usage(usage)
-                    });
-                let detail = detail_of(&value)
-                    .or_else(|| detail_of(&value["response"]))
-                    .or_else(|| {
-                        value["response"]["incomplete_details"]["reason"]
-                            .as_str()
-                            .map(str::to_owned)
-                    });
-                // A rate limit refused inside the stream is a distinct outcome
-                // from a response the model could not finish: it is the
-                // provider's pace, not the request, and a fleet must see it.
-                let rate_limited = (event.kind == "error"
-                    && value["code"].as_str() == Some("rate_limit_exceeded"))
-                    || [&value["error"], &value["response"]["error"]]
-                        .iter()
-                        .any(|error| error["code"].as_str() == Some("rate_limit_exceeded"))
-                    || detail
-                        .as_deref()
-                        .is_some_and(|d| d.starts_with("Rate limit reached"));
-                // A ChatGPT plan's usage limit can also end a started stream.
-                // A code at the top level of an `error` event, as above.
-                let errors = [&value, &value["error"], &value["response"]["error"]];
-                let named = |test: fn(&str) -> bool| {
-                    errors
-                        .iter()
-                        .any(|error| error["code"].as_str().is_some_and(test))
-                };
-                // An overload or a server failure after the stream began is
-                // the provider's, not the request's, and is retried as Codex
-                // retries it (openai/codex e8e6a92, sse/responses_error.rs):
-                // `slow_down` as a rate limit, an overload holding the pool.
-                let code = if named(super::quota) {
-                    "provider_quota_exhausted"
-                } else if named(super::plan_unavailable) {
-                    "provider_plan_unavailable"
-                } else if rate_limited || named(|code| code == "slow_down") {
-                    "provider_rate_limited"
-                } else if named(|code| code == "server_is_overloaded") {
-                    "provider_overloaded"
-                } else if named(|code| code == "server_error") {
-                    "provider_server_error"
-                } else {
-                    "provider_incomplete"
-                };
-                match detail {
-                    Some(detail) => fail_with(code, detail),
-                    None => fail(code),
-                }
+                self.failed(event.kind, value)
             }
             // Metadata and tool argument deltas are represented by the
             // validated terminal output. Unknown final item kinds fail.
             _ => Ok(Frame::Quiet),
+        }
+    }
+    /// The provider's refusal or failure, from the stream's error event.
+    fn failed(&mut self, kind: &str, value: Value) -> Result<Frame> {
+        self.usage = value["response"]
+            .get("usage")
+            .filter(|v| !v.is_null())
+            .map(|usage| Usage {
+                served_model: value["response"]["model"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                ..parse_usage(usage)
+            });
+        let detail = detail_of(&value)
+            .or_else(|| detail_of(&value["response"]))
+            .or_else(|| {
+                value["response"]["incomplete_details"]["reason"]
+                    .as_str()
+                    .map(str::to_owned)
+            });
+        // A rate limit refused inside the stream is a distinct outcome
+        // from a response the model could not finish: it is the
+        // provider's pace, not the request, and a fleet must see it.
+        let rate_limited = (kind == "error"
+            && value["code"].as_str() == Some("rate_limit_exceeded"))
+            || [&value["error"], &value["response"]["error"]]
+                .iter()
+                .any(|error| error["code"].as_str() == Some("rate_limit_exceeded"))
+            || detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("Rate limit reached"));
+        // A ChatGPT plan's usage limit can also end a started stream.
+        // A code at the top level of an `error` event, as above.
+        let errors = [&value, &value["error"], &value["response"]["error"]];
+        let named = |test: fn(&str) -> bool| {
+            errors
+                .iter()
+                .any(|error| error["code"].as_str().is_some_and(test))
+        };
+        // An overload or a server failure after the stream began is
+        // the provider's, not the request's, and is retried as Codex
+        // retries it (openai/codex e8e6a92, sse/responses_error.rs):
+        // `slow_down` as a rate limit, an overload holding the pool.
+        let code = if named(super::quota) {
+            "provider_quota_exhausted"
+        } else if named(super::plan_unavailable) {
+            "provider_plan_unavailable"
+        } else if rate_limited || named(|code| code == "slow_down") {
+            "provider_rate_limited"
+        } else if named(|code| code == "server_is_overloaded") {
+            "provider_overloaded"
+        } else if named(|code| code == "server_error") {
+            "provider_server_error"
+        } else {
+            "provider_incomplete"
+        };
+        // The model's own output cap: what it was writing is the newest
+        // item the response began, or the last it holds.
+        let reason = &value["response"]["incomplete_details"]["reason"];
+        if code == "provider_incomplete" && reason == "max_output_tokens" {
+            let last = (value["response"]["output"].as_array())
+                .and_then(|output| output.last())
+                .and_then(|item| {
+                    Some(super::writes(item["type"].as_str()?, item["name"].as_str()))
+                });
+            let tokens = self.usage.as_ref().map_or(0, |usage| usage.output_tokens);
+            let writing = self.writing.take().or(last);
+            return Err(super::cut_short("max_output_tokens", tokens, writing));
+        }
+        match detail {
+            Some(detail) => fail_with(code, detail),
+            None => fail(code),
         }
     }
     pub fn usage(&self) -> Option<Usage> {
@@ -212,17 +242,10 @@ fn parse_completion_with_usage(
     let mut items = Vec::new();
     let mut calls = Vec::new();
     let mut text = String::new();
-    let mut bytes = 0;
     let output = if streamed_items.is_empty() {
-        let mut output = Vec::with_capacity(response.output.len());
-        for raw in response.output {
-            bytes += raw.get().len();
-            if bytes > MAX_OUTPUT || output.len() >= 64 {
-                return fail("output_limit");
-            }
-            output.push(Bytes::copy_from_slice(raw.get().as_bytes()));
-        }
-        output
+        (response.output.iter())
+            .map(|raw| Bytes::copy_from_slice(raw.get().as_bytes()))
+            .collect()
     } else {
         streamed_items
     };
@@ -327,6 +350,33 @@ mod tests {
         let calls = RawValue::from_string(r#"{"status":"completed","output":[{"type":"function_call","name":"echo","call_id":"x","arguments":"{}"},{"type":"function_call","name":"echo","call_id":"x","arguments":"{}"}]}"#.into()).unwrap();
         assert!(parse_completion(&calls, "").is_err());
     }
+    #[test]
+    fn an_error_in_the_endpoint_s_own_shape_says_what_it_said() {
+        // No `type`, as an OpenAI-shaped error body; a message alone; and
+        // an `error` event whose other fields are not OpenAI's types.
+        for frame in [
+            r#"{"error":{"code":"validation_error","message":"The request was rejected by target.","param":null,"type":"invalid_request_error"}}"#,
+            r#"{"message":"The request was rejected by target."}"#,
+            r#"{"type":"error","output_index":null,"error":{"message":"The request was rejected by target."}}"#,
+        ] {
+            let error = State::default().frame(frame.as_bytes()).unwrap_err();
+            assert_eq!(error.code, "provider_incomplete", "{frame}");
+            assert_eq!(
+                error.detail.as_deref(),
+                Some("The request was rejected by target."),
+                "{frame}"
+            );
+        }
+        // One that says nothing is still a frame that did not parse.
+        for frame in [
+            r#"{"error":"x"}"#,
+            r#"{"type":"response.created","output_index":"x"}"#,
+        ] {
+            let error = State::default().frame(frame.as_bytes()).unwrap_err();
+            assert_eq!(error.code, "invalid_json", "{frame}");
+        }
+    }
+
     #[test]
     fn a_reply_that_does_not_parse_says_why_and_how_it_began() {
         // A call whose arguments come as an object, not the string the
@@ -568,5 +618,52 @@ mod tests {
             let error = State::default().frame(frame.as_bytes()).unwrap_err();
             assert_eq!(error.code, code, "{frame}");
         }
+    }
+    #[test]
+    fn a_reply_cut_at_max_output_tokens_names_what_it_was_writing() {
+        let incomplete = r#"{"type":"response.incomplete","response":{"status":"incomplete",
+            "incomplete_details":{"reason":"max_output_tokens"},"output":[],
+            "usage":{"input_tokens":10,"output_tokens":32000}}}"#
+            .replace('\n', "");
+        let facts = |error: Error| {
+            assert!(super::super::was_cut_short(&error));
+            assert_eq!(error.detail.as_deref(), Some("max_output_tokens"));
+            serde_json::Value::Object(*error.facts.unwrap())
+        };
+        // The item the response began, by the tool it calls.
+        let mut state = State::default();
+        state
+            .frame(br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"write","call_id":"c1","arguments":""}}"#)
+            .unwrap();
+        state
+            .frame(br#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"path\""}"#)
+            .unwrap();
+        assert_eq!(
+            facts(state.frame(incomplete.as_bytes()).unwrap_err()),
+            serde_json::json!({"limit":"max_tokens","output_tokens":32000,"in":"write"})
+        );
+        // Words; and with nothing begun, the last item the response holds.
+        let mut state = State::default();
+        state
+            .frame(br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}"#)
+            .unwrap();
+        assert_eq!(
+            facts(state.frame(incomplete.as_bytes()).unwrap_err())["in"],
+            "text"
+        );
+        let held = incomplete.replace(
+            r#""output":[]"#,
+            r#""output":[{"type":"reasoning","summary":[]}]"#,
+        );
+        assert_eq!(
+            facts(State::default().frame(held.as_bytes()).unwrap_err())["in"],
+            "reasoning"
+        );
+        // Nothing said: no `in`.
+        assert!(
+            facts(State::default().frame(incomplete.as_bytes()).unwrap_err())
+                .get("in")
+                .is_none()
+        );
     }
 }
