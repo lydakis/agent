@@ -12063,7 +12063,7 @@ impl Database {
         let mut statement = snapshot.prepare_cached(&format!(
             "SELECT m.model,COUNT(*),SUM(m.input_tokens),SUM(m.cached_input_tokens),
                     SUM(m.output_tokens),SUM(m.cache_write_tokens),SUM(m.cache_write_1h_tokens)
-             FROM turns t JOIN turn_models m ON m.turn=t.id
+             FROM turns t CROSS JOIN turn_models m ON m.turn=t.id
              WHERE t.started_ms>=?1{glob} GROUP BY 1"
         ))?;
         let mut rows = match name {
@@ -12075,7 +12075,8 @@ impl Database {
             ])?,
             None => statement.query(params![since_ms])?,
         };
-        // Each model's spend, and its cache writes: 5-minute and hour.
+        // Each model's spend, and its cache writes: 5-minute and hour. The
+        // window's turns lead, each one's rows found by its key.
         let mut models: Vec<(String, Spent, i64, i64)> = Vec::new();
         while let Some(r) = rows.next()? {
             let spent = Spent {
