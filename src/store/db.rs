@@ -6706,11 +6706,14 @@ impl Database {
             && options.delivery != Delivery::Steer
             && bot.workspace != workspace;
         // Only the head of a bot's line is ready; the rest wait behind it.
+        // A `configure` kept for the last turn's end is taken before the
+        // next starts: a start admitted here, before the daemon took it,
+        // waits ready for the start that takes it first.
         let status = if attach {
             "attached"
         } else if busy {
             "queued"
-        } else if capacity {
+        } else if capacity && bot.configure_pending.is_none() {
             "running"
         } else {
             "ready"

@@ -7391,6 +7391,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_start_admitted_before_a_kept_configure_is_taken_waits_for_it() {
+        let dir = std::env::temp_dir().join(format!("agent-kept-raced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let first = running(&store, &["Bob".into()]).await[0].1;
+        let mut service = admitting(&store, 4);
+        let change = Configure {
+            instructions: Some("new".into()),
+            ..Configure::default()
+        };
+        service.configure("Bob".into(), None, change).await.unwrap();
+        // The submission's look found the turn running; its end commits
+        // before the submission's own commit, which has room to start it.
+        let (next, admitted, instructions) = store
+            .op("finish", move |db| {
+                turn::Finished::record(db, "Bob", first, None)?;
+                let started = db.begin(
+                    "Bob",
+                    "second",
+                    "more",
+                    true,
+                    &TurnOptions::default(),
+                    |_, _| Ok(()),
+                )?;
+                Ok((
+                    started.turn,
+                    started.status,
+                    db.inspect("Bob")?.instructions,
+                ))
+            })
+            .await
+            .unwrap();
+        // It does not start on the old instructions: it waits for the
+        // start that takes the change first.
+        assert_eq!((admitted, instructions.as_str()), ("ready", ""));
+        service.start_ready().await.unwrap();
+        let (status, bob) = store
+            .op("status", move |db| {
+                Ok((db.turn_status("Bob", next)?, db.inspect("Bob")?))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                status.as_str(),
+                bob.instructions.as_str(),
+                bob.configure_pending
+            ),
+            ("running", "new", None)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn a_change_kept_while_its_turn_runs_is_not_checked_until_it_ends() {
         let dir = std::env::temp_dir().join(format!("agent-kept-unchecked-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
