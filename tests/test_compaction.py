@@ -4,6 +4,7 @@ import os
 import queue
 import sqlite3
 import threading
+import time
 from contextlib import closing
 from unittest import skipUnless
 from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
@@ -194,7 +195,11 @@ class CompactionTests(ModelFixture):
             current = client.request('inspect', bot='Bob')['result']['compaction']
             self.assertNotEqual(current, previous)
             previous = current
-        requests = self.requests()
+        # The last turn's summary is written as it ends, after it reports.
+        requests, deadline = self.requests(), time.monotonic() + 5
+        while sum(is_summary(r) for r in requests) < 5 and time.monotonic() < deadline:
+            time.sleep(.01)
+            requests += self.requests()
         self.assertEqual(sum(is_summary(r) for r in requests), 5)
         self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':'), ensure_ascii=False).encode()) - 2
                             <= 4096 for r in requests))
