@@ -28,8 +28,6 @@ pub enum Slot {
     /// and the conversation has it: the way over to it, a click away.
     Folded,
     Needs,
-    /// Quiet, or waiting to go quiet once the person steps away.
-    Quiet,
     Failed,
     Working,
     Background,
@@ -48,9 +46,8 @@ impl Slot {
 
 /// The order things give way: each step takes that item to its next
 /// form, and a step for an item absent or at its last form is passed.
-const LADDER: [Slot; 14] = [
+const LADDER: [Slot; 13] = [
     Slot::Folded,
-    Slot::Quiet,
     Slot::Access,
     Slot::Place,
     Slot::RoomyContext,

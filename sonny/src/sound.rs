@@ -57,11 +57,6 @@ impl Sounds {
         if !self.on {
             return;
         }
-        // Nothing rings while the person is away: what needs them counts
-        // in the footer for when they are back.
-        if crate::quiet::arm().is_some() {
-            return;
-        }
         if matches!(alert, Alert::NeedsYou | Alert::LeadDone | Alert::Failed) {
             let text: String = what
                 .chars()

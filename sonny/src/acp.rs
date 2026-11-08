@@ -1294,10 +1294,7 @@ impl Session {
         let moving = (!steer).then_some(bound.moving.as_ref()).flatten();
         let mut asked = json!({"bot": bound.bot, "bot_id": bound.bot_id,
             "request_id": crate::unique("acp"),
-            "prompt": match person {
-                Some(_) => crate::stamp::other(&text),
-                None => crate::stamp::person(&text, &bound.bot),
-            },
+            "prompt": crate::stamp::now(&text),
             "delivery": if moving.is_some() { "queue" } else { "steer" },
             "images": if images.is_empty() { Value::Null } else { json!(images) }});
         if let Some(person) = person {
@@ -1959,7 +1956,7 @@ async fn elicit(
     let mut submitted = json!({"bot": bot, "bot_id": bot_id, "delivery": "steer"});
     let _ = match person {
         Some(person) => {
-            submitted["prompt"] = json!(crate::stamp::other(&words));
+            submitted["prompt"] = json!(crate::stamp::now(&words));
             submitted["person"] = json!(person);
             submitted["request_id"] = json!(crate::unique("acp"));
             client
@@ -1968,9 +1965,8 @@ async fn elicit(
                 .map(drop)
                 .map_err(|e| e.to_string())
         }
-        // A pick leaves quiet on, as a click on a card does.
         None => {
-            submitted["prompt"] = json!(crate::stamp::now(&words, &bot));
+            submitted["prompt"] = json!(crate::stamp::now(&words));
             crate::answer_once(&client, &ask.id, submitted)
                 .await
                 .map(drop)
