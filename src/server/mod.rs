@@ -4033,6 +4033,23 @@ impl Service {
         if !self.kept.contains(bot) {
             return Ok(());
         }
+        // A turn still running keeps it, unchecked: what it would be
+        // checked against may yet change before the turn ends.
+        let name = bot.to_owned();
+        match (self.store)
+            .op("configure_running", move |db| {
+                Ok(db.inspect(&name)?.running_turn.is_some())
+            })
+            .await
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) if error.code == "bot_not_found" => {
+                self.kept.remove(bot);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
         match self
             .configure(bot.to_owned(), None, Configure::default())
             .await
@@ -7370,6 +7387,33 @@ mod tests {
         let _ = service.start_ready().await;
         let (_, instructions, pending) = status(store.clone()).await.unwrap();
         assert_eq!((instructions.as_str(), pending), ("new", None));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_change_kept_while_its_turn_runs_is_not_checked_until_it_ends() {
+        let dir = std::env::temp_dir().join(format!("agent-kept-unchecked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        running(&store, &["Bob".into()]).await;
+        let mut service = admitting(&store, 4);
+        let change = Configure {
+            model: Some("openai/other".into()),
+            instructions: Some("new".into()),
+            ..Configure::default()
+        };
+        service.configure("Bob".into(), None, change).await.unwrap();
+        // What it was checked against goes while the turn runs (its
+        // provider, here), and a message comes meanwhile: the change stays
+        // kept for the turn's end, which checks it again.
+        service.providers = Arc::new(HashMap::new());
+        service.take_configure("Bob").await.unwrap();
+        let bob = store.op("inspect", |db| db.inspect("Bob")).await.unwrap();
+        assert_eq!(
+            bob.configure_pending,
+            Some(json!({"model": "openai/other", "instructions": "new"}))
+        );
+        assert!(service.kept.contains("Bob"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
