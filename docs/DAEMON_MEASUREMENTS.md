@@ -7940,5 +7940,29 @@ per-agent `turns` reads it no longer makes cost about 0.3 ms an agent
 30% in bytes (530 to 691 KB at 1,001 agents, for `last` and the new keys)
 and up to a millisecond a page to read. The first refresh still reads every
 agent's latest history items and asks once per agent what its last turn left
-open, so it keeps most of its cost: that is Sonny's to bound next, by reading
-history only for the rows a person sees.
+open, so it keeps most of its cost: that is Sonny's to bound next, by keeping
+what it read across windows and reading what moved off the loop.
+
+The matched hot-path screen against main (Perf workflow on 0cb264e, base
+3b3a00f, GitHub's shared runner) adds no store work per turn, which it
+counts and would fail on:
+
+| Bench | Measure | main | This change | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 32.12 | 32.37 | +0.8% |
+| admission | burst submit p99, ms | 4.63 | 4.64 | +0.2% |
+| completion | release to terminal p99, ms | 10.25 | 10.40 | +1.5% |
+| footprint | idle RSS, MiB | 15.30 | 15.48 | +1.2% |
+| footprint | per idle bot, KiB | 1.63 | 1.44 | -11.6% |
+| footprint | RSS after a turn each, MiB | 25.38 | 25.16 | -0.9% |
+| footprint | CPU per turn, ms | 0.965 | 0.985 | +2.0% |
+| lifecycle | CPU, s | 0.465 | 0.465 | +0.0% |
+| lifecycle | p95 turn, ms | 922.7 | 741.9 | -19.6% |
+| lifecycle | peak RSS, MiB | 23.75 | 23.63 | -0.5% |
+
+Seven more columns on a bot row cost nothing a turn can see: every move is
+inside the runner's noise. The screen warned once, on the lookout's CPU per
+1,000 deltas at 100 leads of 10 tasks (5.25 to 6.5 ms), a Sonny companion
+this change does not touch past one listing at its start: that measure moves
+in steps of 1.25 ms (one 10 ms CPU tick over 8,000 deltas), and the 10x10
+row moved the same one step while the 10x100 row barely moved.
