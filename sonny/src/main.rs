@@ -1243,7 +1243,7 @@ async fn spread_pass(
     lead: String,
     (pick, mode): (u64, &'static str),
     lead_set: bool,
-    settled: std::collections::HashSet<i64>,
+    (settled, waited): (std::collections::HashSet<i64>, Vec<String>),
     mut sandboxes: approvals::Sandboxes,
     woken: Arc<tokio::sync::Notify>,
 ) -> Passed {
@@ -1319,6 +1319,10 @@ async fn spread_pass(
             }
         };
         let Some(fields) = fields else {
+            // One the last pass left waiting has taken the change since:
+            // on its old permissions it may have made an agent this
+            // listing did not name, so the pick lists them again.
+            passed.again |= waited.contains(&name);
             passed.settled.extend(id);
             continue;
         };
@@ -6249,7 +6253,7 @@ impl App {
             self.bot.clone(),
             (spread.pick, spread.mode),
             self.gating.is_none(),
-            spread.settled.clone(),
+            (spread.settled.clone(), spread.waiting.clone()),
             std::mem::take(&mut spread.sandboxes),
             self.woken.clone(),
         )));
@@ -20777,8 +20781,11 @@ mod tests {
         let workspace = std::env::temp_dir().join(unique("spread"));
         std::fs::create_dir_all(&workspace).unwrap();
         let folder = workspace.display().to_string();
+        let task = json!({"name": "b.task", "tools": ["shell"], "gates": [],
+            "settings": {}, "workspace": folder});
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
+        let listed = task.clone();
         let client = daemon_serving(json!({}), move |request| {
             seen.lock().unwrap().push(format!("{} {}", request["op"], request["bot"]));
             match request["op"].as_str() {
@@ -20789,8 +20796,7 @@ mod tests {
             Some("inspect") if request["bot"] == "b" => {
                 json!({"name": "b", "configure_pending": {"settings": {"sandbox": "workspace"}}})
             }
-            Some("inspect") => json!({"name": "b.task", "tools": ["shell"], "gates": [],
-                "settings": {}, "workspace": folder}),
+            Some("inspect") => listed.clone(),
             Some("configure") => json!({"bot": "b.task", "bot_id": 2, "running_turn": 3,
                 "configure_pending": {"approve": ["shell"]}, "changed": []}),
             _ => json!({}),
@@ -20798,7 +20804,7 @@ mod tests {
         })
         .await;
         let passed = spread_pass(
-            client,
+            client.clone(),
             "b".into(),
             (1, "ask"),
             true,
@@ -20819,6 +20825,38 @@ mod tests {
             ["\"inspect\" \"b\"", "\"bots\" null"],
             "{asked:?}"
         );
+        // Both took their change since: the task, left waiting last pass,
+        // may have made an agent on its old permissions after this listing,
+        // so the pick lists them again.
+        // (Full access, whose sandbox names no folder of the test's thread.)
+        let fields = approvals::regate(&task, "full", "b.task", &mut Default::default()).unwrap();
+        let mut has = task.clone();
+        has["settings"] = fields["settings"].clone();
+        assert!(approvals::regate(&has, "full", "b.task", &mut Default::default()).is_none());
+        let taken = daemon_serving(json!({}), move |request| match request["op"].as_str() {
+            Some("bots") => json!({"bots": [
+                {"name": "b", "bot_id": 1},
+                {"name": "b.task", "bot_id": 2, "created_by_id": 1},
+            ], "next_after": null}),
+            Some("inspect") if request["bot"] == "b" => json!({"name": "b"}),
+            Some("inspect") => has.clone(),
+            _ => json!({}),
+        })
+        .await;
+        for (waited, again) in [(vec!["b.task".to_owned()], true), (Vec::new(), false)] {
+            let passed = spread_pass(
+                taken.clone(),
+                "b".into(),
+                (1, "full"),
+                true,
+                (Default::default(), waited),
+                Default::default(),
+                Arc::new(tokio::sync::Notify::new()),
+            )
+            .await;
+            assert!(passed.after_lead);
+            assert_eq!((passed.settled, passed.again), (vec![2], again));
+        }
         let _ = std::fs::remove_dir_all(workspace);
     }
 

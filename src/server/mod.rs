@@ -5546,6 +5546,10 @@ impl Service {
                 // A slot is promised before the commit that may take it, so
                 // admissions queued together cannot start more turns than
                 // the limit allows.
+                // A `configure` kept for a turn that has ended, its task not
+                // yet reaped, is taken before this turn can start; one still
+                // running keeps it.
+                self.take_configure(&bot).await?;
                 let capacity = self.has_capacity();
                 let reserved = capacity && self.limit_active != 0;
                 self.reserved += usize::from(reserved);
@@ -5559,7 +5563,8 @@ impl Service {
                     .map(|active| active.steers.clone());
                 let (b, r) = (bot.clone(), request_id.clone());
                 let providers = self.providers.clone();
-                let queued = store
+                let queued = self
+                    .store
                     .queue("begin", move |db| {
                         let identity = db.identity(&b, bot_id)?;
                         let started =
@@ -7365,6 +7370,40 @@ mod tests {
         let _ = service.start_ready().await;
         let (_, instructions, pending) = status(store.clone()).await.unwrap();
         assert_eq!((instructions.as_str(), pending), ("new", None));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_turn_admitted_before_the_last_end_is_reaped_starts_on_what_was_kept() {
+        let dir = std::env::temp_dir().join(format!("agent-kept-admitted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let first = running(&store, &["Bob".into()]).await[0].1;
+        let mut service = admitting(&store, 4);
+        let change = Configure {
+            instructions: Some("new".into()),
+            ..Configure::default()
+        };
+        service.configure("Bob".into(), None, change).await.unwrap();
+        // Its end commits; the loop has not reaped its task yet when the
+        // next message comes, with room to start it at once.
+        store
+            .op("finish", move |db| {
+                turn::Finished::record(db, "Bob", first, None)
+            })
+            .await
+            .unwrap();
+        let output = Output::writer(tokio::io::sink());
+        let admitted = request(&mut service, submit("Bob", "second"), &output)
+            .await
+            .unwrap();
+        assert_eq!(admitted["status"], "running", "{admitted}");
+        // It started on the change, taken first.
+        let bob = store.op("inspect", |db| db.inspect("Bob")).await.unwrap();
+        assert_eq!(
+            (bob.instructions.as_str(), bob.configure_pending),
+            ("new", None)
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
