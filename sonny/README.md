@@ -514,6 +514,12 @@ questions that names someone goes to the lead as their words: it reads
 them, but only your own pick answers the question in Sonny's windows.
 Questions come as forms only to a client that says it fills them in
 (`elicitation.form`); one without forms still shows each as the `ask` call.
+A lead's thread also gets its tasks' questions, as Sonny's lead window pins
+them: each form starts `From calc.fix`, and a pick answers in that task,
+the same answer its own window sends, so it takes it once. Those open when
+the thread comes (from tasks that ran in the last week) come first, then
+each as it is asked, from tasks the lead starts later too. T3 Code shows
+a task's questions in that task's own thread instead.
 
 Enter sends (and steers a running turn), Tab while a turn runs queues what
 you wrote to run after it, as Codex does, Esc interrupts, `y`/`n` answer a
