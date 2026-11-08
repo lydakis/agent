@@ -438,29 +438,40 @@ class AcpTests(ModelFixture):
         refused, _ = thread.answer_of(thread.ask('session/set_config_option', {
             'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead.gone'}))
         self.assertEqual(refused['error']['code'], -32602)
-        # Listed by folder and in all: each by its name and identity.
+        # Listed by folder and in all: each by its name, its identity and its
+        # store's lineage.
         ids = {bot: self.daemon.request('inspect', bot=bot)['result']['bot_id']
                for bot in ('calc.lead', 'calc.lead.billing')}
         for params in ({'cwd': str(repo)}, {}):
             listed, _ = thread.answer_of(thread.ask('session/list', params))
-            self.assertEqual([(s['sessionId'], s['title'], s['cwd']) for s in listed['result']['sessions']],
-                             [(f'{bot}#{ids[bot]}', bot, str(repo)) for bot in ('calc.lead', 'calc.lead.billing')])
+            sessions = listed['result']['sessions']
+            self.assertEqual([(s['title'], s['cwd']) for s in sessions],
+                             [(bot, str(repo)) for bot in ('calc.lead', 'calc.lead.billing')])
+            for found in sessions:
+                lead, store = found['sessionId'].rsplit('@', 1)
+                self.assertEqual(lead, f'{found["title"]}#{ids[found["title"]]}')
+                self.assertRegex(store, r'^[0-9a-f]{16}$')
+        first, billing = (s['sessionId'] for s in sessions)
         # A listed lead reopens, as that lead even once a session of that id
-        # was moved to another; one removed since does not.
-        listed = f'calc.lead#{ids["calc.lead"]}'
+        # was moved to another.
         reopened = Thread(self, env, repo)
         reopened.answer_of(reopened.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
-        answered, _ = reopened.answer_of(reopened.ask('session/resume', {'sessionId': listed, 'cwd': str(repo),
+        answered, _ = reopened.answer_of(reopened.ask('session/resume', {'sessionId': first, 'cwd': str(repo),
                                                                           'mcpServers': []}))
         self.assertEqual(answered['result']['configOptions'][-1]['currentValue'], 'calc.lead')
         moved, _ = reopened.answer_of(reopened.ask('session/set_config_option', {
-            'sessionId': listed, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead.billing'}))
+            'sessionId': first, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead.billing'}))
         self.assertEqual(moved['result']['configOptions'][-1]['currentValue'], 'calc.lead.billing')
         reopened.close()
-        answered, _ = Thread.resumed(self, env, repo, listed)
+        answered, _ = Thread.resumed(self, env, repo, first)
         self.assertEqual(answered['result']['configOptions'][-1]['currentValue'], 'calc.lead')
-        self.assertIn('result', self.resume(repo, f'calc.lead.billing#{ids["calc.lead.billing"]}'))
-        self.assertIn('error', self.resume(repo, f'calc.lead.billing#{ids["calc.lead.billing"] + 100}'))
+        self.assertIn('result', self.resume(repo, billing))
+        # One removed since, or of another store, does not.
+        lead, store = billing.rsplit('@', 1)
+        stale = f'calc.lead.billing#{ids["calc.lead.billing"] + 100}@{store}'
+        self.assertIn('error', self.resume(repo, stale))
+        other = f'{lead}@{"0" * 16 if store != "0" * 16 else "1" * 16}'
+        self.assertIn('another store', self.resume(repo, other)['error']['message'])
 
     def test_t3_code_threads_pick_their_lead_by_words_not_by_an_option(self):
         """T3 Code carries option picks over to the next thread it opens."""

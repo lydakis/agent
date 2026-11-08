@@ -448,9 +448,10 @@ session to that lead once its prompt is answered. T3 Code is not offered
 it, since it puts a thread's picks to every thread it opens next, which
 would put them all on one lead; there `/switch NAME` picks. `session/list`
 lists the leads Sonny can open, the given folder's or every project's, each
-by an id that names the lead and its identity (`calc.lead.billing#7`), which
-`session/resume` reopens; one removed and made again under its name is not
-the one listed, and is refused.
+by an id that names the lead, its identity and its store's lineage
+(`calc.lead.billing#7@…`), which `session/resume` reopens; one removed and
+made again under its name, or a lead of another store, is not the one
+listed, and is refused.
 
 Enter sends (and steers a running turn), Tab while a turn runs queues what
 you wrote to run after it, as Codex does, Esc interrupts, `y`/`n` answer a

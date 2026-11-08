@@ -493,14 +493,17 @@ impl Agent {
                 .await
                 .map_err(|e| (FAILED, e)),
         };
+        let store = client.store().map(str::to_owned);
         client.close().await;
         let (leads, next) = listing?;
         let sessions: Vec<Value> = leads
             .iter()
             .filter_map(|lead| {
                 let (bot, bot_id) = (lead["name"].as_str()?, lead["bot_id"].as_i64()?);
-                Some(json!({"sessionId": lead_session(bot, bot_id),
-                    "cwd": lead["workspace"], "title": bot}))
+                Some(
+                    json!({"sessionId": lead_session(bot, bot_id, store.as_deref()),
+                    "cwd": lead["workspace"], "title": bot}),
+                )
             })
             .collect();
         let mut listed = json!({"sessions": sessions});
@@ -529,19 +532,28 @@ fn agent_option(leads: &[String], current: &str) -> Value {
         "currentValue": current, "options": choices})
 }
 
-/// The id `session/list` gives a lead: its name and its identity.
-fn lead_session(bot: &str, bot_id: i64) -> String {
-    format!("{bot}#{bot_id}")
+/// The id `session/list` gives a lead: its name, its identity, and the
+/// lineage of the store it is in, since identities are a store's own.
+fn lead_session(bot: &str, bot_id: i64, store: Option<&str>) -> String {
+    match store {
+        Some(store) => format!("{bot}#{bot_id}@{store}"),
+        None => format!("{bot}#{bot_id}"),
+    }
 }
 
-/// The lead a listed session id names, as `session/resume` reopens it.
+/// The lead a listed session id names, as `session/resume` reopens it:
+/// that lead of that store, or none.
 fn listed_lead(session: &str) -> Option<t3::Pinned> {
-    let (bot, bot_id) = session.rsplit_once('#')?;
+    let (lead, store) = match session.rsplit_once('@') {
+        Some((lead, store)) => (lead, Some(store.to_owned())),
+        None => (session, None),
+    };
+    let (bot, bot_id) = lead.rsplit_once('#')?;
     (project::is_lead(bot)).then_some(())?;
     Some(t3::Pinned {
         bot: bot.to_owned(),
         bot_id: Some(bot_id.parse().ok()?),
-        store: None,
+        store,
     })
 }
 
@@ -2271,13 +2283,15 @@ mod tests {
 
     #[test]
     fn a_listed_session_names_a_lead_and_its_identity() {
-        let id = lead_session("calc.lead.billing", 7);
-        assert_eq!(id, "calc.lead.billing#7");
+        let id = lead_session("calc.lead.billing", 7, Some("00ab"));
+        assert_eq!(id, "calc.lead.billing#7@00ab");
         let pinned = listed_lead(&id).unwrap();
         assert_eq!(
-            (pinned.bot.as_str(), pinned.bot_id),
-            ("calc.lead.billing", Some(7))
+            (pinned.bot.as_str(), pinned.bot_id, pinned.store.as_deref()),
+            ("calc.lead.billing", Some(7), Some("00ab"))
         );
+        let unstored = listed_lead(&lead_session("calc.lead", 7, None)).unwrap();
+        assert_eq!((unstored.bot.as_str(), unstored.store), ("calc.lead", None));
         // Only a lead, and only by its identity.
         assert!(listed_lead("calc.fix-cart#7").is_none());
         assert!(listed_lead("calc.lead").is_none());
