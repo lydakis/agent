@@ -470,6 +470,23 @@ the lead's from its next turn. A thread offers only its bot's provider family,
 since a bot changes model only within it, and a task's thread keeps the model
 its lead gave the task.
 
+#### Other ACP clients
+
+`sonny acp` serves any client of the Agent Client Protocol the same way, as
+a bridge from a chat app does: start it once and open a session for each
+conversation. A session opened in a folder offers a third picker, Agent,
+which names the lead behind it: "Default", the lead its first prompt opens
+as above, or one of the folder's leads by name. A lead picked before the
+first prompt is the one that prompt goes to; one picked later moves the
+session to that lead once its prompt is answered. T3 Code is not offered
+it, since it puts a thread's picks to every thread it opens next, which
+would put them all on one lead; there `/switch NAME` picks. `session/list`
+lists the leads Sonny can open, the given folder's or every project's, each
+by an id that names the lead, its identity and its store's lineage
+(`calc.lead.billing#7@…`), which `session/resume` reopens; one removed and
+made again under its name, or a lead of another store, is not the one
+listed, and is refused.
+
 Enter sends (and steers a running turn), Tab while a turn runs queues what
 you wrote to run after it, as Codex does, Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
