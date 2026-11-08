@@ -7601,3 +7601,35 @@ path changed: lone submit CPU 31.1 → 30.8 ms, burst submit p99 4.54 →
 4.52 ms, release to terminal p99 9.73 → 9.92 ms, idle RSS 15.2 → 15.3 MiB,
 CPU per turn 0.92 → 0.92 ms, lifecycle p95 turn 697 → 714 ms, the quiet
 window 1.54 → 1.34 ms/s.
+
+## A waiter leaving touches only its own handles
+
+A waiter (a parked turn, or a client's `wait`) that finished, timed out or
+left took itself off every other waiter's lists: `detach_locked` ran
+`retain` over every handle anyone waited on, so n waiters finishing cost
+Θ(n²), under the registry lock on the daemon's one thread. A session
+closing likewise read every waiter to find its own requests. Now a waiter
+leaves only the lists of its own handles (those still remaining and those
+with results, which together are every one it attached with), and the
+registry keeps each session's requests, so closing reads only those. A
+waiter attached again lets go of its earlier wait first, which also
+returns its share of results it held (they stayed retained before).
+
+Wall time of the registry alone, release build, 4-core Linux cloud
+container (Xeon 2.1 GHz), main d82ec12 against this change. Each parked
+turn waits on a command of its own and on a peer's turn; each wakes on its
+command and leaves:
+
+| Parked turns | Before: all leave | After | Before: one session closes | After |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 0.09 ms | 0.07 ms | 0.23 µs | 0.03 µs |
+| 1,000 | 3.5 ms | 0.48 ms | 2.6 µs | 0.02 µs |
+| 4,000 | 82 ms | 2.9 ms | 12 µs | 0.02 µs |
+| 16,000 | 2,950 ms | 12.6 ms | 40 µs | 0.03 µs |
+
+Per waiter it stays near 0.7 µs from 100 to 16,000. Memory: one map entry
+per session with a `wait` pending, removed with its last request. The
+tests `a_waiter_leaving_costs_the_same_however_many_others_wait` and
+`a_closing_session_takes_its_own_waits_and_no_one_elses` time 8,000 and
+16,000 and fail when twice as many take three times as long; both failed
+against the old scans (16,000 took minutes in a debug build).

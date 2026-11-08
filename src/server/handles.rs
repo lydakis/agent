@@ -115,8 +115,12 @@ struct Inner {
     next_generation: u64,
     next_request: u64,
     waiters: HashMap<Waiter, Waiting>,
+    /// Who waits on each handle. A waiter is listed under its own handles
+    /// only, so leaving touches those and no one else's.
     by_turn: HashMap<(String, i64), Vec<Waiter>>,
     by_process: HashMap<i64, Vec<Waiter>>,
+    /// Each session's request waiters, so a session closing finds its own.
+    by_session: HashMap<u64, Vec<Waiter>>,
     // Only immutable, durable outcomes, retained while a waiter needs them.
     retained: HashMap<String, Retained>,
     // Answers still reading their pending turns, each holding its session's
@@ -169,13 +173,17 @@ impl Handles {
         inner.schedule.insert((at, due));
     }
 
-    /// Remove a waiter, and its deadline from the schedule.
+    /// Remove a waiter, its deadline from the schedule, and it from its
+    /// session's requests.
     fn remove_locked(inner: &mut Inner, waiter: Waiter) -> Option<Waiting> {
         let waiting = inner.waiters.remove(&waiter)?;
         if let Some(at) = waiting.deadline {
             inner
                 .schedule
                 .remove(&(at, Due::Wait(waiter, waiting.generation)));
+        }
+        if let Completion::Respond { session, .. } = waiting.completion {
+            unlist(&mut inner.by_session, session, waiter);
         }
         Some(waiting)
     }
@@ -427,9 +435,15 @@ impl Handles {
             let mut inner = self.inner.lock().unwrap();
             inner.next_generation += 1;
             let generation = inner.next_generation;
+            // A waiter attached again lets go of what it held before.
+            Self::detach_locked(&mut inner, waiter);
+            Self::remove_locked(&mut inner, waiter);
             // Track every input, including an invalid handle restored from
             // storage, so an error resolves it instead of stranding the wait.
             let remaining = handles.iter().cloned().collect();
+            if let Completion::Respond { session, .. } = completion {
+                inner.by_session.entry(session).or_default().push(waiter);
+            }
             for handle in parsed.iter().flatten() {
                 match handle {
                     Handle::Turn { bot, turn } => inner
@@ -440,7 +454,6 @@ impl Handles {
                     Handle::Process(id) => inner.by_process.entry(*id).or_default().push(waiter),
                 }
             }
-            Self::remove_locked(&mut inner, waiter);
             inner.waiters.insert(
                 waiter,
                 Waiting {
@@ -621,10 +634,7 @@ impl Handles {
     /// Sessions own only their still-pending requests, not a history of waits.
     pub fn close_session(&self, session: u64) {
         let mut inner = self.inner.lock().unwrap();
-        let waiters: Vec<Waiter> = inner.waiters.iter().filter_map(|(id, waiting)| {
-            matches!(waiting.completion, Completion::Respond { session: owner, .. } if owner == session)
-                .then_some(*id)
-        }).collect();
+        let waiters = inner.by_session.remove(&session).unwrap_or_default();
         for waiter in waiters {
             Self::detach_locked(&mut inner, waiter);
             Self::remove_locked(&mut inner, waiter);
@@ -657,33 +667,46 @@ impl Handles {
         inner.stepped.clear();
         inner.by_turn.clear();
         inner.by_process.clear();
+        inner.by_session.clear();
         inner.retained.clear();
         std::mem::take(&mut inner.reads)
     }
 
+    /// Release what a waiter holds: its share of retained results, and its
+    /// place under each of its own handles, resolved or not. Its handles are
+    /// those still remaining and those with results, which together are
+    /// every one it attached with.
     fn detach_locked(inner: &mut Inner, waiter: Waiter) {
-        if let Some(waiting) = inner.waiters.get(&waiter) {
-            for (handle, value) in &waiting.results {
-                if let Some(retained) = inner.retained.get_mut(handle)
-                    && Arc::ptr_eq(&retained.value, value)
-                {
-                    retained.waiters -= 1;
-                    if retained.waiters == 0 {
-                        inner.retained.remove(handle);
-                    }
+        let Some(waiting) = inner.waiters.get(&waiter) else {
+            return;
+        };
+        for (handle, value) in &waiting.results {
+            if let Some(retained) = inner.retained.get_mut(handle)
+                && Arc::ptr_eq(&retained.value, value)
+            {
+                retained.waiters -= 1;
+                if retained.waiters == 0 {
+                    inner.retained.remove(handle);
                 }
             }
         }
-        inner
-            .by_turn
-            .values_mut()
-            .for_each(|v| v.retain(|w| *w != waiter));
-        inner.by_turn.retain(|_, v| !v.is_empty());
-        inner
-            .by_process
-            .values_mut()
-            .for_each(|v| v.retain(|w| *w != waiter));
-        inner.by_process.retain(|_, v| !v.is_empty());
+        let handles = waiting.remaining.iter().chain(waiting.results.keys());
+        for handle in handles.filter_map(|text| Handle::parse(text).ok()) {
+            match handle {
+                Handle::Turn { bot, turn } => unlist(&mut inner.by_turn, (bot, turn), waiter),
+                Handle::Process(id) => unlist(&mut inner.by_process, id, waiter),
+            }
+        }
+    }
+}
+
+/// Take `waiter` off the list under `key`, and the list once it is empty.
+fn unlist<K: std::hash::Hash + Eq>(lists: &mut HashMap<K, Vec<Waiter>>, key: K, waiter: Waiter) {
+    if let std::collections::hash_map::Entry::Occupied(mut list) = lists.entry(key) {
+        list.get_mut().retain(|w| *w != waiter);
+        if list.get().is_empty() {
+            list.remove();
+        }
     }
 }
 
@@ -919,6 +942,181 @@ mod tests {
         assert_eq!(result["pending"], json!([]));
         assert!(weak.upgrade().is_none());
         assert!(handles.inner.lock().unwrap().retained.is_empty());
+    }
+
+    /// `n` parked turns, each waiting on a command of its own and on a
+    /// peer's turn.
+    fn parked(n: i64) -> Handles {
+        let handles = Handles::new(mpsc::unbounded_channel().0);
+        let mut inner = handles.inner.lock().unwrap();
+        for turn in 1..=n {
+            let waiter = Waiter::Turn(turn);
+            inner.waiters.insert(
+                waiter,
+                Waiting {
+                    generation: turn as u64,
+                    any: false,
+                    remaining: [format!("proc:{turn}"), format!("turn:Peer/{turn}")].into(),
+                    results: BTreeMap::new(),
+                    completion: Completion::Resume {
+                        bot: format!("b{turn}"),
+                        turn,
+                    },
+                    deadline: None,
+                },
+            );
+            inner.by_process.entry(turn).or_default().push(waiter);
+            let peer = ("Peer".to_owned(), turn);
+            inner.by_turn.entry(peer).or_default().push(waiter);
+        }
+        drop(inner);
+        handles
+    }
+
+    #[test]
+    fn a_waiter_leaving_costs_the_same_however_many_others_wait() {
+        // Each parked turn wakes on its command, then leaves, still
+        // registered under the peer turn it no longer waits for.
+        let wake_all = |n: i64| {
+            let handles = parked(n);
+            let started = std::time::Instant::now();
+            for turn in 1..=n {
+                handles.process_finished(turn, json!({"exit_code":0}));
+                handles.take(turn);
+            }
+            let elapsed = started.elapsed();
+            let inner = handles.inner.lock().unwrap();
+            assert!(inner.waiters.is_empty() && inner.retained.is_empty());
+            assert!(inner.by_turn.is_empty() && inner.by_process.is_empty());
+            elapsed
+        };
+        let n = 8_000;
+        let grew = crate::doubling::outgrows(|twice| wake_all(if twice { 2 * n } else { n }));
+        assert_eq!(grew, None, "{n} waiters, then twice as many");
+    }
+
+    #[tokio::test]
+    async fn a_closing_session_takes_its_own_waits_and_no_one_elses() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-close-wait-test-{}", std::process::id()));
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let handles = parked(8_000);
+        let (output, _worker) = Output::stdout();
+        let request = |session| Completion::Respond {
+            session,
+            output: output.clone(),
+            request: json!(session),
+            reader: store.reader(),
+        };
+        // Two sessions wait on the same command, the first twice over.
+        let (first, again, second) = (Waiter::Request(1), Waiter::Request(2), Waiter::Request(3));
+        for (waiter, session) in [(first, 7), (again, 7), (second, 8)] {
+            let handles_ = ["proc:9001".to_owned()];
+            {
+                let mut inner = handles.inner.lock().unwrap();
+                inner.by_process.entry(9001).or_default().push(waiter);
+                inner.by_session.entry(session).or_default().push(waiter);
+                inner.waiters.insert(
+                    waiter,
+                    Waiting {
+                        generation: 0,
+                        any: false,
+                        remaining: handles_.into_iter().collect(),
+                        results: BTreeMap::new(),
+                        completion: request(session),
+                        deadline: None,
+                    },
+                );
+            }
+        }
+        // Closing a session that waits on nothing leaves every waiter.
+        handles.close_session(99);
+        assert_eq!(handles.stats().0, 8_003);
+        handles.close_session(7);
+        {
+            let inner = handles.inner.lock().unwrap();
+            assert_eq!(inner.by_process[&9001], [second]);
+            assert!(!inner.by_session.contains_key(&7));
+            assert_eq!(inner.waiters.len(), 8_001);
+        }
+        // Answered, the other session's request leaves with its listings.
+        handles.process_finished(9001, json!({"exit_code":0}));
+        {
+            let inner = handles.inner.lock().unwrap();
+            assert!(!inner.by_process.contains_key(&9001));
+            assert!(inner.by_session.is_empty());
+            assert_eq!(inner.waiters.len(), 8_000);
+        }
+        // However many turns are parked, closing sessions costs the same.
+        let close_all = |n: i64| {
+            let handles = parked(n);
+            let started = std::time::Instant::now();
+            for session in 0..n as u64 {
+                handles.close_session(session);
+            }
+            started.elapsed()
+        };
+        let grew = crate::doubling::outgrows(|twice| close_all(if twice { 16_000 } else { 8_000 }));
+        assert_eq!(grew, None);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_waiter_attached_again_lets_go_of_what_it_held() {
+        let dir = std::env::temp_dir().join(format!("agent-reattach-test-{}", std::process::id()));
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let handles = Handles::new(mpsc::unbounded_channel().0);
+        {
+            let mut inner = handles.inner.lock().unwrap();
+            let waiter = Waiter::Turn(1);
+            inner.waiters.insert(
+                waiter,
+                Waiting {
+                    generation: 1,
+                    any: false,
+                    remaining: ["proc:1".into(), "proc:2".into()].into(),
+                    results: BTreeMap::new(),
+                    completion: Completion::Resume {
+                        bot: "Bob".into(),
+                        turn: 1,
+                    },
+                    deadline: None,
+                },
+            );
+            for process in [1, 2] {
+                inner.by_process.entry(process).or_default().push(waiter);
+            }
+        }
+        handles.process_finished(1, json!({"exit_code":0}));
+        assert_eq!(handles.stats(), (1, 1));
+        // Parked again on what it has no result for yet: its first wait's
+        // listings and its share of the result it got go.
+        let resume = Completion::Resume {
+            bot: "Bob".into(),
+            turn: 1,
+        };
+        handles
+            .attach(
+                &store,
+                Waiter::Turn(1),
+                &["turn:Ann/5".into()],
+                None,
+                false,
+                resume,
+            )
+            .await;
+        {
+            let inner = handles.inner.lock().unwrap();
+            assert!(inner.by_process.is_empty() && inner.retained.is_empty());
+        }
+        handles.forget(Waiter::Turn(1));
+        {
+            let inner = handles.inner.lock().unwrap();
+            assert!(inner.waiters.is_empty() && inner.by_turn.is_empty());
+        }
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
