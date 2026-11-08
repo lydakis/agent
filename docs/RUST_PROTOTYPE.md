@@ -3692,7 +3692,11 @@ before it went in; it is billed all the same. A stopping daemon drops it,
 as it ends no turn, and the next turn summarizes as before. A daemon whose
 clients are gone stays up until it lands. A summary that cannot be
 planned, under a budget its calls might pass, with the summarizer's pool
-closed, or with no copy to make, is left to the next turn's start.
+closed, with no copy to make, or for a bot whose `max_rounds` leaves no
+rounds for its two calls, is left to the next turn's start. Under a budget,
+the share the summary may spend is held against the bot's caps, not the
+turn's, by every call of the bot's turns until it goes in or comes to
+nothing, so a turn running beside it cannot spend the same room.
 
 The result is recorded in one transaction: the summary, the covered turns'
 user prompts verbatim (each up to 2 KiB, with a 16 KiB budget for text plus

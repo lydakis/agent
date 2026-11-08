@@ -1408,9 +1408,12 @@ impl Turn {
         reply: ContextUsage,
         retry_at: u64,
     ) -> Result<()> {
+        // Its copy's call and its summary's call take two rounds of their
+        // own; a bot allowed fewer summarizes at its next boundary.
         if record.compaction_instructions.is_none()
             || self.stopping.load(Relaxed)
             || now_ms() < retry_at
+            || self.settings().max_rounds() <= 2
         {
             return Ok(());
         }
@@ -1470,7 +1473,7 @@ impl Turn {
             if aheads.contains_key(&self.bot) {
                 return Ok(());
             }
-            let handle = Ahead::new();
+            let handle = Ahead::new(share);
             aheads.insert(self.bot.clone(), handle.clone());
             handle
         };
@@ -1758,6 +1761,18 @@ impl Turn {
     /// task starts none of its own meanwhile.
     fn ahead_pending(&self) -> bool {
         self.ahead.as_ref().is_some_and(|ahead| ahead.pending())
+    }
+
+    /// The share of the bot's budget the summary its last turn started may
+    /// spend, until it is installed or comes to nothing: held against the
+    /// bot's caps, not this turn's, so the two cannot spend the same room.
+    fn ahead_share(&self) -> Option<Spend> {
+        let ahead = self.ahead.as_ref()?;
+        let aheads = self.aheads.lock().unwrap_or_else(|e| e.into_inner());
+        aheads
+            .get(&self.bot)
+            .filter(|held| Arc::ptr_eq(held, ahead))
+            .map(|_| ahead.share)
     }
 
     /// Done with `ahead`: the bot's next turn may start another.
@@ -3208,6 +3223,12 @@ impl Turn {
                 model_rounds += rounds;
                 record.add(share);
             }
+            // So does the share of a summary the bot's last turn started
+            // and this turn has not installed, against the bot's caps.
+            let behind = self.ahead_share();
+            if let Some(share) = behind {
+                hold_for_bot(&mut record, share, true);
+            }
             // The round limit's last call goes with the tools shown but no
             // call allowed, so the turn ends on a reply rather than failing
             // with its work done and unreported; so does the call after one
@@ -3254,6 +3275,9 @@ impl Turn {
             if let Some((rounds, share)) = held {
                 model_rounds -= rounds;
                 record.take_back(share);
+            }
+            if let Some(share) = behind {
+                hold_for_bot(&mut record, share, false);
             }
             // A call that withheld its replayed thinking recorded that on
             // the bot; the context keeps what it sent.
@@ -6235,6 +6259,8 @@ pub type Aheads = Arc<std::sync::Mutex<HashMap<String, Arc<Ahead>>>>;
 /// summary, and starts no summary of its own while it runs.
 pub struct Ahead {
     state: tokio::sync::Mutex<AheadState>,
+    /// The most it may spend, under the bot's budget.
+    share: Spend,
     /// Set once, under `state`, as it lands.
     landed: AtomicBool,
     told: Notify,
@@ -6250,9 +6276,10 @@ struct AheadState {
 }
 
 impl Ahead {
-    fn new() -> Arc<Self> {
+    fn new(share: Spend) -> Arc<Self> {
         Arc::new(Self {
             state: Default::default(),
+            share,
             landed: AtomicBool::new(false),
             told: Notify::new(),
         })
@@ -6303,6 +6330,22 @@ struct Due {
 struct Landed {
     result: Result<Summary>,
     spent: Spent,
+}
+
+/// Hold `share` against the bot's caps in `record`, or give it back: the
+/// turn's own cap moves with it, so the turn's room stays as it was.
+fn hold_for_bot(record: &mut agent_runtime::store::Bot, share: Spend, hold: bool) {
+    let moved = |until: u64, by: u64| match hold {
+        true => until.saturating_add(by),
+        false => until.saturating_sub(by),
+    };
+    match hold {
+        true => record.add(share),
+        false => record.take_back(share),
+    }
+    if let Some(cap) = &mut record.turn_budget {
+        cap.until = moved(cap.until, share.of(cap.counts));
+    }
 }
 
 /// Milliseconds since `started`.

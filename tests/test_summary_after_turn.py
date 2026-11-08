@@ -180,6 +180,40 @@ class SummaryAfterTurnTests(ModelFixture):
         self.turn(client, 3, 'small')
         self.assertEqual(late(), [])
 
+    def test_a_summary_on_its_way_holds_its_share_of_the_bot_budget(self):
+        # A budget far past the summary's share lets it start as the turn
+        # ends; cut below that share while it runs (budgets are fixed at
+        # creation, so the test edits the store), the budget leaves the
+        # next turn nothing the summary may still spend, so that turn's
+        # first call is its last.
+        self.model.call_script = [('echo', {'text': 'a'})] * 3
+        self.model.timeline, self.model.summary_delay = [], 2.0
+        client = self.client(tools='echo', settings={**SETTINGS, 'max_output_tokens': 64})
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), tools=['echo'],
+                                               compaction_instructions='Summarize.', budget_tokens=10**9))
+        self.past_threshold(client)
+        self.wait_for(lambda: getattr(self.model, 'summarizing', False))
+        with closing(sqlite3.connect(self.path / 'state.sqlite')) as db, db:
+            db.execute("UPDATE bots SET budget_tokens=10000 WHERE name='Bob'")
+        drain(self.model)
+        ended = self.turn(client, 2, 'script')
+        self.assertEqual(ended['data'].get('limit'), 'budget')
+        work = [r for r in drain(self.model) if not is_summary(r)]
+        self.assertEqual(len(work), 1)
+        self.assertEqual(work[0]['tool_choice'], 'none')
+        landed = client.summarized('Bob', timeout=10)
+        self.assertEqual(landed['event'], 'compacted')
+
+    def test_a_bot_held_to_fewer_rounds_than_a_summary_takes_summarizes_at_its_next_turn(self):
+        client = self.start(delay=0, max_rounds=2)
+        self.past_threshold(client)
+        time.sleep(.5)
+        self.assertEqual(self.summaries(), [])
+        self.turn(client, 2, 'small')
+        compacted = self.compacted(client)
+        self.assertTrue(compacted)
+        self.assertNotIn('after_turn', compacted[0]['data']['request'])
+
     def events(self, client):
         events, after = [], 0
         while page := client.request('events', bot='Bob', after=after, limit=256)['result']['events']:
