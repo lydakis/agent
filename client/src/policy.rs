@@ -1304,26 +1304,36 @@ fn skill_text(
     })
 }
 
-/// Append `path` to `text` under `header`, unless it is empty. Reads no
-/// more than what could still fit, so a file past the budget fails on its
-/// size, not after being copied into memory.
-fn append(text: &mut String, path: PathBuf, header: &str) -> Result<Option<Source>, Failure> {
-    let room = MAX_INSTRUCTIONS.saturating_sub(text.len() + header.len());
+/// Append `path` to `text` under `header`, unless it is empty, leaving
+/// `reserve` bytes of the budget for what must follow. Reads no more than
+/// what could still fit, so a file past the budget fails on its size, not
+/// after being copied into memory.
+fn append(
+    text: &mut String,
+    path: PathBuf,
+    header: &str,
+    reserve: usize,
+) -> Result<Option<Source>, Failure> {
+    let room = MAX_INSTRUCTIONS.saturating_sub(text.len() + header.len() + reserve);
     let Some(body) = read_bounded(&path, room)? else {
         let size = std::fs::metadata(&path).map_or(room + 1, |m| m.len() as usize);
         return Err(Failure::TooLong {
             path,
-            total: text.len() + header.len() + size,
+            total: text.len() + header.len() + size + reserve,
         });
     };
-    push(text, path, header, &body)
+    push(text, path, header, &body, reserve)
 }
 
 /// Append a memory index's head ([`crate::memory::head`]): an index holds
 /// every fact, and a new bot starts with the most needed and searches for
 /// the rest. Reads at most [`MEMORY_READ`] of it, enough for thousands of
 /// facts; past that, only those count toward the facts it leaves out.
-fn append_memory(text: &mut String, path: PathBuf) -> Result<Option<Source>, Failure> {
+fn append_memory(
+    text: &mut String,
+    path: PathBuf,
+    reserve: usize,
+) -> Result<Option<Source>, Failure> {
     let mut bytes = read_head(&path, MEMORY_READ)?;
     if bytes.len() > MEMORY_READ {
         let end = bytes
@@ -1336,29 +1346,30 @@ fn append_memory(text: &mut String, path: PathBuf) -> Result<Option<Source>, Fai
         path: path.clone(),
         reason: e.utf8_error().to_string(),
     })?;
-    push(text, path, "\n\n", &crate::memory::head(&index))
+    push(text, path, "\n\n", &crate::memory::head(&index), reserve)
 }
 
 /// How much of a memory index composing reads.
 const MEMORY_READ: usize = 4 * 1024 * 1024;
 
 /// Push `body` read from `path` under `header`, unless it is empty, or fail
-/// when it does not fit.
+/// when it does not fit beside `reserve`.
 fn push(
     text: &mut String,
     path: PathBuf,
     header: &str,
     body: &str,
+    reserve: usize,
 ) -> Result<Option<Source>, Failure> {
     let body = body.trim();
     if body.is_empty() {
         return Ok(None);
     }
     let block = format!("{header}{body}");
-    if text.len() + block.len() > MAX_INSTRUCTIONS {
+    if text.len() + block.len() + reserve > MAX_INSTRUCTIONS {
         return Err(Failure::TooLong {
             path,
-            total: text.len() + block.len(),
+            total: text.len() + block.len() + reserve,
         });
     }
     text.push_str(&block);
@@ -1457,9 +1468,18 @@ fn compose(
 ) -> Result<Instructions, Failure> {
     let mut text = preamble();
     let mut sources = Vec::new();
+    // The role is no file to leave out: when files are, they leave it its
+    // room, so one that fits only without the role is the one left out.
+    let role_block = role
+        .filter(|r| !r.body.is_empty())
+        .map(|role| format!("{ROLE_HEADING}{}\n\n{}", role.name, with_cli(&role.body)));
+    let reserve = match leave {
+        Leave::Refuse => 0,
+        Leave::Out(_) => role_block.as_ref().map_or(0, String::len),
+    };
     for path in agents_files_in(workspace, home().as_deref(), &mut leave)? {
         let header = agents_header(&path);
-        match append(&mut text, path, &header) {
+        match append(&mut text, path, &header, reserve) {
             Ok(source) => sources.extend(source),
             Err(failure) => leave.out(failure)?,
         }
@@ -1476,15 +1496,16 @@ fn compose(
     for path in memory {
         let appended = match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => not_dangling(path),
-            _ => append_memory(&mut after, path.clone()).map(|index| indexes.extend(index)),
+            _ => {
+                append_memory(&mut after, path.clone(), reserve).map(|index| indexes.extend(index))
+            }
         };
         if let Err(failure) = appended {
             leave.out(failure)?;
         }
     }
     // The role comes last: the most specific text a bot is given.
-    if let Some(role) = role.filter(|r| !r.body.is_empty()) {
-        let block = format!("{ROLE_HEADING}{}\n\n{}", role.name, with_cli(&role.body));
+    if let (Some(role), Some(block)) = (role, role_block) {
         if after.len() + block.len() > MAX_INSTRUCTIONS {
             return Err(Failure::TooLong {
                 path: role
@@ -2565,6 +2586,29 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert!(matches!(leave, Leave::Out(left) if left.len() == 1));
         let _ = std::fs::remove_dir_all(&other);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_that_fits_only_without_the_role_is_the_one_left_out() {
+        let root = temp("leaving-room");
+        let role = Profile::parse("lead", None, &"You lead. ".repeat(100));
+        let room =
+            MAX_INSTRUCTIONS - preamble().len() - agents_header(&root.join("AGENTS.md")).len();
+        std::fs::write(root.join("AGENTS.md"), "x".repeat(room - 10)).unwrap();
+        // It fits alone; with the role, a caller that refuses fails on the role.
+        assert!(instructions(&root, None, &[]).is_ok());
+        assert_eq!(
+            instructions(&root, Some(&role), &[]).unwrap_err().code(),
+            "instructions_limit"
+        );
+        let composed = instructions_leaving_out(&root, Some(&role), &[]).unwrap();
+        assert!(matches!(
+            &composed.left_out[..],
+            [Failure::TooLong { path, .. }] if *path == root.join("AGENTS.md")
+        ));
+        assert!(composed.text.contains("# Role: lead"));
+        assert!(composed.text.len() <= MAX_INSTRUCTIONS);
         let _ = std::fs::remove_dir_all(&root);
     }
 
