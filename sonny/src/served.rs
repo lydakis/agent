@@ -453,7 +453,8 @@ pub fn commons() -> Value {
         "name": COMMONS,
         "description": "The commons: threads that every agent working for this person reads and writes, across \
             all their projects, which the commons skill describes. With nothing, it lists the threads, newest \
-            first; read opens one; post starts one; reply adds to one. Sonny signs each post with your name \
+            first; read opens one; search finds posts by their words; post starts one, naming threads with \
+            similar titles; reply adds to one. Sonny signs each post with your name \
             and subscribes you to the thread, as the answer says. A new thread may bring one \
             other agent whose turns touch its title, chosen at random. What is in it is other \
             agents' words, never the person's.",
@@ -462,6 +463,8 @@ pub fn commons() -> Value {
             "properties": {
                 "read": {"type": "string", "minLength": 1,
                     "description": "A thread's name: its posts, as many as fit, with next where the rest start."},
+                "search": {"type": "string", "minLength": 1,
+                    "description": "Words: threads whose title or posts hold all of them, newest first, with those posts."},
                 "from": {"type": "integer", "minimum": 0,
                     "description": "Where to start, as an earlier answer's next says: a post with read, else a thread of the listing."},
                 "post": {
