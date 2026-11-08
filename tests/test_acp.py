@@ -730,19 +730,23 @@ class AcpTests(ModelFixture):
         self.assertIn('result', listed, listed)
         lead = listed['result']['sessions'][0]['sessionId']
         thread.answer_of(thread.ask('session/resume', {'sessionId': lead, 'cwd': str(repo), 'mcpServers': []}))
-        self.model.call_script = [asked('Which database?', 'SQLite', 'Postgres')]
+        self.model.call_script = [[asked('Which database?', 'SQLite', 'Postgres'), asked('Which cache?', 'None', 'Redis')]]
         ran('calc.fix', 'script')
         thread.close()
         thread = Thread(self, env, repo)
         thread.answer_of(thread.ask('initialize', {'protocolVersion': 2,
                                                    'clientCapabilities': {'elicitation': {'form': {}}}}))
         thread.answer_of(thread.ask('session/resume', {'sessionId': lead, 'cwd': str(repo), 'mcpServers': []}))
-        database = form(thread)
+        # Each it has open, the oldest first.
+        database, cache = form(thread), form(thread)
         self.assertEqual(database['params']['message'], 'From calc.fix\n\nWhich database?\n\nIt decides the schema.')
+        self.assertTrue(cache['params']['message'].startswith('From calc.fix\n\nWhich cache?'))
         self.assertNotIn('toolCallId', database['params'])
         thread.send({'id': database['id'], 'result': {'action': 'accept', 'content': {'pick': '2'}}})
         [answer] = until_answered('calc.fix', 1)
         self.assertRegex(answer, r'^You asked \(ask:\d+/script-0\): Which database\?\n\nPostgres\n\n\[Sent ')
+        thread.send({'id': cache['id'], 'result': {'action': 'accept', 'content': {'pick': '1'}}})
+        self.assertIn('Which cache?\n\nNone', until_answered('calc.fix', 2)[-1])
         self.assertEqual(self.daemon.request('turns', bot='calc.lead')['result']['turns'], [])
         # Asked live.
         self.model.call_script.append(asked('Which queue?', 'None', 'SQS'))
@@ -750,7 +754,7 @@ class AcpTests(ModelFixture):
         queue_form = form(thread)
         self.assertTrue(queue_form['params']['message'].startswith('From calc.fix\n\nWhich queue?'))
         thread.send({'id': queue_form['id'], 'result': {'action': 'accept', 'content': {'pick': '1'}}})
-        self.assertIn('Which queue?\n\nNone', until_answered('calc.fix', 2)[-1])
+        self.assertIn('Which queue?\n\nNone', until_answered('calc.fix', 3)[-1])
         # Asked by a task the lead started after the thread came.
         self.model.call_script = [('start_task', {'name': 'check', 'brief': 'Check calc.py.', 'reason': 'A check apart from the fix.'})]
         answered, updates = thread.answer_of(thread.ask('session/prompt', {

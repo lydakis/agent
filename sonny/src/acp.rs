@@ -1869,18 +1869,7 @@ impl Session {
     /// newest first, only to the person's own last words: a question
     /// before those is set aside, as Sonny's window sets it aside.
     async fn questions(&self, agent: &Arc<Agent>, client: &Arc<Client>, bot: &str) {
-        let (mut asked, mut open) = (asks::Asked::default(), Vec::new());
-        let _ = crate::said::walk(client, bot, 0, |at, entry| {
-            open.extend(
-                (asked.entry(at, entry).into_iter())
-                    .filter(|(ask, state)| *state == asks::State::Open && !ask.options.is_empty())
-                    .map(|(ask, _)| ask),
-            );
-            asked.moved_on()
-        })
-        .await;
-        // The oldest first, as they were asked.
-        for ask in open.into_iter().rev() {
+        for ask in open_asks(client, bot).await {
             let bot_id = {
                 let mut state = self.state.lock().await;
                 if !state.asked.insert(ask.id.clone()) {
@@ -1919,7 +1908,11 @@ impl Session {
             .await
             .map_err(|e| e.to_string())?;
         let since = now_ms();
-        let follow = |bot: &str| json!({"bot": bot, "since_ms": since, "kinds": ["tool_started", "tool_completed"]});
+        // Only the calls, and for the lead also its turns' ends.
+        let follow = |bot: &str| {
+            json!({"bot": bot, "since_ms": since,
+                "kinds": ["tool_started", "tool_completed", "turn_finished"]})
+        };
         client
             .request("follow", follow(lead))
             .await
@@ -1933,10 +1926,7 @@ impl Session {
             if let Some(bot) = task["name"].as_str()
                 && watched.insert(bot.to_owned())
             {
-                client
-                    .request("follow", follow(bot))
-                    .await
-                    .map_err(|e| e.to_string())?;
+                (client.request("follow", follow(bot)).await).map_err(|e| e.to_string())?;
             }
         }
         for task in tasks.iter().filter(|task| lately(task, since)) {
@@ -1948,14 +1938,16 @@ impl Session {
             if event["event"] == "follow_lagged" {
                 break;
             }
-            let (Some(bot), Some(call)) =
-                (event["bot"].as_str(), event["data"]["call_id"].as_str())
-            else {
+            let Some(bot) = event["bot"].as_str() else {
                 continue;
             };
             let data = &event["data"];
-            let key = (bot.to_owned(), call.to_owned());
-            match event["event"].as_str() {
+            let key = (
+                bot.to_owned(),
+                data["call_id"].as_str().unwrap_or("").to_owned(),
+            );
+            let done = data["failed"] != true && data["denied"] != true;
+            let new_tasks = match event["event"].as_str() {
                 Some("tool_started") => {
                     let name = data["name"].as_str();
                     if (bot == lead && name == Some(crate::served::START))
@@ -1963,71 +1955,81 @@ impl Session {
                     {
                         started.insert(key);
                     }
+                    false
                 }
-                Some("tool_completed") if started.remove(&key) => {
-                    if data["failed"] == true || data["denied"] == true {
-                        continue;
-                    }
-                    // A task started: followed from now on.
-                    if bot == lead {
-                        for task in tasks_of(&client, lead_id).await? {
-                            if let Some(bot) = task["name"].as_str()
-                                && watched.insert(bot.to_owned())
-                            {
-                                client
-                                    .request("follow", follow(bot))
-                                    .await
-                                    .map_err(|e| e.to_string())?;
-                            }
-                        }
-                        continue;
-                    }
-                    let task = client
-                        .request("inspect", json!({"bot": bot}))
-                        .await
+                // A task started: followed from now on.
+                Some("tool_completed") if bot == lead => started.remove(&key) && done,
+                // One whose start came before this followed: its lead's
+                // turn ends after it.
+                Some("turn_finished") => bot == lead,
+                Some("tool_completed") if started.remove(&key) && done => {
+                    let task = (client.request("inspect", json!({"bot": bot})).await)
                         .map_err(|e| e.to_string())?;
                     self.task_asked(agent, &client, &store, &task).await;
+                    false
                 }
-                _ => {}
+                _ => false,
+            };
+            if new_tasks {
+                for task in tasks_of(&client, lead_id).await? {
+                    if let Some(bot) = task["name"].as_str()
+                        && watched.insert(bot.to_owned())
+                    {
+                        (client.request("follow", follow(bot)).await).map_err(|e| e.to_string())?;
+                        // Its question may have come before it was followed.
+                        self.task_asked(agent, &client, &store, &task).await;
+                    }
+                }
             }
         }
         client.close().await;
         Ok(())
     }
 
-    /// The question `task`, as `bots` or `inspect` gives it, has open, put
-    /// to the person once.
+    /// The questions `task`, as `bots` or `inspect` gives it, has open,
+    /// each put to the person once.
     async fn task_asked(&self, agent: &Arc<Agent>, client: &Client, store: &Path, task: &Value) {
         let (Some(bot), Some(bot_id)) = (task["name"].as_str(), task["bot_id"].as_i64()) else {
             return;
         };
-        let running = task["running_turn"].is_i64();
-        let Some(seen) = crate::needs::scan(client, bot, None).await else {
-            return;
-        };
-        let Some(ask) = seen
-            .open(store, bot, running)
-            .filter(|ask| !ask.options.is_empty())
-        else {
-            return;
-        };
-        if !self
-            .state
-            .lock()
-            .await
-            .asked
-            .insert(format!("{bot} {}", ask.id))
-        {
+        // One its lead marked done, with no turn since, has nothing open.
+        let running = task["running_turn"].as_i64();
+        let newest = running.or(task["last"]["turn"].as_i64());
+        if crate::resolved::holds(crate::resolved::read(store, bot), newest, running.is_some()) {
             return;
         }
-        let asked = (agent.out).asking("elicitation/create", task_form(&self.id, bot, &ask));
-        let (agent, session, task) = (
-            agent.clone(),
-            self.id.clone(),
-            (bot.to_owned(), Some(bot_id)),
-        );
-        tokio::spawn(async move { elicit(asked, &agent, &session, task, &ask).await });
+        for ask in open_asks(client, bot).await {
+            if !(self.state.lock().await.asked).insert(format!("{bot} {}", ask.id)) {
+                continue;
+            }
+            let asked = (agent.out).asking("elicitation/create", task_form(&self.id, bot, &ask));
+            let (agent, session, task) = (
+                agent.clone(),
+                self.id.clone(),
+                (bot.to_owned(), Some(bot_id)),
+            );
+            tokio::spawn(async move { elicit(asked, &agent, &session, task, &ask).await });
+        }
     }
+}
+
+/// The questions `bot` has open with options to pick from, the oldest
+/// first, as they were asked. Read back from its history, newest first,
+/// only to the person's own last words: a question before those is set
+/// aside, as Sonny's window sets it aside.
+async fn open_asks(client: &Client, bot: &str) -> Vec<asks::Ask> {
+    let (mut asked, mut open) = (asks::Asked::default(), Vec::new());
+    let _ = crate::said::walk(client, bot, 0, |at, entry| {
+        open.extend(
+            (asked.entry(at, entry).into_iter())
+                .filter(|(ask, state)| *state == asks::State::Open && !ask.options.is_empty())
+                .map(|(ask, _)| ask),
+        );
+        asked.moved_on()
+    })
+    .await;
+    open.reverse();
+    open
 }
 
 /// How far back a task's question is looked for when a thread comes:
