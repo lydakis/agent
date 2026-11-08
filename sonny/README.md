@@ -682,6 +682,18 @@ way `/react` does, and each note in the margin has its own `↩`.
 
 ![The message quoted into the composer](../docs/sonny/reply-quoted.png)
 
+The message under the mouse also says when it was written, muted, at
+its top right edge, the right end of the empty row over it:
+`Sat 7 Nov 09:13`, the
+year too when it is not this one, on the 12-hour clock where your
+locale's time format (`LC_TIME`) reads that way, `Sat 7 Nov 9:13 AM`.
+It is the time the daemon wrote the message into the history, so a
+message you queued is dated when its turn started. Nothing shows at
+rest, no line is made wider for it, and where the row over the words
+has something on it, or is off the screen, no time shows.
+
+![When a message was written, over it under the mouse](../docs/sonny/message-time.png)
+
 `/` lists the commands:
 
 - `/side [QUESTION]` opens a side chat with a copy of the agent in this
