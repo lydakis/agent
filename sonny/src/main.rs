@@ -6176,7 +6176,7 @@ impl App {
             self.boost = None;
         }
         if let Some(workspace) = record["workspace"].as_str() {
-            self.workspace = workspace.to_owned();
+            self.set_workspace(workspace);
         }
         self.speed = speed(record);
         self.mode = approvals::mode(record);
@@ -8809,11 +8809,21 @@ impl App {
         self.staged.retain(|(turn, _)| waiting.contains(turn));
     }
 
+    /// The folder the agent works in, where its pictures' paths start:
+    /// staged rows drawn from the old one are drawn again.
+    fn set_workspace(&mut self, workspace: &str) {
+        if self.workspace != workspace {
+            self.workspace = workspace.to_owned();
+            self.staged_drawn.get_mut().clear();
+        }
+    }
+
     /// What was sent and has not landed yet, dim, the way it will read
     /// once it does: a blank row above each, as in the history, and one
     /// under the last, so the status row does not touch it.
     fn staged_rows(&self, width: usize) -> Vec<Line<'static>> {
         let mut drawn = self.staged_drawn.borrow_mut();
+        let folder = std::path::Path::new(&self.workspace);
         // Kept for those still waiting alone, at the width drawn now.
         drawn.retain(|((turn, at, _), _)| {
             *at == width && self.staged.iter().any(|(staged, _)| staged == turn)
@@ -8836,7 +8846,7 @@ impl App {
                     .find(|(at, _)| *at == key)
                     .map(|(_, rows)| rows.clone())
                     .unwrap_or_else(|| {
-                        let rows = staged_body(prompt, width, waits);
+                        let rows = staged_body(prompt, width, waits, folder);
                         drawn.push((key, rows.clone()));
                         rows
                     });
@@ -9127,7 +9137,7 @@ impl App {
                 // What this turn runs on and in: the bot may have moved, or
                 // a client chosen another model for it.
                 if let Some(workspace) = data["workspace"].as_str() {
-                    self.workspace = workspace.to_owned();
+                    self.set_workspace(workspace);
                 }
                 if let Some(model) = data["model"].as_str() {
                     self.model = model.to_owned();
@@ -15561,10 +15571,15 @@ fn short(bot: &str, project: &str, lead: &str) -> String {
 type StagedDrawn = ((i64, usize, Option<char>), Vec<Line<'static>>);
 
 /// A message sent and not landed, dim, drawn as it will read once it
-/// does: an answer under the question it answers, a command by name,
+/// does, its pictures found in `folder` as the landed one's are: an answer under the question it answers, a command by name,
 /// words as every surface draws Markdown, after `›` and what it waits
 /// for.
-fn staged_body(prompt: &str, width: usize, waits: Option<char>) -> Vec<Line<'static>> {
+fn staged_body(
+    prompt: &str,
+    width: usize,
+    waits: Option<char>,
+    folder: &std::path::Path,
+) -> Vec<Line<'static>> {
     if let Some(ran) = user_shell::read(prompt) {
         return user_shell::header(&ran.command, width, true);
     }
@@ -15577,7 +15592,13 @@ fn staged_body(prompt: &str, width: usize, waits: Option<char>) -> Vec<Line<'sta
         None => (None, prompt),
     };
     let leads = (Line::from(Span::raw(first)), Line::from(rest));
-    let words = transcript::markdown(&mut transcript::Markdown::default(), prompt, width, leads);
+    // Its pictures' paths start where the landed message's do.
+    let words = transcript::markdown(
+        &mut transcript::Markdown::in_folder(folder),
+        prompt,
+        width,
+        leads,
+    );
     asked
         .into_iter()
         .chain(words.into_iter().map(|row| row.dim()))
@@ -18673,6 +18694,25 @@ mod tests {
         // One alone over it is still kept: the daemon says if it is too much.
         hold(&mut unsent, "y".repeat(UNSENT_BYTES * 2));
         assert_eq!(unsent.len(), 1);
+    }
+
+    #[test]
+    fn a_staged_message_finds_its_pictures_where_the_agent_works() {
+        let dir = std::env::temp_dir().join(format!("sonny-staged-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shot.png"), b"not drawn in tests").unwrap();
+        let shown = |folder: &std::path::Path| {
+            let rows = staged_body("![A shot](shot.png)", 80, None, folder);
+            rows.iter()
+                .map(|row| row.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Found there, it keeps its path, as the landed message does.
+        assert!(shown(&dir).contains("A shot (shot.png)"), "{}", shown(&dir));
+        let elsewhere = dir.join("elsewhere");
+        assert!(!shown(&elsewhere).contains("(shot.png)"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

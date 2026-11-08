@@ -1367,14 +1367,24 @@ pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<
 /// was, behind a bar, its shape without its colors, so it never
 /// outweighs the words that quote it; at most `cap` rows of each, the
 /// rest counted. Every row starts two columns in.
+/// A line that opens or closes a fenced code block.
+fn fence(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("```") || line.starts_with("~~~")
+}
+
 fn quote_rows(text: &str, width: usize, cap: Option<usize>) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let mut lines = text.lines().peekable();
     while let Some(line) = lines.next() {
         let Some(quoted) = quote_line(line) else {
-            // Its own words, as every surface draws Markdown.
+            // Its own words, as every surface draws Markdown. A `>` inside
+            // a fence is code (a shell's redirect), not a quote: the run
+            // goes on to the fence's end, so one reading draws it whole.
             let mut words = line.to_string();
-            while let Some(line) = lines.next_if(|line| quote_line(line).is_none()) {
+            let mut fenced = fence(line);
+            while let Some(line) = lines.next_if(|line| fenced || quote_line(line).is_none()) {
+                fenced ^= fence(line);
                 words.push('\n');
                 words.push_str(line);
             }
@@ -3458,6 +3468,15 @@ mod tests {
             "{shown:?}"
         );
         assert!(shown.iter().any(|row| row == "  - two"), "{shown:?}");
+    }
+
+    #[test]
+    fn a_redirect_in_a_relayed_fence_is_code_not_a_quote() {
+        let said = "Ran:\n```sh\necho hi\n> out.txt\n```\nThen **done**.";
+        let shown = text(&relayed(said, Some("shop.cart"), true, 80));
+        // The fence closes where it does: the words after it are prose.
+        assert!(shown.iter().any(|row| row == "  Then done."), "{shown:?}");
+        assert!(!shown.iter().any(|row| row.contains('▌')), "{shown:?}");
     }
 
     #[test]
