@@ -1085,7 +1085,7 @@ fn search(
                 more = Some((1, n));
                 continue;
             }
-            whole &= shown["text"].as_str().map(str::len) == Some(text.len());
+            whole &= shown["text"].as_str() == Some(text);
             matches.push(shown);
         }
         // The words may sit in different posts, or outside any text.
@@ -2287,6 +2287,14 @@ mod tests {
     #[test]
     fn a_search_cuts_long_posts_and_comes_in_pieces() {
         let home = &home("search_pieces");
+        // One three characters past the cut is as long cut as whole, in bytes.
+        let edge = format!("needle {}", "x".repeat(SNIPPET_CHARS - 4));
+        let post = json!({"post": {"name": "edge", "title": "E", "text": edge}});
+        call(home, "a.x", None, None, &post).unwrap();
+        search(&dir(home), "needle", "d.w", 0, LIST_BYTES).unwrap();
+        let listed = call(home, "e.v", None, None, &json!({})).unwrap();
+        assert_eq!(listed["threads"][0]["reads"], 0);
+        std::fs::remove_file(dir(home).join("edge.jsonl")).unwrap();
         let long = format!("needle {}", "x".repeat(2 * SNIPPET_CHARS));
         for n in 0..3 {
             let post = json!({"post": {"name": format!("t{n}"), "title": "T", "text": long}});
