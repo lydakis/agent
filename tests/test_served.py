@@ -605,7 +605,11 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
 
         post = {'name': 'fake-home', 'title': 'Live tests want a fake HOME', 'text': 'For both binaries.'}
         started = turn('calc.a', {'post': post})
-        self.assertEqual((started['posts'], started['subscription']), (1, 'commons.fake-home'), started)
+        self.assertEqual((started['posts'], started['subscription']['name']), (1, 'commons.fake-home'), started)
+        # The answer says how the thread's posts will reach it, and how to change that.
+        self.assertEqual(started['subscription']['digest'], '0', started)
+        self.assertIn('as they come, the commons source\'s digest', started['subscription']['about'])
+        self.assertIn('subscriptions tool', started['subscription']['about'])
         # Posting subscribes the poster to the thread.
         subscribed = json.loads((self.path / 'state.sqlite.lookout/calc.a.json').read_text())
         # Held by this bot, not one that takes its name later.
@@ -613,8 +617,9 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         self.assertEqual(subscribed['subscriptions'],
                          [{'name': 'commons.fake-home', 'sources': ['commons:fake-home'], 'bot_id': calc_a}])
         replied = turn('shop.b', {'reply': {'thread': 'fake-home', 'text': 'Confirmed here too.'}})
-        self.assertEqual((replied['posts'], replied['told'], replied['subscription']),
-                         (2, [], 'commons.fake-home'), replied)
+        self.assertEqual((replied['posts'], replied['subscription']['name']), (2, 'commons.fake-home'), replied)
+        # A reply wakes no one itself: subscriptions carry it.
+        self.assertNotIn('told', replied)
         thread = (self.path / '.agents/commons/fake-home.jsonl').read_text().splitlines()
         self.assertEqual([json.loads(line)['by'] for line in thread], ['calc.a', 'shop.b'])
         # The lookout tells calc.a of the reply, and shop.b nothing of its own.
@@ -626,6 +631,10 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
             self.assertFalse(prompts and prompts[0]['text'].startswith('From your sources: '), prompts)
         listed = turn('shop.b', {})
         self.assertEqual([t['thread'] for t in listed['threads']], ['fake-home'])
+        # Search finds it by its words, case aside, with the posts that hold them.
+        found = turn('shop.b', {'search': 'confirmed HERE'})
+        self.assertEqual([(t['thread'], [m['by'] for m in t['matches']]) for t in found['threads']],
+                         [('fake-home', ['shop.b'])], found)
 
     def test_a_new_thread_invites_an_agent_whose_turns_touch_it(self):
         for bot in ('calc.a', 'shop.b', 'mail.c'):
@@ -648,12 +657,12 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         prompts = self.daemon.request('prompts', bot='shop.b', turn=turns[-1]['turn'])['result']['prompts']
         self.assertEqual(prompts[0]['text'],
                          '[calc.a started the commons thread stalls, "Checkpoint stalls under load", '
-                         'which your turns touch on. The invite pays for this turn, and, if yours is among '
-                         'the first 3 replies its invites bring, for 1.0M tokens in the thread: while any are '
-                         'left, a reply there starts your turn.]')
-        # The invite's tokens are Sonny's allowance, not a daemon cap: its
-        # turn runs to its own end.
-        self.assertIsNone(turns[-1]['budget_tokens'])
+                         'which your turns touch on. The invite pays for this turn, up to 1.0M tokens of work. '
+                         'Posting there subscribes you to its later posts.]')
+        # The invite's tokens are its turn's budget, counted as work: the
+        # one turn the commons starts.
+        self.assertEqual((turns[-1]['budget_tokens'], turns[-1].get('budget_counts')), (1_000_000, 'work'),
+                         turns[-1])
         listed = json.loads(self.call('calc.a', 'commons', {}))
         self.assertEqual(listed['invites'], {'today': 1, 'a_day': 3, 'reach': 3, 'answered': 0, 'this_week': 1,
                                              'agents': 3})
@@ -667,14 +676,13 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         self.assertEqual(listed['invites'], {'today': 1, 'a_day': 4, 'reach': 3, 'answered': 1, 'this_week': 1,
                                              'agents': 3})
         # mail.c's turn ran the script from its start, so it replied in the
-        # thread too: that wakes the invited shop.b while its invite has
-        # tokens left, its turn running to its own end.
-        deadline = time.monotonic() + 5
-        while not (woken := [t for t in self.daemon.request('turns', bot='shop.b')['result']['turns']
-                             if t['request_id'].endswith('.woken')]):
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(.05)
-        self.assertIsNone(woken[0]['budget_tokens'], woken)
+        # thread too: the invited shop.b, which replied, hears of it through
+        # its subscription alone, and the reply starts no turn of its own.
+        thread = (self.path / '.agents/commons/stalls.jsonl').read_text().splitlines()
+        self.assertIn('mail.c', [json.loads(line)['by'] for line in thread])
+        commons = [t['request_id'] for t in self.daemon.request('turns', bot='shop.b')['result']['turns']
+                   if t['request_id'].startswith('commons.')]
+        self.assertEqual(commons, ['commons.invite.stalls'])
 
     def test_a_lead_made_for_a_subfolder_reads_its_own_memory_and_follows_its_folder(self):
         ws = self.path / 'ws'

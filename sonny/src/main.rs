@@ -140,6 +140,10 @@ use std::{
 use transcript::Markdown;
 use unicode_width::UnicodeWidthStr;
 
+/// The mark by a waiting message's arrow: queued for the turn's end.
+const QUEUED: char = '⋯';
+/// The mark by a waiting steer's arrow: it goes into the turn under way.
+const STEERING: char = '↪';
 /// Rows kept at the bottom: the reply's unfinished line, the status, a
 /// blank row, the composer between a row of its band above and below, and
 /// the footer.
@@ -204,9 +208,10 @@ fn set_measure(text_width: u64) -> bool {
 }
 
 /// The columns the conversation keeps beside the pane in a window
-/// `window` wide, its gutter with them: its measure where it has one;
-/// half the window when it fills the window (`text_width = 0`), so an
-/// open pane and the conversation share it evenly.
+/// `window` wide, its gutters with them: its measure where it has one;
+/// half the window, past its gutters, when it fills the window
+/// (`text_width = 0`), so an open pane and the conversation share it
+/// evenly.
 fn kept(window: u16) -> u16 {
     kept_at(window, measure())
 }
@@ -214,8 +219,8 @@ fn kept(window: u16) -> u16 {
 /// [`kept`] at `measure`.
 fn kept_at(window: u16, measure: usize) -> u16 {
     match measure {
-        WHOLE => window / 2,
-        measure => measure as u16 + GUTTER,
+        WHOLE => window - window.saturating_sub(2 * GUTTER) / 2 - 1,
+        measure => measure as u16 + 2 * GUTTER,
     }
 }
 
@@ -228,7 +233,10 @@ fn measure_of(text_width: u64) -> usize {
 }
 
 /// The blank columns between the conversation and the line beside it,
-/// matched on the pane's side, as the conversation's own rows open.
+/// matched on the pane's side, as the conversation's own rows open; and
+/// between the conversation and the window's edges, so it sits as far in
+/// from the left edge as from the line or the right edge, as the margin's
+/// text does (#742).
 const GUTTER: u16 = 2;
 /// How long a side chat's copy stays once idle.
 /// What follows a guess at the next message in the composer.
@@ -336,6 +344,8 @@ fn usage() -> String {
      sonny sky draws every agent on the daemon lighting up as they talk, as /sky does,\n\
      on its own in the whole terminal; --center NAME puts an agent in the middle, and\n\
      --replay [WHEN] plays the past back from WHEN: 2h, 30m or 1d ago, or 02:10 (an hour ago).\n\
+     sonny where [AGENT] prints the multiplexer and its workspace or session that AGENT's\n\
+     run_in_pane and show_agent calls act in now (AGENT is $AGENT_BOT in an agent's shell).\n\
      sonny lookout watches every lead on the daemon, tells it what happens in its tasks\n\
      and answers its agents' calls of Sonny's tools; Sonny starts one.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
@@ -552,14 +562,7 @@ async fn read_status(
     let store = agent_client::socket::canonical_store(options_store)
         .unwrap_or_else(|_| options_store.to_path_buf());
     // Each source's icon, as the settings give it now.
-    let icons: HashMap<String, String> = agent_client::config::load()
-        .map(|config| {
-            (config.sonny.sources.into_iter())
-                .chain([config.sonny.commons_source])
-                .filter_map(|source| Some((source.name, source.icon?)))
-                .collect()
-        })
-        .unwrap_or_default();
+    let icons = background::source_icons();
     let mut rows = Vec::new();
     // Each lead's project file read once a refresh; a task's profile
     // is the one noted when it started.
@@ -919,6 +922,14 @@ async fn agents_project(bot: &str) -> Result<(PathBuf, String, Vec<String>), Str
     let socket = std::env::var_os("AGENT_SOCKET")
         .map(PathBuf::from)
         .ok_or("AGENT_SOCKET is not set")?;
+    agents_project_at(&socket, bot).await
+}
+
+/// [`agents_project`] on the daemon at `socket`.
+async fn agents_project_at(
+    socket: &std::path::Path,
+    bot: &str,
+) -> Result<(PathBuf, String, Vec<String>), String> {
     let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
     let client = Client::connect(&socket).await.map_err(|e| e.to_string())?.0;
     let project = project_of(&client, bot).await;
@@ -1845,6 +1856,8 @@ fn main() -> std::process::ExitCode {
         }
         Some((verb, rest)) if verb == "sky" => sky_cli(rest),
         Some((verb, rest)) if verb == "status" => status_cli(rest),
+        // An agent's shell runs this, before it opens anything in a terminal.
+        Some((verb, rest)) if verb == "where" => where_cli(rest),
         // An agent's shell runs this, for zen it was asked for in words.
         Some((verb, rest)) if verb == "zen" => zen::cli(rest),
         Some((verb, rest)) if verb == "home" => {
@@ -1938,6 +1951,50 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
     sky::watch(&runtime, socket, store, centre, replay)
+}
+
+/// `sonny where [AGENT]`: the multiplexer and the home in it that AGENT's
+/// `run_in_pane` and `show_agent` calls act in now, by the rule they
+/// follow ([`mux::aim`]), so an agent reads which terminal the person
+/// watches its work in, not one guessed from the skills it has.
+fn where_cli(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: sonny where [AGENT] [--store PATH] [--socket PATH]";
+    let (mut store, mut socket, mut agent) = (None, None, None);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--store" => store = args.next().map(PathBuf::from),
+            "--socket" => socket = args.next().map(PathBuf::from),
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            name if !name.starts_with('-') && agent.is_none() => agent = Some(name.to_owned()),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let agent = (agent.or_else(|| std::env::var("AGENT_BOT").ok()))
+        .filter(|agent| !agent.is_empty())
+        .ok_or(format!("name an agent\n{USAGE}"))?;
+    let (store, socket) = daemon_paths(store, socket)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let (socket, project, chain) = runtime.block_on(agents_project_at(&socket, &agent))?;
+    // A sandboxed agent's shell on macOS reaches the daemon by its own
+    // socket, which no Sonny window notes its place under: the windows
+    // note it under the socket they reach the daemon by, the store's own
+    // unless one was named.
+    let noted = std::iter::once(socket.clone())
+        .chain(agent_client::socket::default_socket(&store).ok())
+        .find(|socket| mux::noted(socket, &project))
+        .unwrap_or(socket);
+    println!(
+        "{}",
+        mux::aim(&noted, &project, &chain, None)?.said(&project)
+    );
+    Ok(())
 }
 
 /// `sonny status [AGENT] [--json]`: what `/status` reads, for an agent's
@@ -2111,7 +2168,7 @@ async fn run() -> Result<(), String> {
             // Sonny no longer writes an `errand` skill: one it wrote, unedited, goes.
             skills::remove("errand");
             if options.layout {
-                mux::install_skill(options.rex_host.as_deref());
+                mux::install_skill();
             }
             let lead =
                 project::open(&client, &dir, options.model.as_deref(), &options.lead).await?;
@@ -2184,6 +2241,7 @@ async fn run() -> Result<(), String> {
     quiet::set_schedule(settings.quiet.clone());
     app.quiet = quiet::arm();
     app.verbose = settings.verbose;
+    app.words_only = !settings.steps;
     set_measure(settings.text_width);
     margin::set_limits(settings.margin_notes, settings.margin_note_lines);
     app.zen = zen::focus(app.reactions_key.as_deref());
@@ -3852,6 +3910,11 @@ struct App {
     /// Every call drawn, rather than the clean view of the bot's words and
     /// the calls that move the work on.
     verbose: bool,
+    /// Only what the person said and the agent's words, its questions and
+    /// what failed: none of the steps between (`[sonny] steps`, off).
+    words_only: bool,
+    /// The newest plan the words-only view was told, for the margin.
+    plan_told: Option<u64>,
     /// The focus the agent is in zen on: only the person's turns and the
     /// agent's questions are drawn, the conversation alone in the middle.
     zen: Option<String>,
@@ -4449,7 +4512,7 @@ impl Fleet {
         ];
         // Said only when the tasks go somewhere this pane is not.
         let note = (!layout.here()).then(|| format!("tasks open in {}", layout.home()));
-        mux::install_skill(options.rex_host.as_deref());
+        mux::install_skill();
         let (tell, said) = tokio::sync::mpsc::unbounded_channel();
         let mut layout = layout;
         layout.keep_aside(used::aside());
@@ -5336,6 +5399,8 @@ impl App {
             opening_all: false,
             woken: Arc::new(tokio::sync::Notify::new()),
             verbose: false,
+            words_only: false,
+            plan_told: None,
             zen: None,
             elsewhere: false,
             instruct: None,
@@ -6214,6 +6279,7 @@ impl App {
         self.stacked = None;
         self.plans.clear();
         self.plan_full = None;
+        self.plan_told = None;
         self.refold = true;
         self.tasks.clear();
         self.starting = None;
@@ -6524,8 +6590,19 @@ impl App {
         output: &str,
         failed: bool,
     ) {
-        // In zen the agent's questions are all of its calls drawn.
-        if self.zen.is_some() && name != asks::TOOL {
+        // Words only, the agent's questions are all of its calls drawn,
+        // and its plan is the margin's alone.
+        if self.words() && name != asks::TOOL {
+            if name == plan::TOOL
+                && !failed
+                && let Some(steps) = plan::steps(arguments)
+            {
+                self.tell_plan(steps);
+            }
+            // A task it started is tracked still, for what it asks.
+            if name == served::START && !failed {
+                self.track_started(arguments, output);
+            }
             return;
         }
         if name == margin::TOOL {
@@ -6667,23 +6744,7 @@ impl App {
     /// The task a `start_task` call started, joining the tasks started
     /// right before it.
     fn commit_started(&mut self, arguments: &Value, output: &str) {
-        let name = arguments["name"].as_str().unwrap_or("task").to_owned();
-        let bot = (output.split(|c: char| c.is_whitespace() || c == '"'))
-            .find(|word| word.starts_with("turn:"))
-            .map(calls::handle_bot)
-            .or_else(|| (self.project.as_ref()).map(|project| format!("{project}.{name}")))
-            .unwrap_or_else(|| name.clone());
-        let task = started::Task {
-            bot,
-            name,
-            // Only its first words are drawn.
-            brief: started::first(arguments["brief"].as_str().unwrap_or("")),
-            state: "starting".into(),
-        };
-        // Its name opens it at once, where it was drawn before it was made.
-        self.names.get_mut().learn(task.bot.clone(), true);
-        self.screen.relink();
-        self.tasks_read = None;
+        let task = self.started_task(arguments, output);
         if let Some((at, drawn)) = self.starting
             && drawn == self.rows_drawn
             && let Some(tasks) = self.tasks.get_mut(&at)
@@ -6709,6 +6770,40 @@ impl App {
         self.starting = Some((at, self.rows_drawn));
     }
 
+    /// A task started, words only: no roster drawn, but tracked as one
+    /// is, so its questions reach this window and the footer counts it;
+    /// those started live or in the newest page, as rows kept would be.
+    fn track_started(&mut self, arguments: &Value, output: &str) {
+        if self.newer.is_some() {
+            return;
+        }
+        let task = self.started_task(arguments, output);
+        let at = self.group();
+        self.tasks.insert(at, vec![task]);
+    }
+
+    /// The task a `start_task` call made, its name known from now on.
+    fn started_task(&mut self, arguments: &Value, output: &str) -> started::Task {
+        let name = arguments["name"].as_str().unwrap_or("task").to_owned();
+        let bot = (output.split(|c: char| c.is_whitespace() || c == '"'))
+            .find(|word| word.starts_with("turn:"))
+            .map(calls::handle_bot)
+            .or_else(|| (self.project.as_ref()).map(|project| format!("{project}.{name}")))
+            .unwrap_or_else(|| name.clone());
+        let task = started::Task {
+            bot,
+            name,
+            // Only its first words are drawn.
+            brief: started::first(arguments["brief"].as_str().unwrap_or("")),
+            state: "starting".into(),
+        };
+        // Its name opens it at once, where it was drawn before it was made.
+        self.names.get_mut().learn(task.bot.clone(), true);
+        self.screen.relink();
+        self.tasks_read = None;
+        task
+    }
+
     /// The rows of the tasks started together as `at`, and the buttons
     /// on them that open each.
     fn started_lines(&self, at: usize) -> (Vec<Line<'static>>, Vec<(usize, screen::Mark)>) {
@@ -6730,6 +6825,10 @@ impl App {
     /// The tasks started together as `at` drawn again where they are;
     /// whether they are still in the conversation.
     fn draw_started(&mut self, at: usize) -> bool {
+        // Words only, no roster is drawn: its tasks are tracked alone.
+        if self.words() {
+            return true;
+        }
         let (lines, marks) = self.started_lines(at);
         self.flush();
         (self.screen).replace_tagged(screen::Tag::Tasks(at as u64), lines, marks)
@@ -6756,7 +6855,7 @@ impl App {
         // read again.
         let gone: Vec<usize> = (self.tasks.keys())
             .copied()
-            .filter(|at| !self.kept(screen::Tag::Tasks(*at as u64)))
+            .filter(|at| !self.words() && !self.kept(screen::Tag::Tasks(*at as u64)))
             .collect();
         for at in gone {
             self.tasks.remove(&at);
@@ -7320,6 +7419,15 @@ impl App {
     /// was set when the margin is not `beside` the conversation; every
     /// other plan call a row of how far it had got.
     fn fold_plan(&mut self, beside: bool) {
+        // Words only, the margin shows the newest plan told; none here.
+        if self.words() {
+            let told = self.plan_told;
+            self.plans.retain(|at, _| Some(*at) == told);
+            let steps = told.and_then(|at| self.plans.get(&at)).cloned();
+            self.margin.set_plan(steps.as_deref().unwrap_or_default());
+            self.plan_full = None;
+            return;
+        }
         // The plans the conversation holds, in its order: a plan call's
         // own row, or the newest of those a cluster gathered.
         let mut held: Vec<u64> = Vec::new();
@@ -7380,6 +7488,19 @@ impl App {
         }
     }
 
+    /// A plan the agent told, words only: the margin's, the newest drawn
+    /// in order, live or in the newest page; an older page tells none.
+    fn tell_plan(&mut self, steps: Vec<String>) {
+        if self.newer.is_some() {
+            return;
+        }
+        let at = self.plan_count;
+        self.plan_count += 1;
+        self.plans.insert(at, steps);
+        self.plan_told = Some(at);
+        self.refold = true;
+    }
+
     /// A `margin` call applied as it starts, so a note shows while the
     /// agent works, and the margin scrolled to it.
     fn note_call(&mut self, call: &str, arguments: &Value, turn: Option<i64>) {
@@ -7433,16 +7554,17 @@ impl App {
     ) {
         let attached = attached && transcript::relays(said, from);
         if attached {
-            if self.zen.is_none() {
+            if !self.words() {
                 self.land_relayed(node, said, from, true);
             }
             return;
         }
         // Reactions from here on answer this one.
         self.bot_reactions.clear();
-        // Words between agents are one quiet row a click opens; none in zen.
+        // Words between agents are one quiet row a click opens; none
+        // words only.
         if transcript::relays(said, from) {
-            if self.zen.is_none() {
+            if !self.words() {
                 self.land_relayed(node, said, from, false);
             }
         } else {
@@ -8589,7 +8711,7 @@ impl App {
                             Some(reason) => {
                                 // It never ran: nothing it would have done follows.
                                 failed = true;
-                                if self.zen.is_none() {
+                                if !self.words() {
                                     self.commit_denied(&name, &arguments, &reason);
                                 }
                             }
@@ -8692,7 +8814,19 @@ impl App {
             .staged
             .iter()
             .flat_map(|(turn, prompt)| {
-                let mut shown: Vec<Line<'static>> = match user_shell::read(prompt) {
+                // What it waits for, a mark by its arrow and no words: a
+                // queued message the turn's end, a steer the end of the
+                // call under way, however long that runs.
+                let waits = match () {
+                    _ if self.queued.contains(turn) => Some(QUEUED),
+                    _ if self.steering.contains(turn) && self.running.is_some() => Some(STEERING),
+                    _ => None,
+                };
+                let (first, rest) = match waits {
+                    Some(mark) => (format!("›{mark} "), "   "),
+                    None => ("› ".to_owned(), "  "),
+                };
+                let shown: Vec<Line<'static>> = match user_shell::read(prompt) {
                     Some(ran) => user_shell::header(&ran.command, width, true),
                     None => {
                         // An answer shows as itself, under the question it answers.
@@ -8705,29 +8839,21 @@ impl App {
                         asked
                             .into_iter()
                             .chain(prompt.split('\n').enumerate().flat_map(|(at, line)| {
-                                let lead = if at == 0 { "› " } else { "  " };
+                                let lead = if at == 0 {
+                                    first.clone()
+                                } else {
+                                    rest.to_owned()
+                                };
                                 transcript::wrap(
                                     Line::from(line.to_owned()).dim(),
                                     width,
                                     Span::raw(lead).dim(),
-                                    Span::raw("  "),
+                                    Span::raw(rest),
                                 )
                             }))
                             .collect()
                     }
                 };
-                // What it waits for, as the person who sent it would ask:
-                // a queued message the turn's end, a steer the end of the
-                // call under way, however long that runs.
-                if self.queued.contains(turn) {
-                    shown.push(Line::from("  queued for after this turn").dim().italic());
-                } else if self.steering.contains(turn) && self.running.is_some() {
-                    shown.push(
-                        Line::from("  steer waiting for the current call to end")
-                            .dim()
-                            .italic(),
-                    );
-                }
                 std::iter::once(Line::default()).chain(shown)
             })
             .collect();
@@ -9350,7 +9476,7 @@ impl App {
                 if data["denied"] == true {
                     // It never ran: nothing it would have done follows.
                     shown.1 = true;
-                    if self.zen.is_none() {
+                    if !self.words() {
                         self.commit_denied(&name, &arguments, &reason);
                     }
                     // The approver's, not the person's: `/retry` may
@@ -9514,6 +9640,10 @@ impl App {
                     _ if (only_reacted || quiet) && ended => {}
                     // In zen a turn the person did not start ends unseen.
                     _ if self.zen_hides() => {}
+                    // Words only, one that ended well ends on its words: how
+                    // long it took is no word of the agent's.
+                    Some(live) if ended && self.words() => self.write_words(live, Words::Reply),
+                    None if ended && self.words() => {}
                     Some(live) if !live.spilled && !live.rows.is_empty() && ended => {
                         self.commit(vec![line]);
                         self.write_words(Live { gap: true, ..live }, Words::Reply);
@@ -9785,7 +9915,12 @@ impl App {
             .as_millis() as i64;
         let (query, window) = view.query(now);
         let read = self.client.request("usage", query).await;
-        view.loaded(window, read.map_err(|error| error.to_string()));
+        // The price sheet as its file says now, so an edit shows at the
+        // next read; a sheet that does not parse prices nothing.
+        let prices = agent_client::config::load()
+            .and_then(|config| agent_client::config::prices(&config))
+            .unwrap_or_default();
+        view.loaded(window, read.map_err(|error| error.to_string()), prices);
     }
 
     async fn reread(&mut self) {
@@ -10338,6 +10473,20 @@ impl App {
                         if let Some(program) = &pane.program {
                             let (x, y) = pane.origin();
                             program.mouse(*mouse, x, y);
+                            return true;
+                        }
+                        // A star or a name in `/sky`: centred on, as the
+                        // arrows and Enter do; on `you`, the person again.
+                        // Each card row starts with a space.
+                        if down
+                            && pane.is_card()
+                            && let Some(view) = self.watch.as_mut().and_then(|w| w.sky.as_mut())
+                            && let Some((line, column)) =
+                                pane.screen.line_at(mouse.column, mouse.row)
+                            && column > 0
+                            && view.click(line, column - 1)
+                        {
+                            pane.screen.unselect();
                             return true;
                         }
                         pane.screen.mouse(*mouse)
@@ -11200,14 +11349,16 @@ impl App {
         if pane == area.width {
             return match self.pane_keys {
                 true => (Rect { width: 0, ..area }, Some(area)),
-                false => (area, None),
+                false => (self.centred(area), None),
             };
         }
         // A gutter each side of the line between them: the conversation
         // stops short of it, and the pane, whose rows open with a space of
-        // their own, starts a column after it.
+        // their own, starts a column after it. The conversation starts as
+        // far in from the window's edge.
         let chat = Rect {
-            width: (area.width - pane - 1).saturating_sub(GUTTER),
+            x: area.x + GUTTER,
+            width: (area.width - pane - 1).saturating_sub(2 * GUTTER),
             ..area
         };
         let pane = Rect {
@@ -11219,16 +11370,21 @@ impl App {
     }
 
     /// The conversation alone in the window: in zen, its column in the
-    /// middle, as a reader centres a page; else where it is, on the left.
+    /// middle, as a reader centres a page; else where it is, on the left;
+    /// a gutter in from either edge.
     fn centred(&self, area: Rect) -> Rect {
         let column = measure() as u16;
         match self.zen {
-            Some(_) if area.width > column => Rect {
+            Some(_) if area.width > column + 2 * GUTTER => Rect {
                 x: area.x + (area.width - column) / 2,
                 width: column,
                 ..area
             },
-            _ => area,
+            _ => Rect {
+                x: area.x + GUTTER,
+                width: area.width.saturating_sub(2 * GUTTER),
+                ..area
+            },
         }
     }
 
@@ -11554,8 +11710,9 @@ impl App {
             self.margin_opens = settings.margin_opens;
             self.agent_opens = settings.agent_opens;
             margin::set_limits(settings.margin_notes, settings.margin_note_lines);
-            if self.verbose != settings.verbose {
+            if self.verbose != settings.verbose || self.words_only == settings.steps {
                 self.verbose = settings.verbose;
+                self.words_only = !settings.steps;
                 self.repaint = true;
             }
             if set_measure(settings.text_width) {
@@ -12270,9 +12427,10 @@ impl App {
                     self.verbose = settings.verbose;
                     // What is already drawn is drawn again in the new view.
                     self.repaint = true;
-                    match self.verbose {
-                        true => "verbose: every tool call",
-                        false => "clean: replies, tasks, questions and the plan",
+                    match (self.verbose, self.words_only) {
+                        (true, _) => "verbose: every tool call",
+                        (false, true) => "words only: what you said and what came back",
+                        (false, false) => "steps: replies, tasks, questions and the plan",
                     }
                     .to_owned()
                 }
@@ -13158,6 +13316,12 @@ impl App {
 
     /// Whether zen keeps what the running turn says out of view: the
     /// person did not start it.
+    /// Whether only words are drawn: the person's, the agent's, its
+    /// questions and what failed, as in zen, every turn's words still.
+    fn words(&self) -> bool {
+        self.zen.is_some() || (self.words_only && !self.verbose)
+    }
+
     fn zen_hides(&self) -> bool {
         self.zen.is_some() && self.elsewhere
     }
@@ -14721,13 +14885,22 @@ impl App {
             Some((_, (_, first, _))) => {
                 let first = (*first).min(rows - 1);
                 let row = row.saturating_sub(first).min(keep - 1);
-                (layout.into_iter().skip(first).take(keep).collect(), row)
+                (layout.iter().copied().skip(first).take(keep).collect(), row)
             }
-            None => window(layout, row, keep),
+            None => {
+                let start = rows.saturating_sub(keep).min(row);
+                let shown: Vec<prompt::Row> = layout[start..].iter().copied().take(keep).collect();
+                (shown, row - start)
+            }
         };
         // Markdown shows as it will read, its marks kept: styled on the
-        // rows shown alone, so a long paste costs no more to draw.
-        let marked = prompt::marks(&self.input);
+        // rows shown alone, read from their lines alone, so a long paste
+        // costs no more to draw.
+        let shown = match (layout.first(), layout.last()) {
+            (Some(first), Some(last)) => first.start..last.end,
+            _ => 0..0,
+        };
+        let marked = self.input.marks(shown);
         let rows: Vec<Line<'static>> = layout
             .iter()
             .map(|part| {
@@ -18006,12 +18179,14 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut app = rt.block_on(async { app(zen_daemon().await) });
         let wide = Rect::new(0, 0, 160, 40);
-        assert_eq!(app.split(wide).0, wide);
+        // Out of zen, a gutter in from either edge.
+        assert_eq!(app.split(wide).0, Rect::new(2, 0, 156, 40));
         app.zen = Some("the rounding".into());
         assert_eq!(app.split(wide).0, Rect::new(30, 0, 100, 40));
-        // A window narrower than the column keeps all of it.
+        // A window narrower than the column keeps all of it, but its
+        // gutters.
         let narrow = Rect::new(0, 0, 80, 40);
-        assert_eq!(app.split(narrow).0, narrow);
+        assert_eq!(app.split(narrow).0, Rect::new(2, 0, 76, 40));
         // The margin stays away in zen.
         app.pane = Some(pane::Pane::margin());
         assert_eq!(app.split(wide), (Rect::new(30, 0, 100, 40), None));
@@ -18468,10 +18643,11 @@ mod tests {
             app.submit().await;
         }
         assert_eq!(staged(&app), [2, 3]);
+        let rows: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
         assert_eq!(
-            app.staged_rows(80).len(),
-            7,
-            "each with a blank row above and what it waits for"
+            rows,
+            ["", "›↪ steer one", "", "›↪ steer two", ""],
+            "each with a blank row above, a mark for what it waits for"
         );
         // Turn 1 takes in the first; its own turn ends as steered.
         app.daemon(turn_event("turn_finished", 2, json!({"status": "steered"})))
@@ -18821,6 +18997,102 @@ mod tests {
             rows[line + 1..],
             [("".into(), false), ("• Done.".into(), false)]
         );
+    }
+
+    #[tokio::test]
+    async fn words_only_draws_what_was_said_and_none_of_the_steps() {
+        let client = daemon_answering(|asked| {
+            let item = match asked["nodes"][0].as_i64() {
+                Some(3) => json!({"type": "function_call_output", "call_id": "c1", "output": "a"}),
+                Some(4) => json!({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done."}]}),
+                _ => return json!({}),
+            };
+            json!({"items": [{"node": asked["nodes"][0], "item": item}]})
+        })
+        .await;
+        let mut app = app(client);
+        app.words_only = true;
+        app.any_history = true;
+        app.width = 120;
+        let rows = |app: &App| -> Vec<String> {
+            (app.pending.iter())
+                .map(|line| line.to_string())
+                .filter(|row| !row.trim().is_empty())
+                .collect()
+        };
+        app.commit(vec![Line::from("› check on the tasks")]);
+        app.daemon(turn_event("accepted", 1, json!({}))).await;
+        // News in, a plan, a send, a call: none of them a row.
+        let updates = "Task updates: what happened in your tasks since you last heard.\n\
+            - calc.neg: turn:calc.neg/3 completed";
+        app.land(5, (updates, ""), (None, false), false);
+        let plan = json!({"steps": ["[x] Read", "[>] Fix", "[ ] Test"]});
+        app.commit_call("p1", Some(1), "plan", &plan, "Plan set.", false);
+        let steer = json!({"command":
+            r#""$AGENT_BIN" run --detach --delivery steer --bot calc.neg -- 'Check div too.'"#});
+        app.commit_call("c0", Some(1), "shell", &steer, "turn:calc.neg/4", false);
+        app.daemon(turn_event(
+            "tool_started",
+            1,
+            json!({"call_id": "c1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}),
+        ))
+        .await;
+        app.daemon(turn_event(
+            "tool_completed",
+            1,
+            json!({"call_id": "c1", "node": 3}),
+        ))
+        .await;
+        let said = json!({"event": "text_delta", "bot": "b", "turn": 1, "text": "Done."});
+        app.daemon(said).await;
+        app.daemon(turn_event("message", 1, json!({"node": 4})))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            1,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        // A task started is no row, but tracked, so what it asks reaches
+        // this window.
+        let start = json!({"name": "add", "brief": "Fix add"});
+        app.commit_call(
+            "s1",
+            Some(1),
+            served::START,
+            &start,
+            "turn:calc.add/1",
+            false,
+        );
+        assert!(
+            app.tasks
+                .values()
+                .flatten()
+                .any(|task| task.bot == "calc.add")
+        );
+        app.read_tasks().await;
+        assert!(
+            app.tasks
+                .values()
+                .flatten()
+                .any(|task| task.bot == "calc.add")
+        );
+        // What was asked and what came back, and how long it took no row.
+        assert_eq!(rows(&app), ["› check on the tasks", "• Done."]);
+        // The plan is the margin's still.
+        app.fold_notes(true);
+        let margin = app.margin.lines(60, std::path::Path::new("/"), None).0;
+        let margin: Vec<String> = margin.iter().map(|l| l.to_string()).collect();
+        assert!(margin.iter().any(|r| r.contains("Plan  1/3")), "{margin:?}");
+        // And never in the conversation, the margin beside it or not.
+        app.fold_notes(false);
+        assert_eq!(rows(&app), ["› check on the tasks", "• Done."]);
+        // A turn that failed still says so.
+        app.daemon(turn_event("accepted", 2, json!({}))).await;
+        app.daemon(turn_event("turn_finished", 2, json!({"status": "failed"})))
+            .await;
+        assert_eq!(rows(&app)[2], "failed for 0s");
     }
 
     #[tokio::test]
@@ -19677,10 +19949,7 @@ mod tests {
         assert!(app.move_to.is_none());
         assert_eq!(app.yours, Some(2));
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
-        assert_eq!(
-            staged,
-            ["", "› after this", "  queued for after this turn", ""]
-        );
+        assert_eq!(staged, ["", "›⋯ after this", ""]);
         // Enter still steers.
         app.input.set("now");
         app.key(enter()).await;
@@ -19688,19 +19957,14 @@ mod tests {
         assert_eq!(steer["delivery"], "steer");
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
         assert_eq!(
-            staged[3..],
-            [
-                "",
-                "› now",
-                "  steer waiting for the current call to end",
-                ""
-            ],
-            "a steer says what it waits for, as a queued message does"
+            staged[2..],
+            ["", "›↪ now", ""],
+            "a steer marks what it waits for, as a queued message does"
         );
         // Sent with no turn running, a message waits for nothing.
         app.running = None;
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
-        assert_eq!(staged[3..], ["", "› now", ""]);
+        assert_eq!(staged[2..], ["", "› now", ""]);
         // Once its turn starts it is no longer waiting.
         app.daemon(turn_event("turn_finished", 3, json!({}))).await;
         app.daemon(turn_event("accepted", 2, json!({}))).await;
@@ -23622,13 +23886,13 @@ mod tests {
     fn the_text_width_sets_the_conversations_measure_and_0_fills_the_window() {
         assert_eq!(measure_of(agent_client::config::TEXT_WIDTH), 100);
         // A wider text keeps its columns, the margin taking the rest.
-        let wide = measure_of(140) as u16 + GUTTER;
-        assert_eq!(pane::margin_width(300, wide), Some(157));
+        let wide = kept_at(300, measure_of(140));
+        assert_eq!(pane::margin_width(300, wide), Some(155));
         assert_eq!(pane::width(160, wide), 160);
         // The window's whole width, wider than any window and a column
         // added to it still fits.
         assert_eq!(measure_of(0), WHOLE);
-        assert!(WHOLE >= u16::MAX as usize / 2 && WHOLE as u16 + GUTTER > WHOLE as u16);
+        assert!(WHOLE >= u16::MAX as usize / 2 && WHOLE as u16 + 2 * GUTTER > WHOLE as u16);
     }
 
     #[test]
@@ -23639,18 +23903,18 @@ mod tests {
             let pane = pane::width(window, kept_at(window, WHOLE));
             match pane == window {
                 true => None,
-                false => Some(((window - pane - 1).saturating_sub(GUTTER), pane - 1)),
+                false => Some(((window - pane - 1).saturating_sub(2 * GUTTER), pane - 1)),
             }
         };
         // Half each, the line and its gutters between them.
-        assert_eq!(split(170), Some((83, 83)));
-        assert_eq!(split(400), Some((198, 198)));
+        assert_eq!(split(170), Some((82, 82)));
+        assert_eq!(split(400), Some((197, 197)));
+        assert_eq!(split(85), Some((40, 39)));
         // Too narrow for two halves of the margin's least, one at a time.
-        assert_eq!(split(82), Some((39, 39)));
-        assert_eq!(split(81), Some((38, 39)));
-        assert_eq!(split(80), None);
-        // A measure of its own is kept as before.
-        assert_eq!(kept_at(170, 100), 102);
+        assert_eq!(split(84), Some((39, 39)));
+        assert_eq!(split(83), None);
+        // A measure of its own is kept as before, with a gutter each side.
+        assert_eq!(kept_at(170, 100), 104);
     }
 
     #[tokio::test]
@@ -23660,10 +23924,14 @@ mod tests {
         app.margin.apply("m1", &post, None, None);
         app.margin_back();
         let (chat, margin) = app.split(Rect::new(0, 0, 170, 40));
-        // The conversation's 100, a gutter each side of the line, the rest.
-        assert_eq!((chat.width, margin.map(|m| m.width)), (100, Some(66)));
+        // The conversation's 100 two columns in, a gutter each side of the
+        // line, the rest.
+        assert_eq!(
+            (chat.x, chat.width, margin.map(|m| m.width)),
+            (2, 100, Some(64))
+        );
         let (chat, margin) = app.split(Rect::new(0, 0, 130, 40));
-        assert_eq!((chat.width, margin), (130, None));
+        assert_eq!((chat.width, margin), (126, None));
         // Asked for with Tab, it has the window to itself, as anything
         // opened in a window too narrow for both does, the conversation
         // a key away.
@@ -23674,7 +23942,7 @@ mod tests {
         // conversation's 100 where there is room for both.
         app.open_pane(pane::Pane::card("status", "esc close"));
         let (chat, pane) = app.split(Rect::new(0, 0, 170, 40));
-        assert_eq!((chat.width, pane.map(|m| m.width)), (100, Some(66)));
+        assert_eq!((chat.width, pane.map(|m| m.width)), (100, Some(64)));
         let (chat, pane) = app.split(Rect::new(0, 0, 130, 40));
         assert_eq!((chat.width, pane.map(|m| m.width)), (0, Some(130)));
         // The conversation back, the footer says how over to the pane,
@@ -23697,7 +23965,7 @@ mod tests {
         // Its ↑ gives the conversation the room back.
         app.follow("sonny:jump/repro");
         let (chat, _) = app.split(Rect::new(0, 0, 130, 40));
-        assert_eq!(chat.width, 130);
+        assert_eq!(chat.width, 126);
     }
 
     #[tokio::test]
@@ -23912,5 +24180,77 @@ mod tests {
         }
         assert!(app.margin.note("repro").is_some());
         assert!(app.notice.is_some());
+    }
+
+    /// Typing into a long prompt: the time each key takes, with the
+    /// composer laid out as a frame lays it, at doubling sizes.
+    /// `cargo test -p sonny --release typing_a_long_prompt -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn typing_a_long_prompt() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let words = [
+            "the",
+            "agent",
+            "reads",
+            "**every**",
+            "file",
+            "in",
+            "`src/`",
+            "and",
+            "then",
+            "writes",
+            "a",
+            "short",
+            "note",
+            "about",
+            "what",
+            "_changed_",
+            "since",
+            "yesterday,",
+        ];
+        let text = |bytes: usize, breaks: bool| {
+            let mut text = String::new();
+            let mut n = 0;
+            while text.len() < bytes {
+                text.push_str(words[n % words.len()]);
+                n += 1;
+                text.push(if breaks && n % 16 == 0 { '\n' } else { ' ' });
+            }
+            text
+        };
+        for breaks in [true, false] {
+            for kib in [16, 32, 64, 128, 256, 512, 1024] {
+                let typed = text(kib * 1024, breaks);
+                for middle in [false, true] {
+                    app.input.set(&typed);
+                    if middle {
+                        let half = typed.len() / 2;
+                        app.input.select(half, half);
+                        app.input.unselect();
+                    }
+                    // Laid out once, as the frame after a paste does.
+                    let _ = app.composer(100);
+                    let keys = 50;
+                    let start = Instant::now();
+                    for _ in 0..keys {
+                        app.key(Event::Key(KeyEvent::new(
+                            KeyCode::Char('x'),
+                            KeyModifiers::NONE,
+                        )))
+                        .await;
+                        let _ = app.composer(100);
+                        let layout = app.input.layout(100);
+                        let _ = app.input.cursor(&layout);
+                    }
+                    let each = start.elapsed() / keys;
+                    eprintln!(
+                        "{} {kib:>5} KiB {}: {each:?} per key",
+                        if breaks { "lines   " } else { "one line" },
+                        if middle { "middle" } else { "end   " },
+                    );
+                }
+            }
+        }
     }
 }

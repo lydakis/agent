@@ -289,7 +289,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | Each new task's speed (`standard`, `fast` or `ultrafast`) | `[sonny] task_speed` | `threads_speed` |
 | The approver's judge | `[judge] model`, `effort` | |
 | What `/side`'s copy may do | `[sonny] side_chat` (`fork`, the default, or `answer`) | |
-| The chime, and every tool call drawn | `[sonny] chime`, `verbose` (true or false) | |
+| The chime, the agent's steps, and every tool call drawn | `[sonny] chime`, `steps`, `verbose` (true or false) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
@@ -393,9 +393,14 @@ task works on, and `/status` (or its name) opens it again, also after the
 lead starts again (kept in `~/.agent/sonny/aside/`); its `/status` row
 says `window set aside for room`. A task set aside that comes to need you
 opens its window again on its own, as what needs you keeps its window. `--rex-host HOST` puts the session on another Rex
-server; `--no-layout` turns the layout off. Sonny writes the skill for the
-multiplexer it runs in to `~/.agents/skills` (`rex-windows`,
-`herdr-panes` or `cmux-tabs`, from `skills/`), so any agent can run a long command where
+server; `--no-layout` turns the layout off. Sonny writes a skill for each
+multiplexer the machine has to `~/.agents/skills` (`rex-windows`,
+`herdr-panes` and `cmux-tabs`, from `skills/`). Each sends the agent to
+`sonny where` first, which prints the multiplexer and the workspace or
+session its calls act in now, by the rule the tools follow: where the person
+last used a window of the agent's (or of the agent that made it), so a
+project open in Herdr and in cmux at once has its agents act in the one the
+person is typing in. With that, any agent can run a long command where
 the person can watch it, and read it back: the `run_in_pane` tool
 (`name`, `command`, `split` right, left, above, below or float) opens a block
 labelled `AGENT/NAME` in a tab of its own (or on that side of the agent's
@@ -626,7 +631,7 @@ way `/react` does, and each note in the margin has its own `↩`.
 - `/config` (or `/settings`) lists every key `~/.agent/config.toml` takes,
   with its value or what its default is, over the composer. ↑/↓ picks
   one; ←/→ steps a key with a few values (efforts, `web_search`,
-  `senders`, `side_chat`, `chime`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
+  `senders`, `side_chat`, `chime`, `steps`, `verbose`, `margin_opens`, `agent_opens`, `suggest`,
   `start_at_boot`) through them
   and its default; Enter types one that takes a name (`model`, `provider`,
   `judge.model`, the profiles), empty for its default; ⌫
@@ -793,7 +798,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   its right edge, dim, its code reviews; one that needs you says what for
   under it. That is all it shows as it opens; `m` shows more and hides it
   again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
-  `icon` in `[sonny.sources.NAME]` shows as that icon), the code reviews
+  `icon` in `[sonny.sources.NAME]` shows as that icon, as it does wherever
+  Sonny names that source: `/background` and the "From your sources" row), the code reviews
   its turns opened or wait on, in any system, as the copy that checks
   each turn names them from its commands' output and reply (`3 reviews · CR-881`; a pull or merge request link its last
   reply holds shows before any is kept), its background work
@@ -930,7 +936,10 @@ way `/react` does, and each note in the margin has its own `↩`.
   no footer, no names but what needs you or failed. The arrows pick a star
   and Enter puts it in the middle: its maker, what it made and whoever it
   talked to in the last hour on the first ring, two hops on the next, the
-  chat log only its own; the stars glide to their places. Esc lets go of
+  chat log only its own; the stars glide to their places. A click on a
+  star, or on an agent's name in the sky, the list or the chat log, centres
+  on it the same way, and a click on `you` puts you back in the middle,
+  in the pane and in `sonny sky`. Esc lets go of
   the pick, then the centre. With thousands of agents the sky folds: a
   star for every agent that needs you, failed, works or was just lit, and
   for the leads, as many as the pane has room for; the rest are a faint
@@ -1210,7 +1219,7 @@ turn of the task numbered after that one reopens it.
 
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
 `[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
-the view (`verbose`, off by default), besides the efforts and the side chat
+the view (`steps` and `verbose`, both off by default), besides the efforts and the side chat
 above. `/config` lists the keys under their table's name, a value set in
 the file plain and a default muted, so what you changed stands out.
 
@@ -1236,7 +1245,9 @@ the version installed, and removes it when agent-browser is gone. Agents
 drive it through the `browser` tool, which the tool host answers outside
 their sandbox: it runs the skill's commands in each agent's own browser
 session, its answers read from agent-browser's JSON, and a screenshot
-comes back as a picture, up to 20 a call. It refuses what would
+without a path comes back as a picture only the agent sees, up to 20 a
+call; the tool tells the agent to show the person one by saving it to a
+path and putting it in its reply as a Markdown image. It refuses what would
 reach past the browser: flags that launch another program or load an
 extension, plugins, the clipboard, the browser's DevTools address, and
 writes outside the agent's folder. It opens `file://` pages anywhere,
@@ -1251,7 +1262,7 @@ desktop`), and agents see and use the person's own desktop through the
 `desktop` tool, which the tool host answers outside their sandbox, since a
 sandboxed process reaches no other app. It runs the skill's commands one
 call at a time across agents, as there is one desktop: what only looks (a
-snapshot, `find`, a screenshot, which comes back as a picture, the apps
+snapshot, `find`, a screenshot, which comes back as a picture only the agent sees, the apps
 and windows) runs at once; a call with a command that acts (a click,
 typing, a key, launching or closing an app, a window, a notification, the
 clipboard) waits for the agent's approvals once. It passes only the flags
@@ -1311,7 +1322,20 @@ writing. The steps on the way, calls and what
 the bot said before each, are dim; the reply stays bright, under the
 turn's `Worked for …` line.
 
-The view is clean by default: the bot's words, and only the calls that
+By default the conversation is words only: what you said and what the
+agent said back, its questions, and a turn that failed. Nothing between
+them is drawn: no calls, no news from tasks, no messages between agents,
+no notes put in the margin, no `Worked for …` line. The plan shows in the
+margin. A message you send while the agent works waits with a mark by its
+arrow, no words: `›↪` a steer, which goes in when the call under way ends,
+and `›⋯` a queued message, for after the turn. `[sonny] steps = true`
+brings back the steps, the view below, and `/verbose` draws every call.
+
+![Words only: a lead asked to check the work, its words as two tasks report in, and nothing between](../docs/sonny/words-only.png)
+
+![A steer and a queued message waiting while the agent works, each a mark by its arrow](../docs/sonny/waiting-marks.png)
+
+With steps, the view is clean: the bot's words, and only the calls that
 move the work on, said as what they did (a task started, steered or
 waited for, a question to you, the plan, memory, an automation, a window
 opened). Commands, reads and edits are left out: agents are people you

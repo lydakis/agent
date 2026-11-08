@@ -142,6 +142,12 @@ pub const SETTINGS: &[Setting] = &[
         default: "true",
     },
     Setting {
+        key: "sonny.steps",
+        about: "the agent's steps between what is said (calls, news in, messages between agents, how long a turn took), or only your words and the agent's",
+        values: SWITCH,
+        default: "false",
+    },
+    Setting {
         key: "sonny.verbose",
         about: "every tool call drawn, or the clean view: replies, tasks, questions and the plan",
         values: SWITCH,
@@ -215,7 +221,7 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "sonny.commons_invite_tokens",
-        about: "the tokens of work an invite pays for in its thread: its turn, and the turns replies there start while any are left; a turn started runs to its end",
+        about: "the tokens of work an invite pays for: the budget of the one turn it starts, a golden ticket's twice that; later replies reach the agent through its subscription",
         values: &[],
         default: "1000000",
     },
