@@ -796,7 +796,9 @@ struct Note {
     text: String,
     /// The hue of what needs you or failed.
     hue: Option<Color>,
-    /// The agents it is about, so a centred sky keeps only its agent's.
+    /// The agents it is about, so a centred sky keeps only its agent's;
+    /// in the order its words name them, so a click on a name finds its
+    /// own agent where two share a short name.
     about: Vec<String>,
     /// In a replay, when it happened, in Unix ms, which it says for its
     /// time.
@@ -1446,7 +1448,8 @@ impl View {
         };
         // What the schedule is first, as the log is narrow.
         let said = format!("{whom} {}, by {maker}", said_when(&booking.when));
-        let about: Vec<usize> = std::iter::once(by).chain(to).collect();
+        // In the order the line names them: whom, then its maker.
+        let about: Vec<usize> = to.into_iter().chain(std::iter::once(by)).collect();
         self.say(now, said, None, &about);
         if let Some(to) = to {
             // A spark of its own: no message, so no count of them.
@@ -3206,14 +3209,16 @@ impl View {
                 (None, _) => (Ink::Plain, agent.glow(now) > 0.4),
             };
             sky.star(agent.at, ink, big);
-            let (row, cols) = sky.covers(agent.at);
-            if row < sky_rows {
-                let (from, to) = (*cols.start(), cols.end() + 1);
+            // Every row it paints: a blob across a row's edge takes two.
+            let (_, cols) = sky.covers(agent.at);
+            let (from, to) = (*cols.start(), cols.end() + 1);
+            for row in sky.painted(agent.at, big).filter(|&row| row < sky_rows) {
+                let agent = Some(index);
                 hits.push(Hit {
                     row,
                     from,
                     to,
-                    agent: Some(index),
+                    agent,
                 });
             }
         }
@@ -4159,28 +4164,25 @@ fn signature(name: &str, minutes: u64, room: usize) -> Vec<String> {
 }
 
 /// Where in `said` each of the agents `about` is named, by its short
-/// name as the log writes it: the columns it takes, a longer name first
-/// so `shop lead` is not found in `shop lead fix`, each place once.
+/// name as the log writes it: the columns it takes. `about` is in the
+/// order the line names them, so each is looked for after the last one
+/// found: two of one short name each find their own place.
 fn named<'a>(said: &str, about: &'a [String]) -> Vec<(usize, usize, &'a str)> {
-    let mut names: Vec<(String, &str)> = (about.iter())
-        .map(|name| (short(name), name.as_str()))
-        .collect();
-    names.sort_by_key(|(short, _)| std::cmp::Reverse(short.len()));
     let edge = |c: Option<char>| c.is_none_or(|c| !(c.is_alphanumeric() || "._-".contains(c)));
-    let mut taken: Vec<(usize, usize)> = Vec::new();
+    let mut after = 0;
     let mut found = Vec::new();
-    for (short, name) in names {
-        let place = (said.match_indices(short.as_str())).find(|&(at, _)| {
-            let end = at + short.len();
-            edge(said[..at].chars().next_back())
-                && edge(said[end..].chars().next())
-                && !taken.iter().any(|&(from, to)| at < to && from < end)
-        });
-        if let Some((at, _)) = place {
-            let end = at + short.len();
-            taken.push((at, end));
+    for name in about {
+        let short = short(name);
+        let place = (said[after..].match_indices(short.as_str()))
+            .map(|(at, _)| after + at)
+            .find(|&at| {
+                edge(said[..at].chars().next_back())
+                    && edge(said[at + short.len()..].chars().next())
+            });
+        if let Some(at) = place {
+            after = at + short.len();
             let from = said[..at].width();
-            found.push((from, from + short.width(), name));
+            found.push((from, from + short.width(), name.as_str()));
         }
     }
     found
@@ -4541,6 +4543,15 @@ impl Sky {
         for col in cols.filter(|_| row < self.rows) {
             self.stars[row * self.cols + col] = true;
         }
+    }
+
+    /// The rows a star at a point paints: a blob's dots, half a dot above
+    /// and below it, may fall in the rows either side of its own.
+    fn painted(&self, at: (f32, f32), big: bool) -> std::ops::RangeInclusive<usize> {
+        let (_, y) = self.spot(at);
+        let reach = if big { 0.5 } else { 0.0 };
+        let row = |y: f32| y.max(0.0) as usize / 4;
+        row(y - reach)..=row(y + reach)
     }
 
     /// The row and columns a star at a point covers.
@@ -6621,6 +6632,33 @@ mod tests {
             (view.centre.as_deref(), view.pick.as_deref()),
             (Some("shop.cart"), None)
         );
+    }
+
+    #[test]
+    fn a_big_star_across_a_row_s_edge_is_clicked_in_both_rows_it_paints() {
+        let mut sky = Sky::new(40, 5);
+        let (_, down) = sky.scale();
+        // Its centre a fifth of a dot above the middle row's bottom edge.
+        let at = (0.0, 1.8 / down);
+        assert_eq!(sky.painted(at, true), 2..=3);
+        assert_eq!(sky.painted(at, false), 2..=2);
+        sky.star(at, Ink::Plain, true);
+        let inked = |row: usize| (0..40).any(|col| sky.dots[row * 40 + col] != 0);
+        assert!(inked(2) && inked(3));
+    }
+
+    #[test]
+    fn a_name_in_the_log_is_found_for_its_own_agent_in_the_order_it_is_named() {
+        // Two agents of one short name: each takes its own place.
+        let about = ["shop.cart".to_owned(), "other.cart".to_owned()];
+        let said = "cart at 9:00, by cart";
+        assert_eq!(
+            named(said, &about),
+            vec![(0, 4, "shop.cart"), (17, 21, "other.cart")]
+        );
+        // A name inside a longer word is not it; one not written is skipped.
+        let about = ["shop.cart".to_owned(), "shop.login".to_owned()];
+        assert_eq!(named("carts → cart", &about), vec![(8, 12, "shop.cart")]);
     }
 
     #[tokio::test]
