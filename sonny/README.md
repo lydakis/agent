@@ -565,6 +565,12 @@ does what it does otherwise. The label stays however narrow the window,
 the words cut first. `[sonny] suggest_ideas = false` turns ideas and tips
 off and leaves the guess as it was.
 
+![An idea where no guess was obvious, labeled after the key](../docs/sonny/suggest-idea.png)
+
+![A tip for a command, which Tab takes](../docs/sonny/suggest-tip.png)
+
+![A tip for a key, only read](../docs/sonny/suggest-tip-key.png)
+
 ![A guess from a task's news, its source after the key](../docs/sonny/suggest-origin.png)
 
 ![The guess, dim in the empty composer after a reply](../docs/sonny/suggest-shown.png)
