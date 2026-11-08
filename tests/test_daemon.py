@@ -326,7 +326,7 @@ class DaemonTests(ModelFixture):
         kept = client.request('configure', bot='Ann', instructions='new', model='openai/other',
                               settings={'cache_ttl': '1h'})
         self.assertEqual(kept['result'], {
-            'bot': 'Ann', 'bot_id': ann_id, 'running_turn': first,
+            'bot': 'Ann', 'bot_id': ann_id, 'running_turn': first, 'changed': [],
             'configure_pending': {'instructions': 'new', 'model': 'openai/other',
                                   'settings': {'cache_ttl': '1h'}}}, kept)
         # A later one merges over it: newer fields win, settings by name,
@@ -345,6 +345,13 @@ class DaemonTests(ModelFixture):
         self.assertEqual((ann['instructions'], ann['configure_pending']), ('Test agent.', later['configure_pending']))
         # Invalid input is refused at once, not kept.
         self.assertEqual(client.request('configure', bot='Ann', effort='low')['error'], 'invalid_effort')
+        # Rules that would reach the turn at once go with the rest: refused
+        # with it, they reach nothing.
+        rules = {'prefix_rules': [{'pattern': ['mkdir'], 'decision': 'forbidden', 'source': 'test.rules:1'}]}
+        refused = client.request('configure', bot='Ann', model='nowhere/model', settings={'rules': rules})
+        self.assertEqual(refused['error'], 'provider_unavailable', refused)
+        ann = client.request('inspect', bot='Ann')['result']
+        self.assertEqual((ann['settings'].get('rules'), ann['configure_pending']), (None, later['configure_pending']))
         queued = client.request('submit', bot='Ann', request_id='two', prompt='again',
                                 delivery='queue')['result']['turn']
         self.model.release_headers.set()

@@ -2585,6 +2585,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
             CREATE INDEX IF NOT EXISTS bots_elision ON bots(elision);
+            CREATE INDEX IF NOT EXISTS bots_configure_pending ON bots(name)
+                WHERE configure_pending IS NOT NULL;
             CREATE TABLE IF NOT EXISTS bot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO bot_sequence VALUES (1,0);

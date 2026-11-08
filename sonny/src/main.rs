@@ -1267,6 +1267,12 @@ async fn spread_pass(
             .collect(),
         false => Vec::new(),
     };
+    // The lead's own change is set once the daemon took it, not while it
+    // keeps it for the end of the lead's running turn: until then the
+    // agents it made are bounded by its old permissions.
+    let lead_set = lead_set
+        && (client.request("inspect", json!({"bot": lead})).await)
+            .is_ok_and(|record| record["configure_pending"].is_null());
     passed.after_lead = listed && lead_set;
     let lead_id = (bots.iter())
         .find(|bot| bot["name"] == lead)
@@ -1320,10 +1326,15 @@ async fn spread_pass(
         asked["bot"] = json!(name);
         asked["bot_id"] = bot["bot_id"].clone();
         let configured = client.request("configure", asked).await;
-        passed.again |= configured.is_ok();
         match configured {
-            Ok(_) if maker_set => passed.settled.extend(id),
-            Ok(_) => {}
+            // Kept for the end of its running turn, it is busy as before:
+            // tried again until the daemon takes it.
+            Ok(answer) if !answer["configure_pending"].is_null() => passed.waiting.push(name),
+            Ok(_) if maker_set => {
+                passed.again = true;
+                passed.settled.extend(id);
+            }
+            Ok(_) => passed.again = true,
             Err(error) if error.code == "bot_busy" => passed.waiting.push(name),
             Err(error) => {
                 passed.notice = Some(format!("{name}'s permissions: {error}"));
@@ -20759,6 +20770,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_permissions_pick_the_daemon_keeps_for_a_turn_s_end_is_not_yet_set() {
+        // The lead's own change is kept for the end of its running turn, and
+        // so is its task's: neither is set, so the task is tried again.
+        let workspace = std::env::temp_dir().join(unique("spread"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let folder = workspace.display().to_string();
+        let client = daemon_serving(json!({}), move |request| match request["op"].as_str() {
+            Some("bots") => json!({"bots": [
+                {"name": "b", "bot_id": 1, "running_turn": 4},
+                {"name": "b.task", "bot_id": 2, "created_by_id": 1, "running_turn": 3},
+            ], "next_after": null}),
+            Some("inspect") if request["bot"] == "b" => {
+                json!({"name": "b", "configure_pending": {"settings": {"sandbox": "workspace"}}})
+            }
+            Some("inspect") => json!({"name": "b.task", "tools": ["shell"], "gates": [],
+                "settings": {}, "workspace": folder}),
+            Some("configure") => json!({"bot": "b.task", "bot_id": 2, "running_turn": 3,
+                "configure_pending": {"approve": ["shell"]}, "changed": []}),
+            _ => json!({}),
+        })
+        .await;
+        let passed = spread_pass(
+            client,
+            "b".into(),
+            (1, "ask"),
+            true,
+            Default::default(),
+            Default::default(),
+            Arc::new(tokio::sync::Notify::new()),
+        )
+        .await;
+        assert!(!passed.after_lead, "the lead's change is still kept");
+        assert_eq!(passed.waiting, ["b.task"]);
+        assert!(passed.settled.is_empty());
+        assert!(!passed.again);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn fast_lists_the_speeds_its_provider_serves_and_picks_one() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
@@ -23210,6 +23260,8 @@ mod tests {
                 {"name": "task", "bot_id": 3, "created_by_id": 2},
                 {"name": "helper", "bot_id": 4, "created_by_id": 3},
             ], "next_after": null}),
+            // The lead, read once a pass for a change still kept: it has none.
+            Some("inspect") if asked["bot"] == "b" => json!({"name": "b"}),
             Some("inspect") => {
                 seen.fetch_add(1, Ordering::SeqCst);
                 json!({"tools": ["shell"], "gates": [], "settings": {}})

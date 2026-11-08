@@ -1498,15 +1498,20 @@ above, then kept with the bot, merged over one kept before: each field
 given replaces the older's, a `model` takes its `effort` with it (absent
 is the model's default), a gate its approver and expiry, `settings` go by
 name with `sandbox` taking the rest of the sandbox, and a change of
-`rules` alone taken meanwhile lets go of the older rules kept. It answers
-`{bot, bot_id, running_turn, configure_pending}`, the whole change kept,
-which `inspect` shows as `configure_pending` and a durable
-`configure_pending` event tells (once per change). When the turn ends,
-before the bot's next turn starts, and at the daemon's start for a turn
-that ended while it was down, the daemon takes it as `configure` takes a
-change, with the live `configured` event; one that can no longer be taken
-(its provider gone from the config, say) is let go with a durable
-`configure_failed` event naming the change, `code` and `detail`.
+`rules` alone taken meanwhile lets go of the older rules kept. `rules`
+given with more are checked with the rest, then reach the running turn as
+rules alone do; a change refused reaches nothing. It answers `{bot,
+bot_id, running_turn, changed, configure_pending}`, `changed` naming the
+rules if they changed now and `configure_pending` the rest kept, which
+`inspect` shows as `configure_pending` and a durable `configure_pending`
+event tells (once per change). When the turn ends (an interrupted parked
+turn too), before the bot's next turn starts, and at the daemon's start
+for a turn that ended while it was down, the daemon takes it as
+`configure` takes a change, with the live `configured` event; a store
+refusing that write leaves it kept, and the bot's next turn waits for it
+as for a refused start. One that can no longer be taken (its provider gone
+from the config, say) is let go with a durable `configure_failed` event
+naming the change, `code` and `detail`.
 Otherwise the next turn sends the
 new instructions: the provider's cache of the old ones is not read again,
 replayed thinking written after them is withheld as when any context in

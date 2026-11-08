@@ -2103,7 +2103,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         .into_iter()
         .collect();
     for bot in service.kept.clone() {
-        service.take_configure(&bot).await?;
+        kept_for_start(service.take_configure(&bot).await)?;
     }
     // Forks whose time ran out while no daemon ran are deleted at once.
     service.plan_expiry(Duration::ZERO).await?;
@@ -3455,8 +3455,9 @@ impl Service {
             self.ready_hint = false;
             return Ok(());
         };
-        // One its last turn kept and no end took (a parked turn stopped,
-        // say) is taken before this one starts.
+        // One its last turn kept and no end took (a store that refused it
+        // then, say) is taken before this one starts; a store refusing it
+        // still leaves the turn ready, as a refused start does.
         self.take_configure(&bot).await?;
         let providers = self.providers.clone();
         match self
@@ -3666,8 +3667,9 @@ impl Service {
                 self.ready_hint = true;
                 self.steer_wakes.remove(&turn);
                 // Before the bot's next turn can start: it starts on what
-                // a `configure` during this one kept.
-                self.take_configure(&bot).await?;
+                // a `configure` during this one kept. A store refusing it
+                // now leaves it for that start, which waits on it.
+                kept_for_start(self.take_configure(&bot).await)?;
                 return Ok(());
             }
             // A wake-up may already have claimed the turn again.
@@ -3701,48 +3703,11 @@ impl Service {
         &mut self,
         bot: String,
         bot_id: Option<i64>,
-        mut change: Configure,
+        change: Configure,
     ) -> Result<Value> {
         // Said of this change alone, before one kept goes under it.
         if change.effort.is_some() && change.model.is_none() {
             return fail_with("invalid_effort", "effort goes with model");
-        }
-        // Rules given with more while a turn runs reach it at once, as
-        // rules alone do; the rest is kept for its end.
-        if !change.rules_only()
-            && let Some(rules) = change.settings.as_mut().and_then(|s| s.remove("rules"))
-        {
-            let name = bot.clone();
-            let running = self
-                .store
-                .read("configure_running", move |db| {
-                    db.identity(&name, bot_id)?;
-                    Ok(db.inspect(&name)?.running_turn.is_some())
-                })
-                .await?;
-            if running {
-                let rules = Configure {
-                    settings: Some(serde_json::Map::from_iter([("rules".to_owned(), rules)])),
-                    ..Configure::default()
-                };
-                if change
-                    .settings
-                    .as_ref()
-                    .is_some_and(serde_json::Map::is_empty)
-                {
-                    change.settings = None;
-                }
-                let live = Box::pin(self.configure(bot.clone(), bot_id, rules)).await?;
-                let mut kept = Box::pin(self.configure(bot, bot_id, change)).await?;
-                let mut changed = live["changed"].as_array().cloned().unwrap_or_default();
-                changed.extend(kept["changed"].as_array().cloned().unwrap_or_default());
-                kept["changed"] = changed.into();
-                return Ok(kept);
-            }
-            change
-                .settings
-                .get_or_insert_default()
-                .insert("rules".to_owned(), rules);
         }
         let rules_only = change.rules_only();
         // One kept before is older: this one goes over it, and both are
@@ -3920,74 +3885,107 @@ impl Service {
             .then_some(given.as_ref())
             .flatten()
             .map(|given| given.rules.clone().unwrap_or_default());
+        // Rules given with more while a turn runs reach it at once, as rules
+        // alone do, once the whole change is checked; the rest is kept.
+        let live = given_rules.as_ref().and(given.clone());
+        let mut rest = raw.clone();
+        if let Some(settings) = rest.get_mut("settings").and_then(Value::as_object_mut) {
+            settings.remove("rules");
+            if settings.is_empty()
+                && let Some(fields) = rest.as_object_mut()
+            {
+                fields.remove("settings");
+            }
+        }
         let bot_name = bot.clone();
         let answer = self
             .store
+            // All of it or none: a write refused partway leaves the bot
+            // as it was, and what was kept still kept.
             .op("configure", move |db| {
-                let id = db.identity(&bot, bot_id)?;
-                // While a turn runs, a parked one too, which reads the bot
-                // again when it resumes, the change is kept for its end:
-                // checked as the store would take it, then undone.
-                let running = match rules_only {
-                    true => None,
-                    false => db.inspect(&bot)?.running_turn,
-                };
-                let write = move |db: &mut agent_runtime::store::Database| {
-                    let mut changed: Vec<String> = Vec::new();
-                    // First: the changes that may be refused here.
-                    if let Some(gate) = gate
-                        && db.set_gate(&bot_name, Some(id), gate, declare.as_deref())?
-                    {
-                        changed.push("gates".into());
+                db.atomic(move |db| {
+                    let id = db.identity(&bot, bot_id)?;
+                    // While a turn runs, a parked one too, which reads the bot
+                    // again when it resumes, the change is kept for its end:
+                    // checked as the store would take it, then undone.
+                    let running = match rules_only {
+                        true => None,
+                        false => db.inspect(&bot)?.running_turn,
+                    };
+                    let write = move |db: &mut agent_runtime::store::Database| {
+                        let mut changed: Vec<String> = Vec::new();
+                        // First: the changes that may be refused here.
+                        if let Some(gate) = gate
+                            && db.set_gate(&bot_name, Some(id), gate, declare.as_deref())?
+                        {
+                            changed.push("gates".into());
+                        }
+                        let mut kin = Vec::new();
+                        if let Some(given) = &given {
+                            let (set, of_kin) =
+                                db.set_settings_of_kin(&bot_name, Some(id), &named, given)?;
+                            changed.extend(set);
+                            kin = of_kin;
+                        }
+                        if let Some((provider, name)) = &model
+                            && db.set_model(
+                                &bot_name,
+                                Some(id),
+                                provider,
+                                name,
+                                effort.as_deref(),
+                            )?
+                        {
+                            changed.push("model".into());
+                        }
+                        if let Some(instructions) = instructions
+                            && db.set_instructions(&bot_name, Some(id), &instructions)?
+                        {
+                            changed.push("instructions".into());
+                        }
+                        if let Some(declare) = &declare
+                            && db.set_declared(&bot_name, Some(id), declare)?
+                        {
+                            changed.push("declared".into());
+                        }
+                        if let Some(fallback) = &fallback
+                            && db.set_fallback(&bot_name, Some(id), fallback.as_deref())?
+                        {
+                            changed.push("fallback".into());
+                        }
+                        changed.extend(
+                            db.set_compaction(
+                                &bot_name,
+                                Some(id),
+                                compaction_instructions.as_ref().map(Option::as_deref),
+                                compaction_model.as_ref().map(Option::as_deref),
+                            )?
+                            .into_iter()
+                            .map(String::from),
+                        );
+                        Ok((changed, kin))
+                    };
+                    if let Some(turn) = running {
+                        db.trial(write)?;
+                        let (changed, kin) = match &live {
+                            Some(given) => db.set_settings_of_kin(
+                                &bot,
+                                Some(id),
+                                &["rules".to_owned()],
+                                given,
+                            )?,
+                            None => (Vec::new(), Vec::new()),
+                        };
+                        let mut kept = db.keep_configure(&bot, id, turn, &rest)?;
+                        kept["changed"] = json!(changed);
+                        return Ok((kept, kin));
                     }
-                    let mut kin = Vec::new();
-                    if let Some(given) = &given {
-                        let (set, of_kin) =
-                            db.set_settings_of_kin(&bot_name, Some(id), &named, given)?;
-                        changed.extend(set);
-                        kin = of_kin;
-                    }
-                    if let Some((provider, name)) = &model
-                        && db.set_model(&bot_name, Some(id), provider, name, effort.as_deref())?
-                    {
-                        changed.push("model".into());
-                    }
-                    if let Some(instructions) = instructions
-                        && db.set_instructions(&bot_name, Some(id), &instructions)?
-                    {
-                        changed.push("instructions".into());
-                    }
-                    if let Some(declare) = &declare
-                        && db.set_declared(&bot_name, Some(id), declare)?
-                    {
-                        changed.push("declared".into());
-                    }
-                    if let Some(fallback) = &fallback
-                        && db.set_fallback(&bot_name, Some(id), fallback.as_deref())?
-                    {
-                        changed.push("fallback".into());
-                    }
-                    changed.extend(
-                        db.set_compaction(
-                            &bot_name,
-                            Some(id),
-                            compaction_instructions.as_ref().map(Option::as_deref),
-                            compaction_model.as_ref().map(Option::as_deref),
-                        )?
-                        .into_iter()
-                        .map(String::from),
-                    );
-                    Ok((changed, kin))
-                };
-                if let Some(turn) = running {
-                    db.trial(write)?;
-                    return Ok((db.keep_configure(&bot, id, turn, &raw)?, Vec::new()));
-                }
-                let (changed, kin) = write(db)?;
-                // What was kept is taken with it; a change of rules alone
-                // lets go only of the older rules kept.
-                db.taken_configure(id, rules_only)?;
-                Ok((json!({"bot":bot,"bot_id":id,"changed":changed}), kin))
+                    let (changed, kin) = write(db)?;
+                    // What was kept is taken with it; a change of rules alone
+                    // lets go only of the older rules kept.
+                    db.taken_configure(id, rules_only)?;
+                    Ok((json!({"bot":bot,"bot_id":id,"changed":changed}), kin))
+                })
             })
             .await?;
         let (answer, kin) = answer;
@@ -4029,7 +4027,8 @@ impl Service {
     /// `configure` takes one; one still running keeps it. One that can no
     /// longer be taken (its model gone from the config, say) is let go,
     /// with a durable `configure_failed` saying why. A store that refuses
-    /// writes leaves it kept for the bot's next turn start.
+    /// writes leaves it kept and answers `storage_error`: no turn of the
+    /// bot starts until it is taken.
     async fn take_configure(&mut self, bot: &str) -> Result<()> {
         if !self.kept.contains(bot) {
             return Ok(());
@@ -4039,7 +4038,7 @@ impl Service {
             .await
         {
             Ok(_) => Ok(()),
-            Err(error) if error.code == "storage_error" => Ok(()),
+            Err(error) if error.code == "storage_error" => Err(error),
             Err(error) if error.code == "bot_not_found" => {
                 self.kept.remove(bot);
                 Ok(())
@@ -4056,7 +4055,7 @@ impl Service {
                 {
                     Err(error) if error.code == "storage_error" => {
                         self.kept.insert(bot.to_owned());
-                        Ok(())
+                        Err(error)
                     }
                     failed => failed,
                 }
@@ -5687,6 +5686,9 @@ impl Service {
                 self.wakes.cancel(turn);
                 self.steer_wakes.remove(&turn);
                 self.ready_hint = true;
+                // It ended here, with no task to finish: what a `configure`
+                // kept for its end is taken now.
+                kept_for_start(self.take_configure(&bot).await)?;
                 view(&reader, bot, true).await
             }
             Command::Shutdown { grace_ms } => {
@@ -5696,6 +5698,15 @@ impl Service {
                 Ok(json!({"shutting_down":true}))
             }
         }
+    }
+}
+
+/// A kept `configure` the store refused to take stays kept: the bot's next
+/// turn start takes it first, and waits while the store refuses.
+fn kept_for_start(taken: Result<()>) -> Result<()> {
+    match taken {
+        Err(error) if error.code == "storage_error" => Ok(()),
+        taken => taken,
     }
 }
 
@@ -6715,6 +6726,19 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(stale.code, "turn_not_found");
+        // A change while it waits parked is kept for its end.
+        let kept = service
+            .configure(
+                "Bob".into(),
+                None,
+                Configure {
+                    instructions: Some("new".into()),
+                    ..Configure::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(kept["configure_pending"], json!({"instructions": "new"}));
         let reply = service
             .dispatch(
                 Command::Interrupt {
@@ -6740,6 +6764,11 @@ mod tests {
                 let state = db.inspect("Bob")?;
                 assert_eq!(state.status, "interrupted");
                 assert_eq!(state.running_turn, None);
+                // Its end, here and with no task to finish, took the change.
+                assert_eq!(
+                    (state.instructions.as_str(), &state.configure_pending),
+                    ("new", &None)
+                );
                 let events = db.events("Bob", 0, 256)?;
                 let events = events["events"].as_array().unwrap();
                 assert_eq!(
@@ -7261,6 +7290,82 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_kept_configure_the_store_refuses_holds_the_next_turn_until_taken() {
+        let dir = std::env::temp_dir().join(format!("agent-kept-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let first = running(&store, &["Bob".into()]).await[0].1;
+        let mut service = bare_service(&store);
+        let kept = service
+            .configure(
+                "Bob".into(),
+                None,
+                Configure {
+                    instructions: Some("new".into()),
+                    ..Configure::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(kept["configure_pending"], json!({"instructions": "new"}));
+        // Its turn ends, and the next is in line, while the store refuses
+        // to take what was kept.
+        let next = store
+            .op("finish", move |db| {
+                turn::Finished::record(db, "Bob", first, None)?;
+                Ok(db
+                    .begin(
+                        "Bob",
+                        "second",
+                        "more",
+                        false,
+                        &TurnOptions {
+                            delivery: agent_runtime::store::Delivery::Queue,
+                            ..TurnOptions::default()
+                        },
+                        |_, _| Ok(()),
+                    )?
+                    .turn)
+            })
+            .await
+            .unwrap();
+        let status = |store: Store| async move {
+            store
+                .op("status", move |db| {
+                    let bob = db.inspect("Bob")?;
+                    Ok((
+                        db.turn_status("Bob", next)?,
+                        bob.instructions,
+                        bob.configure_pending,
+                    ))
+                })
+                .await
+        };
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_take BEFORE UPDATE OF configure_pending ON bots
+                 BEGIN SELECT RAISE(ABORT,'refused'); END;",
+            )
+            .unwrap();
+        let refused = service.start_ready().await.unwrap_err();
+        assert_eq!(refused.code, "storage_error");
+        // The next turn did not start on the old instructions: it waits.
+        let (waits, instructions, pending) = status(store.clone()).await.unwrap();
+        assert_eq!(waits, "ready");
+        assert_eq!((instructions.as_str(), pending.is_some()), ("", true));
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_take;")
+            .unwrap();
+        let _ = service.start_ready().await;
+        let (_, instructions, pending) = status(store.clone()).await.unwrap();
+        assert_eq!((instructions.as_str(), pending), ("new", None));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
