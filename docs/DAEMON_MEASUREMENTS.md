@@ -7601,3 +7601,42 @@ path changed: lone submit CPU 31.1 → 30.8 ms, burst submit p99 4.54 →
 4.52 ms, release to terminal p99 9.73 → 9.92 ms, idle RSS 15.2 → 15.3 MiB,
 CPU per turn 0.92 → 0.92 ms, lifecycle p95 turn 697 → 714 ms, the quiet
 window 1.54 → 1.34 ms/s.
+
+## A reply the model's cap cuts short (#822)
+
+The daemon no longer counts a reply's bytes as it streams: the per-delta
+encoded-length accounting and the per-item counts are gone, and a delta
+costs one length compare before it goes live (in 128 KiB pieces, so one
+piece for every real delta). An output item's start parses two fields of
+it, borrowed, to name what a cut reply was writing. A reply the cap cuts
+costs one store job, `drop_reply` (its `dropped` event, its round, the
+note to the model and the turn's `drops` count, in one commit); a kept
+reply's commit sets `drops` back with the update it already made, and a
+resumed turn reads it in the `context` query it already ran. A bot's
+`max_drops` setting is one more `Option` in its settings JSON. Nothing is
+added to submit, to an ordinary turn's store jobs, or to its events.
+
+The Perf workflow's matched screen of this change against its base
+(`bench.perf_gate`, GitHub runner, head 2fb9a56 against main a53e1eb): store
+work per turn is the same and the gate passed. Release to terminal p99 moved
++6.3% (9.73 to 10.35 ms) inside the runner's spread for it (#771's screen
+moved it -0.3%, #774's +0.0%), with CPU per turn -0.3%; every other daemon
+measure moved under 3%. Sonny's moves are on paths this change does not
+touch (its only change draws a notice on a `dropped` event).
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 30.75 | 31.036 | +0.9% |
+| admission | burst submit p99, ms | 4.566 | 4.497 | -1.5% |
+| completion | release to terminal p99, ms | 9.731 | 10.347 | +6.3% |
+| footprint | idle RSS, MiB | 15.342 | 15.248 | -0.6% |
+| footprint | per idle bot, KiB | 1.666 | 1.62 | -2.8% |
+| footprint | RSS after a turn each, MiB | 24.982 | 24.93 | -0.2% |
+| footprint | CPU per turn, ms | 0.929 | 0.926 | -0.3% |
+| sonny | lookout note p95 at 100x10, ms | 2437.0 | 2441.5 | +0.2% |
+| sonny | quiet window CPU, ms/s | 2.07 | 1.745 | -15.7% |
+| sonny | sky replay CPU per 1k lines, ms | 9.815 | 8.995 | -8.4% |
+| sonny | sky replay RSS, MiB | 88.45 | 74.25 | -16.1% |
+| lifecycle | CPU, s | 0.44 | 0.44 | +0.0% |
+| lifecycle | p95 turn, ms | 579.066 | 578.157 | -0.2% |
+| lifecycle | peak RSS, MiB | 22.469 | 22.502 | +0.1% |

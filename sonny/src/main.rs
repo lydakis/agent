@@ -9365,10 +9365,12 @@ impl App {
             }
             "dropped" => {
                 // The model's own output cap cut its reply short: the
-                // daemon dropped it, so what streamed of it goes too, and
-                // told the agent, whose next call streams afresh.
-                self.live = None;
+                // daemon kept none of it and told the agent, whose next
+                // call streams afresh. What was shown stays, as a retry's
+                // does, part of it in the scrollback already; the notice
+                // says the agent did not keep it.
                 self.live_item = None;
+                self.end_live(Words::Reply);
                 self.ahead.clear();
                 self.streamed = false;
                 self.said.clear();
@@ -9376,10 +9378,10 @@ impl App {
                 self.notice = Some(match data["in"].as_str() {
                     Some(what) => format!(
                         "the model's output limit cut its reply short while writing {what}; \
-                         the reply was dropped and the agent told"
+                         the agent did not keep it and was told"
                     ),
                     None => "the model's output limit cut its reply short; \
-                             the reply was dropped and the agent told"
+                             the agent did not keep it and was told"
                         .into(),
                 });
             }
@@ -18786,7 +18788,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reply_the_model_s_cap_cut_short_is_let_go_and_the_next_drawn() {
+    async fn a_reply_the_model_s_cap_cut_short_stays_as_shown_and_the_next_follows() {
         let client = daemon_with(json!({
             "3": {"type": "message", "role": "assistant",
                   "content": [{"type": "output_text", "text": "Written in parts."}]}
@@ -18801,13 +18803,19 @@ mod tests {
             (delta["item"], delta["text"]) = (json!(item), json!(text));
             delta
         };
-        app.daemon(said(1, "Here is the whole file at once")).await;
+        // Longer than half the screen, so part of it is in the scrollback
+        // before the cut.
+        let long: String = (0..40)
+            .map(|n| format!("Line {n} of the whole file\n"))
+            .collect();
+        app.daemon(said(1, &long)).await;
+        app.daemon(said(1, "and the last")).await;
         app.daemon(event(
             "dropped",
             json!({"limit": "max_tokens", "output_tokens": 32000, "in": "text"}),
         ))
         .await;
-        assert!(app.live.is_none() && app.said.is_empty());
+        assert!(app.live.is_none() && app.said.is_empty() && app.ahead.is_empty());
         assert!(
             app.notice
                 .as_deref()
@@ -18819,7 +18827,21 @@ mod tests {
         let drawn: Vec<String> = (app.pending.iter().chain(&open))
             .map(|line| line.to_string())
             .collect();
-        assert!(!drawn.iter().any(|l| l.contains("whole file")), "{drawn:?}");
+        // What was shown stays, once each, the last line too; the next
+        // reply follows it.
+        for n in [0, 39] {
+            let line = format!("Line {n} of the whole file");
+            assert_eq!(
+                drawn.iter().filter(|l| l.contains(&line)).count(),
+                1,
+                "{drawn:?}"
+            );
+        }
+        assert_eq!(
+            drawn.iter().filter(|l| l.contains("and the last")).count(),
+            1,
+            "{drawn:?}"
+        );
         assert_eq!(
             drawn
                 .iter()

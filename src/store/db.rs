@@ -7018,7 +7018,8 @@ impl Database {
                     AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
                     AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning)),
                     s.status='attached',length(s.images),
-                    length(CAST(s.prompt AS BLOB))+COALESCE(length(CAST(s.quotes AS BLOB)),0)
+                    length(CAST(s.prompt AS BLOB))+COALESCE(length(CAST(s.quotes AS BLOB)),0),
+                    s.expected_turn IS ?2 AND s.origin IS ?6
                  FROM (SELECT id FROM turns WHERE bot=?1 AND status='queued' AND delivery='steer'
                          AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
                        UNION ALL SELECT id FROM turns WHERE ?5 AND bot=?1 AND status='attached'
@@ -7032,15 +7033,25 @@ impl Database {
                 turn,
                 STEER_BATCH_ITEMS as i64,
                 through,
-                attached
+                attached,
+                LIMIT_ORIGIN
             ])?;
             let (mut bytes, mut picture_bytes) = (0, 0);
+            // Whether a steer for another folder, model or effort waits for
+            // a turn of its own: those after it wait behind it, in order,
+            // but for the daemon's note of a reply this turn dropped, a
+            // fact of this turn's own rounds, which has no later turn.
+            let mut waiting_behind = false;
             while let Some(row) = rows.next()? {
                 let size = row.get::<_, i64>(2)? as usize;
                 // Its words with the words it quotes, which it takes in too.
                 let held = row.get::<_, i64>(6)? as usize;
                 if !row.get::<_, bool>(3)? {
-                    break;
+                    waiting_behind = true;
+                    continue;
+                }
+                if waiting_behind && !row.get::<_, bool>(7)? {
+                    continue;
                 }
                 if size > STEER_BATCH_BYTES.saturating_sub(bytes) {
                     // An oversized store-level prompt must not spin forever.
