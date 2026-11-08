@@ -9879,23 +9879,25 @@ impl App {
         };
         let project = &project;
         // A lead marks itself done, naming no task, up to the turn that
-        // marks it, which ending leaves it done.
-        let lead = match self.options.side.is_some() {
+        // marks it, which ending leaves it done, its questions set aside.
+        // A side chat marks the lead it came from as a lead marks a task.
+        let side = self.options.side.is_some();
+        let lead = match side {
             true => side_source(&self.bot).map(str::to_owned),
             false => Some(self.bot.clone()),
         };
-        if let (Some(lead), Some(turn)) = (lead, turn)
-            && project::is_lead(&lead)
-            && resolved::itself(arguments, &lead)
-        {
-            if (now || !resolved::made_by(&self.store(), &lead, call))
-                && let Err(error) = resolved::keep(&self.store(), &lead, turn, call)
+        let lead = lead.filter(|lead| project::is_lead(lead) && resolved::itself(arguments, lead));
+        if let (Some(lead), Some(turn), false) = (&lead, turn, side) {
+            if (now || !resolved::made_by(&self.store(), lead, call))
+                && let Err(error) = resolved::keep(&self.store(), lead, turn, call)
             {
                 self.notice = Some(error);
             }
+            self.set_aside_own();
             return;
         }
-        let (Some(task), Some(turn)) = (resolved::call(arguments, project), turn) else {
+        let (Some(task), Some(turn)) = (lead.or_else(|| resolved::call(arguments, project)), turn)
+        else {
             return;
         };
         if !now && resolved::made_by(&self.store(), &task, call) {
@@ -13564,21 +13566,27 @@ impl App {
             return;
         }
         if asks::moves_on(message, from) {
-            // Words to this agent go past its own questions, not its
-            // tasks': those wait on the person still.
-            let (tasks, own): (Vec<_>, Vec<_>) =
-                (std::mem::take(&mut self.asks).into_iter()).partition(|ask| ask.task.is_some());
-            self.asks = tasks;
-            let keys: Vec<String> = own.iter().map(asks::Ask::key).collect();
-            self.aside.extend(own);
-            for key in keys {
-                self.draw_card(&key);
-            }
+            self.set_aside_own();
         } else if let Some(id) = asks::answer_of(message, from)
             && let Some((_, answer)) = asks::split(message)
         {
             let id = id.to_owned();
             self.settle(&id, asks::State::Answered(answer.trim().to_owned()));
+        }
+        self.settle_asks();
+    }
+
+    /// This agent's own open questions set aside, as words past them or
+    /// its marking itself done leave them; its tasks' wait on the person
+    /// still.
+    fn set_aside_own(&mut self) {
+        let (tasks, own): (Vec<_>, Vec<_>) =
+            (std::mem::take(&mut self.asks).into_iter()).partition(|ask| ask.task.is_some());
+        self.asks = tasks;
+        let keys: Vec<String> = own.iter().map(asks::Ask::key).collect();
+        self.aside.extend(own);
+        for key in keys {
+            self.draw_card(&key);
         }
         self.settle_asks();
     }
@@ -22733,15 +22741,36 @@ mod tests {
         app.bot = "calc.lead".into();
         app.project = Some("calc".into());
         app.options.store = dir.join("store");
-        // Naming no task, a lead marks itself, up to the turn that marks it.
+        // Naming no task, a lead marks itself, up to the turn that marks
+        // it, its own open question set aside.
+        app.asked("q1", Some(11), &json!({"question": "Tag it?"}));
+        assert_eq!(app.asks.len(), 1);
         app.resolve(&json!({}), "c1", Some(12), true).await;
         assert_eq!(resolved::read(&app.store(), "calc.lead"), Some(12));
         assert!(resolved::made_by(&app.store(), "calc.lead", "c1"));
+        assert!(app.asks.is_empty());
+        assert_eq!(app.aside.len(), 1);
+        // Another lead's name is that lead, never this one.
+        app.bot = "shop.web.lead".into();
+        app.project = Some("shop.web".into());
+        app.resolve(&json!({"task": "web.lead"}), "c4", Some(14), true)
+            .await;
+        assert_eq!(resolved::read(&app.store(), "shop.web.lead"), None);
+        app.bot = "calc.lead".into();
+        app.project = Some("calc".into());
         // An outer lead names a lead as it is, up to its newest turn ended.
         app.resolve(&json!({"task": "web.lead"}), "c2", Some(13), true)
             .await;
         assert_eq!(resolved::read(&app.store(), "web.lead"), Some(7));
         assert_eq!(resolved::read(&app.store(), "calc.web.lead"), None);
+        // A side chat marks the lead it came from up to that lead's newest
+        // turn ended, not the side chat's own turn.
+        app.bot = "web.lead.side-1a".into();
+        app.project = None;
+        app.options.side = Some(1);
+        app.options.store = dir.join("side-store");
+        app.resolve(&json!({}), "c3", Some(20), true).await;
+        assert_eq!(resolved::read(&app.store(), "web.lead"), Some(7));
         let _ = std::fs::remove_dir_all(dir);
     }
 
