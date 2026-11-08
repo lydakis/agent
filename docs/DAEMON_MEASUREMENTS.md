@@ -7908,3 +7908,61 @@ A follow now adds one hash insert, and a session that follows by name holds
 one set of those names; neither shows past the runner's noise. The per idle
 bot row moved the other way on #827's screen, which changed nothing per
 bot, and the idle and after-a-turn RSS fell here.
+
+## Each bot carries its whole status (protocol 58, schema 88, #658)
+
+A bot's row now says what its turn is doing (`started_ms`, `waiting_on`,
+`held`) and how its newest turn that counts ended (`last`), kept in the
+commit of each transition. Starting, parking, resuming and finishing a turn
+widen the update of the bot row each already made: no statement is added
+(finishing keeps the newer of two endings with `CASE`s in its one update).
+A hold and an ending in line, which did not touch the row, add one update by
+name in their own commit. `bots` reads seven more columns a row and returns
+the events' cursor, one read of the events' sequence.
+
+Who gains is a client that shows the fleet. Sonny's `/status` asked every
+agent for its last eight turns at each refresh; it now reads each agent's
+turn from the listing. Measured on a store of one lead with N tasks of three
+finished turns each (fixture provider, release builds of main d34479c and
+this change, 4-core Linux cloud container, one run each, medians of the
+refreshes after the first):
+
+| Agents | `/status` refresh, main | This change | First refresh, main | This change | `bots` listing, main | This change |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 11 | 2.9 ms | 0.9 ms | 18 ms | 17 ms | 0.40 ms | 0.57 ms |
+| 101 | 27 ms | 4.0 ms | 135 ms | 102 ms | 3.0 ms | 4.2 ms |
+| 1,001 | 333 ms | 48 ms | 1.71 s | 1.27 s | 21 ms | 26 ms |
+| 4,001 | 1.48 s | 189 ms | 6.84 s | 5.32 s | 111 ms | 97 ms |
+
+A refresh is 3 to 8 times faster, and the gain grows with the fleet: the
+per-agent `turns` reads it no longer makes cost about 0.3 ms an agent
+(298 ms at 1,001, 1.27 s at 4,001, measured alone). The listing grew about
+30% in bytes (530 to 691 KB at 1,001 agents, for `last` and the new keys)
+and up to a millisecond a page to read. The first refresh still reads every
+agent's latest history items and asks once per agent what its last turn left
+open, so it keeps most of its cost: that is Sonny's to bound next, by keeping
+what it read across windows and reading what moved off the loop.
+
+The matched hot-path screen against main (Perf workflow on 0cb264e, base
+3b3a00f, GitHub's shared runner) adds no store work per turn, which it
+counts and would fail on:
+
+| Bench | Measure | main | This change | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 32.12 | 32.37 | +0.8% |
+| admission | burst submit p99, ms | 4.63 | 4.64 | +0.2% |
+| completion | release to terminal p99, ms | 10.25 | 10.40 | +1.5% |
+| footprint | idle RSS, MiB | 15.30 | 15.48 | +1.2% |
+| footprint | per idle bot, KiB | 1.63 | 1.44 | -11.6% |
+| footprint | RSS after a turn each, MiB | 25.38 | 25.16 | -0.9% |
+| footprint | CPU per turn, ms | 0.965 | 0.985 | +2.0% |
+| lifecycle | CPU, s | 0.465 | 0.465 | +0.0% |
+| lifecycle | p95 turn, ms | 922.7 | 741.9 | -19.6% |
+| lifecycle | peak RSS, MiB | 23.75 | 23.63 | -0.5% |
+
+Seven more columns on a bot row cost nothing a turn can see: every move is
+inside the runner's noise. The screen warned once, on the lookout's CPU per
+1,000 deltas at 100 leads of 10 tasks (5.25 to 6.5 ms), a Sonny companion
+this change does not touch past one listing at its start: that measure moves
+in steps of 1.25 ms (one 10 ms CPU tick over 8,000 deltas), and the 10x10
+row moved the same one step while the 10x100 row barely moved.
