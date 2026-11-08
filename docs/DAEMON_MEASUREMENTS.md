@@ -7887,3 +7887,24 @@ About 1 µs per close, growing only with the hash maps' size. Memory: one
 set per session that follows a bot by name, holding those names.
 `a_session_closing_costs_the_same_however_many_bots_others_follow` times
 8,000 and 16,000; with the full scan back it fails.
+
+The Perf workflow's matched screen, base main d34479c against the PR head
+65ca5c1, on the GitHub runner (2026-11-08), passed:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 39.299 | 39.943 | +1.6% |
+| admission | burst submit p99, ms | 6.847 | 6.873 | +0.4% |
+| completion | release to terminal p99, ms | 14.257 | 14.092 | -1.2% |
+| footprint | idle RSS, MiB | 15.412 | 15.242 | -1.1% |
+| footprint | per idle bot, KiB | 1.528 | 1.64 | +7.3% |
+| footprint | RSS after a turn each, MiB | 25.035 | 24.707 | -1.3% |
+| footprint | CPU per turn, ms | 1.302 | 1.304 | +0.2% |
+| lifecycle | CPU, s | 0.615 | 0.615 | +0.0% |
+| lifecycle | p95 turn, ms | 580.032 | 582.222 | +0.4% |
+| lifecycle | peak RSS, MiB | 22.73 | 22.822 | +0.4% |
+
+A follow now adds one hash insert, and a session that follows by name holds
+one set of those names; neither shows past the runner's noise. The per idle
+bot row moved the other way on #827's screen, which changed nothing per
+bot, and the idle and after-a-turn RSS fell here.
