@@ -5696,7 +5696,8 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
     }
     // A done lead's automations wait for a message to reopen it; one the
     // person runs now runs. Only a lead costs a look at its newest turn,
-    // and one that can't be looked at runs as ever.
+    // and one whose turns or history can't be read is not run on a guess:
+    // the fire fails saying so, and the next one looks again.
     if !asked
         && let Target::Bot { name, .. } = &trigger.target
         && crate::project::is_lead(name)
@@ -5705,12 +5706,20 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
         let store = (trigger.daemon.store.as_deref()).map(|store| {
             agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_owned())
         });
-        if let Ok(Some(why)) = with_daemon(trigger, async |c| {
+        match with_daemon(trigger, async |c| {
             lead_paused(c, store.as_deref(), name).await
         }) {
-            let paused = named(json!({"outcome": "paused", "detail": why}));
-            settle(places, trigger, &paused, &kept);
-            return;
+            Ok(Ok(Some(why))) => {
+                let paused = named(json!({"outcome": "paused", "detail": why}));
+                settle(places, trigger, &paused, &kept);
+                return;
+            }
+            Ok(Err(why)) => {
+                let failed = named(json!({"outcome": "failed", "detail": why}));
+                settle(places, trigger, &failed, &kept);
+                return;
+            }
+            _ => {}
         }
     }
     let mut why = match asked {
@@ -5904,19 +5913,31 @@ const PAUSE_LOOK: std::time::Duration = std::time::Duration::from_secs(5);
 /// Why the lead `name`'s automations wait now: its mark beside `store`
 /// says it is done and no turn of its since reopened it, or its newest
 /// turn that ran, past messages steered into it, marked it done, which a
-/// window keeps only once one is open. None when it isn't, or its turns
-/// can't be read.
-async fn lead_paused(client: &Client, store: Option<&Path>, name: &str) -> Option<String> {
-    let ran = crate::last_ran(client, name, None).await.ok()?;
+/// window keeps only once one is open. None when it isn't; why not, when
+/// its turns or history can't be read to tell.
+async fn lead_paused(
+    client: &Client,
+    store: Option<&Path>,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let unread = || format!("whether {name} is done could not be read, so this did not run");
+    let ran = match crate::last_ran(client, name, None).await {
+        Ok(ran) => ran,
+        // A lead that is gone is not paused: the fire finds it gone, and a
+        // repeating automation retires as ever.
+        Err(error) if error.code == "bot_not_found" => return Ok(None),
+        Err(_) => return Err(unread()),
+    };
     let newest = ran["turn"].as_i64();
     let mark = store.and_then(|store| crate::resolved::read(store, name));
     // Its history is read only when no mark says it already.
-    let itself = !crate::resolved::holds(mark, newest, false)
-        && match newest {
-            Some(turn) => crate::needs::resolved_turn(client, name, turn).await,
-            None => false,
-        };
-    crate::resolved::paused(name, mark, newest, itself)
+    let itself = match (crate::resolved::holds(mark, newest, false), newest) {
+        (false, Some(turn)) => crate::needs::resolved_turn(client, name, turn)
+            .await
+            .ok_or_else(unread)?,
+        _ => false,
+    };
+    Ok(crate::resolved::paused(name, mark, newest, itself))
 }
 
 /// Wait while `trigger`'s daemon is paused. A daemon that does not answer
@@ -8828,28 +8849,77 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("sonny-lead-paused-{}", std::process::id()));
         let store = dir.join("store");
         // Not marked: it runs.
-        assert_eq!(lead_paused(&client, Some(&store), "web.lead").await, None);
+        assert_eq!(
+            lead_paused(&client, Some(&store), "web.lead").await,
+            Ok(None)
+        );
         crate::resolved::keep(&store, "web.lead", 9, "c1").unwrap();
         let why = lead_paused(&client, Some(&store), "web.lead")
             .await
+            .unwrap()
             .unwrap();
         assert!(why.contains("web.lead is done"), "{why}");
         // A message reopened it: it runs again.
         newest.store(10, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(lead_paused(&client, Some(&store), "web.lead").await, None);
+        assert_eq!(
+            lead_paused(&client, Some(&store), "web.lead").await,
+            Ok(None)
+        );
         // It marked itself done again, headless: its history says so.
         newest.store(11, std::sync::atomic::Ordering::SeqCst);
         assert!(
             lead_paused(&client, Some(&store), "web.lead")
                 .await
+                .unwrap()
                 .is_some()
         );
         // With no store named too.
-        assert!(lead_paused(&client, None, "web.lead").await.is_some());
+        assert!(
+            lead_paused(&client, None, "web.lead")
+                .await
+                .unwrap()
+                .is_some()
+        );
         // A message steered into the turn that marked it reopens nothing.
         newest.store(12, std::sync::atomic::Ordering::SeqCst);
-        assert!(lead_paused(&client, None, "web.lead").await.is_some());
+        assert!(
+            lead_paused(&client, None, "web.lead")
+                .await
+                .unwrap()
+                .is_some()
+        );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_lead_whose_history_cannot_be_read_is_not_taken_as_open() {
+        // Its newest turn is listed, but reading what it did fails: it may
+        // have marked itself done, so its automation does not run on a guess.
+        let client = crate::tests::daemon_answering(|request| match request["op"].as_str() {
+            Some("turns") => json!({"turns": [{"turn": 11}]}),
+            Some("history_nodes") => json!({"nodes": [{"node": 41, "turn": 11}]}),
+            Some("history_items") => json!({"error": "storage_error", "detail": "a failed read"}),
+            _ => json!({}),
+        })
+        .await;
+        let why = lead_paused(&client, None, "web.lead").await.unwrap_err();
+        assert!(
+            why.contains("whether web.lead is done could not be read"),
+            "{why}"
+        );
+        // Nor when its turns can't be listed.
+        let client = crate::tests::daemon_answering(
+            |_| json!({"error": "storage_error", "detail": "a failed read"}),
+        )
+        .await;
+        assert!(lead_paused(&client, None, "web.lead").await.is_err());
+        // A lead that is gone is no unread one: the fire goes on to find it
+        // gone, which retires a repeating automation.
+        let client = crate::tests::daemon_answering(
+            |_| json!({"error": "bot_not_found", "detail": "no bot named web.lead"}),
+        )
+        .await;
+        assert_eq!(lead_paused(&client, None, "web.lead").await, Ok(None));
     }
 
     #[test]

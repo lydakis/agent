@@ -7020,21 +7020,28 @@ impl App {
                     // A turn that ended on a question waits on the person;
                     // read once per turn it ended.
                     if let (true, Some(last)) = (started::settled(&state), turn["turn"].as_i64()) {
+                        // One that could not be read whole is neither kept
+                        // nor taken as asking nothing: read again next pass,
+                        // keeping what it asked meanwhile.
                         let seen = match self.asks_seen.get(&bot) {
-                            Some((at, seen)) if *at == last => seen.clone(),
+                            Some((at, seen)) if *at == last => Some(seen.clone()),
                             _ => {
-                                let seen = self.scan(&bot, Some(last)).await;
-                                self.asks_seen.insert(bot.clone(), (last, seen.clone()));
+                                let seen = needs::scan(&self.client, &bot, Some(last)).await;
+                                if let Some(seen) = &seen {
+                                    self.asks_seen.insert(bot.clone(), (last, seen.clone()));
+                                }
                                 seen
                             }
                         };
-                        // A task's own mark holds once its turn completed.
-                        done = (seen.itself && turn["status"] == "completed")
-                            || resolved::holds(resolved::read(&store, &bot), seen.turn, false);
-                        // One the lead resolved set its question aside.
-                        needs.asked(&bot, seen.open(&store, &bot, false));
-                        ended.push(bot.clone());
-                        asked.push(bot.clone());
+                        if let Some(seen) = seen {
+                            // A task's own mark holds once its turn completed.
+                            done = (seen.itself && turn["status"] == "completed")
+                                || resolved::holds(resolved::read(&store, &bot), seen.turn, false);
+                            // One the lead resolved set its question aside.
+                            needs.asked(&bot, seen.open(&store, &bot, false));
+                            ended.push(bot.clone());
+                            asked.push(bot.clone());
+                        }
                     }
                     read.push(bot.clone());
                     // One not read again this pass waits on what it asked.
@@ -10373,14 +10380,6 @@ impl App {
         {
             running.started = began;
         }
-    }
-
-    /// What `bot`'s newest 400 nodes say: the oldest question it asked and
-    /// has no answer to, and whether its turn `last` resolved it.
-    async fn scan(&self, bot: &str, last: Option<i64>) -> Seen {
-        needs::scan(&self.client, bot, last)
-            .await
-            .unwrap_or_default()
     }
 
     /// An agent's latest step, as a line; the pull request its latest
@@ -17458,6 +17457,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_question_read_cut_short_after_its_listing_is_never_kept() {
+        // The listing comes back, then reading its items fails: what was
+        // read may lack the open question, so it is kept for none, and the
+        // next refresh reads again.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let broken = Arc::new(AtomicBool::new(true));
+        let failing = broken.clone();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => json!({"bots": [{"name": "shop.t1", "bot_id": 1, "head": 1,
+                "status": "completed", "running_turn": null,
+                "last": {"turn": 1, "status": "completed"}}], "next_after": null}),
+                    "history_nodes" => {
+                        json!({"nodes": [{"node": 2, "turn": 1}, {"node": 1, "turn": 1}],
+                            "next_from": null})
+                    }
+                    "history_items" if failing.load(Ordering::SeqCst) => {
+                        json!({"error": "storage_error", "detail": "a failed read"})
+                    }
+                    "history_items" => json!({"items": [
+                        {"node": 2, "item": {"type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": "done"}]}},
+                        {"node": 1, "item": {"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": "go"}]}}]}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.status_rows().await.unwrap();
+        assert!(!app.asks_seen.contains_key("shop.t1"));
+        broken.store(false, Ordering::SeqCst);
+        app.status_rows().await.unwrap();
+        assert!(app.asks_seen.contains_key("shop.t1"));
+    }
+
+    #[tokio::test]
     async fn a_lead_window_reads_its_agents_histories_before_status_opens() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let histories = Arc::new(AtomicUsize::new(0));
@@ -21245,6 +21283,46 @@ mod tests {
         app.read_tasks().await;
         let rows = drawn(&mut app);
         assert_eq!(rows[1], "  ● many  working  Fix many");
+    }
+
+    #[tokio::test]
+    async fn a_roster_read_cut_short_keeps_no_answer_for_its_task() {
+        // The task's turn ended; reading what it said fails partway: the
+        // roster keeps nothing for that turn, and its next pass reads again.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let broken = Arc::new(AtomicBool::new(true));
+        let failing = broken.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("approvals") => json!({"approvals": []}),
+            Some("inspect") => json!({"name": "calc.add", "running_turn": null}),
+            Some("turns") => json!({"turns": [{"turn": 1, "status": "completed",
+                "started_ms": 5, "finished_ms": 6}], "next_before": null, "next_after": null}),
+            Some("history_nodes") => json!({"nodes": [{"node": 2, "turn": 1}], "next_from": null}),
+            Some("history_items") if failing.load(Ordering::SeqCst) => {
+                json!({"error": "storage_error", "detail": "a failed read"})
+            }
+            Some("history_items") => json!({"items": [{"node": 2, "item": {"type": "message",
+                "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        let arguments = json!({"name": "add", "brief": "Fix add"});
+        app.commit_call(
+            "c",
+            Some(1),
+            served::START,
+            &arguments,
+            "turn:calc.add/1",
+            false,
+        );
+        app.read_tasks().await;
+        assert!(!app.asks_seen.contains_key("calc.add"));
+        broken.store(false, Ordering::SeqCst);
+        app.tasks_read = None;
+        app.read_tasks().await;
+        assert!(app.asks_seen.contains_key("calc.add"));
     }
 
     #[tokio::test]
