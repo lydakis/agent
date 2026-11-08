@@ -259,8 +259,8 @@ and a project file names it for its lead:
 Sonny ships one such profile, `superlead` ([agents/superlead.md](agents/superlead.md)),
 written to `~/.agents/agents` beside the others and used by no lead
 unless a project sets `profile = "superlead"`. It builds on the lead's:
-the folder holds other projects, so the lead subscribes to their leads
-and to every source you set up, and routes work and answers between
+the folder holds other projects, so the lead follows their leads
+and every source you set up, and routes work and answers between
 them as it does between tasks. Sonny
 itself knows only leads and tasks.
 
@@ -943,7 +943,7 @@ way `/react` does, and each note in the margin has its own `↩`.
   `✗ 1` with a red `✗`, left of the `↻`, and a click on either opens
   `/background`. An agent sees the same in its `automations` tool, whose rows
   say how the turn their last run sent ended. Automations and follows are
-  what the agents' `automations` and `subscriptions` tools make.
+  what the agents' `automations` and `follows` tools make.
 
   ![/background listing a nightly run whose turn failed offline and a server the cleanup could not read](../docs/sonny/background-failed.png)
 
@@ -1276,7 +1276,7 @@ way `/react` does, and each note in the margin has its own `↩`.
 Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
 person sees, as a checklist), `margin` (notes beside the conversation),
-`mark_done`, `subscriptions`, `show_agent` and
+`mark_done`, `follows`, `show_agent` and
 `run_in_pane`, `start_task` and `remove_task`; a lead's own, which its
 tasks never take, is `new_project`. The daemon shows them to
 the model and records each call: `plan` and `mark_done` run nothing,
@@ -1299,7 +1299,7 @@ lead's Sonny keeps each task the lead marked done beside the store
 (`state.sqlite.resolved/`), with the task's newest turn finished by then: a
 turn of the task numbered after that one reopens it.
 
-![A lead starting a task, subscribing, a show_agent call refused with its reason, and a discard the person allowed](../docs/sonny/served-tools.png)
+![A lead starting a task, following, a show_agent call refused with its reason, and a discard the person allowed](../docs/sonny/served-tools.png)
 
 ![A decision the lead asked with the ask tool, drawn where it asked it, its code, bold, math and links read as Markdown](../docs/sonny/ask-markdown.png)
 
@@ -1386,14 +1386,14 @@ their approvals, even with its network on.
 [docs/SONNY.md](../docs/SONNY.md) has the details of automations, memory,
 skills and MCP.
 Sonny starts its lookout, `sonny lookout`, when it opens a project: one
-for the daemon, watching for every bot that subscribed, and Sonny
-subscribes each lead to its tasks. As soon as news settles, it tells the
+for the daemon, watching for every bot that follows others, and Sonny
+has each lead follow its tasks. As soon as news settles, it tells the
 lead every message someone else wrote in its tasks and how each turn
 ended, in one "Task updates" note, by the handles its wait tool reads them
 with, as a steer: the note joins the lead's running turn, or starts one,
 and the lead decides what matters. A turn a note started that ends with
 nothing to say stays folded under the note, with no sound. Any agent can
-subscribe to more with its `subscriptions` tool (other agents' tasks, bots
+follow more with its `follows` tool (other agents' tasks, bots
 by name, sources outside such as a chat you poll, questions of its own),
 and `/background` lists what it watches;
 see [docs/LOOKOUT.md](../docs/LOOKOUT.md). The lookout only watches and

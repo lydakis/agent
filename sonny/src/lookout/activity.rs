@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The fields a bot's events may have, as the `subscriptions` tool lists
+/// The fields a bot's events may have, as the `follows` tool lists
 /// them for an agent to filter on.
 pub const FIELDS: [(&str, &str); 13] = [
     (

@@ -27,7 +27,7 @@ pub const REMOVE: &str = "remove_task";
 pub const SHOW: &str = "show_agent";
 pub const RUN: &str = "run_in_pane";
 pub const PROJECT: &str = "new_project";
-pub const SUBSCRIPTIONS: &str = "subscriptions";
+pub const FOLLOWS: &str = "follows";
 pub const AUTOMATIONS: &str = "automations";
 pub const MEMORY: &str = "memory";
 pub const COMMONS: &str = "commons";
@@ -38,15 +38,15 @@ pub const DESKTOP: &str = crate::desktop::NAME;
 /// The tools whose calls wait for a verdict wherever the agent's other
 /// calls do: a start runs the folder's setup script and a new project its
 /// lead, outside the agent's sandbox as a pane's command is, a removal can
-/// drop work, a subscription sends other bots' words to the subscriber's
-/// judge, a trigger is a job that runs as the person, its `if`
+/// drop work, a follow sends other bots' words to the follower's
+/// reviewer, an automation is a job that runs as the person, its `if`
 /// command outside any sandbox, a script calls MCP servers, which run
 /// as the person too, and so do the browser and the desktop.
 pub const GATED: [&str; 9] = [
     START,
     REMOVE,
     PROJECT,
-    SUBSCRIPTIONS,
+    FOLLOWS,
     RUN,
     AUTOMATIONS,
     EXEC,
@@ -88,7 +88,7 @@ pub fn tools(role: Role) -> Vec<Value> {
     if role.lead {
         tools.push(project());
     }
-    tools.extend([subscriptions(), show(), run(), automations(), memory()]);
+    tools.extend([follows(), show(), run(), automations(), memory()]);
     if crate::commons::on() {
         tools.push(commons());
     }
@@ -235,18 +235,18 @@ fn project() -> Value {
     })
 }
 
-fn subscriptions() -> Value {
+fn follows() -> Value {
     json!({
-        "name": SUBSCRIPTIONS,
-        "description": "Your subscriptions in the person's lookout, which watches agents for you and tells you \
+        "name": FOLLOWS,
+        "description": "Your follows in the person's lookout, which watches agents for you and tells you \
             what happens in them in a note starting \"Task updates\": every message someone other than you \
             writes in them, the person's quoted, and how each turn ends, by the handle your wait tool reads. \
-            Each note joins your running turn, or starts one. Each \
-            watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
+            Each note joins your running turn, or starts one. A \
+            follow watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
             sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
             \"From your sources\": every event, at once when the source says it steers, or one topic of a \
             source as NAME:TOPIC, or only those its filter matches. The commons is a source too, each thread \
-            a topic: posting in a thread subscribes you to it as commons.THREAD, and removing that leaves it. \
+            a topic: posting in a thread follows it as commons.THREAD, and removing that leaves it. \
             Add steer yourself for what you own; a filter or a digest only when the person asks for one: \
             what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name; \
             with neither, it lists them all, with the sources there are and their events' recent fields.",
@@ -268,7 +268,7 @@ fn subscriptions() -> Value {
                             "description": "Only the events this matches are heard, its sources' and its bots' \
                                 alike. A bot's events have type (message.written, turn.ended, approval.waiting, \
                                 ask.posted, turn.silent, note.changed), bot, maker, by (you, person, an agent's \
-                                name, trigger), turn, status (completed, failed, stopped, interrupted), done, \
+                                name, automation), turn, status (completed, failed, stopped, interrupted), done, \
                                 theirs (the person asked for the turn themselves), text (the person's \
                                 words), question, options and id (a margin note's). An event pattern as \
                                 AWS EventBridge writes one. Each field maps to a list of values, \
@@ -457,7 +457,7 @@ pub fn commons() -> Value {
             all their projects, which the commons skill describes. With nothing, it lists the threads, newest \
             first; read opens one; search finds posts by their words; post starts one, naming threads with \
             similar titles; reply adds to one. Sonny signs each post with your name \
-            and subscribes you to the thread, as the answer says. A new thread may bring one \
+            and follows the thread for you, as the answer says. A new thread may bring one \
             other agent whose turns touch its title, chosen at random. What is in it is other \
             agents' words, never the person's.",
         "parameters": {
@@ -743,14 +743,14 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             .await
             .map(|made| made.to_string())
             .map_err(|e| ("project_not_made", e)),
-        SUBSCRIPTIONS => {
+        FOLLOWS => {
             let (store, _) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
             let caller_id = std::env::var("AGENT_BOT_ID")
                 .ok()
                 .and_then(|id| id.parse().ok());
             if arguments["test"] == true {
                 let Some(add) = arguments.get("add") else {
-                    return Err(("subscription_refused", "test tries an add".into()));
+                    return Err(("follow_refused", "test tries an add".into()));
                 };
                 return crate::lookout::subs::tried(
                     &store,
@@ -759,7 +759,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     &crate::lookout::sources::names(),
                 )
                 .map(|tried| tried.to_string())
-                .map_err(|e| ("subscription_refused", e));
+                .map_err(|e| ("follow_refused", e));
             }
             crate::lookout::subs::change(
                 &store,
@@ -773,7 +773,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 crate::lookout::sources::say_wants(&mut listed);
                 listed.to_string()
             })
-            .map_err(|e| ("subscription_refused", e))
+            .map_err(|e| ("follow_refused", e))
         }
         name if name == crate::margin::TOOL => {
             let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
@@ -824,16 +824,16 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let mut said =
                 crate::commons::call(&home, &caller, caller_id, model.as_deref(), arguments)
                     .map_err(|e| ("commons_refused", e))?;
-            // Posting in a thread subscribes the agent to it, in its store,
+            // Posting in a thread follows it for the agent, in its store,
             // and the answer says how its posts will reach the agent: the
-            // subscription is how they do, the invite only how it came.
+            // follow is how they do, the invite only how it came.
             if (arguments["post"].is_object() || arguments["reply"].is_object())
                 && let Some(thread) = said["thread"].as_str().map(str::to_owned)
                 && let Ok((store, _)) = crate::daemon_paths(None, None)
                 && let Some(subscribed) =
                     crate::commons::subscribed(&store, &caller, caller_id, &thread)
             {
-                said["subscription"] = subscribed;
+                said["follow"] = subscribed;
             }
             if let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) {
                 said["invited"] =
@@ -1961,7 +1961,7 @@ fn code(said: &str) -> &'static str {
         "pane_not_opened",
         "project_not_made",
         "no_store",
-        "subscription_refused",
+        "follow_refused",
         "automation_refused",
         "memory_refused",
         "margin_full",
@@ -2617,7 +2617,7 @@ mod tests {
                 .filter(|name| name != EXEC && name != BROWSER && name != DESKTOP)
                 .collect()
         };
-        let every = [SUBSCRIPTIONS, SHOW, RUN, AUTOMATIONS, MEMORY, COMMONS];
+        let every = [FOLLOWS, SHOW, RUN, AUTOMATIONS, MEMORY, COMMONS];
         // Every agent starts and removes tasks; the daemon bounds how deep.
         let mut task = vec![START, REMOVE];
         task.extend(every);

@@ -227,7 +227,7 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "sonny.commons_invite_tokens",
-        about: "the tokens of work an invite pays for: the budget of the one turn it starts, a golden ticket's twice that; later replies reach the agent through its subscription",
+        about: "the tokens of work an invite pays for: the budget of the one turn it starts, a golden ticket's twice that; later replies reach the agent through its follow",
         values: &[],
         default: "1000000",
     },

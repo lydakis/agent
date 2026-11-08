@@ -722,7 +722,7 @@ async fn judge(
                     })
                 })
                 .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| Unreviewed::Failed("the judge's answer did not parse".into()))?;
+                .ok_or_else(|| Unreviewed::Failed("the reviewer's answer did not parse".into()))?;
             Ok((verdicts, usage))
         }
     }
@@ -2002,14 +2002,14 @@ mod tests {
 
     #[test]
     fn a_review_that_failed_hands_the_call_to_the_person_as_it_is() {
-        let failed = policy::not_reviewed("the judge's answer did not parse");
+        let failed = policy::not_reviewed("the reviewer's answer did not parse");
         let (decision, reason, unreviewed) = decide(&failed, false);
         assert_eq!(decision, "ask");
         assert!(!unreviewed);
         assert_eq!(
             reason.as_deref(),
             Some(
-                "Automatic approval review failed: the judge's answer did not parse, \
+                "Automatic approval review failed: the reviewer's answer did not parse, \
                  so this waits for you."
             )
         );

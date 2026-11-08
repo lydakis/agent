@@ -297,8 +297,8 @@ class ServedToolTests(ModelFixture):
 
     def test_a_call_made_before_the_host_started_is_answered_once_it_does(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
-                            instructions='Lead.', declare=[declared('subscriptions', inherit=False)])
-        self.model.call_script = [('subscriptions', {})]
+                            instructions='Lead.', declare=[declared('follows', inherit=False)])
+        self.model.call_script = [('follows', {})]
         turn = self.daemon.request('submit', bot='calc.lead', request_id='early', prompt='script')['result']['turn']
         deadline = time.monotonic() + 10
         while not self.daemon.request('tool_calls', tag='sonny')['result']['calls']:
@@ -309,7 +309,7 @@ class ServedToolTests(ModelFixture):
         # The commons, on unless set off, is a source of Sonny's own.
         # No lookout runs here, so none has taken them.
         self.assertEqual(json.loads(self.output('calc.lead', turn)),
-                         {'subscriptions': [], 'sources': [{'name': 'commons', 'events': 0}],
+                         {'follows': [], 'sources': [{'name': 'commons', 'events': 0}],
                           'lookout': {'running': False, 'current': False, 'took_ms': None, 'rereads_every_s': 15}})
 
     def test_an_agent_s_script_calls_an_mcp_server_the_host_keeps_up(self):
@@ -605,20 +605,20 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
 
         post = {'name': 'fake-home', 'title': 'Live tests want a fake HOME', 'text': 'For both binaries.'}
         started = turn('calc.a', {'post': post})
-        self.assertEqual((started['posts'], started['subscription']['name']), (1, 'commons.fake-home'), started)
+        self.assertEqual((started['posts'], started['follow']['name']), (1, 'commons.fake-home'), started)
         # The answer says how the thread's posts will reach it, and how to change that.
-        self.assertEqual(started['subscription']['digest'], '0', started)
-        self.assertIn('as they come, the commons source\'s digest', started['subscription']['about'])
-        self.assertIn('subscriptions tool', started['subscription']['about'])
-        # Posting subscribes the poster to the thread.
+        self.assertEqual(started['follow']['digest'], '0', started)
+        self.assertIn('as they come, the commons source\'s digest', started['follow']['about'])
+        self.assertIn('follows tool', started['follow']['about'])
+        # Posting follows the thread for the poster.
         subscribed = json.loads((self.path / 'state.sqlite.lookout/calc.a.json').read_text())
         # Held by this bot, not one that takes its name later.
         calc_a = self.daemon.request('inspect', bot='calc.a')['result']['bot_id']
         self.assertEqual(subscribed['subscriptions'],
                          [{'name': 'commons.fake-home', 'sources': ['commons:fake-home'], 'bot_id': calc_a}])
         replied = turn('shop.b', {'reply': {'thread': 'fake-home', 'text': 'Confirmed here too.'}})
-        self.assertEqual((replied['posts'], replied['subscription']['name']), (2, 'commons.fake-home'), replied)
-        # A reply wakes no one itself: subscriptions carry it.
+        self.assertEqual((replied['posts'], replied['follow']['name']), (2, 'commons.fake-home'), replied)
+        # A reply wakes no one itself: follows carry it.
         self.assertNotIn('told', replied)
         thread = (self.path / '.agents/commons/fake-home.jsonl').read_text().splitlines()
         self.assertEqual([json.loads(line)['by'] for line in thread], ['calc.a', 'shop.b'])
@@ -658,7 +658,7 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         self.assertEqual(prompts[0]['text'],
                          '[calc.a started the commons thread stalls, "Checkpoint stalls under load", '
                          'which your turns touch on. The invite pays for this turn, up to 1.0M tokens of work. '
-                         'Posting there subscribes you to its later posts.]')
+                         'Posting there follows its later posts for you.]')
         # The invite's tokens are its turn's budget, counted as work: the
         # one turn the commons starts.
         self.assertEqual((turns[-1]['budget_tokens'], turns[-1].get('budget_counts')), (1_000_000, 'work'),
