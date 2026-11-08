@@ -3399,7 +3399,6 @@ fn denial(item: &Value) -> Option<String> {
         .then(|| output["detail"].as_str().unwrap_or("").to_owned())
 }
 
-
 struct Running {
     turn: i64,
     started: Instant,
