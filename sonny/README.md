@@ -559,7 +559,9 @@ commands or keys that would help right now, as in
 `› alt+t boosts your next message  tip`. A guess always comes first; the
 idea or tip only fills a slot that would be empty, and costs no call, timer
 or tool of its own. A tip names only what the slash menu and `?` list, so it
-stays current, and one naming anything else shows nothing. Tab takes an
+stays current, and one naming anything else shows nothing. Each command or
+key is tipped once a window, and never one every composer has (Enter, Esc,
+the arrows) or one that stops or leaves (`/quit`, `/pause`). Tab takes an
 idea or a command as it takes a guess; a key's tip is only read, so Tab
 does what it does otherwise. The label stays however narrow the window,
 the words cut first. `[sonny] suggest_ideas = false` turns ideas and tips

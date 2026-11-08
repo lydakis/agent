@@ -4038,6 +4038,9 @@ struct App {
     suggesting: Option<tokio::task::JoinHandle<Option<suggest::Guess>>>,
     /// The guess, shown in the empty composer for Tab to take.
     suggestion: Option<suggest::Guess>,
+    /// The commands and keys tips have named in this window, so a tip
+    /// shows each once.
+    tipped: Vec<String>,
 }
 
 /// What a job of the lead's layout has to say: a line in the lead's view,
@@ -5288,6 +5291,7 @@ impl App {
             yours: None,
             suggesting: None,
             suggestion: None,
+            tipped: Vec::new(),
             asks_seen: HashMap::new(),
             checks_set: HashMap::new(),
             running_heads: HashMap::new(),
@@ -13415,7 +13419,7 @@ impl App {
         self.suggestion = None;
         let Some(ideas) = (agent_client::config::load().ok())
             .filter(|c| c.sonny.suggest)
-            .map(|c| c.sonny.suggest_ideas)
+            .map(|c| c.sonny.suggest_ideas.then(|| self.tipped.clone()))
         else {
             return;
         };
@@ -13445,6 +13449,13 @@ impl App {
         {
             let job = self.suggesting.take().unwrap();
             self.suggestion = job.await.ok().flatten();
+            // A tip shows each command or key once in a window.
+            if let Some(guess) = &self.suggestion
+                && guess.cue == Some(suggest::Cue::Tip)
+                && let Some(first) = suggest::tipped_by(&guess.text)
+            {
+                self.tipped.push(first);
+            }
             // The agent it came from, found kept there: its name opens it.
             if let Some(suggest::Cue::Agent(name)) = self
                 .suggestion
@@ -17285,11 +17296,7 @@ mod tests {
         };
         // An idea: its word after the key, no arrow, as it came from
         // nowhere; Tab takes its words.
-        let mut app = guessed(
-            "add a cold start benchmark
-idea",
-        )
-        .await;
+        let mut app = guessed("add a cold start benchmark\nidea").await;
         assert_eq!(
             app.suggestion.as_ref().unwrap().cue,
             Some(suggest::Cue::Idea)
@@ -17301,11 +17308,7 @@ idea",
         app.key(tab()).await;
         assert_eq!(&*app.input, "add a cold start benchmark");
         // A tip for a command: Tab takes it, Enter would run it.
-        let mut app = guessed(
-            "/side why did the build slow down
-tip",
-        )
-        .await;
+        let mut app = guessed("/side why did the build slow down\ntip").await;
         assert_eq!(
             row(&app, 80),
             "› /side why did the build slow down  tab  tip"
@@ -17314,20 +17317,16 @@ tip",
         assert_eq!(&*app.input, "/side why did the build slow down");
         // A tip for a key is only read: no `tab`, and Tab does what it
         // does otherwise.
-        let mut app = guessed(
-            "ctrl+r finds that earlier prompt
-tip",
-        )
-        .await;
+        let mut app = guessed("ctrl+r finds that earlier prompt\ntip").await;
         assert_eq!(row(&app, 80), "› ctrl+r finds that earlier prompt  tip");
+        // Each command or key is tipped once in a window.
+        assert_eq!(app.tipped, ["ctrl+r"]);
         app.key(tab()).await;
         assert!(app.input.is_empty());
         // A tip for what Sonny does not have shows nothing.
         for said in [
-            "/teleport to the release branch
-tip",
-            "ctrl+z undoes the last turn
-tip",
+            "/teleport to the release branch\ntip",
+            "ctrl+z undoes the last turn\ntip",
         ] {
             let app = guessed(said).await;
             assert_eq!(app.suggestion, None, "{said}");

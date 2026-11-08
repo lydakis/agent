@@ -67,30 +67,59 @@ const REPLY: &str = "Call no tool. Reply with ONLY the suggestion, and that line
 /// What may stand where the ask would say nothing, each labeled, and
 /// never in place of a guess.
 const IDEAS: &str = "WHERE you would say nothing above, do not leave the slot empty: offer one of these two instead, with its label as the second line. Never in place of a suggestion.
-- An idea: something worth doing for the person's work that neither of you has raised, apart from what this conversation is on, as they would ask for it. Second line: idea
-- A tip: one of Sonny's commands or keys below that would help them right now and that they have not used here. A command as they would type it, with words after it where it takes them (\"/side why did the build slow down\"); a key with what it does for them (\"ctrl+r finds that earlier prompt\"). Second line: tip
+- An idea, first choice: something worth doing for the person's work that neither of you has raised, apart from what this conversation is on, as they would ask for it. Draw on what you know of their work: the project, its code, what is left undone. Second line: idea
+- A tip, when no idea would be worth their time: one of Sonny's commands or keys below put to use on this conversation, so it reads as something they could do now, not a feature: a command as they would type it, with words after it where it takes them (\"/side why did the build slow down\"); a key with what it would find or do here (\"ctrl+f finds the cache discussion\"). Not one they have used here. Second line: tip
 The same format and the same NEVER list apply, except that an idea is one of your own. Say nothing only where a suggestion could be unsafe.
 ";
 
-/// The ask: with `ideas`, what may stand in an empty slot and the
-/// commands and keys a tip names, written once.
-fn asked(ideas: bool) -> &'static str {
+/// Commands and keys too plain, or too drastic, to be a tip: what every
+/// composer has, and what stops or leaves.
+const NOT_TIPS: [&str; 16] = [
+    "/quit",
+    "/pause",
+    "/resume",
+    "enter",
+    "tab",
+    "esc",
+    "/",
+    "!",
+    "shift+enter",
+    "↑↓",
+    "home",
+    "end",
+    "pgup",
+    "pgdn",
+    "ctrl+c",
+    "ctrl+l",
+];
+
+/// The ask: with ideas, what may stand in an empty slot, the commands
+/// and keys a tip names, written once, and the tips this window has
+/// shown already, so it offers another.
+fn asked(ideas: Option<&[String]>) -> std::borrow::Cow<'static, str> {
     static PLAIN: LazyLock<String> = LazyLock::new(|| format!("{ASK}{REPLY}"));
     static WITH_IDEAS: LazyLock<String> = LazyLock::new(|| {
         let mut ask = format!("{ASK}{IDEAS}Sonny's commands:\n");
-        for (name, does) in COMMANDS {
+        for (name, does) in COMMANDS.iter().filter(|(name, _)| !NOT_TIPS.contains(name)) {
             ask.push_str(&format!("{name}: {does}\n"));
         }
         ask.push_str("Sonny's keys:\n");
-        for (keys, does) in SHORTCUTS {
+        let keys = (SHORTCUTS.iter())
+            .filter(|(keys, _)| !keys.split_whitespace().any(|key| NOT_TIPS.contains(&key)));
+        for (keys, does) in keys {
             ask.push_str(&format!("{keys}: {does}\n"));
         }
-        ask.push_str(REPLY);
         ask
     });
     match ideas {
-        true => &WITH_IDEAS,
-        false => &PLAIN,
+        None => PLAIN.as_str().into(),
+        Some([]) => format!("{}{REPLY}", *WITH_IDEAS).into(),
+        Some(tipped) => format!(
+            "{}Tips shown to them already, so not again: {}\n{REPLY}",
+            *WITH_IDEAS,
+            tipped.join(", ")
+        )
+        .into(),
     }
 }
 
@@ -147,14 +176,14 @@ impl Cue {
 }
 
 /// The guess of a copy of `bot` at its head, on `model` when the window's
-/// turns run on one of their own, and, with `ideas`, an idea or a tip
-/// where it would say nothing; `None` when it says nothing, or nothing
-/// worth showing.
+/// turns run on one of their own, and, with `ideas` (the tips the window
+/// has shown), an idea or a tip where it would say nothing; `None` when
+/// it says nothing, or nothing worth showing.
 pub async fn guess(
     client: Arc<Client>,
     bot: String,
     model: Option<String>,
-    ideas: bool,
+    ideas: Option<Vec<String>>,
 ) -> Option<Guess> {
     guessed(client, bot, model, ideas).await.1
 }
@@ -164,7 +193,7 @@ async fn guessed(
     client: Arc<Client>,
     bot: String,
     model: Option<String>,
-    ideas: bool,
+    ideas: Option<Vec<String>>,
 ) -> (Option<String>, Option<Guess>) {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -181,7 +210,8 @@ async fn guessed(
     else {
         return (None, None);
     };
-    let reply = ask(&client, &name, &forked["bot_id"], model, asked(ideas)).await;
+    let ideas = ideas.as_deref();
+    let reply = ask(&client, &name, &forked["bot_id"], model, &asked(ideas)).await;
     let _ = client
         .request("delete", json!({"bot": name, "bot_id": forked["bot_id"]}))
         .await;
@@ -193,7 +223,7 @@ async fn guessed(
 }
 
 /// The guess in the copy's reply, its cue checked.
-async fn read(client: &Client, bot: &str, reply: &str, ideas: bool) -> Option<Guess> {
+async fn read(client: &Client, bot: &str, reply: &str, ideas: Option<&[String]>) -> Option<Guess> {
     let (text, source) = split(reply)?;
     let text = clean(text)?;
     let cue = match source.map(|source| named(source, bot)) {
@@ -205,25 +235,32 @@ async fn read(client: &Client, bot: &str, reply: &str, ideas: bool) -> Option<Gu
 }
 
 /// The guess, unless it is an idea or a tip not asked for, or a tip for
-/// something Sonny does not have.
-fn shown(guess: Guess, ideas: bool) -> Option<Guess> {
-    match &guess.cue {
-        Some(cue) if cue.labels() && !ideas => None,
-        Some(Cue::Tip) if !sonny_has(&guess.text) => None,
+/// something Sonny does not have, does not tip, or tipped already.
+fn shown(guess: Guess, ideas: Option<&[String]>) -> Option<Guess> {
+    match (&guess.cue, ideas) {
+        (Some(cue), None) if cue.labels() => None,
+        (Some(Cue::Tip), Some(tipped)) => {
+            let first = tipped_by(&guess.text)?;
+            (sonny_has(&first) && !tipped.contains(&first)).then_some(guess)
+        }
         _ => Some(guess),
     }
 }
 
-/// Whether a tip begins with one of Sonny's commands or keys.
-fn sonny_has(tip: &str) -> bool {
-    let Some(first) = tip.split_whitespace().next() else {
-        return false;
-    };
-    let first = first.to_lowercase();
-    match first.starts_with('/') {
-        true => COMMANDS.iter().any(|(name, _)| *name == first),
-        false => (SHORTCUTS.iter()).any(|(keys, _)| keys.split_whitespace().any(|k| k == first)),
-    }
+/// The command or key a tip begins with, as Sonny names it.
+pub fn tipped_by(tip: &str) -> Option<String> {
+    tip.split_whitespace().next().map(str::to_lowercase)
+}
+
+/// Whether `first` is one of Sonny's commands or keys that may be a tip.
+fn sonny_has(first: &str) -> bool {
+    !NOT_TIPS.contains(&first)
+        && match first.starts_with('/') {
+            true => COMMANDS.iter().any(|(name, _)| *name == first),
+            false => {
+                (SHORTCUTS.iter()).any(|(keys, _)| keys.split_whitespace().any(|k| k == first))
+            }
+        }
 }
 
 /// The guess's line and, when there is one, the line after it naming its
@@ -595,12 +632,12 @@ mod tests {
     #[test]
     fn a_prediction_keeps_its_own_rules_and_ideas_only_follow_them() {
         // With ideas off, the ask is Claude Code's, as it was.
-        assert!(asked(false).starts_with("[SUGGESTION MODE"));
-        assert!(asked(false).ends_with(REPLY));
-        assert!(!asked(false).contains("idea"));
+        assert!(asked(None).starts_with("[SUGGESTION MODE"));
+        assert!(asked(None).ends_with(REPLY));
+        assert!(!asked(None).contains("idea"));
         // With them on, every rule of a prediction comes first, unchanged,
         // and what may fill an empty slot only after.
-        let with = asked(true);
+        let with = asked(Some(&[]));
         assert!(with.starts_with(ASK));
         assert!(with[ASK.len()..].starts_with("WHERE you would say nothing above"));
         assert!(with.ends_with(REPLY));
@@ -608,6 +645,12 @@ mod tests {
         // them, and nothing else written of Sonny.
         assert!(with.contains("/side: Start a side chat with a copy of this agent\n"));
         assert!(with.contains("alt+t ctrl+x: boost the next message; again for more\n"));
+        // Nothing every composer has, nor what stops or leaves.
+        assert!(!with.contains("/quit:") && !with.contains("ctrl+c ") && !with.contains("\nesc:"));
+        // The tips shown already, so another comes.
+        let after = asked(Some(&["ctrl+r".into(), "/side".into()]));
+        assert!(after.starts_with(with.strip_suffix(REPLY).unwrap()));
+        assert!(after.contains("Tips shown to them already, so not again: ctrl+r, /side\n"));
     }
 
     #[test]
@@ -619,21 +662,27 @@ mod tests {
             text: "add a cold start benchmark".into(),
             cue: Some(Cue::Idea),
         };
-        assert_eq!(shown(idea.clone(), true), Some(idea.clone()));
-        assert_eq!(shown(idea, false), None);
+        assert_eq!(shown(idea.clone(), Some(&[])), Some(idea.clone()));
+        assert_eq!(shown(idea, None), None);
         let tip = |text: &str| Guess {
             text: text.into(),
             cue: Some(Cue::Tip),
         };
-        assert!(shown(tip("/zen the release"), true).is_some());
-        assert!(shown(tip("/zen the release"), false).is_none());
-        assert!(shown(tip("Ctrl+R finds it again"), true).is_some());
-        assert!(shown(tip("alt+t boosts the next message"), true).is_some());
-        assert!(shown(tip("ctrl+x boosts it more"), true).is_some());
+        assert!(shown(tip("/zen the release"), Some(&[])).is_some());
+        assert!(shown(tip("/zen the release"), None).is_none());
+        assert!(shown(tip("Ctrl+R finds it again"), Some(&[])).is_some());
+        assert!(shown(tip("alt+t boosts the next message"), Some(&[])).is_some());
+        assert!(shown(tip("ctrl+x boosts it more"), Some(&[])).is_some());
         // Only what Sonny has.
-        assert!(shown(tip("/teleport home"), true).is_none());
-        assert!(shown(tip("/zenith the release"), true).is_none());
-        assert!(shown(tip("ctrl+z undoes it"), true).is_none());
+        assert!(shown(tip("/teleport home"), Some(&[])).is_none());
+        assert!(shown(tip("/zenith the release"), Some(&[])).is_none());
+        assert!(shown(tip("ctrl+z undoes it"), Some(&[])).is_none());
+        // Nor what is no tip, nor one shown already.
+        assert!(shown(tip("/quit for tonight"), Some(&[])).is_none());
+        assert!(shown(tip("ctrl+c copies it"), Some(&[])).is_none());
+        let tipped = ["ctrl+r".to_owned()];
+        assert!(shown(tip("Ctrl+R finds it again"), Some(&tipped)).is_none());
+        assert!(shown(tip("/zen the release"), Some(&tipped)).is_some());
         // Tab takes a command, never a key's tip, which is only read.
         assert!(tip("/zen the release").takes());
         assert!(!tip("ctrl+r finds it again").takes());
@@ -642,7 +691,7 @@ mod tests {
             text: "run the tests".into(),
             cue: None,
         };
-        assert_eq!(shown(plain.clone(), false), Some(plain.clone()));
+        assert_eq!(shown(plain.clone(), None), Some(plain.clone()));
         assert!(plain.takes());
     }
 
@@ -663,9 +712,10 @@ mod tests {
             let bot = bot.as_str().unwrap();
             for round in 0..rounds {
                 // One at a time: a copy is named by the millisecond.
-                for ideas in [false, true] {
+                for ideas in [None, Some(Vec::new())] {
+                    let on = ideas.is_some();
                     let (reply, guess) = guessed(client.clone(), bot.to_owned(), None, ideas).await;
-                    let said = json!({"bot": bot, "ideas": ideas, "round": round, "reply": reply,
+                    let said = json!({"bot": bot, "ideas": on, "round": round, "reply": reply,
                         "text": guess.as_ref().map(|g| g.text.clone()),
                         "cue": guess.as_ref().and_then(|g| g.cue.as_ref()).map(Cue::name)});
                     println!("SUGGEST_EVAL {said}");
