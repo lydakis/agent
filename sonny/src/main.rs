@@ -25,6 +25,7 @@ mod calls;
 mod cmux;
 mod commons;
 mod config;
+mod context;
 mod declared;
 mod desktop;
 mod diff;
@@ -2223,6 +2224,7 @@ async fn run() -> Result<(), String> {
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = caught.context;
     app.window = caught.window;
+    app.compacted = caught.compacted.clone();
     app.paused = caught.paused(&app.client);
     app.turn_began().await;
     if options.side.is_some() {
@@ -2879,6 +2881,7 @@ async fn caught_up(events: &mut Events) -> Caught {
             match event["event"].as_str() {
                 Some("paused") => caught.pause = Some(event["pause"].clone()),
                 Some("resumed") => caught.pause = Some(Value::Null),
+                Some("compacted") => caught.compacted = Some(event["data"].clone()),
                 _ => {}
             }
         }
@@ -2894,6 +2897,7 @@ async fn caught_up(events: &mut Events) -> Caught {
 struct Caught {
     context: Option<u64>,
     window: Option<u64>,
+    compacted: Option<Value>,
     pause: Option<Value>,
 }
 
@@ -3375,7 +3379,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 29] = [
+const COMMANDS: [(&str, &str); 30] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -3417,6 +3421,7 @@ const COMMANDS: [(&str, &str); 29] = [
         "/audit",
         "Show every tool call the agents made: where it ran, who allowed it",
     ),
+    ("/context", "Show what fills the agent's context"),
     ("/pause", "Stop every agent until /resume, saying why"),
     ("/resume", "Let the agents go on after a pause"),
     ("/mcp", "List the MCP servers agents' scripts call"),
@@ -3625,6 +3630,9 @@ struct App {
     context: Option<u64>,
     /// The model's context window, as the daemon says it with each round.
     window: Option<u64>,
+    /// The last `compacted` event's data, its summary and room (#718),
+    /// for `/context`.
+    compacted: Option<Value>,
     input: prompt::Prompt,
     /// The prompts sent before, which Up and Down bring back.
     recall: recall::Recall<Vec<Option<attach::Picture>>>,
@@ -5300,6 +5308,7 @@ impl App {
             speed: speed(record),
             context: None,
             window: None,
+            compacted: None,
             input: prompt::Prompt::default(),
             recall: recall::Recall::default(),
             pending: Vec::new(),
@@ -6594,6 +6603,7 @@ impl App {
             self.notice = None;
             self.context = caught.context.or(self.context);
             self.window = caught.window.or(self.window);
+            self.compacted = caught.compacted.clone().or(self.compacted.take());
             self.history_after(self.seen_node.max(self.options.side.unwrap_or(0)))
                 .await;
             self.unstage_landed().await;
@@ -9426,7 +9436,10 @@ impl App {
                     running.phase = "Compacting".into();
                 }
             }
-            "compacted" => self.notice = Some("compacted the conversation".into()),
+            "compacted" => {
+                self.compacted = Some(data.clone());
+                self.notice = Some("compacted the conversation".into());
+            }
             "compaction_failed" => {
                 self.notice = Some(format!(
                     "compaction failed: {}",
@@ -9927,6 +9940,30 @@ impl App {
             more: false,
         });
         self.open_pane(pane::Pane::card("background", STATUS_KEYS));
+    }
+
+    /// What fills this agent's context, read-only: `/context` in the
+    /// pane, as `/mcp` is, until Esc. Its record is read once, now.
+    async fn context_card(&mut self) {
+        let record = match self
+            .client
+            .request("inspect", json!({"bot": self.bot}))
+            .await
+        {
+            Ok(record) => record,
+            Err(error) => {
+                self.notice = Some(format!("could not read {}: {error}", self.bot));
+                return;
+            }
+        };
+        let mut parts = context::Parts::from_record(&record);
+        (parts.used, parts.window) = (self.context, self.window);
+        parts.compacted = self.compacted.clone();
+        let lines = context::card(&self.bot, &parts);
+        self.watch = None;
+        let mut pane = pane::Pane::card("context", "esc close");
+        pane.set_card(lines, "esc close");
+        self.open_pane(pane);
     }
 
     /// The tokens the project's agents spent, or every agent's, over
@@ -12361,6 +12398,11 @@ impl App {
             } else {
                 self.background();
             }
+            return;
+        }
+        if prompt == "/context" {
+            self.input.clear();
+            self.context_card().await;
             return;
         }
         if prompt == "/mcp" {
@@ -21672,6 +21714,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_reads_the_agent_s_record_and_keeps_its_last_compaction() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            match request["op"].as_str() {
+                Some("inspect") => json!({"name": "b", "instructions": "be brief", "tools": ["shell"], "declared": []}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        let compacted = json!({"event": "compacted", "bot": "b", "turn": 3,
+            "data": {"summary_bytes": 400, "covered_turns": [1, 3], "reclaimed_bytes": 9000}});
+        app.daemon(compacted).await;
+        assert_eq!(app.compacted.as_ref().unwrap()["summary_bytes"], 400);
+        app.input.set("/context");
+        app.submit().await;
+        let inspect = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r["op"] == "inspect")
+            .cloned();
+        assert_eq!(inspect.unwrap()["bot"], "b");
+        assert_eq!(app.pane.as_ref().map(|pane| pane.title()), Some("context"));
+    }
+
+    #[tokio::test]
     async fn held_words_survive_a_dropped_connection_and_a_narrower_pane() {
         let client = daemon_answering(|_| json!({})).await;
         let mut app = app(client);
@@ -23462,7 +23533,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         app.input.set("/co");
-        assert_eq!(first(&app), ["/compact", "/commons", "/config", "/copy"]);
+        assert_eq!(first(&app), ["/compact", "/commons", "/context", "/config"]);
         let keys = |app: &App| menu_keys(&app.menu(), app.pick, &app.input);
         assert_eq!(
             keys(&app),

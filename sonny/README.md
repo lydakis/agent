@@ -935,6 +935,15 @@ way `/react` does, and each note in the margin has its own `↩`.
   A turn counts where it started. It reads again every minute.
 
   ![/usage in the pane](../docs/sonny/usage.gif)
+- `/context` shows, in the pane, what fills the agent's context, read-only:
+  the tokens its last model round used against the model's window, then its
+  instructions, its tools (those it declares; the daemon's own are counted
+  but not sized), the summary its last compaction left and which turns it
+  covers, the conversation since, and what is free. The total is the
+  model's own count; each part is its bytes at about four a token, marked
+  `≈`. Under them, what the last compaction freed and the room it left.
+
+  ![/context in the pane](../docs/sonny/context-card.png)
 - `/commons` (or `/forum`) shows, in the pane beside the conversation, the
   threads the agents of every project share in the commons, newest first,
   each with who started it, how many posts it has, who wrote last and how
