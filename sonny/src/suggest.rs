@@ -66,10 +66,10 @@ const REPLY: &str = "Call no tool. Reply with ONLY the suggestion, and that line
 
 /// What may stand where the ask would say nothing, each labeled, and
 /// never in place of a guess.
-const IDEAS: &str = "ONLY WHERE you would say nothing above, you may offer one of these instead, with its label as the second line. Never in place of a suggestion.
+const IDEAS: &str = "WHERE you would say nothing above, do not leave the slot empty: offer one of these two instead, with its label as the second line. Never in place of a suggestion.
 - An idea: something worth doing for the person's work that neither of you has raised, apart from what this conversation is on, as they would ask for it. Second line: idea
 - A tip: one of Sonny's commands or keys below that would help them right now and that they have not used here. A command as they would type it, with words after it where it takes them (\"/side why did the build slow down\"); a key with what it does for them (\"ctrl+r finds that earlier prompt\"). Second line: tip
-The same format and the same NEVER list apply, except that an idea is one of your own. Say nothing if neither would be welcome.
+The same format and the same NEVER list apply, except that an idea is one of your own. Say nothing only where a suggestion could be unsafe.
 ";
 
 /// The ask: with `ideas`, what may stand in an empty slot and the
@@ -156,29 +156,49 @@ pub async fn guess(
     model: Option<String>,
     ideas: bool,
 ) -> Option<Guess> {
+    guessed(client, bot, model, ideas).await.1
+}
+
+/// The copy's reply as it came, and the guess read from it.
+async fn guessed(
+    client: Arc<Client>,
+    bot: String,
+    model: Option<String>,
+    ideas: bool,
+) -> (Option<String>, Option<Guess>) {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let name = format!("{bot}.suggest-{:x}", stamp % 0x100_0000);
-    let forked = client
+    let Ok(forked) = client
         .request(
             "fork",
             json!({"source": bot, "bot": name, "allow": [],
                 "expire_ms": EXPIRE.as_millis() as u64, "request_id": name}),
         )
         .await
-        .ok()?;
+    else {
+        return (None, None);
+    };
     let reply = ask(&client, &name, &forked["bot_id"], model, asked(ideas)).await;
     let _ = client
         .request("delete", json!({"bot": name, "bot_id": forked["bot_id"]}))
         .await;
-    let reply = reply?;
-    let (text, source) = split(&reply)?;
+    let Some(reply) = reply else {
+        return (None, None);
+    };
+    let guess = read(&client, &bot, &reply, ideas).await;
+    (Some(reply), guess)
+}
+
+/// The guess in the copy's reply, its cue checked.
+async fn read(client: &Client, bot: &str, reply: &str, ideas: bool) -> Option<Guess> {
+    let (text, source) = split(reply)?;
     let text = clean(text)?;
-    let cue = match source.map(|source| named(source, &bot)) {
+    let cue = match source.map(|source| named(source, bot)) {
         Some(Named::Is(cue)) => Some(cue),
-        Some(Named::Agent(names)) => kept(&client, names).await.map(Cue::Agent),
+        Some(Named::Agent(names)) => kept(client, names).await.map(Cue::Agent),
         Some(Named::Not) | None => None,
     };
     shown(Guess { text, cue }, ideas)
@@ -582,7 +602,7 @@ mod tests {
         // and what may fill an empty slot only after.
         let with = asked(true);
         assert!(with.starts_with(ASK));
-        assert!(with[ASK.len()..].starts_with("ONLY WHERE you would say nothing above"));
+        assert!(with[ASK.len()..].starts_with("WHERE you would say nothing above"));
         assert!(with.ends_with(REPLY));
         // Each command and key a tip may name, as the menu and `?` list
         // them, and nothing else written of Sonny.
@@ -644,8 +664,8 @@ mod tests {
             for round in 0..rounds {
                 // One at a time: a copy is named by the millisecond.
                 for ideas in [false, true] {
-                    let guess = guess(client.clone(), bot.to_owned(), None, ideas).await;
-                    let said = json!({"bot": bot, "ideas": ideas, "round": round,
+                    let (reply, guess) = guessed(client.clone(), bot.to_owned(), None, ideas).await;
+                    let said = json!({"bot": bot, "ideas": ideas, "round": round, "reply": reply,
                         "text": guess.as_ref().map(|g| g.text.clone()),
                         "cue": guess.as_ref().and_then(|g| g.cue.as_ref()).map(Cue::name)});
                     println!("SUGGEST_EVAL {said}");

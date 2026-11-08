@@ -12,8 +12,13 @@ agents and compares:
   come back, unlabeled, as often with ideas on as off. An idea or tip here
   is a slot stolen from a prediction.
 - `open`: conversations with no obvious next step (thanks, an FYI, a fact
-  looked up). With ideas off the copy should mostly say nothing; with them
-  on it may offer an idea or a tip, which the run prints to read.
+  looked up, a project read with nothing to do). With ideas off the copy
+  should mostly say nothing; with them on it should offer an idea or a
+  tip, which the run prints to read.
+
+Every agent works in a copy of the demo repository (docs/demo/tally), so an
+idea has work to be about. Each guess keeps the copy's reply as it came, so
+an idea the filters refused shows as `refused`, not as nothing.
 
 Each fixture is one new agent's first turn, made the way `agent run --new
 --agents` makes it, in a HOME and daemon of the run's own, so no real
@@ -28,7 +33,7 @@ Real model, real spend or plan quota. Run it on the ChatGPT plan after
     .local/venv/bin/python -m bench.suggest_eval --model chatgpt/MODEL \\
         --out .local/suggest-eval/MODEL.json
 
-About 7 turns plus 7 x 2 x rounds small guesses, each a cache read of a
+About 9 turns plus 9 x 2 x rounds small guesses, each a cache read of a
 short conversation.
 """
 import argparse
@@ -63,6 +68,11 @@ FIXTURES = {
     'fyi': ('open', "FYI: the pricing fix merged yesterday and the release went out fine. "
                     "No action needed, just reply briefly."),
     'fact': ('open', "What's the capital of Portugal? One word."),
+    # Open, with work to have an idea about: the agent has read the project.
+    'tour': ('open', "Read tally.py, its tests and the README so you know this project. Reply in "
+                     "one sentence; there's nothing to change yet."),
+    'merged': ('open', "I'll fix the rounding bug in tally.py myself later. Look over the repo so "
+                       "you know it, then reply briefly. Don't change anything."),
 }
 
 
@@ -100,8 +110,10 @@ def summarize(rows):
         kind = FIXTURES[row['bot']][0]
         arm = 'ideas_on' if row['ideas'] else 'ideas_off'
         counts = summary.setdefault(kind, {}).setdefault(arm, {'guess': 0, 'idea': 0, 'tip': 0, 'nothing': 0,
-                                                               'source': 0})
-        if row['text'] is None:
+                                                               'refused': 0, 'source': 0})
+        if row['text'] is None and (row.get('reply') or '').strip():
+            counts['refused'] += 1
+        elif row['text'] is None:
             counts['nothing'] += 1
         elif row['cue'] in ('idea', 'tip'):
             counts[row['cue']] += 1
@@ -139,7 +151,10 @@ def main():
         parser.error(f'{root} is inside {ROOT}: set TMPDIR elsewhere')
     home, workspace = root / 'home', root / 'work'
     (home / '.agent').mkdir(parents=True)
-    workspace.mkdir()
+    shutil.copytree(ROOT / 'docs/demo/tally', workspace)
+    for step in (['init', '-q', '-b', 'main'], ['add', '-A'],
+                 ['-c', 'user.email=demo@example.com', '-c', 'user.name=demo', 'commit', '-qm', 'tally']):
+        subprocess.run(['git', '-C', str(workspace), *step], check=True, capture_output=True)
     env['HOME'] = str(home)
     # cargo and rustup live in the real HOME.
     for key in ('CARGO_HOME', 'RUSTUP_HOME'):
@@ -160,7 +175,8 @@ def main():
     args.out.write_text(json.dumps(result, indent=1))
     print(json.dumps(result['summary'], indent=1))
     for row in rows:
-        print(f"{row['bot']:8} {'on ' if row['ideas'] else 'off'} {row['cue'] or '-':6} {row['text']}")
+        reply = ' / '.join((row.get('reply') or '').split('\n'))
+        print(f"{row['bot']:8} {'on ' if row['ideas'] else 'off'} {row['cue'] or '-':6} {row['text']}  [{reply}]")
     shutil.rmtree(root, ignore_errors=True)
 
 
