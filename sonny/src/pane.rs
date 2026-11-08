@@ -505,6 +505,14 @@ impl Pane {
 
     /// A card's lines, put in only when they changed, so a selection in
     /// them lasts while they do not, and the view stays where it was.
+    /// The card's rows as text.
+    #[cfg(test)]
+    pub fn card_text(&self) -> Vec<String> {
+        (self.card.iter().flatten())
+            .map(|line| line.to_string())
+            .collect()
+    }
+
     pub fn set_card(&mut self, lines: Vec<Line<'static>>, keys: &str) {
         self.set_card_marked(lines, Vec::new(), keys);
     }

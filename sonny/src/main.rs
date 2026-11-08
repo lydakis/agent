@@ -9958,7 +9958,21 @@ impl App {
         };
         let mut parts = context::Parts::from_record(&record);
         (parts.used, parts.window) = (self.context, self.window);
-        parts.compacted = self.compacted.clone();
+        // The compaction the record names: the one this window saw, or,
+        // in a fork (a side chat too), its source's, made before the fork
+        // and so in no event of this agent's.
+        parts.compacted = match record["compaction"].as_i64() {
+            None => None,
+            Some(version)
+                if self
+                    .compacted
+                    .as_ref()
+                    .is_some_and(|data| data["version"].as_i64() == Some(version)) =>
+            {
+                self.compacted.clone()
+            }
+            Some(version) => compaction_named(&self.options.socket, version).await,
+        };
         let lines = context::card(&self.bot, &parts);
         self.watch = None;
         let mut pane = pane::Pane::card("context", "esc close");
@@ -15789,6 +15803,29 @@ fn short(bot: &str, project: &str, lead: &str) -> String {
 /// A staged message's rows by its turn, the width and the mark it
 /// waits with ([`App::staged_drawn`]).
 type StagedDrawn = ((i64, usize, Option<char>), Vec<Line<'static>>);
+
+/// The last `compacted` event's data for compaction `version`, of any
+/// agent: a fork's compaction is its source's, recorded under the source.
+/// On a connection of its own, closed once read, as `/sky`'s past is; the
+/// daemon reads only `compacted` events for it, by their own index.
+async fn compaction_named(socket: &Path, version: i64) -> Option<Value> {
+    let (client, mut events) = Client::connect(socket).await.ok()?;
+    let follow = json!({"bot": "*", "after": 0, "kinds": ["compacted"]});
+    client.request("follow", follow).await.ok()?;
+    let mut found = None;
+    while let Some(event) = events.recv().await {
+        match event["event"].as_str() {
+            // One merged into another at the same head says so again.
+            Some("compacted") if event["data"]["version"].as_i64() == Some(version) => {
+                found = Some(event["data"].clone());
+            }
+            Some("follow_live") => return found,
+            Some("lagged" | "follow_lagged") => return None,
+            _ => {}
+        }
+    }
+    None
+}
 
 /// A message sent and not landed, dim, drawn as it will read once it
 /// does, its pictures found in `folder` as the landed one's are: an answer under the question it answers, a command by name,
@@ -21720,14 +21757,17 @@ mod tests {
         let client = daemon_answering(move |request| {
             seen.lock().unwrap().push(request.clone());
             match request["op"].as_str() {
-                Some("inspect") => json!({"name": "b", "instructions": "be brief", "tools": ["shell"], "declared": []}),
+                Some("inspect") => {
+                    json!({"name": "b", "instructions": "be brief", "tools": ["shell"],
+                    "declared": [], "compaction": 7})
+                }
                 _ => json!({}),
             }
         })
         .await;
         let mut app = app(client);
         let compacted = json!({"event": "compacted", "bot": "b", "turn": 3,
-            "data": {"summary_bytes": 400, "covered_turns": [1, 3], "reclaimed_bytes": 9000}});
+            "data": {"version": 7, "summary_bytes": 400, "covered_turns": [1, 3], "reclaimed_bytes": 9000}});
         app.daemon(compacted).await;
         assert_eq!(app.compacted.as_ref().unwrap()["summary_bytes"], 400);
         app.input.set("/context");
@@ -21740,6 +21780,58 @@ mod tests {
             .cloned();
         assert_eq!(inspect.unwrap()["bot"], "b");
         assert_eq!(app.pane.as_ref().map(|pane| pane.title()), Some("context"));
+        let card = app.pane.as_ref().unwrap().card_text();
+        assert!(
+            card.iter().any(|row| row.contains("turns 1 to 3")),
+            "{card:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fork_s_compaction_is_read_from_its_source_s_events() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("sonny-compacted-{}", unique("t")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (read, mut write) = stream.into_split();
+                let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+                write
+                    .write_all(format!("{ready}\n").as_bytes())
+                    .await
+                    .unwrap();
+                let mut lines = BufReader::new(read).lines();
+                let Ok(Some(line)) = lines.next_line().await else {
+                    continue;
+                };
+                let asked: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(asked["kinds"], json!(["compacted"]));
+                let mut out = vec![json!({"id": asked["id"], "result": {"following": "*"}})];
+                let compacted = |version: i64, bytes: u64| {
+                    json!({"event": "compacted", "bot": "shop.lead",
+                        "data": {"version": version, "summary_bytes": bytes}})
+                };
+                // Merged at the same head, it says so again: the last counts.
+                out.extend([compacted(5, 50), compacted(9, 100), compacted(9, 200)]);
+                out.push(json!({"event": "follow_live", "bot": "*"}));
+                for event in out {
+                    write
+                        .write_all(format!("{event}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                while let Ok(Some(_)) = lines.next_line().await {}
+            }
+        });
+        let found = compaction_named(&socket, 9).await.unwrap();
+        assert_eq!(found["summary_bytes"], 200);
+        assert!(compaction_named(&socket, 4).await.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

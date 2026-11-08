@@ -30,7 +30,10 @@ pub struct Parts {
     /// The daemon's own tools it may call, by name; their schemas are the
     /// daemon's, so only counted.
     pub built_in: usize,
-    /// Its last compaction's `compacted` data, when one was seen.
+    /// Whether its record names a compaction: what it reads starts with
+    /// that compaction's summary.
+    pub compaction: bool,
+    /// That compaction's `compacted` data, when it could be read.
     pub compacted: Option<Value>,
 }
 
@@ -43,6 +46,7 @@ impl Parts {
             instructions: record["instructions"].as_str().map_or(0, str::len) as u64,
             declared: (declared, if declared == 0 { 0 } else { declared_bytes }),
             built_in: record["tools"].as_array().map_or(0, Vec::len),
+            compaction: record["compaction"].is_i64(),
             ..Parts::default()
         }
     }
@@ -134,7 +138,14 @@ pub fn card(name: &str, parts: &Parts) -> Vec<Line<'static>> {
                 format!("{covered}, {}", kb(bytes)),
             ));
         }
-        _ => lines.push(row("Summary", "0".into(), "no compaction seen".into())),
+        // Named and not found: the summary is read, its size unknown here,
+        // and counted with the conversation.
+        _ if parts.compaction => lines.push(row(
+            "Summary",
+            "?".into(),
+            "a compaction's, its size not recorded; in the conversation".into(),
+        )),
+        _ => lines.push(row("Summary", "0".into(), "no compaction yet".into())),
     }
     if let Some(used) = parts.used {
         lines.push(row(
@@ -218,6 +229,21 @@ mod tests {
     }
 
     #[test]
+    fn a_compaction_named_and_not_found_is_not_said_to_be_none() {
+        let record = json!({"instructions": "", "tools": [], "declared": [], "compaction": 9});
+        let mut parts = Parts::from_record(&record);
+        parts.used = Some(1_000);
+        let shown = text(&card("shop.side", &parts));
+        assert!(
+            shown
+                .iter()
+                .any(|row| row.starts_with(" Summary") && row.contains("?  a compaction's")),
+            "{shown:?}"
+        );
+        assert!(!shown.iter().any(|row| row.contains("no compaction")));
+    }
+
+    #[test]
     fn before_any_call_it_says_so_and_counts_what_the_first_reads() {
         let parts =
             Parts::from_record(&json!({"instructions": "abcd", "tools": [], "declared": []}));
@@ -228,7 +254,7 @@ mod tests {
                 .iter()
                 .any(|row| row.starts_with(" Tools") && row.contains("0 declared, 0 B"))
         );
-        assert!(shown.iter().any(|row| row.contains("no compaction seen")));
+        assert!(shown.iter().any(|row| row.contains("no compaction yet")));
         assert!(!shown.iter().any(|row| row.starts_with(" Free")));
     }
 }
