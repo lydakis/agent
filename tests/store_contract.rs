@@ -17656,3 +17656,48 @@ fn a_trim_under_a_running_call_never_hands_its_row_to_another() {
         [json!(["r2", "unknown"])]
     );
 }
+
+#[test]
+fn a_gated_step_is_told_done_once_even_when_its_row_was_trimmed() {
+    use agent_runtime::store::Step;
+    let mut db = db();
+    let (turn, _) = stepping_turn(&mut db, true);
+    let asked = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "1",
+            "send",
+            json!({}),
+            false,
+            Default::default(),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(asked.step, Step::Pending { .. }));
+    db.answer(Decision {
+        bot: "Lead",
+        turn,
+        call_id: "c1/1",
+        request: 1,
+        tag: None,
+        allow: true,
+        unreviewed: false,
+        reason: None,
+        by: Some("test"),
+        leased: false,
+    })
+    .unwrap();
+    db.step_check("Lead", turn, "c1/1", 0).unwrap();
+    // The person trims the whole trail while the step runs.
+    let bound = db.audit_bound(None, Some(i64::MAX)).unwrap();
+    assert_eq!(db.audit_trim(bound).unwrap(), 2);
+    let before = db.last_event_id().unwrap();
+    db.step_result("Lead", turn, "c1", "1", true).unwrap();
+    // Its end is still told, once: a judge sees it done.
+    assert_eq!(db.last_event_id().unwrap(), before + 1);
+    db.step_result("Lead", turn, "c1", "1", false).unwrap();
+    assert_eq!(db.last_event_id().unwrap(), before + 1);
+    assert!(trail(&db).is_empty());
+}

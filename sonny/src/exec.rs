@@ -560,6 +560,18 @@ struct Nested {
     refused: bool,
 }
 
+/// Arguments sent with a step that is only recorded: whole up to
+/// [`RECORD_BYTES`], else `{"cut": FIRST}`, the first characters the
+/// audit trail keeps of them.
+const RECORD_BYTES: usize = 4 * 1024;
+fn recorded(arguments: Value) -> Value {
+    let text = arguments.to_string();
+    if text.len() <= RECORD_BYTES {
+        return arguments;
+    }
+    json!({"cut": text.chars().take(256).collect::<String>()})
+}
+
 /// What a step is, for its row in its agent's audit trail: only what its
 /// tool declares. `kind` is the trail's word for the tool; `place` where
 /// it runs (on this machine outside any sandbox, or at a service
@@ -707,6 +719,13 @@ impl Steps {
             self.run,
             self.next.fetch_add(1, Ordering::SeqCst) + 1
         );
+        // A step only recorded is kept as its arguments' first characters:
+        // past a few KiB it sends just those, so a call whose arguments a
+        // gate could not take still runs, and nothing large is copied.
+        let arguments = match asks {
+            true => arguments,
+            false => recorded(arguments),
+        };
         let mut asked = json!({"bot": bot, "turn": turn, "call_id": call_id,
             "step": step, "name": tool, "arguments": arguments, "record": !asks});
         facts.into(&mut asked);
@@ -1951,6 +1970,17 @@ fn keep(file: &Path, key: &str, value: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use agent_client::config::McpServer;
+
+    #[test]
+    fn a_recorded_step_sends_only_the_start_of_large_arguments() {
+        let small = json!({"text": "hello"});
+        assert_eq!(recorded(small.clone()), small);
+        let large = json!({"content": "x".repeat(64 * 1024)});
+        let sent = recorded(large.clone());
+        let cut = sent["cut"].as_str().unwrap();
+        assert_eq!(cut.chars().count(), 256);
+        assert!(large.to_string().starts_with(cut));
+    }
 
     #[test]
     fn the_options_line_is_codex_s_and_read_off_the_source() {

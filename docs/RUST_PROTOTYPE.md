@@ -3367,8 +3367,9 @@ kinds above (`invalid_declare` otherwise), which its calls' rows carry.
 client lets run without asking: it is written and allowed at once,
 whatever the gates say, so the trail has every step and the gates judge
 only those a client puts to them. A step's `step_result` ends its row;
-told twice, the first holds. A step allowed by nobody is not among the
-calls a judge reads. Approval verdicts now keep `leased` when given under a
+told twice, the first holds, and a step its gates allowed is told done by
+its events even once a trim took its row. A step allowed by nobody is not
+among the calls a judge reads. Approval verdicts now keep `leased` when given under a
 session's lease, which is how a row tells a reviewer from a person. The
 upgrade starts the trail empty: calls from before it are in history only.
 

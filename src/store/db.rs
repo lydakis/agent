@@ -8506,20 +8506,50 @@ impl Database {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })
             .optional()?;
-        let Some((row, approved, outcome)) = row.filter(|(_, _, outcome)| outcome != "denied")
-        else {
+        if row
+            .as_ref()
+            .is_some_and(|(_, _, outcome)| outcome == "denied")
+        {
             return fail_with(
                 "no_allowed_step",
                 format!("no step {step} of {call_id} was allowed"),
             );
+        }
+        // A step its gates allowed is among the turn's calls a judge reads,
+        // told by its events, which the person's trim of the trail never
+        // touches: the trail's row, when still there, only records it.
+        let gated = row
+            .as_ref()
+            .is_none_or(|(_, approved, _)| approved != "nobody");
+        let (allowed, done) = match gated {
+            true => self
+                .conn
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE turn=?1 AND kind='step_decided'
+                     AND json_extract(data,'$.call_id')=?2 AND json_extract(data,'$.decision')='allow'),
+                   EXISTS(SELECT 1 FROM events WHERE turn=?1 AND kind='step_completed'
+                     AND json_extract(data,'$.call_id')=?2)",
+                )?
+                .query_row(params![turn, id], |r| Ok((r.get(0)?, r.get(1)?)))?,
+            false => (true, true),
         };
+        if row.is_none() && !allowed {
+            return fail_with(
+                "no_allowed_step",
+                format!("no step {step} of {call_id} was allowed"),
+            );
+        }
         // Told twice, the first holds.
-        if outcome == "unknown" {
+        let unfinished = row
+            .as_ref()
+            .filter(|(_, _, outcome)| outcome == "unknown")
+            .map(|(row, _, _)| *row);
+        if unfinished.is_some() || (gated && allowed && !done) {
             let tx = self.conn.savepoint()?;
-            audit::finish(&tx, row, epoch_ms(), failed)?;
-            // A step its gates allowed is among the turn's calls a judge
-            // reads, done from here.
-            if approved != "nobody" {
+            if let Some(row) = unfinished {
+                audit::finish(&tx, row, epoch_ms(), failed)?;
+            }
+            if gated && allowed && !done {
                 let mut data = json!({"call_id":id,"step_of":call_id});
                 if failed {
                     data["failed"] = json!(true);

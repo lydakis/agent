@@ -1027,7 +1027,9 @@ the turn already ran.
 
 Every call a script makes reaches the daemon's audit trail, asked or not: a
 call that would not ask is sent with `record`, so the daemon writes it and
-allows it at once, and its `step_result` says how it ended. Each says its
+allows it at once, and its `step_result` says how it ended. Arguments past 4 KiB
+are sent as `{"cut": FIRST}`, their first 256 characters, all the trail
+keeps, so a call no gate could take still runs. Each says its
 place (`external` for a server Sonny reaches by URL, `outside` for one it
 runs) and, where the server marks the tool, whether it reads
 (`readOnlyHint`) or writes (`destructiveHint`, or `readOnlyHint` false).
