@@ -463,9 +463,6 @@ pub struct View {
     paused: bool,
     /// Where the follow reads agents' questions, once it says.
     scans: Option<mpsc::UnboundedSender<(String, Option<i64>)>>,
-    /// The folder of marks a window's check keeps of what a reply left
-    /// waiting on the person, as last read, and when it was looked at.
-    marks: (crate::waiting::Marks, Instant),
     /// What each mark, colour and shape means, and the counts, in the
     /// chat log's place.
     pub legend: bool,
@@ -868,8 +865,6 @@ impl View {
         let (send, feed) = mpsc::unbounded_channel();
         let task = tokio::spawn(follow(socket.clone(), send));
         let mut view = Self::with(socket, feed, task);
-        // What is marked as it opens is read with each agent's questions.
-        view.marks.0.moved(&store, |_| true);
         view.resolved = store;
         view
     }
@@ -924,7 +919,6 @@ impl View {
             unread: HashSet::new(),
             paused: false,
             scans: None,
-            marks: (crate::waiting::Marks::default(), Instant::now()),
             legend: false,
             zen: false,
             models: false,
@@ -1192,30 +1186,11 @@ impl View {
             let from = replay.from as f64;
             self.seek(from, now);
         }
-        self.look_at_marks(now);
         self.play(now);
         self.sweep();
         self.sweep_cord(now);
         self.land(now);
         self.reign(now);
-    }
-
-    /// Read again, live, the questions of each agent whose mark of what
-    /// its reply left waiting on the person changed: a check sets it after
-    /// the turn ended, so no event says so. One stat a second.
-    fn look_at_marks(&mut self, now: Instant) {
-        if self.replay.is_some() || now.duration_since(self.marks.1) < MARKS_LOOK {
-            return;
-        }
-        self.marks.1 = now;
-        let Some(scans) = &self.scans else {
-            return;
-        };
-        for bot in (self.marks.0).moved(&self.resolved, |_| true) {
-            if self.index.contains_key(&bot) {
-                let _ = scans.send((bot, None));
-            }
-        }
     }
 
     /// Take the haikus written and let an hour-old one go; then, live,
@@ -4820,9 +4795,6 @@ impl Sky {
 /// How often `sonny sky` draws: smooth enough for a spark's flight.
 const FRAME: Duration = Duration::from_millis(60);
 
-/// How often the sky looks whether a check changed what an agent's reply
-/// left waiting on the person.
-const MARKS_LOOK: Duration = Duration::from_secs(1);
 /// How long `sonny sky` waits before following a daemon that went again.
 const RETRY: Duration = Duration::from_secs(3);
 /// What the keys do in `sonny sky`.
