@@ -7163,7 +7163,7 @@ mod tests {
         assert!(view.copies.is_empty());
         assert!(view.sparks.is_empty());
         assert_eq!(view.agents[view.index["shop.lead"]].state(), None);
-        let drawn = text(&view.ticked(Instant::now(), 40, 12, true));
+        let drawn = text(&view.ticked(Instant::now(), 40, 12, true).0);
         assert!(!drawn.contains("reviewer"), "{drawn}");
     }
 
