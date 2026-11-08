@@ -10410,6 +10410,20 @@ impl App {
                             program.mouse(*mouse, x, y);
                             return true;
                         }
+                        // A star or a name in `/sky`: centred on, as the
+                        // arrows and Enter do; on `you`, the person again.
+                        // Each card row starts with a space.
+                        if down
+                            && pane.is_card()
+                            && let Some(view) = self.watch.as_mut().and_then(|w| w.sky.as_mut())
+                            && let Some((line, column)) =
+                                pane.screen.line_at(mouse.column, mouse.row)
+                            && column > 0
+                            && view.click(line, column - 1)
+                        {
+                            pane.screen.unselect();
+                            return true;
+                        }
                         pane.screen.mouse(*mouse)
                     }
                     _ => {
