@@ -1344,8 +1344,10 @@ struct Service {
 /// summarizes as one did before.
 struct Tails {
     running: JoinSet<()>,
-    sender: mpsc::UnboundedSender<turn::Tail>,
-    started: mpsc::UnboundedReceiver<turn::Tail>,
+    /// Each running one, by its bot, while it runs: at most one a bot.
+    bots: HashMap<String, tokio::task::AbortHandle>,
+    sender: mpsc::UnboundedSender<(String, turn::Tail)>,
+    started: mpsc::UnboundedReceiver<(String, turn::Tail)>,
 }
 
 impl Default for Tails {
@@ -1353,8 +1355,25 @@ impl Default for Tails {
         let (sender, started) = mpsc::unbounded_channel();
         Tails {
             running: JoinSet::new(),
+            bots: HashMap::new(),
             sender,
             started,
+        }
+    }
+}
+
+impl Tails {
+    fn start(&mut self, bot: String, tail: turn::Tail) {
+        let handle = self.running.spawn(tail);
+        self.bots.insert(bot, handle);
+    }
+    fn reaped(&mut self, id: tokio::task::Id) {
+        self.bots.retain(|_, handle| handle.id() != id);
+    }
+    /// A deleted bot's comes to nothing.
+    fn stop(&mut self, bot: &str) {
+        if let Some(handle) = self.bots.remove(bot) {
+            handle.abort();
         }
     }
 }
@@ -2060,12 +2079,17 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = service.retention.join_next(), if !service.retention.is_empty() => {}
                 // A paused daemon makes no calls: dropped, it comes to
                 // nothing, and the bot's next turn summarizes.
-                Some(tail) = service.tails.started.recv() => {
+                Some((bot, tail)) = service.tails.started.recv() => {
                     if service.paused.is_none() {
-                        service.tails.running.spawn(tail);
+                        service.tails.start(bot, tail);
                     }
                 }
-                _ = service.tails.running.join_next(), if !service.tails.running.is_empty() => {}
+                Some(reaped) = service.tails.running.join_next_with_id(), if !service.tails.running.is_empty() => {
+                    match reaped {
+                        Ok((id, ())) => service.tails.reaped(id),
+                        Err(error) => service.tails.reaped(error.id()),
+                    }
+                }
                 joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
                     let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
                     service.complete(bot, turn, task, exit).await?;
@@ -3494,7 +3518,7 @@ impl Service {
                     // end is committed, holding the turn's own record.
                     match task.take_after() {
                         Some(after) if committed.is_ok() => {
-                            let _ = tails.send(task.tail(after));
+                            let _ = tails.send((bot.clone(), task.tail(after)));
                         }
                         Some(after) => {
                             *task.after.lock().unwrap_or_else(|e| e.into_inner()) = Some(after);
@@ -3790,6 +3814,10 @@ impl Service {
                     )
                     .facts(json!({"running_turn":turn})));
                 }
+                // A summary its last turn started comes to nothing, so a
+                // bot made later under the name cannot take it in.
+                turn::drop_ahead(&self.aheads, &bot);
+                self.tails.stop(&bot);
                 // One bounded piece per job, on a task of its own, so other
                 // bots' requests and commits interleave with a large deletion
                 // instead of waiting behind this loop; the bot refuses work

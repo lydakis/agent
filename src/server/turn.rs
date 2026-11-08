@@ -6285,6 +6285,18 @@ pub type Tail = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 /// when that turn plans it until it is installed or comes to nothing.
 pub type Aheads = Arc<std::sync::Mutex<HashMap<String, Arc<Ahead>>>>;
 
+/// The summary `bot`'s last turn started, if one is running, comes to
+/// nothing: whoever waits for it goes on without it.
+pub fn drop_ahead(aheads: &Aheads, bot: &str) {
+    let dropped = aheads.lock().unwrap_or_else(|e| e.into_inner()).remove(bot);
+    if let Some(ahead) = dropped {
+        ahead
+            .landed
+            .store(true, std::sync::atomic::Ordering::Release);
+        ahead.told.notify_waiters();
+    }
+}
+
 /// A summary started as one of the bot's turns ended, while that call's
 /// cache is warm, for the view the bot's next turn sends. A turn task of
 /// the bot running when it lands installs it at its next boundary, or as

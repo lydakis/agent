@@ -3690,7 +3690,8 @@ ends while one runs starts none. It is dropped, refused with
 on or the bot's model, summarizer, or compaction instructions changed
 before it went in; it is billed all the same. A stopping daemon drops it,
 as it ends no turn, and the next turn summarizes as before; so does a
-`pause`, which stops every model call, this one too. Its retries and its
+`pause`, which stops every model call, this one too, and so does deleting
+the bot, so a bot made later under its name starts without it. Its retries and its
 waits on its pool count toward the turn it is billed to. A daemon whose
 clients are gone stays up until it lands. A summary that cannot be
 planned, under a budget its calls might pass, with the summarizer's pool

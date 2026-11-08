@@ -249,6 +249,26 @@ class SummaryAfterTurnTests(ModelFixture):
         # the second turn's call on the route that call was given.
         self.assertEqual(self.model.routes, [None, None, 'route-2'])
 
+    def test_a_deleted_bots_summary_is_not_taken_in_by_a_namesake(self):
+        client = self.start(tools='shell', delay=1.0)
+        self.past_threshold(client)
+        self.wait_for(lambda: getattr(self.model, 'summarizing', False))
+        self.assertIn('result', client.request('delete', bot='Bob'))
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                                               compaction_instructions='Summarize.'))
+        # The new Bob's first call is held past when the old summary would
+        # have landed, so a summary it took in would go in at its next
+        # boundary.
+        gate = threading.Event()
+        self.model.request_gates = queue.Queue()
+        self.model.request_gates.put(gate)
+        turn = client.request('submit', bot='Bob', request_id='new', prompt='long:2x1')['result']['turn']
+        time.sleep(1.5)
+        gate.set()
+        self.assertEqual(client.finished(turn, timeout=15)['data']['status'], 'completed')
+        self.assertIsNone(client.request('inspect', bot='Bob')['result']['compaction'])
+        self.assertEqual(self.compacted(client), [])
+
     def events(self, client):
         events, after = [], 0
         while page := client.request('events', bot='Bob', after=after, limit=256)['result']['events']:
