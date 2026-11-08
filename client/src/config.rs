@@ -55,7 +55,7 @@
 //! task_done_check = 24          # hours a task sits idle before a copy says whether it is done, 8 by default; 0 never
 //! commons = false               # agents go without the commons, on by default
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
-//! commons_invite_tokens = 1000000  # what an invite pays for in its thread
+//! commons_invite_tokens = 1000000  # the budget of the turn an invite starts, in tokens of work
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
 //! task_tabs = "every"         # which tasks open in a tab: "asked", the default, those an agent or you asked for; "every", each as its turn starts
 //! task_windows = 64            # task windows a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
@@ -536,7 +536,8 @@ pub struct Sonny {
     /// earn more, the square root of the week's agents when that is more:
     /// each answered thread adds one, up to as many again.
     pub commons_invites: u64,
-    /// The tokens an invite pays for in its thread.
+    /// The tokens of work an invite pays for: the budget of the turn it
+    /// starts.
     pub commons_invite_tokens: u64,
     /// The commons as a source, `[sonny.sources.commons]`: its `digest`
     /// and `steer`, as the person's sources take them; it has no command.
