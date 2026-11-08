@@ -1610,11 +1610,11 @@ impl Turn {
                 rounds: rounds - start,
             },
         };
-        // Landed first: what it wrote is billed as it goes in. Its
-        // retries and waits on its pool then count toward the turn it is
-        // billed to, which flushed its own as it ended.
+        // Its retries and waits on its pool count toward the turn it is
+        // billed to, which flushed its own as it ended. They are kept
+        // before it lands, so whoever reads its `compacted` event reads
+        // the turn with them in.
         let (retries, paced_ms) = accounting.totals();
-        self.land(&handle, landed, base, unlanded).await;
         if retries > 0 || paced_ms > 0 {
             let turn = self.turn;
             let _ = self
@@ -1624,6 +1624,7 @@ impl Turn {
                 })
                 .await;
         }
+        self.land(&handle, landed, base, unlanded).await;
     }
 
     /// A summary started after this turn lands: held for the bot's turn

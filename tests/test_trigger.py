@@ -915,11 +915,25 @@ class TriggerFireTests(ModelFixture):
         job_file.write_text('# a scheduler job\n')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         running = self.scheduler(env)
+
+        def listening():
+            # The add rings the scheduler's doorbell, and sets one up through systemd when nobody reads it.
+            try:
+                os.close(os.open(gone / '.agent/automations/.ring', os.O_WRONLY | os.O_NONBLOCK))
+                return True
+            except OSError:
+                return False
+        self.assertTrue(self.until(listening, 30), 'the scheduler did not open its doorbell')
         added = subprocess.run([str(SONNY), 'automation', 'add', '--bot', 'p.task', '--name', 'ztest-gone',
                                 '--every', '30m', '--', 'nobody home'], env=env, capture_output=True, text=True,
                                timeout=120)
         self.assertEqual(added.returncode, 0, added.stderr)
         turns = len(self.turns('p.task'))
+        # The scheduler keeps a job it has not seen before as it first reads it; HOME goes once it has, so
+        # the delete does not race that write.
+        looked = gone / '.agent/automations/.scheduler/looked'
+        self.assertTrue(self.until(lambda: looked.exists() and 'ztest-gone' in looked.read_text(), 30),
+                        'the scheduler did not read its new job')
         shutil.rmtree(gone)
         running.wait(timeout=90)
         self.assertEqual(running.returncode, 0)

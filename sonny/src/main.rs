@@ -67,7 +67,6 @@ mod place;
 mod plan;
 mod project;
 mod prompt;
-mod quiet;
 mod reactions;
 mod recall;
 mod resolved;
@@ -2375,9 +2374,6 @@ async fn run() -> Result<(), String> {
     // Sonny opens on its defaults, said, rather than not at all.
     app.warnings.extend(unread);
     app.sounds.chime = settings.chime;
-    app.schedule = settings.quiet.clone();
-    quiet::set_schedule(settings.quiet.clone());
-    app.quiet = quiet::arm();
     app.verbose = settings.verbose;
     app.words_only = !settings.steps;
     set_measure(settings.text_width);
@@ -3478,7 +3474,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 30] = [
+const COMMANDS: [(&str, &str); 29] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -3526,10 +3522,6 @@ const COMMANDS: [(&str, &str); 30] = [
     ("/mcp", "List the MCP servers agents' scripts call"),
     ("/config", "Change the settings in ~/.agent/config.toml"),
     ("/sound", "Turn the chime when work ends on or off"),
-    (
-        "/quiet",
-        "Go quiet now: agents work on and write you nothing; /quiet off ends it",
-    ),
     (
         "/verbose",
         "Show every tool call, or only what moves the work on",
@@ -3724,9 +3716,6 @@ struct App {
     /// When the person last used this window, for a lead that keeps only
     /// so many task windows open.
     window_used: used::Marks,
-    /// A scroll or a paste: the person is here, though the agent's own
-    /// mark waits for a key, a click or focus.
-    window_present: used::Present,
     place_read: Option<(String, Instant)>,
     model: String,
     effort: Option<String>,
@@ -3942,14 +3931,6 @@ struct App {
     /// messages here, and when that was last looked at.
     picked: reactions::Picked,
     picked_read: Instant,
-    /// Quiet as its file said when last read ([`quiet`]), when that was,
-    /// and the hours that start it.
-    quiet: Option<quiet::Away>,
-    quiet_read: Instant,
-    schedule: quiet::Schedule,
-    /// What is being sent is a pick or an approval, not words: it leaves
-    /// quiet on.
-    picking: bool,
     /// The first line of the person's message the bot answers, and the
     /// rows drawn when it was: a reaction with none drawn since goes right
     /// under it.
@@ -5384,7 +5365,6 @@ impl App {
             place_job: None,
             tab_job: None,
             window_used: Default::default(),
-            window_present: Default::default(),
             place_read: None,
             model,
             effort: record["effort"].as_str().map(str::to_owned),
@@ -5490,10 +5470,6 @@ impl App {
             react_calls: HashMap::new(),
             picked: reactions::Picked::default(),
             picked_read: Instant::now(),
-            quiet: None,
-            quiet_read: Instant::now(),
-            schedule: quiet::Schedule::default(),
-            picking: false,
             eyes: Some(banner::Eyes::new(Instant::now())),
             answering: None,
             rows_drawn: 0,
@@ -5838,13 +5814,6 @@ impl App {
                     heard = Instant::now();
                 }
                 _ = std::future::ready(()), if reading => {}
-            }
-            // A window starts quiet once it is due (this check, at most a
-            // minute late) and it ends in whichever window the person
-            // writes in: asked once a minute, never per frame.
-            if self.quiet_read.elapsed() >= quiet::READ_EVERY {
-                self.quiet_read = Instant::now();
-                self.quiet = quiet::arm();
             }
             if self.picked_read.elapsed() > Duration::from_secs(1) {
                 self.picked_read = Instant::now();
@@ -7067,21 +7036,28 @@ impl App {
                     // A turn that ended on a question waits on the person;
                     // read once per turn it ended.
                     if let (true, Some(last)) = (started::settled(&state), turn["turn"].as_i64()) {
+                        // One that could not be read whole is neither kept
+                        // nor taken as asking nothing: read again next pass,
+                        // keeping what it asked meanwhile.
                         let seen = match self.asks_seen.get(&bot) {
-                            Some((at, seen)) if *at == last => seen.clone(),
+                            Some((at, seen)) if *at == last => Some(seen.clone()),
                             _ => {
-                                let seen = self.scan(&bot, Some(last)).await;
-                                self.asks_seen.insert(bot.clone(), (last, seen.clone()));
+                                let seen = needs::scan(&self.client, &bot, Some(last)).await;
+                                if let Some(seen) = &seen {
+                                    self.asks_seen.insert(bot.clone(), (last, seen.clone()));
+                                }
                                 seen
                             }
                         };
-                        // A task's own mark holds once its turn completed.
-                        done = (seen.itself && turn["status"] == "completed")
-                            || resolved::holds(resolved::read(&store, &bot), seen.turn, false);
-                        // One the lead resolved set its question aside.
-                        needs.asked(&bot, seen.open(&store, &bot, false));
-                        ended.push(bot.clone());
-                        asked.push(bot.clone());
+                        if let Some(seen) = seen {
+                            // A task's own mark holds once its turn completed.
+                            done = (seen.itself && turn["status"] == "completed")
+                                || resolved::holds(resolved::read(&store, &bot), seen.turn, false);
+                            // One the lead resolved set its question aside.
+                            needs.asked(&bot, seen.open(&store, &bot, false));
+                            ended.push(bot.clone());
+                            asked.push(bot.clone());
+                        }
                     }
                     read.push(bot.clone());
                     // One not read again this pass waits on what it asked.
@@ -7388,19 +7364,9 @@ impl App {
             };
             let answer = asks::answer(&ask, &(at + 1).to_string());
             let sent = match &ask.task {
-                // A pick leaves quiet on, as clicking it does anywhere.
-                Some(_) => {
-                    self.picking = true;
-                    let sent = self.answer_task(&ask, &answer, &[]).await;
-                    self.picking = false;
-                    sent
-                }
-                None => {
-                    self.picking = true;
-                    let sent = self.send(answer.clone(), None, false, false, &[]).await;
-                    self.picking = false;
-                    sent.map(|()| self.close_ask(&ask, &answer))
-                }
+                Some(_) => self.answer_task(&ask, &answer, &[]).await,
+                None => (self.send(answer.clone(), None, false, false, &[]).await)
+                    .map(|()| self.close_ask(&ask, &answer)),
             };
             match sent {
                 Ok(()) => self.notice = None,
@@ -8149,6 +8115,14 @@ impl App {
         self.pending.len() - count
     }
 
+    /// When the message at `node` was written, as the daemon dated `item`,
+    /// for the window to show over it under the mouse.
+    fn dated(&mut self, node: i64, item: &Value) {
+        if let Some(ms) = item["written_ms"].as_i64() {
+            self.screen.date(node, ms);
+        }
+    }
+
     /// The bot's words at `node`, as replayed: their last row tagged,
     /// and the person's reactions to them right under it.
     fn commit_said(&mut self, node: i64, lines: Vec<Line<'static>>) {
@@ -8743,6 +8717,7 @@ impl App {
                                 }
                             }
                         }
+                        self.dated(node, &item);
                         self.land(
                             node,
                             (&text(&item), &quotes_of(&item)),
@@ -8759,6 +8734,7 @@ impl App {
                                 std::path::Path::new(&self.workspace),
                             );
                             said = Some((node, lines));
+                            self.dated(node, &item);
                             if !older {
                                 self.saw_reply(node, &reply);
                                 self.last_reply = reply;
@@ -9276,6 +9252,7 @@ impl App {
                     && !quiet_message(&text(item))
                 {
                     self.elsewhere |= transcript::relays(&text(item), item["from"].as_str());
+                    self.dated(node, item);
                     self.land(
                         node,
                         (&text(item), &quotes_of(item)),
@@ -9302,6 +9279,7 @@ impl App {
                     if !transcript::relays(&text(item), item["from"].as_str()) {
                         self.elsewhere = false;
                     }
+                    self.dated(node, item);
                     self.land(
                         node,
                         (&text(item), &quotes_of(item)),
@@ -9416,6 +9394,7 @@ impl App {
                     self.last_reply = text(item);
                     if let Some(node) = data["node"].as_i64() {
                         self.saw_reply(node, &text(item));
+                        self.dated(node, item);
                     }
                 }
                 // Words written when the next item began are this message.
@@ -10417,14 +10396,6 @@ impl App {
         {
             running.started = began;
         }
-    }
-
-    /// What `bot`'s newest 400 nodes say: the oldest question it asked and
-    /// has no answer to, and whether its turn `last` resolved it.
-    async fn scan(&self, bot: &str, last: Option<i64>) -> Seen {
-        needs::scan(&self.client, bot, last)
-            .await
-            .unwrap_or_default()
     }
 
     /// An agent's latest step, as a line; the pull request its latest
@@ -11811,15 +11782,6 @@ impl App {
                 })
         ) {
             self.window_used.used(&self.bot);
-        } else if matches!(
-            &event,
-            Event::Paste(_)
-                | Event::Mouse(event::MouseEvent {
-                    kind: event::MouseEventKind::ScrollUp | event::MouseEventKind::ScrollDown,
-                    ..
-                })
-        ) {
-            self.window_present.used();
         }
         match &event {
             Event::Resize(..) => self.stale = true,
@@ -11923,9 +11885,7 @@ impl App {
                     self.approve_shown = None;
                     let kept = self.denials.clone();
                     self.denials.retain(|d| d.call_id != denied.call_id);
-                    self.picking = true;
                     let sent = self.send(approval(&denied), None, false, false, &[]).await;
-                    self.picking = false;
                     self.notice = Some(match sent {
                         Ok(()) => "approved one retry; the retry is still reviewed".into(),
                         Err(error) => {
@@ -12004,8 +11964,6 @@ impl App {
             // has them; a new width written again as a resize is.
             let settings = settings::Settings::load();
             self.sounds.chime = settings.chime;
-            self.schedule = settings.quiet.clone();
-            quiet::set_schedule(settings.quiet.clone());
             self.margin_opens = settings.margin_opens;
             self.agent_opens = settings.agent_opens;
             margin::set_limits(settings.margin_notes, settings.margin_note_lines);
@@ -12716,13 +12674,6 @@ impl App {
             });
             return;
         }
-        if let Some(rest) = prompt.strip_prefix("/quiet")
-            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
-        {
-            self.input.clear();
-            self.quiet_command(rest.trim());
-            return;
-        }
         if prompt == "/sound" {
             self.input.clear();
             let mut settings = settings::Settings::load();
@@ -12805,7 +12756,6 @@ impl App {
         // the person's own, answering nothing. The question closes once
         // the daemon has the answer.
         let answering = self.answers(&prompt).cloned();
-        let picked = (answering.as_ref()).is_some_and(|ask| asks::picks(ask, &prompt));
         let prompt = match &answering {
             Some(ask) => asks::answer(ask, &prompt),
             None => prompt,
@@ -12813,9 +12763,7 @@ impl App {
         // An answer to a task's question goes to the task, alone.
         if let Some(ask) = answering.clone().filter(|ask| ask.task.is_some()) {
             let pictures = self.placed(&prompt);
-            self.picking = picked;
             let sent = self.answer_task(&ask, &prompt, &pictures).await;
-            self.picking = false;
             match sent {
                 Ok(()) => {
                     self.input.clear();
@@ -12852,10 +12800,7 @@ impl App {
         }
         let pictures = self.placed(&prompt);
         let prompt_sent = prompt.clone();
-        // An option's number is a pick, as a click on it is: quiet stays.
-        self.picking = picked;
         let sent = (self.send(prompt, None, join && !queue, queue, &pictures)).await;
-        self.picking = false;
         match sent {
             Ok(()) => {
                 self.input.clear();
@@ -12921,13 +12866,7 @@ impl App {
         // The person's words carry when they were sent; a record of what
         // Sonny did for them is read as it is.
         let sent = match origin {
-            // The person's words end quiet, here and in every window.
-            // A pick on a question card or an approved retry leaves quiet on.
-            None if self.picking => stamp::now(&prompt, &self.bot),
-            None => {
-                self.quiet = None;
-                stamp::person(&prompt, &self.bot)
-            }
+            None => stamp::now(&prompt),
             Some(_) => prompt.clone(),
         };
         // An answer goes once, whichever window sends it ([`answer_once`]).
@@ -12995,15 +12934,7 @@ impl App {
         let Some(task) = ask.task.clone() else {
             return Err("that question is not a task's".into());
         };
-        // Words the person typed end quiet; a pick leaves it on.
-        let stamped = match self.picking {
-            true => stamp::now(prompt, &task.bot),
-            false => {
-                self.quiet = None;
-                stamp::person(prompt, &task.bot)
-            }
-        };
-        let submitted = json!({"bot": task.bot, "prompt": stamped,
+        let submitted = json!({"bot": task.bot, "prompt": stamp::now(prompt),
             "delivery": "steer", "images": attach::submitted(pictures)});
         let reply = answer_once(&self.client, &ask.id, submitted).await?;
         self.task_answers.push(TaskAnswer {
@@ -13970,19 +13901,15 @@ impl App {
         if let (Some(id), Some(head)) = (forked["bot_id"].as_i64(), forked["head"].as_i64()) {
             margin::start_at(&self.options.store, id, head);
         }
-        // The question is the person's words: stamped, it ends quiet as a
-        // message does. On the model this window's turns run on, whose
-        // cache is warm.
-        if !question.is_empty() {
-            self.quiet = None;
-        }
+        // The question is the person's words, stamped. On the model this
+        // window's turns run on, whose cache is warm.
         if !question.is_empty()
             && let Err(error) = self
                 .client
                 .request(
                     "submit",
                     json!({"bot": name, "bot_id": forked["bot_id"], "request_id": format!("{name}.1"),
-                        "prompt": stamp::person(&question, &name), "delivery": "steer", "model": self.turn_model,
+                        "prompt": stamp::now(&question), "delivery": "steer", "model": self.turn_model,
                         "images": attach::submitted(pictures)}),
                 )
                 .await
@@ -14009,38 +13936,6 @@ impl App {
         if let Err(error) = self.embed(&title, &args) {
             self.notice = Some(format!("no side chat: {error}"));
         }
-    }
-
-    /// `/quiet`: quiet now, for every agent, until the person writes to
-    /// one; `/quiet off` ends it without writing.
-    fn quiet_command(&mut self, rest: &str) {
-        self.quiet_read = Instant::now();
-        self.notice = Some(match rest {
-            "" => {
-                let since = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs() as i64);
-                let asked = quiet::Away {
-                    since,
-                    why: quiet::Why::Asked,
-                };
-                match quiet::start(asked) {
-                    Ok(()) => {
-                        self.quiet = quiet::away();
-                        "quiet: agents work on and write you nothing until you write".to_owned()
-                    }
-                    Err(error) => error,
-                }
-            }
-            "off" => {
-                self.quiet = None;
-                match quiet::end() {
-                    Some(_) => "quiet off".to_owned(),
-                    None => "quiet is not on".to_owned(),
-                }
-            }
-            _ => "/quiet goes quiet now; /quiet off ends it".to_owned(),
-        });
     }
 
     /// This agent's zen as its file now says, set elsewhere: drawn again
@@ -14182,10 +14077,6 @@ impl App {
                 }
             }
             Some(place) => {
-                // The brief is the person's words: it ends quiet as a
-                // message does, and the task, as ever, hears nothing of it.
-                quiet::spoke();
-                self.quiet = None;
                 self.start_new(&project, &dir, &profile, place, &making, brief)
                     .await
             }
@@ -15608,21 +15499,6 @@ impl App {
             }
             items.push(Item::new(Slot::Needs, forms).opens("status"));
         }
-        // Quiet, or waiting for the person to step away outside their hours.
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
-        if let Some((words, on)) = quiet::footer(self.quiet, &self.schedule, epoch) {
-            let short = match on {
-                true => vec![Span::raw("quiet")],
-                false => Vec::new(),
-            };
-            let long = match on {
-                true => Span::raw(words),
-                false => Span::raw(words).dim(),
-            };
-            items.push(Item::new(Slot::Quiet, vec![vec![long], short]));
-        }
         // In zen, the focus, and only what needs the person besides.
         if let Some(focus) = &self.zen {
             let needs = match waiting {
@@ -15649,7 +15525,7 @@ impl App {
                 line.push('…');
             }
             let focus = format!("zen · {}", transcript::cut(&line, room));
-            items.retain(|item| matches!(item.slot, Slot::Needs | Slot::Quiet));
+            items.retain(|item| matches!(item.slot, Slot::Needs));
             let mut place = vec![Span::raw(focus).dim()];
             place.extend(boost.map(Span::raw));
             items.push(Item::new(Slot::Place, vec![place]));
@@ -17597,6 +17473,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_question_read_cut_short_after_its_listing_is_never_kept() {
+        // The listing comes back, then reading its items fails: what was
+        // read may lack the open question, so it is kept for none, and the
+        // next refresh reads again.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let broken = Arc::new(AtomicBool::new(true));
+        let failing = broken.clone();
+        let client =
+            daemon_answering(
+                move |asked| match asked["op"].as_str().unwrap_or_default() {
+                    "bots" => json!({"bots": [{"name": "shop.t1", "bot_id": 1, "head": 1,
+                "status": "completed", "running_turn": null,
+                "last": {"turn": 1, "status": "completed"}}], "next_after": null}),
+                    "history_nodes" => {
+                        json!({"nodes": [{"node": 2, "turn": 1}, {"node": 1, "turn": 1}],
+                            "next_from": null})
+                    }
+                    "history_items" if failing.load(Ordering::SeqCst) => {
+                        json!({"error": "storage_error", "detail": "a failed read"})
+                    }
+                    "history_items" => json!({"items": [
+                        {"node": 2, "item": {"type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": "done"}]}},
+                        {"node": 1, "item": {"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": "go"}]}}]}),
+                    _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+                },
+            )
+            .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.status_rows().await.unwrap();
+        assert!(!app.asks_seen.contains_key("shop.t1"));
+        broken.store(false, Ordering::SeqCst);
+        app.status_rows().await.unwrap();
+        assert!(app.asks_seen.contains_key("shop.t1"));
+    }
+
+    #[tokio::test]
     async fn a_lead_window_reads_its_agents_histories_before_status_opens() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let histories = Arc::new(AtomicUsize::new(0));
@@ -18281,6 +18196,33 @@ mod tests {
             _ => json!({}),
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn a_message_drawn_keeps_when_the_daemon_wrote_it_for_the_mouse() {
+        let entries = json!([
+            {"node": 2, "written_ms": 2_000, "item": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Both checks pass."}]}},
+            {"node": 1, "written_ms": 1_000, "item": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Check the tally work"}]}},
+        ]);
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_nodes") => json!({"nodes": [{"node": 2, "turn": 1, "written_ms": 2_000},
+                {"node": 1, "turn": 1, "written_ms": 1_000}], "next_from": null}),
+            Some("history_items") => json!({"items": entries.as_array().into_iter().flatten()
+                .filter(|entry| asked["nodes"].as_array().into_iter().flatten()
+                    .any(|node| *node == entry["node"]))
+                .cloned()
+                .collect::<Vec<_>>()}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 100;
+        app.history().await;
+        drawn(&mut app);
+        assert_eq!(app.screen.dated(1), Some(1_000));
+        assert_eq!(app.screen.dated(2), Some(2_000));
     }
 
     #[tokio::test]
@@ -21443,6 +21385,46 @@ mod tests {
         app.read_tasks().await;
         let rows = drawn(&mut app);
         assert_eq!(rows[1], "  ● many  working  Fix many");
+    }
+
+    #[tokio::test]
+    async fn a_roster_read_cut_short_keeps_no_answer_for_its_task() {
+        // The task's turn ended; reading what it said fails partway: the
+        // roster keeps nothing for that turn, and its next pass reads again.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let broken = Arc::new(AtomicBool::new(true));
+        let failing = broken.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("approvals") => json!({"approvals": []}),
+            Some("inspect") => json!({"name": "calc.add", "running_turn": null}),
+            Some("turns") => json!({"turns": [{"turn": 1, "status": "completed",
+                "started_ms": 5, "finished_ms": 6}], "next_before": null, "next_after": null}),
+            Some("history_nodes") => json!({"nodes": [{"node": 2, "turn": 1}], "next_from": null}),
+            Some("history_items") if failing.load(Ordering::SeqCst) => {
+                json!({"error": "storage_error", "detail": "a failed read"})
+            }
+            Some("history_items") => json!({"items": [{"node": 2, "item": {"type": "message",
+                "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        let arguments = json!({"name": "add", "brief": "Fix add"});
+        app.commit_call(
+            "c",
+            Some(1),
+            served::START,
+            &arguments,
+            "turn:calc.add/1",
+            false,
+        );
+        app.read_tasks().await;
+        assert!(!app.asks_seen.contains_key("calc.add"));
+        broken.store(false, Ordering::SeqCst);
+        app.tasks_read = None;
+        app.read_tasks().await;
+        assert!(app.asks_seen.contains_key("calc.add"));
     }
 
     #[tokio::test]

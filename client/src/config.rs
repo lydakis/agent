@@ -69,8 +69,6 @@
 //! lookout_waiting = 4096        # events from sources that wait for one agent, 1024 by default; past it newer ones are not kept, and its next note says so; 0 no limit
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
-//! hours = ["Mon-Fri 09:00-19:00"]  # the person's working hours, local; outside them Sonny goes quiet once no window is used for quiet_after. Unset, the default: quiet only with /quiet
-//! quiet_after = "30m"           # how long no Sonny window is used, outside hours, before quiet starts; 30m by default
 //!
 //! [sonny.permissions.strict]    # a /permissions row of the person's own, as Codex's profiles
 //! description = "Offline, commits ask"
@@ -614,107 +612,10 @@ pub struct Sonny {
     /// The hosts this machine is linked to over SSH, by name, whose agents
     /// may use this machine's browser, MCP servers and opens.
     pub links: BTreeMap<String, Link>,
-    /// The person's working hours, local time: outside them, once no
-    /// window has been used for `quiet_after`, Sonny goes quiet. None, the
-    /// default, is no clock: quiet starts only when the person asks.
-    pub hours: Vec<Hours>,
-    /// How long no Sonny window is used, outside `hours`, before quiet
-    /// starts, in seconds.
-    pub quiet_after: u64,
 }
-
-/// One range of `[sonny] hours`, as `"Mon-Fri 09:00-19:00"`: the days it
-/// starts on, Sunday first, and its start and end in minutes from local
-/// midnight. An end at or before the start runs past midnight into the
-/// next day, as `"Fri 22:00-02:00"`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Hours {
-    pub days: [bool; 7],
-    pub start: u16,
-    pub end: u16,
-}
-
-/// How long no window is used, outside hours, before quiet starts, unless
-/// `quiet_after` says otherwise: long enough for a break, short enough
-/// that an evening's replies do not pile up.
-pub const QUIET_AFTER: u64 = 30 * 60;
 
 /// The speeds a task may be given: the daemon's tiers by name.
 pub const SPEEDS: [&str; 3] = ["standard", "fast", "ultrafast"];
-
-/// The days `hours` names, as the time stamp writes them.
-pub const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-/// A range of `[sonny] hours` read: one day or a run of days (`Mon-Fri`,
-/// `Fri-Mon` going round the week), a space, then `HH:MM-HH:MM`.
-pub fn hours(text: &str) -> Result<Hours, String> {
-    let bad = || {
-        format!(
-            "sonny.hours takes ranges as \"Mon-Fri 09:00-19:00\" or \"Sat 10:00-12:00\", not {text:?}"
-        )
-    };
-    let (days, times) = text.trim().split_once(' ').ok_or_else(bad)?;
-    let day = |name: &str| DAYS.iter().position(|day| *day == name).ok_or_else(bad);
-    let (first, last) = match days.split_once('-') {
-        Some((first, last)) => (day(first)?, day(last)?),
-        None => (day(days)?, day(days)?),
-    };
-    let mut on = [false; 7];
-    let mut at = first;
-    loop {
-        on[at] = true;
-        if at == last {
-            break;
-        }
-        at = (at + 1) % 7;
-    }
-    let minute = |time: &str| -> Result<u16, String> {
-        let (hour, minute) = time.split_once(':').ok_or_else(bad)?;
-        let digits = |s: &str| s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit());
-        if !digits(hour) || !digits(minute) {
-            return Err(bad());
-        }
-        let (hour, minute): (u16, u16) = (
-            hour.parse().map_err(|_| bad())?,
-            minute.parse().map_err(|_| bad())?,
-        );
-        match (hour, minute) {
-            (24, 0) => Ok(24 * 60),
-            (0..=23, 0..=59) => Ok(hour * 60 + minute),
-            _ => Err(bad()),
-        }
-    };
-    let (start, end) = times.trim().split_once('-').ok_or_else(bad)?;
-    let (start, end) = (minute(start)?, minute(end)?);
-    if start == 24 * 60 || start == end {
-        return Err(bad());
-    }
-    Ok(Hours {
-        days: on,
-        start,
-        end,
-    })
-}
-
-impl std::fmt::Display for Hours {
-    /// As the config writes it: `Mon-Fri 09:00-19:00`. The days are one
-    /// run, as `hours` reads them; all seven read as Mon-Sun.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let first = (0..7)
-            .find(|&day| self.days[day] && !self.days[(day + 6) % 7])
-            .unwrap_or(1);
-        let mut last = first;
-        while self.days[(last + 1) % 7] && (last + 1) % 7 != first {
-            last = (last + 1) % 7;
-        }
-        let days = match first == last {
-            true => DAYS[first].to_owned(),
-            false => format!("{}-{}", DAYS[first], DAYS[last]),
-        };
-        let time = |minutes: u16| format!("{:02}:{:02}", minutes / 60, minutes % 60);
-        write!(f, "{days} {}-{}", time(self.start), time(self.end))
-    }
-}
 
 /// A link, `[sonny.links.NAME]`: this machine dials `host` over SSH and
 /// answers the browser, `exec` and opens the agents there ask of it.
@@ -830,8 +731,6 @@ impl Default for Sonny {
             sources: Vec::new(),
             browser_confirm: BROWSER_CONFIRM.map(str::to_owned).to_vec(),
             links: BTreeMap::new(),
-            hours: Vec::new(),
-            quiet_after: QUIET_AFTER,
         }
     }
 }
@@ -1490,8 +1389,6 @@ fn parse(text: &str) -> Result<Config, String> {
                 "unsandboxed",
                 "default_permissions",
                 "browser_confirm",
-                "hours",
-                "quiet_after",
             ],
             _ => return Err(format!("unknown table [{name}]")),
         };
@@ -1632,28 +1529,6 @@ fn parse(text: &str) -> Result<Config, String> {
                         _ => Err(invalid()),
                     })
                     .collect::<Result<_, _>>()?;
-                continue;
-            }
-            if (name.as_str(), key.as_str()) == ("sonny", "hours") {
-                let invalid = || {
-                    format!("{name}.{key} must be a list of ranges, as [\"Mon-Fri 09:00-19:00\"]")
-                };
-                let ranges = value.as_array().ok_or_else(invalid)?;
-                config.sonny.hours = ranges
-                    .iter()
-                    .map(|range| hours(range.as_str().ok_or_else(invalid)?))
-                    .collect::<Result<_, _>>()?;
-                continue;
-            }
-            if (name.as_str(), key.as_str()) == ("sonny", "quiet_after") {
-                let text = string(&format!("{name}.{key}"), value)?;
-                config.sonny.quiet_after = span("sonny.quiet_after", &text)?;
-                if config.sonny.quiet_after == 0 {
-                    return Err(format!(
-                        "{name}.{key} is how long no window is used before quiet starts, \
-                         as 30m; more than 0"
-                    ));
-                }
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "unsandboxed") {
@@ -2312,45 +2187,6 @@ mod tests {
         let config = parse("[sonny.links.box]\nhost = \"box\"\ncalls = 2\n").unwrap();
         assert_eq!(config.sonny.links["box"].calls, Some(2));
         assert!(parse("[sonny.links.box]\nhost = \"box\"\ncalls = 0\n").is_err());
-    }
-
-    #[test]
-    fn hours_are_runs_of_days_with_a_time_range_and_none_is_no_clock() {
-        assert_eq!(parse("").unwrap().sonny.hours, Vec::new());
-        assert_eq!(parse("").unwrap().sonny.quiet_after, QUIET_AFTER);
-        let week = hours("Mon-Fri 09:00-19:00").unwrap();
-        assert_eq!(week.days, [false, true, true, true, true, true, false]);
-        assert_eq!((week.start, week.end), (9 * 60, 19 * 60));
-        assert_eq!(week.to_string(), "Mon-Fri 09:00-19:00");
-        // Round the week, and past midnight.
-        let late = hours("Fri-Mon 22:00-02:00").unwrap();
-        assert_eq!(late.days, [true, true, false, false, false, true, true]);
-        assert_eq!(late.to_string(), "Fri-Mon 22:00-02:00");
-        assert_eq!(
-            hours("Sat 10:00-24:00").unwrap().to_string(),
-            "Sat 10:00-24:00"
-        );
-        assert_eq!(
-            hours("Sun-Sat 00:00-24:00").unwrap().to_string(),
-            "Mon-Sun 00:00-24:00"
-        );
-        for bad in [
-            "Mon-Fri",
-            "Monday 09:00-17:00",
-            "Mon 9:00-17:00",
-            "Mon 09:00-09:00",
-            "Mon 24:00-01:00",
-            "Mon 09:60-10:00",
-            "Mon 09:00",
-        ] {
-            assert!(hours(bad).is_err(), "{bad}");
-        }
-        let config = parse("[sonny]\nhours = [\"Mon-Fri 09:00-19:00\", \"Sat 10:00-12:00\"]\nquiet_after = \"45m\"\n").unwrap();
-        assert_eq!(config.sonny.hours.len(), 2);
-        assert_eq!(config.sonny.quiet_after, 45 * 60);
-        assert!(parse("[sonny]\nhours = \"Mon-Fri 09:00-19:00\"\n").is_err());
-        assert!(parse("[sonny]\nhours = [\"weekdays\"]\n").is_err());
-        assert!(parse("[sonny]\nquiet_after = \"0\"\n").is_err());
     }
 
     #[test]

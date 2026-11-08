@@ -247,7 +247,13 @@ pub struct Screen {
     /// The react mark drawn last, where the reactions under the agent's
     /// message under the mouse go: its row and column, and the node.
     react: Option<(u16, u16, i64)>,
+    /// When each message was written, by its node, in Unix milliseconds:
+    /// shown over the message under the mouse.
+    dates: HashMap<i64, i64>,
 }
+
+/// The columns before a message's words: its bullet or arrow and a space.
+const GUTTER: u16 = 2;
 
 /// The mark a message's gutter shows under the mouse: a click answers it.
 pub const REPLY: &str = "↩";
@@ -384,6 +390,16 @@ impl Screen {
     }
 
     /// `mark` on the last row pushed; whether there was one.
+    /// When the message at `node` was written, `ms` in Unix milliseconds.
+    pub fn date(&mut self, node: i64, ms: i64) {
+        self.dates.insert(node, ms);
+    }
+
+    #[cfg(test)]
+    pub fn dated(&self, node: i64) -> Option<i64> {
+        self.dates.get(&node).copied()
+    }
+
     pub fn mark_last(&mut self, mark: Mark) -> bool {
         let laid = self.wrapped == self.rows.len();
         let Some(row) = self.rows.last_mut() else {
@@ -884,6 +900,7 @@ impl Screen {
             },
         );
         self.placed = None;
+        self.dates.extend(older.dates);
         self.swap(0, older.rows);
         self.let_go(None);
     }
@@ -933,6 +950,7 @@ impl Screen {
             return;
         };
         self.pages[page].drawn = true;
+        self.dates.extend(older.dates);
         self.swap(page, older.rows);
         self.let_go(Some(page));
     }
@@ -1078,6 +1096,7 @@ impl Screen {
             let at = placed[p].clone();
             let row = self.pages[..p].iter().map(|p| p.rows).sum::<usize>();
             let rows = self.pages[p].rows;
+            self.forget(row..row + rows);
             self.rows.splice(
                 row..row + rows,
                 (0..at.len()).map(|_| Row {
@@ -1269,6 +1288,19 @@ impl Screen {
         }
     }
 
+    /// The times of the messages ending in `rows`, about to go: a page
+    /// drawn again brings its own back, so only what is drawn is kept.
+    fn forget(&mut self, rows: std::ops::Range<usize>) {
+        if self.dates.is_empty() {
+            return;
+        }
+        for row in &self.rows[rows] {
+            if let Some(Tag::End(node)) = row.tag {
+                self.dates.remove(&node);
+            }
+        }
+    }
+
     /// The oldest rows let go, a batch at a time, once new ones written
     /// pass what is kept and the view is below them: not for older ones
     /// drawn above, nor for the rows wrapped anew at another width.
@@ -1290,6 +1322,7 @@ impl Screen {
                 .len()
                 .saturating_sub(self.back + self.area.height as usize);
             if gone <= view {
+                self.forget(0..drop);
                 self.rows.drain(..drop);
                 self.wrapped -= drop;
                 self.shown.drain(..gone);
@@ -1693,6 +1726,27 @@ impl Screen {
                 .set_symbol(REPLY)
                 .set_style(Style::new().add_modifier(Modifier::DIM));
             self.reply = Some((y, area.x, node));
+            // When it was written, muted, at the top right edge of the
+            // message: the right end of the row over it, only a row on
+            // screen with nothing on it, the gap over an agent's words or
+            // the band's over the person's, so the time never covers
+            // anything and no row is made wider.
+            if at > top
+                && self.shown[at - 1].line.width() == 0
+                && let Some(&ms) = self.dates.get(&node)
+            {
+                let when = crate::stamp::written(ms);
+                let wide = when.width() as u16;
+                // Inset from the right as the words are from the left.
+                if area.width > 2 * GUTTER + wide {
+                    buf.set_string(
+                        area.x + area.width - GUTTER - wide,
+                        y - 1,
+                        when,
+                        Style::new().add_modifier(Modifier::DIM),
+                    );
+                }
+            }
         }
         // An agent's message under the mouse shows the react mark where
         // its reactions go, after any there, muted as the reply mark is.
@@ -2565,6 +2619,56 @@ mod tests {
     }
 
     #[test]
+    fn the_message_under_the_mouse_shows_when_it_was_written_at_its_top_right_on_the_empty_row() {
+        let mut screen = Screen::default();
+        screen.push(vec![Line::from("• The tests pass.")]);
+        screen.mark_last(Mark::Tag(Tag::End(5)));
+        screen.push(vec![Line::default(), Line::from("› thanks")]);
+        screen.mark_last(Mark::Tag(Tag::End(6)));
+        // Words right under a step, no blank row between them.
+        screen.push(vec![
+            Line::from("  ran the tests"),
+            Line::from("• Tagged it."),
+        ]);
+        screen.mark_last(Mark::Tag(Tag::End(7)));
+        let ms = 1_794_042_780_000;
+        for node in [5, 6, 7] {
+            screen.date(node, ms);
+        }
+        let when = crate::stamp::written(ms);
+        let area = Rect::new(0, 0, 40, 6);
+        let draw = |screen: &mut Screen| {
+            let mut buf = Buffer::empty(area);
+            screen.render(area, &mut buf, |_| None);
+            buf
+        };
+        // Nothing at rest.
+        let buf = draw(&mut screen);
+        assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
+        // Over a message, its time at its top right edge, on the blank row
+        // over it, muted.
+        screen.mouse(mouse(MouseEventKind::Moved, 4, 2));
+        let buf = draw(&mut screen);
+        assert_eq!(row(&buf, 1), format!("{when:>38}  "));
+        assert!(buf[(37, 1)].modifier.contains(Modifier::DIM));
+        assert!(row(&buf, 2).starts_with("↩ thanks"));
+        // The first row on screen has no row over it: no time.
+        screen.mouse(mouse(MouseEventKind::Moved, 4, 0));
+        let buf = draw(&mut screen);
+        assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
+        // A row with words on it over the message is left as it is.
+        screen.mouse(mouse(MouseEventKind::Moved, 4, 4));
+        let buf = draw(&mut screen);
+        assert!(
+            row(&buf, 4).starts_with("↩ Tagged it."),
+            "{:?}",
+            row(&buf, 4)
+        );
+        assert_eq!(row(&buf, 3).trim_end(), "  ran the tests");
+        assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
+    }
+
+    #[test]
     fn an_agent_s_message_under_the_mouse_shows_a_react_mark_where_its_reactions_go() {
         let mut screen = Screen::default();
         screen.push(vec![
@@ -3242,6 +3346,36 @@ mod tests {
         assert!(screen.pages[0].drawn && !screen.pages[1].drawn);
         assert_eq!(screen.height(20), 14_050);
         assert_eq!(screen.wanted(), None);
+    }
+
+    #[test]
+    fn a_message_time_goes_with_its_rows_and_comes_back_with_its_page() {
+        let area = Rect::new(0, 0, 20, 5);
+        let dated = |range, node| {
+            let mut page = written(rows(range));
+            page.mark_last(Mark::Tag(Tag::End(node)));
+            page.date(node, 1_000 * node);
+            page
+        };
+        let (mut screen, _) = screen(rows(20_000..20_050), 20, 5);
+        screen.prepend(1, dated(10_000..17_000, 1));
+        screen.prepend(2, dated(0..7_000, 2));
+        drawn(&mut screen, area);
+        // The page let go took its message's time; the one drawn kept its.
+        assert!(!screen.pages[0].drawn);
+        assert_eq!((screen.dated(2), screen.dated(1)), (None, Some(1_000)));
+        screen.scroll(isize::MAX);
+        screen.fill(2, dated(0..7_000, 2));
+        drawn(&mut screen, area);
+        assert_eq!((screen.dated(2), screen.dated(1)), (Some(2_000), None));
+        // The oldest rows trimmed away take theirs too.
+        let mut screen = written(rows(0..10));
+        screen.mark_last(Mark::Tag(Tag::End(3)));
+        screen.date(3, 3_000);
+        screen.push(rows(10..KEEP + KEEP / 4 + 11));
+        drawn(&mut screen, area);
+        assert!(screen.trimmed());
+        assert_eq!(screen.dated(3), None);
     }
 
     #[test]
