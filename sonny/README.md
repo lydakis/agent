@@ -793,7 +793,8 @@ way `/react` does, and each note in the margin has its own `↩`.
   its right edge, dim, its code reviews; one that needs you says what for
   under it. That is all it shows as it opens; `m` shows more and hides it
   again: at each row's right edge, dim, the rest of what it tracks: what it follows (a source with an
-  `icon` in `[sonny.sources.NAME]` shows as that icon), the code reviews
+  `icon` in `[sonny.sources.NAME]` shows as that icon, as it does wherever
+  Sonny names that source: `/background` and the "From your sources" row), the code reviews
   its turns opened or wait on, in any system, as the copy that checks
   each turn names them from its commands' output and reply (`3 reviews · CR-881`; a pull or merge request link its last
   reply holds shows before any is kept), its background work
