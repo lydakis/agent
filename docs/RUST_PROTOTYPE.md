@@ -514,6 +514,7 @@ when it sets either.
 | `compact_keep` (`--compact-keep`) | Target percent of either context envelope kept verbatim: as newest whole turns by compaction, as newest items by elision. Reduced when pinned context leaves less room. Must be below `compact_at`. | 25 |
 | `compact_tokens` (`--compact-tokens`) | Input tokens per request that start elision and compaction too, whichever of this and `compact_at` comes first (see [compaction](#compaction)). 0 leaves only `compact_at`; otherwise at least 1,024. | from the model's context window |
 | `max_rounds` (`--max-rounds`) | Model calls each turn may make; the last goes with no tool call allowed, and the turn fails `tool_round_limit` past it. | none |
+| `max_drops` (`--max-drops`) | Replies in a row the model's own output cap may cut short in a turn; each before the last is dropped and the model told, and the last ends the turn `provider_incomplete`. | 3 |
 | `keep_turns` (`--keep-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)), and a terminal read waits live for its output before its turn parks. 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
@@ -1009,14 +1010,15 @@ or stringify the full conversation on each turn. Provider HTTP/TLS comes from
 transactions from [rusqlite](https://docs.rs/rusqlite/0.40.2/rusqlite/).
 
 Current limits: 8 MiB / 4,096 items of model context per request (stored
-history is unbounded), 256 KiB input prompt, 64 KiB instructions, 768 KiB JSON-encoded terminal provider output
-(a full 128,000-token answer, under the 1 MiB event cap; tool call ids and
-names count toward it), 64 KiB JSON-encoded
+history is unbounded), 256 KiB input prompt, 64 KiB instructions, no bound of
+the daemon's own on one reply (the model's own output cap bounds it; see
+[Replies the model's cap cuts short](#replies-the-models-cap-cuts-short)), 64 KiB JSON-encoded
 tool call id without NUL, unique within its turn (a longer one, one with a
 NUL, or one an earlier call of the response or turn used fails the response
 with `invalid_tool_call_id`, so every gated call can be listed and answered
-by a command naming it alone), 2 MiB SSE frame,
-16 MiB response stream, 200 provider rounds per turn, and the configurable
+by a command naming it alone), a 16 MiB response stream, over HTTP or a
+socket, which also bounds one SSE frame (an endpoint that never stops; no
+model writes that much), 200 provider rounds per turn, and the configurable
 active-turn, process, and connection-startup bounds below. Provider startup
 admission, when bounded, has a 60-second timeout and releases its permit when
 response headers arrive. Both live providers hold headers until the first
@@ -2181,6 +2183,33 @@ tool anyway has those calls run, as any committed plan's, and the turn then
 fails `tool_round_limit`.
 Unbilled failures remain bounded by the attempt and time limits above.
 
+### Replies the model's cap cuts short
+
+A reply the model's own output cap cuts short (Anthropic's `max_tokens` stop,
+Responses' `response.incomplete` for `max_output_tokens`) is not retried, as
+the same request would write the same reply. It is dropped: nothing of it is
+recorded, so no partial tool call can run, and the turn goes on with every
+earlier round kept. One commit counts its round (its usage does when the
+provider reported it), records a durable `dropped` event, and queues a strict
+steer for the turn from the `limit` origin, which the next boundary takes as
+it takes any steer. Its words are the facts, and the event's data the same:
+
+```json
+{"dropped":{"limit":"max_tokens","output_tokens":32000,"in":"write"}}
+```
+
+`in` is what the reply was writing when cut, `text`, `reasoning`, or the tool
+it called, when the stream said. No budget refuses that steer: the turn's
+calls are what the budget bounds, and a spent one still makes the turn's last
+call, which reads it. The cap cutting `max_drops` replies of a turn in a row
+(unset, three) ends the turn on the last, `provider_incomplete` with the same
+facts on its `turn_finished`, since each can cost a whole reply's output. The
+turn keeps the count, so a park or a restart counts on; a reply it keeps sets
+it back to none. The daemon puts
+no bound of its own on a reply under the 16 MiB response stream: events carry
+previews of calls (2 KiB of arguments), text streams live in pieces of at most
+128 KiB, and a history read answers `item_too_large` for one item past a line.
+
 ### Held turns
 
 Protocol 47: a failure a person can fix holds the turn instead of ending
@@ -2722,6 +2751,7 @@ command reaches another bot's. A request on it:
 | Request | On a bot's own socket |
 |---|---|
 | `configure`, `answer`, `tool_result`, `approve_step`, `step_result`, `serve_approvals`, `renew_approvals`, `shutdown` | `not_permitted`: any of them would let a confined command undo its confinement |
+| `audit_trim` | `not_permitted`: the audit trail is the person's record of what agents did |
 | `create`, `fork` | Made by the caller, whatever `created_by` names (another is `not_permitted`), so the bot inherits its sandbox; its workspace and `writable` folders, and a fork's source's, must be ones the caller may write. A fork with `allow: []`, which only answers, may be of any bot |
 | `submit` | Reads as the caller's: `from` its turn when the request names it (the CLI does, from `AGENT_TURN`), else with its name as `origin`; `from` naming another bot is `not_permitted`. A workspace for a sandboxed bot must be one the caller may write |
 | `delete`, `prune`, `compact`, `interrupt` | The caller itself, or a bot it made; another is `not_permitted` |
@@ -3308,6 +3338,69 @@ calls, `agent answer --bot NAME --turn N --call ID --request R allow|deny
 [--tag T] [--reason TEXT]` decides one and refuses to run inside a bot's
 tool shell, and `run --pretty` prints each pending call with the commands
 that allow or deny it.
+
+### Audit trail
+
+Protocol version 57 (schema 87) keeps a trail of what every agent did: one
+append-only `audit` table, with a row for each tool call that starts or is
+denied, and a row for each step a client puts to the daemon (an MCP call
+inside a script, a browser or desktop command). The daemon records what it
+sees and only that; nothing is guessed. A row holds:
+
+| Field | What it is |
+|---|---|
+| `id`, `at_ms` | Its place in the trail, never reused even after a trim, and when it was written; times rise with ids |
+| `bot_id`, `bot`, `turn`, `call_id`, `step` | Whose call it was (`step` set for a step, as the client named it) |
+| `tool` | The tool's name, or a step's |
+| `kind` | `shell`, `file`, `mcp`, `browser`, `desktop`, `agents` or `web`; for a declared tool, what its client declared, else `null` |
+| `place` | `sandbox` (a shell or file call the bot's sandbox confined), `outside` (one it didn't), `external` (the web, or a remote MCP server), or `null` when the call says nothing of where it ran |
+| `approved` | `nobody` (no gate named it), `rule` (a command rule allowed it), `person` (a verdict given without a session's lease) or `reviewer` (every verdict under one) |
+| `access` | `read` or `write` only where the tool declares which (the daemon's file, web and agents tools; a client's step); `unknown` otherwise, and always for a shell command |
+| `ms`, `outcome` | How long it ran and how it ended: `completed`, `failed`, `denied`, or `unknown` while it runs or when it never said |
+| `preview` | The first 256 characters of its arguments |
+
+A call's row is written in the commit that starts it (or denies it), and
+its end updates the row in the commit that records the result: no store job
+is added to a turn. A step is written when it is decided: at once under no
+gate, or when its gates answer, keeping the facts it was announced with
+until then. Rows outlive their bots, their turns and every retention
+setting: only the person trims them.
+
+`{"op":"audit","before","since_ms","until_ms","bot","bot_id","turn","kind","place","approved","access","outcome","tool","limit"}`
+reads a page newest first, every field optional: `before` an id, the times
+in epoch milliseconds (found by bisecting ids, as times rise with them),
+`bot` a name or a pattern of `*`, `?` and `[...]` as `history_search` takes
+one, and the rest equal to a row's. `limit` is 1 to 500 (100 by default).
+The reply is `{rows, next_before}`; pass `next_before` as `before` for the
+next older page, `null` when there is none. A word outside a field's
+vocabulary is `invalid_audit`, never an empty page. It reads on a reader
+connection, so it waits for no turn.
+
+`{"op":"audit_trim","before"}` or `{"op":"audit_trim","before_ms"}`
+deletes every row older than that id or time, in pieces of 10,000 on the
+retention task, and answers `{trimmed, before}` once done. It is refused on
+a bot's own socket. `agent audit` reads the trail (`--bot`, `--turn`,
+`--kind`, `--place`, `--approved`, `--access`, `--outcome`, `--tool`,
+`--since`, `--before`, `--limit`, `--pretty` for a line each) and
+`agent audit trim --before ID` or `--older-than 30d` trims it.
+
+An agent reads the same trail with its `history` tool: `audit` in place of
+`turn` or `query` (an object of `kind`, `place`, `approved`, `access`,
+`outcome`, `tool` and `since_ms`), with `bot` for one agent's or a pattern,
+and `before` for older rows; 50 rows a call.
+
+A client says what its tools are: a declared tool takes `kind`, one of the
+kinds above (`invalid_declare` otherwise), which its calls' rows carry.
+`approve_step` takes `kind`, `place` and `access` for the step's row
+(`invalid_step` for another word), and `record: true` for a step the
+client lets run without asking: it is written and allowed at once,
+whatever the gates say, so the trail has every step and the gates judge
+only those a client puts to them. A step's `step_result` ends its row;
+told twice, the first holds, and a step its gates allowed is told done by
+its events even once a trim took its row. A step allowed by nobody is not
+among the calls a judge reads. Approval verdicts now keep `leased` when given under a
+session's lease, which is how a row tells a reviewer from a person. The
+upgrade starts the trail empty: calls from before it are in history only.
 
 ### Tool-result elision
 

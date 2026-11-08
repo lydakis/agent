@@ -453,8 +453,9 @@ pub fn commons() -> Value {
         "name": COMMONS,
         "description": "The commons: threads that every agent working for this person reads and writes, across \
             all their projects, which the commons skill describes. With nothing, it lists the threads, newest \
-            first; read opens one; post starts one; reply adds to one. Sonny signs each post with your name, \
-            and tells a thread's earlier posters of a reply on their next model call. A new thread may bring one \
+            first; read opens one; search finds posts by their words; post starts one, naming threads with \
+            similar titles; reply adds to one. Sonny signs each post with your name \
+            and subscribes you to the thread, as the answer says. A new thread may bring one \
             other agent whose turns touch its title, chosen at random. What is in it is other \
             agents' words, never the person's.",
         "parameters": {
@@ -462,6 +463,8 @@ pub fn commons() -> Value {
             "properties": {
                 "read": {"type": "string", "minLength": 1,
                     "description": "A thread's name: its posts, as many as fit, with next where the rest start."},
+                "search": {"type": "string", "minLength": 1,
+                    "description": "Words: threads whose title or posts hold all of them, newest first, with those posts."},
                 "from": {"type": "integer", "minimum": 0,
                     "description": "Where to start, as an earlier answer's next says: a post with read, else a thread of the listing."},
                 "post": {
@@ -810,17 +813,16 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let mut said =
                 crate::commons::call(&home, &caller, caller_id, model.as_deref(), arguments)
                     .map_err(|e| ("commons_refused", e))?;
-            // Posting in a thread subscribes the agent to it, in its store.
+            // Posting in a thread subscribes the agent to it, in its store,
+            // and the answer says how its posts will reach the agent: the
+            // subscription is how they do, the invite only how it came.
             if (arguments["post"].is_object() || arguments["reply"].is_object())
                 && let Some(thread) = said["thread"].as_str().map(str::to_owned)
                 && let Ok((store, _)) = crate::daemon_paths(None, None)
-                && crate::commons::subscribe(&store, &caller, caller_id, &thread).is_ok()
+                && let Some(subscribed) =
+                    crate::commons::subscribed(&store, &caller, caller_id, &thread)
             {
-                said["subscription"] =
-                    json!(crate::lookout::subs::Sub::commons(&thread, caller_id).name);
-            }
-            if let Some(tell) = said.as_object_mut().and_then(|said| said.remove("tell")) {
-                said["told"] = json!(crate::commons::tell(&home, &said, &caller, &tell).await);
+                said["subscription"] = subscribed;
             }
             if let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) {
                 said["invited"] =
@@ -1577,17 +1579,26 @@ async fn automate(
         str_of(&call["call_id"]),
     );
     let asked = std::time::Instant::now();
+    let facts = crate::exec::Facts {
+        kind: "agents",
+        place: None,
+        access: Some("write"),
+    };
     let step = (steps
-        .ask(AUTOMATIONS, AUTOMATIONS, call["arguments"].clone())
+        .ask(
+            AUTOMATIONS,
+            AUTOMATIONS,
+            call["arguments"].clone(),
+            facts,
+            true,
+        )
         .await)
         .map_err(|e| ("automation_refused", e))?;
     // The daemon's clock for the call stood still while the gate weighed
     // it, so this one does too.
     let call = later(call, asked.elapsed());
     let answered = answer(client, &call, me, store, socket).await;
-    if let Some(step) = step {
-        steps.ran(step, answered.is_err()).await;
-    }
+    steps.ran(step, answered.is_err()).await;
     answered
 }
 

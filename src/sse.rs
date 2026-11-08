@@ -1,6 +1,8 @@
 use crate::{Result, fail};
 
-pub const MAX_FRAME: usize = 2 * 1024 * 1024;
+/// One frame is bounded as the whole response is: a reply's items come whole
+/// in one, and again in the terminal frame.
+pub const MAX_FRAME: usize = crate::provider::MAX_RESPONSE;
 
 /// Incremental SSE decoder. UTF-8 is decoded only after complete data lines.
 #[derive(Default)]

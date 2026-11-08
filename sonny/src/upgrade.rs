@@ -182,6 +182,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::git::NO_SNAPSHOTS,
         retire: "0.11.0",
     },
+    // The commons' wake marks go with the wakes: an invite is the one
+    // turn the commons starts (0.9.1).
+    Migration {
+        id: crate::commons::WOKEN_GONE,
+        retire: "0.11.0",
+    },
     // Sonny's own nightly memory cleanup, scheduled before each run started
     // an agent of its own, is scheduled again fresh, keeping its model and
     // time (0.9.0).

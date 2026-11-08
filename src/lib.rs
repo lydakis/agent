@@ -1,4 +1,6 @@
 pub mod codec;
+#[cfg(test)]
+mod doubling;
 pub mod output;
 pub mod provider;
 pub mod rules;

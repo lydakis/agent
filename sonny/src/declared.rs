@@ -28,7 +28,24 @@ pub fn tools(role: Role) -> Vec<Value> {
         tools.push(crate::resolved::tool());
     }
     tools.extend(crate::served::tools(role));
-    tools
+    tools.into_iter().map(kinded).collect()
+}
+
+/// `tool` with the kind its calls' rows in the agent's audit trail name:
+/// what it does, in the trail's words. Running a command in a pane is a
+/// command; memory is files; a script's calls are MCP's, and the browser
+/// and the desktop their own; the rest work with agents and the person.
+fn kinded(mut tool: Value) -> Value {
+    let kind = match tool["name"].as_str().unwrap_or_default() {
+        crate::served::RUN => "shell",
+        crate::served::MEMORY => "file",
+        crate::served::EXEC => "mcp",
+        crate::served::BROWSER => "browser",
+        crate::served::DESKTOP => "desktop",
+        _ => "agents",
+    };
+    tool["kind"] = json!(kind);
+    tool
 }
 
 /// The lead whose line the bot `record` describes is in: the nearest of
@@ -92,7 +109,7 @@ pub fn declare(record: &Value, role: Role) -> Option<Value> {
     let mut ours = tools(role);
     // A task resolves itself, as its lead resolves it.
     if !role.lead && resolves(record) {
-        ours.push(crate::resolved::tool());
+        ours.push(kinded(crate::resolved::tool()));
     }
     // A gate Sonny did not set, as another client's tag or several, is
     // not one Sonny can add its gated tools to, so that bot goes without
