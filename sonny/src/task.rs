@@ -1101,11 +1101,8 @@ fn own(bots: &[Value], lead: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn listed(agent: &Path, name: &str) -> bool {
-    listed_on(agent, &[], name)
-}
-
-/// [`listed`], on the daemon `env` names when it names one.
+/// Whether the daemon `env` names, or this shell's, lists `name`: so when
+/// it can't be read, to keep a task's folder.
 fn listed_on(agent: &Path, env: &[(String, String)], name: &str) -> bool {
     let Ok(output) = Command::new(agent)
         .envs(env.iter().map(|(key, value)| (key, value)))
@@ -1736,12 +1733,18 @@ pub fn remove(
     kept()?;
     // Its newest turns while it is there: one not finished, running or
     // waiting to, keeps the task as it is.
-    let turns = match listed(&agent, name) {
-        true => Some(turns_of(&agent, name)?),
-        false => None,
+    let bot = listing(&agent, name)?;
+    // The turn the daemon says runs, however many messages steered into it
+    // since, each a turn of its own already ended.
+    if let Some(running) = bot.as_ref().and_then(|bot| bot["running_turn"].as_i64()) {
+        return Err(busy(name, running));
+    }
+    let turns = match bot {
+        Some(_) => Some(turns_of(&agent, name)?),
+        None => None,
     };
     if let Some(turn) = (turns.iter().flatten()).find(|turn| turn["finished_ms"].is_null()) {
-        return Err(busy(name, turn));
+        return Err(busy(name, turn["turn"].as_i64().unwrap_or(0)));
     }
     // Done first, so a removal cut short leaves a task done, which a call
     // again tidies.
@@ -1818,14 +1821,27 @@ fn turns_of(agent: &Path, name: &str) -> Result<Vec<Value>, String> {
     }
 }
 
-/// Why `name`, whose turn `turn` has not finished, is left as it is: a
-/// task is cleaned up once it is idle, which says how.
-fn busy(name: &str, turn: &Value) -> String {
-    let number = turn["turn"]
-        .as_i64()
-        .map_or(String::new(), |turn| format!(" {turn}"));
+/// `name` as `agent ls` lists it, none when it is not there.
+fn listing(agent: &Path, name: &str) -> Result<Option<Value>, String> {
+    let output = Command::new(agent)
+        .args(["ls", "--name", name])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("running {}: {e}", agent.display()))?;
+    match serde_json::from_slice::<Value>(&output.stdout) {
+        Ok(Value::Array(bots)) => Ok(bots.into_iter().find(|bot| bot["name"] == name)),
+        _ => Err(format!(
+            "whether {name} is there could not be read: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// Why `name`, whose turn `turn` has not ended, is left as it is: a task
+/// is cleaned up once it is idle, which says how.
+fn busy(name: &str, turn: i64) -> String {
     format!(
-        "{name} was left as it is: its turn{number} has not ended, and only an idle task is cleaned up. \
+        "{name} was left as it is: its turn {turn} has not ended, and only an idle task is cleaned up. \
          Its update reaches you when the turn ends; clean it up then, or end the turn first \
          with `agent interrupt --bot {name}`"
     )
@@ -1837,7 +1853,7 @@ mod tests {
 
     #[test]
     fn a_task_at_work_is_left_as_it_is_and_says_how_it_can_be_cleaned_up() {
-        let said = busy("fix", &serde_json::json!({"turn": 4, "status": "running"}));
+        let said = busy("fix", 4);
         assert!(said.contains("its turn 4 has not ended"), "{said}");
         assert!(said.contains("`agent interrupt --bot fix`"), "{said}");
         assert_eq!(capitalized("removed"), "Removed");

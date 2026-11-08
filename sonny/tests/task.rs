@@ -524,6 +524,14 @@ fn a_done_worktree_task_is_marked_done_and_its_worktree_removed_with_its_merged_
     let (ok, err) = lab.remove(&lab.repo, false);
     assert!(!ok && err.contains("its turn 9 has not ended"), "{err}");
     assert!(worktree.exists() && lab.done("demo.fix").is_none());
+    // The turn the daemon says runs keeps it too, however many messages
+    // steered into it since, each a turn already ended.
+    let ls = lab.scratch.join("run.log.ls");
+    std::fs::write(&ls, r#"[{"name":"demo.fix","running_turn":3}]"#).unwrap();
+    let (ok, err) = lab.remove(&lab.repo, false);
+    assert!(!ok && err.contains("its turn 3 has not ended"), "{err}");
+    assert!(worktree.exists() && lab.done("demo.fix").is_none());
+    std::fs::write(&ls, r#"[{"name":"demo.fix","running_turn":null}]"#).unwrap();
     turns(
         serde_json::json!([{"turn": 9, "status": "completed", "finished_ms": 8},
         {"turn": 7, "status": "completed", "finished_ms": 5}]),
