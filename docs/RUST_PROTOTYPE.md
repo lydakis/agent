@@ -3690,7 +3690,9 @@ ends while one runs starts none. It is dropped, refused with
 on or the bot's model, summarizer, or compaction instructions changed
 before it went in; it is billed all the same. A stopping daemon drops it,
 as it ends no turn, and the next turn summarizes as before; so does a
-`pause`, which stops its call (the calls it finished stay billed), and so
+`pause`, which stops its call (the calls it finished stay billed: their
+charge is queued to the store even when the stop comes while it waits for
+room there), and so
 does deleting the bot or its expiring, so a bot made later under its name
 starts without it. Going in, it clears the sent-view mark of every turn of
 the bot since the one it is billed to, so no later call is read as having

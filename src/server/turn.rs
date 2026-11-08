@@ -4170,8 +4170,9 @@ impl Turn {
         usage: Option<agent_runtime::provider::Usage>,
     ) -> Result<()> {
         let ended = self.tailing.load(Relaxed);
+        // Kept: a summary stopped while this waits for room still bills it.
         self.store
-            .op("compaction_usage", move |db| match ended {
+            .op_kept("compaction_usage", move |db| match ended {
                 false => db.compaction_usage(turn, usage.as_ref()),
                 true => db.compaction_usage_after(turn, usage.as_ref()),
             })
@@ -4190,7 +4191,7 @@ impl Turn {
         if let Some(usage) = usage {
             let turn = self.turn;
             self.store
-                .op("failed_usage", move |db| {
+                .op_kept("failed_usage", move |db| {
                     db.failed_usage(turn, &usage, added, read)
                 })
                 .await?;

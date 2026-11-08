@@ -873,6 +873,19 @@ impl Store {
     ) -> Result<T> {
         self.enqueue(label, None, operation).await
     }
+    /// Run a job that is queued even if its caller stops waiting for it,
+    /// as a pause stops a summary: a charge for what a provider already
+    /// billed, which must reach the store whatever happens to the caller.
+    pub async fn op_kept<T: Send + 'static>(
+        &self,
+        label: &'static str,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let store = self.clone();
+        tokio::spawn(async move { store.op(label, operation).await })
+            .await
+            .map_err(|_| Error::new("storage_worker_failed"))?
+    }
     /// Run a job that can prune a bot's events. Jobs for different bots may
     /// share a commit; another pruning job for this bot must follow publication
     /// of the first, so it cannot erase a terminal event before live delivery.
@@ -1094,6 +1107,36 @@ mod tests {
         store.stats()["operations"]["commit"]["count"]
             .as_u64()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_kept_job_is_queued_after_its_caller_stops_waiting_for_room() {
+        let store = scratch_store("kept").await;
+        let (held, gate) = hold(&store).await;
+        let mut waiting = Vec::new();
+        for x in 0..GROUP_JOBS as i64 {
+            waiting.push(queue(&store, insert(x)).await);
+        }
+        // The queue is full: the caller gives up while its job waits for room.
+        let kept = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            store.op_kept("test", insert(100)),
+        )
+        .await;
+        assert!(kept.is_err(), "the full queue held the job back");
+        gate.send(()).unwrap();
+        held.await.unwrap().unwrap();
+        for job in waiting {
+            job.await.unwrap().unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !rows(&store).await.contains(&100) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the kept job never ran"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     #[tokio::test]
