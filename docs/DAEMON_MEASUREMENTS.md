@@ -7811,3 +7811,53 @@ reads 0 on a run too short for its 10 ms CPU ticks.
 | lifecycle | CPU, s | 0.51 | 0.51 | +0.0% |
 | lifecycle | p95 turn, ms | 580.477 | 581.998 | +0.3% |
 | lifecycle | peak RSS, MiB | 22.75 | 22.775 | +0.1% |
+
+## A parked call admitted beside any number of others
+
+Each call coming back to a provider pool that rate limits it refilled the
+allowance by summing every parked call's booking in each dimension, found a
+due booking by scanning them, and summed them again beside it: Θ(K) per
+admission, so K parked calls draining cost Θ(K²) under the pool's lock on
+the daemon's one thread. Now the bookings are kept soonest due first, with
+running totals per dimension: an admission reads the soonest and the
+totals, and a booking whose grace ran out leaves from the front. A due
+booking is now always the soonest one, where it was the first in the list,
+which a spent booking's swap could reorder.
+
+Wall time of K parked calls coming back, each spending its booking
+(refill, find the due booking, admit), release build, 4-core Linux cloud
+container (Xeon 2.1 GHz), main d82ec12 against this change:
+
+| Parked calls | Before | After |
+| ---: | ---: | ---: |
+| 100 | 0.04 ms | 0.02 ms |
+| 1,000 | 3.5 ms | 0.09 ms |
+| 4,000 | 48 ms | 0.39 ms |
+| 16,000 | 822 ms | 1.7 ms |
+
+About 0.1 µs per admission from 1,000 to 16,000. Memory: a B-tree entry per
+parked call where a vector element was, and three counters per pool.
+`a_parked_call_is_admitted_at_the_same_cost_however_many_are_parked` times
+8,000 and 16,000; with the totals summed per admission again it fails.
+
+The Perf workflow's matched screen, base main c87a374 against the PR head
+c2ea71a, on the GitHub runner (2026-11-08), passed:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 39.967 | 40.216 | +0.6% |
+| admission | burst submit p99, ms | 6.777 | 6.835 | +0.9% |
+| completion | release to terminal p99, ms | 14.245 | 14.355 | +0.8% |
+| footprint | idle RSS, MiB | 15.293 | 14.438 | -5.6% |
+| footprint | per idle bot, KiB | 1.36 | 1.756 | +29.1% |
+| footprint | RSS after a turn each, MiB | 24.914 | 23.623 | -5.2% |
+| footprint | CPU per turn, ms | 1.33 | 1.353 | +1.7% |
+| lifecycle | CPU, s | 0.62 | 0.61 | -1.6% |
+| lifecycle | p95 turn, ms | 580.79 | 581.849 | +0.2% |
+| lifecycle | peak RSS, MiB | 22.057 | 22.271 | +1.0% |
+
+No bench here is rate limited, so every call is admitted at once, nothing
+is booked, and an empty B-tree allocates nothing. The per idle bot row
+moves by itself between runs on the shared runner (1.74 to 1.66 KiB on
+#812's screen, which touched nothing per bot), and the idle and
+after-a-turn RSS both fell here; the drain itself is the table above.
