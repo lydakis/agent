@@ -177,6 +177,23 @@ const IDLE_FRAME: Duration = Duration::from_secs(1);
 /// an idle window wakes once a second, not ten times.
 const LIVELY_TICK: Duration = Duration::from_millis(100);
 const LIVELY_FOR: Duration = Duration::from_secs(5);
+
+/// How long a window waits before it looks round again: [`LIVELY_TICK`]
+/// while something on it moves or it heard from the person or the daemon
+/// within [`LIVELY_FOR`], `quiet` ago; otherwise a frame.
+fn tick_every(moving: bool, quiet: Duration) -> Duration {
+    match moving || quiet < LIVELY_FOR {
+        true => LIVELY_TICK,
+        false => IDLE_FRAME,
+    }
+}
+
+/// Whether looking round redraws the window: while something moves, on an
+/// idle window's tick, which is its frame and moves its clocks on, and
+/// once a frame has passed since the last draw (`drawn` ago).
+fn tick_draws(moving: bool, lively: bool, drawn: Option<Duration>) -> bool {
+    moving || !lively || drawn.is_none_or(|ago| ago >= IDLE_FRAME)
+}
 /// How much history is shown on attach.
 const HISTORY_ITEMS: u64 = 200;
 /// How much older history is drawn at a time as the view nears its top:
@@ -5618,8 +5635,9 @@ impl App {
             if self.quit {
                 return Ok(());
             }
-            let lively = self.moving() || heard.elapsed() < LIVELY_FOR;
-            let next_tick = ticked + if lively { LIVELY_TICK } else { IDLE_FRAME };
+            let every = tick_every(self.moving(), heard.elapsed());
+            let lively = every == LIVELY_TICK;
+            let next_tick = ticked + every;
             let mut tick = false;
             tokio::select! {
                 event = events.recv(), if !self.down => {
@@ -5717,10 +5735,7 @@ impl App {
                             }
                         }
                     }
-                    // An idle window's tick is its frame: the clocks move on.
-                    changed |= self.moving()
-                        || !lively
-                        || drawn.is_none_or(|at| at.elapsed() >= IDLE_FRAME);
+                    changed |= tick_draws(self.moving(), lively, drawn.map(|at| at.elapsed()));
                 }
                 _ = self.woken.notified() => {
                     changed = true;
@@ -21503,6 +21518,55 @@ mod tests {
             written.last().unwrap(),
             "• The pay step is the regression at p95."
         );
+    }
+
+    #[test]
+    fn an_idle_window_looks_round_once_a_frame_and_a_lively_one_ten_times_as_often() {
+        // Quiet past LIVELY_FOR with nothing moving: once a second.
+        assert_eq!(tick_every(false, LIVELY_FOR), IDLE_FRAME);
+        assert_eq!(tick_every(false, Duration::from_secs(600)), IDLE_FRAME);
+        // A key, a daemon event, or a fleet line just now: lively again.
+        assert_eq!(tick_every(false, Duration::ZERO), LIVELY_TICK);
+        assert_eq!(
+            tick_every(false, LIVELY_FOR - Duration::from_millis(1)),
+            LIVELY_TICK
+        );
+        // Something moving on it (a running turn, a shell, a pulse) keeps
+        // it lively however long it has been quiet.
+        assert_eq!(tick_every(true, Duration::from_secs(600)), LIVELY_TICK);
+        // An idle tick is the window's frame: it always redraws, so its
+        // clocks move on; a lively one redraws only for what moves or once
+        // a frame has passed.
+        assert!(tick_draws(false, false, Some(Duration::ZERO)));
+        assert!(!tick_draws(false, true, Some(Duration::from_millis(100))));
+        assert!(tick_draws(false, true, Some(IDLE_FRAME)));
+        assert!(tick_draws(false, true, None));
+        assert!(tick_draws(true, true, Some(Duration::ZERO)));
+    }
+
+    #[test]
+    fn a_waiting_mark_written_while_the_window_idles_is_read_on_its_next_look_round() {
+        let dir = std::env::temp_dir().join(format!("sonny-idle-mark-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lead");
+        let mut waiting = Waiting {
+            file: Some(file.clone()),
+            ..Waiting::default()
+        };
+        waiting.read();
+        assert!(!waiting.holds(false));
+        // The agent marks its reply as waiting on the person while no key or
+        // event wakes the window: the next look round, at most a frame
+        // later, reads it.
+        std::fs::write(&file, r#"{"turn": 3, "for": "a decision"}"#).unwrap();
+        waiting.read();
+        assert!(waiting.holds(false));
+        assert_eq!(waiting.mark.as_ref().unwrap().waiting_for, "a decision");
+        // Cleared the same way.
+        std::fs::remove_file(&file).unwrap();
+        waiting.read();
+        assert!(!waiting.holds(false));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
