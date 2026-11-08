@@ -7657,3 +7657,23 @@ waiters, so it shows the change costs the light path nothing.
 | lifecycle | CPU, s | 0.45 | 0.435 | -3.3% |
 | lifecycle | p95 turn, ms | 729.244 | 698.447 | -4.2% |
 | lifecycle | peak RSS, MiB | 23.611 | 23.568 | -0.2% |
+
+On a live daemon, `bench.parked_waits` gives `bots` bots one held turn each
+(8 active slots, the rest queued), sends one client `wait` per turn with
+the same timeout over 8 connections, and times a `stats` request in a loop
+while they give up together; the stall is the slowest of those requests.
+Release builds of main d82ec12 and this change (b33e6e7), same
+4-core container, alternated, two runs each at 8,000 and 16,000:
+
+| Waits | Main: stall | Head: stall | Main: drain | Head: drain | Main: CPU | Head: CPU |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 1.9 ms | 41.5 ms* | 97 ms | 160 ms | 160 ms | 230 ms |
+| 4,000 | 5.4, 6.0 ms | 3.9, 8.1 ms | 314, 291 ms | 313, 299 ms | 380, 410 ms | 360, 380 ms |
+| 8,000 | 53, 101 ms | 2.2, 4.4 ms | 685, 641 ms | 680, 463 ms | 840, 820 ms | 790, 590 ms |
+| 16,000 | 1,177, 1,112 ms | 6.1, 9.0 ms | 1,700, 1,592 ms | 1,195, 1,327 ms | 2,060, 1,970 ms | 1,360, 1,480 ms |
+
+\* one run, a single slow probe; the 4,000 runs show no difference either
+way. Up to about 4,000 waits the registry's share is lost in the cost of
+answering them; at 16,000 the old scan held the daemon's one thread for
+over a second while they gave up, where now no request waits more than
+10 ms, and the drain takes a third less CPU.
