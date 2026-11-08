@@ -843,11 +843,12 @@ async fn read_status(
 }
 
 /// Where `/status` keeps what it read of each agent's history for the next
-/// window, beside the store.
-fn reads_file(store: &std::path::Path) -> std::path::PathBuf {
-    let mut file = store.as_os_str().to_owned();
-    file.push(".status-reads.json");
-    file.into()
+/// window, beside the store: one file a lead, as each lead's card reads its
+/// own agents, so leads sharing a store never undo each other's.
+fn reads_file(store: &std::path::Path, lead: &str) -> std::path::PathBuf {
+    let mut dir = store.as_os_str().to_owned();
+    dir.push(".status-reads");
+    std::path::PathBuf::from(dir).join(format!("{lead}.json"))
 }
 
 /// The build that kept them: another may read a history otherwise.
@@ -865,6 +866,7 @@ fn reads_build() -> String {
 /// only the agents that ran since.
 fn take_reads(
     store: &std::path::Path,
+    lead: &str,
     status_read: &mut HashMap<String, (Value, Latest)>,
     asks_seen: &mut HashMap<String, (i64, Seen)>,
 ) {
@@ -874,7 +876,7 @@ fn take_reads(
         latest: HashMap<String, (Value, Latest)>,
         seen: HashMap<String, (i64, Seen)>,
     }
-    let Some(kept) = std::fs::read(reads_file(store))
+    let Some(kept) = std::fs::read(reads_file(store, lead))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
         .filter(|kept| kept.build == reads_build())
@@ -893,6 +895,7 @@ fn take_reads(
 /// next one, in place of what was kept before.
 fn keep_reads(
     store: &std::path::Path,
+    lead: &str,
     status_read: &HashMap<String, (Value, Latest)>,
     asks_seen: &HashMap<String, (i64, Seen)>,
 ) {
@@ -911,7 +914,11 @@ fn keep_reads(
         seen,
     };
     if let Ok(bytes) = serde_json::to_vec(&kept) {
-        let _ = waiting::replace(&reads_file(store), &bytes);
+        let file = reads_file(store, lead);
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = waiting::replace(&file, &bytes);
     }
 }
 
@@ -2138,7 +2145,7 @@ fn status_cli(args: &[String]) -> Result<(), String> {
         let scope = background::Scope {
             glob: format!("{project}.*"),
             project,
-            lead,
+            lead: lead.clone(),
         };
         let view = StatusView {
             bot: "",
@@ -2150,7 +2157,7 @@ fn status_cli(args: &[String]) -> Result<(), String> {
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
         let kept = agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
-        take_reads(&kept, &mut latest, &mut asks);
+        take_reads(&kept, &lead, &mut latest, &mut asks);
         let read = read_status(
             &client,
             &store,
@@ -2162,7 +2169,7 @@ fn status_cli(args: &[String]) -> Result<(), String> {
         )
         .await?;
         if read.fresh {
-            keep_reads(&kept, &latest, &asks);
+            keep_reads(&kept, &lead, &latest, &asks);
         }
         Ok::<_, String>(read)
     })?;
@@ -9944,8 +9951,9 @@ impl App {
         // What the background pass read, waited for if it still runs, so
         // no history is read twice.
         self.warmed().await;
+        let lead = self.scope().lead;
         if self.status_read.is_empty() {
-            take_reads(&store, &mut self.status_read, &mut self.asks_seen);
+            take_reads(&store, &lead, &mut self.status_read, &mut self.asks_seen);
         }
         let (project, rows) = match self.status_rows().await {
             Ok(read) => read,
@@ -9955,7 +9963,7 @@ impl App {
             }
         };
         if std::mem::take(&mut self.reads_unkept) {
-            keep_reads(&store, &self.status_read, &self.asks_seen);
+            keep_reads(&store, &lead, &self.status_read, &self.asks_seen);
         }
         let alerts = self.status_alerts().await;
         self.watch = Some(Watch {
@@ -10333,11 +10341,12 @@ impl App {
             None => {
                 let (client, woken) = (self.client.clone(), self.woken.clone());
                 let (store, scope) = (self.options.store.clone(), self.scope());
+                let lead = scope.lead.clone();
                 self.warming = Some(Warming::Running(tokio::spawn(async move {
                     let kept = agent_client::socket::canonical_store(&store)
                         .unwrap_or_else(|_| store.clone());
                     let (mut latest, mut seen) = (HashMap::new(), HashMap::new());
-                    take_reads(&kept, &mut latest, &mut seen);
+                    take_reads(&kept, &lead, &mut latest, &mut seen);
                     let view = StatusView {
                         bot: "",
                         asks: &[],
@@ -10352,7 +10361,7 @@ impl App {
                             .await
                             .ok()?;
                     if read.fresh {
-                        keep_reads(&kept, &latest, &seen);
+                        keep_reads(&kept, &lead, &latest, &seen);
                     }
                     woken.notify_one();
                     Some((latest, seen))
@@ -17399,7 +17408,9 @@ mod tests {
         let app = open().await;
         assert_eq!(histories.load(Ordering::SeqCst), 4);
         drop(app);
-        // The next reads none: nothing moved.
+        // The next reads none: nothing moved, and another lead keeping its
+        // own reads in the same store takes nothing of this one's.
+        keep_reads(&store, "docs.lead", &HashMap::new(), &HashMap::new());
         let app = open().await;
         assert_eq!(histories.load(Ordering::SeqCst), 4);
         drop(app);
@@ -17408,7 +17419,7 @@ mod tests {
         open().await;
         assert_eq!(histories.load(Ordering::SeqCst), 6);
         // What another build kept is read again.
-        let kept = reads_file(&store);
+        let kept = reads_file(&store, "shop.lead");
         let mut file: Value = serde_json::from_slice(&std::fs::read(&kept).unwrap()).unwrap();
         file["build"] = json!("another");
         std::fs::write(&kept, file.to_string()).unwrap();
@@ -17456,7 +17467,7 @@ mod tests {
         task.warm_reads().await;
         assert!(matches!(task.warming, Some(Warming::Done)));
         // And kept it for the next window.
-        assert!(reads_file(&app.options.store).exists());
+        assert!(reads_file(&app.options.store, "shop.lead").exists());
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -24921,13 +24932,18 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let store = home.join("state.sqlite");
         let start = std::time::Instant::now();
-        keep_reads(&store, &app.status_read, &app.asks_seen);
+        keep_reads(&store, &app.bot, &app.status_read, &app.asks_seen);
         eprintln!("STATUS kept in {:?}", start.elapsed());
         let (client, _events) = Client::connect(Path::new(&socket)).await.unwrap();
         let mut again = super::tests::app(client);
         again.bot = app.bot.clone();
         let start = std::time::Instant::now();
-        take_reads(&store, &mut again.status_read, &mut again.asks_seen);
+        take_reads(
+            &store,
+            &again.bot,
+            &mut again.status_read,
+            &mut again.asks_seen,
+        );
         let (_, rows) = again.status_rows().await.unwrap();
         eprintln!(
             "STATUS reopen: {} rows in {:?}",
@@ -24936,7 +24952,7 @@ mod tests {
         );
         // A lead's window with nothing kept: its pass off the loop, then
         // the card opening on what it read.
-        std::fs::remove_file(reads_file(&store)).unwrap();
+        std::fs::remove_file(reads_file(&store, &app.bot)).unwrap();
         let (client, _events) = Client::connect(Path::new(&socket)).await.unwrap();
         let mut warm = super::tests::app(client);
         warm.bot = app.bot.clone();
