@@ -86,10 +86,14 @@ def main():
         'SELECT kind, count(*) FROM events WHERE written_ms >= ? GROUP BY kind ORDER BY 2 DESC',
         (since,)).fetchall())
     gates = collections.defaultdict(list)
-    per_turn = collections.defaultdict(int)
+    # Each gated call's wait as a wall-clock span ending when the call
+    # started; calls in one batch wait side by side, so a turn's gate time is
+    # the union of its spans, not their sum.
+    spans = collections.defaultdict(list)
     gated_calls = 0
-    for bot, turn, data in db.execute(
-            "SELECT bot, turn, data FROM events WHERE kind='tool_started' AND written_ms >= ?", (since,)):
+    for bot, turn, written, data in db.execute(
+            "SELECT bot, turn, written_ms, data FROM events WHERE kind='tool_started' AND written_ms >= ?",
+            (since,)):
         try:
             approvals = json.loads(data).get('approvals') or []
         except ValueError:
@@ -104,9 +108,20 @@ def main():
             gates[f"{kind(bot)}:{a.get('tag')}:{a.get('by')}"].append(waited)
             longest = max(longest, waited)
         if approvals:
-            per_turn[(bot, turn)] += longest
+            spans[(bot, turn)].append((written - longest, written))
     out['gated_calls'] = gated_calls
     out['gate_waits_ms'] = {k: dist(v) for k, v in sorted(gates.items(), key=lambda kv: -len(kv[1]))}
+    per_turn = {}
+    for key, waits in spans.items():
+        total, reach = 0, None
+        for begin, end in sorted(waits):
+            if reach is None or begin > reach:
+                total += end - begin
+                reach = end
+            elif end > reach:
+                total += end - reach
+                reach = end
+        per_turn[key] = total
     # The share of each gated turn's length spent waiting on gates.
     lengths = {(b, t): f - s for b, t, s, f in db.execute(
         'SELECT bot, id, started_ms, finished_ms FROM turns WHERE started_ms >= ? AND finished_ms IS NOT NULL',
@@ -117,8 +132,11 @@ def main():
 
     # From the turn's acceptance to its start (waiting behind another turn,
     # pacing, a go-later) and to its first finished item, by kind of agent.
+    # A turn that waited is `queued` when sent and `accepted` when it starts;
+    # the earlier of the two is when it was sent.
     accepted = {(b, t): ms for b, t, ms in db.execute(
-        "SELECT bot, turn, min(written_ms) FROM events WHERE kind='accepted' AND written_ms >= ? GROUP BY bot, turn",
+        "SELECT bot, turn, min(written_ms) FROM events WHERE kind IN ('queued', 'accepted') AND written_ms >= ?"
+        " GROUP BY bot, turn",
         (since,))}
     first = {(b, t): ms for b, t, ms in db.execute(
         "SELECT bot, turn, min(written_ms) FROM events WHERE kind='message' AND written_ms >= ? GROUP BY bot, turn",

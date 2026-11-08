@@ -292,6 +292,7 @@ def run(args, out, logs, home, ws, store, sock, env):
         phases.append({'phase': phase, 'from_ms': int(started * 1000), 'to_ms': int(ended * 1000),
                        'cpu': {pid: round(after[pid][0] - before.get(pid, (0, 0))[0], 3)
                                for pid in after},
+                       'cpu_before': {pid: before[pid][0] for pid in before},
                        'rss_mib': {pid: round(after[pid][1], 1) for pid in after},
                        'echo_ms': echo})
         time.sleep(3)  # let the last turn's echoes settle between phases
@@ -317,6 +318,7 @@ def report(out):
     phases = json.loads((out / 'phases.json').read_text())
     procs = {}
     lines = collections.defaultdict(list)
+    exits = {}
     for log in (out / 'logs').glob('*.log'):
         pid = int(log.stem)
         for raw in log.read_text(errors='replace').splitlines():
@@ -326,6 +328,9 @@ def report(out):
             ms, kind, a, b = int(parts[0]), parts[1], parts[2], parts[3]
             if kind == 'start':
                 procs[pid] = label(b)
+                continue
+            if kind == 'exit':
+                exits[pid] = (ms, float(a))
                 continue
             lines[pid].append((ms, kind, a, b))
     result = []
@@ -346,6 +351,10 @@ def report(out):
         cpu = collections.Counter()
         for pid, seconds in phase['cpu'].items():
             cpu[procs.get(int(pid), '?')] += seconds
+        # Processes that ended inside the phase, from their own exit line.
+        for pid, (ms, seconds) in exits.items():
+            if str(pid) not in phase['cpu'] and phase['from_ms'] <= ms < phase['to_ms']:
+                cpu[procs.get(pid, '?')] += seconds - phase.get('cpu_before', {}).get(str(pid), 0)
         rows = []
         for who in sorted(set(by_label) | set(cpu)):
             counts = by_label[who]

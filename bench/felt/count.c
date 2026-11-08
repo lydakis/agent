@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -60,10 +61,24 @@ __attribute__((constructor)) static void start(void) {
   emit("start", ppid, args);
 }
 
+// CPU seconds at a normal exit, for processes gone before the phase's last
+// look (a killed process runs no destructor and goes uncounted).
+__attribute__((destructor)) static void finish(void) {
+  struct rusage ru;
+  if (getrusage(RUSAGE_SELF, &ru) != 0) return;
+  char cpu[32];
+  snprintf(cpu, sizeof cpu, "%.3f",
+           ru.ru_utime.tv_sec + ru.ru_stime.tv_sec +
+               (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6);
+  emit("exit", cpu, "");
+}
+
 static void argv_line(char *const argv[], char *out, size_t size) {
   out[0] = 0;
   for (int i = 0; argv && argv[i] && i < 6; i++) {
-    strncat(out, argv[i], size - strlen(out) - 2);
+    size_t used = strlen(out);
+    if (used + 2 >= size) break;  // room for one more byte and the space
+    strncat(out, argv[i], size - used - 2);
     strcat(out, " ");
   }
 }
