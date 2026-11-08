@@ -4,7 +4,7 @@
 //! step of [`LADDER`] takes an item to its next form, as Powerline drops
 //! its lowest-priority segments first: words before marks, marks before
 //! whole items, and what needs the person never.
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Stylize};
 use ratatui::text::{Line, Span};
 use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
@@ -27,7 +27,6 @@ pub enum Slot {
     /// What the pane shows while the window has room for one of the two
     /// and the conversation has it: the way over to it, a click away.
     Folded,
-    Needs,
     /// Quiet, or waiting to go quiet once the person steps away.
     Quiet,
     Failed,
@@ -100,15 +99,6 @@ pub fn count(mark: &'static str, color: Color, n: usize, goes: bool) -> Vec<Vec<
         forms.push(Vec::new());
     }
     forms
-}
-
-/// A span of a count on a beat of its pulse: reversed in its hue, as
-/// wide as at rest so nothing beside it moves.
-pub fn beat(span: &mut Span<'static>) {
-    let color = span.style.fg.unwrap_or(Color::Yellow);
-    span.style = Style::new()
-        .fg(color)
-        .add_modifier(Modifier::REVERSED | Modifier::BOLD);
 }
 
 /// A folder as fish's prompt shortens it: each part but the last to its
@@ -265,7 +255,6 @@ mod tests {
                     "",
                 ],
             ),
-            Item::new(Slot::Needs, count("?", Color::Yellow, 1, false)).opens("status"),
             Item::new(Slot::Failed, count("✗", Color::Red, 1, false)).opens("background"),
             Item::new(Slot::Working, count("●", Color::Cyan, 2, true)).opens("status"),
             word(Slot::Background, &["↻ 3", ""]),
@@ -285,22 +274,22 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_row_gives_way_by_the_ladder_and_keeps_what_needs_you() {
+    fn a_busy_row_gives_way_by_the_ladder_and_keeps_its_counts() {
         let rows: Vec<String> = [100, 80, 60, 44].map(|w| row(busy(), w)).into();
         // The counts are their marks and numbers alone, at every width.
         assert_eq!(
             rows[0].trim(),
-            "⏵⏵ full access · GPT 6.1 Sol high · ~/Developer/agent on main  ? 1  ✗ 1  ● 2  ↻ 3  ✎ 2  37% left"
+            "⏵⏵ full access · GPT 6.1 Sol high · ~/Developer/agent on main       ✗ 1  ● 2  ↻ 3  ✎ 2  37% left"
         );
         assert_eq!(
             rows[1].trim(),
-            "⏵⏵ GPT 6.1 Sol high · ~/D/agent on main    ? 1  ✗ 1  ● 2  ↻ 3  ✎ 2  37% left"
+            "⏵⏵ GPT 6.1 Sol high · ~/D/agent on main         ✗ 1  ● 2  ↻ 3  ✎ 2  37% left"
         );
         assert_eq!(
             rows[2].trim(),
-            "⏵⏵ GPT 6.1 Sol high · agent on main   ? 1  ✗ 1  ● 2  37%"
+            "⏵⏵ GPT 6.1 Sol high · agent on main   ✗ 1  ● 2  37% left"
         );
-        assert_eq!(rows[3].trim(), "⏵⏵ GPT 6.1 Sol high   ? 1  ✗ 1  ● 2  37%");
+        assert_eq!(rows[3].trim(), "⏵⏵ GPT 6.1 Sol high        ✗ 1  ● 2  37%");
         for (row, w) in rows.iter().zip([100, 80, 60, 44]) {
             assert_eq!(row.width(), w, "{row}");
             assert!(row.starts_with("  ⏵⏵") && row.ends_with("  "), "{row}");
@@ -355,11 +344,7 @@ mod tests {
         let got: Vec<(String, &str)> = opens.iter().map(|(r, l)| (shown(r), *l)).collect();
         assert_eq!(
             got,
-            [
-                ("? 1".into(), "status"),
-                ("✗ 1".into(), "background"),
-                ("● 2".into(), "status"),
-            ]
+            [("✗ 1".into(), "background"), ("● 2".into(), "status"),]
         );
     }
 

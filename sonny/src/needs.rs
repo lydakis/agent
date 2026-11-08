@@ -1,9 +1,10 @@
-//! What waits on the person, said one way for every surface that counts
-//! it: the footer, a task's tab, `/status`, the started list and the sky.
-//! An agent needs the person while a call of its waits on their approval
-//! (gated `manual`, or handed to them by a reviewer, [`person_call`]) or
-//! a question it put to them with the ask tool is open, as
-//! [`crate::asks::open`] reads its history.
+//! What waits on the person, said one way for every surface that shows
+//! it: a task's tab, `/status`, the started list and the sky. An agent
+//! waits on the person while a call of its waits on their approval (gated
+//! `manual`, or handed to them by a reviewer, [`person_call`]). A question
+//! it put to them with the ask tool, as [`crate::asks::open`] reads its
+//! history, is kept too, for the lead's window to pin: it is no state of
+//! its own, as the lead asks the person for its tasks.
 //!
 //! The daemon keeps both. A surface reads them whole when it starts or
 //! comes back ([`listing`], [`scan`]) into a [`Needs`], which its events
@@ -295,11 +296,6 @@ struct Open {
 }
 
 impl Needs {
-    /// Whether `bot` waits on the person.
-    pub fn waits(&self, bot: &str) -> bool {
-        self.holds(bot) || self.asks.contains_key(bot)
-    }
-
     /// Whether a call of `bot`'s waits on the person's approval.
     pub fn holds(&self, bot: &str) -> bool {
         self.calls.get(bot).is_some_and(|calls| !calls.is_empty())
@@ -389,7 +385,7 @@ impl Needs {
         let Some(bot) = event["bot"].as_str() else {
             return false;
         };
-        let was = self.waits(bot);
+        let was = self.holds(bot);
         let data = &event["data"];
         let turn = event["turn"].as_i64().unwrap_or(-1);
         let kind = event["event"].as_str().unwrap_or("");
@@ -476,7 +472,7 @@ impl Needs {
         if self.calls.get(bot).is_some_and(BTreeSet::is_empty) {
             self.calls.remove(bot);
         }
-        was != self.waits(bot)
+        was != self.holds(bot)
     }
 }
 
@@ -489,6 +485,10 @@ fn from_person(data: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn asking(needs: &Needs, bot: &str) -> bool {
+        needs.asks.contains_key(bot)
+    }
 
     fn event(bot: &str, turn: i64, kind: &str, data: Value) -> Value {
         json!({"bot": bot, "turn": turn, "event": kind, "data": data})
@@ -519,10 +519,10 @@ mod tests {
             "approval_requested",
             json!({"calls": [gated("c1", "auto"), gated("c2", "manual")]}),
         ));
-        assert!(needs.waits("p.fix"));
+        assert!(needs.holds("p.fix"));
         needs.event(&event("p.fix", 3, "step_decided", json!({"call_id": "c2"})));
         assert!(
-            !needs.waits("p.fix"),
+            !needs.holds("p.fix"),
             "the reviewer's own call waits on no one"
         );
         needs.event(&event(
@@ -531,24 +531,24 @@ mod tests {
             "approval_asked",
             json!({"call_id": "c1", "tag": "auto"}),
         ));
-        assert!(needs.waits("p.fix"));
+        assert!(needs.holds("p.fix"));
         needs.event(&event(
             "p.fix",
             3,
             "tool_started",
             json!({"name": "shell", "call_id": "c1"}),
         ));
-        assert!(!needs.waits("p.fix"), "a call allowed starts");
+        assert!(!needs.holds("p.fix"), "a call allowed starts");
     }
 
     #[test]
     fn a_parked_turn_resuming_after_a_restart_still_waits_on_its_call() {
         let mut needs = Needs::default();
         needs.held(vec![("p.fix".into(), 4, "c1".into())], |_| true);
-        assert!(needs.waits("p.fix"));
+        assert!(needs.holds("p.fix"));
         // The turn picks up again with no call's verdict.
         needs.event(&event("p.fix", 4, "turn_resumed", json!({})));
-        assert!(needs.waits("p.fix"));
+        assert!(needs.holds("p.fix"));
         // A steer's own turn ends; the running one goes on waiting.
         needs.event(&event(
             "p.fix",
@@ -556,14 +556,14 @@ mod tests {
             "turn_finished",
             json!({"status": "steered"}),
         ));
-        assert!(needs.waits("p.fix"));
+        assert!(needs.holds("p.fix"));
         needs.event(&event(
             "p.fix",
             4,
             "turn_finished",
             json!({"status": "failed"}),
         ));
-        assert!(!needs.waits("p.fix"));
+        assert!(!needs.holds("p.fix"));
     }
 
     #[test]
@@ -574,15 +574,15 @@ mod tests {
             |_| true,
         );
         needs.held(Vec::new(), |bot| bot == "a.x");
-        assert!(!needs.waits("a.x"));
-        assert!(needs.waits("b.y"));
+        assert!(!needs.holds("a.x"));
+        assert!(needs.holds("b.y"));
     }
 
     #[test]
-    fn a_question_waits_through_its_turns_end_and_is_read_again_then() {
+    fn a_question_is_kept_through_its_turns_end_and_is_read_again_then() {
         let mut needs = Needs::default();
         needs.event(&event("p.fix", 2, "tool_started", ask("q1", "Ship it?")));
-        assert!(needs.waits("p.fix"));
+        assert!(asking(&needs, "p.fix"));
         assert_eq!(needs.asks["p.fix"].call.as_deref(), Some("q1"));
         // Not whole yet: its history says it, with what Sonny took it as,
         // once the call is taken.
@@ -601,13 +601,11 @@ mod tests {
             "turn_finished",
             json!({"status": "completed"}),
         ));
-        assert!(
-            needs.waits("p.fix"),
-            "a task that ended on a question needs you"
-        );
+        assert!(asking(&needs, "p.fix"), "kept for the lead to pin");
+        assert!(!needs.holds("p.fix"), "a question is no wait of its own");
         assert_eq!(needs.due(), vec![("p.fix".to_owned(), Some(2))]);
         needs.asked("p.fix", Some(whole("Ship it?")));
-        assert!(needs.waits("p.fix"));
+        assert!(asking(&needs, "p.fix"));
         let read: Vec<_> = needs
             .asks()
             .map(|(bot, a)| (bot, a.question.as_str()))
@@ -625,7 +623,7 @@ mod tests {
             "tool_completed",
             json!({"call_id": "q1", "denied": true}),
         ));
-        assert!(!needs.waits("p.fix"));
+        assert!(!asking(&needs, "p.fix"));
     }
 
     #[test]
@@ -639,9 +637,9 @@ mod tests {
             json!({"from": {"bot": "p.lead"}}),
         ));
         needs.event(&event("p.fix", 3, "accepted", json!({"origin": "trigger"})));
-        assert!(needs.waits("p.fix"), "only the person answers it");
-        assert!(needs.event(&event("p.fix", 4, "accepted", json!({}))));
-        assert!(!needs.waits("p.fix"));
+        assert!(asking(&needs, "p.fix"), "only the person answers it");
+        needs.event(&event("p.fix", 4, "accepted", json!({})));
+        assert!(!asking(&needs, "p.fix"));
         needs.event(&event(
             "p.fix",
             4,
@@ -651,7 +649,7 @@ mod tests {
         assert_eq!(needs.due(), vec![("p.fix".to_owned(), Some(4))]);
         // A reaction is not words of their own: the read puts it back.
         needs.asked("p.fix", Some(whole("Ship it?")));
-        assert!(needs.waits("p.fix"));
+        assert!(asking(&needs, "p.fix"));
     }
 
     #[test]
@@ -663,10 +661,10 @@ mod tests {
         read.held(vec![("p.c".into(), 1, "c".into())], |_| true);
         let bots = ["p.a".to_owned(), "p.c".to_owned()];
         kept.adopt(&read, &bots, &bots);
-        assert!(!kept.waits("p.a"));
-        assert!(kept.waits("p.b"));
-        assert!(kept.waits("p.c"));
+        assert!(!asking(&kept, "p.a"));
+        assert!(asking(&kept, "p.b"));
+        assert!(kept.holds("p.c"));
         kept.forget("p.b");
-        assert!(!kept.waits("p.b"));
+        assert!(!asking(&kept, "p.b"));
     }
 }

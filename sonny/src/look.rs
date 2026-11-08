@@ -8,7 +8,7 @@
 //! (no-color.org) no color is drawn at all, and bold, dim, underline and
 //! reverse carry what is left; every colored mark has its own shape.
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ratatui::{
     buffer::{Buffer, Cell},
@@ -124,36 +124,6 @@ pub fn beat(since: Duration) -> bool {
     since < BEAT * BEATS && since.as_millis() % BEAT.as_millis() < BEAT_ON.as_millis()
 }
 
-/// A count that pulses once each time it rises, as what needs the person
-/// does when something new comes to need them; steady as it falls or holds.
-#[derive(Clone, Copy, Default)]
-pub struct Pulse {
-    seen: usize,
-    at: Option<Instant>,
-}
-
-impl Pulse {
-    /// The count as it is `now`.
-    pub fn see(&mut self, count: usize, now: Instant) {
-        if count > self.seen {
-            self.at = Some(now);
-        }
-        self.seen = count;
-    }
-
-    /// Still beating `now`, whether on a beat or between two.
-    pub fn moving(&self, now: Instant) -> bool {
-        self.at
-            .is_some_and(|at| now.saturating_duration_since(at) < BEAT * BEATS)
-    }
-
-    /// On a beat `now`.
-    pub fn on(&self, now: Instant) -> bool {
-        self.at
-            .is_some_and(|at| beat(now.saturating_duration_since(at)))
-    }
-}
-
 /// The band as a row holds it: a role, not a color, made the theme's band
 /// ([`band`]) as each frame is finished ([`Look::cell`]), as a stylesheet's
 /// variable is read when the page is painted. Rows drawn before the theme
@@ -234,25 +204,6 @@ pub fn contrast(a: Rgb, b: Rgb) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_pulse_beats_three_times_when_its_count_rises_and_then_holds() {
-        let start = Instant::now();
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let mut pulse = Pulse::default();
-        pulse.see(0, start);
-        assert!(!pulse.on(start));
-        pulse.see(1, start);
-        let times = [0, 400, 500, 900, 1000, 1400, 1500, 2000];
-        let beats: Vec<bool> = times.map(|ms| pulse.on(at(ms))).into();
-        assert_eq!(beats, [true, false, true, false, true, false, false, false]);
-        // Held or falling, it stays steady; a new rise pulses again.
-        pulse.see(1, at(2000));
-        pulse.see(0, at(2000));
-        assert!(!pulse.on(at(2000)));
-        pulse.see(1, at(3000));
-        assert!(pulse.on(at(3000)));
-    }
 
     #[test]
     fn muted_text_reads_and_still_differs_from_the_rest() {

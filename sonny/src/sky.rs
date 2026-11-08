@@ -7,7 +7,7 @@
 //! whoever is lit fades like a firefly. It is a calm window, kept open to
 //! watch: every pair that has talked keeps a faint curve, as in 0.7.0, an
 //! agent at rest is a dot, a working star breathes, and only what a glance
-//! can act on has a hue, yellow `?` for what needs you and red `✗` for
+//! can act on has a hue, yellow `?` for a call waiting on your approval and red `✗` for
 //! what failed, with cyan for a tool call's moment. Beside it,
 //! where there is room, the chat log of who talked to whom, newest at the
 //! bottom, fading as it rises. Where the sky has no room, under about 60
@@ -275,7 +275,8 @@ impl Work {
 /// Where an agent is, in the state table's words.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum State {
-    NeedsYou,
+    /// A call of its waits on the person's approval.
+    Approval,
     Working,
     Failed,
 }
@@ -283,7 +284,7 @@ enum State {
 impl State {
     fn mark(self) -> (&'static str, Color, &'static str) {
         match self {
-            State::NeedsYou => ("?", NEEDS, "needs you"),
+            State::Approval => ("?", NEEDS, "waits on you"),
             State::Working => ("●", WORKING, "working"),
             State::Failed => ("✗", FAILED, "failed"),
         }
@@ -354,7 +355,7 @@ impl Agent {
     /// Whether its `?` is on a beat `now`: it needs the person and came
     /// to a moment ago, so the mark beats a few times and then holds.
     fn beats(&self, now: Instant) -> bool {
-        self.state() == Some(State::NeedsYou)
+        self.state() == Some(State::Approval)
             && (self.asked).is_some_and(|at| crate::look::beat(now.saturating_duration_since(at)))
     }
 
@@ -377,8 +378,8 @@ impl Agent {
     }
 
     fn state(&self) -> Option<State> {
-        if self.waits.waits(&self.name) {
-            Some(State::NeedsYou)
+        if self.waits.holds(&self.name) {
+            Some(State::Approval)
         } else if self.running.is_some() {
             Some(State::Working)
         } else if self.failed {
@@ -791,7 +792,7 @@ impl Hit {
 struct Note {
     at: Instant,
     text: String,
-    /// The hue of what needs you or failed.
+    /// The hue of what waits on you or failed.
     hue: Option<Color>,
     /// The agents it is about, so a centred sky keeps only its agent's;
     /// in the order its words name them, so a click on a name finds its
@@ -1912,10 +1913,10 @@ impl View {
         let turn = event["turn"].as_i64().unwrap_or(-1);
         // What waits on the person, as every surface reads it: a copy's
         // asks and approvals are its own.
-        let waiting = self.agents[at].state() == Some(State::NeedsYou);
+        let waiting = self.agents[at].state() == Some(State::Approval);
         if own && live {
             self.agents[at].waits.event(event);
-            if !waiting && self.agents[at].state() == Some(State::NeedsYou) {
+            if !waiting && self.agents[at].state() == Some(State::Approval) {
                 self.agents[at].asked = Some(now);
             }
         }
@@ -2476,7 +2477,7 @@ impl View {
 
     /// Told once when an agent comes to wait on the person's approval.
     fn waits(&mut self, at: usize, waiting: bool, now: Instant) {
-        if !waiting && self.agents[at].state() == Some(State::NeedsYou) {
+        if !waiting && self.agents[at].state() == Some(State::Approval) {
             let said = format!("? {} waits for you", self.short(at));
             self.say(now, said, Some(NEEDS), &[at]);
         }
@@ -2738,7 +2739,7 @@ impl View {
 
     /// Which agents draw as stars: all when they fit in `room`, else the
     /// most interesting first. Interest is what a glance can act on, then
-    /// what happens, then place: needs you 1000, failed 500, working 40,
+    /// what happens, then place: waits on you 1000, failed 500, working 40,
     /// 30 for a glow just lit, 60 for a lead. What needs the person or
     /// failed, and `always`, draw whatever the room.
     fn shown(&self, now: Instant, room: usize, always: &[Option<usize>]) -> Vec<bool> {
@@ -2750,7 +2751,7 @@ impl View {
         let interest = |at: usize| {
             let agent = &self.agents[at];
             let state = match agent.state() {
-                Some(State::NeedsYou) => 1000.0,
+                Some(State::Approval) => 1000.0,
                 Some(State::Failed) => 500.0,
                 Some(State::Working) => 40.0,
                 None => 0.0,
@@ -3218,7 +3219,7 @@ impl View {
                     return false;
                 }
                 if self.zen {
-                    return matches!(agent.state(), Some(State::NeedsYou | State::Failed));
+                    return matches!(agent.state(), Some(State::Approval | State::Failed));
                 }
                 true
             })
@@ -3247,7 +3248,7 @@ impl View {
                 !cord_names.contains(&at),
                 Some(at) != picked,
                 Some(at) != centre,
-                agent.state() != Some(State::NeedsYou),
+                agent.state() != Some(State::Approval),
                 !active(agent),
                 !agent.root,
                 std::cmp::Reverse(agent.root.then(|| sizes.get(&agent.arm).copied())),
@@ -3261,10 +3262,10 @@ impl View {
         for at in named {
             let agent = &self.agents[at];
             // The mark says what the colour does: `? ` for an agent that
-            // needs you, `✗ ` for one that failed. Bold while it works.
+            // waits on you, `✗ ` for one that failed. Bold while it works.
             // A `?` new since a moment ago beats, reversed, then holds.
             let mark = match agent.state() {
-                Some(state @ (State::NeedsYou | State::Failed)) => {
+                Some(state @ (State::Approval | State::Failed)) => {
                     let (mark, color, _) = state.mark();
                     let style = Style::default().fg(color).bold();
                     let style = match agent.beats(now) {
@@ -3296,7 +3297,7 @@ impl View {
                     to,
                     agent: Some(at),
                 }),
-                None if agent.state() == Some(State::NeedsYou) => {
+                None if agent.state() == Some(State::Approval) => {
                     *unnamed.entry(agent.arm).or_default() += 1;
                 }
                 None => {}
@@ -3505,7 +3506,7 @@ impl View {
             row(Span::raw("⠛").bold(), vec![says("   working: it breathes")]),
             row(
                 Span::raw("?").fg(NEEDS),
-                vec![says("   by a name: it needs you")],
+                vec![says("   by a name: it waits on you")],
             ),
             row(
                 Span::raw("✗").fg(FAILED),
@@ -3727,7 +3728,7 @@ impl View {
                 return -1;
             }
             match agent.state() {
-                Some(State::NeedsYou) => 0,
+                Some(State::Approval) => 0,
                 Some(State::Failed) => 1,
                 Some(State::Working) => 2,
                 None if lit => 3,
@@ -3870,14 +3871,14 @@ impl View {
         }
         let states = match self.models {
             true => &[][..],
-            false => &[State::NeedsYou, State::Working, State::Failed][..],
+            false => &[State::Approval, State::Working, State::Failed][..],
         };
         for &state in states {
             let n = shown.iter().filter(|a| a.state() == Some(state)).count();
             if n > 0 || state == State::Working {
                 let (mark, color, word) = state.mark();
-                let word = if state == State::NeedsYou && n != 1 {
-                    "need you"
+                let word = if state == State::Approval && n != 1 {
+                    "wait on you"
                 } else {
                     word
                 };
@@ -3964,7 +3965,7 @@ fn legend(list: bool) -> Vec<Line<'static>> {
         Span::raw("⠛").bold(),
         says(" working breathes  "),
         mark("?", NEEDS),
-        says(" needs you  "),
+        says(" waits on you  "),
         mark("✗", FAILED),
         says(" failed  "),
         Span::raw("name").bold(),
@@ -4016,7 +4017,7 @@ fn legend(list: bool) -> Vec<Line<'static>> {
 /// are kept for what needs the person or failed.
 fn name_style(state: Option<State>, glow: f32) -> Style {
     match state {
-        Some(State::Working | State::NeedsYou) => Style::default().bold(),
+        Some(State::Working | State::Approval) => Style::default().bold(),
         Some(State::Failed) => Style::default(),
         None if glow > 0.08 => Style::default(),
         None => Style::default().add_modifier(Modifier::DIM),
@@ -7289,7 +7290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_copy_leaves_its_agents_asks_alone_and_no_stranger_takes_its_work() {
+    async fn a_copy_leaves_its_agents_waits_alone_and_no_stranger_takes_its_work() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![json!({"name": "shop.lead", "bot_id": 2})]))
             .unwrap();
@@ -7299,31 +7300,37 @@ mod tests {
             "data": {"bot_id": 3, "created_by": "shop.lead", "created_by_id": 2, "expire_ms": 60_000}}),
         ))
         .unwrap();
-        // The lead asks; its copy is told something and asks too.
-        send.send(Feed::Live(
-            json!({"event": "tool_started", "bot": "shop.lead",
-            "turn": 1, "data": {"name": crate::asks::TOOL, "call_id": "c1"}}),
-        ))
-        .unwrap();
+        // A call of the lead's waits on the person; its copy is told
+        // something, and a call of its own waits too.
+        let gated = |bot: &str, call: &str| {
+            Feed::Live(json!({"event": "approval_requested", "bot": bot, "turn": 1,
+                "data": {"calls": [{"call_id": call, "gates": ["manual"]}]}}))
+        };
+        send.send(gated("shop.lead", "c1")).unwrap();
         view.drain();
         let lead = view.index["shop.lead"];
-        let asking = |view: &View| view.agents[lead].state() == Some(State::NeedsYou);
-        assert!(asking(&view));
+        let waiting = |view: &View| view.agents[lead].state() == Some(State::Approval);
+        assert!(waiting(&view));
         send.send(Feed::Live(
             json!({"event": "accepted", "bot": "shop.lead.side",
             "turn": 1, "data": {}}),
         ))
         .unwrap();
         view.drain();
-        assert!(asking(&view), "a copy's prompt answers nothing");
-        view.agents[lead].waits.asked("shop.lead", None);
+        assert!(waiting(&view), "a copy's prompt answers nothing");
+        send.send(Feed::Live(
+            json!({"event": "tool_started", "bot": "shop.lead",
+            "turn": 1, "data": {"name": "shell", "call_id": "c1"}}),
+        ))
+        .unwrap();
+        send.send(gated("shop.lead.side", "c2")).unwrap();
         send.send(Feed::Live(
             json!({"event": "tool_started", "bot": "shop.lead.side",
-            "turn": 1, "data": {"name": crate::asks::TOOL, "call_id": "c2"}}),
+            "turn": 1, "data": {"name": "shell", "call_id": "c3"}}),
         ))
         .unwrap();
         view.drain();
-        assert!(!asking(&view), "a copy's ask is its own");
+        assert!(!waiting(&view), "a copy's call is its own");
         assert!(view.agents[lead].twinkle.is_some());
         // The lead is removed and its name taken by someone else.
         send.send(Feed::Live(json!({"event": "deleted", "bot": "shop.lead"})))
@@ -7783,12 +7790,11 @@ mod tests {
         };
         for feed in [
             live("shop.lead", "accepted", 1, json!({})),
-            live("shop.lead", "tool_started", 1, json!({"name": "ask"})),
             live(
                 "shop.lead",
-                "turn_finished",
+                "approval_requested",
                 1,
-                json!({"status": "completed"}),
+                json!({"calls": [{"call_id": "c0", "gates": ["manual"]}]}),
             ),
             live(
                 "shop.login",
@@ -7819,8 +7825,8 @@ mod tests {
         }
         view.drain();
         let state = |view: &View, name: &str| view.agents[view.index[name]].state();
-        assert_eq!(state(&view, "shop.lead"), Some(State::NeedsYou));
-        assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
+        assert_eq!(state(&view, "shop.lead"), Some(State::Approval));
+        assert_eq!(state(&view, "shop.login"), Some(State::Approval));
         assert_eq!(state(&view, "shop.cart"), Some(State::Failed));
         let shown = text(&view.card(100, 40));
         assert!(shown.contains("? shop lead"), "{shown}");
@@ -7845,13 +7851,20 @@ mod tests {
         assert_eq!(beating(&mut view, 50, 20), 0);
         assert_eq!(
             text(&[view.footer(100)]),
-            "  3 agents · ? 2 need you · ● 0 working · ✗ 1 failed · 3 messages in the last minute"
+            "  3 agents · ? 2 wait on you · ● 0 working · ✗ 1 failed · 3 messages in the last minute"
         );
 
         // The call allowed, the agent works again; a new turn for what
-        // failed and what asked starts afresh.
+        // failed and what waited starts afresh.
         for feed in [
             live("shop.login", "tool_completed", 2, json!({"call_id": "c1"})),
+            live("shop.lead", "tool_completed", 1, json!({"call_id": "c0"})),
+            live(
+                "shop.lead",
+                "turn_finished",
+                1,
+                json!({"status": "completed"}),
+            ),
             live("shop.cart", "accepted", 4, json!({})),
             live("shop.lead", "accepted", 5, json!({})),
             live(
@@ -7870,45 +7883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_question_its_lead_resolved_does_not_need_the_person() {
-        let (mut view, send) = view();
-        let dir = std::env::temp_dir().join(format!("sonny-sky-resolved-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("store.resolved")).unwrap();
-        std::fs::write(dir.join("store.resolved/shop.cart.json"), r#"{"turn": 5}"#).unwrap();
-        view.resolved = dir.join("store");
-        send.send(Feed::Roll(vec![
-            json!({"name": "shop.lead"}),
-            json!({"name": "shop.cart", "created_by": "shop.lead"}),
-            json!({"name": "shop.login", "created_by": "shop.lead"}),
-        ]))
-        .unwrap();
-        let seen = |turn: i64| crate::needs::Seen {
-            ask: crate::asks::call(
-                &crate::asks::id(2, "q1"),
-                &json!({"question": "q1", "options": [{"label": "a"}]}),
-            ),
-            itself: false,
-            turn: Some(turn),
-        };
-        // Its lead resolved the cart past the turn that asked; the login
-        // still asks, as does the cart once a later turn reopens it.
-        send.send(Feed::Asked("shop.cart".into(), Some(Box::new(seen(4)))))
-            .unwrap();
-        send.send(Feed::Asked("shop.login".into(), Some(Box::new(seen(4)))))
-            .unwrap();
-        view.drain();
-        let state = |view: &View, name: &str| view.agents[view.index[name]].state();
-        assert_ne!(state(&view, "shop.cart"), Some(State::NeedsYou));
-        assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
-        send.send(Feed::Asked("shop.cart".into(), Some(Box::new(seen(6)))))
-            .unwrap();
-        view.drain();
-        assert_eq!(state(&view, "shop.cart"), Some(State::NeedsYou));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn what_needs_the_person_stays_until_they_answer_it() {
+    async fn what_waits_on_the_person_stays_until_they_answer_it() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![
             json!({"name": "shop.lead"}),
@@ -7970,9 +7945,10 @@ mod tests {
         view.drain();
         let state = |view: &View, name: &str| view.agents[view.index[name]].state();
         assert_eq!(state(&view, "shop.ops"), Some(State::Failed));
-        assert_eq!(state(&view, "shop.cart"), Some(State::NeedsYou));
-        assert_eq!(state(&view, "shop.lead"), Some(State::NeedsYou));
-        assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
+        assert_eq!(state(&view, "shop.cart"), Some(State::Approval));
+        assert_eq!(state(&view, "shop.lead"), Some(State::Approval));
+        // A question asked is no wait of its own: its lead asks the person.
+        assert_eq!(state(&view, "shop.login"), Some(State::Working));
 
         // The last call answered, the waiting one started; the lead that
         // made the task passes a word on, which answers nothing, as the
@@ -7997,10 +7973,6 @@ mod tests {
         view.drain();
         assert_eq!(state(&view, "shop.lead"), Some(State::Working));
         assert_eq!(state(&view, "shop.cart"), Some(State::Working));
-        assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
-        send.send(live("shop.login", "steered", 4, json!({})))
-            .unwrap();
-        view.drain();
         assert_eq!(state(&view, "shop.login"), Some(State::Working));
     }
 
@@ -8014,7 +7986,7 @@ mod tests {
         view.legend = true;
         let shown = text(&view.card(80, 30));
         assert!(
-            shown.contains("⠛ working breathes  ? needs you  ✗ failed"),
+            shown.contains("⠛ working breathes  ? waits on you  ✗ failed"),
             "{shown}"
         );
         assert!(shown.contains("⠤⠤ shell  ⡇ files  ⡁⢈ web"), "{shown}");
@@ -8065,13 +8037,19 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 40);
         // The newest at the bottom of the column, a blank under it, what
-        // needs you in its hue.
+        // waits on you in its hue.
         assert!(!rows[39].trim_end().ends_with("asks you"), "{:?}", rows[39]);
         assert!(rows[38].ends_with("? a asks you"), "{:?}", rows[38]);
         assert!(rows[37].ends_with("you → a"), "{:?}", rows[37]);
         assert!(rows[36].ends_with("a → b"), "{:?}", rows[36]);
         assert!(rows[0].trim().is_empty() || !rows[0].contains('→'));
-        // Zen: the sky alone, and no names but what needs the person.
+        // Zen: the sky alone, and no names but what waits on the person.
+        send.send(Feed::Live(
+            json!({"event": "approval_requested", "bot": "a", "turn": 9,
+            "data": {"calls": [{"call_id": "c1", "gates": ["manual"]}]}}),
+        ))
+        .unwrap();
+        view.drain();
         view.zen = true;
         let zen = text(&view.card(140, 40));
         assert!(!zen.contains('→'), "{zen}");

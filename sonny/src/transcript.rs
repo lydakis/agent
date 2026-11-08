@@ -1760,7 +1760,7 @@ fn news(text: &str) -> Option<Vec<String>> {
             } else if status.starts_with("took its margin note") {
                 parts.push(format!("{name} took a note away"));
             } else if status.starts_with("waiting for the person") {
-                parts.push(format!("{name} needs you"));
+                parts.push(format!("{name} waits on you"));
             } else if status.starts_with("put a question to the person") {
                 parts.push(format!("{name} asks you"));
             } else if status.starts_with("has printed nothing") {
@@ -3568,7 +3568,7 @@ mod tests {
         assert_eq!(
             text(&super::prompt(note, 160, None).0),
             [
-                "↳ Task updates · shop.fix noted · shop.web took a note away · shop.docs needs you · shop.api quiet · shop.db asks you"
+                "↳ Task updates · shop.fix noted · shop.web took a note away · shop.docs waits on you · shop.api quiet · shop.db asks you"
             ]
         );
     }

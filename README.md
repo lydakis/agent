@@ -243,7 +243,7 @@ mail, chat and other people keep adding to it.
 You hand the folder's lead several things at once. It starts a task for
 each and hears how every turn ended through the [lookout](docs/LOOKOUT.md),
 so you don't check on them. What needs you comes to you: a task's question
-or a decision reaches the lead, and the footer counts it (`? 1 needs you`).
+or a decision reaches the lead, which asks you itself.
 News from outside comes in the same way, from the lookout's
 [sources](docs/LOOKOUT.md#sources) such as a chat poller or a mailbox. The
 lead can read further through your MCP servers, and weighs what it hears

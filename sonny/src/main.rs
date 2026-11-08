@@ -649,7 +649,7 @@ async fn read_status(
                 match held {
                     Ok(_) => "waiting on its reviewer".into(),
                     // Unlisted, the call may be the person's.
-                    Err(_) => "needs you".into(),
+                    Err(_) => started::APPROVAL.into(),
                 }
             }
             (true, Some("waiting")) => {
@@ -741,15 +741,15 @@ async fn read_status(
         if let Some(ask) = &ask {
             step = format!("asks: {}", first_line(&ask.question));
         }
-        let state = match needs.waits(name) {
-            true => "needs you".to_owned(),
+        let state = match needs.holds(name) {
+            true => started::APPROVAL.to_owned(),
             false => state,
         };
         let state = match resolved && !running {
             true => started::DONE.to_owned(),
             false => state,
         };
-        let group = status::group(&state, running, ask.is_some(), resolved);
+        let group = status::group(&state, running, resolved);
         let place = match view.places.get(name) {
             Some((tab, Some((side, other)))) => {
                 format!("tab {tab}, {side} {}", short(other, &project, &lead))
@@ -2968,7 +2968,9 @@ fn report_status(state: &str, bot: &str) {
     // its project, and what it is doing.
     let name = bot.split_once('.').map_or(bot, |(_, name)| name);
     let doing = match state {
-        "blocked" | "asking" => "needs you",
+        "blocked" => started::APPROVAL,
+        // A question it put to the person ends its turn: it rests.
+        "asking" => started::IDLE,
         "error" => "failed",
         // A turn that ended, seen or not yet: it rests.
         "done" => started::IDLE,
@@ -3864,9 +3866,6 @@ struct App {
     /// opens on them. None before it starts; done once it has.
     warming: Option<Warming>,
     sounds: sound::Sounds,
-    /// The footer's needs-you count, which beats a few times when it
-    /// rises; kept as the footer is drawn, from what it counts.
-    needs_pulse: std::cell::Cell<look::Pulse>,
     /// The reply text the current model call has streamed.
     said: String,
     /// Prompts sent and not in the conversation yet, by their turn: a
@@ -4375,7 +4374,7 @@ fn room_for(
         project: project.to_owned(),
         mine: lineage.iter().chain(doing.keys()).cloned().collect(),
         keep: (doing.iter())
-            .filter(|(_, doing)| matches!(**doing, "needs you" | "failed"))
+            .filter(|(_, doing)| matches!(**doing, started::APPROVAL | "failed"))
             .map(|(bot, _)| bot.clone())
             .collect(),
         used: Arc::new(used::when),
@@ -4600,7 +4599,7 @@ impl Naming {
             .or_else(|| bots.first())
             .copied()?;
         let mut name = format!("{} · {}", self.named(first), self.doing[first]);
-        for state in ["needs you", "working"] {
+        for state in [started::APPROVAL, "working"] {
             let others = bots
                 .iter()
                 .filter(|b| **b != first && self.doing.get(**b) == Some(&state))
@@ -4815,7 +4814,7 @@ impl Fleet {
                 && self
                     .doing
                     .get(name)
-                    .is_none_or(|doing| matches!(*doing, "working" | "needs you"))
+                    .is_none_or(|doing| matches!(*doing, "working" | started::APPROVAL))
             {
                 self.activity.insert(name.to_owned(), "idle");
                 self.doing.insert(name.to_owned(), "idle");
@@ -4882,7 +4881,7 @@ impl Fleet {
             let ask = self.open_ask(&bot, seen);
             self.needs.asked(&bot, ask);
             self.scanned.remove(&bot);
-            let waits = self.needs.waits(&bot);
+            let waits = self.needs.holds(&bot);
             self.settle(&bot, waits);
         }
         if let Some((bot, head)) = self.unread.pop()
@@ -4939,9 +4938,9 @@ impl Fleet {
             self.doing(bot, "working");
             return;
         }
-        let needs = self.needs.waits(bot);
+        let needs = self.needs.holds(bot);
         let doing = match needs {
-            true => "needs you",
+            true => started::APPROVAL,
             false => "working",
         };
         let (command, name) = self.window(bot, doing);
@@ -4991,7 +4990,7 @@ impl Fleet {
     /// they have not looked at yet nor one that needs them, and with no
     /// other passes the limit. The person's focus stays where it is.
     fn needs_window(&self, bot: &str) {
-        let (command, name) = self.window(bot, "needs you");
+        let (command, name) = self.window(bot, started::APPROVAL);
         let (windows, mut room) = self.room();
         let (bot, told) = (bot.to_owned(), self.tell.clone());
         let (socket, project) = (self.socket.clone(), self.project.clone());
@@ -5131,7 +5130,7 @@ impl Fleet {
                 // One that ended on a question waits for its answer there.
                 if task != self.lead
                     && self.ended.get(&task) == Some(&turn)
-                    && !self.needs.waits(&task)
+                    && !self.needs.holds(&task)
                 {
                     self.ended.remove(&task);
                     if every {
@@ -5192,24 +5191,21 @@ impl Fleet {
         let Some(&activity) = self.activity.get(bot) else {
             return;
         };
-        let doing = match self.needs.waits(bot) {
-            true => "needs you",
+        let doing = match self.needs.holds(bot) {
+            true => started::APPROVAL,
             false => activity,
         };
         if self.doing.get(bot) != Some(&doing) {
             self.doing.insert(bot.to_owned(), doing);
-            if doing == "needs you" && bot != self.lead && self.lineage.contains(bot) {
+            if doing == started::APPROVAL && bot != self.lead && self.lineage.contains(bot) {
                 self.needs_window(bot);
             }
             self.name_windows();
             let short = self.short(bot).to_owned();
             let alert = match doing {
                 _ if !ring => None,
-                // The lead's own questions end its turn, which its view
-                // rings for; its calls held for the person ring here.
-                "needs you" if bot == self.lead && !self.needs.holds(bot) => None,
-                // In zen the lead breaks through with a question alone.
-                _ if self.zen && !(bot == self.lead && doing == "needs you") => None,
+                // In zen the lead breaks through with its own calls alone.
+                _ if self.zen && !(bot == self.lead && doing == started::APPROVAL) => None,
                 // The lead's view rings for its own ends: only it knows
                 // whether a turn the lookout started said anything.
                 started::IDLE if bot == self.lead => None,
@@ -5219,7 +5215,10 @@ impl Fleet {
                     format!("{short} finished, saying nothing"),
                 )),
                 "failed" => Some((sound::Alert::Failed, format!("{short} failed"))),
-                "needs you" => Some((sound::Alert::NeedsYou, format!("{short} needs you"))),
+                started::APPROVAL => Some((
+                    sound::Alert::Approval,
+                    format!("{short} waits on your approval"),
+                )),
                 _ => None,
             };
             self.alerts.extend(alert);
@@ -5280,7 +5279,7 @@ impl Fleet {
             // coming to wait rings, and the wait ending is quiet, as what
             // the bot does then rings for itself.
             if self.needs.event(event) {
-                let waits = self.needs.waits(bot);
+                let waits = self.needs.holds(bot);
                 self.settle(bot, waits);
             }
             match kind {
@@ -5451,7 +5450,6 @@ impl App {
             reads_unkept: false,
             warming: None,
             sounds: sound::Sounds::new(false),
-            needs_pulse: std::cell::Cell::default(),
             said: String::new(),
             staged: Vec::new(),
             staged_drawn: std::cell::RefCell::default(),
@@ -7068,11 +7066,9 @@ impl App {
                         asked.push(bot.clone());
                     }
                     read.push(bot.clone());
-                    // One not read again this pass waits on what it asked.
-                    let waits =
-                        needs.waits(&bot) || (!asked.contains(&bot) && self.task_needs.waits(&bot));
+                    let waits = needs.holds(&bot);
                     match (waits, done) {
-                        (true, _) => "needs you".to_owned(),
+                        (true, _) => started::APPROVAL.to_owned(),
                         (false, true) => started::DONE.to_owned(),
                         _ => state,
                     }
@@ -10578,8 +10574,8 @@ impl App {
             status_report("blocked", &self.bot);
             // With a fleet, the lead's Sonny rings for every agent.
             if self.fleet.is_none() {
-                let what = format!("{} needs you", self.bot);
-                self.sounds.alert(sound::Alert::NeedsYou, &what);
+                let what = format!("{} waits on your approval", self.bot);
+                self.sounds.alert(sound::Alert::Approval, &what);
             }
         }
     }
@@ -11357,13 +11353,11 @@ impl App {
         }
     }
 
-    /// The other agents at work, and how many agents wait on the person:
-    /// this one, with a question or a call of its open here, and the others
-    /// as their windows' names say ([`Fleet::settle`]). Without windows for
-    /// the project's agents, the tasks this one started: those running as
-    /// the daemon says, drawn or not, and those that need the person as
-    /// their rosters read them.
-    fn agents(&self) -> (usize, usize) {
+    /// The other agents at work: as their windows' names say
+    /// ([`Fleet::settle`]), or, without windows for the project's agents,
+    /// the tasks this one started: those running as the daemon says, drawn
+    /// or not, but for one its roster reads waiting on the person.
+    fn agents(&self) -> usize {
         let doing: HashMap<&str, &str> = match &self.fleet {
             Some(fleet) => (fleet.doing.iter())
                 .map(|(bot, doing)| (bot.as_str(), *doing))
@@ -11374,24 +11368,15 @@ impl App {
                 match &self.tasks_running {
                     Some(running) => (running.iter())
                         .map(|bot| (bot.as_str(), "working"))
-                        .chain(rostered.filter(|(_, state)| *state == "needs you"))
+                        .chain(rostered.filter(|(_, state)| *state == started::APPROVAL))
                         .collect(),
                     None => rostered.collect(),
                 }
             }
         };
-        let count = |state: &str| {
-            (doing.iter())
-                .filter(|(bot, doing)| **bot != self.bot && **doing == state)
-                .count()
-        };
-        // Its transcript read only so far back, the fleet's read of its
-        // history may hold a question this window does not.
-        // Its tasks' questions pinned here count as theirs.
-        let here = self.asks.iter().any(|ask| ask.task.is_none())
-            || !self.approvals.is_empty()
-            || (self.fleet.as_ref()).is_some_and(|fleet| fleet.needs.waits(&self.bot));
-        (count("working"), usize::from(here) + count("needs you"))
+        (doing.iter())
+            .filter(|(bot, doing)| **bot != self.bot && **doing == "working")
+            .count()
     }
 
     /// A button clicked: what Sonny does for it now, or once the loop
@@ -13679,13 +13664,12 @@ impl App {
     /// Whether something on the screen moves with time alone, so each
     /// tick draws it: the running turn's shimmer and clock, a shell's
     /// clock and output, a card beside (the sky, or one read again every
-    /// few seconds), a side chat, a count's pulse on its beats. Whatever
+    /// few seconds), a side chat. Whatever
     /// else changes comes with an event, which draws it.
     fn moving(&self) -> bool {
         self.running.is_some()
             || self.shell.is_some()
             || (self.pane.as_ref()).is_some_and(|pane| pane.is_card() || pane.program.is_some())
-            || self.needs_pulse.get().moving(Instant::now())
     }
 
     /// Whether zen keeps what the running turn says out of view: the
@@ -15616,21 +15600,9 @@ impl App {
                 .opens("switch"),
             );
         }
-        let (working, waiting) = self.agents();
         // Marks as the roster and /status draw them, each with its number,
         // so the counts read without colour.
-        // Something new to answer beats the count a few times, reversed,
-        // then it holds still (F12).
-        let mut pulse = self.needs_pulse.get();
-        pulse.see(waiting, Instant::now());
-        self.needs_pulse.set(pulse);
-        if waiting > 0 {
-            let mut forms = footer::count("?", Color::Yellow, waiting, false);
-            if pulse.on(Instant::now()) {
-                forms.iter_mut().flatten().for_each(footer::beat);
-            }
-            items.push(Item::new(Slot::Needs, forms).opens("status"));
-        }
+        let working = self.agents();
         // Quiet, or waiting for the person to step away outside their hours.
         let epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -15646,12 +15618,8 @@ impl App {
             };
             items.push(Item::new(Slot::Quiet, vec![vec![long], short]));
         }
-        // In zen, the focus, and only what needs the person besides.
+        // In zen, the focus, and only whether it is quiet besides.
         if let Some(focus) = &self.zen {
-            let needs = match waiting {
-                0 => 0,
-                n => format!("  ? {n}").width(),
-            };
             // An armed boost too, quieter than the full footer's: an arrow
             // for each step above the agent's own effort, so ↑ then ↑↑.
             let boost = (self.boost.as_ref()).map(|boost| {
@@ -15664,7 +15632,7 @@ impl App {
                 format!(" {}", "↑".repeat(steps))
             });
             let marked = boost.as_ref().map_or(0, |boost| boost.width());
-            let room = width.saturating_sub(4 + needs + marked + "zen · ".len());
+            let room = width.saturating_sub(4 + marked + "zen · ".len());
             // As much of its first line as the row holds: the footer's own
             // width, not a glance's.
             let mut line = focus.lines().next().unwrap_or("").to_owned();
@@ -15672,7 +15640,7 @@ impl App {
                 line.push('…');
             }
             let focus = format!("zen · {}", transcript::cut(&line, room));
-            items.retain(|item| matches!(item.slot, Slot::Needs | Slot::Quiet));
+            items.retain(|item| matches!(item.slot, Slot::Quiet));
             let mut place = vec![Span::raw(focus).dim()];
             place.extend(boost.map(Span::raw));
             items.push(Item::new(Slot::Place, vec![place]));
@@ -17663,7 +17631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_says_needs_you_only_for_calls_the_person_must_answer_and_the_tabs_agree() {
+    async fn status_says_it_waits_on_you_only_for_calls_the_person_must_answer_and_tabs_agree() {
         let waiting = json!([{"turn": 4, "status": "waiting", "waiting_on": {"approval": true}}]);
         let (client, events) = daemon_with_events(json!({}), move |asked| {
             match asked["op"].as_str().unwrap_or_default() {
@@ -17704,13 +17672,13 @@ mod tests {
                 .state
                 .clone()
         };
-        assert_eq!(state("shop.fix"), "needs you");
+        assert_eq!(state("shop.fix"), started::APPROVAL);
         assert_eq!(state("shop.web"), "waiting on its reviewer");
         // What /status read, the tabs and the footer say too.
         let fleet = app.fleet.as_ref().unwrap();
-        assert_eq!(fleet.doing["shop.fix"], "needs you");
+        assert_eq!(fleet.doing["shop.fix"], started::APPROVAL);
         assert_eq!(fleet.doing["shop.web"], "working");
-        assert_eq!(app.agents(), (1, 1));
+        assert_eq!(app.agents(), 1);
     }
 
     #[tokio::test]
@@ -18776,47 +18744,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_new_question_beats_the_footer_count_and_then_it_holds() {
-        let mut app = app_in_zen(zen_daemon().await);
-        app.history().await;
-        let mark = |app: &App| {
-            let (line, _) = app.footer(60);
-            let span = (line.spans.into_iter()).find(|span| span.content == "?");
-            span.map(|span| span.style.add_modifier.contains(Modifier::REVERSED))
-        };
-        // Drawn first with one waiting: the count rose from none.
-        assert_eq!(mark(&app), Some(true));
-        // A second and a half on, it holds still, as wide as before.
-        let mut pulse = look::Pulse::default();
-        pulse.see(1, Instant::now() - Duration::from_secs(2));
-        app.needs_pulse.set(pulse);
-        assert_eq!(mark(&app), Some(false));
-        assert_eq!(app.footer(60).0.width(), 60);
-    }
-
-    #[tokio::test]
-    async fn in_zen_the_footer_counts_only_what_needs_the_person() {
+    async fn in_zen_the_footer_shows_only_the_focus() {
         let mut app = app_in_zen(zen_daemon().await);
         app.history().await;
         let (footer, counter) = app.footer(60);
         let footer = footer.to_string();
         assert!(footer.starts_with("  zen · the rounding"), "{footer}");
-        assert!(footer.ends_with("? 1  "), "{footer}");
+        assert!(!footer.contains('?'), "{footer}");
         assert_eq!(footer.width(), 60);
-        let [(counter, "status")] = &counter[..] else {
-            panic!("{counter:?}")
-        };
-        let columns: Vec<char> = footer.chars().collect();
-        let counted: String = columns[counter.start as usize..counter.end as usize]
-            .iter()
-            .collect();
-        assert_eq!(counted, "? 1");
-        // The focus gets the room the count doesn't take: the mark and
-        // its number, not a word after them.
+        assert!(counter.is_empty(), "{counter:?}");
+        // A focus too long for the row is cut to fit it.
         app.zen = Some("a long focus that cannot fit".into());
         let footer = app.footer(30).0.to_string();
         assert!(footer.starts_with("  zen · a long focus"), "{footer}");
-        assert!(footer.ends_with("? 1  "), "{footer}");
         assert!(footer.width() <= 30, "{footer}");
     }
 
@@ -21865,7 +21805,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_task_that_ended_on_a_question_needs_you() {
+    async fn a_task_that_ended_on_a_question_rests_its_history_read_once() {
         let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let scanned = scans.clone();
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
@@ -21895,7 +21835,7 @@ mod tests {
             false,
         );
         app.read_tasks().await;
-        assert_eq!(drawn(&mut app)[1], "  ? ask  needs you  Fix ask");
+        assert_eq!(drawn(&mut app)[1], "  ✓ ask  idle  Fix ask");
         // Its history is read once for the turn it ended.
         app.tasks_read = None;
         app.read_tasks().await;
@@ -22257,22 +22197,23 @@ mod tests {
         let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
         fleet.reconcile().await;
         // The call held across the restart: its tab says so, not working.
-        assert_eq!(fleet.doing["calc.fix"], "needs you");
+        assert_eq!(fleet.doing["calc.fix"], started::APPROVAL);
         // Its parked turn picks up again with no verdict: still waiting.
         let event = |bot: &str, kind: &str, turn: i64, data: Value| json!({"event": kind, "bot": bot, "turn": turn, "data": data});
         fleet.event(&event("calc.fix", "turn_resumed", 4, json!({})));
-        assert_eq!(fleet.doing["calc.fix"], "needs you");
-        // The questions asked while away are read one at a time after.
-        assert_eq!(fleet.doing["calc.ask"], "idle");
+        assert_eq!(fleet.doing["calc.fix"], started::APPROVAL);
+        // The questions asked while away are read one at a time after,
+        // for the lead's window to pin: a question is no state of its own.
         while !fleet.unread.is_empty() {
             fleet.rescan().await;
         }
-        assert_eq!(fleet.doing["calc.ask"], "needs you");
+        assert_eq!(fleet.doing["calc.ask"], "idle");
+        assert!(fleet.needs.asks().any(|(bot, _)| bot == "calc.ask"));
         // The footer counts what the tabs say, this agent's own aside.
         let mut app = app(client);
         app.bot = "calc.lead".into();
         app.fleet = Some(fleet);
-        assert_eq!(app.agents(), (0, 3));
+        assert_eq!(app.agents(), 0);
         // The call answered, the task works on.
         let fleet = app.fleet.as_mut().unwrap();
         fleet.event(&event(
@@ -22282,7 +22223,7 @@ mod tests {
             json!({"call_id": "c1"}),
         ));
         assert_eq!(fleet.doing["calc.fix"], "working");
-        assert_eq!(app.agents(), (1, 2));
+        assert_eq!(app.agents(), 1);
     }
 
     /// A task's question shows in its lead's window too, by whose it is,
@@ -22670,10 +22611,11 @@ mod tests {
         app.read_tasks().await;
         app.pin_task_asks();
         assert_eq!(app.asks.len(), 1, "read while it runs");
-        // A quick pass that does not read it again still says it needs you.
+        // A quick pass that does not read it again keeps it pinned.
         app.tasks_read = Some(Instant::now() - Duration::from_secs(5));
         app.read_tasks().await;
-        assert!(drawn(&mut app)[1].contains("needs you"));
+        app.pin_task_asks();
+        assert_eq!(app.asks.len(), 1);
         app.input.set("done");
         app.submit().await;
         let to = sent.lock().unwrap().last().cloned().unwrap();
@@ -22805,7 +22747,7 @@ mod tests {
         // window, so it opens, past the limit, and the new one stays.
         let fleet = app.fleet.as_mut().unwrap();
         fleet.event(&event("calc.b", "approval_asked", json!({"call_id": "c1"})));
-        assert_eq!(fleet.doing["calc.b"], "needs you");
+        assert_eq!(fleet.doing["calc.b"], started::APPROVAL);
         fleet.layout.settle();
         let shown = windowed(fleet);
         assert!(shown.contains(&"calc.a".to_owned()) && shown.contains(&"calc.b".to_owned()));
@@ -22867,7 +22809,7 @@ mod tests {
         assert_eq!(fleet.doing["calc.a"], "working");
         // A call of its held for the person opens its tab.
         fleet.event(&event("calc.a", "approval_asked", json!({"call_id": "c1"})));
-        assert_eq!(fleet.doing["calc.a"], "needs you");
+        assert_eq!(fleet.doing["calc.a"], started::APPROVAL);
         fleet.layout.settle();
         assert!(windowed(&fleet).contains(&"calc.a".to_owned()));
         assert!(!windowed(&fleet).contains(&"calc.b".to_owned()));
@@ -22950,10 +22892,8 @@ mod tests {
             fleet.rescan().await;
         }
         assert_eq!(fleet.doing["calc.ask"], "idle");
-        assert_eq!(
-            fleet.doing["calc.new"], "needs you",
-            "one not resolved still asks"
-        );
+        let asking: Vec<&str> = fleet.needs.asks().map(|(bot, _)| bot).collect();
+        assert_eq!(asking, ["calc.new"], "one not resolved still asks");
         // The lead's roster, read again now and then, agrees.
         let mut app = app(client);
         app.bot = "calc.lead".into();
@@ -22969,67 +22909,22 @@ mod tests {
             .map(|task| (task.bot.as_str(), task.state.as_str()))
             .collect();
         assert_eq!(states["calc.ask"], "done");
-        assert_eq!(states["calc.new"], "needs you");
+        assert_eq!(states["calc.new"], "idle");
         let fleet = app.fleet.as_ref().unwrap();
         assert_eq!(fleet.doing["calc.ask"], "idle");
-        assert_eq!(fleet.doing["calc.new"], "needs you");
+        let asking: Vec<&str> = fleet.needs.asks().map(|(bot, _)| bot).collect();
+        assert_eq!(asking, ["calc.new"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
-    async fn a_task_that_ends_on_its_own_question_needs_you() {
-        let (client, events) = project_waiting().await;
-        let mut fleet = Fleet::in_memory(client.clone(), events, "calc", "calc.lead");
-        fleet.reconcile().await;
-        while !fleet.unread.is_empty() {
-            fleet.rescan().await;
-        }
-        let event = |kind: &str, turn: i64, data: Value| json!({"event": kind, "bot": "calc.new", "turn": turn, "data": data});
-        // A reviewer's call is no one's to answer here.
-        assert_eq!(
-            fleet.doing["calc.new"], "needs you",
-            "its question, read at start"
-        );
-        fleet.event(&event("accepted", 3, json!({})));
-        assert_eq!(
-            fleet.doing["calc.new"], "working",
-            "the person wrote past it"
-        );
-        let ask = json!({"name": "ask", "call_id": "q2", "arguments": "{}"});
-        fleet.event(&event("tool_started", 3, ask));
-        assert_eq!(fleet.doing["calc.new"], "needs you");
-        fleet.event(&event("tool_completed", 3, json!({"call_id": "q2"})));
-        fleet.event(&event("turn_finished", 3, json!({"status": "completed"})));
-        // Done, but waiting on the person: so its tab says, and the end of
-        // the turn reads its history again.
-        assert_eq!(fleet.doing["calc.new"], "needs you");
-        assert_eq!(fleet.ended.get("calc.new"), Some(&3));
-        fleet.rescan().await;
-        assert_eq!(fleet.doing["calc.new"], "needs you");
-        // The person's words steered into a turn running then answer it,
-        // as the fleet follows steers too.
-        assert!(FLEET_KINDS.contains(&"steered"));
-        fleet.event(&event("steered", 4, json!({"steer": 5})));
-        assert_eq!(fleet.doing["calc.new"], "idle");
-    }
-
-    #[tokio::test]
-    async fn the_footer_counts_what_needs_the_person_and_a_click_opens_status() {
+    async fn the_footer_counts_agents_at_work_and_a_click_opens_status() {
         use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = app(daemon_answering(|_| json!({})).await);
         app.model = "opus".into();
         // Nothing counted while nothing runs or waits.
         let (line, opens) = app.footer(100);
         assert!(opens.is_empty() && !line.to_string().contains('●'));
-        let ask = |id: &str| {
-            asks::call(
-                id,
-                &json!({"question": "Merge?", "options": [
-                {"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]}),
-            )
-            .unwrap()
-        };
-        app.asks = vec![ask("c1"), ask("c2")];
         // With no windows for them, the tasks started, as their roster reads them.
         let task = |name: &str, state: &str| started::Task {
             bot: format!("calc.{name}"),
@@ -23037,9 +22932,12 @@ mod tests {
             brief: "b".into(),
             state: state.into(),
         };
-        // Agents are counted: this one once, however many it asked.
-        app.tasks
-            .insert(0, vec![task("add", "working"), task("neg", "needs you")]);
+        // Agents are counted once each, and one waiting on the person's
+        // approval is not at work.
+        app.tasks.insert(
+            0,
+            vec![task("add", "working"), task("neg", started::APPROVAL)],
+        );
         app.tasks
             .insert(1, vec![task("add", "working"), task("div", "working")]);
         let (line, opens) = app.footer(100);
@@ -23053,22 +22951,18 @@ mod tests {
                 (cells, *link)
             })
             .collect();
-        assert_eq!(
-            shown,
-            [("? 2".to_owned(), "status"), ("● 2".to_owned(), "status")]
-        );
+        assert_eq!(shown, [("● 2".to_owned(), "status")]);
         // The agent's name is the composer's to say, not the footer's.
-        assert!(text.ends_with("  ? 2  ● 2  "), "{text}");
+        assert!(text.ends_with("  ● 2  "), "{text}");
         assert!(!text.contains(&app.bot), "{text}");
         assert_eq!(text.width(), 100);
         let counter = opens[0].0.clone();
-        // Its marks and colors as a roster's: yellow ? for what needs the
-        // person, cyan ● at work.
+        // Its mark and color as a roster's: cyan ● at work.
         let marks: Vec<_> = (line.spans.iter())
             .filter(|span| span.content == "●" || span.content == "?")
             .map(|span| span.style.fg)
             .collect();
-        assert_eq!(marks, [Some(Color::Yellow), Some(Color::Cyan)]);
+        assert_eq!(marks, [Some(Color::Cyan)]);
         app.opens_at = vec![(
             20,
             10 + counter.start..10 + counter.end,
@@ -23186,18 +23080,18 @@ mod tests {
         let mut app = app(client);
         app.bot = "calc".into();
         app.bot_id = Some(7);
-        // Only one roster still drawn: its task needs the person.
+        // Only one roster still drawn: its task waits on the person.
         app.tasks.insert(
             0,
             vec![started::Task {
                 bot: "calc.ask".into(),
                 name: "ask".into(),
                 brief: "b".into(),
-                state: "needs you".into(),
+                state: started::APPROVAL.into(),
             }],
         );
         app.read_running_tasks().await;
-        assert_eq!(app.agents(), (2, 1));
+        assert_eq!(app.agents(), 2);
     }
 
     #[tokio::test]

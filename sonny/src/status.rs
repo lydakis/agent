@@ -1,10 +1,9 @@
 //! `/status`: the project's agents on one card, read from the daemon and
 //! Rex with no model call. Its agents are grouped by where they stand, as
-//! a thread list is, the lead first in its group: what needs the person,
-//! what works, and, folded away, what sits idle and what is marked done.
-//! Each row is one line: the agent, its state and for how long, and at the
-//! right its code reviews; one that needs the person says what for under
-//! it. More, on a key: what it follows, what runs for it in the background
+//! a thread list is, the lead first in its group: what failed, what works,
+//! and, folded away, what sits idle and what is marked done. Each row is
+//! one line: the agent, its state and for how long; one that waits on the
+//! person's approval says so as its state. More, on a key: what it follows, what runs for it in the background
 //! and where its window is, and the picked one's model, profile and latest
 //! step. A task's own helpers fold under it.
 use ratatui::{
@@ -49,9 +48,10 @@ pub struct Row {
 /// Where a task stands, as `/status` groups the tasks, in its order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
-    /// Waiting on the person's approval or answer, or failed.
-    NeedsYou,
-    /// A turn running, queued, rate limited, or waiting on other tasks.
+    /// Its last turn failed.
+    Failed,
+    /// A turn running, queued, rate limited, held, waiting on other tasks
+    /// or on the person's approval.
     Working,
     /// Its turn ended, stopped, or never started, with nothing open; a
     /// pull request it opened shows on its row.
@@ -63,11 +63,11 @@ pub enum Group {
 }
 
 impl Group {
-    /// The group as a word for scripts: `needs_you`, `working`, `idle`,
+    /// The group as a word for scripts: `failed`, `working`, `idle`,
     /// `done`.
     pub fn key(self) -> &'static str {
         match self {
-            Group::NeedsYou => "needs_you",
+            Group::Failed => "failed",
             Group::Working => "working",
             Group::Idle => "idle",
             Group::Done => "done",
@@ -76,7 +76,7 @@ impl Group {
 
     fn heading(self) -> &'static str {
         match self {
-            Group::NeedsYou => "Needs you",
+            Group::Failed => "Failed",
             Group::Working => "Working",
             Group::Idle => "Idle",
             Group::Done => "Done",
@@ -85,15 +85,12 @@ impl Group {
 }
 
 /// Where a task stands: `state` as `/status` names it, whether a turn
-/// runs, whether it has a question open for the person, and whether it is
-/// marked done, which only a task with no turn running can be.
-pub fn group(state: &str, running: bool, asking: bool, done: bool) -> Group {
+/// runs, and whether it is marked done, which only a task with no turn
+/// running can be.
+pub fn group(state: &str, running: bool, done: bool) -> Group {
     match state {
         _ if done && !running => Group::Done,
-        "needs you" | "failed" => Group::NeedsYou,
-        // Held on a cause the person can fix: theirs to set right.
-        _ if state.starts_with(HELD) => Group::NeedsYou,
-        _ if asking => Group::NeedsYou,
+        "failed" => Group::Failed,
         _ if running => Group::Working,
         _ => Group::Idle,
     }
@@ -135,7 +132,7 @@ pub fn pull_requests(text: &str) -> Vec<String> {
 pub fn mark(state: &str) -> Span<'static> {
     match state {
         "working" => Span::raw("● ").fg(Color::Cyan),
-        "needs you" => Span::raw("? ").fg(Color::Yellow).bold(),
+        crate::started::APPROVAL => Span::raw("? ").fg(Color::Yellow).bold(),
         crate::started::IDLE | "completed" => Span::raw("✓ ").fg(Color::Green),
         crate::started::DONE => Span::raw("✓ ").dim(),
         crate::started::QUIET => Span::raw("✓ ").dim(),
@@ -233,9 +230,9 @@ pub fn card(
     let mut listed: Vec<&Row> = rows.iter().filter(|r| r.name == "lead").collect();
     for row in &tasks {
         match top(row) {
-            // One that needs the person is listed there too.
+            // One that waits on the person's approval is listed there too.
             Some(parent) => {
-                if row.group == Group::NeedsYou {
+                if row.state == crate::started::APPROVAL {
                     listed.push(row);
                 }
                 under.entry(parent).or_default().push(row);
@@ -249,7 +246,7 @@ pub fn card(
         tasks.len(),
         if tasks.len() == 1 { "" } else { "s" }
     );
-    for (group, said) in [(Group::NeedsYou, "need you"), (Group::Working, "working")] {
+    for (group, said) in [(Group::Failed, "failed"), (Group::Working, "working")] {
         if count(group) > 0 {
             head.push_str(&format!(" · {} {said}", count(group)));
         }
@@ -261,7 +258,7 @@ pub fn card(
         Details::Quiet => false,
     };
     let trackers = details != Details::Quiet;
-    for group in [Group::NeedsYou, Group::Working, Group::Idle, Group::Done] {
+    for group in [Group::Failed, Group::Working, Group::Idle, Group::Done] {
         let in_group: Vec<&&Row> = listed.iter().filter(|r| r.group == group).collect();
         if in_group.is_empty() {
             continue;
@@ -286,7 +283,7 @@ pub fn card(
         for row in in_group.iter().take(showing) {
             named.push((out.len(), row.bot.clone()));
             out.extend(row_lines(row, width, "", shown(row), trackers));
-            // A helper listed with what needs the person shows alone.
+            // A helper listed for what waits on the person shows alone.
             let Some(helped) = under.get(&row.bot).filter(|_| top(row).is_none()) else {
                 continue;
             };
@@ -297,7 +294,7 @@ pub fn card(
                 helped.len(),
                 if helped.len() == 1 { "" } else { "s" }
             );
-            for (state, word) in [(Group::NeedsYou, "need you"), (Group::Working, "working")] {
+            for (state, word) in [(Group::Failed, "failed"), (Group::Working, "working")] {
                 let k = helped.iter().filter(|h| h.group == state).count();
                 if k > 0 {
                     said.push_str(&format!(", {k} {word}"));
@@ -567,7 +564,7 @@ fn row_lines(
             ));
         }
     }
-    if !row.latest.is_empty() && (details || row.group == Group::NeedsYou) {
+    if !row.latest.is_empty() && (details || row.group == Group::Failed) {
         // The agent's words, read as the Markdown they are.
         let line = Line::from(crate::transcript::inline(&row.latest, Default::default())).dim();
         out.extend(crate::transcript::capped(
@@ -669,24 +666,20 @@ mod tests {
             held_alerts(&many)[0].said,
             "usage limit reached · 6000 agents waiting: api and 5999 more"
         );
-        assert_eq!(
-            group("held: ChatGPT sign-in", true, false, false),
-            Group::NeedsYou
-        );
+        assert_eq!(group("held: ChatGPT sign-in", true, false), Group::Working);
     }
 
     #[test]
     fn tasks_are_grouped_by_where_they_stand() {
-        assert_eq!(group("working", true, false, false), Group::Working);
-        assert_eq!(group("waiting on fix", true, false, true), Group::Working);
-        assert_eq!(group("needs you", true, false, false), Group::NeedsYou);
-        // A question asked ends the turn; it still needs the person.
-        assert_eq!(group("idle", false, true, false), Group::NeedsYou);
-        assert_eq!(group("failed", false, false, false), Group::NeedsYou);
-        // A pull request shows on the row, not as a group of its own.
-        assert_eq!(group("idle", false, false, false), Group::Idle);
-        assert_eq!(group("stopped", false, false, false), Group::Idle);
-        assert_eq!(group("failed", false, true, true), Group::Done);
+        assert_eq!(group("working", true, false), Group::Working);
+        assert_eq!(group("waiting on fix", true, true), Group::Working);
+        // A call waiting on the person's approval: its turn still works.
+        assert_eq!(group(crate::started::APPROVAL, true, false), Group::Working);
+        // A question asked ends the turn: it rests, as its lead asks.
+        assert_eq!(group("idle", false, false), Group::Idle);
+        assert_eq!(group("failed", false, false), Group::Failed);
+        assert_eq!(group("stopped", false, false), Group::Idle);
+        assert_eq!(group("failed", false, true), Group::Done);
     }
 
     #[test]
@@ -737,11 +730,11 @@ mod tests {
             },
             Row {
                 latest: "asks: staging or prod?".into(),
-                ..row("zero", "needs you", Group::NeedsYou)
+                ..row("zero", crate::started::APPROVAL, Group::Working)
             },
             Row {
                 profile: "task".into(),
-                pr: "2 reviews · o/r#9".into(),
+                pr: "o/r#9".into(),
                 follows: "▲".into(),
                 background: "↻ 1 automation".into(),
                 place: "tab 2".into(),
@@ -751,34 +744,31 @@ mod tests {
             row("old", "done", Group::Done),
         ];
         // As it opens: each agent, its state and time, the lead first in
-        // its group; what one that needs the person waits for; Idle and
-        // Done folded.
+        // its group; one waiting on the person's approval says so; Idle
+        // and Done folded.
         let quiet = card("calc", &rows, 80, &[], Details::Quiet, &[]);
         assert_eq!(
             text(&quiet),
             [
-                "calc · 3 tasks · 1 need you · 1 working",
+                "calc · 3 tasks · 2 working",
                 "",
-                "Needs you · 1",
-                " ? zero needs you · took 42s",
-                "   └ asks: staging or prod?",
-                "",
-                "Working · 1",
+                "Working · 2",
                 " ● lead working · 42s",
+                " ? zero waits on your approval · 42s",
                 "",
                 "Idle · 1 ▸",
                 "",
                 "Done · 1 ▸",
             ]
         );
-        assert_eq!(quiet.folds, [(9, Group::Idle), (11, Group::Done)]);
-        // Its code reviews show at the right as it opens, the rest not.
+        assert_eq!(quiet.folds, [(6, Group::Idle), (8, Group::Done)]);
+        // Its pull request shows at the right as it opens, the rest not.
         let idle = card("calc", &rows, 80, &[Group::Idle], Details::Quiet, &[]);
         let lines = text(&idle);
-        assert_eq!(lines[10].width(), 80);
-        assert!(lines[10].starts_with(" ✓ equal idle · took 42s "));
-        assert!(lines[10].ends_with(" 2 reviews · o/r#9"), "{}", lines[10]);
-        assert!(!lines[10].contains("tab 2") && !lines[10].contains('▲'));
+        assert_eq!(lines[7].width(), 80);
+        assert!(lines[7].starts_with(" ✓ equal idle · took 42s "));
+        assert!(lines[7].ends_with(" o/r#9"), "{}", lines[7]);
+        assert!(!lines[7].contains("tab 2") && !lines[7].contains('▲'));
         // More: what each tracks at its right.
         let plain = card(
             "calc",
@@ -789,22 +779,20 @@ mod tests {
             &[],
         );
         let lines = text(&plain);
-        // What it waits for shows whether picked or not.
-        assert_eq!(lines[3], " ? zero needs you · took 42s");
-        assert_eq!(lines[4], "   └ asks: staging or prod?");
         assert_eq!(
-            lines[7].trim_end(),
+            lines[3].trim_end(),
             " ● lead working · 42s                                                      tab 1"
         );
-        assert_eq!(lines[7].width(), 80);
-        assert_eq!(lines[9], "Idle · 1 ▾");
+        assert_eq!(lines[3].width(), 80);
+        assert_eq!(lines[4], " ? zero waits on your approval · 42s");
+        assert_eq!(lines[6], "Idle · 1 ▾");
         assert_eq!(
-            lines[10],
-            " ✓ equal idle · took 42s          ▲ · 2 reviews · o/r#9 · ↻ 1 automation · tab 2"
+            lines[7],
+            " ✓ equal idle · took 42s                      ▲ · o/r#9 · ↻ 1 automation · tab 2"
         );
-        assert_eq!(lines[12], "Done · 1 ▸");
-        assert_eq!(lines.len(), 13);
-        assert_eq!(plain.folds, [(9, Group::Idle), (12, Group::Done)]);
+        assert_eq!(lines[9], "Done · 1 ▸");
+        assert_eq!(lines.len(), 10);
+        assert_eq!(plain.folds, [(6, Group::Idle), (9, Group::Done)]);
         // Picked, its model, profile and latest step show under it.
         let picked = card(
             "calc",
@@ -815,10 +803,10 @@ mod tests {
             &[],
         );
         let lines = text(&picked);
-        assert_eq!(lines[11], "   GPT 6.1 Sol · chatgpt · task profile");
-        assert_eq!(lines[12], "   └ Opened the pull request.");
+        assert_eq!(lines[8], "   GPT 6.1 Sol · chatgpt · task profile");
+        assert_eq!(lines[9], "   └ Opened the pull request.");
         let named: Vec<&str> = picked.named.iter().map(|(_, b)| b.as_str()).collect();
-        assert_eq!(named, ["calc.zero", "calc.lead", "calc.equal"]);
+        assert_eq!(named, ["calc.lead", "calc.zero", "calc.equal"]);
         let opened = card("calc", &rows, 80, &[Group::Done], Details::Quiet, &[]);
         let lines = text(&opened);
         assert_eq!(lines[lines.len() - 2], "Done · 1 ▾");
@@ -855,18 +843,18 @@ mod tests {
             helper("tests", "idle", Group::Idle, "fix"),
             // Its helper's helper is the task's too.
             helper("lint", "idle", Group::Idle, "tests"),
-            // One that needs the person is listed with what needs them.
-            helper("ask", "needs you", Group::NeedsYou, "fix"),
+            // One that waits on the person's approval is listed on its own too.
+            helper("ask", crate::started::APPROVAL, Group::Working, "fix"),
         ];
         let shut = card("calc", &rows, 80, &[], Details::Picked(None), &[]);
         let lines = text(&shut);
-        assert_eq!(lines[2], "Needs you · 1");
-        assert_eq!(lines[3], " ? ask needs you · took 42s");
-        assert_eq!(lines[5], "Working · 1");
-        assert_eq!(lines[6], " ● fix working · 42s");
-        assert_eq!(lines[7], "   ▸ 4 helpers, 1 need you, 1 working");
-        assert_eq!(lines.len(), 8);
-        assert_eq!(shut.helpers, [(7, "calc.fix".to_owned())]);
+        assert_eq!(lines[0], "calc · 5 tasks · 3 working");
+        assert_eq!(lines[2], "Working · 2");
+        assert_eq!(lines[3], " ● fix working · 42s");
+        assert_eq!(lines[4], "   ▸ 4 helpers, 2 working");
+        assert_eq!(lines[5], " ? ask waits on your approval · 42s");
+        assert_eq!(lines.len(), 6);
+        assert_eq!(shut.helpers, [(4, "calc.fix".to_owned())]);
         let open = card(
             "calc",
             &rows,
@@ -876,20 +864,20 @@ mod tests {
             &["calc.fix".to_owned()],
         );
         let lines = text(&open);
-        assert_eq!(lines[7], "   ▾ 4 helpers, 1 need you, 1 working");
-        assert_eq!(lines[8], "   ● review working · 42s");
-        assert_eq!(lines[9], "   ✓ tests idle · took 42s");
-        assert_eq!(lines[10], "   ✓ lint idle · took 42s");
-        assert_eq!(lines[11], "   ? ask needs you · took 42s");
+        assert_eq!(lines[4], "   ▾ 4 helpers, 2 working");
+        assert_eq!(lines[5], "   ● review working · 42s");
+        assert_eq!(lines[6], "   ✓ tests idle · took 42s");
+        assert_eq!(lines[7], "   ✓ lint idle · took 42s");
+        assert_eq!(lines[8], "   ? ask waits on your approval · 42s");
         let named: Vec<&str> = open.named.iter().map(|(_, b)| b.as_str()).collect();
         assert_eq!(
             named,
             [
-                "calc.ask",
                 "calc.fix",
                 "calc.review",
                 "calc.tests",
                 "calc.lint",
+                "calc.ask",
                 "calc.ask"
             ]
         );

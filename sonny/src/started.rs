@@ -48,6 +48,10 @@ pub const DONE: &str = "done";
 /// failure, and not a reply either.
 pub const QUIET: &str = "no reply";
 
+/// The state of a task whose call waits on the person's approval: it still works,
+/// stopped on them.
+pub const APPROVAL: &str = "waits on your approval";
+
 /// Whether a task in `state` waits on nothing more of its own.
 pub fn settled(state: &str) -> bool {
     matches!(
@@ -63,7 +67,7 @@ fn sign(state: &str) -> Span<'static> {
         DONE => Span::raw("✓").dim(),
         QUIET => Span::raw("✓").dim(),
         "failed" => Span::raw("✗").fg(Color::Red),
-        "needs you" => Span::raw("?").fg(Color::Yellow).bold(),
+        APPROVAL => Span::raw("?").fg(Color::Yellow).bold(),
         "stopped" | "removed" => Span::raw("■").dim(),
         "starting" => Span::raw("○").dim(),
         _ => Span::raw("●").fg(Color::Cyan),

@@ -17,8 +17,8 @@ pub enum Alert {
     /// The lead finished: the answer to what the person asked.
     LeadDone,
     Failed,
-    /// An agent waits on the person's answer.
-    NeedsYou,
+    /// A call of an agent's waits on the person's approval.
+    Approval,
 }
 
 impl Alert {
@@ -27,7 +27,7 @@ impl Alert {
             Alert::TaskDone => ("SONNY_SOUND_TASK", "Pop"),
             Alert::LeadDone => ("SONNY_SOUND_DONE", "Glass"),
             Alert::Failed => ("SONNY_SOUND_FAILED", "Basso"),
-            Alert::NeedsYou => ("SONNY_SOUND_NEEDS_YOU", "Hero"),
+            Alert::Approval => ("SONNY_SOUND_APPROVAL", "Hero"),
         }
     }
 }
@@ -57,12 +57,12 @@ impl Sounds {
         if !self.on {
             return;
         }
-        // Nothing rings while the person is away: what needs them counts
-        // in the footer for when they are back.
+        // Nothing rings while the person is away: what waits on them
+        // shows in `/status` for when they are back.
         if crate::quiet::arm().is_some() {
             return;
         }
-        if matches!(alert, Alert::NeedsYou | Alert::LeadDone | Alert::Failed) {
+        if matches!(alert, Alert::Approval | Alert::LeadDone | Alert::Failed) {
             let text: String = what
                 .chars()
                 .filter(|c| !c.is_control())
