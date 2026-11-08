@@ -23,10 +23,10 @@ def opens_with_summary(request):
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
 class SummaryAfterTurnTests(ModelFixture):
-    def start(self, tools='echo', delay=1.0):
+    def start(self, tools='echo', delay=1.0, **settings):
         # Every summary takes `delay`; each request's arrival is timed.
         self.model.timeline, self.model.summary_delay = [], delay
-        client = self.client(tools=tools, settings=SETTINGS)
+        client = self.client(tools=tools, settings={**SETTINGS, **settings})
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=tools.split(','), compaction_instructions='Summarize.'))
         return client
@@ -164,3 +164,25 @@ class SummaryAfterTurnTests(ModelFixture):
         compacted = self.compacted(client)
         self.assertEqual(len(compacted), 1)
         self.assertNotIn('after_turn', compacted[0]['data']['request'])
+
+    def test_events_a_summary_writes_after_its_turn_was_pruned_are_pruned_later(self):
+        # Kept to one turn: the next turn ends, and its retention prunes the
+        # turn whose summary still runs; that summary then writes the
+        # turn's usage and `compacted` events.
+        client = self.start(delay=1.5, keep_turns=1)
+        ended = self.past_threshold(client)
+        self.turn(client, 2, 'small')
+        landed = client.summarized('Bob', timeout=10)
+        self.assertEqual(landed['turn'], ended['turn'])
+        late = lambda: [e for e in self.events(client) if e.get('turn') == ended['turn']]
+        self.assertTrue(late())
+        # The next turn's retention finds them.
+        self.turn(client, 3, 'small')
+        self.assertEqual(late(), [])
+
+    def events(self, client):
+        events, after = [], 0
+        while page := client.request('events', bot='Bob', after=after, limit=256)['result']['events']:
+            events += page
+            after = page[-1]['cursor']
+        return events

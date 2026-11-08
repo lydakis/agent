@@ -1520,7 +1520,10 @@ impl Turn {
             .store
             .read("inspect", move |db| db.inspect(&bot))
             .await
-            .map(|bot| (bot.compaction, bot.summary_setup()));
+            .map(|bot| bot.compaction);
+        // What the summary is written under: the turn's record, which a
+        // change made since does not reach.
+        let setup = record.summary_setup();
         let mut accounting = Accounting {
             beside: true,
             ..Accounting::default()
@@ -1529,7 +1532,7 @@ impl Turn {
         let mut rounds = start;
         let (base, result) = match base {
             Err(error) => (None, Err(error)),
-            Ok((base, setup)) => (
+            Ok(base) => (
                 Some(AfterTurn {
                     turn: self.turn,
                     base,
@@ -1692,13 +1695,19 @@ impl Turn {
                 _ => None,
             }
         };
+        // Installed first: the install job is what bills a summary that
+        // was written, so its spend is in the store once it is answered.
+        let installed = match queued {
+            Some(queued) => matches!(self.installed(queued).await?, Compaction::Done),
+            None => false,
+        };
         // What it spent is on the bot as the store keeps it, and on this
         // turn's record unless the record was read before it was spent:
         // that part counts now, toward the bot's caps and not this turn's.
         let bot = self.bot.clone();
         let unseen = self
             .store
-            .read("inspect", move |db| db.inspect(&bot))
+            .op("inspect", move |db| db.inspect(&bot))
             .await?
             .spent()
             .minus(record.spent());
@@ -1706,10 +1715,7 @@ impl Turn {
         if let Some(cap) = &mut record.turn_budget {
             cap.until = cap.until.saturating_add(unseen.of(cap.counts));
         }
-        match queued {
-            Some(queued) => Ok(matches!(self.installed(queued).await?, Compaction::Done)),
-            None => Ok(false),
-        }
+        Ok(installed)
     }
 
     /// The summary this turn planned as it ended, started once its end is

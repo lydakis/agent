@@ -5265,6 +5265,9 @@ impl Database {
             tx.execute("UPDATE turns SET view_sent=0 WHERE id=?", [running])?;
         }
         let cursor = event(&tx, name, billed, "compacted", data.clone())?;
+        if let Some(ended) = ended {
+            retain_late(&tx, ended.turn, name)?;
+        }
         tx.commit()?;
         Ok(entry(cursor, name, billed, "compacted", data))
     }
@@ -7580,7 +7583,10 @@ impl Database {
     /// A retry of a summary made after `turn` ended, as that turn's event.
     pub fn retried_after(&mut self, turn: i64, data: Value) -> Result<()> {
         let bot = self.ended(turn)?;
-        event(&self.conn, &bot.name, Some(turn), "retry", data)?;
+        let tx = self.conn.savepoint()?;
+        event(&tx, &bot.name, Some(turn), "retry", data)?;
+        retain_late(&tx, turn, &bot.name)?;
+        tx.commit()?;
         Ok(())
     }
     /// Charge an unsuccessful provider call without accepting its output.
@@ -7607,15 +7613,24 @@ impl Database {
     /// Charge a summarizer response without adding it to the transcript.
     pub fn compaction_usage(&mut self, turn: i64, usage: Option<&Usage>) -> Result<()> {
         let bot = self.active(turn)?;
-        self.bill_summary(&bot, turn, usage)
+        self.bill_summary(&bot, turn, usage, false)
     }
     /// Charge a summarizer response made after `turn` ended to that turn.
     pub fn compaction_usage_after(&mut self, turn: i64, usage: Option<&Usage>) -> Result<()> {
         let bot = self.ended(turn)?;
-        self.bill_summary(&bot, turn, usage)
+        self.bill_summary(&bot, turn, usage, true)
     }
-    fn bill_summary(&mut self, bot: &Bot, turn: i64, usage: Option<&Usage>) -> Result<()> {
+    fn bill_summary(
+        &mut self,
+        bot: &Bot,
+        turn: i64,
+        usage: Option<&Usage>,
+        late: bool,
+    ) -> Result<()> {
         let tx = self.conn.savepoint()?;
+        if late {
+            retain_late(&tx, turn, &bot.name)?;
+        }
         if let Some(usage) = usage {
             record_usage_for(
                 &tx,
@@ -15407,6 +15422,15 @@ fn migrate_unanswered_tools(conn: &Connection, bot: &str, turn: i64) -> Result<(
         "INSERT OR IGNORE INTO retained_turns(turn,bot) VALUES (?,?)",
         params![turn, bot],
     )?;
+    Ok(())
+}
+
+/// Events a summary started as `turn` ended writes after it: retention may
+/// have pruned the turn meanwhile, and prunes find a turn's events only
+/// through its entry here, so the entry comes back with them.
+fn retain_late(conn: &rusqlite::Connection, turn: i64, bot: &str) -> Result<()> {
+    conn.prepare_cached("INSERT OR IGNORE INTO retained_turns(turn,bot) VALUES (?,?)")?
+        .execute(params![turn, bot])?;
     Ok(())
 }
 
