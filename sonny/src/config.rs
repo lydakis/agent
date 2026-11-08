@@ -478,8 +478,13 @@ fn quiet_gone(text: &str) -> Result<Option<String>, ()> {
             list = !trimmed.contains(']');
             continue;
         }
-        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
-            table = trimmed.trim_matches(['[', ']']).trim().to_owned();
+        // A heading, `[sonny]`, a comment after it or not.
+        if let Some(heading) = trimmed
+            .strip_prefix('[')
+            .filter(|rest| !rest.starts_with('['))
+            && let Some((name, _)) = heading.split_once(']')
+        {
+            table = name.trim().to_owned();
         }
         let set = trimmed.split_once('=');
         if let Some((key, value)) = set
@@ -870,6 +875,11 @@ mod tests {
         // A list over several lines goes whole.
         let text = "[sonny]\nhours = [\n  \"Mon-Fri 09:00-19:00\",\n  \"Sat 10:00-12:00\",\n]\nchime = true\n";
         assert_eq!(quiet_gone(text), Ok(Some("[sonny]\nchime = true\n".into())));
+        // A heading with a comment after it is the table all the same.
+        assert_eq!(
+            quiet_gone("[sonny] # mine\nhours = [\"Mon 09:00-17:00\"]\nchime = true\n"),
+            Ok(Some("[sonny] # mine\nchime = true\n".into()))
+        );
         // Nothing to take away, here or in another table.
         assert_eq!(quiet_gone("[sonny]\nchime = true\n"), Ok(None));
         assert_eq!(quiet_gone("[daemon]\ndepth = 2\n"), Ok(None));
