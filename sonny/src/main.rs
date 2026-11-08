@@ -24,6 +24,7 @@ mod calls;
 mod cmux;
 mod commons;
 mod config;
+mod context;
 mod declared;
 mod desktop;
 mod diff;
@@ -2242,6 +2243,7 @@ async fn run() -> Result<(), String> {
     let mut app = App::new(client, &name, &bot, options.clone());
     app.context = caught.context;
     app.window = caught.window;
+    app.compacted = caught.compacted.clone();
     app.paused = caught.paused(&app.client);
     app.turn_began().await;
     if options.side.is_some() {
@@ -2914,6 +2916,7 @@ async fn caught_up(events: &mut Events) -> Caught {
             match event["event"].as_str() {
                 Some("paused") => caught.pause = Some(event["pause"].clone()),
                 Some("resumed") => caught.pause = Some(Value::Null),
+                Some("compacted") => caught.compacted = Some(event["data"].clone()),
                 _ => {}
             }
         }
@@ -2929,6 +2932,7 @@ async fn caught_up(events: &mut Events) -> Caught {
 struct Caught {
     context: Option<u64>,
     window: Option<u64>,
+    compacted: Option<Value>,
     pause: Option<Value>,
 }
 
@@ -3410,7 +3414,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
 /// open `/background`, and `/settings` opens `/config`, unlisted.
-const COMMANDS: [(&str, &str); 29] = [
+const COMMANDS: [(&str, &str); 30] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -3452,6 +3456,7 @@ const COMMANDS: [(&str, &str); 29] = [
         "/audit",
         "Show every tool call the agents made: where it ran, who allowed it",
     ),
+    ("/context", "Show what fills the agent's context"),
     ("/pause", "Stop every agent until /resume, saying why"),
     ("/resume", "Let the agents go on after a pause"),
     ("/mcp", "List the MCP servers agents' scripts call"),
@@ -3660,6 +3665,9 @@ struct App {
     context: Option<u64>,
     /// The model's context window, as the daemon says it with each round.
     window: Option<u64>,
+    /// The last `compacted` event's data, its summary and room (#718),
+    /// for `/context`.
+    compacted: Option<Value>,
     input: prompt::Prompt,
     /// The prompts sent before, which Up and Down bring back.
     recall: recall::Recall<Vec<Option<attach::Picture>>>,
@@ -5338,6 +5346,7 @@ impl App {
             speed: speed(record),
             context: None,
             window: None,
+            compacted: None,
             input: prompt::Prompt::default(),
             recall: recall::Recall::default(),
             pending: Vec::new(),
@@ -6648,6 +6657,7 @@ impl App {
             self.notice = None;
             self.context = caught.context.or(self.context);
             self.window = caught.window.or(self.window);
+            self.compacted = caught.compacted.clone().or(self.compacted.take());
             self.history_after(self.seen_node.max(self.options.side.unwrap_or(0)))
                 .await;
             self.unstage_landed().await;
@@ -9480,7 +9490,10 @@ impl App {
                     running.phase = "Compacting".into();
                 }
             }
-            "compacted" => self.notice = Some("compacted the conversation".into()),
+            "compacted" => {
+                self.compacted = Some(data.clone());
+                self.notice = Some("compacted the conversation".into());
+            }
             "compaction_failed" => {
                 self.notice = Some(format!(
                     "compaction failed: {}",
@@ -9981,6 +9994,44 @@ impl App {
             more: false,
         });
         self.open_pane(pane::Pane::card("background", STATUS_KEYS));
+    }
+
+    /// What fills this agent's context, read-only: `/context` in the
+    /// pane, as `/mcp` is, until Esc. Its record is read once, now.
+    async fn context_card(&mut self) {
+        let record = match self
+            .client
+            .request("inspect", json!({"bot": self.bot}))
+            .await
+        {
+            Ok(record) => record,
+            Err(error) => {
+                self.notice = Some(format!("could not read {}: {error}", self.bot));
+                return;
+            }
+        };
+        let mut parts = context::Parts::from_record(&record);
+        (parts.used, parts.window) = (self.context, self.window);
+        // The compaction the record names: the one this window saw, or,
+        // in a fork (a side chat too), its source's, made before the fork
+        // and so in no event of this agent's.
+        parts.compacted = match record["compaction"].as_i64() {
+            None => None,
+            Some(version)
+                if self
+                    .compacted
+                    .as_ref()
+                    .is_some_and(|data| data["version"].as_i64() == Some(version)) =>
+            {
+                self.compacted.clone()
+            }
+            Some(version) => compaction_named(&self.options.socket, version).await,
+        };
+        let lines = context::card(&self.bot, &parts);
+        self.watch = None;
+        let mut pane = pane::Pane::card("context", "esc close");
+        pane.set_card(lines, "esc close");
+        self.open_pane(pane);
     }
 
     /// The tokens the project's agents spent, or every agent's, over
@@ -12415,6 +12466,11 @@ impl App {
             } else {
                 self.background();
             }
+            return;
+        }
+        if prompt == "/context" {
+            self.input.clear();
+            self.context_card().await;
             return;
         }
         if prompt == "/mcp" {
@@ -15816,6 +15872,29 @@ fn short(bot: &str, project: &str, lead: &str) -> String {
 /// A staged message's rows by its turn, the width and the mark it
 /// waits with ([`App::staged_drawn`]).
 type StagedDrawn = ((i64, usize, Option<char>), Vec<Line<'static>>);
+
+/// The last `compacted` event's data for compaction `version`, of any
+/// agent: a fork's compaction is its source's, recorded under the source.
+/// On a connection of its own, closed once read, as `/sky`'s past is; the
+/// daemon reads only `compacted` events for it, by their own index.
+async fn compaction_named(socket: &Path, version: i64) -> Option<Value> {
+    let (client, mut events) = Client::connect(socket).await.ok()?;
+    let follow = json!({"bot": "*", "after": 0, "kinds": ["compacted"]});
+    client.request("follow", follow).await.ok()?;
+    let mut found = None;
+    while let Some(event) = events.recv().await {
+        match event["event"].as_str() {
+            // One merged into another at the same head says so again.
+            Some("compacted") if event["data"]["version"].as_i64() == Some(version) => {
+                found = Some(event["data"].clone());
+            }
+            Some("follow_live") => return found,
+            Some("lagged" | "follow_lagged") => return None,
+            _ => {}
+        }
+    }
+    None
+}
 
 /// A message sent and not landed, dim, drawn as it will read once it
 /// does, its pictures found in `folder` as the landed one's are: an answer under the question it answers, a command by name,
@@ -21772,6 +21851,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_reads_the_agent_s_record_and_keeps_its_last_compaction() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let client = daemon_answering(move |request| {
+            seen.lock().unwrap().push(request.clone());
+            match request["op"].as_str() {
+                Some("inspect") => {
+                    json!({"name": "b", "instructions": "be brief", "tools": ["shell"],
+                    "declared": [], "compaction": 7})
+                }
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut app = app(client);
+        let compacted = json!({"event": "compacted", "bot": "b", "turn": 3,
+            "data": {"version": 7, "summary_bytes": 400, "covered_turns": [1, 3], "reclaimed_bytes": 9000}});
+        app.daemon(compacted).await;
+        assert_eq!(app.compacted.as_ref().unwrap()["summary_bytes"], 400);
+        app.input.set("/context");
+        app.submit().await;
+        let inspect = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r["op"] == "inspect")
+            .cloned();
+        assert_eq!(inspect.unwrap()["bot"], "b");
+        assert_eq!(app.pane.as_ref().map(|pane| pane.title()), Some("context"));
+        let card = app.pane.as_ref().unwrap().card_text();
+        assert!(
+            card.iter().any(|row| row.contains("turns 1 to 3")),
+            "{card:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fork_s_compaction_is_read_from_its_source_s_events() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("sonny-compacted-{}", unique("t")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (read, mut write) = stream.into_split();
+                let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+                write
+                    .write_all(format!("{ready}\n").as_bytes())
+                    .await
+                    .unwrap();
+                let mut lines = BufReader::new(read).lines();
+                let Ok(Some(line)) = lines.next_line().await else {
+                    continue;
+                };
+                let asked: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(asked["kinds"], json!(["compacted"]));
+                let mut out = vec![json!({"id": asked["id"], "result": {"following": "*"}})];
+                let compacted = |version: i64, bytes: u64| {
+                    json!({"event": "compacted", "bot": "shop.lead",
+                        "data": {"version": version, "summary_bytes": bytes}})
+                };
+                // Merged at the same head, it says so again: the last counts.
+                out.extend([compacted(5, 50), compacted(9, 100), compacted(9, 200)]);
+                out.push(json!({"event": "follow_live", "bot": "*"}));
+                for event in out {
+                    write
+                        .write_all(format!("{event}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                while let Ok(Some(_)) = lines.next_line().await {}
+            }
+        });
+        let found = compaction_named(&socket, 9).await.unwrap();
+        assert_eq!(found["summary_bytes"], 200);
+        assert!(compaction_named(&socket, 4).await.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn held_words_survive_a_dropped_connection_and_a_narrower_pane() {
         let client = daemon_answering(|_| json!({})).await;
         let mut app = app(client);
@@ -23570,7 +23733,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         app.input.set("/co");
-        assert_eq!(first(&app), ["/compact", "/commons", "/config", "/copy"]);
+        assert_eq!(first(&app), ["/compact", "/commons", "/context", "/config"]);
         let keys = |app: &App| menu_keys(&app.menu(), app.pick, &app.input);
         assert_eq!(
             keys(&app),
