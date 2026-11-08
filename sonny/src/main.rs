@@ -556,14 +556,7 @@ async fn read_status(
     let store = agent_client::socket::canonical_store(options_store)
         .unwrap_or_else(|_| options_store.to_path_buf());
     // Each source's icon, as the settings give it now.
-    let icons: HashMap<String, String> = agent_client::config::load()
-        .map(|config| {
-            (config.sonny.sources.into_iter())
-                .chain([config.sonny.commons_source])
-                .filter_map(|source| Some((source.name, source.icon?)))
-                .collect()
-        })
-        .unwrap_or_default();
+    let icons = background::source_icons();
     let mut rows = Vec::new();
     // Each lead's project file read once a refresh; a task's profile
     // is the one noted when it started.

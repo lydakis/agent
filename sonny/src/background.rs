@@ -447,15 +447,48 @@ pub fn count(items: &[Item], bot: &str) -> usize {
         .count()
 }
 
+/// Each source's icon, as `[sonny.sources.NAME] icon` gives it, the
+/// commons' too: the settings read again only once they change, so every
+/// surface that names a source can mark it as `/status` does.
+pub fn source_icons() -> HashMap<String, String> {
+    static KEPT: kept::Slot<HashMap<String, String>> = std::sync::Mutex::new(None);
+    let load = || {
+        let icons = (agent_client::config::load().map(|config| {
+            (config.sonny.sources.into_iter())
+                .chain([config.sonny.commons_source])
+                .filter_map(|source| Some((source.name, source.icon?)))
+                .collect()
+        }))
+        .unwrap_or_default();
+        (icons, None)
+    };
+    match agent_client::config::path() {
+        Some(path) => kept::read(&KEPT, "icons", vec![path], load),
+        None => load().0,
+    }
+}
+
+/// The icons a follow is shown by, each once: its sources' when every
+/// one has an icon, else none.
+fn icons_of(item: &Item, icons: &HashMap<String, String>) -> Option<String> {
+    if item.kind != Kind::Subscription || item.sources.is_empty() {
+        return None;
+    }
+    let mut said = String::new();
+    for source in &item.sources {
+        let icon = icons.get(source)?;
+        if !said.contains(icon.as_str()) {
+            said.push_str(icon);
+        }
+    }
+    Some(said)
+}
+
 /// What `/status` says of `bot`'s: `↻ 2 automations, 1 follow`, or
 /// nothing.
 pub fn fact(items: &[Item], bot: &str, icons: &HashMap<String, String>) -> String {
     // A follow whose every source has its icon is shown by those.
-    let shown = |i: &Item| {
-        i.kind == Kind::Subscription
-            && !i.sources.is_empty()
-            && i.sources.iter().all(|s| icons.contains_key(s))
-    };
+    let shown = |i: &Item| icons_of(i, icons).is_some();
     let of = |kind: Kind| {
         items
             .iter()
@@ -529,6 +562,8 @@ pub struct View {
     /// asked the daemon.
     turns: HashMap<String, Value>,
     lookout: String,
+    /// Each source's icon, which marks the follows of it.
+    icons: HashMap<String, String>,
     selected: usize,
     /// The item the first `d` picked, by kind, agent and name.
     confirm: Option<(Kind, String, String)>,
@@ -558,6 +593,7 @@ impl View {
             items: Vec::new(),
             turns,
             lookout: String::new(),
+            icons: HashMap::new(),
             selected: 0,
             confirm: None,
             notice: None,
@@ -587,6 +623,7 @@ impl View {
         }
         self.lookout =
             crate::tool_host::with_status(lookout::status(&self.store, &self.bot), &self.store);
+        self.icons = source_icons();
     }
 
     /// How the turns ended, as the window has since asked the daemon.
@@ -751,7 +788,12 @@ impl View {
         let mark = match item.kind {
             _ if item.failed.is_some() => Span::raw("✗ ").fg(Color::Red),
             Kind::Trigger => Span::raw("↻ ").dim(),
-            Kind::Subscription => Span::raw("◎ ").dim(),
+            // A follow of sources with icons is marked by them, as its
+            // agent's `/status` row is.
+            Kind::Subscription => match icons_of(item, &self.icons) {
+                Some(icons) => Span::raw(format!("{icons} ")).dim(),
+                None => Span::raw("◎ ").dim(),
+            },
             Kind::Server | Kind::Setup => Span::raw("  "),
         };
         let name = Span::raw(item.name.clone()).bold();
@@ -948,6 +990,39 @@ mod tests {
         // One with a source that has none is still counted.
         assert_eq!(fact(&items, "calc.lead", &icons), "↻ 1 follow");
         assert_eq!(super::icons(&items, "calc.fix", &icons), "");
+        // `/background` marks each follow as `/status` shows it: by its
+        // sources' icons, or the follow mark when one has none.
+        let view = View {
+            scope: Scope {
+                project: "calc".into(),
+                lead: "calc.lead".into(),
+                glob: "calc.*".into(),
+            },
+            store: std::env::temp_dir().join("background-icons.sqlite"),
+            store_id: None,
+            bot: "calc.lead".into(),
+            items: items.to_vec(),
+            turns: HashMap::new(),
+            lookout: String::new(),
+            icons,
+            selected: 0,
+            confirm: None,
+            notice: None,
+        };
+        let rows: Vec<String> = (view.card(100).0.iter())
+            .map(|l| l.to_string())
+            .filter(|l| l.contains(" for lead"))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                // The picked row, padded as the pick draws it.
+                "  ◎ tasks for lead ",
+                "  ▲ prs for lead",
+                "  ◎ ci for lead",
+                "  # chat for lead"
+            ]
+        );
     }
 
     #[test]
@@ -1230,6 +1305,7 @@ mod tests {
             ],
             turns: HashMap::new(),
             lookout: String::new(),
+            icons: HashMap::new(),
             selected: 1,
             confirm: None,
             notice: None,
@@ -1286,6 +1362,7 @@ mod tests {
             ],
             turns: HashMap::new(),
             lookout: "Lookout · not running".into(),
+            icons: HashMap::new(),
             selected: 0,
             confirm: None,
             notice: None,

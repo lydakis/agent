@@ -95,7 +95,7 @@
 //! digest = "15m"                # a subscriber hears it at most this often; unset, as it comes
 //! steer = { from = ["boss"] }   # what cuts into a busy subscriber's turn, as a filter is written
 //! watch = ["~/bin/slack-poll"]  # files whose edit starts it again on them; unset, none
-//! icon = "▲"                    # one character /status shows on the row of each agent that follows it
+//! icon = "▲"                    # one character marking it wherever Sonny names it: /status, /background, news rows
 //! wants = "channel"             # a field of its events: the values subscriptions' filters name are written for the command
 //! [sonny.sources.commons]       # Sonny's own source: the commons threads an agent posted in
 //! digest = "15m"                # the default; 0 at once. Takes digest and steer alone
@@ -903,8 +903,9 @@ pub struct Source {
     /// Files whose change starts it again on them, as a service manager
     /// restarts a unit on its new binary: each from `/` or `~/`.
     pub watch: Vec<String>,
-    /// One character cell `/status` shows on the row of each agent that
-    /// follows it.
+    /// One character cell that marks it wherever Sonny names it: on the
+    /// `/status` row of each agent that follows it, its follows in
+    /// `/background`, and the "From your sources" row.
     pub icon: Option<String>,
     /// A field of its events whose values subscriptions' filters name,
     /// as `id` or `meta.repo`: the lookout writes those values to a file
