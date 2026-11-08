@@ -8056,3 +8056,38 @@ The same screen on a 4-CPU Linux container, release builds of 3b3a00f and
 - **Per idle bot moves both ways.** It reads -8.8% on another local round, against +19.2% and +11.3% here, at 1.3 to 1.75 KiB. Nothing new is held per idle bot: the map of summaries running has an entry only while one runs.
 - **A false RSS reading.** A first local footprint and lifecycle run showed head's RSS 2.8 MiB higher. All of the gap was in file-backed pages of the head binary (13.8 MiB resident against 11.1 MiB), and its anonymous memory and heap matched main's to the KiB (1644 KiB each). The head binary had just been built, so more of it sat in the page cache. Fresh copies of the two binaries gave 15.9 and 15.8 MiB idle, and the footprint and lifecycle rows above are from those copies.
 - **CPU and latency** moved both ways within the runner's noise. Under the gate's rule, nothing warned.
+
+## A turn's start parses nothing it already has
+
+Found while benchmarking after Wave 3 (2026-11-08). Callgrind on the
+five-harness screen's c32-h65536 case (32 agents, 3 turns each, 64 KiB of
+history, synthetic model) showed where the store thread's instructions went
+on main 0b35e4c (daemon unchanged since deaff2c):
+
+- **Each prompt's opening was parsed back out of its item by SQLite.** The
+  `openings` insert ran `json_extract` over the whole 64 KiB item, twice, to
+  get the first part's text and its length: 2.4 million instructions a turn,
+  19% of the daemon's instructions in this case. That first part is the
+  prompt's own words, which the store holds as it writes the item, so the
+  opening and its length now come from them. An item rewritten in place (a
+  declined note) still has its opening read back from the item.
+- **The bot row's 52-column `SELECT` was prepared on every read.** `inspect`
+  and `inspect_id` built the statement with `format!` and ran it uncached:
+  about 265,000 instructions to parse each time, 5 reads a turn, 11% of the
+  instructions. #831's six status columns made each parse 17% dearer. Both
+  reads now use the statement cache.
+- The per-turn `UPDATE`s of a turn's start and model round, and the
+  checkpoint insert, were prepared on each run too; they are cached now.
+
+| Measure, c32-h65536 | main | head | Change |
+| --- | ---: | ---: | ---: |
+| daemon instructions (callgrind, one run) | 1,218 M | 766 M | -37% |
+| store thread instructions | 829 M | 377 M | -55% |
+| daemon CPU, s (16 runs each, interleaved) | 0.305 | 0.245 | -20% |
+| first chunk p50, ms | 67 | 57 | -15% |
+| turn p99, ms | 590 | 576 | -2% |
+| RSS, MiB | 26.2 | 26.3 | 0% |
+
+The rest of a turn's start is now writing the item (`insert_node`) and
+building it (`prompt_item`). Openings read the same: the store contract
+tests that read them back pass unchanged.
