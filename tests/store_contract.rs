@@ -403,7 +403,7 @@ fn unfinished_tools_are_answered_truthfully_without_disabling_the_bot() {
                 None,
             )
             .unwrap();
-            db.tool_start(turn, &calls[0]).unwrap();
+            db.tool_start(turn, &calls[0], false, false).unwrap();
             let events = db.finish(turn, Some(&Error::new(error))).unwrap();
             assert_eq!(events.len(), 3);
             assert_eq!(events[0]["data"]["outcome_unknown"], true);
@@ -522,7 +522,7 @@ fn restart_repairs_unanswered_tools_once_including_previously_blocked_bots() {
                     None,
                 )
                 .unwrap();
-                db.tool_start(turn, &call).unwrap();
+                db.tool_start(turn, &call, false, false).unwrap();
                 if id == "done" {
                     db.tool_finish(turn, id, &result("written")).unwrap();
                 }
@@ -597,11 +597,11 @@ fn tool_results_and_cursor_events_commit_together() {
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
     assert!(db.tool_finish(turn, "c1", &result("too early")).is_err());
-    let started = db.tool_start(turn, &call).unwrap();
+    let started = db.tool_start(turn, &call, false, false).unwrap();
     assert_eq!(started["event"], "tool_started");
     assert!(started["cursor"].as_i64().is_some());
     db.tool_finish(turn, "c1", &result("hi")).unwrap();
-    assert!(db.tool_start(turn, &call).is_err());
+    assert!(db.tool_start(turn, &call, false, false).is_err());
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     assert_eq!(
         db.finish(turn, None).unwrap().last().unwrap()["data"]["status"],
@@ -665,6 +665,7 @@ fn allow(db: &mut Database, turn: i64, call_id: &str) -> Result<Answered> {
         unreviewed: false,
         reason: None,
         by: Some("test"),
+        leased: false,
     })
 }
 
@@ -703,7 +704,7 @@ fn late_verdicts_are_refused_and_listings_find_each_calls_own_item() {
         .unwrap()
         .as_millis() as u64;
     assert!(matches!(
-        db.approval_start(turn, &s1, now_ms).unwrap(),
+        db.approval_start(turn, &s1, false, now_ms).unwrap(),
         Gated::Expired
     ));
 }
@@ -911,7 +912,7 @@ fn a_sandboxed_bot_waits_for_a_verdict_only_on_an_escape() {
     assert_eq!(gated, ["up", "climbs", "outside"]);
     // What runs confined was never announced; each escape was.
     for call in &calls {
-        let announced = db.approval_start(turn, call, 0);
+        let announced = db.approval_start(turn, call, false, 0);
         match gated.contains(&call.call_id.as_str()) {
             true => assert!(
                 matches!(announced, Ok(Gated::Pending { .. })),
@@ -954,10 +955,11 @@ fn an_expiry_that_came_first_beats_a_later_denial() {
         unreviewed: false,
         reason: Some("no"),
         by: Some("test"),
+        leased: false,
     })
     .unwrap();
     assert!(matches!(
-        db.approval_start(turn, &call, u64::MAX).unwrap(),
+        db.approval_start(turn, &call, false, u64::MAX).unwrap(),
         Gated::Expired
     ));
 }
@@ -993,6 +995,7 @@ fn a_deny_decides_the_call_and_later_answers_are_refused() {
             unreviewed: false,
             reason,
             by: Some("test"),
+            leased: false,
         })
     };
     let denied = answer(&mut db, "manual", false, Some("no")).unwrap();
@@ -1005,7 +1008,7 @@ fn a_deny_decides_the_call_and_later_answers_are_refused() {
         assert_eq!(late.facts.unwrap()["decision"], "deny");
     }
     assert!(matches!(
-        db.approval_start(turn, &call, 0).unwrap(),
+        db.approval_start(turn, &call, false, 0).unwrap(),
         Gated::Denied
     ));
 }
@@ -1145,7 +1148,7 @@ fn a_turn_parks_on_the_load_gate_before_its_command_and_wakes_to_run_it() {
     assert_eq!(waiting.pending.len(), 2);
     assert!(db.load_parked().unwrap().is_empty());
     // It runs s1 as any call: it had not started.
-    db.tool_start(turn, &round[0]).unwrap();
+    db.tool_start(turn, &round[0], false, false).unwrap();
 }
 
 #[test]
@@ -1157,7 +1160,7 @@ fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
     let Gated::Pending {
         expires_ms: Some(lapse),
         ..
-    } = db.approval_start(turn, s1, epoch_now()).unwrap()
+    } = db.approval_start(turn, s1, false, epoch_now()).unwrap()
     else {
         panic!("the first call waits until the second call's gate lapses")
     };
@@ -1177,7 +1180,7 @@ fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
     assert!(matches!(db.wake("Bob", turn, true).unwrap(), Wake::Resume));
     db.resume(turn).unwrap();
     assert!(matches!(
-        db.approval_start(turn, s1, epoch_now()).unwrap(),
+        db.approval_start(turn, s1, false, epoch_now()).unwrap(),
         Gated::Lapsed
     ));
 }
@@ -1187,7 +1190,7 @@ fn a_failure_after_a_later_call_lapsed_keeps_its_request() {
     let mut db = db();
     let (turn, round) = lapsing_round(&mut db, &[("read", "r1"), ("write", "w1")]);
     // The ungated call runs past the later call's lapse, then fails.
-    db.tool_start(turn, &round[0]).unwrap();
+    db.tool_start(turn, &round[0], false, false).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(60));
     let failed = Outcome {
         failed: true,
@@ -1199,7 +1202,8 @@ fn a_failure_after_a_later_call_lapsed_keeps_its_request() {
     let page = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
     assert_eq!(page["approvals"][0]["request"], 1);
     assert!(matches!(
-        db.approval_start(turn, &round[1], epoch_now()).unwrap(),
+        db.approval_start(turn, &round[1], false, epoch_now())
+            .unwrap(),
         Gated::Expired
     ));
 }
@@ -1225,6 +1229,7 @@ fn every_parked_turns_lapse_is_read_at_once() {
         unreviewed: false,
         reason: None,
         by: Some("test"),
+        leased: false,
     })
     .unwrap();
     assert_eq!(db.next_lapse(turn).unwrap(), None);
@@ -1246,17 +1251,18 @@ fn no_call_starts_once_a_later_call_lapsed() {
         unreviewed: false,
         reason: None,
         by: Some("test"),
+        leased: false,
     })
     .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(60));
     // Neither an ungated call nor an allowed one starts after the lapse.
-    let started = db.tool_start(turn, r1);
+    let started = db.tool_start(turn, r1, false, false);
     assert_eq!(
         started.err().map(|e| e.to_string()).as_deref(),
         Some("approval_expired: a later call's gate lapsed first")
     );
     assert!(matches!(
-        db.approval_start(turn, s1, epoch_now()).unwrap(),
+        db.approval_start(turn, s1, false, epoch_now()).unwrap(),
         Gated::Lapsed
     ));
 }
@@ -1291,10 +1297,12 @@ fn a_tag_listing_reads_only_that_tags_calls() {
         unreviewed: false,
         reason: None,
         by: Some("test"),
+        leased: false,
     })
     .unwrap();
     assert!(matches!(
-        db.approval_start(turn, &round[0], epoch_now()).unwrap(),
+        db.approval_start(turn, &round[0], false, epoch_now())
+            .unwrap(),
         Gated::Started
     ));
     assert_eq!(listed(&db, "slow"), ["s2"]);
@@ -1362,6 +1370,7 @@ fn a_tag_listing_reads_no_call_that_tag_answered() {
                 unreviewed: false,
                 reason: None,
                 by: Some("test"),
+                leased: false,
             })
             .unwrap();
         }
@@ -1486,7 +1495,7 @@ fn a_call_announced_again_is_found_by_a_listing_already_past_it() {
     let after = page["next_after"].as_i64().unwrap();
     // Then s1 fails, and s2 needs a verdict again.
     assert!(matches!(
-        db.approval_start(turn, &calls[0], 0).unwrap(),
+        db.approval_start(turn, &calls[0], false, 0).unwrap(),
         Gated::Started
     ));
     let failed = Outcome {
@@ -1538,7 +1547,7 @@ fn held_verdicts_follow_the_group_that_holds_them() {
     assert!(allow(&mut db, turn, "s1").unwrap().notify.is_some());
     db.abandon_group().unwrap();
     assert!(matches!(
-        db.approval_start(turn, &call, 0).unwrap(),
+        db.approval_start(turn, &call, false, 0).unwrap(),
         Gated::Pending { .. }
     ));
     // One that committed survives a later group that consumed it and failed.
@@ -1547,12 +1556,12 @@ fn held_verdicts_follow_the_group_that_holds_them() {
     db.commit_group().unwrap();
     db.begin_group().unwrap();
     assert!(matches!(
-        db.approval_start(turn, &call, 0).unwrap(),
+        db.approval_start(turn, &call, false, 0).unwrap(),
         Gated::Started
     ));
     db.abandon_group().unwrap();
     assert!(matches!(
-        db.approval_start(turn, &call, 0).unwrap(),
+        db.approval_start(turn, &call, false, 0).unwrap(),
         Gated::Started
     ));
 }
@@ -1581,7 +1590,7 @@ fn the_announced_call_count_follows_the_rows() {
     assert_eq!((db.approval_requests(), rows()), (3, 3));
     allow(&mut db, turn, "s1").unwrap();
     assert!(matches!(
-        db.approval_start(turn, &round[0], 0).unwrap(),
+        db.approval_start(turn, &round[0], false, 0).unwrap(),
         Gated::Started
     ));
     assert_eq!((db.approval_requests(), rows()), (2, 2));
@@ -1589,7 +1598,7 @@ fn the_announced_call_count_follows_the_rows() {
     db.begin_group().unwrap();
     allow(&mut db, turn, "s2").unwrap();
     assert!(matches!(
-        db.approval_start(turn, &round[1], 0).unwrap(),
+        db.approval_start(turn, &round[1], false, 0).unwrap(),
         Gated::Started
     ));
     assert_eq!(db.approval_requests(), 1);
@@ -1607,10 +1616,11 @@ fn the_announced_call_count_follows_the_rows() {
         unreviewed: false,
         reason: Some("no"),
         by: Some("test"),
+        leased: false,
     })
     .unwrap();
     assert!(matches!(
-        db.approval_start(turn, &round[1], 0).unwrap(),
+        db.approval_start(turn, &round[1], false, 0).unwrap(),
         Gated::Denied
     ));
     assert_eq!((db.approval_requests(), rows()), (1, 1));
@@ -1697,10 +1707,11 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
         unreviewed: false,
         reason: Some("not that"),
         by: Some("test"),
+        leased: false,
     })
     .unwrap();
     assert!(matches!(
-        db.approval_start(turn, &round[0], 0).unwrap(),
+        db.approval_start(turn, &round[0], false, 0).unwrap(),
         Gated::Denied
     ));
     let served = served_since(&mut db, &mut watermark);
@@ -1729,10 +1740,11 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
         unreviewed: false,
         reason: None,
         by: Some("test"),
+        leased: false,
     })
     .unwrap();
     assert!(matches!(
-        db.approval_start(turn, &round[1], 0).unwrap(),
+        db.approval_start(turn, &round[1], false, 0).unwrap(),
         Gated::Started
     ));
     let denials = db.inspect("Bob").unwrap().denials;
@@ -1802,6 +1814,7 @@ fn a_gate_hands_a_call_to_a_person_who_then_decides_it() {
         unreviewed: false,
         reason,
         by: Some("approver"),
+        leased: false,
     };
     let asked = db.ask(decision(Some("judged risky: it pushes"))).unwrap();
     assert_eq!(
@@ -1831,7 +1844,7 @@ fn a_gate_hands_a_call_to_a_person_who_then_decides_it() {
     // A person's answer decides it.
     allow(&mut db, turn, "s0").unwrap();
     assert!(matches!(
-        db.approval_start(turn, &call, 0).unwrap(),
+        db.approval_start(turn, &call, false, 0).unwrap(),
         Gated::Started
     ));
     // A gate that lapses has nobody to wait on: it cannot ask.
@@ -1903,6 +1916,7 @@ fn each_gate_keeps_its_own_handoff_to_a_person() {
         unreviewed: false,
         reason: Some("doubted"),
         by: Some("approver"),
+        leased: false,
     };
     db.ask(decision("a", false)).unwrap();
     db.ask(decision("b", false)).unwrap();
@@ -1918,6 +1932,7 @@ fn each_gate_keeps_its_own_handoff_to_a_person() {
     db.answer(Decision {
         reason: None,
         by: Some("person"),
+        leased: false,
         ..decision("b", true)
     })
     .unwrap();
@@ -1931,11 +1946,12 @@ fn each_gate_keeps_its_own_handoff_to_a_person() {
     db.answer(Decision {
         reason: None,
         by: Some("person"),
+        leased: false,
         ..decision("a", true)
     })
     .unwrap();
     assert!(matches!(
-        db.approval_start(turn, &call, 0).unwrap(),
+        db.approval_start(turn, &call, false, 0).unwrap(),
         Gated::Started
     ));
 }
@@ -2002,6 +2018,7 @@ fn schema_49_waiting_calls_were_not_handed_to_anyone() {
         unreviewed: false,
         reason: None,
         by: Some("approver"),
+        leased: false,
     })
     .unwrap();
     let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
@@ -2055,10 +2072,11 @@ fn a_new_turn_starts_its_denials_from_none() {
             unreviewed: false,
             reason: Some("not that"),
             by: Some("test"),
+            leased: false,
         })
         .unwrap();
         assert!(matches!(
-            db.approval_start(turn, &call, 0).unwrap(),
+            db.approval_start(turn, &call, false, 0).unwrap(),
             Gated::Denied
         ));
     };
@@ -2099,7 +2117,7 @@ fn a_new_turn_starts_its_denials_from_none() {
     );
     allow(&mut db, next, "n0").unwrap();
     assert!(matches!(
-        db.approval_start(next, &call, 0).unwrap(),
+        db.approval_start(next, &call, false, 0).unwrap(),
         Gated::Started
     ));
     deny(&mut db, next, 1);
@@ -2132,9 +2150,10 @@ fn an_unreviewed_denial_counts_nothing_and_old_denials_leave_the_window() {
             unreviewed,
             reason: (!allow).then_some("no"),
             by: Some("test"),
+            leased: false,
         })
         .unwrap();
-        db.approval_start(turn, &call, 0).unwrap();
+        db.approval_start(turn, &call, false, 0).unwrap();
     };
     decide(&mut db, 0, false, false);
     decide(&mut db, 1, false, false);
@@ -3532,6 +3551,7 @@ fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
             grammar: None,
             steps: false,
             inherit: Inherit::All,
+            kind: None,
         };
         db.create(
             "Lead",
@@ -3563,7 +3583,7 @@ fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
             .collect();
         db.append(turn, vec![], &calls, None).unwrap();
         for call in &calls {
-            db.tool_start(turn, call).unwrap();
+            db.tool_start(turn, call, false, false).unwrap();
         }
         // The turn waits on c1's answer, as a turn waits across a restart.
         assert!(
@@ -4013,7 +4033,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
         .map(|(i, (id, command))| shell_call(&format!("fc_{i}"), id, command))
         .unzip();
     db.append(turn, items, &round, None).unwrap();
-    db.tool_start(turn, &round[0]).unwrap();
+    db.tool_start(turn, &round[0], false, false).unwrap();
     let failed = Outcome {
         failed: true,
         files: Default::default(),
@@ -4021,7 +4041,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     };
     let (_, completed) = db.tool_finish(turn, "c1", &failed).unwrap();
     assert_eq!(completed["data"]["failed"], true);
-    db.tool_start(turn, &round[1]).unwrap();
+    db.tool_start(turn, &round[1], false, false).unwrap();
     let read = db.prompts("Carol", turn, 64 * 1024).unwrap();
     assert_eq!(
         read["prompts"],
@@ -4052,7 +4072,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
         .unwrap();
     allow(&mut db, person, "b1").unwrap();
     assert!(matches!(
-        db.approval_start(person, &call, 0).unwrap(),
+        db.approval_start(person, &call, false, 0).unwrap(),
         Gated::Started
     ));
     let entry = Database::PROMPTS_ENTRY;
@@ -4388,7 +4408,7 @@ fn schema_40_gives_every_existing_bot_the_defaults_and_completes_parked_turns() 
         let (item, w) = call("w");
         db.append(turn, vec![item], std::slice::from_ref(&w), None)
             .unwrap();
-        db.tool_start(turn, &w).unwrap();
+        db.tool_start(turn, &w, false, false).unwrap();
         db.suspend(
             turn,
             "w",
@@ -4869,6 +4889,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         expire_ms: None,
         grammar: None,
         steps: false,
+        kind: None,
     };
     // The lead's own tool, which a bot it creates does not take.
     let resolve = Declared {
@@ -4881,6 +4902,7 @@ fn declared_tools_pass_to_created_bots_and_forks_and_a_forks_allow_narrows_them(
         expire_ms: None,
         grammar: None,
         steps: false,
+        kind: None,
     };
     let declared = [react.clone()];
     let leads = [react.clone(), resolve];
@@ -4980,6 +5002,7 @@ fn a_tool_declared_for_some_generations_goes_that_far_down_and_no_further() {
         expire_ms: None,
         grammar: None,
         steps: false,
+        kind: None,
     };
     let (lead, _) = db
         .create(
@@ -5045,6 +5068,7 @@ fn a_call_is_taken_once_and_a_second_take_is_refused_so_it_never_runs_twice() {
         grammar: None,
         steps: false,
         inherit: Inherit::All,
+        kind: None,
     };
     db.create(
         "Lead",
@@ -5077,7 +5101,7 @@ fn a_call_is_taken_once_and_a_second_take_is_refused_so_it_never_runs_twice() {
     db.append(turn, vec![], &calls, None).unwrap();
     let mut expires = 0;
     for call in &calls {
-        expires = db.tool_start(turn, call).unwrap()["data"]["expires_ms"]
+        expires = db.tool_start(turn, call, false, false).unwrap()["data"]["expires_ms"]
             .as_u64()
             .unwrap();
     }
@@ -5138,6 +5162,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
         grammar: None,
         steps: false,
         inherit: Inherit::All,
+        kind: None,
     };
     db.create(
         "Lead",
@@ -5170,7 +5195,7 @@ fn waiting_calls_page_past_held_answers_and_an_answer_out_of_time_is_refused() {
     db.append(turn, vec![], &calls, None).unwrap();
     let mut expires = 0;
     for call in &calls {
-        expires = db.tool_start(turn, call).unwrap()["data"]["expires_ms"]
+        expires = db.tool_start(turn, call, false, false).unwrap()["data"]["expires_ms"]
             .as_u64()
             .unwrap();
     }
@@ -5212,6 +5237,7 @@ fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
         grammar: None,
         steps: false,
         inherit: Inherit::All,
+        kind: None,
     };
     db.create(
         "Lead",
@@ -5241,7 +5267,7 @@ fn a_parked_answer_s_pictures_are_stored_once_its_result_is() {
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
-    db.tool_start(turn, &call).unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
     assert!(
         db.suspend_answer(turn, "c1", &[], 0, None, None)
             .unwrap()
@@ -5417,7 +5443,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
-    db.tool_start(turn, &call).unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
     let outcome = Outcome {
         output: "preview".into(),
         artifacts: vec![
@@ -7461,7 +7487,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
     let (live, forked) = db.fork("Bob", "live", Fork { ..Fork::default() }).unwrap();
     assert_eq!(live.head, Some(mid - 2));
     assert_eq!(forked.unwrap()["data"]["node"], mid - 2);
-    db.tool_start(turn, &call).unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
     let (_, entry) = db.tool_finish(turn, "c1", &result("hi")).unwrap();
     let answered = entry["data"]["node"].as_i64().unwrap();
     let (branch, _) = db
@@ -7614,10 +7640,10 @@ fn a_running_turn_forks_at_its_newest_finished_round() {
     db.append(turn, vec![a_item, b_item], &[a.clone(), b.clone()], None)
         .unwrap();
     assert_eq!(fork_point(&mut db, "Bob", "f1").unwrap(), prompt);
-    db.tool_start(turn, &a).unwrap();
+    db.tool_start(turn, &a, false, false).unwrap();
     db.tool_finish(turn, "a", &result("one")).unwrap();
     assert_eq!(fork_point(&mut db, "Bob", "f2").unwrap(), prompt);
-    db.tool_start(turn, &b).unwrap();
+    db.tool_start(turn, &b, false, false).unwrap();
     db.tool_finish(turn, "b", &result("two")).unwrap();
     let round = head(&db, "Bob");
     assert_eq!(fork_point(&mut db, "Bob", "f3").unwrap(), round);
@@ -7636,13 +7662,13 @@ fn a_running_turn_forks_at_its_newest_finished_round() {
     assert_eq!(fork_point(&mut db, "Bob", "f4").unwrap(), round);
 
     // Parked on a wait, the turn keeps its closed node.
-    db.tool_start(turn, &c).unwrap();
+    db.tool_start(turn, &c, false, false).unwrap();
     db.tool_finish(turn, "c", &result("three")).unwrap();
     let answered = head(&db, "Bob");
     let (w_item, w) = call("w");
     db.append(turn, vec![w_item], std::slice::from_ref(&w), None)
         .unwrap();
-    db.tool_start(turn, &w).unwrap();
+    db.tool_start(turn, &w, false, false).unwrap();
     db.suspend(
         turn,
         "w",
@@ -7696,7 +7722,7 @@ fn a_steer_closes_the_round_it_joins() {
     let (item, a) = call("a");
     db.append(turn, vec![item], std::slice::from_ref(&a), None)
         .unwrap();
-    db.tool_start(turn, &a).unwrap();
+    db.tool_start(turn, &a, false, false).unwrap();
     db.tool_finish(turn, "a", &result("one")).unwrap();
     for n in 0..2 {
         db.begin(
@@ -7751,7 +7777,7 @@ fn a_round_that_reuses_a_call_id_of_its_turn_is_refused_whole() {
     let (item, a) = call("a");
     db.append(turn, vec![item], std::slice::from_ref(&a), None)
         .unwrap();
-    db.tool_start(turn, &a).unwrap();
+    db.tool_start(turn, &a, false, false).unwrap();
     db.tool_finish(turn, "a", &result("one")).unwrap();
     db.begin(
         "Bob",
@@ -7851,7 +7877,7 @@ fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
     let (item, bg) = call("bg");
     db.append(turn, vec![item], std::slice::from_ref(&bg), None)
         .unwrap();
-    db.tool_start(turn, &bg).unwrap();
+    db.tool_start(turn, &bg, false, false).unwrap();
     let process = db.process_start(turn, "bg").unwrap();
     db.tool_finish(turn, "bg", &result(&format!("proc:{process}")))
         .unwrap();
@@ -7886,7 +7912,7 @@ fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
     let (item, w) = call("w");
     db.append(turn, vec![item], std::slice::from_ref(&w), None)
         .unwrap();
-    db.tool_start(turn, &w).unwrap();
+    db.tool_start(turn, &w, false, false).unwrap();
     let (_, entry) = db.tool_finish(turn, "w", &result("{}")).unwrap();
     let delivered = entry["data"]["node"].as_i64().unwrap();
     db.delivered(delivered, &[process]).unwrap();
@@ -7927,7 +7953,7 @@ fn schema_36_ends_a_turn_in_flight_and_keeps_its_history() {
         let (item, w) = call("w");
         db.append(turn, vec![item], std::slice::from_ref(&w), None)
             .unwrap();
-        db.tool_start(turn, &w).unwrap();
+        db.tool_start(turn, &w, false, false).unwrap();
         db.suspend(
             turn,
             "w",
@@ -8019,7 +8045,7 @@ fn forks_preserve_reasoning_pairs_and_require_every_parallel_result() {
     );
     assert!(db.inspect("split").is_err());
     for (index, call) in calls.iter().enumerate() {
-        db.tool_start(turn, call).unwrap();
+        db.tool_start(turn, call, false, false).unwrap();
         let (_, event) = db.tool_finish(turn, &call.call_id, &result("ok")).unwrap();
         let node = event["data"]["node"].as_i64().unwrap();
         if index == 0 {
@@ -8131,7 +8157,7 @@ fn anthropic_forks_check_the_whole_tool_batch_after_a_checkpoint() {
         .into();
     db.append(turn, vec![item], &calls, None).unwrap();
     for (index, call) in calls.iter().enumerate() {
-        db.tool_start(turn, call).unwrap();
+        db.tool_start(turn, call, false, false).unwrap();
         let (_, event) = db.tool_finish(turn, &call.call_id, &result("ok")).unwrap();
         let node = event["data"]["node"].as_i64().unwrap();
         if index == 0 {
@@ -9629,7 +9655,7 @@ fn retention_preserves_unfinished_turns_and_their_completed_prefix() {
     };
     db.append(first.turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
-    db.tool_start(first.turn, &call).unwrap();
+    db.tool_start(first.turn, &call, false, false).unwrap();
     assert_eq!(db.prune("Bob", 1).unwrap()["events"], 0);
     db.tool_finish(first.turn, "live", &result("done")).unwrap();
     db.finish(first.turn, None).unwrap();
@@ -11199,7 +11225,7 @@ fn a_halt_says_a_call_it_cut_off_has_an_unknown_outcome_and_one_it_never_started
             })
             .collect();
         db.append(turn, items, &calls, None).unwrap();
-        db.tool_start(turn, &calls[0]).unwrap();
+        db.tool_start(turn, &calls[0], false, false).unwrap();
         let Halted::Parked(events) = db.suspend_halted(turn, halt, 0, 0, 0, None).unwrap() else {
             panic!("a running turn parks");
         };
@@ -11944,7 +11970,7 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
         };
         db.append(turn, vec![], std::slice::from_ref(&call), None)
             .unwrap();
-        db.tool_start(turn, &call).unwrap();
+        db.tool_start(turn, &call, false, false).unwrap();
         let outcome = Outcome {
             output: "{}".into(),
             artifacts: Vec::new(),
@@ -12981,7 +13007,7 @@ fn exchange(db: &mut Database, turn: i64, call_id: &str, output: &str) -> (i64, 
         .iter()
         .find_map(|entry| entry["data"]["node"].as_i64())
         .unwrap();
-    db.tool_start(turn, &call).unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
     let (_, entry) = db.tool_finish(turn, call_id, &result(output)).unwrap();
     (asked, entry["data"]["node"].as_i64().unwrap())
 }
@@ -13110,7 +13136,7 @@ fn pictures_count_at_their_weight_and_go_whole() {
         None,
     )
     .unwrap();
-    db.tool_start(turn, &call).unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
     let read = Outcome {
         parts: vec![agent_runtime::codec::Part::Image(photo.clone())],
         ..result("photo.png: a PNG image, 600×600; it follows")
@@ -13351,7 +13377,7 @@ fn a_current_turn_over_budget_fits_once_its_answered_results_are_elided() {
                 None,
             )
             .unwrap();
-            db.tool_start(turn, &call).unwrap();
+            db.tool_start(turn, &call, false, false).unwrap();
             db.tool_finish(turn, &call.call_id, &result(&lines(n, 800)))
                 .unwrap();
             // The runtime reads the window each round, which saves its start.
@@ -13556,7 +13582,7 @@ fn a_result_s_text_parts_elide_together() {
         None,
     )
     .unwrap();
-    db.tool_start(turn, &call).unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
     let long = format!("{}the end", lines(0, 400));
     let outcome = Outcome {
         parts: vec![agent_runtime::codec::Part::Text { text: long.clone() }],
@@ -13605,7 +13631,7 @@ fn a_custom_tool_s_pictures_are_read_without_their_bytes() {
         None,
     )
     .unwrap();
-    db.tool_start(turn, &call).unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
     let data = "A".repeat(4096);
     let outcome = Outcome {
         parts: vec![agent_runtime::codec::Part::Image(
@@ -15082,10 +15108,11 @@ fn a_denied_call_closes_its_round() {
         unreviewed: false,
         reason: Some("no"),
         by: Some("test"),
+        leased: false,
     })
     .unwrap();
     assert!(matches!(
-        db.approval_start(turn, &call, 0).unwrap(),
+        db.approval_start(turn, &call, false, 0).unwrap(),
         Gated::Denied
     ));
     let denied = head(&db, "Bob");
@@ -15110,10 +15137,11 @@ fn a_refused_call_is_read_after_the_words_it_came_after() {
             unreviewed: false,
             reason: Some("no"),
             by: Some("test"),
+            leased: false,
         })
         .unwrap();
         assert!(matches!(
-            db.approval_start(turn, &call, 0).unwrap(),
+            db.approval_start(turn, &call, false, 0).unwrap(),
             Gated::Denied
         ));
         json!({"name":"shell","arguments":call.arguments})
@@ -15191,7 +15219,7 @@ fn a_refused_call_is_read_after_the_words_it_came_after() {
         .unwrap();
     allow(&mut db, next, "s5").unwrap();
     assert!(matches!(
-        db.approval_start(next, &call, 0).unwrap(),
+        db.approval_start(next, &call, false, 0).unwrap(),
         Gated::Started
     ));
     db.tool_finish(next, "s5", &result("released")).unwrap();
@@ -15823,7 +15851,7 @@ fn an_expired_fork_still_running_a_command_holds_back_no_other() {
     let (item, bg) = call("bg");
     db.append(turn, vec![item], std::slice::from_ref(&bg), None)
         .unwrap();
-    db.tool_start(turn, &bg).unwrap();
+    db.tool_start(turn, &bg, false, false).unwrap();
     let process = db.process_start(turn, "bg").unwrap();
     db.tool_finish(turn, "bg", &result(&format!("proc:{process}")))
         .unwrap();
@@ -16411,6 +16439,7 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
         grammar: None,
         steps: true,
         inherit: Inherit::All,
+        kind: None,
     };
     let gate = Gate {
         tag: "manual".into(),
@@ -16446,10 +16475,20 @@ fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
     };
     db.append(turn, vec![], std::slice::from_ref(&call), None)
         .unwrap();
-    db.tool_start(turn, &call).unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
     use agent_runtime::store::{Publication, Step};
     let Step::Pending { approval, .. } = db
-        .step_announce("Lead", turn, "c1", "1", "send", json!({}), 0)
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "1",
+            "send",
+            json!({}),
+            false,
+            Default::default(),
+            0,
+        )
         .unwrap()
         .step
     else {
@@ -17333,4 +17372,863 @@ fn a_cut_reply_s_note_reaches_its_turn_past_a_steer_that_waits_for_its_own() {
     // The two others stay queued, in order.
     assert_eq!(taken, [&json!("limit")]);
     assert_eq!(absorbed.outcomes.len(), 1);
+}
+
+/// The audit trail, read newest first with no filter.
+fn trail(db: &Database) -> Vec<Value> {
+    let page = db
+        .audit(&agent_runtime::store::audit::Query::default())
+        .unwrap();
+    page["rows"].as_array().unwrap().clone()
+}
+/// One row's facts: tool, kind, place, approved by, reads or writes, outcome.
+fn facts(row: &Value) -> Value {
+    json!([
+        row["tool"],
+        row["kind"],
+        row["place"],
+        row["approved"],
+        row["access"],
+        row["outcome"]
+    ])
+}
+/// A running turn of Bob, who has `shell` and `read` under no gate.
+fn tooled_turn(db: &mut Database) -> i64 {
+    let tools = ["shell".to_owned(), "read".to_owned()];
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            tools: &tools,
+            ..binding()
+        },
+    )
+    .unwrap();
+    db.begin(
+        "Bob",
+        "request",
+        "work",
+        true,
+        &TurnOptions::default(),
+        allow_provider,
+    )
+    .unwrap()
+    .turn
+}
+fn read_call(call_id: &str) -> ToolCall {
+    ToolCall {
+        custom: false,
+        name: "read".into(),
+        call_id: call_id.into(),
+        arguments: json!({"path":"/synthetic/a"}).to_string(),
+    }
+}
+
+#[test]
+fn each_call_is_kept_in_the_audit_trail_with_its_facts_and_outcome() {
+    let mut db = db();
+    let turn = tooled_turn(&mut db);
+    let (item, shell) = shell_call("fc_1", "s1", "ls");
+    let read = read_call("r1");
+    db.append(turn, vec![item], &[shell.clone(), read.clone()], None)
+        .unwrap();
+    // Started, a call is in the trail before it ends.
+    db.tool_start(turn, &shell, true, false).unwrap();
+    db.tool_start(turn, &read, false, true).unwrap();
+    let rows = trail(&db);
+    assert_eq!(
+        rows.iter().map(facts).collect::<Vec<_>>(),
+        [
+            json!(["read", "file", "outside", "rule", "read", "unknown"]),
+            json!(["shell", "shell", "sandbox", "nobody", "unknown", "unknown"]),
+        ]
+    );
+    assert_eq!(rows[1]["preview"], json!({"command":"ls"}).to_string());
+    assert_eq!(
+        (&rows[1]["bot"], &rows[1]["turn"]),
+        (&json!("Bob"), &json!(turn))
+    );
+    assert!(rows[1]["ms"].is_null());
+    db.tool_finish(turn, "s1", &result("ok")).unwrap();
+    db.tool_finish(
+        turn,
+        "r1",
+        &Outcome {
+            failed: true,
+            ..result("no such file")
+        },
+    )
+    .unwrap();
+    let rows = trail(&db);
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["outcome"].clone())
+            .collect::<Vec<_>>(),
+        [json!("failed"), json!("completed")]
+    );
+    assert!(
+        rows.iter()
+            .all(|r| r["ms"].as_i64().is_some_and(|ms| ms >= 0))
+    );
+}
+
+#[test]
+fn the_trail_says_who_approved_or_denied_each_gated_call() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let calls: Vec<(Bytes, ToolCall)> = ["s1", "s2", "s3"]
+        .iter()
+        .map(|id| shell_call(&format!("fc_{id}"), id, "true"))
+        .collect();
+    let (items, calls): (Vec<Bytes>, Vec<ToolCall>) = calls.into_iter().unzip();
+    db.append(turn, items, &calls, None).unwrap();
+    let decide = |db: &mut Database, call_id, allow, leased| {
+        db.answer(Decision {
+            bot: "Bob",
+            turn,
+            call_id,
+            request: 1,
+            tag: None,
+            allow,
+            unreviewed: false,
+            reason: None,
+            by: Some("test"),
+            leased,
+        })
+        .unwrap();
+    };
+    // Without a lease the answer is a person's; under one, a reviewer's.
+    decide(&mut db, "s1", true, false);
+    decide(&mut db, "s2", true, true);
+    decide(&mut db, "s3", false, false);
+    assert!(matches!(
+        db.approval_start(turn, &calls[0], true, 0).unwrap(),
+        Gated::Started
+    ));
+    assert!(matches!(
+        db.approval_start(turn, &calls[1], false, 0).unwrap(),
+        Gated::Started
+    ));
+    assert!(matches!(
+        db.approval_start(turn, &calls[2], false, 0).unwrap(),
+        Gated::Denied
+    ));
+    let rows = trail(&db);
+    assert_eq!(
+        rows.iter().map(facts).collect::<Vec<_>>(),
+        [
+            json!(["shell", "shell", null, "person", "unknown", "denied"]),
+            json!([
+                "shell", "shell", "outside", "reviewer", "unknown", "unknown"
+            ]),
+            json!(["shell", "shell", "sandbox", "person", "unknown", "unknown"]),
+        ]
+    );
+}
+
+/// A running turn of Lead, whose declared `run` tool has steps, gated by
+/// `manual` when `gated`.
+fn stepping_turn(db: &mut Database, gated: bool) -> (i64, ToolCall) {
+    let run = Declared {
+        name: "run".into(),
+        description: "Run.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        grammar: None,
+        steps: true,
+        inherit: Inherit::All,
+        kind: Some("mcp".into()),
+    };
+    let gate = Gate {
+        tag: "manual".into(),
+        tools: vec!["run".into()],
+        expire_ms: None,
+    };
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(std::slice::from_ref(&run)),
+            gate: gated.then_some(&gate),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        name: "run".into(),
+        call_id: "c1".into(),
+        arguments: "{}".into(),
+        custom: false,
+    };
+    db.append(turn, vec![], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
+    (turn, call)
+}
+
+#[test]
+fn a_tool_hosts_steps_are_kept_with_the_facts_it_declares() {
+    use agent_runtime::store::{Step, audit::Facts};
+    let mut db = db();
+    let (turn, _) = stepping_turn(&mut db, true);
+    let browser = Facts::given(Some("browser"), Some("outside"), Some("read")).unwrap();
+    // A step only recorded is decided at once, by nobody, under the gate.
+    let recorded = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "1",
+            "snapshot",
+            json!({}),
+            true,
+            browser,
+            0,
+        )
+        .unwrap();
+    assert!(matches!(recorded.step, Step::Decided(_)));
+    // A step that asks waits for the gate, and keeps its facts meanwhile.
+    let writes = Facts::given(Some("mcp"), Some("external"), Some("write")).unwrap();
+    let asked = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "2",
+            "send",
+            json!({"to":"x"}),
+            false,
+            writes,
+            0,
+        )
+        .unwrap();
+    assert!(matches!(asked.step, Step::Pending { .. }));
+    let listed = db.approvals(Some("Lead"), None, 0, None, 64).unwrap();
+    let step = (listed["approvals"].as_array().unwrap().iter())
+        .find(|a| a["call_id"] == "c1/2")
+        .unwrap();
+    assert_eq!(step["arguments"], json!({"to":"x"}));
+    // A step waiting has no row yet, so it cannot be reported.
+    let early = db
+        .step_result("Lead", turn, "c1", "2", false)
+        .err()
+        .unwrap();
+    assert_eq!(early.code, "no_allowed_step");
+    db.answer(Decision {
+        bot: "Lead",
+        turn,
+        call_id: "c1/2",
+        request: 1,
+        tag: None,
+        allow: true,
+        unreviewed: false,
+        reason: None,
+        by: Some("test"),
+        leased: false,
+    })
+    .unwrap();
+    assert!(matches!(
+        db.step_check("Lead", turn, "c1/2", 0).unwrap().step,
+        Step::Decided(_)
+    ));
+    // Each report ends its step's row; told twice, the first holds.
+    db.step_result("Lead", turn, "c1", "1", false).unwrap();
+    db.step_result("Lead", turn, "c1", "2", true).unwrap();
+    db.step_result("Lead", turn, "c1", "2", false).unwrap();
+    let rows = trail(&db);
+    assert_eq!(
+        rows.iter()
+            .map(|r| json!([r["step"], facts(r)]))
+            .collect::<Vec<_>>(),
+        [
+            json!([
+                "2",
+                ["send", "mcp", "external", "person", "write", "failed"]
+            ]),
+            json!([
+                "1",
+                [
+                    "snapshot",
+                    "browser",
+                    "outside",
+                    "nobody",
+                    "read",
+                    "completed"
+                ]
+            ]),
+            json!([null, ["run", "mcp", null, "nobody", "unknown", "unknown"]]),
+        ]
+    );
+    assert_eq!(rows[0]["preview"], json!({"to":"x"}).to_string());
+    // A step never announced cannot be reported.
+    let unknown = db
+        .step_result("Lead", turn, "c1", "9", false)
+        .err()
+        .unwrap();
+    assert_eq!(unknown.code, "no_allowed_step");
+}
+
+#[test]
+fn a_step_under_no_gate_is_recorded_even_when_it_would_ask() {
+    use agent_runtime::store::Step;
+    let mut db = db();
+    let (turn, _) = stepping_turn(&mut db, false);
+    let stepped = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "1",
+            "click",
+            json!({}),
+            false,
+            Default::default(),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(stepped.step, Step::Decided(_)));
+    db.step_result("Lead", turn, "c1", "1", false).unwrap();
+    assert_eq!(
+        facts(&trail(&db)[0]),
+        json!(["click", null, null, "nobody", "unknown", "completed"])
+    );
+}
+
+#[test]
+fn the_trail_reads_by_filter_and_pages_back_by_id() {
+    use agent_runtime::store::audit::Query;
+    let mut db = db();
+    let turn = tooled_turn(&mut db);
+    let calls: Vec<ToolCall> = (0..5).map(|n| read_call(&format!("r{n}"))).collect();
+    let (item, shell) = shell_call("fc_s", "s", "true");
+    let mut all = calls.clone();
+    all.push(shell.clone());
+    db.append(turn, vec![item], &all, None).unwrap();
+    for call in &all {
+        db.tool_start(turn, call, false, false).unwrap();
+    }
+    let page = |query: Query| db.audit(&query).unwrap();
+    let files = page(Query {
+        kind: Some("file".into()),
+        limit: Some(2),
+        ..Default::default()
+    });
+    let ids = |page: &Value| -> Vec<Value> {
+        (page["rows"].as_array().unwrap().iter())
+            .map(|r| r["call_id"].clone())
+            .collect()
+    };
+    assert_eq!(ids(&files), [json!("r4"), json!("r3")]);
+    let older = page(Query {
+        kind: Some("file".into()),
+        limit: Some(2),
+        before: files["next_before"].as_i64(),
+        ..Default::default()
+    });
+    assert_eq!(ids(&older), [json!("r2"), json!("r1")]);
+    let last = page(Query {
+        kind: Some("file".into()),
+        limit: Some(2),
+        before: older["next_before"].as_i64(),
+        ..Default::default()
+    });
+    assert_eq!(ids(&last), [json!("r0")]);
+    assert!(last["next_before"].is_null());
+    // A bot pattern, a time window and a tool each narrow the page.
+    assert_eq!(
+        ids(&page(Query {
+            bot: Some("B*".into()),
+            tool: Some("shell".into()),
+            ..Default::default()
+        })),
+        [json!("s")]
+    );
+    assert_eq!(
+        ids(&page(Query {
+            bot: Some("C*".into()),
+            ..Default::default()
+        })),
+        Vec::<Value>::new()
+    );
+    assert_eq!(
+        ids(&page(Query {
+            since_ms: Some(i64::MAX),
+            ..Default::default()
+        })),
+        Vec::<Value>::new()
+    );
+    assert_eq!(
+        ids(&page(Query {
+            since_ms: Some(0),
+            ..Default::default()
+        }))
+        .len(),
+        6
+    );
+    assert_eq!(
+        ids(&page(Query {
+            until_ms: Some(0),
+            ..Default::default()
+        })),
+        Vec::<Value>::new()
+    );
+    // A word outside a field's vocabulary is refused, never an empty page.
+    let wrong = db
+        .audit(&Query {
+            kind: Some("disk".into()),
+            ..Default::default()
+        })
+        .err()
+        .unwrap();
+    assert_eq!(wrong.code, "invalid_audit");
+}
+
+#[test]
+fn the_trail_outlives_its_bot_and_goes_only_by_a_trim() {
+    let mut db = db();
+    let turn = tooled_turn(&mut db);
+    let read = read_call("r1");
+    db.append(turn, vec![], std::slice::from_ref(&read), None)
+        .unwrap();
+    db.tool_start(turn, &read, false, false).unwrap();
+    db.tool_finish(turn, "r1", &result("ok")).unwrap();
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    db.delete_bot("Bob").unwrap();
+    let rows = trail(&db);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["bot"], "Bob");
+    // A trim takes one bound: an id or a time.
+    assert!(db.audit_bound(None, None).is_err());
+    assert!(db.audit_bound(Some(1), Some(1)).is_err());
+    let bound = db.audit_bound(None, Some(i64::MAX)).unwrap();
+    assert_eq!(
+        db.audit_bound(None, Some(0)).unwrap(),
+        rows[0]["id"].as_i64().unwrap()
+    );
+    assert_eq!(db.audit_trim(bound).unwrap(), 1);
+    assert_eq!(db.audit_trim(bound).unwrap(), 0);
+    assert!(trail(&db).is_empty());
+}
+
+#[test]
+fn schema_84_starts_the_trail_empty() {
+    let path = std::env::temp_dir().join(format!("agent-schema84-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE audit;
+             ALTER TABLE tools DROP COLUMN audit;
+             PRAGMA user_version=84;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert!(trail(&db).is_empty());
+    let turn = tooled_turn(&mut db);
+    let read = read_call("r1");
+    db.append(turn, vec![], std::slice::from_ref(&read), None)
+        .unwrap();
+    db.tool_start(turn, &read, false, false).unwrap();
+    db.tool_finish(turn, "r1", &result("ok")).unwrap();
+    assert_eq!(trail(&db)[0]["outcome"], "completed");
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_trim_under_a_running_call_never_hands_its_row_to_another() {
+    let mut db = db();
+    let turn = tooled_turn(&mut db);
+    let (first, second) = (read_call("r1"), read_call("r2"));
+    db.append(turn, vec![], &[first.clone(), second.clone()], None)
+        .unwrap();
+    db.tool_start(turn, &first, false, false).unwrap();
+    // The whole trail goes while the first call runs; the next call's row
+    // takes a new id, so the first one's end changes nothing of it.
+    let bound = db.audit_bound(None, Some(i64::MAX)).unwrap();
+    assert_eq!(db.audit_trim(bound).unwrap(), 1);
+    db.tool_start(turn, &second, false, false).unwrap();
+    db.tool_finish(turn, "r1", &result("ok")).unwrap();
+    let rows = trail(&db);
+    assert_eq!(
+        rows.iter()
+            .map(|r| json!([r["call_id"], r["outcome"]]))
+            .collect::<Vec<_>>(),
+        [json!(["r2", "unknown"])]
+    );
+}
+
+#[test]
+fn a_gated_step_is_told_done_once_even_when_its_row_was_trimmed() {
+    use agent_runtime::store::Step;
+    let mut db = db();
+    let (turn, _) = stepping_turn(&mut db, true);
+    let asked = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "1",
+            "send",
+            json!({}),
+            false,
+            Default::default(),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(asked.step, Step::Pending { .. }));
+    db.answer(Decision {
+        bot: "Lead",
+        turn,
+        call_id: "c1/1",
+        request: 1,
+        tag: None,
+        allow: true,
+        unreviewed: false,
+        reason: None,
+        by: Some("test"),
+        leased: false,
+    })
+    .unwrap();
+    db.step_check("Lead", turn, "c1/1", 0).unwrap();
+    // The person trims the whole trail while the step runs.
+    let bound = db.audit_bound(None, Some(i64::MAX)).unwrap();
+    assert_eq!(db.audit_trim(bound).unwrap(), 2);
+    let before = db.last_event_id().unwrap();
+    db.step_result("Lead", turn, "c1", "1", true).unwrap();
+    // Its end is still told, once: a judge sees it done.
+    assert_eq!(db.last_event_id().unwrap(), before + 1);
+    db.step_result("Lead", turn, "c1", "1", false).unwrap();
+    assert_eq!(db.last_event_id().unwrap(), before + 1);
+    assert!(trail(&db).is_empty());
+}
+
+/// Bob as a `bots` page lists him, with the page's cursor.
+fn listed(db: &Database) -> (Value, i64) {
+    let page = db.list(None, 64, None, false, None).unwrap();
+    let bob = (page["bots"].as_array().unwrap().iter())
+        .find(|bot| bot["name"] == "Bob")
+        .unwrap()
+        .clone();
+    (bob, page["cursor"].as_i64().unwrap())
+}
+
+fn paced(db: &mut Database, turn: i64) {
+    let blocked = Blocked {
+        code: "provider_login_rejected".into(),
+        detail: Some("HTTP 401".into()),
+        since_ms: 5,
+    };
+    db.suspend_paced(
+        turn,
+        99,
+        0,
+        0,
+        0,
+        0,
+        0,
+        false,
+        None,
+        None,
+        None,
+        None,
+        Some(blocked),
+        None,
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_bot_carries_its_whole_status_through_every_transition() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let (bob, before) = listed(&db);
+    assert_eq!(
+        (
+            &bob["status"],
+            &bob["started_ms"],
+            &bob["waiting_on"],
+            &bob["last"]
+        ),
+        (&json!("idle"), &Value::Null, &Value::Null, &Value::Null)
+    );
+    // Running: when it started.
+    let first = db
+        .begin(
+            "Bob",
+            "r1",
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (bob, cursor) = listed(&db);
+    assert!(cursor > before, "the cursor moves with each event");
+    assert_eq!(bob["status"], "running");
+    assert_eq!(bob["running_turn"], first);
+    let started = db.turn_view("Bob", first).unwrap()["started_ms"].clone();
+    assert!(started.is_i64());
+    assert_eq!(bob["started_ms"], started);
+    // Parked: on what, as the turn's own view says; `inspect` says the same.
+    paced(&mut db, first);
+    let (bob, _) = listed(&db);
+    assert_eq!(bob["status"], "paced");
+    assert_eq!(
+        bob["waiting_on"],
+        db.turn_view("Bob", first).unwrap()["waiting_on"]
+    );
+    assert_eq!(
+        bob["waiting_on"]["blocked"]["code"],
+        "provider_login_rejected"
+    );
+    let inspected = serde_json::to_value(db.inspect("Bob").unwrap()).unwrap();
+    assert_eq!(inspected["waiting_on"], bob["waiting_on"]);
+    assert_eq!(inspected["started_ms"], started);
+    db.resume(first).unwrap();
+    let (bob, _) = listed(&db);
+    assert_eq!(
+        (&bob["status"], &bob["waiting_on"]),
+        (&json!("running"), &Value::Null)
+    );
+    // Ended: how, and nothing runs.
+    db.finish(first, None).unwrap();
+    let (bob, _) = listed(&db);
+    let view = db.turn_view("Bob", first).unwrap();
+    assert_eq!(bob["status"], "completed");
+    assert_eq!(bob["started_ms"], Value::Null);
+    assert_eq!(
+        bob["last"],
+        json!({"turn":first,"status":"completed","started_ms":started,
+            "finished_ms":view["finished_ms"],"error":null})
+    );
+    // Held at its start: held, and on what, as the turn's view says.
+    let second = db
+        .begin(
+            "Bob",
+            "r2",
+            "next",
+            false,
+            &TurnOptions {
+                delivery: Delivery::Queue,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.hold(second, &Error::with("provider_unavailable", "openai"))
+        .unwrap()
+        .unwrap();
+    let (bob, _) = listed(&db);
+    assert_eq!(bob["status"], "held");
+    assert_eq!(
+        bob["waiting_on"],
+        db.turn_view("Bob", second).unwrap()["waiting_on"]
+    );
+    // A message behind the held turn ending leaves the hold.
+    let behind = db
+        .begin(
+            "Bob",
+            "r2b",
+            "behind",
+            false,
+            &TurnOptions {
+                delivery: Delivery::Queue,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.end_queued(behind, &Error::new("cancelled")).unwrap();
+    let (still, _) = listed(&db);
+    assert_eq!(
+        (&still["status"], &still["waiting_on"]),
+        (&bob["status"], &bob["waiting_on"])
+    );
+    // Failed before it started: its failure is the bot's last.
+    db.end_queued(second, &Error::new("provider_unavailable"))
+        .unwrap();
+    let (bob, _) = listed(&db);
+    assert_eq!(
+        (&bob["status"], &bob["waiting_on"]),
+        (&json!("failed"), &Value::Null)
+    );
+    assert_eq!(bob["last"]["turn"], second);
+    assert_eq!(bob["last"]["started_ms"], Value::Null);
+    assert_eq!(bob["last"]["error"], "provider_unavailable");
+    // One cancelled in line did nothing: the last stays.
+    let cancelled = db
+        .begin(
+            "Bob",
+            "r3",
+            "never",
+            false,
+            &TurnOptions {
+                delivery: Delivery::Queue,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.end_queued(cancelled, &Error::new("cancelled")).unwrap();
+    let (bob, _) = listed(&db);
+    assert_eq!(
+        (&bob["status"], &bob["last"]["turn"]),
+        (&json!("failed"), &json!(second))
+    );
+}
+
+#[test]
+fn a_listings_cursor_never_falls_behind_a_deleted_bots_events() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let (_, before) = listed(&db);
+    // Carol owns the newest events, and takes them with her.
+    db.delete_bot("Carol").unwrap();
+    let (_, after) = listed(&db);
+    assert!(after >= before, "{after} < {before}");
+    // Following from it finds no gap: nothing changed since the listing.
+    let page = db.events_after(after, 64).unwrap();
+    assert_eq!(page["pruned_before"], Value::Null, "{page}");
+}
+
+#[test]
+fn a_message_failing_in_line_while_a_turn_runs_is_the_bots_last_once_it_ends() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let running = db
+        .begin(
+            "Bob",
+            "r1",
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let queued = db
+        .begin(
+            "Bob",
+            "r2",
+            "then",
+            true,
+            &TurnOptions {
+                delivery: Delivery::Queue,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(queued.status, "queued");
+    db.end_queued(queued.turn, &Error::new("turn_budget_exhausted"))
+        .unwrap();
+    // The running turn still speaks for the bot.
+    let (bob, _) = listed(&db);
+    assert_eq!(bob["status"], "running");
+    assert_eq!(bob["last"]["turn"], queued.turn);
+    // Ending after it, the older turn does not hide the newer failure.
+    db.finish(running, None).unwrap();
+    let (bob, _) = listed(&db);
+    assert_eq!(bob["status"], "failed");
+    assert_eq!(bob["last"]["turn"], queued.turn);
+    assert_eq!(bob["last"]["error"], "turn_budget_exhausted");
+}
+
+#[test]
+fn a_store_before_bot_status_reads_each_bots_status_from_its_turns() {
+    let path = std::env::temp_dir().join(format!("bot-status-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let (done, failed) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        db.create("Ann", Some("/synthetic"), binding()).unwrap();
+        let done = db
+            .begin(
+                "Bob",
+                "r1",
+                "go",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.finish(done, None).unwrap();
+        let failed = db
+            .begin(
+                "Ann",
+                "r1",
+                "go",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.finish(failed, Some(&Error::new("provider_error")))
+            .unwrap();
+        let running = db
+            .begin(
+                "Bob",
+                "r2",
+                "again",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        paced(&mut db, running);
+        (done, failed)
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE bots DROP COLUMN started_ms; ALTER TABLE bots DROP COLUMN waiting_on;
+             ALTER TABLE bots DROP COLUMN last_turn; ALTER TABLE bots DROP COLUMN last_status;
+             ALTER TABLE bots DROP COLUMN last_started_ms; ALTER TABLE bots DROP COLUMN last_finished_ms;
+             ALTER TABLE bots DROP COLUMN last_error; PRAGMA user_version=87;",
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let page = db.list(None, 64, None, false, None).unwrap();
+    let (ann, bob) = (&page["bots"][0], &page["bots"][1]);
+    assert_eq!(ann["status"], "failed");
+    assert_eq!(ann["last"]["turn"], failed);
+    assert_eq!(ann["last"]["error"], "provider_error");
+    assert_eq!(bob["status"], "paced");
+    assert_eq!(bob["last"]["turn"], done);
+    assert_eq!(bob["last"]["status"], "completed");
+    let running = bob["running_turn"].as_i64().unwrap();
+    assert_eq!(
+        bob["waiting_on"],
+        db.turn_view("Bob", running).unwrap()["waiting_on"]
+    );
+    assert_eq!(
+        bob["started_ms"],
+        db.turn_view("Bob", running).unwrap()["started_ms"]
+    );
+    drop(db);
+    let _ = std::fs::remove_file(path);
 }

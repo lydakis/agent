@@ -144,7 +144,7 @@ pub struct Picker {
     /// Each row's name and what it is, as typing matches them.
     rows: Vec<(String, String)>,
     /// Typed to narrow the rows.
-    pub filter: String,
+    filter: String,
     /// The pick, among the rows shown.
     pick: usize,
     /// The row picked with nothing typed.
@@ -152,7 +152,15 @@ pub struct Picker {
     /// What the person picked before, which ranks a row first among
     /// rows matched alike; none for a list whose order is its meaning.
     picks: Option<crate::fuzzy::Picks>,
+    /// The rows ranked, and what was typed then, until it or the picks
+    /// change: an arrow or a frame reads them, not every row again, and a
+    /// letter typed on looks only at the rows the letters before left.
+    ranked: std::cell::RefCell<Option<(String, Shown)>>,
 }
+
+/// The rows typing leaves, best first: each one's place among the rows
+/// given and the chars of its name typed.
+pub type Shown = std::rc::Rc<Vec<(usize, Vec<usize>)>>;
 
 impl Picker {
     /// A list of `rows`, each its name and what it is, `pick` picked.
@@ -164,21 +172,48 @@ impl Picker {
             pick,
             first: pick,
             picks: None,
+            ranked: Default::default(),
         }
     }
 
     /// Ranked by what the person picked before, within a match's tier.
     pub fn weighed(mut self, picks: crate::fuzzy::Picks) -> Self {
         self.picks = Some(picks);
+        self.ranked.take();
         self
     }
 
     /// The rows typing leaves, best first, each its place among the rows
     /// given and the chars of its name typed; a row found by what it is
     /// marks none. With nothing typed, every row in the list's order.
-    pub fn shown(&self) -> Vec<(usize, Vec<usize>)> {
+    pub fn shown(&self) -> Shown {
+        let mut ranked = self.ranked.borrow_mut();
+        let left = match &*ranked {
+            Some((typed, shown)) if *typed == self.filter => return shown.clone(),
+            // What more letters match, the letters before matched too:
+            // a row they left out stays out.
+            Some((typed, shown)) if self.filter.starts_with(typed.as_str()) => {
+                let mut left = vec![false; self.rows.len()];
+                for &(at, _) in shown.iter() {
+                    left[at] = true;
+                }
+                Some(left)
+            }
+            _ => None,
+        };
+        let shown = Shown::new(self.rank(left));
+        *ranked = Some((self.filter.clone(), shown.clone()));
+        shown
+    }
+
+    /// The rows ranked for what is typed, of those `left` keeps.
+    fn rank(&self, left: Option<Vec<bool>>) -> Vec<(usize, Vec<usize>)> {
         use crate::fuzzy::{better, find, order};
-        let found = (self.rows.iter()).map(|(name, about)| {
+        let kept = |at: usize| left.as_ref().is_none_or(|left| left[at]);
+        let found = (self.rows.iter().enumerate()).map(|(at, (name, about))| {
+            if !kept(at) {
+                return None;
+            }
             let named = find(name, &self.filter);
             let best = better(named.clone(), find(about, &self.filter));
             best.map(|mut best| {
@@ -196,6 +231,11 @@ impl Picker {
         (order(found, weight).into_iter())
             .map(|(at, found)| (at, found.at))
             .collect()
+    }
+
+    /// What is typed to narrow the rows.
+    pub fn filter(&self) -> &str {
+        &self.filter
     }
 
     /// Where the pick is among `shown()`.
@@ -241,6 +281,7 @@ impl Picker {
             if let Some(picks) = &mut self.picks {
                 picks.pick_now(&name);
             }
+            self.ranked.take();
             // Ranked higher now, the row taken stays the one picked.
             if let Some(now) = self.shown().iter().position(|(row, _)| *row == at) {
                 self.pick = now;
@@ -400,11 +441,11 @@ mod tests {
         let mut list = picker(&["standard", "fast", "flex"]);
         assert_eq!(list.chosen(), Some(2), "opens on the row it was given");
         assert_eq!(list.event(&key(KeyCode::Char('f'))), Act::Stay);
-        let shown: Vec<usize> = list.shown().into_iter().map(|(at, _)| at).collect();
+        let shown: Vec<usize> = list.shown().iter().map(|(at, _)| *at).collect();
         assert_eq!(shown, [1, 2]);
         assert_eq!(list.chosen(), Some(1), "typing picks the best row");
         list.event(&key(KeyCode::Char('l')));
-        assert_eq!(list.shown(), [(2, vec![0, 1])]);
+        assert_eq!(*list.shown(), [(2, vec![0, 1])]);
         assert_eq!(list.event(&key(KeyCode::Enter)), Act::Take(2));
         // Backspace back to nothing picks the row the list opened on.
         list.event(&key(KeyCode::Backspace));
@@ -449,7 +490,7 @@ mod tests {
             0,
         );
         list.narrow("sandbox".into());
-        assert_eq!(list.shown(), [(1, vec![])]);
+        assert_eq!(*list.shown(), [(1, vec![])]);
         let (line, cursor) = list.line("type to narrow");
         assert_eq!(line.to_string(), "› sandbox");
         assert_eq!(cursor, 9);
@@ -458,5 +499,93 @@ mod tests {
             list.line("type to narrow").0.to_string(),
             "› type to narrow"
         );
+    }
+
+    #[test]
+    fn letters_typed_on_rank_the_rows_as_typing_them_at_once_does() {
+        let rows: Vec<(String, String)> = (0..300)
+            .map(|n| {
+                (
+                    format!("p{}.task-{n}_{}", n % 7, ["fix", "Shop", "cart"][n % 3]),
+                    format!("of p{}.lead", n % 7),
+                )
+            })
+            .collect();
+        let mut list = Picker::new(rows.clone(), 3);
+        let keys = [
+            "t", "a", "s", "\u{8}", "k", "-", "1", "\u{8}", "\u{8}", "\u{8}", "S", "h", "o", ".",
+            "p", "\u{8}", "l",
+        ];
+        for key in keys {
+            let mut filter = list.filter().to_owned();
+            match key {
+                "\u{8}" => {
+                    filter.pop();
+                }
+                key => filter.push_str(key),
+            }
+            list.narrow(filter.clone());
+            let mut fresh = Picker::new(rows.clone(), 3);
+            fresh.narrow(filter.clone());
+            assert_eq!(*list.shown(), *fresh.shown(), "{filter:?}");
+            assert_eq!(list.at(), fresh.at(), "{filter:?}");
+        }
+    }
+
+    /// A list of every agent at fleet scale: what a key costs.
+    /// `cargo test -p sonny --release a_long_list -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn a_long_list_moves_and_narrows() {
+        for count in [1_000, 2_000, 4_000, 8_000, 16_000] {
+            let rows: Vec<(String, String)> = (0..count)
+                .map(|n| {
+                    (
+                        format!("p{}.task-{n}", n % 40),
+                        format!("task of p{}.lead", n % 40),
+                    )
+                })
+                .collect();
+            let mut list = Picker::new(rows.clone(), 0).weighed(crate::fuzzy::Picks::default());
+            let _ = list.shown();
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                let items: Vec<Item> = (list.shown().iter())
+                    .map(|&(at, ref found)| {
+                        Item::new(rows[at].0.clone(), rows[at].1.clone()).found(found)
+                    })
+                    .collect();
+                let _ = lines(&items, list.at(), 100, 40);
+            }
+            let frame = start.elapsed() / 20;
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                list.down();
+                let _ = list.shown();
+                let _ = list.at();
+            }
+            let arrow = start.elapsed() / 20;
+            list.narrow("ta".into());
+            let _ = list.shown();
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                list.down();
+                let _ = list.shown();
+                let _ = list.at();
+            }
+            let narrowed = start.elapsed() / 20;
+            list.narrow(String::new());
+            let _ = list.shown();
+            let word = "p1.task-12";
+            let start = std::time::Instant::now();
+            for end in 1..=word.len() {
+                list.narrow(word[..end].into());
+                let _ = list.shown();
+            }
+            let typed = start.elapsed() / word.len() as u32;
+            eprintln!(
+                "{count:>6} rows: frame {frame:?}, arrow {arrow:?}, arrow narrowed {narrowed:?}, each letter of {word:?} {typed:?}"
+            );
+        }
     }
 }

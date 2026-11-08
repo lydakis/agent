@@ -292,6 +292,7 @@ at its model's own effort (`AGENT_EFFORT` when its model is
 | The chime, the agent's steps, and every tool call drawn | `[sonny] chime`, `steps`, `verbose` (true or false) | |
 | The widest the conversation is written | `[sonny] text_width` (100 by default, at least 40, 0 for the window's whole width) | |
 | A guess at your next message | `[sonny] suggest` (true, the default, or false) | |
+| An idea or a tip where no guess is obvious | `[sonny] suggest_ideas` (true, the default, or false) | |
 | Whether agents have the commons | `[sonny] commons` (true, the default, or false) | |
 | When a note opens the margin | `[sonny] margin_opens` (`always`, the default, `unless-closed` or `never`) | |
 | The most notes a margin holds | `[sonny] margin_notes` (6 by default, at least 1; past it the agent's new note is refused, and it is told which notes are there) | |
@@ -590,6 +591,29 @@ words. The copy names the source from a fixed set (`earlier`, `margin`,
 `commons`, or an agent's name, which Sonny looks up and a click opens), so a guess about the
 reply you are reading, or a source it made up, shows none, and a window
 too narrow for the whole guess and its source leaves the source out.
+
+When your next message isn't obvious, the copy would say nothing, and the
+composer would show only its hint. Instead, the same call may offer
+something you didn't ask for, labeled as what it is: an `idea` for the
+work, apart from what the conversation is on, or a `tip` for one of Sonny's
+commands or keys that would help right now, as in
+`› /side why did the build slow down  tab  tip` or
+`› alt+t boosts your next message  tip`. A guess always comes first; the
+idea or tip only fills a slot that would be empty, and costs no call, timer
+or tool of its own. A tip names only what the slash menu and `?` list, so it
+stays current, and one naming anything else shows nothing. Each command or
+key is tipped once a window, and never one every composer has (Enter, Esc,
+the arrows) or one that stops or leaves (`/quit`, `/pause`). Tab takes an
+idea or a command as it takes a guess; a key's tip is only read, so Tab
+does what it does otherwise. The label stays however narrow the window,
+the words cut first. `[sonny] suggest_ideas = false` turns ideas and tips
+off and leaves the guess as it was.
+
+![An idea where no guess was obvious, labeled after the key](../docs/sonny/suggest-idea.png)
+
+![A tip for a command, which Tab takes](../docs/sonny/suggest-tip.png)
+
+![A tip for a key, only read](../docs/sonny/suggest-tip-key.png)
 
 ![A guess from a task's news, its source after the key](../docs/sonny/suggest-origin.png)
 
@@ -1107,9 +1131,12 @@ way `/react` does, and each note in the margin has its own `↩`.
   task's instructions, with `task.md` after it. Paths in the lead's folder
   that a brief names (through a link too) are turned into the same paths
   in the task's worktree, so the task never writes the lead's folder by
-  its full path. The `remove_task` tool (`task`, `discard`) removes a task
-  that is done and its worktree, refusing while the worktree has
-  uncommitted changes. Its branch is kept unless it is merged.
+  its full path. The `remove_task` tool (`task`, `discard`) cleans up a
+  task that is done: it marks it done, as `mark_done` does, and removes
+  its worktree, refusing while the task is working or the worktree has
+  uncommitted changes. Its branch is kept unless it is merged. The agent
+  and its history stay, so a message reopens it; only the person deletes
+  an agent, with `agent rm`.
 - **Tasks that start their own:** every agent has `start_task` and
   `remove_task`, for help inside its own brief, such as a review or a
   watch on something; separate work still goes to its lead. How deep a
@@ -1506,7 +1533,10 @@ Your own messages sit on a band tinted from the theme's foreground over
 its background, as Codex and Claude Code tint the user's cell, with a
 row of the band above and below the words, so your turns are easy to
 find when you scroll back; a reply that opens with a
-heading takes no `•` before it.
+heading takes no `•` before it. Your words read as the agent's do: their
+Markdown (bold, code, lists, tables, math, pictures) is drawn the one way
+every surface draws it, in your sent messages, in what waits queued or
+steered, and in a message between agents once opened.
 
 ![Your message on its band, and the footer, all muted at rest, saying 76% left](../docs/sonny/message-band.png)
 

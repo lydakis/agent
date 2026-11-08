@@ -1,5 +1,6 @@
 //! The processes Sonny runs for agents at once: the tool host's tool calls
-//! in `sonny tool` processes. One total, as a systemd slice bounds a group
+//! in `sonny tool` processes, and the browser tool's agent-browser
+//! commands. One total, as a systemd slice bounds a group
 //! of units, so a turn that parks cheaply in the daemon cannot leave
 //! unbounded work running here. Callers wait their turn in order (Tokio's
 //! semaphore is fair), and no agent holds more than half of it, so one

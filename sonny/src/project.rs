@@ -59,13 +59,27 @@ pub fn profile(dir: &Path, name: &str) -> Result<agent_client::policy::Profile, 
     let skills = [("coordination", coordination.as_ref())];
     agent_client::policy::profile_with(dir, name, &roles, &skills)
         .map_err(|e| format!("{}: {e}", e.code()))?
-        .ok_or_else(|| {
-            let missing = agent_client::policy::Failure::Missing {
-                name: name.to_owned(),
-                kind: "profile",
-            };
-            format!("{}: {missing}", missing.code())
-        })
+        .ok_or_else(|| missing_profile(name))
+}
+
+/// The role `name` as Sonny ships it, none of the person's files read;
+/// `None` for a name Sonny ships no role of.
+fn shipped(name: &str) -> Option<agent_client::policy::Profile> {
+    let roles = builtins();
+    let roles = roles.each_ref().map(|(name, text)| (*name, text.as_ref()));
+    let coordination = crate::commons::role(COORDINATION);
+    let skills = [("coordination", coordination.as_ref())];
+    agent_client::policy::shipped_profile(name, &roles, &skills)
+        .ok()
+        .flatten()
+}
+
+fn missing_profile(name: &str) -> String {
+    let missing = agent_client::policy::Failure::Missing {
+        name: name.to_owned(),
+        kind: "profile",
+    };
+    format!("{}: {missing}", missing.code())
 }
 
 /// The name of the profile a project's lead runs as: its file's `profile`,
@@ -334,39 +348,93 @@ fn role(dir: &Path, chosen: Option<&str>) -> Result<agent_client::policy::Profil
     }
 }
 
+/// [`role`], or, when the project's own role cannot be used, Sonny's of
+/// the same name (else its lead's), with why in `left_out`. A role the
+/// person picked by name is theirs to fix: that fails.
+fn role_or_shipped(
+    dir: &Path,
+    chosen: Option<&str>,
+    left_out: &mut Vec<String>,
+) -> Result<agent_client::policy::Profile, String> {
+    let error = match role(dir, chosen) {
+        Ok(role) => return Ok(role),
+        Err(error) if chosen.is_some() => return Err(error),
+        Err(error) => error,
+    };
+    let name = (agent_client::project::read(dir).ok())
+        .and_then(|info| lead_profile(&info).ok())
+        .filter(|name| shipped(name).is_some())
+        .unwrap_or_else(|| "lead".into());
+    let role = shipped(&name).ok_or(error.clone())?;
+    left_out.push(format!(
+        "the lead's role: {error}; it runs as Sonny's own {name} role"
+    ));
+    Ok(role)
+}
+
 /// A lead's instructions as Sonny composes them for `dir` now: its role,
 /// the folder's rules, skills and memory, then the project's task rule.
 /// Rex is the rex-windows skill's to
 /// explain, so they read the same in any client.
-pub fn instructions(dir: &Path, chosen: Option<&str>) -> Result<String, String> {
-    compose(dir, chosen).map(|(text, _)| text)
+pub fn instructions(dir: &Path, chosen: Option<&str>) -> Result<Composed, String> {
+    compose(dir, chosen)
 }
 
-/// The instructions and the names of the skills they list, for a lead in
-/// the role `chosen` or its project's.
-fn compose(dir: &Path, chosen: Option<&str>) -> Result<(String, Vec<String>), String> {
-    let (composed, skills) = folder(dir, &role(dir, chosen)?)?;
+/// A lead's instructions as composed now, and what was left out of them.
+pub struct Composed {
+    pub text: String,
+    /// The names of the skills they list.
+    skills: Vec<String>,
+    /// Each file (or the role) that could not be used, and why: the
+    /// lead opens without it, and it and the person are told.
+    pub left_out: Vec<String>,
+}
+
+/// The instructions for a lead in the role `chosen` or its project's.
+fn compose(dir: &Path, chosen: Option<&str>) -> Result<Composed, String> {
+    let mut left_out = Vec::new();
+    let role = role_or_shipped(dir, chosen, &mut left_out)?;
+    let mut composed = folder(dir, &role)?;
+    left_out.append(&mut composed.left_out);
     let info = agent_client::project::read(dir)?;
     let rule = agent_client::project::rule(&info);
-    Ok((format!("{composed}\n\n{rule}"), skills))
+    composed.text = format!("{}\n\n{rule}", composed.text);
+    composed.left_out = left_out;
+    Ok(composed)
 }
 
 /// The role with the folder's rules, skills and memory and who it works
-/// for, before the project's task rule, and the names of the skills they
-/// list.
-fn folder(
-    dir: &Path,
-    role: &agent_client::policy::Profile,
-) -> Result<(String, Vec<String>), String> {
+/// for, before the project's task rule. A rule, skill or memory file that
+/// cannot be read, or does not fit, is left out whole and said in
+/// `left_out`: a broken link in a skills folder never keeps a lead from
+/// opening.
+fn folder(dir: &Path, role: &agent_client::policy::Profile) -> Result<Composed, String> {
     let memory = memory(dir)?;
-    let composed =
-        agent_client::policy::instructions(dir, Some(role), &memory).map_err(|e| e.to_string())?;
+    let composed = agent_client::policy::instructions_leaving_out(dir, Some(role), &memory)
+        .map_err(|e| e.to_string())?;
     let skills = composed
         .skills
         .into_iter()
         .map(|skill| skill.name)
         .collect();
-    Ok((composed.text, skills))
+    // Paths under the home folder as `~`, so a narrow window shows what
+    // is missing; the lead's shell reads them the same.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let left_out = (composed.left_out.iter())
+        .map(|failure| {
+            let said = failure.to_string();
+            let said = match home.as_str() {
+                "" | "/" => said,
+                home => said.replace(&format!("{home}/"), "~/"),
+            };
+            format!("left out of the lead's instructions: {said}")
+        })
+        .collect();
+    Ok(Composed {
+        text: composed.text,
+        skills,
+        left_out,
+    })
 }
 
 /// The memory a lead of `dir` reads: its own project's, by the name its
@@ -424,16 +492,22 @@ impl Instructions {
 /// Whether a lead's instructions may follow the folder: only when Sonny
 /// wrote what they hold (or saw a client compose it), so instructions the
 /// person set some other way are never overwritten.
+/// With what was left out of the folder's instructions, which the lead
+/// goes without whichever it is.
 pub fn review(
     dir: &Path,
     bot: &Value,
     lead: &str,
     new: bool,
     chosen: Option<&str>,
-) -> Result<Instructions, String> {
-    let (composed, skills) = compose(dir, chosen)?;
+) -> Result<(Instructions, Vec<String>), String> {
+    let Composed {
+        text: composed,
+        skills,
+        left_out,
+    } = compose(dir, chosen)?;
     let current = bot["instructions"].as_str().unwrap_or_default();
-    Ok(if current == composed {
+    let reviewed = if current == composed {
         wrote(lead, current);
         Instructions::Current
     } else if new || written(lead).is_some_and(|key| key == fingerprint(current)) {
@@ -445,7 +519,58 @@ pub fn review(
             .filter(|name| !current.contains(&format!("- {name}:")))
             .collect();
         Instructions::Kept { missing }
-    })
+    };
+    Ok((reviewed, left_out))
+}
+
+/// Where a note of what a lead opened without comes from.
+pub const START_ORIGIN: &str = "sonny.start";
+
+/// What a lead is told of what its window could not use as it opened.
+pub fn start_note(warnings: &[String]) -> String {
+    let mut note = String::from("Sonny opened without what it could not use:\n");
+    for warning in warnings {
+        note.push_str(&format!("- {warning}\n"));
+    }
+    note.push_str("Tell the person, and fix what is yours to fix.");
+    note
+}
+
+/// Tell `bot` of `warnings` with its next model call: attached, so no
+/// turn starts for it, and once a day for the same warnings, however
+/// often the window opens.
+pub async fn tell_warnings(client: &Client, bot: &str, warnings: &[String]) -> Result<(), String> {
+    if warnings.is_empty() {
+        return Ok(());
+    }
+    let note = start_note(warnings);
+    let day = crate::home::now_ms() / 86_400_000;
+    let key = format!(
+        "sonny-start-{}-{day}",
+        fingerprint(&format!("{bot}\n{note}"))
+    );
+    let asked = json!({"bot": bot, "prompt": note, "request_id": key,
+        "delivery": "attach", "origin": START_ORIGIN});
+    match client.request("submit", asked).await {
+        Ok(_) => Ok(()),
+        // Told today already.
+        Err(error) if error.code == "idempotency_conflict" => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// The window's one line for `warnings`, the first in full; whether its
+/// agent is `told` of them all.
+pub fn warnings_notice(warnings: &[String], told: bool) -> Option<String> {
+    let told = match told {
+        true => "; the agent is told",
+        false => "",
+    };
+    match warnings {
+        [] => None,
+        [one] => Some(format!("{one}{told}")),
+        [first, rest @ ..] => Some(format!("{first}; and {} more{told}", rest.len())),
+    }
 }
 
 /// What names a lead across daemons: bot ids count from one in each
@@ -903,7 +1028,9 @@ async fn create(
     bot: Option<&str>,
     chosen: Option<&str>,
 ) -> Result<bool, String> {
-    let role = role(dir, chosen)?;
+    // What it was made without is said where it opens, as each window
+    // reviews its instructions.
+    let role = role_or_shipped(dir, chosen, &mut Vec::new())?;
     let info = agent_client::project::read(dir)?;
     // A project file that names a model keeps it; otherwise asked for,
     // the role's, AGENT_MODEL's, the config's `model`, then the newest
@@ -912,7 +1039,9 @@ async fn create(
     // config's `[sonny] lead_effort`, else AGENT_EFFORT with AGENT_MODEL's
     // model, as the CLI takes them.
     let (mut effort, model) = (None, model.map(str::to_owned));
-    let config = agent_client::config::load()?;
+    // A config that does not read is said as the window opens; until it
+    // reads, a lead is made with the defaults.
+    let config = agent_client::config::load().unwrap_or_default();
     let model = match model
         .or_else(|| info["model"].as_str().map(str::to_owned))
         .or_else(|| role.model.clone())
@@ -954,7 +1083,7 @@ async fn make(
     picks: &agent_client::project::Picks,
     bot: Option<&str>,
 ) -> Result<Value, String> {
-    let (instructions, _) = folder(dir, role)?;
+    let instructions = folder(dir, role)?.text;
     // Gated and confined from the start, as a new lead's mode makes it,
     // whoever opens it first.
     let mode = crate::approvals::default();
@@ -987,7 +1116,9 @@ async fn make(
     if let Some(state) = &state {
         settings.insert("env".into(), json!({crate::state::VAR: state}));
     }
-    let config = agent_client::config::load()?;
+    // As in `create`: a config that does not read is said where the lead
+    // opens, and the defaults stand until it reads.
+    let config = agent_client::config::load().unwrap_or_default();
     if config.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
     }
@@ -1253,7 +1384,7 @@ mod tests {
         let (base, coordination) = base.split_once(skill).unwrap();
         assert!(lead.body.starts_with(base));
         assert!(lead.body.ends_with(coordination));
-        let text = instructions(&dir, None).unwrap();
+        let text = instructions(&dir, None).unwrap().text;
         assert!(text.contains("# Role: my-lead\n\n"), "{text}");
         // A variant of the lead is no role to start a peer in.
         assert!(!text.contains("- my-lead:"));
@@ -1267,7 +1398,49 @@ mod tests {
         assert!(lead.body.starts_with(base));
         assert!(lead.body.contains("you lead their leads"));
         assert!(lead.body.ends_with(coordination));
-        assert!(!instructions(&dir, None).unwrap().contains("- superlead:"));
+        assert!(
+            !instructions(&dir, None)
+                .unwrap()
+                .text
+                .contains("- superlead:")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lead_opens_without_a_broken_skill_or_role_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("sonny-left-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".agents/skills")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        // A skill copied as a link to where it no longer is.
+        std::os::unix::fs::symlink("/nowhere/review", dir.join(".agents/skills/review")).unwrap();
+        let composed = instructions(&dir, None).unwrap();
+        assert_eq!(
+            composed.left_out,
+            [format!(
+                "left out of the lead's instructions: cannot read {}: a link to a missing file",
+                dir.join(".agents/skills/review").display()
+            )]
+        );
+        assert!(!composed.text.contains("- review:"));
+        // A lead.md that cannot be read: the lead runs as Sonny's, and says so.
+        std::fs::create_dir_all(dir.join(".agents/agents")).unwrap();
+        std::os::unix::fs::symlink("gone.md", dir.join(".agents/agents/lead.md")).unwrap();
+        assert!(role(&dir, None).is_err());
+        let composed = instructions(&dir, None).unwrap();
+        assert!(composed.left_out[0].starts_with("the lead's role: instructions_unreadable: "));
+        assert!(composed.left_out[0].ends_with("it runs as Sonny's own lead role"));
+        assert!(composed.text.contains("# Role: lead\n\n"));
+        // One picked by name is the person's to fix.
+        assert!(instructions(&dir, Some("lead")).is_err());
+        // The window says the first, and how many more.
+        assert_eq!(
+            warnings_notice(&["a".into(), "b".into(), "c".into()], true).as_deref(),
+            Some("a; and 2 more; the agent is told")
+        );
+        assert_eq!(warnings_notice(&["a".into()], false).as_deref(), Some("a"));
+        assert!(start_note(&["a".into()]).contains("\n- a\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1406,7 +1579,7 @@ mod tests {
         let lead = format!("kept-test-{}", std::process::id());
         let missing = |instructions: &str| {
             let bot = serde_json::json!({ "instructions": instructions });
-            match review(&dir, &bot, &lead, false, None).unwrap() {
+            match review(&dir, &bot, &lead, false, None).unwrap().0 {
                 Instructions::Kept { missing } => missing,
                 other => panic!("kept, not {other:?}"),
             }

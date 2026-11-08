@@ -2029,14 +2029,18 @@ async fn setup_lead(
         .unwrap_or_default()
         .to_owned();
     let mut asked = json!({"bot": lead.bot});
-    if let Ok(project::Instructions::Stale(text)) = project::review(
+    let mut left_out = Vec::new();
+    if let Ok((reviewed, left)) = project::review(
         Path::new(&workspace),
         &record,
         &key,
         lead.new,
         project::chosen(&agent.options.store, &lead.bot).as_deref(),
     ) {
-        asked["instructions"] = json!(text);
+        left_out = left;
+        if let project::Instructions::Stale(text) = reviewed {
+            asked["instructions"] = json!(text);
+        }
     }
     let declare = declared::declare(&record, crate::served::Role::LEAD);
     if let Some(declare) = &declare {
@@ -2089,6 +2093,24 @@ async fn setup_lead(
                 "severity": "warning", "title": format!("{} kept its setup", lead.bot),
                 "description": error.to_string()}),
             ),
+        }
+    }
+    // What it opened without: the thread says so, and the lead is told
+    // with its next model call, as in Sonny's window.
+    if !left_out.is_empty() {
+        agent.out.update(
+            session,
+            json!({"sessionUpdate": "notice", "severity": "warning",
+            "title": format!("{} opened without what it could not use", lead.bot),
+            "description": left_out.join("\n")}),
+        );
+        if let Err(error) = project::tell_warnings(client, &lead.bot, &left_out).await {
+            agent.out.update(
+                session,
+                json!({"sessionUpdate": "notice", "severity": "warning",
+                "title": format!("{} was not told what it opened without", lead.bot),
+                "description": error}),
+            );
         }
     }
     lookout::subscribe_lead(&agent.options.store, &lead.bot, &lead.project)?;
