@@ -1096,6 +1096,7 @@ impl Screen {
             let at = placed[p].clone();
             let row = self.pages[..p].iter().map(|p| p.rows).sum::<usize>();
             let rows = self.pages[p].rows;
+            self.forget(row..row + rows);
             self.rows.splice(
                 row..row + rows,
                 (0..at.len()).map(|_| Row {
@@ -1287,6 +1288,19 @@ impl Screen {
         }
     }
 
+    /// The times of the messages ending in `rows`, about to go: a page
+    /// drawn again brings its own back, so only what is drawn is kept.
+    fn forget(&mut self, rows: std::ops::Range<usize>) {
+        if self.dates.is_empty() {
+            return;
+        }
+        for row in &self.rows[rows] {
+            if let Some(Tag::End(node)) = row.tag {
+                self.dates.remove(&node);
+            }
+        }
+    }
+
     /// The oldest rows let go, a batch at a time, once new ones written
     /// pass what is kept and the view is below them: not for older ones
     /// drawn above, nor for the rows wrapped anew at another width.
@@ -1308,6 +1322,7 @@ impl Screen {
                 .len()
                 .saturating_sub(self.back + self.area.height as usize);
             if gone <= view {
+                self.forget(0..drop);
                 self.rows.drain(..drop);
                 self.wrapped -= drop;
                 self.shown.drain(..gone);
@@ -3327,6 +3342,36 @@ mod tests {
         assert!(screen.pages[0].drawn && !screen.pages[1].drawn);
         assert_eq!(screen.height(20), 14_050);
         assert_eq!(screen.wanted(), None);
+    }
+
+    #[test]
+    fn a_message_time_goes_with_its_rows_and_comes_back_with_its_page() {
+        let area = Rect::new(0, 0, 20, 5);
+        let dated = |range, node| {
+            let mut page = written(rows(range));
+            page.mark_last(Mark::Tag(Tag::End(node)));
+            page.date(node, 1_000 * node);
+            page
+        };
+        let (mut screen, _) = screen(rows(20_000..20_050), 20, 5);
+        screen.prepend(1, dated(10_000..17_000, 1));
+        screen.prepend(2, dated(0..7_000, 2));
+        drawn(&mut screen, area);
+        // The page let go took its message's time; the one drawn kept its.
+        assert!(!screen.pages[0].drawn);
+        assert_eq!((screen.dated(2), screen.dated(1)), (None, Some(1_000)));
+        screen.scroll(isize::MAX);
+        screen.fill(2, dated(0..7_000, 2));
+        drawn(&mut screen, area);
+        assert_eq!((screen.dated(2), screen.dated(1)), (Some(2_000), None));
+        // The oldest rows trimmed away take theirs too.
+        let mut screen = written(rows(0..10));
+        screen.mark_last(Mark::Tag(Tag::End(3)));
+        screen.date(3, 3_000);
+        screen.push(rows(10..KEEP + KEEP / 4 + 11));
+        drawn(&mut screen, area);
+        assert!(screen.trimmed());
+        assert_eq!(screen.dated(3), None);
     }
 
     #[test]
