@@ -21795,7 +21795,7 @@ mod tests {
         // The agent marks its reply as waiting on the person while no key or
         // event wakes the window: the next look round, at most a frame
         // later, reads it.
-        std::fs::write(&file, r#"{"turn": 3, "for": "a decision"}"#).unwrap();
+        std::fs::write(&file, r#"{"v": 2, "turn": 3, "for": "a decision"}"#).unwrap();
         waiting.read();
         assert!(waiting.holds(false));
         assert_eq!(waiting.mark.as_ref().unwrap().waiting_for, "a decision");
