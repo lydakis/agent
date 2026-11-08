@@ -378,6 +378,8 @@ async fn waiting_for(
 /// or a message steered into it, theirs, not another agent's, a client's
 /// or another person's. The daemon reads a turn's words whole however
 /// long it ran; past [`PROMPTS`] bytes of them it is read again whole.
+/// Words past even that may be theirs: unsure, it counts them, as a mark
+/// is status alone, and one wrongly withheld would be kept for good.
 async fn heard_the_person(client: &Client, bot: &str, turn: i64) -> Result<bool, String> {
     for bytes in [PROMPTS, PROMPTS_MOST] {
         let read = client
@@ -391,7 +393,7 @@ async fn heard_the_person(client: &Client, bot: &str, turn: i64) -> Result<bool,
             return Ok(theirs);
         }
     }
-    Ok(false)
+    Ok(true)
 }
 
 /// How many bytes of a turn's words [`heard_the_person`] reads first, and
@@ -665,6 +667,7 @@ mod tests {
                     let lead = json!({"turn": 3, "text": "brief", "from": {"bot": "calc.lead", "turn": 2}});
                     match (request["bot"].as_str(), request["bytes"].as_u64()) {
                         (Some("calc.told"), _) => json!({"prompts": [lead], "prompts_more": false}),
+                        (Some("calc.long"), _) => json!({"prompts": [lead], "prompts_more": true}),
                         (_, Some(16384)) => json!({"prompts": [lead], "prompts_more": true}),
                         _ => json!({"prompts": [lead, {"turn": 4, "text": "Ship it.", "steer": true}],
                             "prompts_more": false}),
@@ -697,6 +700,12 @@ mod tests {
             Ok(None)
         );
         assert_eq!(crate::reviews::read(&store, "calc.told", 6), ["CR-881"]);
+        // Words past even the daemon's bound may be the person's: unsure,
+        // they count, as a mark is status alone.
+        assert_eq!(
+            waiting_for(&client, &store, "calc.long", 8, 3).await,
+            Ok(Some("staging or prod".into()))
+        );
         // A lead's reply is the person's to read, whoever started its turn.
         assert_eq!(
             waiting_for(&client, &store, "calc.lead", 7, 3).await,
