@@ -7862,6 +7862,53 @@ moves by itself between runs on the shared runner (1.74 to 1.66 KiB on
 #812's screen, which touched nothing per bot), and the idle and
 after-a-turn RSS both fell here; the drain itself is the table above.
 
+## A session closing visits only the bots it followed
+
+A session closing ran `retain` over the followers of every bot anyone
+followed by name, to find its own: Θ(followed bots) per close, so as many
+sessions closing as bots followed cost Θ(n²) under the hub's lock on the
+daemon's one thread. Sonny's lookout, Sky and tool host follow `*`, so it
+grew with the bots programs and windows follow one by one. Now the hub
+keeps the bots each session follows by name, and closing visits only
+those. Approver tags are still read in full at a close; they number a few.
+
+Wall time of n short sessions closing, each following one bot, beside one
+session following all n, release build, 4-core Linux cloud container (Xeon
+2.1 GHz), main d82ec12 against this change:
+
+| Bots followed | Before | After |
+| ---: | ---: | ---: |
+| 100 | 0.09 ms | 0.04 ms |
+| 1,000 | 10 ms | 0.5 ms |
+| 4,000 | 134 ms | 3.3 ms |
+| 16,000 | 5,887 ms | 18 ms |
+
+About 1 µs per close, growing only with the hash maps' size. Memory: one
+set per session that follows a bot by name, holding those names.
+`a_session_closing_costs_the_same_however_many_bots_others_follow` times
+8,000 and 16,000; with the full scan back it fails.
+
+The Perf workflow's matched screen, base main d34479c against the PR head
+65ca5c1, on the GitHub runner (2026-11-08), passed:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 39.299 | 39.943 | +1.6% |
+| admission | burst submit p99, ms | 6.847 | 6.873 | +0.4% |
+| completion | release to terminal p99, ms | 14.257 | 14.092 | -1.2% |
+| footprint | idle RSS, MiB | 15.412 | 15.242 | -1.1% |
+| footprint | per idle bot, KiB | 1.528 | 1.64 | +7.3% |
+| footprint | RSS after a turn each, MiB | 25.035 | 24.707 | -1.3% |
+| footprint | CPU per turn, ms | 1.302 | 1.304 | +0.2% |
+| lifecycle | CPU, s | 0.615 | 0.615 | +0.0% |
+| lifecycle | p95 turn, ms | 580.032 | 582.222 | +0.4% |
+| lifecycle | peak RSS, MiB | 22.73 | 22.822 | +0.4% |
+
+A follow now adds one hash insert, and a session that follows by name holds
+one set of those names; neither shows past the runner's noise. The per idle
+bot row moved the other way on #827's screen, which changed nothing per
+bot, and the idle and after-a-turn RSS fell here.
+
 ## Each bot carries its whole status (protocol 58, schema 88, #658)
 
 A bot's row now says what its turn is doing (`started_ms`, `waiting_on`,
