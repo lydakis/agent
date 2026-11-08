@@ -43,6 +43,22 @@ pub(crate) fn valid_call_id(id: &str) -> bool {
     !id.is_empty() && !id.contains('\0') && encoded_len(id) <= MAX_CALL_ID
 }
 
+/// A provider's frame or item that would not parse: serde's words and how
+/// it began, so the shape that broke it shows without the whole of it.
+pub(crate) fn unparsed(error: serde_json::Error, frame: &[u8]) -> Error {
+    const HEAD: usize = 512;
+    let mut error = Error::from(error);
+    let head = String::from_utf8_lossy(&frame[..frame.len().min(HEAD)]);
+    let head: String = head
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let more = if frame.len() > HEAD { "…" } else { "" };
+    let said = error.detail.take().unwrap_or_default();
+    error.detail = Some(format!("{said}; it began {head}{more}"));
+    error
+}
+
 /// The bytes `text` takes as a JSON string body, as serde_json escapes it.
 /// Decoded text can grow up to sixfold when encoded, so output bounds count
 /// this rather than the decoded length.
@@ -83,37 +99,6 @@ const IDLE_READ: Duration = Duration::from_secs(120);
 /// The ChatGPT Codex endpoint's sticky-routing header; see `Request::route`.
 const TURN_STATE: &str = "x-codex-turn-state";
 
-/// Default idle time after which an Anthropic prompt cache is refreshed while
-/// a turn runs a tool: under the cache's five-minute lifetime, with a minute's
-/// margin for the request itself.
-pub const KEEP_WARM: Duration = Duration::from_secs(240);
-/// How long an Anthropic prompt cache lives unread, by default.
-pub const CACHE_LIFETIME: Duration = Duration::from_secs(300);
-/// The longest a cache refresh waits for its pool, even when the cache it
-/// refreshes would outlive the wait.
-const KEEP_WARM_WAIT: Duration = Duration::from_secs(30);
-
-/// Whether a cache refresh has been sent: once it has, it is billed and its
-/// answer must be kept; before then, cancelling it costs nothing.
-#[derive(Default)]
-pub struct Refresh(std::sync::atomic::AtomicU8);
-impl Refresh {
-    const SENT: u8 = 1;
-    const CANCELLED: u8 = 2;
-    /// Claim the send; false once cancelled.
-    fn send(&self) -> bool {
-        self.swap_from_idle(Self::SENT)
-    }
-    /// Cancel an unsent refresh; false when it was already sent.
-    pub fn cancel(&self) -> bool {
-        self.swap_from_idle(Self::CANCELLED)
-    }
-    fn swap_from_idle(&self, to: u8) -> bool {
-        use std::sync::atomic::Ordering::{AcqRel, Acquire};
-        self.0.compare_exchange(0, to, AcqRel, Acquire).is_ok()
-    }
-}
-
 /// Betas every Anthropic API request opts into: the thinking-binding check,
 /// dropping rather than failing on a mismatch (the drops are reported);
 /// fallback credit, which a refusal mints so a retry on another model is
@@ -149,6 +134,21 @@ impl Speed {
     }
 }
 
+/// The TLS client setup every connection the daemon makes shares: TLS 1.2
+/// and 1.3, the platform's verifier and its root certificates, loaded once,
+/// and `alpn` offered in that order. A clone shares the verifier.
+pub(crate) fn tls_config(alpn: &[&[u8]]) -> Result<rustls::ClientConfig> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .and_then(|builder| builder.with_platform_verifier())
+        .map_err(|_| Error::new("http_client_init"))?
+        .with_no_client_auth();
+    tls.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    Ok(tls)
+}
+
 /// HTTP connections and the startup-admission budget shared by every
 /// provider. Each shard is its own client, so its own pooled HTTP/2
 /// connection per host; a request takes the least-loaded shard and holds it
@@ -175,6 +175,9 @@ impl Transport {
     /// no bound beyond the operating system. `connections` is the number of
     /// shards, at least one.
     pub fn new(max_connecting: usize, connections: usize) -> Result<Arc<Self>> {
+        // One TLS setup for every shard: building each client's own loaded
+        // the system's root certificates once per shard.
+        let tls = tls_config(&[b"h2", b"http/1.1"])?;
         let shards = (0..connections.max(1))
             .map(|_| {
                 // No total deadline: long generations are legitimate. Idle
@@ -189,6 +192,7 @@ impl Transport {
                     .read_timeout(IDLE_READ)
                     .pool_idle_timeout(Duration::from_secs(60))
                     .pool_max_idle_per_host(1024)
+                    .use_preconfigured_tls(tls.clone())
                     .build()
                     .map_err(|_| Error::new("http_client_init"))?;
                 Ok(Shard {
@@ -242,8 +246,6 @@ pub struct Provider {
     login: Option<Arc<login::Login>>,
     max_output_tokens: Option<u32>,
     stall_timeout: Duration,
-    /// Refresh an idle Anthropic prompt cache after this long; `None` disables.
-    keep_warm: Option<Duration>,
     /// Ask Anthropic to cache for an hour instead of five minutes.
     cache_hour: bool,
     /// A faster tier than standard, one this provider serves.
@@ -255,8 +257,13 @@ pub struct Provider {
     /// A Bedrock endpoint, however it authenticates: it takes no fallback
     /// credit and serves no WebSocket.
     bedrock: bool,
+    /// Bedrock Mantle, the one Bedrock endpoint that hosts server-side tools.
+    mantle: bool,
     /// The models this provider last listed, shared by every clone.
     listing: Arc<models::Listing>,
+    /// The windows the person set, with the name this provider is bound
+    /// to, which their model paths start with.
+    windows: Option<(Arc<str>, Arc<Windows>)>,
 }
 
 /// Streamed text or thinking, with the index of the response's output item
@@ -402,6 +409,9 @@ pub struct Request<'a> {
     pub tools: &'a RawValue,
     /// Keep schemas needed to interpret history while disabling new calls.
     pub allow_tool_calls: bool,
+    /// A JSON Schema the reply's text must follow, which the provider
+    /// enforces as it writes: its structured output. Tool calls still go.
+    pub output_schema: Option<&'a RawValue>,
     /// Offer the provider's web search beside `tools`, as it declares it.
     pub web_search: bool,
     /// The credit a refusal minted, sent with this retry of the refused
@@ -423,8 +433,7 @@ pub struct Request<'a> {
     /// core/src/client.rs). HTTP only.
     pub route: Option<&'a OnceLock<String>>,
     /// When the request was last sent, where its prompt cache's lifetime
-    /// starts. Shared so a caller refreshing that cache while the reply
-    /// streams can read it before the call returns.
+    /// starts, for the call's usage record.
     pub sent: Option<&'a Sent>,
 }
 
@@ -505,7 +514,9 @@ impl Provider {
             Family::Anthropic => "messages",
         };
         url.set_path(&format!("{}/{route}", url.path().trim_end_matches('/')));
-        let bedrock = aws::endpoint(&url).is_some();
+        let endpoint = aws::endpoint(&url);
+        let bedrock = endpoint.is_some();
+        let mantle = endpoint.is_some_and(|(_, service)| service == "bedrock-mantle");
         Ok(Self {
             transport,
             pools: Arc::new(pace::Pools::default()),
@@ -515,14 +526,21 @@ impl Provider {
             login: None,
             max_output_tokens: None,
             stall_timeout: STALL_TIMEOUT,
-            keep_warm: Some(KEEP_WARM),
             cache_hour: false,
             speed: None,
             sockets: None,
             aws: None,
             bedrock,
+            mantle,
             listing: Arc::default(),
+            windows: None,
         })
+    }
+    /// The context windows the person set, read for models of this
+    /// provider by `name/model`.
+    pub fn with_windows(mut self, name: &str, windows: Arc<Windows>) -> Self {
+        self.windows = Some((name.into(), windows));
+        self
     }
     /// Model pool levels behind this provider, for `stats`.
     pub fn status(&self) -> serde_json::Value {
@@ -559,6 +577,14 @@ impl Provider {
         if let Some(sockets) = &self.sockets {
             sockets.recorded(bot, ids);
         }
+    }
+    /// Whether the endpoint takes OpenAI's custom tools, whose call is
+    /// free-form text a grammar shapes: OpenAI's own API, on a key or the
+    /// ChatGPT plan. Other Responses endpoints may serve OpenAI's models
+    /// but refuse the tool for others (Grok on Bedrock, 2026-11-07), so
+    /// there a grammar tool is a function taking its text.
+    pub fn grammars(&self) -> bool {
+        self.family == Family::Responses && self.url.host_str() == Some("api.openai.com")
     }
     pub fn family(&self) -> Family {
         self.family
@@ -701,25 +727,9 @@ impl Provider {
         Ok(self)
     }
 
-    /// Refresh an idle prompt cache after `after`, under its five-minute
-    /// lifetime; `None` disables it.
-    pub fn with_keep_warm(mut self, after: Option<Duration>) -> Result<Self> {
-        if after.is_some_and(|after| after.is_zero() || after >= CACHE_LIFETIME) {
-            return Err(Error::with(
-                "invalid_keep_warm",
-                format!(
-                    "keep_warm is more than 0 and under the {}s cache lifetime",
-                    CACHE_LIFETIME.as_secs()
-                ),
-            ));
-        }
-        self.keep_warm = after;
-        Ok(self)
-    }
-
     /// Ask Anthropic to keep prompt caches for an hour: each write bills
-    /// twice the input rate instead of 1.25 times, and needs no refresh
-    /// across a gap under an hour. The Responses family takes no lifetime.
+    /// twice the input rate instead of 1.25 times, and lasts across a gap
+    /// under an hour. The Responses family takes no lifetime.
     pub fn with_cache_hour(mut self, hour: bool) -> Self {
         self.cache_hour = hour && self.family == Family::Anthropic;
         self
@@ -740,32 +750,22 @@ impl Provider {
         self.family == Family::Anthropic && !(self.bedrock && five_minute_cache(model))
     }
 
-    /// This provider with one bot's output bound, cache lifetime, keep-warm
-    /// and speed; borrowed, with no copy, when they are its own.
+    /// This provider with one bot's output bound, cache lifetime and speed;
+    /// borrowed, with no copy, when they are its own.
     pub fn shaped(
         &self,
         max_output_tokens: Option<u32>,
-        keep_warm: Option<Duration>,
         cache_hour: bool,
         speed: Option<Speed>,
     ) -> Result<std::borrow::Cow<'_, Self>> {
         let cache_hour = cache_hour && self.family == Family::Anthropic;
         let speed = speed.filter(|speed| *speed != Speed::Standard);
-        if (max_output_tokens, keep_warm, cache_hour, speed)
-            == (
-                self.max_output_tokens,
-                self.keep_warm,
-                self.cache_hour,
-                self.speed,
-            )
+        if (max_output_tokens, cache_hour, speed)
+            == (self.max_output_tokens, self.cache_hour, self.speed)
         {
             return Ok(std::borrow::Cow::Borrowed(self));
         }
-        let mut shaped = self
-            .clone()
-            .with_keep_warm(keep_warm)?
-            .with_cache_hour(cache_hour)
-            .with_speed(speed)?;
+        let mut shaped = self.clone().with_cache_hour(cache_hour).with_speed(speed)?;
         shaped.max_output_tokens = None;
         if let Some(limit) = max_output_tokens {
             shaped = shaped.with_max_output_tokens(limit)?;
@@ -773,30 +773,8 @@ impl Provider {
         Ok(std::borrow::Cow::Owned(shaped))
     }
 
-    /// How long a turn may sit on a tool before its prompt cache is refreshed
-    /// with [`Provider::keep_warm`], or `None` where that does not apply.
-    /// Anthropic's own API only: a request with `max_tokens: 0` generates
-    /// nothing, bills a cache read, and restarts the cache's lifetime. It
-    /// rejects budgeted thinking, so older models with thinking on are left
-    /// out, and Bedrock is left out until the same request is verified there.
-    /// The Responses cache outlives a long tool call without help.
-    pub fn keep_warm_after(&self, model: &str, reasoning: Option<&str>) -> Option<Duration> {
-        let applies = self.family == Family::Anthropic
-            && !self.cache_hour
-            && !self.bedrock
-            && !(reasoning.is_some() && legacy_thinking(model));
-        self.keep_warm.filter(|_| applies)
-    }
-
     /// Everything before the history array, ending with `[`.
     fn prefix(&self, request: &Request<'_>) -> Result<Vec<u8>> {
-        self.prefix_for(request, false)
-    }
-
-    /// The prefix of `request`, or with `warm` of the same request sent only
-    /// to refresh its cache: no output and no stream. Nothing else differs,
-    /// since the cache is keyed on everything the request renders.
-    fn prefix_for(&self, request: &Request<'_>, warm: bool) -> Result<Vec<u8>> {
         #[derive(Serialize)]
         struct Responses<'a> {
             model: &'a str,
@@ -813,6 +791,9 @@ impl Provider {
             tool_choice: Option<&'static str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             reasoning: Option<Value>,
+            /// The reply's structured output, when the turn asks for one.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            text: Option<Value>,
             #[serde(skip_serializing_if = "Option::is_none")]
             prompt_cache_key: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -882,7 +863,6 @@ impl Provider {
         };
         let disable_tools = !request.allow_tool_calls && tools.get() != "[]";
         let (mut bytes, field) = match self.family {
-            Family::Responses if warm => return fail("keep_warm_unsupported"),
             Family::Responses => (
                 serde_json::to_vec(&Responses {
                     model: request.model,
@@ -899,6 +879,12 @@ impl Provider {
                     reasoning: request
                         .reasoning
                         .map(|effort| json!({"effort":effort,"summary":"auto"})),
+                    // Strict, as Codex sends a turn's output schema: the
+                    // reply follows the schema exactly.
+                    text: request.output_schema.map(|schema| {
+                        json!({"format":{"type":"json_schema","name":"output",
+                            "schema":schema,"strict":true}})
+                    }),
                     prompt_cache_key: request.cache_key,
                     // Fast is OpenAI's priority tier, by the name every
                     // model that has one takes.
@@ -912,14 +898,14 @@ impl Provider {
             Family::Anthropic => (
                 serde_json::to_vec(&Anthropic {
                     model: request.model,
-                    max_tokens: if warm { 0 } else { max_tokens },
+                    max_tokens,
                     // An explicit breakpoint after the static prefix (tools
                     // and instructions) guarantees a read point for it.
                     system: (!request.instructions.is_empty()).then(|| {
                         json!([{"type":"text","text":request.instructions,
                             "cache_control":cache}])
                     }),
-                    stream: !warm,
+                    stream: true,
                     cache_control: cache.clone(),
                     tools: (tools.get() != "[]").then_some(tools),
                     tool_choice: disable_tools.then_some(ToolChoice { r#type: "none" }),
@@ -941,10 +927,23 @@ impl Provider {
                                 "block_binding":{"prefix_mismatch_behavior":"drop_block"}})
                         }
                     }),
-                    output_config: request
-                        .reasoning
-                        .filter(|_| !legacy_thinking(request.model))
-                        .map(|level| json!({"effort":level})),
+                    // Effort, where the model takes it, and the reply's
+                    // structured output, when the turn asks for one.
+                    output_config: {
+                        let mut config = serde_json::Map::new();
+                        if let Some(level) =
+                            (request.reasoning).filter(|_| !legacy_thinking(request.model))
+                        {
+                            config.insert("effort".into(), json!(level));
+                        }
+                        if let Some(schema) = request.output_schema {
+                            config.insert(
+                                "format".into(),
+                                json!({"type":"json_schema","schema":schema}),
+                            );
+                        }
+                        (!config.is_empty()).then_some(Value::Object(config))
+                    },
                     fallback_credit_token: request.fallback_credit.filter(|_| !self.bedrock),
                     speed: self.speed.map(Speed::name),
                 })?,
@@ -961,125 +960,6 @@ impl Provider {
     fn body(&self, prefix: Bytes, items: &Items) -> (reqwest::Body, usize) {
         let len = prefix.len() + items.bytes + 2;
         (reqwest::Body::wrap_stream(framed(prefix, items)), len)
-    }
-
-    /// Send `request` again only to restart its prompt cache's lifetime:
-    /// no output and no stream, so it bills a read of the cache the previous
-    /// call left. Paced and admitted like any call, but it gives up rather
-    /// than wait for a closed or busy pool or for startup admission past
-    /// `expires`, when the cache it refreshes is gone, or past a 30-second
-    /// bound. `refresh` records the send: from then on the request is
-    /// billed, and dropping it loses what it cost. Returns the usage and
-    /// when the request was sent, which is when the cache was last read.
-    pub async fn keep_warm(
-        &self,
-        request: Request<'_>,
-        refresh: &Refresh,
-        expires: tokio::time::Instant,
-    ) -> Result<(Usage, tokio::time::Instant)> {
-        self.keep_warm_inner(request, refresh, expires)
-            .await
-            .map_err(|error| sanitize_error(error, self.key.as_deref()))
-    }
-
-    async fn keep_warm_inner(
-        &self,
-        request: Request<'_>,
-        refresh: &Refresh,
-        expires: tokio::time::Instant,
-    ) -> Result<(Usage, tokio::time::Instant)> {
-        if self
-            .keep_warm_after(request.model, request.reasoning)
-            .is_none()
-        {
-            return fail("keep_warm_unsupported");
-        }
-        let pace = self.pools.get(&self.pool_key(request.model));
-        let prefix = Bytes::from(self.prefix_for(&request, true)?);
-        let estimate = pace::Cost {
-            input: self.input_estimate(&pace, prefix.len() + request.items.weight, 0),
-            output: 0,
-        };
-        let by = expires.min(tokio::time::Instant::now() + KEEP_WARM_WAIT);
-        let (mut reservation, admission) = tokio::time::timeout_at(by, async {
-            // A refresh has no turn of its own to park, so it waits out a
-            // parking wait here, within its deadline.
-            let reservation = loop {
-                let mut park_for = None;
-                match pace.acquire_cost(estimate, &mut park_for).await {
-                    Err(_) if let Some(wait) = park_for => tokio::time::sleep(wait).await,
-                    result => break result?,
-                }
-            };
-            Ok::<_, Error>((reservation, self.admit().await?))
-        })
-        .await
-        .map_err(|_| Error::new("provider_paced"))??;
-        let (body, len) = self.body(prefix, &request.items);
-        let (client, _lease) = self.transport.lease();
-        let http = client
-            .post(self.url.clone())
-            .header("content-type", "application/json")
-            .header("content-length", len)
-            .header("accept", "application/json")
-            .body(body);
-        let http = self.anthropic_headers(http, self.key.as_ref());
-        if !refresh.send() {
-            return fail("keep_warm_cancelled");
-        }
-        reservation.dispatch();
-        let sent_at = tokio::time::Instant::now();
-        let response = match http.send().await {
-            Ok(response) => response,
-            Err(error) => {
-                reservation.settle(0);
-                return Err(connection_error(error));
-            }
-        };
-        drop(admission);
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let headers = response.headers().clone();
-            let body = error_body(response).await.unwrap_or_default();
-            let quota = status == 429 && body.quota;
-            if !quota {
-                reservation.learn(&headers, self.limits());
-            }
-            if matches!(status, 429 | 529) && !quota {
-                refused(&pace, status == 529, retry_after(&headers));
-            }
-            reservation.settle(0);
-            return Err(waits(
-                Error {
-                    code: if quota {
-                        "provider_quota_exhausted".to_owned()
-                    } else {
-                        format!("provider_http_{status}")
-                    },
-                    detail: body.detail,
-                    facts: None,
-                },
-                &headers,
-            ));
-        }
-        reservation.learn(response.headers(), self.limits());
-        // The answer is a message with no content; only its usage matters.
-        let mut stream = response.bytes_stream();
-        let mut body = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| Error::new("provider_stream_failed"))?;
-            if chunk.len() > 64 * 1024 - body.len() {
-                reservation.settle(0);
-                return fail("provider_response_limit");
-            }
-            body.extend_from_slice(&chunk);
-        }
-        let message: Value = serde_json::from_slice(&body)
-            .map_err(|_| Error::with("invalid_provider_response", "keep-warm body"))?;
-        let usage = anthropic::message_usage(&message, self.cache_hour);
-        reservation.settle_refresh(&usage, self.family);
-        pace.accepted();
-        Ok((usage, sent_at))
     }
 
     /// The input a request of `bytes` reserves beside `output`: about a
@@ -1822,10 +1702,80 @@ fn claude_model(model: &str) -> &str {
         .unwrap_or(model)
 }
 
-/// The model's context window in tokens: what the provider's listing
-/// says, else the window Anthropic publishes for a Claude model (1M from
-/// Claude 5 on, 200K before), else 200K, the smallest a current model has.
+/// Context windows a person set by model path, `PROVIDER/MODEL` with `*`
+/// and `?` wildcards, as OpenCode sets a model's `limit.context` and
+/// Codex its `model_context_window`: for a model a provider does not list,
+/// or lists wrong, or to hold a bot under its model's full window. The
+/// most specific pattern a path matches wins: an exact path over every
+/// wildcard (a `*` can match nothing, so `a/*b` counts as many literal
+/// characters as `a/b`), then the one with the most characters that are
+/// not wildcards, then the first by name.
+#[derive(Debug, Default)]
+pub struct Windows(Vec<(String, u64)>);
+
+/// The least window a pattern may set: the least compaction threshold.
+pub const MIN_WINDOW: u64 = 1024;
+
+impl Windows {
+    /// `PATTERN=TOKENS`, each pattern once.
+    pub fn parse<'a>(specs: impl IntoIterator<Item = &'a str>) -> Result<Self> {
+        let mut set: Vec<(String, u64)> = Vec::new();
+        for spec in specs {
+            let parsed = spec.rsplit_once('=').and_then(|(pattern, tokens)| {
+                let tokens = tokens.parse::<u64>().ok().filter(|t| *t >= MIN_WINDOW)?;
+                (pattern.contains('/') && !pattern.chars().any(char::is_whitespace))
+                    .then(|| (pattern.to_owned(), tokens))
+            });
+            let Some((pattern, tokens)) = parsed else {
+                return fail_with(
+                    "usage",
+                    format!(
+                        "--context-window takes PROVIDER/MODEL=TOKENS, * and ? wildcards, at least {MIN_WINDOW} tokens, not {spec}"
+                    ),
+                );
+            };
+            if set.iter().any(|(given, _)| *given == pattern) {
+                return fail_with(
+                    "usage",
+                    format!("--context-window {pattern} is given twice"),
+                );
+            }
+            set.push((pattern, tokens));
+        }
+        let wild = |c: char| matches!(c, '*' | '?');
+        let rank = |pattern: &str| {
+            let literal = pattern.chars().filter(|c| !wild(*c)).count();
+            (pattern.chars().any(wild), std::cmp::Reverse(literal))
+        };
+        set.sort_by(|(a, _), (b, _)| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+        Ok(Self(set))
+    }
+    /// The window set for `path`, `PROVIDER/MODEL`.
+    pub fn get(&self, path: &str) -> Option<u64> {
+        (self.0.iter())
+            .find(|(pattern, _)| crate::tools::name_matches(pattern, path))
+            .map(|(_, tokens)| *tokens)
+    }
+    /// Each pattern and its window, as the daemon announces them.
+    pub fn json(&self) -> Value {
+        Value::Object(
+            (self.0.iter())
+                .map(|(pattern, tokens)| (pattern.clone(), (*tokens).into()))
+                .collect(),
+        )
+    }
+}
+
+/// The model's context window in tokens: the window the person set for
+/// it, else what the provider's listing says, else the window Anthropic
+/// publishes for a Claude model (1M from Claude 5 on, 200K before), else
+/// 200K, the smallest a current model has.
 pub fn context_window(provider: &Provider, model: &str) -> u64 {
+    if let Some(tokens) = (provider.windows.as_ref())
+        .and_then(|(name, windows)| windows.get(&format!("{name}/{model}")))
+    {
+        return tokens;
+    }
     if let Some(tokens) = provider.listed_window(model) {
         return tokens;
     }
@@ -2084,6 +2034,35 @@ mod tests {
     }
 
     #[test]
+    fn shards_share_one_tls_setup() {
+        // On Linux, loading the root certificates from disk is most of
+        // what a client costs to build; shared, 64 shards cost little more
+        // than one. Built apart, each loaded them again and 64 took about
+        // 64 times as long. macOS's verifier reads its roots from the
+        // system when it first checks a certificate, so building clients
+        // costs no load there either way.
+        #[cfg(target_os = "linux")]
+        let build = |shards| {
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    Transport::new(0, shards).unwrap();
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let (one, many) = (build(1), build(64));
+            assert!(many < one * 16, "1 shard {one:?}, 64 shards {many:?}");
+        }
+        Transport::new(0, 64).unwrap();
+        let tls = tls_config(&[b"h2", b"http/1.1"]).unwrap();
+        assert_eq!(tls.alpn_protocols, [b"h2".to_vec(), b"http/1.1".to_vec()]);
+    }
+
+    #[test]
     fn retry_after_reads_milliseconds_first_then_seconds() {
         use reqwest::header::{HeaderMap, HeaderValue};
         let mut headers = HeaderMap::new();
@@ -2112,6 +2091,78 @@ mod tests {
         ] {
             assert_eq!(context_window(&provider, model), window, "{model}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_window_the_person_set_beats_the_listing_most_specific_first() {
+        let transport = Transport::new(64, 1).unwrap();
+        let windows = Windows::parse([
+            "bedrock/*=400000",
+            "bedrock/*openai.*=1000000",
+            "bedrock/us.anthropic.claude-opus-5-5-v1:0=150000",
+            "anthropic/*=300000",
+        ])
+        .unwrap();
+        let windows = Arc::new(windows);
+        let bedrock = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            "http://127.0.0.1:1/v1",
+            None,
+        )
+        .unwrap()
+        .with_windows("bedrock", windows.clone());
+        for (model, window) in [
+            ("openai.gpt-6-sol", 1_000_000),
+            ("us.anthropic.claude-opus-5-5-v1:0", 150_000),
+            ("us.anthropic.claude-sonnet-5-5-v1:0", 400_000),
+            ("meta.llama-5", 400_000),
+        ] {
+            assert_eq!(context_window(&bedrock, model), window, "{model}");
+        }
+        // A pattern for every provider's Claude, lower than its own window
+        // on purpose (the runtime test sets one under a listing).
+        let anthropic = Provider::new(
+            transport.clone(),
+            Family::Anthropic,
+            "http://127.0.0.1:1/v1",
+            None,
+        )
+        .unwrap()
+        .with_windows("anthropic", windows.clone());
+        assert_eq!(context_window(&anthropic, "claude-opus-5-5"), 300_000);
+        // A provider no pattern names keeps its own windows.
+        let other = Provider::new(transport, Family::Anthropic, "http://127.0.0.1:1/v1", None)
+            .unwrap()
+            .with_windows("work", windows);
+        assert_eq!(context_window(&other, "claude-opus-5-5"), 1_000_000);
+        assert_eq!(context_window(&other, "gpt-6-luna"), 200_000);
+        for wrong in [
+            "bedrock=1000000",
+            "bedrock/*=1000",
+            "bedrock/*=lots",
+            "a b/c=2000",
+        ] {
+            assert_eq!(
+                Windows::parse([wrong]).unwrap_err().code,
+                "usage",
+                "{wrong}"
+            );
+        }
+        assert!(Windows::parse(["a/b=2000", "a/b=3000"]).is_err());
+    }
+
+    #[test]
+    fn an_exact_window_beats_a_wildcard_that_matches_nothing() {
+        // `provider/*model` has as many literal characters as the exact
+        // path and sorts first by name; its `*` matches nothing here.
+        let windows = Windows::parse(["provider/*model=1000000", "provider/model=200000"]).unwrap();
+        assert_eq!(windows.get("provider/model"), Some(200_000));
+        assert_eq!(windows.get("provider/big-model"), Some(1_000_000));
+        let windows = Windows::parse(["a/b?=3000", "a/b=2000", "a/*=4000"]).unwrap();
+        assert_eq!(windows.get("a/b"), Some(2_000));
+        assert_eq!(windows.get("a/bc"), Some(3_000));
+        assert_eq!(windows.get("a/c"), Some(4_000));
     }
 
     #[test]
@@ -2172,6 +2223,7 @@ mod tests {
                 reasoning: Some("high"),
                 tools: &none(),
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 cache_key: None,
@@ -2204,6 +2256,7 @@ mod tests {
                 reasoning: Some("low"),
                 tools: &none(),
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: Some("credit"),
                 cache_key: Some("k"),
@@ -2230,6 +2283,7 @@ mod tests {
                     reasoning: None,
                     tools: &none(),
                     allow_tool_calls: true,
+                    output_schema: None,
                     web_search: false,
                     fallback_credit: None,
                     cache_key: None,
@@ -2251,6 +2305,7 @@ mod tests {
                 reasoning: Some("low"),
                 tools: &none(),
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 cache_key: None,
@@ -2274,6 +2329,7 @@ mod tests {
                 reasoning: None,
                 tools: &none(),
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 cache_key: None,
@@ -2301,6 +2357,7 @@ mod tests {
                 reasoning: None,
                 tools: &none(),
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 cache_key: Some("k"),
@@ -2326,7 +2383,7 @@ mod tests {
                 Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
             let schemas = crate::tools::Registry::all()
                 .unwrap()
-                .encoded(family, &["echo".into()], &[], false)
+                .encoded(family, false, &["echo".into()], &[], false)
                 .unwrap();
             for allow in [true, false] {
                 for tools in [&*schemas, &*none()] {
@@ -2337,6 +2394,7 @@ mod tests {
                             reasoning: None,
                             tools,
                             allow_tool_calls: allow,
+                            output_schema: None,
                             web_search: false,
                             fallback_credit: None,
                             cache_key: None,
@@ -2365,6 +2423,75 @@ mod tests {
                             }
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// A turn's output schema goes as each family's structured output,
+    /// beside the effort and the tools; without one the request is as
+    /// before.
+    #[test]
+    fn an_output_schema_is_each_familys_structured_output() {
+        let transport = Transport::new(64, 1).unwrap();
+        let schema = RawValue::from_string(
+            r#"{"type":"object","additionalProperties":false,"required":["a"],"properties":{"a":{"type":"string"}}}"#
+                .into(),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(schema.get()).unwrap();
+        let tools = crate::tools::Registry::all().unwrap();
+        for family in [Family::Anthropic, Family::Responses] {
+            let provider =
+                Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
+            let schemas = tools
+                .encoded(family, false, &["echo".into()], &[], false)
+                .unwrap();
+            let body = |output_schema, reasoning| {
+                let mut prefix = provider
+                    .prefix(&Request {
+                        model: "claude-sonnet-5",
+                        instructions: "i",
+                        reasoning,
+                        tools: &schemas,
+                        allow_tool_calls: true,
+                        output_schema,
+                        web_search: false,
+                        fallback_credit: None,
+                        cache_key: None,
+                        items: Items::empty(),
+                        chain: None,
+                        route: None,
+                        sent: None,
+                    })
+                    .unwrap();
+                prefix.extend_from_slice(b"]}");
+                serde_json::from_slice::<Value>(&prefix).unwrap()
+            };
+            let asked = body(Some(&*schema), Some("low"));
+            // The tools stay callable: the schema holds the reply's text.
+            assert!(asked.get("tool_choice").is_none());
+            assert!(asked["tools"].is_array());
+            let plain = body(None, Some("low"));
+            match family {
+                Family::Anthropic => {
+                    assert_eq!(
+                        asked["output_config"],
+                        json!({"effort":"low","format":{"type":"json_schema","schema":parsed}})
+                    );
+                    assert_eq!(
+                        body(Some(&*schema), None)["output_config"],
+                        json!({"format":{"type":"json_schema","schema":parsed}})
+                    );
+                    assert_eq!(plain["output_config"], json!({"effort":"low"}));
+                }
+                Family::Responses => {
+                    assert_eq!(
+                        asked["text"],
+                        json!({"format":{"type":"json_schema","name":"output",
+                            "schema":parsed,"strict":true}})
+                    );
+                    assert!(plain.get("text").is_none());
                 }
             }
         }
@@ -2420,6 +2547,7 @@ mod tests {
                     reasoning: Some("high"),
                     tools: &none(),
                     allow_tool_calls: true,
+                    output_schema: None,
                     web_search: false,
                     fallback_credit: None,
                     cache_key: None,
@@ -2520,6 +2648,7 @@ mod tests {
                     reasoning: Some("high"),
                     tools: &none(),
                     allow_tool_calls: true,
+                    output_schema: None,
                     web_search: false,
                     fallback_credit: Some("credit"),
                     cache_key: None,
@@ -2535,52 +2664,10 @@ mod tests {
         }
     }
 
-    /// A refresh is the call's own request with no output and no stream:
-    /// anything else it rendered differently would miss the call's cache.
-    #[test]
-    fn a_keep_warm_request_differs_only_in_output_and_streaming() {
-        let transport = Transport::new(64, 1).unwrap();
-        let provider = Provider::new(
-            transport,
-            Family::Anthropic,
-            "https://api.anthropic.com/v1",
-            None,
-        )
-        .unwrap();
-        let tools = none();
-        let request = || Request {
-            model: "claude-sonnet-5",
-            instructions: "i",
-            reasoning: Some("high"),
-            tools: &tools,
-            allow_tool_calls: true,
-            web_search: false,
-            fallback_credit: None,
-            cache_key: None,
-            items: Items::empty(),
-            chain: None,
-            route: None,
-            sent: None,
-        };
-        let parse = |mut bytes: Vec<u8>| -> Value {
-            bytes.extend_from_slice(b"]}");
-            serde_json::from_slice(&bytes).unwrap()
-        };
-        let call = parse(provider.prefix(&request()).unwrap());
-        let mut warm = parse(provider.prefix_for(&request(), true).unwrap());
-        assert_eq!(
-            (&warm["max_tokens"], &warm["stream"]),
-            (&json!(0), &json!(false))
-        );
-        warm["max_tokens"] = call["max_tokens"].clone();
-        warm["stream"] = json!(true);
-        assert_eq!(warm, call);
-    }
-
     /// An hour-long cache marks both breakpoints alike, since a longer
-    /// lifetime may not follow a shorter one, and needs no refresh.
+    /// lifetime may not follow a shorter one.
     #[test]
-    fn an_hour_long_cache_marks_both_breakpoints_and_is_not_refreshed() {
+    fn an_hour_long_cache_marks_both_breakpoints() {
         let transport = Transport::new(64, 1).unwrap();
         let provider = Provider::new(
             transport.clone(),
@@ -2597,6 +2684,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -2611,7 +2699,6 @@ mod tests {
         let hour = json!({"type":"ephemeral","ttl":"1h"});
         assert_eq!(body["cache_control"], hour);
         assert_eq!(body["system"][0]["cache_control"], hour);
-        assert_eq!(provider.keep_warm_after("claude-sonnet-5", None), None);
         let responses = Provider::new(transport, Family::Responses, "https://h/v1", None)
             .unwrap()
             .with_cache_hour(true);
@@ -2664,6 +2751,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 cache_key: None,
@@ -2693,21 +2781,16 @@ mod tests {
             None,
         )
         .unwrap();
-        let same = anthropic
-            .shaped(None, Some(KEEP_WARM), false, None)
-            .unwrap();
+        let same = anthropic.shaped(None, false, None).unwrap();
         assert!(matches!(same, std::borrow::Cow::Borrowed(_)));
-        let own = anthropic.shaped(Some(4096), None, true, None).unwrap();
-        assert_eq!(
-            (own.max_output_tokens, own.keep_warm, own.cache_hour),
-            (Some(4096), None, true)
-        );
+        let own = anthropic.shaped(Some(4096), true, None).unwrap();
+        assert_eq!((own.max_output_tokens, own.cache_hour), (Some(4096), true));
         assert_eq!(anthropic.anthropic_max_tokens("claude-sonnet-5"), 128_000);
         assert_eq!(own.anthropic_max_tokens("claude-sonnet-5"), 4096);
         // Its family's own rules still hold.
         assert_eq!(
             anthropic
-                .shaped(Some(1024), None, false, None)
+                .shaped(Some(1024), false, None)
                 .err()
                 .unwrap()
                 .code,
@@ -2715,78 +2798,8 @@ mod tests {
         );
         // Responses keeps no cache lifetime, so an hour asks for nothing.
         let responses = Provider::new(transport, Family::Responses, "https://h/v1", None).unwrap();
-        let hour = responses.shaped(None, Some(KEEP_WARM), true, None).unwrap();
+        let hour = responses.shaped(None, true, None).unwrap();
         assert!(matches!(hour, std::borrow::Cow::Borrowed(_)));
-    }
-
-    /// Only Anthropic's own API refreshes: the Responses cache outlives a
-    /// long tool call, budgeted thinking refuses `max_tokens: 0`, and Bedrock
-    /// has not been verified to take it.
-    #[test]
-    fn keep_warm_applies_where_a_zero_output_request_is_accepted() {
-        let transport = Transport::new(64, 1).unwrap();
-        let anthropic = Provider::new(
-            transport.clone(),
-            Family::Anthropic,
-            "https://api.anthropic.com/v1",
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            anthropic.keep_warm_after("claude-sonnet-5", Some("high")),
-            Some(KEEP_WARM)
-        );
-        assert_eq!(
-            anthropic.keep_warm_after("claude-haiku-4-5", None),
-            Some(KEEP_WARM)
-        );
-        assert_eq!(
-            anthropic.keep_warm_after("claude-haiku-4-5", Some("low")),
-            None
-        );
-        let off = Provider::new(
-            transport.clone(),
-            Family::Anthropic,
-            "https://api.anthropic.com/v1",
-            None,
-        )
-        .unwrap()
-        .with_keep_warm(None)
-        .unwrap();
-        assert_eq!(off.keep_warm_after("claude-sonnet-5", None), None);
-        let responses = Provider::new(
-            transport.clone(),
-            Family::Responses,
-            "https://api.openai.com/v1",
-            None,
-        )
-        .unwrap();
-        assert_eq!(responses.keep_warm_after("gpt-5", None), None);
-        let bedrock = Provider::new(
-            transport.clone(),
-            Family::Anthropic,
-            "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1",
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            bedrock.keep_warm_after("anthropic.claude-sonnet-5", None),
-            None
-        );
-        for after in [0, 300] {
-            let refused = Provider::new(
-                transport.clone(),
-                Family::Anthropic,
-                "https://a.test/v1",
-                None,
-            )
-            .unwrap()
-            .with_keep_warm(Some(Duration::from_secs(after)));
-            assert_eq!(
-                refused.err().map(|e| e.code),
-                Some("invalid_keep_warm".to_owned())
-            );
-        }
     }
 
     /// Bedrock serves both wire families this runtime already speaks, on two
@@ -2882,6 +2895,7 @@ mod tests {
                     reasoning: None,
                     tools: &none(),
                     allow_tool_calls: true,
+                    output_schema: None,
                     web_search: false,
                     fallback_credit: None,
                     cache_key: None,
@@ -2981,6 +2995,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 cache_key: None,
@@ -3049,6 +3064,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 cache_key: None,
@@ -3118,6 +3134,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -3192,6 +3209,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -3301,6 +3319,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -3389,6 +3408,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -3419,95 +3439,6 @@ mod tests {
             .unwrap();
         assert_eq!(upgrades.try_recv().unwrap(), "Bearer second");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn a_refresh_gives_up_when_its_cache_expires_before_the_pool_opens() {
-        let provider = Provider::new(
-            Transport::new(0, 1).unwrap(),
-            Family::Anthropic,
-            "http://127.0.0.1:9",
-            None,
-        )
-        .unwrap();
-        // Closed for less than a park, so a call would wait it out.
-        let model = "claude-sonnet-5";
-        let pool = provider.pools.get(&Family::Anthropic.pool_key(model));
-        pool.limited(Some(Duration::from_millis(200)));
-        let tools = none();
-        let request = Request {
-            model,
-            instructions: "",
-            reasoning: None,
-            tools: &tools,
-            allow_tool_calls: true,
-            web_search: false,
-            fallback_credit: None,
-            cache_key: None,
-            items: Items::empty(),
-            chain: None,
-            route: None,
-            sent: None,
-        };
-        let started = tokio::time::Instant::now();
-        let refresh = Refresh::default();
-        let expires = started + Duration::from_millis(50);
-        let error = provider
-            .keep_warm(request, &refresh, expires)
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "provider_paced");
-        assert!(started.elapsed() < Duration::from_millis(200));
-        // Never sent, so a turn can still cancel it at no cost.
-        assert!(refresh.cancel());
-    }
-
-    #[tokio::test]
-    async fn a_refresh_reports_when_it_was_sent_not_when_it_began_waiting() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0; 4096];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = socket.read(&mut buffer).await.unwrap();
-                request.extend_from_slice(&buffer[..n]);
-            }
-            let body = r#"{"type":"message","content":[],"usage":{"input_tokens":2,"cache_read_input_tokens":90,"output_tokens":0}}"#;
-            let _ = socket
-                .write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes())
-                .await;
-        });
-        let provider =
-            Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None).unwrap();
-        let model = "claude-sonnet-5";
-        let pool = provider.pools.get(&Family::Anthropic.pool_key(model));
-        pool.limited(Some(Duration::from_millis(150)));
-        let tools = none();
-        let request = Request {
-            model,
-            instructions: "",
-            reasoning: None,
-            tools: &tools,
-            allow_tool_calls: true,
-            web_search: false,
-            fallback_credit: None,
-            cache_key: None,
-            items: Items::empty(),
-            chain: None,
-            route: None,
-            sent: None,
-        };
-        let started = tokio::time::Instant::now();
-        let (usage, sent_at) = provider
-            .keep_warm(request, &Refresh::default(), started + CACHE_LIFETIME)
-            .await
-            .unwrap();
-        assert_eq!(usage.cached_input_tokens, 90);
-        // The cache's next deadline counts from the send, after the wait.
-        assert!(sent_at >= started + Duration::from_millis(150));
     }
 
     #[tokio::test]
@@ -3547,6 +3478,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -3600,6 +3532,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             items: Items::empty(),
@@ -3668,6 +3601,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             items: Items::empty(),
@@ -3718,6 +3652,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             items: Items::empty(),
@@ -3764,6 +3699,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                output_schema: None,
                 web_search: false,
                 fallback_credit: None,
                 items: Items::empty(),
@@ -3801,6 +3737,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             items: Items::empty(),
@@ -3850,6 +3787,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            output_schema: None,
             web_search: false,
             fallback_credit: None,
             cache_key: None,
@@ -3921,6 +3859,7 @@ mod tests {
                     reasoning: None,
                     tools: &none(),
                     allow_tool_calls: true,
+                    output_schema: None,
                     web_search: false,
                     fallback_credit: None,
                     cache_key: None,
@@ -3936,7 +3875,7 @@ mod tests {
         let at = |family, url: &str, speed| {
             Provider::new(transport.clone(), family, url, None)
                 .unwrap()
-                .shaped(None, Some(KEEP_WARM), false, speed)
+                .shaped(None, false, speed)
                 .map(std::borrow::Cow::into_owned)
         };
         let claude = "https://api.example.test";

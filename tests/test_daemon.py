@@ -85,7 +85,7 @@ class DaemonTests(ModelFixture):
         self.assertEqual(refused['error'], 'web_search_unavailable')
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), tools=['echo']))
 
-    def test_a_patch_is_a_custom_tool_call_answered_in_kind(self):
+    def test_a_patch_is_a_function_off_openai_and_a_custom_call_is_answered_in_kind(self):
         patch = ('*** Begin Patch\n*** Add File: notes.md\n+# Notes\n'
                  '*** Update File: calc.py\n@@\n-x = 1\n+x = 2\n*** End Patch')
         call = dict(type='custom_tool_call', id='ctc_1', call_id='p1', name='apply_patch', input=patch)
@@ -117,11 +117,13 @@ class DaemonTests(ModelFixture):
                 client.request('create', bot='Bob', workspace=str(root))
                 turn = client.request('submit', bot='Bob', request_id='patch', prompt='patch it')['result']['turn']
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-                # Declared as a grammar-constrained custom tool.
+                # Off OpenAI's own API, declared as a function taking the
+                # patch: other endpoints refuse custom tools.
                 tool, = requests[0]['tools']
-                self.assertEqual((tool['type'], tool['name'], tool['format']['syntax']), ('custom', 'apply_patch', 'lark'))
-                # The call goes back as the model made it, answered by a
-                # custom tool call output.
+                self.assertEqual((tool['type'], tool['name'], tool['parameters']['required']),
+                                 ('function', 'apply_patch', ['input']))
+                # A custom call still goes back as the model made it,
+                # answered by a custom tool call output.
                 *_, sent, answer = requests[1]['input']
                 self.assertEqual(sent, call)
                 self.assertEqual(answer, dict(type='custom_tool_call_output', call_id='p1',
@@ -221,6 +223,29 @@ class DaemonTests(ModelFixture):
         self.assertEqual(kinds - {'follow_live'}, {'turn_finished'})
         refused = ends.request('follow', bot='*', after=0, kinds=[])
         self.assertEqual(refused['error'], 'invalid_follow_kinds')
+
+    def test_a_follow_widened_from_where_a_narrow_replay_ended_repeats_nothing(self):
+        client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
+        self.addCleanup(client.close)
+        client.request('create', bot='Alice', workspace=str(self.path))
+        first = client.request('submit', bot='Alice', request_id='a', prompt='hi')['result']['turn']
+        client.finished(first)
+        history = client.request('events', bot='Alice', after=0, limit=256)['result']['events']
+        # A rare kind, written first: everything the turn wrote follows it.
+        sky = Connection(client.socket_path)
+        self.addCleanup(sky.close)
+        sky.request('follow', bot='*', after=0, kinds=['created'])
+        live = sky.receive(lambda e: e.get('event') == 'follow_live')
+        self.assertEqual([e['event'] for e in sky.durable], ['created'])
+        self.assertGreaterEqual(live['cursor'], history[-1]['cursor'])
+        # Widened from where the past ended, as a client does once it has
+        # drawn it: nothing written before the boundary comes back.
+        sky.request('follow', bot='*', after=live['cursor'], kinds=['created', 'turn_started', 'turn_finished'])
+        sky.receive(lambda e: e.get('event') == 'follow_live')
+        self.assertEqual([e['event'] for e in sky.durable], ['created'])
+        second = client.request('submit', bot='Alice', request_id='b', prompt='hi')['result']['turn']
+        sky.receive(lambda e: e.get('event') == 'turn_finished' and e.get('turn') == second)
+        self.assertEqual({e['turn'] for e in sky.durable if e['event'] != 'created'}, {second})
 
     def test_a_follow_from_a_time_replays_what_was_written_since(self):
         client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')

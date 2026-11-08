@@ -216,8 +216,8 @@ vulnerability, whether or not the code's own documentation agrees.
   SQLite makes beside it take that mode too, and tightens a store or
   sidecar an earlier daemon left looser. The daemon's log, the
   companions' folder and logs, and what the lookout keeps beside the
-  store (its log, cursor, lock and marker, the sources', subscriptions'
-  and goals' folders) are made `0600` and `0700` the same way. There is
+  store (its log, cursor, lock and marker, the sources' and subscriptions'
+  folders) are made `0600` and `0700` the same way. There is
   no encryption at rest. Tool output spilled to files goes in folders
   made `0700`, as `0600` files.
 - `rm`, `prune` and `--keep-turns` delete rows; SQLite's free pages and
@@ -253,7 +253,7 @@ vulnerability, whether or not the code's own documentation agrees.
 
 Sonny's tool host answers some tools outside every agent's sandbox, since
 they are things the sandbox cannot do: triggers, memory, `start_task`,
-`run_in_pane`, `browser`, `exec` for MCP, subscriptions, goals. Each that
+`run_in_pane`, `browser`, `exec` for MCP, subscriptions. Each that
 can change something outside the agent's folder waits on the agent's
 approval gate as a call that leaves the sandbox would; `memory` and
 `show_agent` wait for none.
@@ -261,10 +261,20 @@ approval gate as a call that leaves the sandbox would; `memory` and
 - **Triggers** are jobs of the system's scheduler (a LaunchAgent, a
   systemd user service) that run as the person. Adding one, and its `if`
   command, wait for a verdict; the `if` command runs with the provider
-  keys stripped. Nothing of a trigger runs between its fires. A goal's
-  check command runs the same way.
+  keys stripped. An `if` command an agent added runs in that agent's own
+  sandbox, with its variables and its own capped daemon socket
+  (`agent sandbox --bot`), as Codex runs whatever an agent wrote: a gate
+  such as `cd FOLDER && ./quiet` runs a script the agent can rewrite, and
+  runs it no further than the agent's own commands reach. One the person
+  or Sonny added runs as the person. One added before 0.9.0, when Sonny
+  did not record who wrote it, does not run until it is added again, but
+  for Sonny's own, which it knows by their whole text. Nothing of a
+  trigger runs between its fires.
 - **Lookout sources** are commands the person sets up in `config.toml`,
-  run with `sh -c` as the person outside any sandbox.
+  run with `sh -c` as the person outside any sandbox. A source runs its
+  script again on every run, and starts again on an edit to a file its
+  `watch` list names, so its command and those files must be ones no
+  agent can write: keep them outside every agent's folders.
 - **MCP servers** run as the person outside every sandbox, started from
   `~/.agent/config.toml` with `~/.agent/env` in their environment. An
   agent reaches them only through `exec`, a QuickJS script with no files,
@@ -332,8 +342,9 @@ These are not vulnerabilities to report; they are the boundaries of what
 is built.
 
 - A bot without a sandbox, and every daemon companion, trigger, lookout
-  source, goal check, `.agents/setup` and MCP server, runs with the
-  person's full permissions. A workspace snapshot or a worktree is not a
+  source, `.agents/setup` and MCP server, runs with the person's full
+  permissions; of a trigger's `if` commands, one an agent added runs in
+  its sandbox. A workspace snapshot or a worktree is not a
   sandbox.
 - The sandbox confines commands, writes and edits, not reads: a confined
   bot can read any file the person can and send it to its model provider.

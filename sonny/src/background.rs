@@ -9,7 +9,7 @@
 //! fire went out and whose turn then failed, as when the machine was
 //! offline or a login expired, the daemon saying how the turn ended; and a
 //! server the nightly memory cleanup could not read, by the fact it saves.
-use crate::{lookout, trigger};
+use crate::{kept, lookout, trigger};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     style::{Color, Stylize},
@@ -26,6 +26,9 @@ pub enum Kind {
     /// A server the nightly memory cleanup could not read: its
     /// `unreadable-SERVER` fact.
     Server,
+    /// The nightly memory cleanup Sonny turns on by default, which it
+    /// could not schedule ([`trigger::cleanup_unscheduled`]).
+    Setup,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -57,6 +60,11 @@ pub struct Item {
     /// When a trigger last fired, in ms: a fire that sent no turn is still
     /// a fire of its own.
     pub fired_ms: Option<u64>,
+    /// The sources a subscription hears, by name.
+    pub sources: Vec<String>,
+    /// What makes its failure the same one when `failed`'s words change:
+    /// a broken `--if`'s break, whatever each failed check printed.
+    pub episode: Option<String>,
 }
 
 /// Every trigger made on the daemon whose store is `store_id` and every
@@ -69,15 +77,15 @@ pub fn read(
     ours: impl Fn(&str) -> bool,
 ) -> Vec<Item> {
     let mut items = Vec::new();
-    if let (Some(id), Ok(places)) = (store_id, trigger::Places::home()) {
-        for (mut row, bots) in trigger::on_store(&places, id) {
+    if let Some(id) = store_id {
+        for (mut row, bots) in triggers(id) {
             if bots.iter().any(|bot| ours(bot)) {
                 trigger::with_turn(&mut row, turns);
                 items.push(trigger_item(&row, bots));
             }
         }
     }
-    for (subscriber, subs) in lookout::subs::all(store) {
+    for (subscriber, subs) in subscriptions(store) {
         if !ours(&subscriber) {
             continue;
         }
@@ -85,6 +93,14 @@ pub fn read(
         for sub in subs {
             let own = project.is_some_and(|p| sub == lookout::subs::Sub::lead(&subscriber, p));
             let described = sub.describe();
+            let mut sources: Vec<String> = (sub.sources.iter())
+                .map(|s| {
+                    s.split_once(':')
+                        .map_or(s.as_str(), |(name, _)| name)
+                        .to_owned()
+                })
+                .collect();
+            sources.dedup();
             let what = described
                 .strip_prefix(&format!("{} · ", sub.name))
                 .unwrap_or(&described)
@@ -105,10 +121,46 @@ pub fn read(
                 failed: None,
                 handle: None,
                 fired_ms: None,
+                episode: None,
+                sources,
             });
         }
     }
     items
+}
+
+/// Remove the rows of triggers made on the daemon whose store is
+/// `store_id` that have nothing left to say ([`trigger::forget_among`]), found
+/// among the rows as last read: only those are read again. How many went.
+pub fn forget_done(store_id: &str, turns: &HashMap<String, Value>) -> usize {
+    let Ok(places) = trigger::Places::home() else {
+        return 0;
+    };
+    trigger::forget_among(&places, store_id, turns, &triggers(store_id))
+}
+
+/// The rows of the triggers made on the daemon whose store is
+/// `store_id`, as [`trigger::on_store`] reads them, read again only once
+/// the folders they are in change or a row changes with time.
+fn triggers(store_id: &str) -> Vec<(Value, Vec<String>)> {
+    static KEPT: kept::Slot<Vec<(Value, Vec<String>)>> = kept::Slot::new(None);
+    let Ok(places) = trigger::Places::home() else {
+        return Vec::new();
+    };
+    let paths = vec![places.jobs.clone(), places.state.clone()];
+    kept::read(&KEPT, store_id, paths, || {
+        trigger::on_store_until(&places, store_id)
+    })
+}
+
+/// Every subscription beside `store`, as [`lookout::subs::all`] reads
+/// them, read again only once their folder changes.
+fn subscriptions(store: &Path) -> Vec<(String, Vec<lookout::subs::Sub>)> {
+    static KEPT: kept::Slot<Vec<(String, Vec<lookout::subs::Sub>)>> = kept::Slot::new(None);
+    let key = store.to_string_lossy();
+    kept::read(&KEPT, &key, vec![lookout::subs::dir(store)], || {
+        (lookout::subs::all(store), None)
+    })
 }
 
 /// The person's own agents, which no project names, as the one the nightly
@@ -151,17 +203,62 @@ pub fn read_around(
     let mut items = read(store, store_id, turns, |bot| {
         scope.takes(bot) || personal(bot)
     });
-    if let Some(home) = std::env::var_os("HOME") {
-        let root = PathBuf::from(home).join(".agents/memory");
-        items.extend(servers(&root, &scope.project));
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let (view, cleanup) = memory(&home, &scope.project);
+        items.extend(servers(&view));
+        items.extend(unscheduled(cleanup));
     }
     items
 }
 
+/// The memory's facts the person's and `project`'s, and why the nightly
+/// cleanup could not be scheduled, read again only once their folders or
+/// that file change.
+fn memory(home: &Path, project: &str) -> (Value, Option<(String, i64)>) {
+    static KEPT: kept::Slot<(Value, Option<(String, i64)>)> = kept::Slot::new(None);
+    let root = home.join(".agents/memory");
+    let paths = vec![
+        root.clone(),
+        root.join("projects").join(project),
+        trigger::cleanup_unscheduled_path(home),
+    ];
+    let key = format!("{}\0{project}", home.display());
+    kept::read(&KEPT, &key, paths, || {
+        let view = agent_client::memory::view(&root, Some(project));
+        ((view, trigger::cleanup_unscheduled(home)), None)
+    })
+}
+
+/// The nightly memory cleanup, when Sonny could not schedule it: the
+/// person's to know in every window, since nothing else runs it.
+fn unscheduled(cleanup: Option<(String, i64)>) -> Option<Item> {
+    let (why, at) = cleanup?;
+    let tried = (now_ms() / 1000).saturating_sub(at.max(0) as u64);
+    Some(Item {
+        kind: Kind::Setup,
+        name: "memory-cleanup".into(),
+        bot: String::new(),
+        bots: Vec::new(),
+        when: String::new(),
+        what: String::new(),
+        facts: vec![
+            format!("tried {}", ago(tried)),
+            "Sonny tries again at its next start".into(),
+        ],
+        reply_to: None,
+        own: false,
+        failed: Some(first_line(&why)),
+        episode: None,
+        sources: Vec::new(),
+        handle: None,
+        fired_ms: None,
+    })
+}
+
 /// The `unreadable-SERVER` facts the nightly memory cleanup saves, the
-/// person's and `project`'s, each as the server it names.
-fn servers(root: &Path, project: &str) -> Vec<Item> {
-    let view = agent_client::memory::view(root, Some(project));
+/// person's and the project's, as `view` has them: each as the server it
+/// names.
+fn servers(view: &Value) -> Vec<Item> {
     let scopes =
         std::iter::once(&view["user"]).chain(view["projects"].as_array().into_iter().flatten());
     let mut items = Vec::new();
@@ -196,6 +293,8 @@ fn servers(root: &Path, project: &str) -> Vec<Item> {
                 }),
                 handle: None,
                 fired_ms: None,
+                episode: None,
+                sources: Vec::new(),
             });
         }
     }
@@ -210,6 +309,7 @@ pub fn failures(items: &[Item]) -> Vec<String> {
     (items.iter())
         .filter_map(|item| {
             let why = item.failed.as_ref()?;
+            let why = item.episode.as_ref().unwrap_or(why);
             let turn = item.handle.as_deref().unwrap_or("");
             let at = item.fired_ms.unwrap_or(0);
             Some(format!("{:?}/{}/{at}/{turn}/{why}", item.kind, item.name))
@@ -230,13 +330,27 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
     let mut facts = Vec::new();
     let sent = row["sent"].as_u64().unwrap_or(0);
     let last = &row["last"];
+    // What its `--if` said, while it has one: one removed since says
+    // nothing about it now.
+    let checked = match row["if"].is_string() {
+        true => &row["checked"],
+        false => &Value::Null,
+    };
     let mut failed = None;
+    let mut episode = None;
+    // A last fire that failed because its `--if` could not answer is over
+    // once a later check answers: the check, not that fire, is what holds.
+    let gate_broke = last["gate"] == "failed";
+    let mut fired_ms = last["fired_ms"].as_u64();
     facts.push(match row["runs"].as_u64() {
         Some(runs) => format!("sent {sent} of {runs}"),
         None if sent == 0 && last.is_null() => "not run yet".into(),
         None => format!("sent {sent}"),
     });
-    if let Some(outcome) = last["outcome"].as_str() {
+    if let Some(until) = row["until"].as_str() {
+        facts.push(format!("until {until}"));
+    }
+    if let Some(outcome) = last["outcome"].as_str().filter(|_| !gate_broke) {
         let ago = last["fired_ms"]
             .as_u64()
             .map(|at| format!(" {}", ago(now_ms().saturating_sub(at) / 1000)))
@@ -275,6 +389,29 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
             });
         }
     }
+    // What its `--if` said last: checked and nothing new is a healthy
+    // quiet; could not check is a failure until a check answers again.
+    let checked_ago = |key: &str| {
+        checked[key]
+            .as_u64()
+            .map(|at| format!(" {}", ago(now_ms().saturating_sub(at) / 1000)))
+            .unwrap_or_default()
+    };
+    match checked["gate"].as_str() {
+        Some("no") => facts.push(format!("checked{}, nothing new", checked_ago("checked_ms"))),
+        Some("failed") => {
+            facts.push(format!("could not check since{}", checked_ago("since_ms")));
+            failed = Some(match checked["detail"].as_str() {
+                Some(detail) if !detail.is_empty() => first_line(detail),
+                _ => "could not check".into(),
+            });
+            // One break, however many checks it failed and whatever each
+            // printed.
+            fired_ms = checked["since_ms"].as_u64().or(fired_ms);
+            episode = Some("could not check".into());
+        }
+        _ => {}
+    }
     if row["missed"] == true {
         facts.push("missed its time".into());
     }
@@ -296,7 +433,9 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         own: false,
         failed,
         handle: trigger::sent(row),
-        fired_ms: last["fired_ms"].as_u64(),
+        fired_ms,
+        episode,
+        sources: Vec::new(),
     }
 }
 
@@ -308,13 +447,53 @@ pub fn count(items: &[Item], bot: &str) -> usize {
         .count()
 }
 
+/// Each source's icon, as `[sonny.sources.NAME] icon` gives it, the
+/// commons' too: the settings read again only once they change, so every
+/// surface that names a source can mark it as `/status` does.
+pub fn source_icons() -> HashMap<String, String> {
+    static KEPT: kept::Slot<HashMap<String, String>> = std::sync::Mutex::new(None);
+    let load = || {
+        let icons = (agent_client::config::load().map(|config| {
+            (config.sonny.sources.into_iter())
+                .chain([config.sonny.commons_source])
+                .filter_map(|source| Some((source.name, source.icon?)))
+                .collect()
+        }))
+        .unwrap_or_default();
+        (icons, None)
+    };
+    match agent_client::config::path() {
+        Some(path) => kept::read(&KEPT, "icons", vec![path], load),
+        None => load().0,
+    }
+}
+
+/// The icons a follow is shown by, each once: its sources' when every
+/// one has an icon, else none.
+fn icons_of(item: &Item, icons: &HashMap<String, String>) -> Option<String> {
+    if item.kind != Kind::Subscription || item.sources.is_empty() {
+        return None;
+    }
+    let mut said = String::new();
+    for source in &item.sources {
+        let icon = icons.get(source)?;
+        if !said.contains(icon.as_str()) {
+            said.push_str(icon);
+        }
+    }
+    Some(said)
+}
+
 /// What `/status` says of `bot`'s: `↻ 2 automations, 1 follow`, or
 /// nothing.
-pub fn fact(items: &[Item], bot: &str) -> String {
+pub fn fact(items: &[Item], bot: &str, icons: &HashMap<String, String>) -> String {
+    // A follow whose every source has its icon is shown by those.
+    let shown = |i: &Item| icons_of(i, icons).is_some();
     let of = |kind: Kind| {
         items
             .iter()
             .filter(|i| i.kind == kind && !i.own && i.bots.iter().any(|b| b == bot))
+            .filter(|i| !shown(i))
             .count()
     };
     let said: Vec<String> = [
@@ -329,6 +508,22 @@ pub fn fact(items: &[Item], bot: &str) -> String {
         true => String::new(),
         false => format!("↻ {}", said.join(", ")),
     }
+}
+
+/// The icons of the sources `bot` follows, as `[sonny.sources.NAME]
+/// icon` gives them, each once, in the order of its follows.
+pub fn icons(items: &[Item], bot: &str, icons: &HashMap<String, String>) -> String {
+    let mut said = String::new();
+    let theirs = (items.iter())
+        .filter(|i| i.kind == Kind::Subscription && !i.own && i.bots.iter().any(|b| b == bot));
+    for source in theirs.flat_map(|i| &i.sources) {
+        if let Some(icon) = icons.get(source)
+            && !said.contains(icon.as_str())
+        {
+            said.push_str(icon);
+        }
+    }
+    said
 }
 
 /// The agents a window's `/background` covers: the project's, as
@@ -367,6 +562,8 @@ pub struct View {
     /// asked the daemon.
     turns: HashMap<String, Value>,
     lookout: String,
+    /// Each source's icon, which marks the follows of it.
+    icons: HashMap<String, String>,
     selected: usize,
     /// The item the first `d` picked, by kind, agent and name.
     confirm: Option<(Kind, String, String)>,
@@ -396,6 +593,7 @@ impl View {
             items: Vec::new(),
             turns,
             lookout: String::new(),
+            icons: HashMap::new(),
             selected: 0,
             confirm: None,
             notice: None,
@@ -425,6 +623,7 @@ impl View {
         }
         self.lookout =
             crate::tool_host::with_status(lookout::status(&self.store, &self.bot), &self.store);
+        self.icons = source_icons();
     }
 
     /// How the turns ended, as the window has since asked the daemon.
@@ -473,6 +672,11 @@ impl View {
                     self.notice = Some(
                         "the nightly cleanup removes it the night the server reads again".into(),
                     );
+                } else if item.kind == Kind::Setup {
+                    self.notice = Some(
+                        "it goes once the cleanup is scheduled: `~/.agent/memory schedule --model PROVIDER/MODEL`"
+                            .into(),
+                    );
                 } else if confirm == Some(key_of(&item)) {
                     self.remove(&item);
                 } else {
@@ -512,7 +716,7 @@ impl View {
             Kind::Subscription => {
                 lookout::subs::remove(&self.store, &item.bot, &item.name).map(drop)
             }
-            Kind::Server => return,
+            Kind::Server | Kind::Setup => return,
         };
         self.notice = Some(match done {
             Ok(()) => format!("removed {}", item.name),
@@ -584,8 +788,13 @@ impl View {
         let mark = match item.kind {
             _ if item.failed.is_some() => Span::raw("✗ ").fg(Color::Red),
             Kind::Trigger => Span::raw("↻ ").dim(),
-            Kind::Subscription => Span::raw("◎ ").dim(),
-            Kind::Server => Span::raw("  "),
+            // A follow of sources with icons is marked by them, as its
+            // agent's `/status` row is.
+            Kind::Subscription => match icons_of(item, &self.icons) {
+                Some(icons) => Span::raw(format!("{icons} ")).dim(),
+                None => Span::raw("◎ ").dim(),
+            },
+            Kind::Server | Kind::Setup => Span::raw("  "),
         };
         let name = Span::raw(item.name.clone()).bold();
         let mut spans = vec![pick, mark, name];
@@ -599,6 +808,9 @@ impl View {
             }
             Kind::Server => {
                 spans.push(Span::raw(" could not be read by the nightly memory cleanup").dim());
+            }
+            Kind::Setup => {
+                spans.push(Span::raw(" is not scheduled: nothing cleans up memory").dim());
             }
         }
         let mut first =
@@ -665,7 +877,9 @@ impl View {
         }
         match self.items.get(self.selected) {
             Some(item) if item.kind == Kind::Trigger => keys.extend(["r run now", "d remove"]),
-            Some(item) if !item.own && item.kind != Kind::Server => keys.push("d remove"),
+            Some(item) if !item.own && !matches!(item.kind, Kind::Server | Kind::Setup) => {
+                keys.push("d remove")
+            }
             _ => {}
         }
         keys.push("esc close");
@@ -726,6 +940,8 @@ mod tests {
             failed: None,
             handle: None,
             fired_ms: None,
+            episode: None,
+            sources: Vec::new(),
         }
     }
 
@@ -745,9 +961,68 @@ mod tests {
         assert_eq!(count(&items, "calc.lead"), 3);
         assert_eq!(count(&items, "calc.digest"), 1);
         assert_eq!(count(&items, "calc.fix"), 0);
-        assert_eq!(fact(&items, "calc.lead"), "↻ 2 automations, 1 follow");
-        assert_eq!(fact(&items, "calc.digest"), "↻ 1 automation");
-        assert_eq!(fact(&items, "calc.fix"), "");
+        let none = HashMap::new();
+        assert_eq!(
+            fact(&items, "calc.lead", &none),
+            "↻ 2 automations, 1 follow"
+        );
+        assert_eq!(fact(&items, "calc.digest", &none), "↻ 1 automation");
+        assert_eq!(fact(&items, "calc.fix", &none), "");
+    }
+
+    #[test]
+    fn a_follow_of_sources_with_icons_shows_as_them() {
+        let follow = |name: &str, sources: &[&str]| Item {
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+            ..item(Kind::Subscription, name, &["calc.lead"], false)
+        };
+        let items = [
+            item(Kind::Subscription, "tasks", &["calc.lead"], true),
+            follow("prs", &["github"]),
+            follow("ci", &["github", "buildkite"]),
+            follow("chat", &["slack"]),
+        ];
+        let icons: HashMap<String, String> = [("github", "▲"), ("slack", "#")]
+            .into_iter()
+            .map(|(s, i)| (s.to_owned(), i.to_owned()))
+            .collect();
+        assert_eq!(super::icons(&items, "calc.lead", &icons), "▲#");
+        // One with a source that has none is still counted.
+        assert_eq!(fact(&items, "calc.lead", &icons), "↻ 1 follow");
+        assert_eq!(super::icons(&items, "calc.fix", &icons), "");
+        // `/background` marks each follow as `/status` shows it: by its
+        // sources' icons, or the follow mark when one has none.
+        let view = View {
+            scope: Scope {
+                project: "calc".into(),
+                lead: "calc.lead".into(),
+                glob: "calc.*".into(),
+            },
+            store: std::env::temp_dir().join("background-icons.sqlite"),
+            store_id: None,
+            bot: "calc.lead".into(),
+            items: items.to_vec(),
+            turns: HashMap::new(),
+            lookout: String::new(),
+            icons,
+            selected: 0,
+            confirm: None,
+            notice: None,
+        };
+        let rows: Vec<String> = (view.card(100).0.iter())
+            .map(|l| l.to_string())
+            .filter(|l| l.contains(" for lead"))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                // The picked row, padded as the pick draws it.
+                "  ◎ tasks for lead ",
+                "  ▲ prs for lead",
+                "  ◎ ci for lead",
+                "  # chat for lead"
+            ]
+        );
     }
 
     #[test]
@@ -773,6 +1048,120 @@ mod tests {
         );
         assert_eq!(fresh.facts, ["not run yet"]);
         assert_eq!(fresh.failed, None);
+    }
+
+    #[test]
+    fn a_cleanup_sonny_could_not_schedule_is_a_failure_in_every_window() {
+        let home = std::env::temp_dir().join(format!("bg-unscheduled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".agent/sonny")).unwrap();
+        assert_eq!(unscheduled(trigger::cleanup_unscheduled(&home)), None);
+        let at = now_ms() / 1000 - 120;
+        std::fs::write(
+            home.join(".agent/sonny/cleanup-not-scheduled.json"),
+            json!({"why": "automations_unsupported: no scheduler here", "at": at}).to_string(),
+        )
+        .unwrap();
+        let item = unscheduled(trigger::cleanup_unscheduled(&home)).unwrap();
+        assert_eq!(item.kind, Kind::Setup);
+        assert_eq!(
+            item.failed.as_deref(),
+            Some("automations_unsupported: no scheduler here")
+        );
+        assert_eq!(
+            item.facts,
+            ["tried 2m ago", "Sonny tries again at its next start"]
+        );
+        // The person's, so every window shows it.
+        let scope = Scope {
+            project: "calc".into(),
+            lead: "calc.lead".into(),
+            glob: "calc.*".into(),
+        };
+        assert!(shown(&scope, &item));
+        assert_eq!(failures(std::slice::from_ref(&item)).len(), 1);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_check_that_found_nothing_is_healthy_and_one_that_could_not_is_a_failure() {
+        let at = now_ms() - 5 * 60 * 1000;
+        let row = |checked: Value, last: Value| {
+            json!({"name": "triage", "when": "every 10m", "bot": "p.triage",
+                "message": "Run the triage", "sent": 3, "if": "cd /w && ! ./quiet",
+                "last": last, "checked": checked})
+        };
+        let sent = json!({"outcome": "sent", "fired_ms": at - 3_600_000});
+        // Checked, nothing new: no failure, and it says when it looked.
+        let quiet = trigger_item(
+            &row(json!({"gate": "no", "checked_ms": at}), sent.clone()),
+            vec!["p.triage".into()],
+        );
+        assert_eq!(quiet.failed, None);
+        assert_eq!(
+            quiet.facts,
+            [
+                "sent 3",
+                "last sent 1h ago",
+                "checked 5m ago, nothing new",
+                "if cd /w && ! ./quiet"
+            ]
+        );
+        // Could not check: a failure, since the first check that could not.
+        let broke = json!({"outcome": "failed", "gate": "failed", "fired_ms": at,
+            "detail": "--if: exit status: 2: quiet: token expired"});
+        // Each failed check settles as the last fire, at its own time.
+        let checking = |checked_ms: u64| {
+            let mut last = broke.clone();
+            last["fired_ms"] = json!(checked_ms);
+            trigger_item(
+                &row(
+                    json!({"gate": "failed", "checked_ms": checked_ms, "since_ms": at - 600_000,
+                        "detail": "--if: exit status: 2: quiet: token expired"}),
+                    last,
+                ),
+                vec!["p.triage".into()],
+            )
+        };
+        let unhealthy = checking(at);
+        assert_eq!(
+            unhealthy.failed.as_deref(),
+            Some("--if: exit status: 2: quiet: token expired")
+        );
+        assert_eq!(
+            unhealthy.facts[..2],
+            ["sent 3", "could not check since 15m ago"]
+        );
+        // Each check that fails again is the same break, not news, though
+        // what it printed changed.
+        let mut again = checking(at + 60_000);
+        assert_eq!(
+            failures(std::slice::from_ref(&unhealthy)),
+            failures(std::slice::from_ref(&again))
+        );
+        again.failed = Some("--if: exit status: 2: quiet: request 7f3a timed out".into());
+        assert_eq!(
+            failures(std::slice::from_ref(&unhealthy)),
+            failures(&[again])
+        );
+        // A check that answers again ends it, though no run went since.
+        let back = trigger_item(
+            &row(json!({"gate": "no", "checked_ms": at + 120_000}), broke),
+            vec!["p.triage".into()],
+        );
+        assert_eq!(back.failed, None);
+        assert_eq!(back.facts[..2], ["sent 3", "checked 3m ago, nothing new"]);
+        // Its `--if` removed since: what the old one said last is not its
+        // health now.
+        let mut ungated = row(
+            json!({"gate": "failed", "checked_ms": at, "since_ms": at,
+                "detail": "--if: exit status: 2"}),
+            sent,
+        );
+        ungated["if"] = Value::Null;
+        let ungated = trigger_item(&ungated, vec!["p.triage".into()]);
+        assert_eq!(ungated.failed, None);
+        assert_eq!(ungated.facts, ["sent 3", "last sent 1h ago"]);
     }
 
     #[test]
@@ -872,7 +1261,7 @@ mod tests {
             "unreadable-tracker",
             "tracker: 401",
         );
-        let found = servers(&root, "calc");
+        let found = servers(&agent_client::memory::view(&root, Some("calc")));
         let names: Vec<&str> = found.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["chat", "mail"]);
         assert_eq!(
@@ -916,6 +1305,7 @@ mod tests {
             ],
             turns: HashMap::new(),
             lookout: String::new(),
+            icons: HashMap::new(),
             selected: 1,
             confirm: None,
             notice: None,
@@ -972,6 +1362,7 @@ mod tests {
             ],
             turns: HashMap::new(),
             lookout: "Lookout · not running".into(),
+            icons: HashMap::new(),
             selected: 0,
             confirm: None,
             notice: None,

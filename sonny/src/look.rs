@@ -8,6 +8,7 @@
 //! (no-color.org) no color is drawn at all, and bold, dim, underline and
 //! reverse carry what is left; every colored mark has its own shape.
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use ratatui::{
     buffer::{Buffer, Cell},
@@ -55,6 +56,10 @@ impl Look {
     }
 
     pub fn cell(self, cell: &mut Cell) {
+        // The band as it is now: rows hold its role, not a color.
+        if cell.bg == BAND {
+            cell.bg = band();
+        }
         // A hue on a muted row (the footer's branch, an agent's name) is a
         // short mark meant to read: dim over it falls under 3:1 in many
         // themes, so the hue is drawn as it is and the words round it
@@ -92,7 +97,7 @@ impl Look {
 /// no further than keeps 4.5:1 (WCAG's for text), or, in a theme whose own
 /// text reads at under 6:1, three quarters of that, so muted still differs
 /// from the rest.
-fn muted(foreground: Rgb, background: Rgb) -> Rgb {
+pub fn muted(foreground: Rgb, background: Rgb) -> Rgb {
     let floor = (contrast(foreground, background) * 0.75).min(4.5);
     let mut weight = 0.55;
     loop {
@@ -104,10 +109,65 @@ fn muted(foreground: Rgb, background: Rgb) -> Rgb {
     }
 }
 
+/// A beat of the pulse: shown this long, then a gap, so a beat is
+/// half a second and two come a second, under the three flashes a second
+/// WCAG 2.3.1 allows.
+const BEAT: Duration = Duration::from_millis(500);
+const BEAT_ON: Duration = Duration::from_millis(320);
+/// Beats in a pulse: enough to catch the eye from across the screen,
+/// as a dock icon's bounce does, and over in a second and a half.
+const BEATS: u32 = 3;
+
+/// Whether a pulse that began `since` ago is on a beat now: a one-shot,
+/// strong while it lasts and then gone for good, never a loop.
+pub fn beat(since: Duration) -> bool {
+    since < BEAT * BEATS && since.as_millis() % BEAT.as_millis() < BEAT_ON.as_millis()
+}
+
+/// A count that pulses once each time it rises, as what needs the person
+/// does when something new comes to need them; steady as it falls or holds.
+#[derive(Clone, Copy, Default)]
+pub struct Pulse {
+    seen: usize,
+    at: Option<Instant>,
+}
+
+impl Pulse {
+    /// The count as it is `now`.
+    pub fn see(&mut self, count: usize, now: Instant) {
+        if count > self.seen {
+            self.at = Some(now);
+        }
+        self.seen = count;
+    }
+
+    /// Still beating `now`, whether on a beat or between two.
+    pub fn moving(&self, now: Instant) -> bool {
+        self.at
+            .is_some_and(|at| now.saturating_duration_since(at) < BEAT * BEATS)
+    }
+
+    /// On a beat `now`.
+    pub fn on(&self, now: Instant) -> bool {
+        self.at
+            .is_some_and(|at| beat(now.saturating_duration_since(at)))
+    }
+}
+
+/// The band as a row holds it: a role, not a color, made the theme's band
+/// ([`band`]) as each frame is finished ([`Look::cell`]), as a stylesheet's
+/// variable is read when the page is painted. Rows drawn before the theme
+/// switched between light and dark so take the new band at once, while a
+/// turn is still running and before anything is drawn again. An RGB too
+/// dark for any theme's band to be: one row drawn without a frame's look
+/// would show near black, not a band that passes for right.
+pub const BAND: Color = Color::Rgb(2, 1, 3);
+
 /// The band the person's own messages sit on, as Codex and Claude Code
 /// tint the user's cell: the theme's foreground a little over its
-/// background, so it reads in every theme; a fixed gray when the terminal
-/// did not say its colors.
+/// background, so it reads in every theme; a fixed gray with no hue of
+/// its own when the terminal did not say its colors, as after it switched
+/// to the other of light and dark.
 pub fn band() -> Color {
     let theme = crate::term::theme();
     let light = crate::term::light();
@@ -116,8 +176,8 @@ pub fn band() -> Color {
             let (r, g, b) = blend(foreground, background, if light { 0.06 } else { 0.09 });
             Color::Rgb(r, g, b)
         }
-        _ if light => Color::Rgb(238, 238, 240),
-        _ => Color::Rgb(40, 40, 48),
+        _ if light => Color::Rgb(238, 238, 238),
+        _ => Color::Rgb(40, 40, 40),
     }
 }
 
@@ -174,6 +234,25 @@ pub fn contrast(a: Rgb, b: Rgb) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pulse_beats_three_times_when_its_count_rises_and_then_holds() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut pulse = Pulse::default();
+        pulse.see(0, start);
+        assert!(!pulse.on(start));
+        pulse.see(1, start);
+        let times = [0, 400, 500, 900, 1000, 1400, 1500, 2000];
+        let beats: Vec<bool> = times.map(|ms| pulse.on(at(ms))).into();
+        assert_eq!(beats, [true, false, true, false, true, false, false, false]);
+        // Held or falling, it stays steady; a new rise pulses again.
+        pulse.see(1, at(2000));
+        pulse.see(0, at(2000));
+        assert!(!pulse.on(at(2000)));
+        pulse.see(1, at(3000));
+        assert!(pulse.on(at(3000)));
+    }
 
     #[test]
     fn muted_text_reads_and_still_differs_from_the_rest() {
@@ -235,6 +314,26 @@ mod tests {
         assert_eq!(buffer[(2, 0)].symbol(), "c");
         assert!(buffer[(1, 0)].modifier.contains(Modifier::DIM));
         assert_eq!(buffer[(2, 0)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn the_band_a_row_holds_is_the_theme_band_as_the_frame_is_finished() {
+        let fresh = || {
+            let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 2, 1));
+            buffer[(0, 0)].set_symbol("a").set_bg(BAND);
+            buffer[(1, 0)].set_symbol("b").set_bg(Color::Rgb(9, 9, 9));
+            buffer
+        };
+        for look in [Look::Drawn, Look::Muted((1, 2, 3))] {
+            let mut buffer = fresh();
+            look.finish(&mut buffer);
+            assert_eq!(buffer[(0, 0)].bg, band(), "{look:?}");
+            assert_ne!(buffer[(0, 0)].bg, BAND);
+            assert_eq!(buffer[(1, 0)].bg, Color::Rgb(9, 9, 9), "other colors stay");
+        }
+        let mut buffer = fresh();
+        Look::Plain.finish(&mut buffer);
+        assert_eq!(buffer[(0, 0)].bg, Color::Reset);
     }
 
     #[test]

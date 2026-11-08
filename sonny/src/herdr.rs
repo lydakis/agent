@@ -759,7 +759,7 @@ if out is not None:
             json!({
                 "n": 10,
                 "workspaces": [
-                    {"workspace_id": "w1", "label": "lydakis"},
+                    {"workspace_id": "w1", "label": "home"},
                     {"workspace_id": "w2", "label": "graft"},
                 ],
                 "panes": [
@@ -771,7 +771,7 @@ if out is not None:
         let herdr = Herdr::open(bin, "graft", None, None).unwrap();
         assert_eq!(
             (herdr.workspace.as_str(), herdr.home().as_str()),
-            ("w1", "Herdr workspace lydakis")
+            ("w1", "Herdr workspace home")
         );
         let mut layout = Layout::new(Box::new(herdr));
         let cwd = Path::new("/work");

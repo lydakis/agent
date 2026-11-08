@@ -937,6 +937,7 @@ async fn create(
         model: Some(model),
         effort: (config.sonny.lead_effort.clone()).or(effort.filter(|e| !e.is_empty())),
         web_search: config.web_search,
+        web_search_off: config.web_search_off,
         fallbacks: config.fallbacks,
         ..Default::default()
     };
@@ -963,15 +964,29 @@ async fn make(
         // lead doesn't get is left out there.
         None => {
             let model = picks.model.as_deref().or(role.model.as_deref());
-            agent_client::default_tools(client.providers(), model.unwrap_or(""), picks.web_search)
-                .into_iter()
-                .map(String::from)
-                .collect()
+            agent_client::default_tools(
+                client.providers(),
+                model.unwrap_or(""),
+                picks.web_search,
+                &picks.web_search_off,
+            )
+            .into_iter()
+            .map(String::from)
+            .collect()
         }
     };
-    let declare = json!(crate::declared::tools(crate::served::Role::of(0)));
+    let declare = json!(crate::declared::tools(crate::served::Role::LEAD));
     let gate = crate::approvals::gate(mode, &crate::approvals::gateable(&tools, &declare));
-    let mut settings = crate::approvals::sandbox(mode, dir);
+    // Writing its own state folder, by the name it is made under.
+    let lead = (bot.map(str::to_owned)).or_else(|| {
+        let info = agent_client::project::read(dir).ok()?;
+        info["coordinator"].as_str().map(str::to_owned)
+    });
+    let state = lead.as_deref().and_then(crate::state::folder);
+    let mut settings = crate::approvals::sandbox(mode, dir, state.as_deref());
+    if let Some(state) = &state {
+        settings.insert("env".into(), json!({crate::state::VAR: state}));
+    }
     let config = agent_client::config::load()?;
     if config.hide_senders {
         settings.insert("hide_senders".into(), json!(true));
@@ -1004,6 +1019,7 @@ pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
         picks.effort = config.sonny.lead_effort;
     }
     picks.web_search = config.web_search;
+    picks.web_search_off = config.web_search_off;
     picks.fallbacks = config.fallbacks;
     let socket = std::env::var_os("AGENT_SOCKET")
         .map(PathBuf::from)
@@ -1039,7 +1055,7 @@ async fn open_new_lead(client: &Client, socket: &Path, caller: &str, made: &mut 
     }
     let like = crate::project_of(client, caller).await;
     let store = std::env::var_os("AGENT_STORE").map(PathBuf::from);
-    let opened = std::env::current_exe()
+    let opened = crate::named::me()
         .map_err(|e| e.to_string())
         .and_then(|me| {
             let bot = format!("{project}.lead");

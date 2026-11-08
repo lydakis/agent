@@ -199,7 +199,7 @@ pub fn source(id: u32) -> Option<String> {
 /// The most rows a picture takes shown on its own in the pane: the
 /// window's height less the pane's title and a row or two around it.
 pub fn tall() -> u32 {
-    let rows = ratatui::crossterm::terminal::size().map_or(ROWS, |(_, rows)| rows as u32);
+    let rows = crate::term::size().map_or(ROWS, |size| size.rows as u32);
     rows.saturating_sub(6).clamp(ROWS, DIACRITICS.len() as u32)
 }
 
@@ -289,7 +289,7 @@ pub fn raster(bytes: &[u8], width: usize, most_rows: u32) -> Result<Drawn, Strin
 /// The pane's width as it is now, should it have narrowed since `width`
 /// was read: a picture wider than its pane wraps into nonsense.
 pub fn now(width: usize) -> usize {
-    ratatui::crossterm::terminal::size().map_or(width, |(cols, _)| width.min(cols as usize))
+    crate::term::size().map_or(width, |size| width.min(size.columns as usize))
 }
 
 /// How many of a picture's pixels a cell is wide, at the scale it is drawn.

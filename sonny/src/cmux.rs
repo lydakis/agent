@@ -663,7 +663,7 @@ print(json.dumps(out))
             json!({
                 "n": 10,
                 "workspaces": [
-                    {"id": "ws-1", "title": "lydakis",
+                    {"id": "ws-1", "title": "home",
                      "panes": [pane("pn-1", &[("sf-1", "graft.lead"), ("sf-2", "graft.fix")])]},
                     {"id": "ws-2", "title": "graft", "panes": [pane("pn-2", &[("sf-3", "zsh")])]},
                 ],
@@ -672,7 +672,7 @@ print(json.dumps(out))
         let cmux = Cmux::open(bin, "graft", None, None).unwrap();
         assert_eq!(
             (cmux.workspace.as_str(), cmux.home().as_str()),
-            ("ws-1", "cmux workspace lydakis")
+            ("ws-1", "cmux workspace home")
         );
         let mut layout = Layout::new(Box::new(cmux));
         layout

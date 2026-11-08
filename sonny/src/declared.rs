@@ -5,10 +5,9 @@
 //! keeps its plan where they see it, keeps notes in the margin beside the
 //! conversation, and puts windows and panes where they look; a lead also
 //! resolves its tasks, makes projects and subscribes to the lookout, a
-//! task resolves itself, and any agent with room below it in its lead's
-//! line starts and removes tasks.
+//! task resolves itself, and every agent starts and removes tasks, as deep
+//! as the daemon lets a line go.
 use crate::served::Role;
-use agent_client::Client;
 use serde_json::{Map, Value, json};
 
 /// The most tools a bot may have declared, and the most bytes they take,
@@ -21,6 +20,7 @@ pub fn tools(role: Role) -> Vec<Value> {
     let mut tools = vec![
         crate::reactions::tool(),
         crate::asks::tool(),
+        crate::asks::close_tool(),
         crate::plan::tool(),
         crate::margin::tool(),
     ];
@@ -31,66 +31,21 @@ pub fn tools(role: Role) -> Vec<Value> {
     tools
 }
 
-/// Where the bot `record` describes stands in its lead's line: how many
-/// generations below the lead it is, 0 for the lead or a side chat of it,
-/// and the lead's record, `None` for a line no lead heads, such as one an
-/// agent the person made with `--new` starts. It walks no further than
-/// knowing the bot is `limit` deep needs, 0 for no end. A line whose
-/// maker is gone is as deep as the limit: removing a finished task
-/// never gives what it made more room.
-pub async fn line(client: &Client, record: &Value, limit: u64) -> (u64, Option<Value>) {
-    let mut depth = 0;
+/// The lead whose line the bot `record` describes is in: the nearest of
+/// its makers that leads, with `maker` giving the bot that made a bot, as
+/// a listing of every bot already read does, or the CLI. `None` for a
+/// line no lead heads, such as one an agent the person made with `--new`
+/// starts, or one whose maker is gone.
+pub fn lead_by(record: &Value, maker: impl Fn(&Value) -> Option<Value>) -> Option<Value> {
     let mut at = record.clone();
     // A line of agents each made by the one before; a cycle the store
     // cannot hold, but a bound all the same.
     for _ in 0..256 {
-        let name = at["name"].as_str().unwrap_or_default();
-        if crate::project::is_lead(name) {
-            return (depth, Some(at));
-        }
-        // A side chat is a copy of its agent, as deep as it is.
-        if crate::side_copy(&at).is_none() {
-            depth += 1;
-        }
-        if limit != 0 && depth >= limit {
-            return (depth, None);
-        }
-        let Some(by) = at["created_by"].as_str().map(str::to_owned) else {
-            return (depth, None);
-        };
-        let asked = json!({"bot": by, "bot_id": at["created_by_id"]});
-        match client.request("inspect", asked).await {
-            Ok(mut maker) => {
-                maker["name"] = json!(by);
-                at = maker;
-            }
-            Err(_) => return (gone(depth, limit), None),
-        }
-    }
-    (depth, None)
-}
-
-/// [`line`], with `maker` giving the bot that made a bot, as a listing of
-/// every bot already read does, or the CLI.
-pub fn line_by(
-    record: &Value,
-    limit: u64,
-    maker: impl Fn(&Value) -> Option<Value>,
-) -> (u64, Option<Value>) {
-    let mut depth = 0;
-    let mut at = record.clone();
-    for _ in 0..256 {
         if crate::project::is_lead(at["name"].as_str().unwrap_or_default()) {
-            return (depth, Some(at));
-        }
-        if crate::side_copy(&at).is_none() {
-            depth += 1;
-        }
-        if limit != 0 && depth >= limit {
-            return (depth, None);
+            return Some(at);
         }
         if !at["created_by"].is_string() {
-            return (depth, None);
+            return None;
         }
         // The maker by the id it made it with, not another of its name.
         match maker(&at) {
@@ -101,31 +56,23 @@ pub fn line_by(
             {
                 at = next
             }
-            _ => return (gone(depth, limit), None),
+            _ => return None,
         }
     }
-    (depth, None)
+    None
 }
 
-/// How deep a line whose maker is gone counts: as deep as `limit` lets
-/// lines go, so it starts none.
-fn gone(depth: u64, limit: u64) -> u64 {
-    match limit {
-        0 => depth,
-        _ => depth.max(limit),
+/// The role of the bot `record` describes: a lead's, by its name, or a
+/// task's.
+pub fn role(record: &Value) -> Role {
+    match crate::project::is_lead(record["name"].as_str().unwrap_or_default()) {
+        true => Role::LEAD,
+        false => Role::TASK,
     }
-}
-
-/// The role of the bot `record` describes, by where it stands in its
-/// lead's line, as deep as the person's config lets lines go.
-pub async fn role(client: &Client, record: &Value) -> Role {
-    let limit = crate::served::depth_limit();
-    let (depth, _) = line(client, record, limit).await;
-    Role::at(depth, limit)
 }
 
 /// Whether the bot `record` describes resolves itself: a lead made it, or
-/// another bot made it with `resolve_task`, as a task's own helper takes it.
+/// another bot made it with `mark_done`, as a task's own helper takes it.
 fn resolves(record: &Value) -> bool {
     let inherited = || {
         (record["declared"].as_array().into_iter().flatten())
@@ -155,10 +102,14 @@ pub fn declare(record: &Value, role: Role) -> Option<Value> {
             !(tool["name"].as_str()).is_some_and(|name| crate::served::GATED.contains(&name))
         });
     }
-    // The commons is Sonny's while it is off, too, so it gives way.
+    // The commons is Sonny's while it is off, too, so it gives way, and
+    // so does any tool Sonny answers that this build no longer declares.
     let mut names = tools(Role::ALL);
     names.push(crate::served::commons());
-    let sonnys = |other: &Value| names.iter().any(|tool| tool["name"] == other["name"]);
+    let sonnys = |other: &Value| {
+        other["answered_by"] == crate::served::TAG
+            || names.iter().any(|tool| tool["name"] == other["name"])
+    };
     if ours.iter().all(|tool| declared.contains(tool))
         && declared
             .iter()
@@ -177,10 +128,10 @@ pub fn declare(record: &Value, role: Role) -> Option<Value> {
 /// to this build's tools, as opening its window would, or `None` when it
 /// has them or never had Sonny's (a tool Sonny's lookout answers): so an agent no one opens since an
 /// upgrade, such as a task out of sight, gets a tool added since. A lead
-/// stays a lead, by the tool only a lead has; any other bot takes the role
-/// of `depth`, where it stands in its lead's line ([`line`]); and a tool
-/// Sonny gates is gated as the bot's mode gates the rest.
-pub fn refresh(record: &Value, depth: u64) -> Option<Map<String, Value>> {
+/// stays a lead, by the tool only a lead has; any other bot takes a
+/// task's; and a tool Sonny gates is gated as the bot's mode gates the
+/// rest.
+pub fn refresh(record: &Value) -> Option<Map<String, Value>> {
     // A trigger's shadow copy keeps the few tools it was made with, and
     // no gate a person answers.
     if (record["name"].as_str()).is_some_and(|name| crate::trigger::shadow_source(name).is_some()) {
@@ -198,7 +149,7 @@ pub fn refresh(record: &Value, depth: u64) -> Option<Map<String, Value>> {
     let lead = declared
         .iter()
         .any(|tool| tool["name"] == crate::served::PROJECT);
-    fields(record, Role::of(if lead { 0 } else { depth.max(1) }))
+    fields(record, if lead { Role::LEAD } else { Role::TASK })
 }
 
 /// The `configure` fields that give Sonny's tools, a task's, to the bot
@@ -209,7 +160,7 @@ pub fn adopt(record: &Value) -> Option<Map<String, Value>> {
     if (record["declared"].as_array()).is_some_and(|tools| !tools.is_empty()) {
         return None;
     }
-    fields(record, Role::of(1))
+    fields(record, Role::TASK)
 }
 
 /// The `configure` fields that bring `record` to Sonny's tools in `role`,
@@ -238,15 +189,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// A lead, a task of it, and a task of that task's, in a line two deep.
+    /// A lead, and any other agent: a task of it, or a task of that task's.
     fn a_lead() -> Role {
-        Role::at(0, 2)
+        Role::LEAD
     }
     fn a_task() -> Role {
-        Role::at(1, 2)
+        Role::TASK
     }
     fn a_helper() -> Role {
-        Role::at(2, 2)
+        Role::TASK
     }
 
     #[test]
@@ -259,7 +210,14 @@ mod tests {
             a_lead(),
         )
         .unwrap();
-        assert!(serde_json::to_vec(&lead).unwrap().len() <= DECLARED_BYTES / 2);
+        // Sonny's own take at most half of the daemon's budget, the rest
+        // left to the agent's.
+        let size = serde_json::to_vec(&lead).unwrap().len();
+        assert!(
+            size <= DECLARED_BYTES / 2,
+            "{size} over {}",
+            DECLARED_BYTES / 2
+        );
         let wanted = declare(&json!({"declared": [other]}), a_helper()).unwrap();
         let mut all = vec![other];
         all.extend(tools(a_helper()));
@@ -318,35 +276,51 @@ mod tests {
         };
         // Another client's bot, or one with no tools declared, is left alone.
         let other = json!({"name": "x", "declared": [{"name": "theirs"}]});
-        assert_eq!(refresh(&other, 1), None);
+        assert_eq!(refresh(&other), None);
         // Nor is one whose tool only shares a name with one of Sonny's.
         let named =
             json!({"name": "x", "declared": [{"name": crate::served::MEMORY, "result": "ok"}]});
-        assert_eq!(refresh(&named, 1), None);
-        assert_eq!(refresh(&json!({"name": "x"}), 1), None);
+        assert_eq!(refresh(&named), None);
+        assert_eq!(refresh(&json!({"name": "x"})), None);
         // A lead from an older build, missing a tool: it stays a lead.
         let mut old: Vec<Value> = tools(a_lead());
         old.pop();
         let lead = json!({"name": "calc.lead", "bot_id": 7, "declared": old});
-        let fields = refresh(&lead, 0).unwrap();
+        let fields = refresh(&lead).unwrap();
         assert_eq!(fields["bot"], "calc.lead");
         assert_eq!(fields["bot_id"], 7);
         assert!(names(&fields).contains(&crate::served::START.to_owned()));
         assert!(!fields.contains_key("approve"));
         let mut current = lead.clone();
         current["declared"] = fields["declare"].clone();
-        assert_eq!(refresh(&current, 0), None);
+        assert_eq!(refresh(&current), None);
         // A task under auto: its new tools are gated as the rest are.
         let mut old: Vec<Value> = tools(a_helper());
         old.retain(|tool| tool["name"] != crate::served::RUN);
         let task = json!({"name": "calc.fix", "bot_id": 8, "created_by": "calc.lead",
             "tools": ["shell", "read"], "declared": old,
             "gates": [{"tag": "auto", "tools": ["shell"]}]});
-        let fields = refresh(&task, 2).unwrap();
-        assert!(!names(&fields).contains(&crate::served::START.to_owned()));
+        let fields = refresh(&task).unwrap();
+        // Every agent starts tasks, as deep as the daemon lets it.
+        assert!(names(&fields).contains(&crate::served::START.to_owned()));
+        assert!(!names(&fields).contains(&crate::served::PROJECT.to_owned()));
         let approve = fields["approve"].as_array().unwrap();
         assert!(approve.iter().any(|tool| tool == "shell"));
         assert!(approve.iter().any(|tool| tool == crate::served::RUN));
+    }
+
+    #[test]
+    fn a_tool_sonny_answered_that_this_build_dropped_goes_with_the_refresh() {
+        let mut old: Vec<Value> = tools(a_lead());
+        old.push(json!({"name": "goal", "parameters": {"type": "object"},
+            "answered_by": crate::served::TAG}));
+        old.push(json!({"name": "theirs", "result": "ok"}));
+        let fields = refresh(&json!({"name": "calc.lead", "bot_id": 7, "declared": old})).unwrap();
+        let names: Vec<&str> = (fields["declare"].as_array().unwrap().iter())
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(!names.contains(&"goal"));
+        assert!(names.contains(&"theirs"));
     }
 
     #[test]
@@ -372,35 +346,16 @@ mod tests {
     }
 
     #[test]
-    fn starting_tasks_reaches_as_deep_as_the_line_goes() {
-        let role = |lead, starts, passes| Role {
-            lead,
-            starts,
-            passes,
-        };
-        // Two deep: the lead's tasks start their own, which start none.
-        assert_eq!(a_lead(), role(true, true, Some(1)));
-        assert_eq!(a_task(), role(false, true, Some(0)));
-        assert_eq!(a_helper(), role(false, false, Some(0)));
-        // One deep: only the lead starts tasks.
-        assert_eq!(Role::at(0, 1), role(true, true, Some(0)));
-        assert_eq!(Role::at(1, 1), role(false, false, Some(0)));
-        // Three deep: the lead's start goes two generations down.
-        assert_eq!(Role::at(0, 3), role(true, true, Some(2)));
-        // No end.
-        assert_eq!(Role::at(40, 0), role(false, true, None));
+    fn every_agent_starts_tasks_and_a_lead_alone_makes_projects() {
         let named = |role: Role, name: &str| -> Option<Value> {
             tools(role).into_iter().find(|tool| tool["name"] == name)
         };
-        // A lead's start and removal go down as many generations as have
-        // room, from their first turn: its tasks' stay their own, so their
-        // helpers start none.
+        // Start and removal reach every generation: the daemon bounds how
+        // deep a line goes, and says so when a start goes past it.
         for name in [crate::served::START, crate::served::REMOVE] {
-            assert_eq!(named(a_lead(), name).unwrap()["inherit"], 1);
-            assert_eq!(named(a_task(), name).unwrap()["inherit"], false);
-            assert_eq!(named(a_helper(), name), None);
-            assert_eq!(named(Role::at(0, 3), name).unwrap()["inherit"], 2);
-            assert_eq!(named(Role::at(5, 0), name).unwrap().get("inherit"), None);
+            for role in [a_lead(), a_task(), a_helper()] {
+                assert_eq!(named(role, name).unwrap().get("inherit"), None);
+            }
         }
         // Making projects is a lead's alone, and never passed on.
         assert_eq!(
@@ -408,11 +363,13 @@ mod tests {
             false
         );
         assert_eq!(named(a_task(), crate::served::PROJECT), None);
-        assert_eq!(named(Role::at(3, 0), crate::served::PROJECT), None);
+        assert_eq!(role(&json!({"name": "shop.lead"})), Role::LEAD);
+        assert_eq!(role(&json!({"name": "shop.lead.web"})), Role::LEAD);
+        assert_eq!(role(&json!({"name": "shop.fix"})), Role::TASK);
     }
 
     #[test]
-    fn a_line_whose_maker_is_gone_is_as_deep_as_lines_go() {
+    fn a_line_s_lead_is_its_nearest_maker_that_leads() {
         let bots = [
             json!({"name": "shop.lead", "bot_id": 1}),
             json!({"name": "shop.fix", "bot_id": 2, "created_by": "shop.lead", "created_by_id": 1}),
@@ -422,32 +379,33 @@ mod tests {
             let bots = bots.to_vec();
             move |at: &Value| bots.iter().find(|b| b["name"] == at["created_by"]).cloned()
         };
-        assert_eq!(line_by(&bots[2], 2, maker(&bots)).0, 2);
-        assert_eq!(line_by(&bots[1], 3, maker(&bots)).0, 1);
-        // Its task removed, a helper gets no more room.
+        let lead = |record: &Value, bots: &[Value]| {
+            lead_by(record, maker(bots)).map(|lead| lead["name"].clone())
+        };
+        assert_eq!(lead(&bots[2], &bots), Some(json!("shop.lead")));
+        assert_eq!(lead(&bots[0], &bots), Some(json!("shop.lead")));
+        // Its task removed, a helper has no lead.
         let without = [bots[0].clone(), bots[2].clone()];
-        assert_eq!(line_by(&bots[2], 3, maker(&without)).0, 3);
-        // Nor from another that took its task's name.
+        assert_eq!(lead(&bots[2], &without), None);
+        // Nor through another that took its task's name.
         let renamed = json!({"name": "shop.fix", "bot_id": 9, "created_by": "shop.lead",
             "created_by_id": 1});
         let reused = [bots[0].clone(), renamed, bots[2].clone()];
-        assert_eq!(line_by(&bots[2], 3, maker(&reused)).0, 3);
-        // With no end to lines, none is counted deeper than it is.
-        assert_eq!(line_by(&bots[2], 0, maker(&without)).0, 1);
-        // One the person made, which no agent made, is its line's root.
+        assert_eq!(lead(&bots[2], &reused), None);
+        // One the person made, which no agent made, heads no lead's line.
         let theirs = json!({"name": "shop.solo", "bot_id": 4});
-        assert_eq!(line_by(&theirs, 2, maker(&bots)).0, 1);
+        assert_eq!(lead(&theirs, &bots), None);
     }
 
     #[test]
-    fn a_lead_and_its_tasks_resolve_tasks() {
+    fn a_lead_and_its_tasks_mark_tasks_done() {
         let lead = declare(&json!({}), a_lead()).unwrap();
         assert_eq!(lead, Value::Array(tools(a_lead())));
         assert!(
             lead.as_array()
                 .unwrap()
                 .iter()
-                .any(|t| t["name"] == "resolve_task")
+                .any(|t| t["name"] == "mark_done")
         );
         assert_eq!(declare(&json!({"declared": lead}), a_lead()), None);
         // A bot no longer a lead gives it up, unless a lead made it: a
@@ -462,7 +420,7 @@ mod tests {
             own.as_array()
                 .unwrap()
                 .iter()
-                .any(|t| t["name"] == "resolve_task")
+                .any(|t| t["name"] == "mark_done")
         );
         let mut kept = task.clone();
         kept["declared"] = own;
@@ -474,7 +432,7 @@ mod tests {
             kept.as_array()
                 .unwrap()
                 .iter()
-                .any(|t| t["name"] == "resolve_task")
+                .any(|t| t["name"] == "mark_done")
         );
         // What a lead declares, a task it starts takes from its first turn.
         assert!(crate::resolved::tool().get("inherit").is_none());

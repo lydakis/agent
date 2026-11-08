@@ -9,6 +9,9 @@ use agent_runtime::{Error, Result, fail_with};
 // using this exit status, never by parsing a shared human-readable log.
 const DAEMON_OWNERSHIP_CONFLICT: i32 = 75;
 
+/// `agent sandbox` could not run its command.
+const SANDBOX_FAILED: i32 = 125;
+
 #[cfg(feature = "heap-profile")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -113,7 +116,13 @@ fn run() -> Result<i32> {
         return sign_in::main(&args[1..]);
     }
     if args[0] == "sandbox" {
-        return sandboxed(&args[1..]);
+        // Its own failure exits 125, as `env`, `timeout` and `docker run`
+        // say theirs, so a caller reading the command's exit status, such
+        // as a check where 1 says no, never takes it for the command's.
+        return sandboxed(&args[1..]).or_else(|error| {
+            report(&error);
+            Ok(SANDBOX_FAILED)
+        });
     }
     if args[0] == "serve" {
         SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -134,6 +143,14 @@ fn run() -> Result<i32> {
 /// left there: git runs a repository's hooks and the commands its config
 /// names. As Codex's `codex sandbox`, with no daemon: the same sandbox,
 /// run here. The agent's home stays read-only, as in every sandbox.
+///
+/// `--bot NAME` runs it as one of that bot's commands instead: in the
+/// bot's sandbox, its folders, network and sockets, reaching the daemon
+/// through the bot's own socket, which the daemon lends while it runs,
+/// with the bot's variables. For a command a bot wrote that a client runs
+/// outside the bot's turn, such as an automation's check: it does no more
+/// than the bot could. Its own failure exits 125, as `env` and `timeout`
+/// say theirs, the command's exit status otherwise.
 fn sandboxed(args: &[String]) -> Result<i32> {
     use agent_runtime::sandbox::{Daemon, Mode, Policy};
     let split = args
@@ -145,6 +162,7 @@ fn sandboxed(args: &[String]) -> Result<i32> {
         return fail_with("usage", "sandbox needs a command after --");
     };
     let mut writable = Vec::new();
+    let (mut bot, mut bot_id, mut connection) = (None, None, Vec::new());
     let mut iter = flags.iter();
     while let Some(flag) = iter.next() {
         match (flag.as_str(), iter.next()) {
@@ -158,10 +176,46 @@ fn sandboxed(args: &[String]) -> Result<i32> {
                     return fail_with("usage", format!("--writable {path} is not a folder here"));
                 }
             },
+            ("--bot", Some(name)) => bot = Some(name.clone()),
+            ("--bot-id", Some(id)) => {
+                bot_id = Some(
+                    (id.parse::<i64>()).map_err(|_| Error::with("usage", "--bot-id is an id"))?,
+                );
+            }
+            ("--store" | "--socket", Some(path)) => connection.extend([flag.clone(), path.clone()]),
             _ => return fail_with("usage", format!("sandbox does not accept {flag}")),
         }
     }
-    agent_runtime::sandbox::available()?;
+    if bot.is_none() && (bot_id.is_some() || !connection.is_empty()) {
+        return fail_with("usage", "--bot-id, --store and --socket go with --bot");
+    }
+    if bot.is_some() && !writable.is_empty() {
+        return fail_with(
+            "usage",
+            "--writable conflicts with --bot, whose sandbox says what it writes",
+        );
+    }
+    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+    if let Some(bot) = bot {
+        // The lend lasts while this holds its connection: until the command
+        // is done. The daemon says what the bot's commands get, as it built it
+        // for them: its sandbox and its whole environment.
+        let lent = client::lend(&connection, &bot, bot_id)?;
+        let policy: Option<Policy> = serde_json::from_value(lent.answer["policy"].clone())
+            .map_err(|_| {
+                Error::with(
+                    "sandbox_unavailable",
+                    "the daemon's sandbox is not one known here",
+                )
+            })?;
+        let environment: std::collections::BTreeMap<String, String> =
+            serde_json::from_value(lent.answer["env"].clone()).map_err(|_| {
+                Error::with("sandbox_unavailable", "the daemon sent no environment")
+            })?;
+        let status = run_in(policy.as_ref(), program, &rest, Some(&environment));
+        drop(lent);
+        return status;
+    }
     // What a daemon this CLI starts keeps read-only in every root: a
     // checkout's git folder, agents' settings, cloud keys.
     let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect();
@@ -189,23 +243,61 @@ fn sandboxed(args: &[String]) -> Result<i32> {
             .collect(),
         ..Daemon::default()
     };
+    agent_runtime::sandbox::available()?;
     let mode = match writable.is_empty() {
         true => Mode::ReadOnly,
         false => Mode::WorkspaceWrite,
     };
     let policy = Policy::new(Some(mode), None, &writable, false, &daemon)?
         .ok_or(Error::new("sandbox_unavailable"))?;
-    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+    run_in(Some(&policy), program, &rest, None)
+}
+
+/// `program` with `rest`, in `policy` when one is given, with `environment`
+/// (a lent command's, whose sandbox the daemon holds) in place of this
+/// one's when one is given: its exit status, as a shell
+/// reports one a signal ended.
+fn run_in(
+    policy: Option<&agent_runtime::sandbox::Policy>,
+    program: &str,
+    rest: &[&str],
+    environment: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<i32> {
+    // In place of this one's, keeping what the sandbox set itself (the
+    // descriptor its bot's socket is handed by).
+    let given = |command: &mut tokio::process::Command| {
+        if let Some(environment) = environment {
+            let own: Vec<(std::ffi::OsString, std::ffi::OsString)> = (command.as_std().get_envs())
+                .filter_map(|(name, value)| Some((name.to_owned(), value?.to_owned())))
+                .collect();
+            command.env_clear().envs(environment).envs(own);
+        }
+    };
     let status = runtime()?.block_on(async {
+        let Some(policy) = policy else {
+            let mut command = tokio::process::Command::new(program);
+            command.args(rest);
+            given(&mut command);
+            return command.status().await.map_err(Error::from);
+        };
         // What the sandbox holds in place stays held while the command
         // runs, and what it left in place for it is gone before this exits,
-        // as for a bot's command.
-        let held = agent_runtime::sandbox::hold(&policy).await;
-        let status = match agent_runtime::sandbox::command(&policy, program, &rest, false) {
-            Ok(mut child) => child.status().await.map_err(Error::from),
+        // as for a bot's command. A lent sandbox's the daemon holds, in the
+        // list its own commands share, until this session closes.
+        let held = match environment {
+            Some(_) => None,
+            None => Some(agent_runtime::sandbox::hold(policy).await),
+        };
+        let status = match agent_runtime::sandbox::command(policy, program, rest, false) {
+            Ok(mut child) => {
+                given(&mut child);
+                child.status().await.map_err(Error::from)
+            }
             Err(e) => Err(e),
         };
-        held.release();
+        if let Some(held) = held {
+            held.release();
+        }
         status
     })?;
     // A command a signal ended exits as a shell reports it.
@@ -234,6 +326,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut max_input_bytes = None;
     let mut max_readers = None;
     let mut max_load = None;
+    let mut max_depth = None;
     let mut idle_exit = None;
     let mut stall_timeout = None;
     let mut shell_excludes = Vec::new();
@@ -241,6 +334,9 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let (mut protected, mut protected_existing) = (Vec::new(), Vec::new());
     let mut protected_paths = Vec::new();
     let mut walled = Vec::new();
+    let mut windows = Vec::new();
+    let mut models = None;
+    let mut provider_config = None;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -267,6 +363,13 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--protect" => protected.push(value.clone()),
             "--protect-path" => protected_paths.push(value.into()),
             "--wall" => walled.push(value.into()),
+            "--context-window" => windows.push(value.as_str()),
+            "--models" => models = Some(value.into()),
+            // Made whole here, so the file watched and reread on each edit is
+            // the one named, with or without a folder in front of it.
+            "--provider-config" => {
+                provider_config = Some(std::path::absolute(value).unwrap_or_else(|_| value.into()))
+            }
             "--protect-existing" => protected_existing.push(value.clone()),
             "--max-processes"
             | "--max-lasting"
@@ -296,6 +399,12 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--max-load" => {
                 let load = cli::load(value)?;
                 max_load = (load > 0.0).then_some(load);
+            }
+            "--max-depth" => {
+                let depth: u64 = value
+                    .parse()
+                    .map_err(|_| Error::with("usage", format!("{flag} needs an integer")))?;
+                max_depth = (depth > 0).then_some(depth);
             }
             // `prepare` has checked each range.
             "--stall-timeout" => stall_timeout = Some(cli::duration_secs(flag, value)?),
@@ -331,5 +440,9 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         protected_existing,
         protected_paths,
         walled,
+        context_windows: std::sync::Arc::new(agent_runtime::provider::Windows::parse(windows)?),
+        models,
+        provider_config,
+        max_depth,
     })
 }

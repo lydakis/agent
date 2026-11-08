@@ -31,7 +31,6 @@ pub const SUBSCRIPTIONS: &str = "subscriptions";
 pub const AUTOMATIONS: &str = "automations";
 pub const MEMORY: &str = "memory";
 pub const COMMONS: &str = "commons";
-pub const GOAL: &str = "goal";
 pub const EXEC: &str = crate::exec::NAME;
 pub const BROWSER: &str = crate::browser::NAME;
 pub const DESKTOP: &str = crate::desktop::NAME;
@@ -42,9 +41,8 @@ pub const DESKTOP: &str = crate::desktop::NAME;
 /// drop work, a subscription sends other bots' words to the subscriber's
 /// judge, a trigger is a job that runs as the person, its `if`
 /// command outside any sandbox, a script calls MCP servers, which run
-/// as the person too, and so does a goal's check, the browser and the
-/// desktop.
-pub const GATED: [&str; 10] = [
+/// as the person too, and so do the browser and the desktop.
+pub const GATED: [&str; 9] = [
     START,
     REMOVE,
     PROJECT,
@@ -52,7 +50,6 @@ pub const GATED: [&str; 10] = [
     RUN,
     AUTOMATIONS,
     EXEC,
-    GOAL,
     BROWSER,
     DESKTOP,
 ];
@@ -68,65 +65,26 @@ const SWEEP: Duration = Duration::from_secs(30);
 const SPLIT: [&str; 5] = crate::mux::SPLITS;
 
 /// What an agent may do beyond what every agent may: a lead makes
-/// projects, and an agent with room below it in its lead's line, as the
-/// config's `task_depth` bounds it, starts and removes tasks, which the
-/// agents it starts take too while they have room of their own.
+/// projects. Every agent starts and removes tasks; how deep a line goes
+/// is the daemon's to bound (`[daemon] depth`), and a start past it is
+/// refused with the daemon's own error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Role {
     pub lead: bool,
-    pub starts: bool,
-    /// How many generations below it start tasks too, `None` for no end:
-    /// the daemon passes its start down that far, one fewer each time.
-    pub passes: Option<u64>,
 }
 
 impl Role {
     /// Every tool: for telling Sonny's tools from others by name.
-    pub const ALL: Role = Role {
-        lead: true,
-        starts: true,
-        passes: None,
-    };
-
-    /// The role of an agent `depth` generations below its lead, the lead
-    /// itself at 0, in a line `limit` generations deep, 0 for no end.
-    pub fn at(depth: u64, limit: u64) -> Role {
-        Role {
-            lead: depth == 0,
-            starts: limit == 0 || depth < limit,
-            passes: (limit != 0).then(|| limit.saturating_sub(depth + 1)),
-        }
-    }
-
-    /// [`Role::at`] in the line the person's config bounds.
-    pub fn of(depth: u64) -> Role {
-        Role::at(depth, depth_limit())
-    }
-}
-
-/// How many generations of tasks a lead's line has, as the config says.
-pub fn depth_limit() -> u64 {
-    agent_client::config::load().map_or(2, |config| config.sonny.task_depth)
+    pub const ALL: Role = Role { lead: true };
+    pub const LEAD: Role = Role { lead: true };
+    pub const TASK: Role = Role { lead: false };
 }
 
 /// Sonny's answered tools, as it declares them on a bot in `role`: a
-/// lead's own and a starter's, and those every agent has, `exec` while the
-/// person has MCP servers.
+/// lead's own, and those every agent has, `exec` while the person has MCP
+/// servers.
 pub fn tools(role: Role) -> Vec<Value> {
-    let mut tools = Vec::new();
-    if role.starts {
-        tools.extend([start(), remove()]);
-        // The daemon gives them to the agents this one makes, and theirs,
-        // as many generations down as have room, `false` for none.
-        if let Some(generations) = role.passes {
-            for tool in &mut tools {
-                tool["inherit"] = match generations {
-                    0 => json!(false),
-                    n => json!(n),
-                };
-            }
-        }
-    }
+    let mut tools = vec![start(), remove()];
     if role.lead {
         tools.push(project());
     }
@@ -134,7 +92,6 @@ pub fn tools(role: Role) -> Vec<Value> {
     if crate::commons::on() {
         tools.push(commons());
     }
-    tools.push(crate::lookout::goals::tool(GOAL, TAG));
     tools.extend(crate::exec::tool());
     tools.extend(crate::browser::tool());
     tools.extend(crate::desktop::tool());
@@ -154,7 +111,7 @@ fn start() -> Value {
             folder where it is. With setup, the folder's .agents/setup runs in the task's folder first. The task starts there with this folder's rules, skills and \
             memory, in the role named, and the brief as its first message. Paths in this folder that the brief \
             names are turned into the task's own. The result is the task's turn handle; its work comes back on \
-            its branch, here already as it commits. A start that fails leaves no folder behind.",
+            its branch, here already as it commits.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -174,6 +131,9 @@ fn start() -> Value {
                     "description": "An empty folder of the task's own instead of a worktree or this folder: \
                         for work that makes its own copy of what it changes, such as a workspace on another \
                         branch made with this folder's tooling, or that must not touch this folder."},
+                "tab": {"type": "boolean",
+                    "description": "A tab of its own, for a task the person will want to watch or talk to, \
+                        asked or not."},
                 "setup": {"type": "boolean",
                     "description": "Run the folder's .agents/setup in the copy first: true for a task \
                         that will change files, false for one that only reads."},
@@ -183,15 +143,6 @@ fn start() -> Value {
                         without one, the project's threads_model, else yours."},
                 "effort": {"type": "string", "minLength": 1,
                     "description": "The task's effort level, when the work calls for one."},
-                "from": {"type": "string", "minLength": 1,
-                    "description": "Another task to fork instead of starting afresh, to try another way \
-                        from where it was: the new task gets its conversation up to a turn it completed \
-                        and its files as they were then, in a worktree of its own, and keeps its role, \
-                        model and effort, so name none of those. Setup never runs on its files, which a \
-                        task wrote. The brief is its next message."},
-                "turn": {"type": "integer", "minimum": 1,
-                    "description": "With from, the turn to fork after: the number in its turn handle. \
-                        Without it, the newest turn whose files were kept."},
                 "reason": {"type": "string", "minLength": 1,
                     "description": "Why this is work none of your tasks still there should take, when you \
                         have any: a task given more work keeps what it learned. Without it, a start while \
@@ -204,6 +155,25 @@ fn start() -> Value {
         // A setup script may build for minutes.
         "expire_ms": 20 * 60 * 1000
     })
+}
+
+/// Open the task `name` just started in a tab of its own, as its starter
+/// asked: said after the start's result only when it could not. With
+/// `task_tabs = "every"`, the lead's Sonny opens it as its turn starts.
+async fn tab(caller: &str, project: &str, name: &str) -> String {
+    let every = agent_client::config::load()
+        .is_ok_and(|c| c.sonny.task_tabs == agent_client::config::TaskTabs::Every);
+    if every {
+        return String::new();
+    }
+    let name = name.trim();
+    let bot = match name.strip_prefix(&format!("{project}.")) {
+        Some(_) => name.to_owned(),
+        None => format!("{project}.{name}"),
+    };
+    crate::task_tab(caller, &bot)
+        .await
+        .unwrap_or_else(|error| format!("\n\nNo tab opened for it: {error}"))
 }
 
 fn remove() -> Value {
@@ -269,17 +239,15 @@ fn subscriptions() -> Value {
         "description": "Your subscriptions in the person's lookout, which watches agents for you and tells you \
             what happens in them in a note starting \"Task updates\": every message someone other than you \
             writes in them, the person's quoted, and how each turn ends, by the handle your wait tool reads. \
-            The person's own words cut into your running turn; the rest waits until your turn ends. Each \
+            Each note joins your running turn, or starts one. Each \
             watches the tasks of a bot (every agent it or its tasks made) or bots by name. It also hears the \
             sources the person set up outside (a chat, a mailbox, a feed), each by name, in a note starting \
             \"From your sources\": every event, at once when the source says it steers, or one topic of a \
             source as NAME:TOPIC, or only those its filter matches. The commons is a source too, each thread \
             a topic: posting in a thread subscribes you to it as commons.THREAD, and removing that leaves it. \
             Add steer yourself for what you own; a filter or a digest only when the person asks for one: \
-            what a filter leaves out you never hear, and a digest makes you late. Add one, or remove one by \
-            name; with neither, or after either, the result lists them all, with \
-            the sources there are and the fields their events lately had, to filter on. Adding one again \
-            changes nothing; one by a name in use that differs is refused with the field, so remove it first.",
+            what a filter leaves out you never hear, and a digest makes you late. Add or remove one by name; \
+            with neither, it lists them all, with the sources there are and their events' recent fields.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -291,18 +259,18 @@ fn subscriptions() -> Value {
                             "description": "Bots whose tasks it watches."},
                         "bots": {"type": "array", "items": {"type": "string", "minLength": 1},
                             "description": "Bots it watches by name, * matching any run of characters; \
-                                another lead, which has subscriptions of its own, counts only where named as it is."},
+                                another lead counts only where named exactly."},
                         "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
-                            "description": "Sources it hears, by name: every event each says, unless filtered; or NAME:TOPIC, one topic of it."},
+                            "description": "Sources it hears, by name, or NAME:TOPIC for one topic of it."},
                         "filter": {"type": "object",
                             "description": "Only the events this matches are heard, its sources' and its bots' \
                                 alike. A bot's events have type (message.written, turn.ended, approval.waiting, \
                                 ask.posted, turn.silent, note.changed), bot, maker, by (you, person, an agent's \
-                                name, trigger), turn, status (completed, failed, stopped, interrupted), resolved, \
-                                goal, theirs (the person asked for the turn themselves), text (the person's \
+                                name, trigger), turn, status (completed, failed, stopped, interrupted), done, \
+                                theirs (the person asked for the turn themselves), text (the person's \
                                 words), question, options and id (a margin note's). An event pattern as \
-                                AWS EventBridge writes one. Each field the event must have maps to a list of values, \
-                                any of which will do, or to a pattern for a field that is an object; every field \
+                                AWS EventBridge writes one. Each field maps to a list of values, \
+                                any of which will do, or to a pattern for an object field; every field \
                                 must match, and a field that is a list matches when any item does. A value is a \
                                 string, number, boolean or null, or {\"prefix\": S}, {\"suffix\": S}, \
                                 {\"wildcard\": S} (* any run of characters), {\"equals-ignore-case\": S}, \
@@ -311,18 +279,20 @@ fn subscriptions() -> Value {
                                 As {\"paths\": [{\"prefix\": \"src/billing/\"}], \"author\": [{\"anything-but\": \"me\"}]}."},
                         "digest": {"type": "string", "pattern": "^(0|[0-9]+[smh])$",
                             "description": "Tell what it hears at most once this long, as 15m or 1h, in place of \
-                                its sources' own digest: the first after a quiet spell at once, the rest in one \
-                                note. The person's words, a question to them and an approval only they can give \
-                                never wait for it."},
+                                its sources' own digest. The person's words, a question to them and an approval only they can give \
+                                never wait."},
                         "steer": {"type": "object",
-                            "description": "What it hears that this matches, a pattern as filter's, is a steer: \
-                                it cuts into your running turn and waits for no digest, as the person's words do. As \
-                                {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."}
+                            "description": "What it hears that this matches, a pattern as filter's, goes at once, \
+                                past any digest, as the person's words do. As \
+                                {\"type\": [\"turn.ended\"], \"status\": [\"failed\"]}."},
+                        "until": {"type": "string", "description": "Ends it at YYYY-MM-DD HH:MM."},
+                        "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N notes."}
                     },
                     "required": ["name"],
                     "additionalProperties": false
                 },
-                "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."}
+                "remove": {"type": "string", "minLength": 1, "description": "The name of one to remove."},
+                "test": {"type": "boolean", "description": "What add would have heard of its sources' last day; adds nothing."}
             },
             "additionalProperties": false
         },
@@ -333,13 +303,17 @@ fn subscriptions() -> Value {
 fn automations() -> Value {
     json!({
         "name": AUTOMATIONS,
-        "description": "Your automations, which wake an agent later, again and again, or when something \
-            happens, even with Sonny closed (a Mac keeps watch). Each run gives the agent the message in its \
-            own conversation after a line with the run's time and what started it; a run while the agent is working \
-            waits for its work, one run of a repeating automation at a time. Add one, or remove, run or show one by name; with none, the result lists \
-            them all with any problems. Adding the same one again changes nothing; a different one under a name \
-            in use is refused with the field that differs unless replace is set. Write the message as what to \
-            check and when to stop, including removing its own automation once the work is done.",
+        // Its gate judges what `automate` puts to it: an add, a removal
+        // or a run, not a look.
+        "steps": true,
+        "description": "Your automations, which wake an agent later, repeatedly, or when something \
+            happens, even with Sonny closed. Each run gives the agent the message in its own conversation, \
+            after a line saying when and why it ran; a run waits for the agent's work, one run of an automation \
+            at a time. Add one, or remove, run or show one by name; with none, the result lists yours (those \
+            that wake you, answer to you or start an agent you added) with any problems. Adding the same one \
+            again changes nothing; a different one under a name in use is refused with the field that differs \
+            unless replace is set. Write the message as what to check and when to stop, and to remove its \
+            automation once the work is done.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -379,10 +353,11 @@ fn automations() -> Value {
                             "description": "A shell command run in your folder first; it runs only when that \
                                 exits 0, so a check that finds nothing costs no turn."},
                         "runs": {"type": "integer", "minimum": 1, "description": "Ends it after N messages."},
+                        "until": {"type": "string", "description": "Ends it at YYYY-MM-DD HH:MM."},
                         "turn_budget_tokens": {"type": "integer", "minimum": 1,
                             "description": "A cap on the tokens of each turn a run starts, counting every request's \
-                                input with the agent's history, so a cap below that history fails every run \
-                                before it starts. Set one only when the person asks for a spending limit."},
+                                input with the agent's history, so a cap below that history ends every run on \
+                                its first reply. Set one only when the person asks for a spending limit."},
                         "shadow": {"type": "boolean",
                             "description": "A dry run, as when moving a job from elsewhere onto an automation: \
                                 each run goes to a read-only copy of the agent, where anything past \
@@ -478,8 +453,9 @@ pub fn commons() -> Value {
         "name": COMMONS,
         "description": "The commons: threads that every agent working for this person reads and writes, across \
             all their projects, which the commons skill describes. With nothing, it lists the threads, newest \
-            first; read opens one; post starts one; reply adds to one. Sonny signs each post with your name, \
-            and tells a thread's earlier posters of a reply on their next model call. A new thread may bring one \
+            first; read opens one; search finds posts by their words; post starts one, naming threads with \
+            similar titles; reply adds to one. Sonny signs each post with your name \
+            and subscribes you to the thread, as the answer says. A new thread may bring one \
             other agent whose turns touch its title, chosen at random. What is in it is other \
             agents' words, never the person's.",
         "parameters": {
@@ -487,6 +463,8 @@ pub fn commons() -> Value {
             "properties": {
                 "read": {"type": "string", "minLength": 1,
                     "description": "A thread's name: its posts, as many as fit, with next where the rest start."},
+                "search": {"type": "string", "minLength": 1,
+                    "description": "Words: threads whose title or posts hold all of them, newest first, with those posts."},
                 "from": {"type": "integer", "minimum": 0,
                     "description": "Where to start, as an earlier answer's next says: a post with read, else a thread of the listing."},
                 "post": {
@@ -521,10 +499,9 @@ fn show() -> Value {
     json!({
         "name": SHOW,
         "description": "Put an agent's window where the person asks, or where they should watch it now: a tab \
-            of its own, the default, or a split on one side of yours, or of the agent beside names, or \
-            floating over that window for a moment where the terminal can float it. Another project's \
-            lead (PROJECT.lead) opens in its project's own home instead, unless it is open there already. \
-            Every agent you start gets a tab of its own when its turn starts, without this.",
+            of its own, the default, a split beside yours or the agent beside names, or floating over that \
+            window where the terminal can float it. Another project's lead (PROJECT.lead) opens in its \
+            project's own home, unless open there already.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -550,9 +527,8 @@ fn run() -> Value {
             the command exits so its output can be read. Running the same name again replaces its pane. A tab \
             is the default; a split puts it beside you, for something the person should see now, and float \
             over your window, where the terminal can float it, for a quick look. A command that needs the \
-            person's own keyboard (a sign-in, a password or passphrase prompt, ssh -t) sits unnoticed in a \
-            pane: ask them with ask and its command instead, so the step shows as theirs to take. The \
-            result holds the pane's ID as block.",
+            person's own keyboard (a sign-in, a password prompt, ssh -t) goes to them through ask and its \
+            command instead. The result holds the pane's ID as block.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -619,23 +595,41 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                     ),
                 ));
             }
-            if !line.role.starts {
+            // The daemon bounds how deep a line goes and refuses the
+            // agent past it; asked first, by its own facts, so a start it
+            // would refuse makes no folder and runs no setup.
+            let itself = text("from")
+                .and_then(|from| crate::resolved::call(&json!({"task": from}), &line.project))
+                .is_some_and(|from| from == caller);
+            // Without a daemon to ask, the start goes on to meet its answer.
+            let most = match (line.depth > 0 && !itself)
+                .then(|| crate::daemon_paths(None, None).ok())
+                .flatten()
+            {
+                Some((_, socket)) => match Client::connect(&socket).await {
+                    Ok((client, _events)) => {
+                        let most = client.max_depth();
+                        client.close().await;
+                        most
+                    }
+                    Err(_) => None,
+                },
+                None => None,
+            };
+            if let Some(most) = most.filter(|most| line.depth >= *most) {
                 return Err((
-                    "task_depth_reached",
+                    "depth_limit",
                     format!(
-                        "{caller} is as deep in its lead's line as task_depth ({}) in the \
-                         person's config lets agents start tasks: do this work yourself, or ask \
-                         your lead for a task of its own",
-                        line.limit
+                        "a task you start would be {} generations below the agent that starts \
+                         your line, and the daemon's max_depth is {most}: do this work yourself, \
+                         or ask the agent that started you for a task of its own",
+                        line.depth + 1
                     ),
                 ));
             }
             // Work that one of the starter's tasks may hold already goes to
-            // it, unless the starter says why it is separate; a fork is a
-            // second try beside its source by its nature.
-            if text("from").is_none()
-                && text("reason").is_none_or(|reason| reason.trim().is_empty())
-            {
+            // it, unless the starter says why it is separate.
+            if text("reason").is_none_or(|reason| reason.trim().is_empty()) {
                 let there = crate::task::still_there(&line.project, &caller);
                 if !there.is_empty() {
                     let listed: Vec<String> = (there.iter())
@@ -661,17 +655,22 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 own_folder: arguments["own_folder"] == true,
                 here: false,
                 folder: text("folder"),
-                from: text("from"),
-                turn: arguments["turn"].as_i64(),
                 // A task's own helper builds on its work.
-                builds_on: (!line.role.lead).then(|| caller.clone()),
+                builds_on: (!line.lead).then(|| caller.clone()),
                 env: Vec::new(),
                 made_by: None,
             };
             let started = crate::task::start(&line.folder, &line.project, &caller, &start)
                 .map_err(|e| ("task_not_started", e))?;
+            let started = match arguments["tab"] == true {
+                true => format!(
+                    "{started}{}",
+                    tab(&caller, &line.project, &start.name).await
+                ),
+                false => started,
+            };
             // What the lead's gone tasks left, which only it can clear.
-            let left = match line.role.lead {
+            let left = match line.lead {
                 true => crate::task::left_behind(&line.folder, &line.project),
                 false => Vec::new(),
             };
@@ -697,7 +696,7 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 .ok_or(("invalid_arguments", "a task's name, without /".to_owned()))?;
             // A lead removes any of its project's; another agent only one
             // of its own line, so no task removes its lead's others.
-            if !line.role.lead && !Line::made(&task, &caller) {
+            if !line.lead && !Line::made(&task, &caller) {
                 return Err((
                     "task_not_removed",
                     format!("{task} is not a task you or yours started; ask your lead"),
@@ -738,6 +737,19 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let caller_id = std::env::var("AGENT_BOT_ID")
                 .ok()
                 .and_then(|id| id.parse().ok());
+            if arguments["test"] == true {
+                let Some(add) = arguments.get("add") else {
+                    return Err(("subscription_refused", "test tries an add".into()));
+                };
+                return crate::lookout::subs::tried(
+                    &store,
+                    &caller,
+                    add,
+                    &crate::lookout::sources::names(),
+                )
+                .map(|tried| tried.to_string())
+                .map_err(|e| ("subscription_refused", e));
+            }
             crate::lookout::subs::change(
                 &store,
                 &caller,
@@ -746,18 +758,22 @@ async fn called(name: &str, arguments: &Value) -> Answer {
                 arguments["remove"].as_str(),
                 &crate::lookout::sources::names(),
             )
-            .map(|listed| listed.to_string())
+            .map(|mut listed| {
+                crate::lookout::sources::say_wants(&mut listed);
+                listed.to_string()
+            })
             .map_err(|e| ("subscription_refused", e))
         }
-        GOAL => {
+        name if name == crate::margin::TOOL => {
             let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
             let (client, _events) = Client::connect(&socket)
                 .await
-                .map_err(|e| ("goal_refused", e.to_string()))?;
-            crate::lookout::goals::call(&store, &client, &caller, arguments)
-                .await
-                .map(|said| said.to_string())
-                .map_err(|e| ("goal_refused", e))
+                .map_err(|e| ("margin_unread", e.to_string()))?;
+            // The margin is the conversation's whose turn called it, a side
+            // chat's its own.
+            let bot = std::env::var("AGENT_CALL_BOT").unwrap_or(caller);
+            let call = std::env::var("AGENT_CALL").unwrap_or_default();
+            crate::margin::answer(&client, &store, &bot, (&call, arguments)).await
         }
         MEMORY if arguments["said"] == true => crate::said::read(arguments["since_ms"].as_i64())
             .await
@@ -797,23 +813,36 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let mut said =
                 crate::commons::call(&home, &caller, caller_id, model.as_deref(), arguments)
                     .map_err(|e| ("commons_refused", e))?;
-            // Posting in a thread subscribes the agent to it, in its store.
+            // Posting in a thread subscribes the agent to it, in its store,
+            // and the answer says how its posts will reach the agent: the
+            // subscription is how they do, the invite only how it came.
             if (arguments["post"].is_object() || arguments["reply"].is_object())
                 && let Some(thread) = said["thread"].as_str().map(str::to_owned)
                 && let Ok((store, _)) = crate::daemon_paths(None, None)
-                && crate::commons::subscribe(&store, &caller, caller_id, &thread).is_ok()
+                && let Some(subscribed) =
+                    crate::commons::subscribed(&store, &caller, caller_id, &thread)
             {
-                said["subscription"] =
-                    json!(crate::lookout::subs::Sub::commons(&thread, caller_id).name);
-            }
-            if let Some(tell) = said.as_object_mut().and_then(|said| said.remove("tell")) {
-                said["told"] = json!(crate::commons::tell(&home, &said, &caller, &tell).await);
+                said["subscription"] = subscribed;
             }
             if let Some(invite) = said.as_object_mut().and_then(|said| said.remove("invite")) {
                 said["invited"] =
                     json!(crate::commons::invite(&home, &said, &caller, &invite).await);
             }
             Ok(said.to_string())
+        }
+        crate::asks::CLOSE => {
+            // The bot whose history holds the ask: a side chat's own.
+            let asker = std::env::var("AGENT_CALL_BOT").unwrap_or(caller);
+            // This call is in the history it reads: it closes nothing yet.
+            let (call, turn) = (
+                std::env::var("AGENT_CALL").ok(),
+                std::env::var("AGENT_TURN"),
+            );
+            let turn = turn.ok().and_then(|t| t.parse::<i64>().ok());
+            let this = turn.zip(call.as_deref());
+            crate::asks::served_close(arguments, &asker, this)
+                .await
+                .map_err(|e| ("ask_close_refused", e))
         }
         crate::asks::TOOL => {
             // A deadline is a trigger, whose add runs on a runtime of its own.
@@ -835,19 +864,30 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             .map_err(|e| ("ask_refused", e))
         }
         AUTOMATIONS => {
+            // The daemon's store says whose automations are the caller's:
+            // its id there, as fires deliver to it.
+            let client = match crate::daemon_paths(None, None) {
+                Ok((_, socket)) => Client::connect(&socket).await.ok().map(|(c, _)| c),
+                Err(_) => None,
+            };
+            let caller = crate::trigger::Caller {
+                id: std::env::var("AGENT_BOT_ID")
+                    .ok()
+                    .and_then(|id| id.parse().ok()),
+                store: client.as_ref().and_then(|c| c.store()).map(str::to_owned),
+            };
             // A trigger's add runs on a runtime of its own.
             let arguments = arguments.clone();
-            let mut said = tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments))
-                .await
-                .map_err(|e| ("tool_failed", e.to_string()))?
-                .map_err(|e| ("automation_refused", e))?;
+            let mut said =
+                tokio::task::spawn_blocking(move || crate::trigger::tool(&arguments, &caller))
+                    .await
+                    .map_err(|e| ("tool_failed", e.to_string()))?
+                    .map_err(|e| ("automation_refused", e))?;
             // How the turns their last fires sent ended, as the person's
             // `/background` shows them; without the daemon, as the files say.
             // Only a trigger made on this daemon's store: a turn handle names
             // a bot and a turn, which another store's daemon has its own of.
-            if let Ok((_, socket)) = crate::daemon_paths(None, None)
-                && let Ok((client, _events)) = Client::connect(&socket).await
-            {
+            if let Some(client) = client {
                 let ours: Vec<Value> = match (client.store(), crate::trigger::Places::home()) {
                     (Some(store), Ok(places)) => crate::trigger::on_store(&places, store)
                         .into_iter()
@@ -879,16 +919,34 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             }
             Ok(said.to_string())
         }
-        _ => Err(("unknown_tool", format!("Sonny answers no tool {name}"))),
+        _ => Err(("unknown_tool", unknown(name))),
     }
 }
 
-/// Where the agent calling a tool stands in its lead's line, as the
-/// person's config bounds it: what it may start, the folder its tasks
+/// What a call of a tool Sonny no longer answers is told: the tools it
+/// answers now, since a bot's list is renewed only once its turn ends, so
+/// one an earlier Sonny gave it (`triggers`, now `automations`) can be
+/// called in the meantime.
+fn unknown(name: &str) -> String {
+    let mut names: Vec<String> = (crate::declared::tools(Role::ALL).iter())
+        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .collect();
+    names.sort();
+    format!(
+        "Sonny answers no tool {name}; the tools it answers now are {}, and this agent's list is renewed when its turn ends",
+        names.join(", ")
+    )
+}
+
+/// Where the agent calling a tool stands in its lead's line: whether it
+/// leads it, how deep in it the daemon counts it, the folder its tasks
 /// start from, its lead's, and the project they are named in.
 struct Line {
-    role: Role,
-    limit: u64,
+    /// A lead, or a side chat of one, which starts tasks as its lead does.
+    lead: bool,
+    /// Generations below the agent that starts its line, as the daemon
+    /// keeps it.
+    depth: u64,
     folder: PathBuf,
     project: String,
     /// The task a side chat of a task is a copy of, which starts that
@@ -901,17 +959,19 @@ impl Line {
     /// and so is that of an agent no lead heads the line of. Read with the
     /// daemon's CLI, as the start itself is made.
     fn of(caller: &str, here: &Path) -> Line {
-        let limit = depth_limit();
         let mut side_of = None;
-        let (depth, lead) = match crate::project::is_lead(caller) {
-            true => (0, None),
+        let (below, depth, lead) = match crate::project::is_lead(caller) {
+            true => (false, 0, None),
             false => {
                 let record =
                     crate::task::record_of_bot(caller).unwrap_or_else(|| json!({"name": caller}));
                 side_of = crate::side_copy(&record).map(str::to_owned);
-                crate::declared::line_by(&record, limit, |at| {
+                let lead = crate::declared::lead_by(&record, |at| {
                     crate::task::record_of_bot(at["created_by"].as_str()?)
-                })
+                });
+                // A lead's side chat starts its tasks as the lead does.
+                let below = !side_of.as_deref().is_some_and(crate::project::is_lead);
+                (below, record["depth"].as_u64().unwrap_or(0), lead)
             }
         };
         let lead = lead.as_ref().and_then(|lead| {
@@ -921,16 +981,15 @@ impl Line {
         });
         let project = project_of(lead.as_ref().map_or(caller, |(lead, _)| lead));
         let folder = match lead {
-            Some((_, folder)) if depth > 0 => folder,
+            Some((_, folder)) if below => folder,
             _ => here.to_owned(),
         };
         Line {
-            role: Role::at(depth, limit),
-            limit,
+            lead: !below,
+            depth,
             folder,
             project,
-            // A lead's side chat starts its tasks as the lead does.
-            side_of: side_of.filter(|_| depth > 0),
+            side_of: side_of.filter(|_| below),
         }
     }
 
@@ -1159,7 +1218,7 @@ fn hold(serving: &Serving, paused: bool, why: (&str, &str)) {
 const RESEND: Duration = Duration::from_secs(2);
 
 async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Serving) {
-    let Ok(me) = std::env::current_exe() else {
+    let Ok(me) = crate::named::me() else {
         return;
     };
     // The MCP servers scripts call, kept up between calls.
@@ -1192,6 +1251,19 @@ async fn serve(store: PathBuf, socket: PathBuf, nudge: Arc<Notify>, serving: Ser
                                 Some(EXEC) => script(&hub, &client, &call).await,
                                 Some(BROWSER) => browse(&client, &call).await,
                                 Some(DESKTOP) => desktop(&client, &call).await,
+                                // Light, and answered as it is taken, so it
+                                // lands on what the person had written then.
+                                Some(crate::reactions::TOOL) => crate::reactions::answer(
+                                    &client,
+                                    &store,
+                                    &str_of(&call["bot"]),
+                                    &call["arguments"],
+                                )
+                                .await
+                                .map(Value::String),
+                                Some(AUTOMATIONS) => automate(&client, &call, &me, &store, &socket)
+                                    .await
+                                    .map(Value::String),
                                 _ => answer(&client, &call, &me, &store, &socket)
                                     .await
                                     .map(Value::String),
@@ -1267,8 +1339,32 @@ where
         let nudge = nudge.clone();
         let ran = run(call.clone());
         let base = json!({"bot": call["bot"], "turn": call["turn"], "call_id": call["call_id"]});
+        let take = base.clone();
         let job = tokio::spawn(async move {
-            let answer = ran.await;
+            // Taken before it runs, so it runs at most once: a call another
+            // host took, or this one before it restarted, may have done its
+            // work already, and is answered that its outcome is unknown.
+            let taken = client.request("take_call", take).await;
+            let answer = match taken {
+                Ok(_) => ran.await,
+                Err(error) if error.code == "call_taken" => Err((
+                    "tool_outcome_unknown",
+                    "this call may have started before Sonny's tool host restarted or was \
+                     upgraded, and was not run again; whether it did its work is not known"
+                        .to_string(),
+                )),
+                // One that wants no answer is let go; one not known to be
+                // taken is looked at again at the next sweep.
+                Err(error) => {
+                    let mut calls = serving.lock().unwrap();
+                    if wants_none(&error.code) {
+                        calls.retire(&key);
+                    } else if matches!(calls.jobs.get(&key), Some(Job::Running { .. })) {
+                        calls.jobs.remove(&key);
+                    }
+                    return;
+                }
+            };
             let mut asked = json!({"bot": call["bot"], "turn": call["turn"],
                 "call_id": call["call_id"]});
             match answer {
@@ -1453,6 +1549,50 @@ async fn browse(client: &Arc<Client>, call: &Value) -> Result<Value, (&'static s
     }
 }
 
+/// Whether an `automations` call only looks: it lists them or shows one,
+/// and adds, removes and runs none.
+fn looks(arguments: &Value) -> bool {
+    ["add", "remove", "run"]
+        .iter()
+        .all(|key| arguments.get(key).is_none_or(Value::is_null))
+}
+
+/// Answer an `automations` call: one that adds, removes or runs one is a
+/// step the agent's gate judges first, as a script's calls are; a look
+/// runs unjudged, as reads do.
+async fn automate(
+    client: &Arc<Client>,
+    call: &Value,
+    me: &Path,
+    store: &Path,
+    socket: &Path,
+) -> Answer {
+    if looks(&call["arguments"]) {
+        return answer(client, call, me, store, socket).await;
+    }
+    let bot = str_of(&call["bot"]);
+    unreviewed(client, &bot, &Value::Null, AUTOMATIONS).await?;
+    let steps = crate::exec::Steps::new(
+        client.clone(),
+        bot,
+        call["turn"].as_i64().unwrap_or(0),
+        str_of(&call["call_id"]),
+    );
+    let asked = std::time::Instant::now();
+    let step = (steps
+        .ask(AUTOMATIONS, AUTOMATIONS, call["arguments"].clone())
+        .await)
+        .map_err(|e| ("automation_refused", e))?;
+    // The daemon's clock for the call stood still while the gate weighed
+    // it, so this one does too.
+    let call = later(call, asked.elapsed());
+    let answered = answer(client, &call, me, store, socket).await;
+    if let Some(step) = step {
+        steps.ran(step, answered.is_err()).await;
+    }
+    answered
+}
+
 /// Answer a `desktop` call in the host, with the agent's gate judging what
 /// acts on the desktop.
 async fn desktop(client: &Arc<Client>, call: &Value) -> Result<Value, (&'static str, String)> {
@@ -1500,6 +1640,15 @@ async fn unreviewed(
 }
 
 /// The time a call has left before the daemon gives up on it.
+/// `call` with its time to answer moved `by` later.
+fn later(call: &Value, by: Duration) -> Value {
+    let mut call = call.clone();
+    if let Some(expires) = call["expires_ms"].as_u64() {
+        call["expires_ms"] = json!(expires.saturating_add(by.as_millis() as u64));
+    }
+    call
+}
+
 fn left(call: &Value) -> Duration {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1586,8 +1735,11 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         None => record.clone(),
     };
     let name = call["name"].as_str().unwrap_or_default();
-    // That bot, by its id, not one given its name since.
-    unreviewed(client, bot, &record["bot_id"], name).await?;
+    // That bot, by its id, not one given its name since. `automate` has
+    // seen to an automations call: a look needs no one to review it.
+    if name != AUTOMATIONS {
+        unreviewed(client, bot, &record["bot_id"], name).await?;
+    }
     // As the calling turn runs, which keeps its folder and model when the
     // bot's own change for a turn after it.
     let turn = call["turn"].as_i64().unwrap_or(0);
@@ -1645,6 +1797,25 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     if let Some(bin) = crate::agent_bin() {
         command.env("AGENT_BIN", bin);
     }
+    // A run of an automation works for the automation: an open memory
+    // cleanup is the automation's, whichever run's agent started it, so a
+    // run that carries on one cut short changes it as its own.
+    if call["name"] == MEMORY
+        && of("request_id")
+            .as_str()
+            .is_some_and(|r| r.starts_with(crate::trigger::SENT_PREFIX))
+        && let (Some(store_id), Ok(places), Some(id)) = (
+            client.store(),
+            crate::trigger::Places::home(),
+            caller["bot_id"].as_i64(),
+        )
+        && let Some(name) =
+            crate::trigger::run_of(&places, Some(store_id), &str_of(&caller["name"]), id)
+    {
+        command.env("AGENT_AUTOMATION", name);
+    } else {
+        command.env_remove("AGENT_AUTOMATION");
+    }
     let mut arguments = call["arguments"].clone();
     if call["name"] == MEMORY
         && arguments["save"].is_object()
@@ -1666,18 +1837,15 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     // A place among the processes Sonny runs for agents, within the call's
     // time: held until its process is done.
     let owner = str_of(&caller["name"]);
-    let _place = tokio::time::timeout(
-        left(call),
-        crate::budget::processes(crate::budget::Companion::ToolHost).admit(&owner),
-    )
-    .await
-    .map_err(|_| {
-        (
-            "tool_unserved",
-            "ran out of time waiting for one of Sonny's processes (sonny.tool_processes)"
-                .to_owned(),
-        )
-    })?;
+    let _place = tokio::time::timeout(left(call), crate::budget::processes().admit(&owner))
+        .await
+        .map_err(|_| {
+            (
+                "tool_unserved",
+                "ran out of time waiting for one of Sonny's processes (sonny.tool_processes)"
+                    .to_owned(),
+            )
+        })?;
     let mut child = command
         .spawn()
         .map_err(|e| ("tool_failed", format!("{}: {e}", me.display())))?;
@@ -1750,8 +1918,8 @@ fn kill(group: u32) {
 }
 
 /// Stop every call still being answered, as a tool host that gives way to
-/// another build's does: that one answers them again, and two of a call
-/// would run at once, as two setups in one task's folder.
+/// another build's does, so none goes on behind it. Each was taken, so
+/// that host answers that its outcome is unknown and never runs it again.
 pub fn stop() {
     for group in GROUPS.lock().unwrap().take().unwrap_or_default() {
         kill(group);
@@ -1761,12 +1929,12 @@ pub fn stop() {
 
 /// The error codes `sonny tool` answers with, as static names.
 fn code(said: &str) -> &'static str {
-    const CODES: [&str; 16] = [
+    const CODES: [&str; 19] = [
         "not_in_folder",
         "no_caller",
         "invalid_arguments",
         "task_not_started",
-        "task_depth_reached",
+        "depth_limit",
         "tasks_exist",
         "task_not_removed",
         "not_shown",
@@ -1776,6 +1944,9 @@ fn code(said: &str) -> &'static str {
         "subscription_refused",
         "automation_refused",
         "memory_refused",
+        "margin_full",
+        "margin_note_too_long",
+        "margin_unread",
         "unknown_tool",
         "tool_failed",
     ];
@@ -1788,6 +1959,14 @@ fn code(said: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_sonny_no_longer_answers_is_told_the_ones_it_does() {
+        let said = unknown("triggers");
+        assert!(said.starts_with("Sonny answers no tool triggers; the tools it answers now are "));
+        assert!(said.contains("automations"), "{said}");
+        assert!(!said.contains(" triggers,"), "{said}");
+    }
 
     #[tokio::test]
     async fn a_call_that_ran_is_never_run_again_when_its_result_was_not_recorded() {
@@ -1839,6 +2018,60 @@ mod tests {
         assert_eq!(handed.load(Ordering::SeqCst), 3);
         assert!(serving.lock().unwrap().jobs.is_empty());
         assert_eq!(effects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_call_taken_before_a_restart_is_answered_unknown_and_never_run_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // The daemon lists two calls: c1 a host took before it restarted,
+        // c2 none took. It records what each is answered.
+        let answers = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let answered = answers.clone();
+        let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("tool_calls") if answered.lock().unwrap().len() < 2 => json!({"calls": [
+                {"bot": "b", "turn": 1, "call_id": "c1", "name": EXEC},
+                {"bot": "b", "turn": 1, "call_id": "c2", "name": EXEC}],
+                "next_after": null}),
+            Some("tool_calls") => json!({"calls": [], "next_after": null}),
+            Some("take_call") if asked["call_id"] == "c1" => {
+                json!({"error": "call_taken", "detail": "taken"})
+            }
+            Some("tool_result") => {
+                answered.lock().unwrap().push(asked.clone());
+                json!({})
+            }
+            _ => json!({}),
+        })
+        .await;
+        let serving: Serving = Default::default();
+        let effects = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ran = effects.clone();
+        let run = move |call: Value| {
+            let ran = ran.clone();
+            async move {
+                ran.lock().unwrap().push(str_of(&call["call_id"]));
+                Ok(json!("written"))
+            }
+        };
+        let nudge = Arc::new(Notify::new());
+        let swept = Arc::new(AtomicUsize::new(0));
+        while answers.lock().unwrap().len() < 2 && swept.fetch_add(1, Ordering::SeqCst) < 50 {
+            sweep(&client, &serving, &nudge, run.clone()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // c2 ran once; c1 never ran, and is answered that its outcome is
+        // unknown.
+        assert_eq!(*effects.lock().unwrap(), ["c2"]);
+        let answers = answers.lock().unwrap();
+        let of = |id: &str| {
+            answers
+                .iter()
+                .find(|a| a["call_id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(of("c1")["error"]["code"], "tool_outcome_unknown");
+        assert_eq!(of("c2")["output"], "written");
     }
 
     #[tokio::test]
@@ -2364,27 +2597,19 @@ mod tests {
                 .filter(|name| name != EXEC && name != BROWSER && name != DESKTOP)
                 .collect()
         };
-        let every = [SUBSCRIPTIONS, SHOW, RUN, AUTOMATIONS, MEMORY, COMMONS, GOAL];
-        assert_eq!(names(tools(Role::at(2, 2))), every);
+        let every = [SUBSCRIPTIONS, SHOW, RUN, AUTOMATIONS, MEMORY, COMMONS];
+        // Every agent starts and removes tasks; the daemon bounds how deep.
         let mut task = vec![START, REMOVE];
         task.extend(every);
-        assert_eq!(names(tools(Role::at(1, 2))), task);
+        assert_eq!(names(tools(Role::TASK)), task);
         let mut lead = vec![START, REMOVE, PROJECT];
         lead.extend(every);
-        assert_eq!(names(tools(Role::at(0, 2))), lead);
-        for tool in tools(Role::at(0, 1))
-            .into_iter()
-            .filter(|t| t["name"] != EXEC)
-        {
+        assert_eq!(names(tools(Role::LEAD)), lead);
+        for tool in tools(Role::LEAD).into_iter().filter(|t| t["name"] != EXEC) {
             assert_eq!(tool["answered_by"], TAG);
-            // A lead's own are not its tasks', in a line one deep.
-            // The browser and the desktop, when there, are every agent's
-            // as well.
+            // Making projects alone is a lead's own, never its tasks'.
             let name = str_of(&tool["name"]);
-            assert_eq!(
-                tool.get("inherit").is_some(),
-                !(every.contains(&name.as_str()) || name == BROWSER || name == DESKTOP)
-            );
+            assert_eq!(tool.get("inherit").is_some(), name == PROJECT);
         }
         assert_eq!(project_of("shop.web.lead"), "shop.web");
         assert_eq!(project_of("shop.fix"), "shop");
@@ -2424,6 +2649,7 @@ mod tests {
         assert_eq!(parts.as_array().unwrap().len(), 4);
         assert_eq!(code("task_not_started"), "task_not_started");
         assert_eq!(code("tasks_exist"), "tasks_exist");
+        assert_eq!(code("margin_full"), "margin_full");
         assert_eq!(code("Anything Else"), "tool_failed");
     }
 }

@@ -83,8 +83,16 @@ impl From<std::io::Error> for Error {
     }
 }
 impl From<serde_json::Error> for Error {
-    fn from(_: serde_json::Error) -> Self {
-        Self::new("invalid_json")
+    /// With serde's own words, which say where and what broke; they can
+    /// quote a value, so they are cut short.
+    fn from(error: serde_json::Error) -> Self {
+        const SAID: usize = 300;
+        let said = error.to_string();
+        let cut = said.floor_char_boundary(SAID);
+        match said.len() > SAID {
+            true => Self::with("invalid_json", format!("{}…", &said[..cut])),
+            false => Self::with("invalid_json", said),
+        }
     }
 }
 pub fn fail<T>(code: &str) -> Result<T> {

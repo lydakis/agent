@@ -11,7 +11,8 @@
 //! `~/.agent/memory`, a script Sonny writes, shows the indexes, reads,
 //! saves, removes, indexes and checks facts; the `memory` skill Sonny
 //! installs says what to save. A read is recorded beside the facts, so the
-//! cleanup can find facts no agent has opened in a while. `schedule` adds a nightly automation, through
+//! cleanup can find facts no agent has opened in a while. `schedule`, which Sonny
+//! runs when it first opens a lead, adds a nightly automation, through
 //! `~/.agent/automation`, whose agent follows the `memory-cleanup` skill
 //! between `cleanup start` and `cleanup finish`, which commit to a local
 //! git repository in `~/.agents/memory` and revert a cleanup that removed too
@@ -50,7 +51,7 @@ const READS: &str = ".reads";
 /// asked to check that it still holds: Codex drops a memory unused for 30,
 /// Copilot one unused for 28.
 const UNREAD_DAYS: i64 = 30;
-const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory search WORDS... [SCOPE]\n       memory save NAME --type user|feedback|project|reference|work --description TEXT --source TEXT [--external] [--confirmed N] [--pushed-back N] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory said [SINCE_MS]   (Sonny: what the person wrote to any agent since then)\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         --model starts the memory-cleanup agent; without it, the existing one\n         SCOPE: --user | --project NAME; none: the project of this folder";
+const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory search WORDS... [SCOPE]\n       memory save NAME --type user|feedback|project|reference|work --description TEXT --source TEXT [--external] [--confirmed N] [--pushed-back N] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory said [SINCE_MS]   (Sonny: what the person wrote to any agent since then)\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         each run starts an agent on --model; without it, the model scheduled before\n         SCOPE: --user | --project NAME; none: the project of this folder";
 
 /// `memory show|save|rm|index|check|changed|cleanup|schedule`, as
 /// `~/.agent/memory` runs it.
@@ -168,15 +169,32 @@ fn run(
     args: &[String],
     stdin: &dyn Fn() -> Result<String, String>,
 ) -> Result<Value, String> {
-    // Bot ids are each store's own, and stores under one HOME share its
-    // memory: the store names which bot.
-    let caller = std::env::var("AGENT_BOT_ID")
-        .ok()
-        .map(|id| match std::env::var("AGENT_STORE") {
-            Ok(store) => format!("{store}#{id}"),
-            Err(_) => id,
-        });
+    let var = |key: &str| std::env::var(key).ok();
+    let caller = caller(
+        var("AGENT_AUTOMATION"),
+        var("AGENT_BOT_ID"),
+        var("AGENT_STORE"),
+    );
     run_as(root, cwd, args, stdin, caller.as_deref())
+}
+
+/// Who changes memory, as an open cleanup tells its own changes from
+/// others': bot ids are each store's own, and stores under one HOME share
+/// its memory, so the store names which bot. A run of an automation is the
+/// automation (Sonny's tool host names it), so a cleanup one run started
+/// and a later run, in an agent of its own, carries on has one owner.
+fn caller(
+    automation: Option<String>,
+    bot_id: Option<String>,
+    store: Option<String>,
+) -> Option<String> {
+    let who = automation
+        .map(|name| format!("automation:{name}"))
+        .or(bot_id)?;
+    Some(match store {
+        Some(store) => format!("{store}#{who}"),
+        None => who,
+    })
 }
 
 /// [`run`] for `caller`, the agent's id, or none for the person.
@@ -526,11 +544,17 @@ impl Fact {
     fn valid(&self) -> Result<(), String> {
         valid_name(&self.name)?;
         if !TYPES.contains(&self.kind.as_str()) {
-            return Err(format!(
-                "invalid_type: {}: one of {}",
-                self.kind,
-                TYPES.join(", ")
-            ));
+            // An empty value is a missing one: say what the fact needs,
+            // not an empty name followed by a colon.
+            let types = TYPES.join(", ");
+            return Err(if self.kind.is_empty() {
+                format!("invalid_type: the fact needs a type: {types}")
+            } else {
+                format!(
+                    "invalid_type: {} is not a type; the fact needs one of {types}",
+                    self.kind
+                )
+            });
         }
         for (field, value) in [("description", &self.description), ("source", &self.source)] {
             if value.trim().is_empty() || value.contains('\n') || value.trim() != value {
@@ -563,9 +587,12 @@ fn valid_name(name: &str) -> Result<(), String> {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     {
-        return Err(format!(
-            "invalid_name: {name}: a fact's name is 1-64 of a-z 0-9 -, not starting with - and not memory"
-        ));
+        let rule = "1-64 of a-z 0-9 -, not starting with - and not memory";
+        return Err(if name.is_empty() {
+            format!("invalid_name: the fact needs a name: {rule}")
+        } else {
+            format!("invalid_name: {name}: a fact's name is {rule}")
+        });
     }
     Ok(())
 }
@@ -800,11 +827,26 @@ fn save(
     }
     note(Some(&text))?;
     write(&dir.join(INDEX), &index)?;
-    Ok(
-        json!({"saved": fact.name, "path": path, "replaced": before.is_some(),
-        "duplicate": duplicate, "index": dir.join(INDEX), "index_bytes": index.len(),
-        "facts": all.len()}),
-    )
+    let mut saved = json!({"saved": fact.name, "path": path, "replaced": before.is_some(),
+        "duplicate": duplicate, "index": dir.join(INDEX), "facts": all.len()});
+    // A fact a new agent will not see in its index's head is still saved,
+    // and the reply says so, rather than a size that reads as a cap.
+    if !in_head(&index, &fact.name) {
+        saved["past_head"] =
+            json!("saved; past the head of the index a new agent starts with, so search finds it");
+    }
+    Ok(saved)
+}
+
+/// Whether the fact `name` has its line in the head of `index` that a new
+/// agent starts with ([`head`]).
+fn in_head(index: &str, name: &str) -> bool {
+    if index.len() <= HEAD {
+        return true;
+    }
+    let head = head(index);
+    let line = format!("- {name} (");
+    head.lines().any(|shown| shown.starts_with(&line))
 }
 
 /// A folder's reads. Reads are bookkeeping, not memory: a record that is
@@ -871,9 +913,7 @@ fn remove(dir: &Path, name: &str, note: Note) -> Result<Value, String> {
     if all_reads.remove(name).is_some() {
         write(&dir.join(READS), &Value::Object(all_reads).to_string())?;
     }
-    Ok(
-        json!({"removed": name, "duplicate": duplicate, "index_bytes": index.len(), "facts": all.len()}),
-    )
+    Ok(json!({"removed": name, "duplicate": duplicate, "facts": all.len()}))
 }
 
 /// What is wrong in a folder, without changing it: the first file that is
@@ -1119,22 +1159,62 @@ fn changed(root: &Path) -> Result<Value, String> {
     Err("unchanged: nothing saved or removed since the last cleanup".into())
 }
 
+/// Who an open cleanup belongs to: every caller that started or carried
+/// it on, `null` for the person. A `by` that is one caller, as a cleanup
+/// opened before callers joined wrote it, is that one.
+fn owners(open: &Value) -> Vec<Value> {
+    match &open["by"] {
+        Value::Array(owners) => owners.clone(),
+        one => vec![one.clone()],
+    }
+}
+
 /// Commit what agents saved since the last cleanup and remember where the
 /// cleanup starts. A start while one is open returns that one, so a
-/// cleanup cut short is measured from where it began.
+/// cleanup cut short is measured from where it began, and the caller
+/// joins its owners: what it changes from then on is the cleanup's, which
+/// a refused cleanup takes back, and not another agent's, which it keeps.
+/// Earlier owners stay owners, so a run that stopped mid-cleanup and wakes
+/// later is still the cleanup too.
 fn cleanup_start(root: &Path, caller: Option<&str>) -> Result<Value, String> {
     repo(root)?;
+    // A refusal cut short is carried on first, never resumed as a cleanup:
+    // what a run changed after it would stand, as memory goes back once.
+    let refused = std::fs::read_to_string(root.join(CLEANUP))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .is_some_and(|open| open["refused"].is_object());
+    if refused {
+        match cleanup_finish(root) {
+            // Another finish closed it meanwhile: start anew.
+            Err(e) if e.starts_with("cleanup_not_started") => {}
+            done => return done,
+        }
+    }
+    // The memory folder's lock, which a finish holds too: two starts, or a
+    // start and a finish, never both read the open cleanup and write it.
+    let _lock = lock(root)?;
     let state = root.join(CLEANUP);
     if let Ok(text) = std::fs::read_to_string(&state) {
-        let open: Value = serde_json::from_str(&text)
+        let mut open: Value = serde_json::from_str(&text)
             .map_err(|e| format!("memory_invalid: {}: {e}", state.display()))?;
-        let (Some(commit), Some(facts)) = (open["commit"].as_str(), open["facts"].as_u64()) else {
+        let (Some(commit), Some(facts)) = (
+            open["commit"].as_str().map(str::to_owned),
+            open["facts"].as_u64(),
+        ) else {
             return Err(format!(
                 "memory_invalid: {}: no commit or facts",
                 state.display()
             ));
         };
-        return started(root, commit, facts, true);
+        let mut by = owners(&open);
+        let caller = json!(caller);
+        if !by.contains(&caller) {
+            by.push(caller);
+            open["by"] = Value::Array(by);
+            write(&state, &open.to_string())?;
+        }
+        return started(root, &commit, facts, true);
     }
     let count = all_facts(root)?;
     git(root, &["add", "-A"])?;
@@ -1154,7 +1234,7 @@ fn cleanup_start(root: &Path, caller: Option<&str>) -> Result<Value, String> {
     let work: Vec<String> = work(root)?.into_iter().map(|(path, _, _)| path).collect();
     write(
         &state,
-        &json!({"commit": commit, "facts": count, "work": work, "at_ms": at_ms, "by": caller})
+        &json!({"commit": commit, "facts": count, "work": work, "at_ms": at_ms, "by": [caller]})
             .to_string(),
     )?;
     started(root, &commit, count as u64, false)
@@ -1219,15 +1299,16 @@ fn fact_changes(listing: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
 }
 
 /// Note a fact another agent saved (`now` its text) or removed (none)
-/// while a cleanup is open, for [`put_back`]. The cleanup's own agent's
-/// changes are the cleanup's. Called under the fact's folder lock, so the
-/// notes are in the order the changes were made.
+/// while a cleanup is open, for [`put_back`]. Its owners' changes are the
+/// cleanup's. Called under the fact's folder lock, so the notes are in the
+/// order the changes were made.
 fn noted(root: &Path, caller: Option<&str>, path: &Path, now: Option<&str>) -> Result<(), String> {
     let Ok(open) = std::fs::read_to_string(root.join(CLEANUP)) else {
         return Ok(());
     };
-    let by = serde_json::from_str::<Value>(&open).unwrap_or_default()["by"].clone();
-    if by.as_str() == caller {
+    let open = serde_json::from_str::<Value>(&open).unwrap_or_default();
+    // Once the cleanup is refused, its owners' changes are no part of it.
+    if owners(&open).contains(&json!(caller)) && !open["refused"].is_object() {
         return Ok(());
     }
     let Ok(relative) = path.strip_prefix(root) else {
@@ -1336,6 +1417,12 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
         .iter()
         .map(|dir| lock(dir))
         .collect::<Result<Vec<_>, _>>()?;
+    // A refusal cut short is carried on: once its revert landed, nothing
+    // here would read as a loss, and finishing it as a clean cleanup would
+    // drop what others saved meanwhile.
+    if open["refused"].is_object() {
+        return refuse(root, &state, &open, start);
+    }
     // A file that is not a fact keeps the cleanup open until it is fixed.
     let after = all_facts(root)?;
     git(root, &["add", "-A"])?;
@@ -1357,17 +1444,11 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
     let before = (before as usize).saturating_sub(work.len());
     let limit = (before / 4).max(2);
     if lost > limit {
-        git(root, &["revert", "--no-edit", &head])?;
-        private(root)?;
-        let kept = put_back(root)?;
-        let _ = std::fs::remove_file(&state);
-        let others = match kept {
-            0 => String::new(),
-            n => format!(" with the {n} facts other agents saved or removed meanwhile"),
-        };
-        return Err(format!(
-            "loss_guard: the cleanup removed {lost} of {before} lasting facts, above {limit}; memory is back as it was at {start}{others}, and the refused cleanup is commit {head}"
-        ));
+        // Said before it is done, so a run killed partway carries it on.
+        let mut open = open.clone();
+        open["refused"] = json!({"head": head, "lost": lost, "before": before, "limit": limit});
+        write(&state, &open.to_string())?;
+        return refuse(root, &state, &open, start);
     }
     let _ = std::fs::remove_file(root.join(OTHERS));
     // A refused cleanup saved nothing of what the person wrote, so the
@@ -1381,10 +1462,49 @@ fn cleanup_finish(root: &Path) -> Result<Value, String> {
     )
 }
 
-/// The automation that runs the cleanup each night: an agent of its own,
-/// started on the first run in the memory folder, woken only when
-/// `changed` says so, and each turn capped.
-fn schedule_args(script: &Path, args: &[String]) -> Result<Vec<String>, String> {
+/// Take a refused cleanup back to `start`, put back what others saved or
+/// removed meanwhile, and close it. Each step can run again: memory goes
+/// back to `start` until the cleanup says it went back, while what others
+/// wrote is still listed to put back or the refused commit is the newest.
+/// Once it says so, memory never goes back again: what others save after
+/// is only put back.
+fn refuse(root: &Path, state: &Path, open: &Value, start: &str) -> Result<Value, String> {
+    let refused = &open["refused"];
+    let head = refused["head"].as_str().unwrap_or_default();
+    if refused["back"] != true {
+        let newest = git(root, &["rev-parse", "HEAD"])?.trim().to_owned();
+        if newest == head || root.join(OTHERS).exists() {
+            // The tree as it was at `start`, whatever is on disk: others'
+            // writes since are listed, and put back next.
+            git(root, &["read-tree", "-u", "--reset", start])?;
+            let message = format!("Memory cleanup refused, back to {start}, {}", today());
+            git(root, &["commit", "-q", "--allow-empty", "-m", &message])?;
+            private(root)?;
+        }
+        // Said before what others wrote is put back and its list removed:
+        // a list begun after that holds only later writes, and going back
+        // again would drop the ones put back.
+        let mut open = open.clone();
+        open["refused"]["back"] = json!(true);
+        write(state, &open.to_string())?;
+    }
+    let kept = put_back(root)?;
+    let _ = std::fs::remove_file(state);
+    let others = match kept {
+        0 => String::new(),
+        n => format!(" with the {n} facts other agents saved or removed meanwhile"),
+    };
+    let (lost, before, limit) = (&refused["lost"], &refused["before"], &refused["limit"]);
+    Err(format!(
+        "loss_guard: the cleanup removed {lost} of {before} lasting facts, above {limit}; memory is back as it was at {start}{others}, and the refused cleanup is commit {head}"
+    ))
+}
+
+/// The automation that runs the cleanup each night: each run in an agent
+/// of its own in the memory folder, woken only when `changed` says so, and
+/// each turn capped. `kept` is the automation already there, as `show`
+/// gives it: scheduling again, say at another time, keeps its model.
+fn schedule_args(script: &Path, args: &[String], kept: &Value) -> Result<Vec<String>, String> {
     let usage = || format!("usage: {USAGE}");
     let (mut model, mut effort, mut cron) = (None, None, None);
     let mut it = args.iter();
@@ -1400,59 +1520,91 @@ fn schedule_args(script: &Path, args: &[String]) -> Result<Vec<String>, String> 
         }
         *slot = Some(it.next().ok_or_else(usage)?.clone());
     }
+    if model.is_none() && effort.is_some() {
+        return Err(usage());
+    }
     let quote = format!("'{}'", script.to_string_lossy().replace('\'', r"'\''"));
     let mut add = vec![
         "--name".into(),
-        "memory-cleanup".into(),
+        AGENT.into(),
         "--cron".into(),
-        cron.unwrap_or_else(|| "30 3 * * *".into()),
+        // Scheduled again, it keeps its time unless given one.
+        cron.or_else(|| {
+            kept["when"]
+                .as_str()?
+                .strip_prefix("cron ")
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "30 3 * * *".into()),
     ];
-    // A first schedule starts the agent; scheduling again, say at another
-    // time, keeps the one it started, its model and its history.
-    match (model, effort) {
-        (Some(model), effort) => {
+    let text = |value: &Value| value.as_str().map(str::to_owned);
+    match (model, kept) {
+        (Some(model), _) => {
             add.extend(["--start".into(), AGENT.into(), "--model".into(), model]);
             if let Some(effort) = effort {
                 add.extend(["--effort".into(), effort]);
             }
         }
-        (None, None) => add.extend(["--bot".into(), AGENT.into()]),
-        (None, Some(_)) => return Err(usage()),
+        (None, kept) if kept["start"].is_object() => {
+            let model = text(&kept["start"]["model"]).ok_or_else(usage)?;
+            add.extend(["--start".into(), AGENT.into(), "--model".into(), model]);
+            if let Some(effort) = text(&kept["start"]["effort"]) {
+                add.extend(["--effort".into(), effort]);
+            }
+        }
+        (None, _) => {
+            return Err(format!(
+                "model_needed: there is no {AGENT} automation to keep the model of; schedule with --model PROVIDER/MODEL"
+            ));
+        }
     }
+    // A conversation of its own each night: the cleanup reads memory, not
+    // earlier nights.
+    add.push("--fresh".into());
     add.extend([
         "--if".into(),
         format!("{quote} changed"),
         "--turn-budget-tokens".into(),
         "1000000".into(),
+        "--budget-counts".into(),
+        "work".into(),
+        "--replace".into(),
         "--".into(),
-        "Clean up memory as the memory-cleanup skill says.".into(),
+        CLEANUP_ASK.into(),
     ]);
     Ok(add)
 }
 
-const AGENT: &str = "memory-cleanup";
+pub const AGENT: &str = "memory-cleanup";
+/// What each run of the nightly cleanup is sent.
+pub const CLEANUP_ASK: &str = "Clean up memory as the memory-cleanup skill says.";
 
 fn schedule(home: &Path, args: &[String]) -> Result<Value, String> {
-    let add = schedule_args(&home.join(".agent/memory"), args)?;
-    // The agent the automation starts works in the memory folder.
+    let script = home.join(".agent/automation");
+    let kept = automation(&script, &["show".into(), AGENT.into()])?;
+    let add = schedule_args(&home.join(".agent/memory"), args, &kept)?;
+    // Each run's agent works in the memory folder, made a repository once
+    // the automation is there.
     let root = home.join(".agents/memory");
-    repo(&root)?;
+    std::fs::create_dir_all(&root)
+        .map_err(|e| format!("memory_failed: {}: {e}", root.display()))?;
     std::env::set_current_dir(&root)
         .map_err(|e| format!("memory_failed: {}: {e}", root.display()))?;
-    add_automation(&home.join(".agent/automation"), &add).map_err(|error| match error.split_once(':') {
-        Some(("bot_exists", _)) => format!(
-            "bot_exists: {AGENT} is an agent already: schedule without --model to keep it, or remove it with agent rm --bot {AGENT} to start it on another model"
-        ),
-        Some(("bot_not_found", _)) if !add.iter().any(|a| a == "--start") => format!(
-            "bot_not_found: there is no {AGENT} agent yet: schedule with --model to start one"
-        ),
-        _ => error,
-    })
+    let added = automation(&script, &[&["add".to_owned()][..], &add].concat())?;
+    repo(&root)?;
+    Ok(added)
 }
 
-/// `~/.agent/automation add ARGS`, run in this folder with this shell's
-/// daemon and agent: its JSON line, or its error as `CODE: detail`.
-fn add_automation(script: &Path, args: &[String]) -> Result<Value, String> {
+/// Whether the nightly cleanup was ever scheduled here, by the person or
+/// by Sonny: the memory folder is a repository from then on, also after
+/// the person removes the automation, which then stays removed.
+pub fn scheduled_once(home: &Path) -> bool {
+    crate::policy::git_entry(&home.join(".agents/memory"))
+}
+
+/// `~/.agent/automation ARGS`, run in this folder with this shell's daemon
+/// and agent: its JSON line, or its error as `CODE: detail`.
+fn automation(script: &Path, args: &[String]) -> Result<Value, String> {
     if !script.is_file() {
         return Err(format!(
             "automations_unsupported: {} is not there to add the nightly cleanup",
@@ -1460,7 +1612,6 @@ fn add_automation(script: &Path, args: &[String]) -> Result<Value, String> {
         ));
     }
     let out = std::process::Command::new(script)
-        .arg("add")
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
@@ -1626,7 +1777,8 @@ mod tests {
         assert!(fact.starts_with("---\nname: short-replies\ndescription: George wants one-line answers\ntype: feedback\nsource: George, 2026-10-10\nverified: "));
         assert!(fact.ends_with("---\n\nKeep replies short.\n"));
         let index = std::fs::read_to_string(root.join(INDEX)).unwrap();
-        assert_eq!(index.len(), saved["index_bytes"].as_u64().unwrap() as usize);
+        // In the head: nothing more to say.
+        assert!(saved.get("past_head").is_none() && saved.get("index_bytes").is_none());
         assert!(index.starts_with(&format!(
             "# Memory in {}\n\n- short-replies (feedback, verified ",
             root.display()
@@ -1640,7 +1792,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(again["duplicate"], true);
-        assert_eq!(again["index_bytes"], saved["index_bytes"]);
+        assert_eq!(again["facts"], saved["facts"]);
         // A save under the same name replaces the fact; the index follows.
         let changed = save_user(
             &root,
@@ -1715,16 +1867,25 @@ mod tests {
         // An index is never full: every save lands, and a new agent reads
         // its head, which says how many facts it leaves out.
         let n = 400;
+        let mut replies = Vec::new();
         for i in 0..n {
             let name = format!("fact-{i:03}");
-            save_user(
-                &root,
-                &name,
-                "a description of some length ".repeat(3).trim(),
-                "x",
-            )
-            .unwrap();
+            replies.push(
+                save_user(
+                    &root,
+                    &name,
+                    "a description of some length ".repeat(3).trim(),
+                    "x",
+                )
+                .unwrap(),
+            );
         }
+        // A save past the head says so, and only then.
+        assert!(replies[0].get("past_head").is_none());
+        assert_eq!(
+            replies[n - 1]["past_head"],
+            "saved; past the head of the index a new agent starts with, so search finds it"
+        );
         let index = std::fs::read_to_string(root.join(INDEX)).unwrap();
         assert!(index.len() > HEAD && index.contains(&format!("fact-{:03}", n - 1)));
         let top = head(&index);
@@ -2112,6 +2273,41 @@ mod tests {
     }
 
     #[test]
+    fn a_save_missing_its_type_or_name_says_what_the_fact_needs() {
+        let home = temp("needs");
+        let detail = |r: Result<Value, String>| error_json(&r.unwrap_err());
+        // A tool call that leaves a field out sends it empty.
+        let save = json!({"save": {"name": "pinned-version", "description": "d",
+            "source": "s", "text": "x"}, "user": true});
+        let error = detail(call(&home, &home, &save));
+        assert_eq!(error["error"], "invalid_type");
+        assert_eq!(
+            error["detail"],
+            "the fact needs a type: user, feedback, project, reference, work"
+        );
+        let mut wrong = save.clone();
+        wrong["save"]["type"] = json!("note");
+        let error = detail(call(&home, &home, &wrong));
+        assert_eq!(
+            error["detail"],
+            "note is not a type; the fact needs one of user, feedback, project, reference, work"
+        );
+        let mut nameless = save.clone();
+        nameless["save"]["type"] = json!("user");
+        nameless["save"]["name"] = json!("");
+        let error = detail(call(&home, &home, &nameless));
+        assert_eq!(error["error"], "invalid_name");
+        assert!(
+            error["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("the fact needs a name: "),
+            "{error}"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn a_fact_saved_after_outside_content_says_so_in_its_file_and_the_index() {
         let home = temp("outside");
         let root = home.join(".agents/memory");
@@ -2422,6 +2618,368 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_cut_short_after_its_put_back_goes_back_no_more() {
+        let root = temp("cleanup-cut-late");
+        let as_ = |caller: Option<&str>, line: &[&str]| {
+            run_as(&root, &root, &args(line), &|| Ok("-".into()), caller)
+        };
+        let save = |caller, name: &str, text: &str| {
+            let mut line = vec!["save", name, "--type", "feedback", "--description"];
+            line.extend([name, "--source", "test", "--user", "--", text]);
+            as_(caller, &line).unwrap();
+        };
+        repo(&root).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            save(None, name, "before");
+        }
+        as_(Some("7"), &["cleanup", "start"]).unwrap();
+        save(Some("8"), "e", "new from 8");
+        for name in ["b", "c", "d"] {
+            as_(Some("7"), &["rm", name, "--user"]).unwrap();
+        }
+        let open: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        let start = open["commit"].as_str().unwrap().to_owned();
+        // The finish was killed after it went back and put back agent 8's
+        // save, before it closed the cleanup.
+        git(&root, &["add", "-A"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "cleanup"]).unwrap();
+        let head = git(&root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        let mut cut = open.clone();
+        cut["refused"] = json!({"head": head, "lost": 3, "before": 4, "limit": 2, "back": true});
+        write(&root.join(CLEANUP), &cut.to_string()).unwrap();
+        git(&root, &["read-tree", "-u", "--reset", &start]).unwrap();
+        git(&root, &["commit", "-q", "--allow-empty", "-m", "back"]).unwrap();
+        assert_eq!(put_back(&root).unwrap(), 1);
+        // Agent 8 saves again while the cleanup is still open: a new list.
+        save(Some("8"), "f", "later from 8");
+        assert!(root.join(OTHERS).exists());
+        let refused = as_(Some("7"), &["cleanup", "finish"]).unwrap_err();
+        assert!(refused.starts_with("loss_guard: "), "{refused}");
+        let text = |name: &str| std::fs::read_to_string(root.join(format!("{name}.md"))).ok();
+        // Both of agent 8's saves stay: the first, put back before the
+        // finish was cut short, is not taken back again.
+        assert!(
+            text("e").unwrap().ends_with("new from 8\n"),
+            "{:?}",
+            text("e")
+        );
+        assert!(text("f").unwrap().ends_with("later from 8\n"));
+        for name in ["b", "c", "d"] {
+            assert!(text(name).unwrap().ends_with("before\n"), "{name}");
+        }
+        assert!(!root.join(CLEANUP).exists());
+        assert!(!root.join(OTHERS).exists());
+        assert_eq!(check(&root)["problems"], json!([]));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_start_after_a_refusal_cut_short_carries_the_refusal_on() {
+        let root = temp("cleanup-cut-start");
+        let as_ = |caller: Option<&str>, line: &[&str]| {
+            run_as(&root, &root, &args(line), &|| Ok("-".into()), caller)
+        };
+        let save = |caller, name: &str, text: &str| {
+            let mut line = vec!["save", name, "--type", "feedback", "--description"];
+            line.extend([name, "--source", "test", "--user", "--", text]);
+            as_(caller, &line).unwrap();
+        };
+        repo(&root).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            save(None, name, "before");
+        }
+        as_(Some("7"), &["cleanup", "start"]).unwrap();
+        for name in ["b", "c", "d"] {
+            as_(Some("7"), &["rm", name, "--user"]).unwrap();
+        }
+        // The finish was killed once it had refused the cleanup and gone
+        // back, before it closed it.
+        let open: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        let start = open["commit"].as_str().unwrap().to_owned();
+        git(&root, &["add", "-A"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "cleanup"]).unwrap();
+        let head = git(&root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        let mut cut = open.clone();
+        cut["refused"] = json!({"head": head, "lost": 3, "before": 4, "limit": 2, "back": true});
+        write(&root.join(CLEANUP), &cut.to_string()).unwrap();
+        git(&root, &["read-tree", "-u", "--reset", &start]).unwrap();
+        git(&root, &["commit", "-q", "--allow-empty", "-m", "back"]).unwrap();
+        // The next night's run starts: the refusal is closed, not handed on
+        // for it to carry on, and what it owned saves now stays.
+        let refused = as_(Some("9"), &["cleanup", "start"]).unwrap_err();
+        assert!(refused.starts_with("loss_guard: "), "{refused}");
+        assert!(!root.join(CLEANUP).exists());
+        let text = |name: &str| std::fs::read_to_string(root.join(format!("{name}.md"))).ok();
+        for name in ["a", "b", "c", "d"] {
+            assert!(text(name).unwrap().ends_with("before\n"), "{name}");
+        }
+        let fresh = as_(Some("9"), &["cleanup", "start"]).unwrap();
+        assert_eq!(fresh["duplicate"], json!(false), "{fresh}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_owner_s_save_after_its_cleanup_was_refused_is_put_back() {
+        let root = temp("cleanup-refused-owner");
+        let as_ = |caller: Option<&str>, line: &[&str]| {
+            run_as(&root, &root, &args(line), &|| Ok("-".into()), caller)
+        };
+        repo(&root).unwrap();
+        as_(Some("7"), &["cleanup", "start"]).unwrap();
+        let mut open: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        open["refused"] = json!({"head": "x", "lost": 3, "before": 4, "limit": 2});
+        write(&root.join(CLEANUP), &open.to_string()).unwrap();
+        let line = ["save", "e", "--type", "feedback", "--description", "e"];
+        let mut line = line.to_vec();
+        line.extend(["--source", "test", "--user", "--", "from 7"]);
+        as_(Some("7"), &line).unwrap();
+        let others = std::fs::read_to_string(root.join(OTHERS)).unwrap();
+        assert!(others.contains("from 7"), "{others}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_refusal_cut_short_is_carried_on_and_keeps_what_others_saved() {
+        let root = temp("cleanup-cut");
+        let as_ = |caller: Option<&str>, line: &[&str]| {
+            run_as(&root, &root, &args(line), &|| Ok("-".into()), caller)
+        };
+        let save = |caller, name: &str, text: &str| {
+            let mut line = vec!["save", name, "--type", "feedback", "--description"];
+            line.extend([name, "--source", "test", "--user", "--", text]);
+            as_(caller, &line).unwrap();
+        };
+        repo(&root).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            save(None, name, "before");
+        }
+        as_(Some("7"), &["cleanup", "start"]).unwrap();
+        save(Some("8"), "e", "new from 8");
+        for name in ["b", "c", "d"] {
+            as_(Some("7"), &["rm", name, "--user"]).unwrap();
+        }
+        // The finish was killed after it refused the cleanup and took memory
+        // back to its start, before it put back what agent 8 saved.
+        let open: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        let start = open["commit"].as_str().unwrap().to_owned();
+        git(&root, &["add", "-A"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "cleanup"]).unwrap();
+        let head = git(&root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        let mut cut = open.clone();
+        cut["refused"] = json!({"head": head, "lost": 3, "before": 4, "limit": 2});
+        write(&root.join(CLEANUP), &cut.to_string()).unwrap();
+        git(&root, &["read-tree", "-u", "--reset", &start]).unwrap();
+        git(&root, &["commit", "-q", "--allow-empty", "-m", "back"]).unwrap();
+        assert!(!root.join("e.md").exists());
+        // The next finish carries the refusal on, rather than reading no
+        // loss and closing it with agent 8's fact gone.
+        let refused = as_(Some("7"), &["cleanup", "finish"]).unwrap_err();
+        assert!(
+            refused.starts_with("loss_guard: the cleanup removed 3 of 4 lasting facts, above 2"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("with the 1 facts other agents saved"),
+            "{refused}"
+        );
+        let text = |name: &str| std::fs::read_to_string(root.join(format!("{name}.md"))).ok();
+        assert!(
+            text("e").unwrap().ends_with("new from 8\n"),
+            "{:?}",
+            text("e")
+        );
+        for name in ["b", "c", "d"] {
+            assert!(text(name).unwrap().ends_with("before\n"), "{name}");
+        }
+        assert!(!root.join(CLEANUP).exists());
+        assert!(!root.join(OTHERS).exists());
+        assert_eq!(check(&root)["problems"], json!([]));
+        // Run again after it closed, it is no cleanup at all.
+        let code = |r: Result<Value, String>| error_json(&r.unwrap_err())["error"].clone();
+        assert_eq!(
+            code(as_(Some("7"), &["cleanup", "finish"])),
+            "cleanup_not_started"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_cleanup_carried_on_by_a_later_run_is_the_automations_and_rolls_back_whole() {
+        let root = temp("cleanup-runs");
+        let store = || Some("/s/state.sqlite".to_owned());
+        // Runs A and B of the nightly cleanup are agents 7 and 9; both are
+        // the automation. Agent 8 is someone else.
+        let run_a = caller(Some("memory-cleanup".into()), Some("7".into()), store());
+        let run_b = caller(Some("memory-cleanup".into()), Some("9".into()), store());
+        let other = caller(None, Some("8".into()), store());
+        assert_eq!(run_a, run_b);
+        assert_eq!(
+            run_a.as_deref(),
+            Some("/s/state.sqlite#automation:memory-cleanup")
+        );
+        assert_eq!(other.as_deref(), Some("/s/state.sqlite#8"));
+        assert_eq!(caller(None, None, store()), None);
+        let as_ = |caller: &Option<String>, line: &[&str]| {
+            run_as(
+                &root,
+                &root,
+                &args(line),
+                &|| Ok("-".into()),
+                caller.as_deref(),
+            )
+        };
+        let save = |caller: &Option<String>, name: &str, text: &str| {
+            let mut line = vec!["save", name, "--type", "feedback", "--description"];
+            line.extend([name, "--source", "test", "--user", "--", text]);
+            as_(caller, &line).unwrap();
+        };
+        repo(&root).unwrap();
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            save(&None, name, "before");
+        }
+        // Run A starts and removes one, then stops without finishing.
+        as_(&run_a, &["cleanup", "start"]).unwrap();
+        as_(&run_a, &["rm", "a", "--user"]).unwrap();
+        // Run B carries it on, another agent saves a fact, and B removes
+        // too much.
+        let resumed = as_(&run_b, &["cleanup", "start"]).unwrap();
+        assert_eq!(resumed["duplicate"], true);
+        save(&other, "g", "saved by another agent");
+        for name in ["b", "c", "d"] {
+            as_(&run_b, &["rm", name, "--user"]).unwrap();
+        }
+        let refused = as_(&run_b, &["cleanup", "finish"]).unwrap_err();
+        assert!(
+            refused.starts_with("loss_guard: the cleanup removed 4 of 6"),
+            "{refused}"
+        );
+        // Both runs' removals are taken back; the other agent's save stays.
+        let text = |name: &str| std::fs::read_to_string(root.join(format!("{name}.md"))).ok();
+        for name in ["a", "b", "c", "d"] {
+            assert!(text(name).unwrap().ends_with("before\n"), "{name}");
+        }
+        assert!(text("g").unwrap().ends_with("saved by another agent\n"));
+        assert_eq!(check(&root)["problems"], json!([]));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_cleanup_another_caller_takes_over_rolls_back_whole_and_keeps_others_saves() {
+        let root = temp("cleanup-takeover");
+        let store = || Some("/s/state.sqlite".to_owned());
+        // A is an agent that started a cleanup by hand; B the nightly
+        // automation, which carries it on; C another agent.
+        let a = caller(None, Some("7".into()), store());
+        let b = caller(Some("memory-cleanup".into()), Some("9".into()), store());
+        let c = caller(None, Some("8".into()), store());
+        let as_ = |caller: &Option<String>, line: &[&str]| {
+            run_as(
+                &root,
+                &root,
+                &args(line),
+                &|| Ok("-".into()),
+                caller.as_deref(),
+            )
+        };
+        let save = |caller: &Option<String>, name: &str, text: &str| {
+            let mut line = vec!["save", name, "--type", "feedback", "--description"];
+            line.extend([name, "--source", "test", "--user", "--", text]);
+            as_(caller, &line).unwrap();
+        };
+        repo(&root).unwrap();
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            save(&None, name, "before");
+        }
+        // A starts and removes one, then stops.
+        as_(&a, &["cleanup", "start"]).unwrap();
+        as_(&a, &["rm", "a", "--user"]).unwrap();
+        // B carries it on and owns it beside A.
+        let resumed = as_(&b, &["cleanup", "start"]).unwrap();
+        assert_eq!(resumed["duplicate"], true);
+        let open: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        assert_eq!(open["by"], json!([a, b]));
+        // Starting again adds no owner twice.
+        as_(&b, &["cleanup", "start"]).unwrap();
+        let again: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        assert_eq!(again["by"], json!([a, b]));
+        // C saves an unrelated fact; B removes too much, and A, waking
+        // late, removes one more.
+        save(&c, "g", "saved by C");
+        for name in ["b", "c"] {
+            as_(&b, &["rm", name, "--user"]).unwrap();
+        }
+        as_(&a, &["rm", "d", "--user"]).unwrap();
+        let refused = as_(&b, &["cleanup", "finish"]).unwrap_err();
+        assert!(
+            refused.starts_with("loss_guard: the cleanup removed 4 of 6"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("with the 1 facts other agents saved or removed meanwhile"),
+            "{refused}"
+        );
+        // Every removal of the cleanup is taken back; C's save stays.
+        let text = |name: &str| std::fs::read_to_string(root.join(format!("{name}.md"))).ok();
+        for name in ["a", "b", "c", "d"] {
+            assert!(text(name).unwrap().ends_with("before\n"), "{name}");
+        }
+        assert!(text("g").unwrap().ends_with("saved by C\n"));
+        assert_eq!(check(&root)["problems"], json!([]));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_cleanup_opened_with_one_owner_takes_a_new_one_beside_it() {
+        let root = temp("cleanup-one-owner");
+        let as_ = |caller: Option<&str>, line: &[&str]| {
+            run_as(&root, &root, &args(line), &|| Ok("-".into()), caller)
+        };
+        repo(&root).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            let mut line = vec!["save", name, "--type", "feedback", "--description"];
+            line.extend([name, "--source", "test", "--user", "--", "before"]);
+            as_(None, &line).unwrap();
+        }
+        // An open cleanup whose `by` is one caller, as one opened before
+        // callers joined it wrote it.
+        as_(Some("s#7"), &["cleanup", "start"]).unwrap();
+        let mut open: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        open["by"] = json!("s#7");
+        write(&root.join(CLEANUP), &open.to_string()).unwrap();
+        as_(Some("s#automation:memory-cleanup"), &["cleanup", "start"]).unwrap();
+        let open: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(CLEANUP)).unwrap()).unwrap();
+        assert_eq!(open["by"], json!(["s#7", "s#automation:memory-cleanup"]));
+        for (who, name) in [("s#7", "a"), ("s#automation:memory-cleanup", "b")] {
+            as_(Some(who), &["rm", name, "--user"]).unwrap();
+        }
+        as_(Some("s#automation:memory-cleanup"), &["rm", "c", "--user"]).unwrap();
+        let refused = as_(None, &["cleanup", "finish"]).unwrap_err();
+        assert!(refused.starts_with("loss_guard: "), "{refused}");
+        assert!(!refused.contains("other agents"), "{refused}");
+        for name in ["a", "b", "c"] {
+            assert!(root.join(format!("{name}.md")).exists(), "{name}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn work_leads_the_index_by_name_and_the_cleanup_retires_it_uncounted() {
         let root = temp("cleanup-work");
         let save = |name: &str, kind: &str| {
@@ -2573,10 +3131,11 @@ mod tests {
     }
 
     #[test]
-    fn the_schedule_is_a_gated_capped_automation_that_starts_or_keeps_its_own_agent() {
+    fn the_schedule_is_a_gated_capped_automation_whose_runs_keep_its_model() {
         let script = Path::new("/Users/g/.agent/memory");
-        let line = |rest: &[&str]| schedule_args(script, &args(rest));
-        let add = line(&["--model", "openai/mini"]).unwrap();
+        let none = Value::Null;
+        let line = |rest: &[&str], kept: &Value| schedule_args(script, &args(rest), kept);
+        let add = line(&["--model", "openai/mini"], &none).unwrap();
         assert_eq!(
             add,
             args(&[
@@ -2588,28 +3147,66 @@ mod tests {
                 "memory-cleanup",
                 "--model",
                 "openai/mini",
+                "--fresh",
                 "--if",
                 "'/Users/g/.agent/memory' changed",
                 "--turn-budget-tokens",
                 "1000000",
+                "--budget-counts",
+                "work",
+                "--replace",
                 "--",
                 "Clean up memory as the memory-cleanup skill says.",
             ])
         );
-        let add = line(&["--model", "m", "--effort", "low", "--cron", "0 4 * * *"]).unwrap();
+        let add = line(
+            &["--model", "m", "--effort", "low", "--cron", "0 4 * * *"],
+            &none,
+        )
+        .unwrap();
         assert_eq!(add[3], "0 4 * * *");
         assert_eq!(add[8..10], args(&["--effort", "low"]));
-        // Without a model, the agent it started before.
-        let again = line(&["--cron", "0 5 * * *"]).unwrap();
-        assert_eq!(again[3..6], args(&["0 5 * * *", "--bot", "memory-cleanup"]));
-        assert_eq!(line(&[]).unwrap()[4..6], args(&["--bot", "memory-cleanup"]));
+        // Without a model, the one the automation there runs on: a new
+        // time is the same runs at another hour.
+        let kept = json!({"name": "memory-cleanup", "bot": "memory-cleanup",
+            "start": {"model": "anthropic/opus", "effort": "high"}});
+        let again = line(&["--cron", "0 5 * * *"], &kept).unwrap();
+        assert_eq!(
+            again[3..10],
+            args(&[
+                "0 5 * * *",
+                "--start",
+                "memory-cleanup",
+                "--model",
+                "anthropic/opus",
+                "--effort",
+                "high"
+            ])
+        );
+        // Scheduled again with nothing, it keeps its time too, as an
+        // upgrade schedules one from before runs were fresh.
+        let timed = json!({"name": "memory-cleanup", "when": "cron 15 2 * * *",
+            "start": {"model": "anthropic/opus"}});
+        let same = line(&[], &timed).unwrap();
+        assert_eq!(same[3], "15 2 * * *");
+        assert!(same.contains(&"--fresh".to_owned()));
+        // One scheduled to message the agent it started (`--bot`), as
+        // scheduling again without a model did before, has no model to
+        // keep: it is given one.
+        let old = json!({"name": "memory-cleanup", "bot": "memory-cleanup", "start": null});
+        assert!(line(&[], &old).unwrap_err().starts_with("model_needed: "));
+        let nothing = line(&["--cron", "0 5 * * *"], &none).unwrap_err();
+        assert!(nothing.starts_with("model_needed: "), "{nothing}");
         for bad in [
             &["--effort", "low"][..],
             &["--model"],
             &["--model", "m", "--model", "n"],
             &["--every", "1d"],
         ] {
-            assert!(line(bad).unwrap_err().starts_with("usage: "), "{bad:?}");
+            assert!(
+                line(bad, &kept).unwrap_err().starts_with("usage: "),
+                "{bad:?}"
+            );
         }
     }
 }

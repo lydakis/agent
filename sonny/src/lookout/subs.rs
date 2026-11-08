@@ -32,6 +32,16 @@ pub struct Sub {
     /// The bot it was made for, by ID, when Sonny made it on the bot's
     /// behalf: another bot that takes the name does not hold it.
     pub owner: Option<i64>,
+    /// When it ends, as `YYYY-MM-DD HH:MM` in local time, as an
+    /// automation's `--at` is written.
+    pub until: Option<String>,
+    /// How many notes telling what it heard it lasts, as an automation's
+    /// `--runs` counts messages.
+    pub runs: Option<u64>,
+    /// When one that lasts so many notes was added, in milliseconds since
+    /// the epoch: its notes are counted under it, so one removed and
+    /// added again under the name starts afresh.
+    pub made: Option<u64>,
 }
 
 impl Sub {
@@ -53,6 +63,9 @@ impl Sub {
             digest: None,
             steer: None,
             owner: None,
+            until: None,
+            runs: None,
+            made: None,
         }
     }
 
@@ -69,11 +82,21 @@ impl Sub {
             digest: None,
             steer: None,
             owner,
+            until: None,
+            runs: None,
+            made: None,
         }
     }
 
     /// Whether the bot of `record` holds it: one made for another bot of
     /// its name does not.
+    /// Which subscription it is, for its counts: all it says, and the
+    /// subscriber bot it is for.
+    pub fn identity(&self, subscriber: Option<i64>) -> String {
+        let bot = subscriber.map_or(String::new(), |id| id.to_string());
+        format!("{bot}/{}", super::digest(&self.to_json().to_string()))
+    }
+
     pub fn held_by(&self, record: &Value) -> bool {
         self.owner
             .is_none_or(|owner| record["bot_id"].as_i64().is_none_or(|id| id == owner))
@@ -82,6 +105,11 @@ impl Sub {
     /// Whether it hears this event of a source: it names the source, or
     /// the source and the event's topic, and its filter, if any, matches.
     pub fn hears(&self, event: &super::sources::Event) -> bool {
+        // The lookout's word that a source is down or back reaches every
+        // subscription to it, whatever its topic or filter.
+        if event.lookout {
+            return (self.sources.iter()).any(|name| super::sources::named(name).0 == event.source);
+        }
         let named = |name: &String| match super::sources::named(name) {
             (source, None) => source == event.source,
             (source, topic) => source == event.source && topic == event.topic.as_deref(),
@@ -114,13 +142,41 @@ impl Sub {
         if let Some(steer) = &self.steer {
             out["steer"] = steer.clone();
         }
+        if let Some(until) = &self.until {
+            out["until"] = json!(until);
+        }
+        if let Some(runs) = self.runs {
+            out["runs"] = json!(runs);
+        }
+        if let Some(made) = self.made {
+            out["made"] = json!(made);
+        }
         out
     }
 
-    /// Whether it says more than what it watches: a filter, a digest or
-    /// what steers. One that says none costs the lookout nothing more.
+    /// Whether it says more than what it watches: a filter, a digest,
+    /// what steers, or how many notes it lasts, which counts what it
+    /// heard. One that says none costs the lookout nothing more.
     pub fn rules(&self) -> bool {
-        self.filter.is_some() || self.digest.is_some() || self.steer.is_some()
+        self.filter.is_some()
+            || self.digest.is_some()
+            || self.steer.is_some()
+            || self.runs.is_some()
+    }
+
+    /// When it ends, in seconds since the epoch; none when it lasts.
+    pub fn ends_at(&self) -> Option<i64> {
+        crate::trigger::moment(self.until.as_deref()?).ok()
+    }
+
+    /// What its notes are counted under: its name and when it was added.
+    pub fn counter(&self) -> String {
+        format!("{}@{}", self.name, self.made.unwrap_or(0))
+    }
+
+    /// Whether it has ended by `now`, seconds since the epoch.
+    pub fn over(&self, now: i64) -> bool {
+        self.ends_at().is_some_and(|at| at <= now)
     }
 
     /// Its digest as a span; none unset or `0`.
@@ -161,6 +217,13 @@ impl Sub {
                 .filter(|steer| !steer.is_null() && super::pattern::check(steer).is_ok())
                 .cloned(),
             owner: value["bot_id"].as_i64(),
+            // An end that does not read never comes; how many notes, at
+            // least one.
+            until: (value["until"].as_str())
+                .filter(|at| crate::trigger::moment(at).is_ok())
+                .map(str::to_owned),
+            runs: value["runs"].as_u64().map(|n| n.max(1)),
+            made: value["made"].as_u64(),
         })
     }
 
@@ -182,8 +245,17 @@ impl Sub {
             Some(steer) => format!(", steers when {steer}"),
             None => String::new(),
         };
+        let until = match &self.until {
+            Some(until) => format!(", until {until}"),
+            None => String::new(),
+        };
+        let runs = match self.runs {
+            Some(1) => ", for 1 note".to_owned(),
+            Some(runs) => format!(", for {runs} notes"),
+            None => String::new(),
+        };
         format!(
-            "{} · {}{filter}{digest}{steer}",
+            "{} · {}{filter}{digest}{steer}{until}{runs}",
             self.name,
             watched.join(", ")
         )
@@ -198,6 +270,8 @@ impl Sub {
             ("filter", self.filter != other.filter),
             ("digest", self.digest != other.digest),
             ("steer", self.steer != other.steer),
+            ("until", self.until != other.until),
+            ("runs", self.runs != other.runs),
         ]
         .into_iter()
         .find_map(|(field, differs)| differs.then_some(field))
@@ -233,6 +307,24 @@ pub fn steer_files(store: &Path) {
     let mut record = store.as_os_str().to_owned();
     record.push(".migrated");
     crate::upgrade::once(Path::new(&record), STEER, || files_steer(store));
+}
+
+/// Goals are gone (0.9.0): what the lookout kept of them goes with them.
+pub const GOALS_GONE: &str = "lookout-goals-gone";
+
+/// `STORE.lookout/goals`, the goals and how each ended, removed once for
+/// the store.
+pub fn goals_gone(store: &Path) {
+    let mut record = store.as_os_str().to_owned();
+    record.push(".migrated");
+    crate::upgrade::once(
+        Path::new(&record),
+        GOALS_GONE,
+        || match std::fs::remove_dir_all(dir(store).join("goals")) {
+            Ok(()) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        },
+    );
 }
 
 /// The config at `path` with `urgent` under a source named `steer`, and
@@ -437,6 +529,234 @@ pub fn matches(glob: &str, name: &str) -> bool {
     rest.is_empty()
 }
 
+/// What subscriptions want of `source`'s events by its `field`: whether
+/// one wants them all (it names the source and no exact values of the
+/// field), else the values their filters name for it, as `ci:main` names
+/// a topic. So a source that cannot read everything reads only these.
+pub fn wanted<'a>(
+    subs: impl IntoIterator<Item = &'a Sub>,
+    source: &str,
+    field: &str,
+) -> (bool, Vec<Value>) {
+    let path: Vec<&str> = field.split('.').collect();
+    let mut values: Vec<Value> = Vec::new();
+    let mut all = false;
+    for sub in subs {
+        let naming: Vec<Option<&str>> = (sub.sources.iter())
+            .map(|name| super::sources::named(name))
+            .filter(|(of, _)| *of == source)
+            .map(|(_, topic)| topic)
+            .collect();
+        if naming.is_empty() {
+            continue;
+        }
+        // Its filter names the values, for every topic it hears.
+        if let Some(filter) = &sub.filter {
+            let mut named = Vec::new();
+            if pinned(filter, &path, &mut named) {
+                values.extend(named);
+                continue;
+            }
+        }
+        // Else each topic it names is the value when the field is the topic.
+        match field == "topic" && naming.iter().all(Option::is_some) {
+            true => values.extend(naming.into_iter().flatten().map(|t| json!(t))),
+            false => all = true,
+        }
+    }
+    values.sort_by_key(Value::to_string);
+    values.dedup();
+    (all, values)
+}
+
+/// Whether `pattern` lets through only events whose field at `path` is one
+/// of exact values, which it adds to `values`: a list of plain values
+/// there, or every branch of its `$or` so.
+fn pinned(pattern: &Value, path: &[&str], values: &mut Vec<Value>) -> bool {
+    match path.split_first() {
+        // Down the path, through every `$or` along it.
+        Some((part, rest)) => {
+            if (pattern.get(part)).is_some_and(|next| pinned(next, rest, values)) {
+                return true;
+            }
+        }
+        None => {
+            if let Some(items) = pattern.as_array()
+                && !items.is_empty()
+                && (items.iter()).all(|v| v.is_string() || v.is_number() || v.is_boolean())
+            {
+                values.extend(items.iter().cloned());
+                return true;
+            }
+        }
+    }
+    match pattern.get("$or").and_then(Value::as_array) {
+        Some(branches) if !branches.is_empty() => {
+            let mut named = Vec::new();
+            if branches.iter().all(|b| pinned(b, path, &mut named)) {
+                values.extend(named);
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// How far back a subscription's counts go, by the hour.
+const COUNTED_HOURS: u64 = 24;
+const HOUR_MS: u64 = 60 * 60 * 1000;
+
+/// What each of a subscriber's subscriptions told it lately, by the hour,
+/// for the listing: what it heard that notes told, those notes, how many
+/// of them steered for it, and when it last told.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Counts(std::collections::BTreeMap<String, Count>);
+
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Count {
+    /// By hour since the epoch: heard, notes, steers.
+    hours: std::collections::VecDeque<(u64, [u64; 3])>,
+    last_ms: u64,
+    /// The notes it counted last, by request: one sent again counts once.
+    notes: std::collections::VecDeque<String>,
+    /// Which subscription it counts, by `Sub::identity`: another under its
+    /// name, or the same for another bot of the subscriber's name, counts
+    /// afresh.
+    of: String,
+}
+
+/// How many notes a subscription's count remembers having counted.
+const COUNTED_NOTES: usize = 16;
+
+impl Count {
+    fn recent(&mut self, now_ms: u64) {
+        let first = (now_ms / HOUR_MS).saturating_sub(COUNTED_HOURS - 1);
+        while self.hours.front().is_some_and(|(hour, _)| *hour < first) {
+            self.hours.pop_front();
+        }
+    }
+}
+
+impl Counts {
+    /// A note told what `sub` heard, `heard` of it, steering for it or not.
+    pub fn told(
+        &mut self,
+        sub: &str,
+        of: &str,
+        note: &str,
+        heard: u64,
+        steered: bool,
+        now_ms: u64,
+    ) {
+        let count = self.0.entry(sub.to_owned()).or_default();
+        if count.of != of {
+            *count = Count {
+                of: of.to_owned(),
+                ..Count::default()
+            };
+        }
+        if count.notes.iter().any(|had| had == note) {
+            return;
+        }
+        if count.notes.len() == COUNTED_NOTES {
+            count.notes.pop_front();
+        }
+        count.notes.push_back(note.to_owned());
+        count.recent(now_ms);
+        let hour = now_ms / HOUR_MS;
+        if count.hours.back().is_none_or(|(last, _)| *last != hour) {
+            count.hours.push_back((hour, [0; 3]));
+        }
+        if let Some((_, [h, n, s])) = count.hours.back_mut() {
+            *h += heard;
+            *n += 1;
+            *s += u64::from(steered);
+        }
+        count.last_ms = now_ms;
+    }
+
+    /// Only the subscriptions `kept` keeps, by name and identity: one
+    /// removed, or another put in its place, counts afresh. Whether any went.
+    pub fn keep(&mut self, kept: impl Fn(&str, &str) -> bool) -> bool {
+        let before = self.0.len();
+        self.0.retain(|sub, count| kept(sub, &count.of));
+        self.0.len() < before
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn to_json(&self) -> Value {
+        (self.0.iter())
+            .map(|(sub, count)| {
+                let hours: Vec<Value> = (count.hours.iter())
+                    .map(|(hour, [h, n, s])| json!([hour, h, n, s]))
+                    .collect();
+                (
+                    sub.clone(),
+                    json!({"hours": hours, "last_ms": count.last_ms, "notes": count.notes,
+                        "of": count.of}),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>()
+            .into()
+    }
+
+    pub fn from_json(value: &Value) -> Counts {
+        let count = |value: &Value| -> Count {
+            let hours = (value["hours"].as_array().into_iter().flatten())
+                .filter_map(|row| {
+                    let at = |n: usize| row.get(n).and_then(Value::as_u64);
+                    Some((at(0)?, [at(1)?, at(2)?, at(3)?]))
+                })
+                .collect();
+            Count {
+                hours,
+                last_ms: value["last_ms"].as_u64().unwrap_or(0),
+                notes: (value["notes"].as_array().into_iter().flatten())
+                    .filter_map(|note| note.as_str().map(str::to_owned))
+                    .collect(),
+                of: value["of"].as_str().unwrap_or_default().to_owned(),
+            }
+        };
+        Counts(
+            (value.as_object().into_iter().flatten())
+                .map(|(sub, value)| (sub.clone(), count(value)))
+                .collect(),
+        )
+    }
+
+    /// What `sub` told in the last 24 hours as of `now_ms`, as the listing
+    /// says it: none when it told nothing yet.
+    pub fn of(&self, sub: &str, of: &str, now_ms: u64) -> Option<Value> {
+        let mut count = (self.0.get(sub)).filter(|count| count.of == of)?.clone();
+        count.recent(now_ms);
+        let [mut heard, mut notes, mut steers] = [0; 3];
+        for (_, [h, n, s]) in &count.hours {
+            (heard, notes, steers) = (heard + h, notes + n, steers + s);
+        }
+        let last = super::sources::clock(u128::from(count.last_ms));
+        Some(json!({"heard": heard, "notes": notes, "steers": steers, "last": last}))
+    }
+}
+
+/// Where the lookout keeps a subscriber's counts.
+pub fn counts_file(store: &Path, subscriber: &str) -> PathBuf {
+    dir(store)
+        .join(".counts")
+        .join(format!("{subscriber}.json"))
+}
+
+/// A subscriber's counts, as the lookout last wrote them.
+pub fn counts(store: &Path, subscriber: &str) -> Counts {
+    (std::fs::read_to_string(counts_file(store, subscriber)).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .map(|value| Counts::from_json(&value))
+        .unwrap_or_default()
+}
+
 /// Where subscribers' files are: beside the store.
 pub fn dir(store: &Path) -> PathBuf {
     let mut path = store.as_os_str().to_owned();
@@ -446,6 +766,111 @@ pub fn dir(store: &Path) -> PathBuf {
 
 fn file(store: &Path, subscriber: &str) -> PathBuf {
     dir(store).join(format!("{subscriber}.json"))
+}
+
+/// Where the lookout keeps when it took each subscriber's file.
+fn taken_file(store: &Path) -> PathBuf {
+    super::beside(store, ".lookout.taken.json")
+}
+
+/// What the lookout took of one subscriber's file: the file's revision,
+/// its modification time in nanoseconds since the epoch, or none for a
+/// file it saw go; and when it took it, in milliseconds since the epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Took {
+    pub revision: Option<u64>,
+    pub at_ms: u128,
+}
+
+/// Each subscriber file's revision as it is now, looked at before the
+/// files are read: a write after the look leaves the file newer than what
+/// is kept, so it is taken again at the next read, never missed.
+pub(super) fn revisions(store: &Path) -> std::collections::HashMap<String, u64> {
+    let Ok(entries) = std::fs::read_dir(dir(store)) else {
+        return Default::default();
+    };
+    (entries.filter_map(Result::ok))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let bot = name.strip_suffix(".json")?.to_owned();
+            Some((bot, revision(&entry.path())?))
+        })
+        .collect()
+}
+
+fn revision(path: &Path) -> Option<u64> {
+    let at = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(at.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as u64)
+}
+
+/// Bring what the lookout took up to the files' `revisions`, as of `now`:
+/// whether anything changed, so the file beside the store is written only
+/// then.
+pub(super) fn take(
+    taken: &mut std::collections::HashMap<String, Took>,
+    revisions: &std::collections::HashMap<String, u64>,
+    now: u128,
+) -> bool {
+    let mut changed = false;
+    for (name, &revision) in revisions {
+        if taken.get(name).and_then(|took| took.revision) != Some(revision) {
+            let revision = Some(revision);
+            taken.insert(
+                name.clone(),
+                Took {
+                    revision,
+                    at_ms: now,
+                },
+            );
+            changed = true;
+        }
+    }
+    for (name, took) in taken.iter_mut() {
+        if took.revision.is_some() && !revisions.contains_key(name) {
+            *took = Took {
+                revision: None,
+                at_ms: now,
+            };
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Keep what the lookout took of each subscriber's file beside the store.
+pub(super) fn took(store: &Path, taken: &std::collections::HashMap<String, Took>) {
+    let body: serde_json::Map<String, Value> = (taken.iter())
+        .map(|(name, took)| {
+            let took = json!({"revision_ns": took.revision, "at_ms": took.at_ms as u64});
+            (name.clone(), took)
+        })
+        .collect();
+    let body = Value::Object(body).to_string();
+    let _ = agent_client::files::replace_mode(&taken_file(store), body.as_bytes(), 0o600);
+}
+
+/// What the lookout makes of `subscriber`'s file: whether one runs, when it
+/// took the file, and whether what it took is the file as it is now, a
+/// removed file included. A running lookout reads every file again within
+/// `REREAD`.
+pub fn taken(store: &Path, subscriber: &str) -> Value {
+    let running = super::running(store);
+    let took = (std::fs::read_to_string(taken_file(store)).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .map(|taken| taken[subscriber].clone())
+        .unwrap_or_default();
+    let now = revision(&file(store, subscriber));
+    // A subscriber with no file and nothing taken has nothing to hear.
+    let same = match now {
+        Some(now) => took["revision_ns"].as_u64() == Some(now),
+        None => took["revision_ns"].is_null(),
+    };
+    json!({
+        "running": running,
+        "took_ms": took["at_ms"].as_u64(),
+        "current": running && same,
+        "rereads_every_s": super::REREAD.as_secs(),
+    })
 }
 
 /// A subscriber's subscriptions, as its file holds them.
@@ -478,6 +903,48 @@ fn read_whole(store: &Path, subscriber: &str) -> Result<Vec<Sub>, String> {
         .iter())
     .map(|sub| Sub::from_json(sub).ok_or_else(unreadable))
     .collect()
+}
+
+/// Each subscriber's file as the lookout last read it, by the file's
+/// stamp: a look on the lookout's timer reads only the files that changed
+/// since, so a thousand subscribers cost a thousand stats, not a thousand
+/// reads.
+#[derive(Default)]
+pub(super) struct Read(std::collections::HashMap<String, (crate::kept::Stamp, Vec<Sub>)>);
+
+impl Read {
+    /// Every subscriber with a file, and what it holds, as [`all`] says:
+    /// a file read again only once it changed.
+    pub(super) fn all(&mut self, store: &Path) -> Vec<(String, Vec<Sub>)> {
+        let Ok(entries) = std::fs::read_dir(dir(store)) else {
+            self.0.clear();
+            return Vec::new();
+        };
+        let mut kept = std::collections::HashMap::new();
+        let mut all: Vec<(String, Vec<Sub>)> = Vec::new();
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(bot) = name.strip_suffix(".json").map(str::to_owned) else {
+                continue;
+            };
+            // Stamped before the read, so a change during it is read next
+            // time.
+            let stamp = crate::kept::stamp(&entry.path());
+            let subs = match (stamp, self.0.remove(&bot)) {
+                (Some(now), Some((had, subs))) if now == had => subs,
+                _ => read(store, &bot),
+            };
+            if let Some(stamp) = stamp.filter(crate::kept::Stamp::settled) {
+                kept.insert(bot.clone(), (stamp, subs.clone()));
+            }
+            if !subs.is_empty() {
+                all.push((bot, subs));
+            }
+        }
+        self.0 = kept;
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all
+    }
 }
 
 /// Every subscriber with a file, and what it holds.
@@ -585,6 +1052,20 @@ pub fn remove(store: &Path, subscriber: &str, name: &str) -> Result<bool, String
     drop_named(store, subscriber, &mut subs, name)
 }
 
+/// End `sub` of `subscriber`'s, as the lookout read it: one put in its
+/// place under the name since, by another call, stays. Whether it went.
+pub fn end(store: &Path, subscriber: &str, sub: &Sub) -> Result<bool, String> {
+    let _held = held(store)?;
+    let mut subs = read_whole(store, subscriber)?;
+    let before = subs.len();
+    subs.retain(|s| s != sub);
+    if subs.len() == before {
+        return Ok(false);
+    }
+    write(store, subscriber, &subs)?;
+    Ok(true)
+}
+
 fn drop_named(
     store: &Path,
     subscriber: &str,
@@ -597,11 +1078,51 @@ fn drop_named(
     Ok(subs.len() < before)
 }
 
+/// End the subscriptions the deleted bot of `id` held as `subscriber`:
+/// all of them, but one held by another bot of the name. How many ended.
+pub fn forget(store: &Path, subscriber: &str, id: Option<i64>) -> Result<usize, String> {
+    let _held = held(store)?;
+    let mut subs = read_whole(store, subscriber)?;
+    let before = subs.len();
+    subs.retain(|sub| sub.owner.is_some_and(|owner| Some(owner) != id));
+    if subs.len() < before {
+        write(store, subscriber, &subs)?;
+    }
+    Ok(before - subs.len())
+}
+
+/// What `subscriber` holds that no bot now listed holds: all of it when
+/// no bot by that name is listed (`live` none), else what an older bot by
+/// that name added. A file written since the listing (`listed`) is left
+/// as it is: a bot made since may have written it. A delete the lookout
+/// missed while it was away ends them as one it saw does. How many went.
+pub fn unheld(
+    store: &Path,
+    subscriber: &str,
+    live: Option<i64>,
+    listed: std::time::SystemTime,
+) -> Result<usize, String> {
+    let _held = held(store)?;
+    let written = std::fs::metadata(file(store, subscriber)).and_then(|m| m.modified());
+    if written.is_ok_and(|at| at >= listed) {
+        return Ok(0);
+    }
+    let mut subs = read_whole(store, subscriber)?;
+    let before = subs.len();
+    subs.retain(|sub| live.is_some_and(|live| sub.owner.is_none_or(|owner| owner == live)));
+    if subs.len() < before {
+        write(store, subscriber, &subs)?;
+    }
+    Ok(before - subs.len())
+}
+
 /// A `subscriptions` call of `subscriber`'s: `add` one, as `to_json`
-/// writes it, or `remove` one by name, then list them all, with the
-/// `sources` the person set up. Adding one again changes nothing; one
-/// under a name in use that differs is refused with the field, and one
-/// naming a source there is not with the sources there are.
+/// writes it, or `remove` one by name, answered with that one alone, and
+/// for one added that hears sources, what it would have heard of their
+/// last day; with neither, list them all, with the `sources` the person
+/// set up. Adding one again changes nothing; one under a name in use that
+/// differs is refused with the field, and one naming a source there is
+/// not with the sources there are.
 pub fn change(
     store: &Path,
     subscriber: &str,
@@ -615,21 +1136,12 @@ pub fn change(
     }
     // What it adds is held by the bot of that ID, so a later bot given
     // the name, a task started again, say, never inherits it.
-    let add = add.map(parse).transpose()?.map(|sub| Sub { owner, ..sub });
-    let known = |name: &String| {
-        let (source, topic) = super::sources::named(name);
-        sources.iter().any(|s| s == source) && topic.is_none_or(|topic| plain(topic, NAME_MAX))
-    };
-    if let Some(unknown) = (add.iter().flat_map(|sub| &sub.sources)).find(|s| !known(s)) {
-        let there = match sources.is_empty() {
-            true => "none: the person sets them up under [sonny.sources] in ~/.agent/config.toml"
-                .to_owned(),
-            false => sources.join(", "),
-        };
-        return Err(format!(
-            "no source {unknown:?}; the sources there are {there}"
-        ));
-    }
+    let made = (super::epoch_ms() as u64).max(1);
+    let add = (add.map(|add| checked(add, sources)).transpose()?).map(|sub| Sub {
+        owner,
+        made: sub.runs.map(|_| made),
+        ..sub
+    });
     // One change at a time, so two at once both land.
     let _held = held(store)?;
     let mut subs = read_whole(store, subscriber)?;
@@ -640,6 +1152,10 @@ pub fn change(
         write(store, subscriber, &subs)?;
     }
     let mut said = json!({});
+    let changes = add.is_some() || remove.is_some();
+    // What it added is all a change lists, one removed being gone: the
+    // whole listing is for a call that changes nothing.
+    let mut changed: Vec<Sub> = Vec::new();
     if let Some(name) = remove {
         said["removed"] = json!(drop_named(store, subscriber, &mut subs, name)?);
     }
@@ -668,9 +1184,19 @@ pub fn change(
         }
     }
     if let Some(sub) = add {
+        if !sub.sources.is_empty() {
+            let tried = preview(store, subscriber, &sub);
+            said["test"] = tried["test"].clone();
+            if !tried["examples"].is_null() {
+                said["examples"] = tried["examples"].clone();
+            }
+        }
         match subs.iter().find(|s| s.name == sub.name) {
             Some(had) => match had.differs(&sub) {
-                None => said["added"] = json!(false),
+                None => {
+                    changed.push(had.clone());
+                    said["added"] = json!(false)
+                }
                 Some(field) => {
                     return Err(format!(
                         "a subscription {} with another {field} is there; remove it first",
@@ -679,13 +1205,43 @@ pub fn change(
                 }
             },
             None => {
+                changed.push(sub.clone());
                 subs.push(sub);
                 write(store, subscriber, &subs)?;
                 said["added"] = json!(true);
             }
         }
     }
-    said["subscriptions"] = subs.iter().map(Sub::to_json).collect();
+    let listed = match changes {
+        true => &changed,
+        false => &subs,
+    };
+    // What each told lately, as the lookout counts it; when each was
+    // added is the lookout's to count by, not the bot's to read.
+    let (counts, now) = (counts(store, subscriber), super::epoch_ms() as u64);
+    let listing: Vec<Value> = (listed.iter())
+        .map(|sub| {
+            let mut listed = Sub {
+                made: None,
+                ..sub.clone()
+            }
+            .to_json();
+            if let Some(told) = counts.of(&sub.name, &sub.identity(owner), now) {
+                listed["lately"] = told;
+            }
+            listed
+        })
+        .collect();
+    // One only removed lists nothing, rather than an empty list that
+    // would read as none left.
+    if !(changes && listing.is_empty()) {
+        said["subscriptions"] = json!(listing);
+    }
+    // Whether what it lists is what the lookout listens for.
+    said["lookout"] = taken(store, subscriber);
+    if changes {
+        return Ok(said);
+    }
     // Examples come only from events these subscriptions hear, and are
     // what sources printed, as a note from them is.
     let (listed, examples) = super::sources::listed(store, sources, &subs);
@@ -694,6 +1250,212 @@ pub fn change(
         said["examples"] = json!(super::sources::EXAMPLES);
     }
     Ok(said)
+}
+
+/// A subscription `add` names, and the sources it names among `sources`,
+/// the ones there are.
+fn checked(add: &Value, sources: &[String]) -> Result<Sub, String> {
+    let sub = parse(add)?;
+    let known = |name: &String| {
+        let (source, topic) = super::sources::named(name);
+        sources.iter().any(|s| s == source) && topic.is_none_or(|topic| plain(topic, NAME_MAX))
+    };
+    if let Some(unknown) = sub.sources.iter().find(|s| !known(s)) {
+        let there = match sources.is_empty() {
+            true => "none: the person sets them up under [sonny.sources] in ~/.agent/config.toml"
+                .to_owned(),
+            false => sources.join(", "),
+        };
+        return Err(format!(
+            "no source {unknown:?}; the sources there are {there}"
+        ));
+    }
+    Ok(sub)
+}
+
+/// A `subscriptions` call's `test`: what the subscription `add` names
+/// would have heard of its sources' last 24 hours, as the lookout keeps
+/// them, and adding nothing. How many events it would hear, how many
+/// would steer, about how many notes they would be, with its digest or
+/// its sources', and the newest few as examples. What `subscriber` said
+/// itself, or was told another way, it does not hear, as live.
+pub fn tried(
+    store: &Path,
+    subscriber: &str,
+    add: &Value,
+    sources: &[String],
+) -> Result<Value, String> {
+    Ok(preview(store, subscriber, &checked(add, sources)?))
+}
+
+/// What `sub` would have heard of its sources' last 24 hours, as `tried`
+/// answers it.
+fn preview(store: &Path, subscriber: &str, sub: &Sub) -> Value {
+    let now = super::epoch_ms();
+    let since = now.saturating_sub(super::sources::RECENT_SPAN.as_millis());
+    let mut named: Vec<&str> = (sub.sources.iter())
+        .map(|name| super::sources::named(name).0)
+        .collect();
+    named.sort_unstable();
+    named.dedup();
+    let mut events: Vec<(super::sources::Event, bool)> = (named.iter())
+        .flat_map(|source| super::sources::recent(store, source, since))
+        .collect();
+    events.sort_by_key(|(event, _)| event.at_ms);
+    let (mut heard, mut steers, mut cut) = (0, 0, 0);
+    let mut times = Vec::new();
+    let mut newest = Vec::new();
+    for (event, was_cut) in &events {
+        if event.from.as_deref() == Some(subscriber) || !sub.hears(event) {
+            continue;
+        }
+        heard += 1;
+        cut += usize::from(*was_cut);
+        let steer = event.steer
+            || (sub.steer.as_ref()).is_some_and(|s| super::pattern::matches(s, &event.fields));
+        steers += usize::from(steer);
+        // Its own digest is one clock for all it hears; else each source
+        // keeps its own, as the lookout does.
+        let (digest, clock) = match &sub.digest {
+            Some(_) => (sub.digest_span(), ""),
+            None => (event.digest, event.source.as_str()),
+        };
+        let heard = super::sources::Heard {
+            event: (*event).clone(),
+            subs: vec![sub.name.clone()],
+        };
+        let bytes = super::sources::line(&heard).len();
+        let window = digest.map_or(0, |d| d.as_millis());
+        times.push(Timed {
+            at: event.at_ms,
+            steer,
+            window,
+            clock,
+            bytes,
+        });
+        newest.push(event);
+    }
+    let examples: Vec<Value> = (newest.iter().rev().take(3))
+        .map(|event| {
+            json!({"source": event.source, "topic": event.topic, "at": super::sources::clock(event.at_ms),
+                "text": super::sources::cut(&event.text, 200)})
+        })
+        .collect();
+    let mut tried = json!({"since": super::sources::clock(since), "events": events.len(),
+        "heard": heard, "steers": steers,
+        // One that lasts so many notes ends after them.
+        "notes": notes(&times).min(sub.runs.map_or(usize::MAX, |runs| runs as usize))});
+    if cut > 0 {
+        tried["cut"] = json!(format!(
+            "{cut} of the events it heard were kept cut, which a filter may misjudge"
+        ));
+    }
+    // The commons keeps no recent log, as no bot does.
+    let untested: Vec<&str> = [
+        (!sub.tasks_of.is_empty() || !sub.bots.is_empty()).then_some("its bots"),
+        named.contains(&COMMONS_SOURCE).then_some("the commons"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !untested.is_empty() {
+        tried["untested"] = json!(format!(
+            "{}: only what sources printed is kept to test on",
+            untested.join(" and ")
+        ));
+    }
+    let mut said = json!({"test": tried});
+    if !examples.is_empty() {
+        said["test"]["examples"] = json!(examples);
+        said["examples"] = json!(super::sources::EXAMPLES);
+    }
+    said
+}
+
+/// One event a test heard, as the estimate of its notes sees it.
+#[derive(Clone, Copy)]
+struct Timed<'a> {
+    /// When it came, in epoch ms.
+    at: u128,
+    steer: bool,
+    /// The digest it waits for, in ms; `0` for none.
+    window: u128,
+    /// Whose clock that digest counts on.
+    clock: &'a str,
+    /// Its line's length in the note.
+    bytes: usize,
+}
+
+/// About how many notes these events would be, as the lookout sends
+/// them: a note goes once what came since the note before settles, and
+/// an event is ready, or at once for a steer,
+/// carrying what is ready by then, steers first, as many as a note holds;
+/// each event no sooner than a digest after the note before on its
+/// clock. What a note had no room for, or a digest still holds, waits for
+/// a later one, which goes no sooner than the note before.
+fn notes(times: &[Timed]) -> usize {
+    use std::collections::HashMap;
+    fn ready(last: &HashMap<&str, u128>, e: &Timed) -> u128 {
+        match e.steer {
+            true => e.at,
+            false => (last.get(e.clock)).map_or(e.at, |told| e.at.max(told + e.window)),
+        }
+    }
+    /// The notes that go before `before`, or all of them: how many.
+    fn send<'a>(
+        waiting: &mut Vec<Timed<'a>>,
+        last: &mut HashMap<&'a str, u128>,
+        free: &mut u128,
+        before: Option<u128>,
+    ) -> usize {
+        let settle = super::SETTLE.as_millis();
+        // What waits settles from when the first of it came since the note
+        // before, as the lookout's `heard_since`; a steer waits for none.
+        let goes = |last: &HashMap<&str, u128>, free: u128, settled: u128, e: &Timed| {
+            let at = ready(last, e).max(free);
+            if e.steer { at } else { at.max(settled) }
+        };
+        let mut notes = 0;
+        while let Some(since) = (waiting.iter()).map(|e| e.at.max(*free)).min() {
+            let settled = since + settle;
+            let Some(went) = (waiting.iter())
+                .map(|e| goes(last, *free, settled, e))
+                .min()
+            else {
+                break;
+            };
+            if before.is_some_and(|at| went >= at) {
+                break;
+            }
+            notes += 1;
+            let (mut carried, held): (Vec<_>, Vec<_>) =
+                waiting.drain(..).partition(|e| ready(last, e) <= went);
+            carried.sort_by_key(|e| !e.steer);
+            let mut bytes = 0;
+            let take = (carried.iter().take(super::NOTE_ITEMS))
+                .take_while(|e| {
+                    bytes += e.bytes + 1;
+                    bytes <= super::sources::NOTE_BYTES
+                })
+                .count()
+                .max(1);
+            for e in carried.drain(..take) {
+                last.insert(e.clock, went);
+            }
+            carried.extend(held);
+            *waiting = carried;
+            *free = went;
+        }
+        notes
+    }
+    let mut last: HashMap<&str, u128> = HashMap::new();
+    let mut waiting: Vec<Timed> = Vec::new();
+    let (mut free, mut notes) = (0, 0);
+    for e in times {
+        notes += send(&mut waiting, &mut last, &mut free, Some(e.at));
+        waiting.push(*e);
+    }
+    notes + send(&mut waiting, &mut last, &mut free, None)
 }
 
 /// The fields that keep a filter from hearing any event like those its
@@ -762,6 +1524,26 @@ fn parse(value: &Value) -> Result<Sub, String> {
             Some(steer.clone())
         }
     };
+    // As an automation's `--at`: a time to come.
+    let until = match value.get("until") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(until)) => {
+            let at = crate::trigger::moment(until)?;
+            if at <= super::epoch_ms() as i64 / 1000 {
+                return Err(format!("until {until} has passed"));
+            }
+            Some(until.trim().to_owned())
+        }
+        Some(_) => return Err("until is YYYY-MM-DD HH:MM".into()),
+    };
+    let runs = match value.get("runs") {
+        None | Some(Value::Null) => None,
+        Some(runs) => Some(
+            (runs.as_u64())
+                .filter(|n| *n >= 1)
+                .ok_or("runs is a whole number, 1 or more")?,
+        ),
+    };
     let sub = Sub {
         name: name.to_owned(),
         tasks_of: strings("tasks_of"),
@@ -771,6 +1553,9 @@ fn parse(value: &Value) -> Result<Sub, String> {
         digest,
         steer,
         owner: None,
+        until,
+        runs,
+        made: None,
     };
     if sub.tasks_of.is_empty() && sub.bots.is_empty() && sub.sources.is_empty() {
         return Err("a subscription watches tasks_of a bot, bots by name or sources".into());
@@ -808,6 +1593,27 @@ mod tests {
         );
         // One the lines can't move is left for the config's own error.
         assert_eq!(steers("sonny.sources.ci.urgent = \"*\"\n"), Err(()));
+    }
+
+    #[test]
+    fn the_goals_folder_goes_once_and_subscriptions_stay() {
+        let store = std::env::temp_dir().join(format!("sonny-goals-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let mut record = store.as_os_str().to_owned();
+        record.push(".migrated");
+        let _ = std::fs::remove_file(&record);
+        std::fs::create_dir_all(dir(&store).join("goals/ended")).unwrap();
+        std::fs::write(dir(&store).join("goals/ended/a.x.json"), "{}").unwrap();
+        std::fs::write(dir(&store).join("a.x.json"), "{\"subscriptions\": []}").unwrap();
+        goals_gone(&store);
+        assert!(!dir(&store).join("goals").exists());
+        assert!(dir(&store).join("a.x.json").exists());
+        // Done, it never runs again; and a store with none is done too.
+        assert_eq!(crate::upgrade::lines(Path::new(&record)), [GOALS_GONE]);
+        goals_gone(&store);
+        assert_eq!(crate::upgrade::lines(Path::new(&record)), [GOALS_GONE]);
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let _ = std::fs::remove_file(&record);
     }
 
     #[test]
@@ -888,6 +1694,267 @@ mod tests {
         assert_eq!(again["subscriptions"].as_array().unwrap().len(), 1);
         assert_eq!(again["subscriptions"][0]["sources"], json!(["github:8"]));
         assert_eq!(again["subscriptions"][0]["bot_id"], 2);
+        let _ = std::fs::remove_dir_all(dir(&store));
+    }
+
+    #[test]
+    fn a_subscription_ends_at_its_until_after_its_runs_or_with_its_bot() {
+        let store = std::env::temp_dir().join(format!("subs-end-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let now = super::super::epoch_ms() as i64 / 1000;
+        let soon = crate::trigger::until_text(now + 3600);
+        let once = json!({"name": "deploy", "bots": ["a"], "until": soon, "runs": 1});
+        let added = change(&store, "shop.lead", Some(1), Some(&once), None, &[]).unwrap();
+        assert_eq!(added["subscriptions"][0]["until"], json!(soon));
+        assert_eq!(added["subscriptions"][0]["runs"], 1);
+        let sub = &read(&store, "shop.lead")[0];
+        assert_eq!(Sub::from_json(&sub.to_json()).as_ref(), Some(sub));
+        assert!(sub.rules());
+        assert!(!sub.over(now) && sub.over(now + 3600));
+        assert!(sub.describe().contains(&soon), "{}", sub.describe());
+        // Its notes count under when it was added, which the bot never
+        // reads; the same added again in one call counts afresh.
+        assert!(sub.made.is_some() && added["subscriptions"][0].get("made").is_none());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        change(
+            &store,
+            "shop.lead",
+            Some(1),
+            Some(&once),
+            Some("deploy"),
+            &[],
+        )
+        .unwrap();
+        assert_ne!(read(&store, "shop.lead")[0].counter(), sub.counter());
+        // The one the lookout read ended, its replacement stays.
+        assert_eq!(end(&store, "shop.lead", sub), Ok(false));
+        assert_eq!(read(&store, "shop.lead").len(), 1);
+        let now_there = read(&store, "shop.lead")[0].clone();
+        assert_eq!(end(&store, "shop.lead", &now_there), Ok(true));
+        assert!(read(&store, "shop.lead").is_empty());
+        change(&store, "shop.lead", Some(1), Some(&once), None, &[]).unwrap();
+        // A time gone, or no notes at all, is refused.
+        let past = crate::trigger::until_text(now - 120);
+        let refused = change(
+            &store,
+            "shop.lead",
+            Some(1),
+            Some(&json!({"name": "late", "bots": ["a"], "until": past})),
+            None,
+            &[],
+        );
+        assert!(refused.unwrap_err().contains("has passed"));
+        let none = json!({"name": "none", "bots": ["a"], "runs": 0});
+        assert!(
+            change(&store, "shop.lead", Some(1), Some(&none), None, &[])
+                .unwrap_err()
+                .contains("runs")
+        );
+        // The bot of ID 1 deleted: its subscriptions go, but those a later
+        // bot of the name holds stay.
+        assert_eq!(forget(&store, "shop.lead", Some(1)), Ok(1));
+        assert!(read(&store, "shop.lead").is_empty());
+        let theirs = json!({"name": "theirs", "bots": ["b"]});
+        change(&store, "shop.lead", Some(2), Some(&theirs), None, &[]).unwrap();
+        assert_eq!(forget(&store, "shop.lead", Some(1)), Ok(0));
+        assert_eq!(read(&store, "shop.lead")[0].name, "theirs");
+        let _ = std::fs::remove_dir_all(dir(&store));
+    }
+
+    #[test]
+    fn a_test_says_what_a_subscription_would_have_heard_and_adds_nothing() {
+        let store = std::env::temp_dir().join(format!("subs-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let sources_dir = super::super::beside(&store, ".sources");
+        let file = super::super::sources::recent_file(&sources_dir, "ci");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let now = super::super::epoch_ms() as u64;
+        let line = |at: u64, status: &str, steer: bool| {
+            json!({"source": "ci", "text": format!("build {status}"), "topic": "main", "steer": steer,
+                "at_ms": at, "seq": 0, "fields": {"text": format!("build {status}"), "status": status}})
+            .to_string()
+        };
+        let day = 24 * 60 * 60 * 1000;
+        let lines = [
+            line(now - day - 1000, "failed", false),
+            line(now - 60_000, "passed", false),
+            line(now - 50_000, "failed", false),
+            line(now - 40_000, "failed", true),
+            line(now - 1_000, "failed", false),
+        ];
+        // What the subscriber said itself it does not hear.
+        let mut own: Value = serde_json::from_str(&line(now - 500, "failed", false)).unwrap();
+        own["from"] = json!("shop.lead");
+        let mut lines = lines.to_vec();
+        lines.push(own.to_string());
+        std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+        let sources = ["ci".to_owned()];
+        let add = json!({"name": "red", "sources": ["ci:main"], "filter": {"status": ["failed"]},
+            "bots": ["ci.*"]});
+        let said = tried(&store, "shop.lead", &add, &sources).unwrap();
+        let test = &said["test"];
+        // What is older than a day is gone; what the filter leaves out is
+        // not heard.
+        assert_eq!(
+            (&test["events"], &test["heard"], &test["steers"]),
+            (&json!(5), &json!(3), &json!(1))
+        );
+        assert_eq!(test["notes"], 3, "{said}");
+        assert_eq!(test["examples"][0]["text"], "build failed");
+        assert_eq!(test["examples"].as_array().unwrap().len(), 3);
+        assert!(test["untested"].as_str().unwrap().contains("its bots"));
+        assert!(said["examples"].as_str().is_some());
+        assert!(read(&store, "shop.lead").is_empty());
+        // A digest gathers what does not steer.
+        let digested = json!({"name": "red", "sources": ["ci"], "digest": "1h"});
+        assert_eq!(tried_notes(&store, &digested), 3);
+        let all = json!({"name": "red", "sources": ["ci"]});
+        assert_eq!(tried_notes(&store, &all), 4);
+        let once = json!({"name": "red", "sources": ["ci"], "runs": 1});
+        assert_eq!(tried_notes(&store, &once), 1);
+        let other = tried(&store, "shop.fix", &all, &sources).unwrap();
+        assert_eq!(other["test"]["heard"], 5, "{other}");
+        // The commons keeps no recent log: a test of it says so.
+        let commons = json!({"name": "t", "sources": [format!("{COMMONS_SOURCE}:topic"), "ci"]});
+        let names = ["ci".to_owned(), COMMONS_SOURCE.to_owned()];
+        let said = tried(&store, "shop.lead", &commons, &names).unwrap();
+        assert!(
+            said["test"]["untested"]
+                .as_str()
+                .unwrap()
+                .starts_with("the commons:"),
+            "{said}"
+        );
+        // A source there is not is refused as add refuses it.
+        let none = json!({"name": "x", "sources": ["cd"]});
+        assert!(
+            tried(&store, "shop.lead", &none, &sources)
+                .unwrap_err()
+                .contains("no source")
+        );
+        // Adding it answers with it and the same test, not every
+        // subscription and source; removing it, with that it went.
+        let added = change(&store, "shop.lead", None, Some(&add), None, &sources).unwrap();
+        assert_eq!(added["added"], true);
+        assert_eq!(added["subscriptions"].as_array().unwrap().len(), 1);
+        assert_eq!(added["subscriptions"][0]["name"], "red");
+        assert_eq!(added["test"]["heard"], 3, "{added}");
+        assert!(added["examples"].as_str().is_some());
+        assert!(added.get("sources").is_none(), "{added}");
+        let quiet = json!({"name": "quiet", "bots": ["ci.*"]});
+        let added = change(&store, "shop.lead", None, Some(&quiet), None, &sources).unwrap();
+        assert!(added.get("test").is_none(), "{added}");
+        let listed = change(&store, "shop.lead", None, None, None, &sources).unwrap();
+        assert_eq!(listed["subscriptions"].as_array().unwrap().len(), 2);
+        assert_eq!(listed["sources"][0]["name"], "ci");
+        let gone = change(&store, "shop.lead", None, None, Some("red"), &sources).unwrap();
+        assert_eq!(gone["removed"], true);
+        assert!(gone.get("subscriptions").is_none(), "{gone}");
+        assert!(gone.get("sources").is_none(), "{gone}");
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let _ = std::fs::remove_dir_all(&sources_dir);
+    }
+
+    fn tried_notes(store: &Path, add: &Value) -> u64 {
+        tried(store, "shop.lead", add, &["ci".to_owned()]).unwrap()["test"]["notes"]
+            .as_u64()
+            .unwrap()
+    }
+
+    #[test]
+    fn notes_come_at_most_once_a_digest_and_a_steer_goes_at_once() {
+        let s = |n: u64| u128::from(n) * 1000;
+        let hour = 3_600_000;
+        let t = |at: u128, steer: bool, window: u128, clock: &'static str| Timed {
+            at,
+            steer,
+            window,
+            clock,
+            bytes: 100,
+        };
+        // As they come: a spell within the settle is one note.
+        assert_eq!(
+            notes(&[
+                t(s(0), false, 0, "a"),
+                t(s(1), false, 0, "a"),
+                t(s(10), false, 0, "a")
+            ]),
+            2
+        );
+        // A digest: the first at once, the rest gathered at its end.
+        let digested = [
+            t(s(0), false, hour, "a"),
+            t(s(60), false, hour, "a"),
+            t(s(120), false, hour, "a"),
+        ];
+        assert_eq!(notes(&digested), 2);
+        // Three sources, each its own digest's clock: each first at once.
+        let three = [
+            t(s(0), false, hour, "a"),
+            t(s(60), false, hour, "b"),
+            t(s(120), false, hour, "c"),
+        ];
+        assert_eq!(notes(&three), 3);
+        let steered = [
+            t(s(0), false, hour, "a"),
+            t(s(60), false, hour, "a"),
+            t(s(120), true, hour, "a"),
+        ];
+        // A steer goes at once, alone: what its digest holds waits on.
+        assert_eq!(notes(&steered), 3);
+        // What settled while its digest held it goes once the digest ends.
+        let late = [
+            t(s(0), false, hour, "a"),
+            t(s(60), false, hour, "a"),
+            t(s(3603), true, hour, "a"),
+        ];
+        assert_eq!(notes(&late), 3);
+        // Steers wait for no settle: each goes as it comes.
+        assert_eq!(
+            notes(&[
+                t(0, true, 0, "a"),
+                t(500, true, 0, "a"),
+                t(1000, true, 0, "a")
+            ]),
+            3
+        );
+        // A note holds so many events, and so many bytes.
+        let burst = vec![t(0, false, 0, "a"); 2000];
+        assert_eq!(notes(&burst), 2000 / super::super::NOTE_ITEMS);
+        let big = Timed {
+            bytes: super::super::sources::NOTE_BYTES / 2,
+            ..t(0, false, 0, "a")
+        };
+        assert_eq!(notes(&[big; 4]), 4);
+        assert_eq!(notes(&[]), 0);
+    }
+
+    #[test]
+    fn the_listing_says_what_each_subscription_told_lately() {
+        let store = std::env::temp_dir().join(format!("subs-lately-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir(&store));
+        let sub = json!({"name": "prs", "bots": ["a"]});
+        change(&store, "shop.lead", None, Some(&sub), None, &[]).unwrap();
+        let mut counts = Counts::default();
+        let now = super::super::epoch_ms() as u64;
+        let of = read(&store, "shop.lead")[0].identity(None);
+        // Another's counts under its name, or an older one's, are not its.
+        counts.told("prs", "another", "lookout-z", 9, true, now);
+        counts.told("prs", &of, "lookout-a", 3, false, now - 2 * HOUR_MS);
+        counts.told("prs", &of, "lookout-b", 1, true, now);
+        // The same note sent again counts once.
+        counts.told("prs", &of, "lookout-b", 1, true, now);
+        assert_eq!(Counts::from_json(&counts.to_json()), counts);
+        let file = counts_file(&store, "shop.lead");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, counts.to_json().to_string()).unwrap();
+        let listed = change(&store, "shop.lead", None, None, None, &[]).unwrap();
+        let lately = &listed["subscriptions"][0]["lately"];
+        assert_eq!(
+            (&lately["heard"], &lately["notes"], &lately["steers"]),
+            (&json!(4), &json!(2), &json!(1))
+        );
+        assert!(lately["last"].is_string());
         let _ = std::fs::remove_dir_all(dir(&store));
     }
 
@@ -1003,17 +2070,23 @@ mod tests {
             warned["unseen"],
             "no recent event of cr had path: the filter hears none until one does"
         );
+        // A change answers with what changed alone; the sources are
+        // listed with all the subscriptions, on a call that changes nothing.
+        assert_eq!(warned["subscriptions"].as_array().unwrap().len(), 1);
+        assert!(warned.get("sources").is_none(), "{warned}");
+        let whole = change(&store, "shop.lead", None, None, None, &sources).unwrap();
+        assert_eq!(whole["subscriptions"].as_array().unwrap().len(), 4);
         // Examples only from the newest event its subscriptions hear, the
         // billing one rather than the later one its filter leaves out, with
         // the outside-content warning.
-        let listed = &warned["sources"][0];
+        let listed = &whole["sources"][0];
         assert_eq!(listed["name"], "cr");
         assert_eq!(
             listed["fields"]["paths"],
             "list of strings, as [\"src/billing/a.rs\"]"
         );
         assert_eq!(listed["fields"]["meta.team"], "string, as \"core\"");
-        assert_eq!(warned["examples"], super::super::sources::EXAMPLES);
+        assert_eq!(whole["examples"], super::super::sources::EXAMPLES);
         // A caller hearing none of them sees each field's kinds alone.
         let other = change(&store, "ops.lead", None, None, None, &sources).unwrap();
         assert_eq!(other["sources"][0]["fields"]["paths"], "list of strings");
@@ -1053,7 +2126,8 @@ mod tests {
             "{none}"
         );
         let sources = ["mail".to_owned(), "slack".to_owned()];
-        let heard = change(&store, "shop.lead", None, Some(&slack), None, &sources).unwrap();
+        change(&store, "shop.lead", None, Some(&slack), None, &sources).unwrap();
+        let heard = change(&store, "shop.lead", None, None, None, &sources).unwrap();
         let names: Vec<&Value> = (heard["sources"].as_array().unwrap().iter())
             .map(|s| &s["name"])
             .collect();
@@ -1104,8 +2178,8 @@ mod tests {
         .unwrap();
         let gone = change(&store, &long, None, None, Some("x"), &[]).unwrap();
         assert_eq!(
-            (gone["removed"].clone(), gone["subscriptions"].clone()),
-            (json!(true), json!([]))
+            (gone["removed"].clone(), gone.get("subscriptions")),
+            (json!(true), None)
         );
         // Changes made at once all land.
         let threads: Vec<_> = (0..8)
@@ -1139,6 +2213,62 @@ mod tests {
         change(&store, "shop.lead", None, None, Some("prs"), &[]).unwrap();
         change(&store, "shop.lead", None, None, Some("tasks"), &[]).unwrap();
         assert_eq!(all(&store).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_look_reads_again_only_the_files_that_changed() {
+        let dir = std::env::temp_dir().join(format!("subs-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("state.sqlite");
+        std::fs::create_dir_all(super::dir(&store)).unwrap();
+        let path = file(&store, "shop.lead");
+        let named = |name: &str| {
+            json!({"subscriptions": [{"name": name, "bots": ["shop.fix"]}]}).to_string()
+        };
+        // Written in place, its length the same, and its time set back
+        // past the racy window: only its time tells it changed.
+        let now = std::time::SystemTime::now();
+        let write = |name: &str, ago: u64| {
+            std::fs::write(&path, named(name)).unwrap();
+            let past = now - std::time::Duration::from_secs(ago);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+        };
+        let names = |files: &mut Read| -> Vec<String> {
+            (files.all(&store).into_iter())
+                .flat_map(|(_, subs)| subs.into_iter().map(|sub| sub.name))
+                .collect()
+        };
+        let mut files = Read::default();
+        write("aaaa", 60);
+        assert_eq!(names(&mut files), ["aaaa"]);
+        // Kept under its stamp, so the next look reads nothing.
+        let kept = |files: &Read| files.0.get("shop.lead").map(|(stamp, _)| *stamp);
+        assert_eq!(kept(&files), crate::kept::stamp(&path));
+        assert_eq!(names(&mut files), ["aaaa"]);
+        // Read again once it changed.
+        write("bbbb", 30);
+        assert_eq!(names(&mut files), ["bbbb"]);
+        // A permission put right, which changes neither its time nor its
+        // size, is a change too: what read as nothing is read again.
+        use std::os::unix::fs::PermissionsExt;
+        let before = crate::kept::stamp(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_ne!(crate::kept::stamp(&path), before);
+        // Just written: no proof a change in the same tick is not missed,
+        // so it is read each look until it settles.
+        std::fs::write(&path, named("cccc")).unwrap();
+        assert_eq!(names(&mut files), ["cccc"]);
+        std::fs::write(&path, named("dddd")).unwrap();
+        assert_eq!(names(&mut files), ["dddd"]);
+        // A file gone is no subscriber.
+        std::fs::remove_file(&path).unwrap();
+        assert!(files.all(&store).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

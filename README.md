@@ -56,6 +56,25 @@ missing; `PREFIX` installs elsewhere, `SONNY_VERSION` picks a release and
 `SONNY_PACKAGES=0` leaves the system's packages alone. [install.sh](install.sh)
 is short enough to read first.
 
+For Sonny from main without a version tag, use the nightly Homebrew channel
+(macOS or Linux):
+
+```sh
+brew unlink sonny                         # if the stable formula is installed
+brew install lydakis/agent/sonny-nightly
+# Later:
+brew update
+brew reinstall lydakis/agent/sonny-nightly
+```
+
+Nightly fetches current main on every install or reinstall and builds Sonny
+and its daemon together from that checkout. No `--HEAD`, version tag or wait
+for the nightly workflow is needed. Use `reinstall` to update: Homebrew's
+`upgrade` can skip a formula whose version has not changed. `sonny --version`
+and `sonny agent --version` show the built commit. The nightly workflow checks
+the recipe at 07:17 UTC; stable `sonny` and the Linux installer above continue
+to install versioned releases. Both Homebrew channels build from source.
+
 ## Quickstart
 
 Set the key for any provider you use, and pick a default model as
@@ -73,19 +92,27 @@ in the environment); no region is needed. A Bedrock API key in
 `AWS_BEARER_TOKEN_BEDROCK` works too, with `AWS_REGION` set to the key's region. Start the daemon with `--provider bedrock` and name Claude
 models by their cross-region inference profile, like
 `bedrock/global.anthropic.claude-opus-5-5`, which AWS routes to whichever
-region holds the model (from any source region the profile supports), or `--provider bedrock-openai` for `bedrock-openai/openai.gpt-6-sol`.
+region holds the model (from any source region the profile supports), or `--provider bedrock-openai` for `bedrock-openai/openai.gpt-6-sol`
+on Bedrock Mantle, or `--provider bedrock-openai-runtime` for the models
+Bedrock runtime's OpenAI-compatible endpoint serves, by inference profile
+(`bedrock-openai-runtime/us.openai.gpt-6-sol`).
 `AGENT_PROVIDER` takes the place of `--provider` for any provider, so
 `export AGENT_PROVIDER=bedrock AGENT_MODEL=bedrock/global.anthropic.claude-sonnet-5`
 needs no flags.
 To keep them instead, put `provider = "bedrock"` and
 `model = "bedrock/global.anthropic.claude-sonnet-5"` in `~/.agent/config.toml`;
-the shell's variables come first.
+the shell's variables come first. An edit to `provider` there applies to a
+running daemon's next turns without a restart; running turns finish where
+they started.
 For a ChatGPT Go, Plus or Pro plan, run `agent login chatgpt` once and start
 the daemon with `--provider chatgpt`; it signs in through OpenAI's
 [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source)
 and keeps the token fresh itself.
-`agent models --discover` writes `~/.agent/models` from what your providers
-list; edit it down to the models Sonny and your agents should offer.
+Each daemon start rewrites `~/.agent/models.discovered` from what your
+providers list (`agent models --discover` does it on demand). Your own
+`~/.agent/models` goes on top: a `PROVIDER/MODEL` line adds a model or puts
+it first with your note, and `-PROVIDER/MODEL` hides one. Sonny and your
+agents offer the two together.
 
 Each bot has its own model, so bots on different providers can run side by
 side in one daemon. Other OpenAI Responses-compatible gateways
@@ -251,9 +278,11 @@ goes in your shell profile. Tool shells never get the keys the daemon's
 providers use; as in Codex, `[shell_environment_policy]` with
 `ignore_default_excludes = false` also leaves out every variable named like
 `*KEY*`, `*SECRET*` or `*TOKEN*`, and `exclude` lists more. Bots search the web where their provider offers
-it, as Codex's do: OpenAI with an API key, Anthropic, and GPT on Bedrock. Every
+it, as Codex's do: OpenAI with an API key, Anthropic, and GPT on Bedrock Mantle. Every
 bot can also read a page with `web_fetch`, which the daemon runs itself. Put
-`web_search = "disabled"` in `config.toml` to leave both out of new bots.
+`web_search = "disabled"` in `config.toml` to leave both out of new bots, or
+`web_search_off = ["bedrock-openai/xai.*"]` to leave search out for models
+whose provider's search refuses them.
 A message one agent sends another reaches its model with a line naming the
 sender, so no agent takes it for yours; `senders = "hidden"` leaves that out.
 A note sent with `--delivery attach` rides on the bot's next call and goes as a
@@ -265,7 +294,14 @@ limit, a provider that is down) waits for you rather than failing, for
 `agent held` lists what waits and `agent retry` tries it again now.
 A request Claude's safety classifiers decline ends the turn, unless
 `[fallbacks]` names another model for the bot's own; that model then answers
-that request alone ([CLI.md](docs/CLI.md)).
+that request alone ([CLI.md](docs/CLI.md)). A model's context window, which
+sets when its agents compact, is what its provider lists, else Anthropic's published one for Claude, else
+200K; `[context_windows]` sets it by model, as `"bedrock/*openai.*" =
+1000000`, the most specific pattern winning, also lower on purpose.
+A price sheet, `~/.agent/prices.toml` (or the file `prices` in the config
+names), gives what a million tokens cost by the same patterns, and Sonny's
+`/usage` shows each model's cost and the total; nothing is bundled, so
+prices never go stale behind your back.
 
 ## How fast is it?
 

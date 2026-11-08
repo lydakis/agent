@@ -7,6 +7,9 @@
 pub struct Settings {
     /// Whether finished and waiting work rings. Notifications show either way.
     pub chime: bool,
+    /// Whether the agent's steps between what is said are drawn, or only
+    /// the person's words and the agent's (the default).
+    pub steps: bool,
     /// Whether every tool call is drawn, or only the bot's words and the
     /// calls that move the work on (the clean view, the default).
     pub verbose: bool,
@@ -17,6 +20,13 @@ pub struct Settings {
     pub margin_opens: agent_client::config::MarginOpens,
     /// Where a click on an agent's name takes the person.
     pub agent_opens: agent_client::config::AgentOpens,
+    /// The most notes a margin holds.
+    pub margin_notes: u64,
+    /// The most lines a margin note runs to.
+    pub margin_note_lines: u64,
+    /// The person's hours, and how long outside them no window is used
+    /// before quiet starts.
+    pub quiet: crate::quiet::Schedule,
 }
 
 impl Default for Settings {
@@ -34,10 +44,14 @@ impl Settings {
     fn from(sonny: agent_client::config::Sonny) -> Self {
         Settings {
             chime: sonny.chime,
+            steps: sonny.steps,
             verbose: sonny.verbose,
             text_width: sonny.text_width,
             margin_opens: sonny.margin_opens,
             agent_opens: sonny.agent_opens,
+            margin_notes: sonny.margin_notes,
+            margin_note_lines: sonny.margin_note_lines,
+            quiet: crate::quiet::Schedule::from(&sonny),
         }
     }
 

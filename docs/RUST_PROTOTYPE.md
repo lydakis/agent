@@ -46,7 +46,9 @@ Cargo.lock hashes; observer fingerprints continue to cover the benchmark tools.
 ## Software first
 
 Programs are the clients. Every command below emits JSONL events on stdout by
-default; exit codes report the turn outcome. `--pretty` renders the same stream
+default; exit codes report the turn outcome, and a turn that failed says why
+in one line on stderr too (a `wait` that timed out says so in `pending` alone).
+`--pretty` renders the same stream
 for a human watching a terminal and is never the input protocol. The daemon's
 socket protocol is the contract; the `agent` client is one consumer of it.
 
@@ -171,7 +173,9 @@ submitting client. `--delivery queue` or `steer` hands a busy bot the work
 instead of getting `bot_busy` ([delivery modes](#delivery-modes)). A controller can inspect metadata through `ls` or observe events through
 `follow` from outside a shell tool. Full records remain available via the protocol.
 
-Shell tool processes receive `AGENT_BIN`, an absolute `AGENT_STORE`,
+Shell tool processes receive `AGENT_BIN` (the daemon's own program, or the
+path its starter gave in `AGENT_BIN` when that names the same program, as a
+client that starts the daemon under a name of its own does), an absolute `AGENT_STORE`,
 `AGENT_SOCKET` when a socket is configured, and `AGENT_MODEL`, the running
 turn's effective model, so newly created peers default to its model.
 Continuing an existing peer keeps that peer's stored model unless `--model`
@@ -306,40 +310,90 @@ it; `served_model`, the model the provider named in its response, which can
 differ from the one requested (a dated snapshot, a reroute, and after a
 fallback the last attempt's); `context_window`, the model's context window
 in tokens on a model round's event, so a client can say how full the
-conversation is; a prompt-cache refresh's event carries
-`purpose: "keep_warm"` and is not a model round), and the store keeps running
+conversation is), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
 `input_tokens`, `cached_input_tokens`). Both report `cache_hit`, the share of
 input tokens the provider served from its prompt cache, to three places; it
 is the number the context window's hysteresis exists to keep high, and
 `stats` reports the same totals and ratio for every turn since the daemon
-started, from three atomics and no storage read. `create` and `fork` accept
-`budget_tokens`, a lifetime cap on input plus output tokens for that bot. The
-cap is checked before each model call and before each submission: a
-submission on an exhausted bot fails with `budget_exhausted`, and a turn whose
-next call would exceed the cap ends as `failed` with `budget_exhausted` after
-any tool already planned has run, so the bot is never left uncertain. One
-call may overshoot the cap. Forks start at zero with their own optional cap.
-Reported usage from failed or incomplete calls is charged without accepting their
-output into history. Such calls count in `model_rounds` when usage is reported.
-Failed-attempt usage also counts before a retry and later tool rounds: a retry
-cannot start after that usage exhausts the budget. This check uses the running
-total without another store read.
-Cancellation and failures before a usage report is returned can leave usage
-unaccounted for; these totals are not a reconciliation of provider billing.
-Successful calls retain their single atomic transcript/usage commit; budget
-checks use the turn's running total without an extra database read per round.
-`submit` also accepts `budget_tokens`, a cap on the input plus output tokens
-of the turn it starts, checked where the bot's cap is. A turn past it ends as
-`failed` with `turn_budget_exhausted` and the facts `turn_budget_tokens` and
-`turn_tokens_used`; when both caps are reached the bot's `budget_exhausted`
-is named, since it outlasts the turn. The cap is stored on the turn (`turns`
-lists it as `budget_tokens`), so a resumed turn counts what it spent before
-parking, and a resend naming another cap is an `idempotency_conflict`. A
-steer joins a turn that already has its cap: `budget_tokens` with
-`delivery: "steer"` is `invalid_delivery`. A summary held beside a call
-counts toward both caps.
+started, from three atomics and no storage read.
+
+A budget counts one of two measures, named by `budget_counts`: `tokens`, the
+default, is the provider's usage, every call's input and output, the history
+it sends again included; `work` counts what the calls add, for an allowance
+that should not pay again for a history the bot already has. The daemon
+keeps both for every bot and turn, the same way wherever they are counted.
+A call's work is its output, plus the share of its input that the request's
+history items sent for the first time take of the request, by size: the items
+after the newest node the bot's calls have read or written. A history sent
+again, warm in the provider's cache or cold, is free, and what joins it (a
+prompt, a steer, a tool's result) is charged once, on the call that first
+sends it, however much the request lost meanwhile to an elision, a compaction
+or a window moving on: what leaves a request never hides what joins it.
+Output is charged when it is made; sending it back is free. A summary
+re-reads the history and is charged its output alone. A
+failed or incomplete call is charged as a call, the history it sent read
+through, its output not accepted, so its retry sends nothing new. A fork's
+history is its source's: what the source's calls read of it is read, through
+the checkpoint at most. Each call counts its new items from the end of the
+window the turn already holds, so the cost is the new items alone, with no
+store read, whatever the history's length. The store keeps the bot's work
+(`work_tokens` in `inspect`, beside `tokens_used`), the node its calls have
+read through, and each turn's (`work_tokens` in the turn view, and on each
+`usage` event what that call charged), so a park or a restart counts on. Cancellation and failures
+before a usage report is returned can leave usage and work unaccounted for;
+these totals are not a reconciliation of provider billing.
+
+`create` and `fork` accept `budget_tokens`, a lifetime cap on the bot, and
+`budget_counts` (`tokens` or `work`, only with a cap; alone it is
+`invalid_budget`); `inspect` and `bots` report both. The cap is checked
+before each model call and before each submission: a submission on an
+exhausted bot fails with `budget_exhausted` and the facts `budget_tokens`,
+`budget_counts` and the count it reached (`tokens_used` or `work_tokens`).
+Forks start at zero with their own optional cap. `submit` also accepts
+`budget_tokens` and `budget_counts`, a cap on the turn it starts, checked
+where the bot's cap is; past it the facts are `turn_budget_tokens`,
+`budget_counts` and `turn_tokens_used` or `turn_work_tokens`, and when both
+caps are reached the bot's `budget_exhausted` is named, since it outlasts the
+turn. The two caps may count different measures. The cap is stored on the
+turn (`turns` lists `budget_tokens` and, with one, `budget_counts`), so a
+resumed turn counts what it did before parking, and a resend naming another
+cap or measure is an `idempotency_conflict`. A steer joins a turn that already has its cap:
+`budget_tokens` with `delivery: "steer"` is `invalid_delivery`. A summary
+held beside a call counts toward both caps, in the measure each counts.
+
+A budget ends a turn as the round limit does: its last call goes with the
+tools shown and no call allowed, so the turn ends on a reply rather than
+failing with its work done and unreported. Once any call of the turn (an
+answer, a summary, a failed attempt) has spent a cap and the turn goes on,
+for tool results or a steer, its next call goes so. No call's work is known
+before it is made, so none is predicted, and that last call may overshoot
+the cap by what it spends. The live `tool_calls_withheld` says why (`reason`:
+`budget`, `turn_budget` or `tool_round_limit`), and a turn that completes on such a call is `completed`
+with `limit` (`budget`, `turn_budget` or `rounds`) on its `turn_finished`
+and in its turn view. A retry of a failed attempt that spent a cap goes the
+same way. A cap spent before the turn made any call fails it with
+`budget_exhausted` or `turn_budget_exhausted`, as does one spent again after
+that last call. Usage and work from failed or incomplete calls count in
+`model_rounds` when usage is reported, and toward the caps before a retry and
+later tool rounds, from the running totals without another store read.
+Successful calls keep their single atomic transcript and usage commit.
+
+`submit` also accepts `output_schema` (protocol 51), a JSON Schema object
+the reply of the turn it starts follows, as Codex's turn output schema:
+each of the turn's model calls asks its provider for structured output,
+`text.format` with a strict `json_schema` for Responses (the ChatGPT plan
+included) and `output_config.format` with a `json_schema` beside the
+effort for Anthropic and Bedrock. The tools stay callable, so a turn may
+look before it answers; a summary is free text and asks for none. The daemon checks
+only that it is an object of at most 64 KiB as JSON
+(`invalid_output_schema`): which schemas a model takes is its provider's to
+say, as a failed call. It is stored on the turn (`turns.output_schema`,
+schema 81), so a resumed turn asks for it too and a resend naming another is
+an `idempotency_conflict`. It shapes the turn it starts: with `steer` or
+`attach` it is `invalid_delivery`. The judge `sonny approver` runs asks its
+verdict this way.
 
 `submit` also accepts `images`, pictures sent with the prompt: up to 20 of
 `{"media_type", "data"}`, the type one of `image/png`, `image/jpeg`,
@@ -426,10 +480,11 @@ keeps what it started with; the next start takes a change.
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 bytes of those waiting submissions: their prompts and the words they quote, which wait with them. | none |
 | `--max-input-bytes` | Bytes of request lines every session together has read and the daemon has not yet taken up. A line is read on credit for its first 4 KiB, and one that goes on waits for credit for the longest line (8 MiB) at once and gives back what it did not use, so readers never each hold part of what they need; an eighth of the bound is kept for lines that end within 4 KiB, so interrupts, renewals and status reads get in while long submits wait. At least one longest line and its reserve. Zero is unbounded. | a sixteenth of physical memory, at least 64 MiB |
-| `--max-readers` | Store reader connections, each on its own thread, for the reads clients ask for that decide nothing ([observation reads](#observation-reads)), which take all but one, and for turns' own reads. At least 1. | one per logical CPU |
+| `--max-readers` | Most store reader connections, each on its own thread and opened as reads wait for one, for the reads clients ask for that decide nothing ([observation reads](#observation-reads)), which take all but one, and for turns' own reads. At least 1. | one per logical CPU |
 | `--max-load` | The 1-minute load average at which new foreground and background commands wait while one of the daemon's is running, as make's `-l`: never while none is, so a loaded machine slows the fleet and never stops it, and `--max-processes` stays the bound behind it. One thread reads the load each second; waiters hold no slot, go in the order they came, and take a freed slot only if the gate still admits them. A call that would be refused (forbidden, asked about with no gate, an escape no gate allows) is answered at once, never held; a gated one waits for its verdict instead, so a denial comes back as soon as it is given, and one allowed starts then. A round's calls that run together are let in or held whole. A foreground command held past 1.5 s parks its turn before the call (or the batch it starts with) starts: one commit, `turn_waiting` with `{call_id, load: true, deadline_ms}` (also its view's `waiting_on`), no task, no active slot, and it survives restart. The gate's next admitting reading wakes every parked turn once the load falls, or the oldest alone on a loaded machine where none of the daemon's commands runs; a turn whose round has a later gated call is woken at that call's lapse too. A fraction is kept. Zero is no gate. Reported in `ready` as `limits.load`, `null` for none (protocol 44). | none (the agent CLI passes `cpus * 2`) |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--stall-timeout` | How long an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count; a connection that sends no bytes at all, keepalives included, fails sooner, after 2 minutes. Whole seconds, `1s` to `24h`. `[daemon] stall_timeout` in `~/.agent/config.toml` sets it, as a duration such as `"15m"`. | `10m` |
+| `--max-depth` | How many generations below the bot that starts its line `create` and `fork` may make a bot (Codex's `agents.max_depth`). A bot made with no creator, or with `starts_line`, is at 0; one another bot creates is one below its creator; a fork its source makes stands where its source does, and one another bot makes is one below that bot. Each bot keeps its `depth`, so the check reads only its creator's row. Past the bound, `depth_limit`, with `depth` and `max_depth`, and nothing made; a resend of a keyed creation still answers with the bot it made. Zero is unbounded. Reported in `ready` as `limits.depth`, `null` for none (protocol 52). | none (the agent CLI passes `[daemon] depth`, 2 by default) |
 | `--idle-exit` | How long, in whole seconds, before a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
 
@@ -447,8 +502,8 @@ different context windows or output limits. These were daemon flags before
 schema 40; a bot from before then takes the defaults. A value its provider's
 family refuses, such as an Anthropic output bound below 2,048, is refused at
 `create` with that provider's error. A turn calls through the shared provider,
-or through a copy shaped by the bot's own output bound, cache lifetime and
-keep-warm when it sets any of them.
+or through a copy shaped by the bot's own output bound and cache lifetime
+when it sets either.
 
 | Setting (flag) | Meaning | Default |
 | --- | --- | --- |
@@ -462,8 +517,7 @@ keep-warm when it sets any of them.
 | `keep_turns` (`--keep-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)), and a terminal read waits live for its output before its turn parks. 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
-| `keep_warm` (`--keep-warm`) | Seconds an Anthropic prompt cache may sit unread while a turn runs a tool before it is refreshed (see [keeping the cache warm](#keeping-the-anthropic-cache-warm)). Below 300; 0 never refreshes. | 240 |
-| `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on every cache marker of a request: the instructions', the request's own, and the pinned compaction summary's and note's, since the API refuses a longer lifetime after a shorter one. `1h` bills each write at twice the input rate instead of 1.25 times and sends no refreshes. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. A bot whose summarizer or fallback is such a model keeps five minutes on every call, since those calls carry the same pinned blocks. `inspect` reports a lifetime never set as `null`, so a client's own default can tell it from `5m` someone chose. | unset (`5m`) |
+| `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on every cache marker of a request: the instructions', the request's own, and the pinned compaction summary's and note's, since the API refuses a longer lifetime after a shorter one. `1h` bills each write at twice the input rate instead of 1.25 times. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. A bot whose summarizer or fallback is such a model keeps five minutes on every call, since those calls carry the same pinned blocks. `inspect` reports a lifetime never set as `null`, so a client's own default can tell it from `5m` someone chose. | unset (`5m`) |
 | `speed` (`--speed`) | The tier the bot's own model's calls are served at: `standard`, `fast` or `ultrafast`, each faster one at a higher price per token. The Claude API serves `fast`, its fast mode (sent as `speed` with the `fast-mode-2026-02-01` beta; Opus 4.8 and later, twice the price, its own rate limit, so its own pool, which learns `anthropic-fast-input-tokens-*` and `anthropic-fast-output-tokens-*`); Bedrock serves Claude at standard only. OpenAI's API and the ChatGPT plan serve `fast` (sent as `service_tier: priority`) and `ultrafast`; Bedrock serves GPT models `ultrafast` alone (OpenAI's fast-mode guide and Bedrock's GPT-6.1 Sol and GPT-6 Astra cards, read 2026-10-30). A tier the binding does not serve is refused `invalid_speed` with its `speeds`; which models take one is the provider's to say, and a call on one that does not fails there. Switching it misses the prompt cache once. Calls on another model (a `compaction_model`, a fallback) go at standard. `inspect` reports `standard` when unset. | `standard` |
 | `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
@@ -474,6 +528,7 @@ keep-warm when it sets any of them.
 | `outputs` (`--outputs`) | An absolute folder that holds each tool output stream cut for the model whole, one file per stream, in place of the store's copy (see [retained outputs](#retained-outputs)). The daemon makes it, owner-only, and writes there only while the bot's sandbox cannot write it; otherwise the stream stays in the store. `agent run --new` and Sonny name `outputs` beside the store unless told otherwise. | none |
 | `unix_sockets` (`--unix-socket`, repeatable) | Absolute Unix sockets, or folders of them, the only ones a sandboxed bot's commands reach, such as a Docker or SSH agent socket (see [sandbox](#sandbox)). Each is stored by its real path while it exists. At most 64. | none |
 | `rules` (none) | The bot's [command rules](#command-rules), as its client read them: `prefix_rules`, `host_executables`, or `invalid` with why they couldn't be read. A bot another made takes its creator's, always. At most 256 KiB as JSON. | none |
+| `env` (none) | Variables its commands get beside the daemon's environment, as a map of name to value, as Codex's `shell_environment_policy.set` sets them for every shell: a client names a fact for its bots' shells, such as Sonny's `SONNY_STATE`. Names are a letter or `_`, then letters, digits and `_`; `AGENT_` ones are the daemon's own and refused. A bot another made takes its creator's, always, and a change reaches the bots it made, as `rules` do, so no bot plants a variable (`PATH`, `LD_PRELOAD`) that changes what a command approved to leave its sandbox runs. `inspect` shows the values, so they hold no secrets. At most 16 KiB as JSON. Protocol 53. | none |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -497,7 +552,7 @@ A model reference is `PROVIDER/MODEL`. A provider spec is
 
 | Family | Protocol | Defaults |
 | --- | --- | --- |
-| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://api.openai.com/v1`, the ChatGPT plan login `agent login chatgpt` saved; `bedrock-openai` → `https://bedrock-mantle.{region}.api.aws/openai/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK` |
+| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://api.openai.com/v1`, the ChatGPT plan login `agent login chatgpt` saved; `bedrock-openai` → `https://bedrock-mantle.{region}.api.aws/openai/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK`; `bedrock-openai-runtime` → `https://bedrock-runtime.{region}.amazonaws.com/openai/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK` |
 | `anthropic` | Anthropic Messages API, streaming SSE | `anthropic` → `https://api.anthropic.com/v1`, `ANTHROPIC_API_KEY`; `bedrock` → `https://bedrock-runtime.{region}.amazonaws.com/anthropic/v1`, SigV4 or `AWS_BEARER_TOKEN_BEDROCK` |
 
 The family `responses-ws` is the Responses API over a WebSocket per bot,
@@ -521,7 +576,9 @@ inference profiles (`global.anthropic.claude-opus-5-5`, or `us.`, `eu.`,
 holds the model, from any source region the profile supports (AWS lists them
 per profile, and `ListInferenceProfiles` names only the profiles callable from
 the region asked), and `bedrock-openai` binds OpenAI and other models on Bedrock Mantle, as
-Claude Code and Codex do by default. Both take the region in Claude Code's
+Claude Code and Codex do by default. `bedrock-openai-runtime` binds runtime's
+OpenAI-compatible route, as Codex's `amazon-bedrock-runtime` does, for models
+served only there, by inference profile. All take the region in Claude Code's
 order: `AWS_REGION`, `AWS_DEFAULT_REGION`, the `region` of the active profile
 (`AWS_PROFILE`, else `default`) in the AWS shared credentials file and then
 the config file, else us-east-1; the first value set must be shaped like a region,
@@ -760,64 +817,21 @@ suspect.
 Empty instructions omit the system block, since empty text
 cannot carry an Anthropic cache breakpoint; automatic caching remains enabled.
 
-### Keeping the Anthropic cache warm
+### The Anthropic cache lifetime
 
 Anthropic's default prompt cache lives five minutes from its last read, and a
 foreground tool call may run ten. On 2026-09-25 a Sonnet 5 bot idle for eight
 minutes between two calls read only its 2.3k-token system and tools prefix
 from cache; the 6.8k-token conversation was written again at 1.25 times the
 input rate. The one-hour cache read all 9.0k, but it bills every write at
-twice the input rate, idle or not. The daemon keeps the five-minute cache and
-refreshes it instead. While a turn's call streams its reply or a tool runs,
-once that call's cache has gone the bot's `keep_warm` seconds unread (240
-by default), it sends that call's request again with `max_tokens: 0` and
-`stream: false`. That request generates nothing, bills a cache read, and
-restarts the cache's lifetime. It repeats until the reply and then the tool
-finish. The lifetime is counted from when the call, or the last refresh, was
-sent, so a call still waiting for its pool or startup admission is not
-refreshed. Refreshing during the reply matters because a long one outlives the
-cache on its own: in the 2026-09-25 Sonnet 5 rerun, six replies of 32k to
-86k output tokens each took longer than five minutes, and the refresh sent
-when the next tool started found the prefix gone and wrote it again. Each
-refresh runs as a task of its own: one still unanswered when the reply ends
-carries into the tool that follows. When the tool ends, the next model round
-starts, or the turn ends or is interrupted, one not yet sent is dropped at no
-cost, and one already sent is answered, so its cost is recorded and counts
-toward the bot's budget before another call. A summary's call is not
-refreshed.
-Nothing else in the request differs, since the cache is keyed on everything it
-renders. A refresh is paced and admitted like a call, but gives up waiting
-for its pool and startup admission once the cache it would refresh has
-expired, and after 30 seconds in any case. Usage is read per attempt, as for
-a call. A refused
-refresh publishes a non-durable `keep_warm_failed` event and ends refreshes
-until the next model call, which pays the write it would have paid anyway.
-
-Anthropic's
-[prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-guidance, read 2026-09-25 through Anthropic's API skill rather than the live
-page, documents the `max_tokens: 0` request under pre-warming. It recommends
-this keep-alive over the one-hour cache for five-to-sixty-minute gaps only on
-Claude Fable 5.1 and Mythos 5.1, whose cache reads are nearly free (0.025
-times the input rate on Fable 5.1). For other models, it picks the one-hour
-cache for such gaps. Refreshing those models too is this runtime's inference,
-not Anthropic's advice. During a streaming reply or a running tool the next
-model call is certain, so each refresh costs a 0.1-times read of the
-conversation where expiry costs a 1.25-times rewrite; a ten-minute tool takes
-at most two. Whether it also
-beats the one-hour cache, which covers parked waits and gaps between turns
-but bills every write at twice the input rate, is not measured; a bot's
-`cache_ttl` of `1h` (`--cache-ttl 1h`) selects it for that comparison. Its writes are recorded apart, from
-Anthropic's per-lifetime split or, when a report has none, as the request
-asked. The guidance
-also lists the requests `max_tokens: 0` rejects: streaming, budgeted thinking
-(`thinking.type: "enabled"`), structured outputs, and forced tool choice. So
-older models with thinking on are not refreshed. Bedrock is also left out
-until the same request is verified there. Refreshes cover foreground tool
-calls only: a turn parked on `wait` has no live task to send them, and a bot
-between turns may never be called again. The Responses cache needs none: the
-ChatGPT backend still read 7.4k of 7.7k tokens after a 20-minute gap, and it
-refuses `prompt_cache_retention: "24h"` with a 400.
+twice the input rate, idle or not. A bot chooses with `cache_ttl`; Sonny and
+the CLI's policy give Claude bots `1h`, which also covers parked waits and
+gaps between turns. The daemon sends no request to keep a cache alive: a
+cache that lapses is written again by the next call. Writes are recorded by
+lifetime, from Anthropic's per-lifetime split or, when a report has none, as
+the request asked. The Responses cache needs no lifetime: the ChatGPT backend
+still read 7.4k of 7.7k tokens after a 20-minute gap, and it refuses
+`prompt_cache_retention: "24h"` with a 400.
 
 A bot created with `--fallback PROVIDER/MODEL` (`create.fallback`, a known
 provider's model in the bot's family, inherited by its forks) sends a request
@@ -1050,8 +1064,14 @@ operations.
 Reads that decide nothing run beside the service loop, not in it:
 `history_nodes`, `history_items`, `history_search`, `turns`, `bots`,
 `events`, `usage` and `prompts`. Each runs on one of the store's reader
-connections (`--max-readers`, one per logical CPU by default; WAL readers
-do not block each other or the writer). They take at most all but one of
+connections (at most `--max-readers`, one per logical CPU by default; WAL
+readers do not block each other or the writer). One reader opens with the
+store; another opens when a read is queued with no reader free to take
+it, and one past the first closes after 30 seconds without a read, so a
+quiet daemon holds one and a busy one widens on its own. The readers that
+are open share one 2 MiB page cache budget equally: an idle reader takes
+its new share as soon as one opens or closes, a busy one as its read ends
+(`stats` shows the shares held as `readers.cache_kib`). They take at most all but one of
 the connections, the rest waiting in the order they came, so a turn's own
 reads (its context, a compaction plan) always find one free, as Kubernetes'
 API Priority and Fairness keeps seats for each priority level. Meanwhile the loop serves every other
@@ -1111,8 +1131,7 @@ daemon has since started again and the turn goes on; the first's
 `tool_completed` says `outcome_unknown`, the second's `cancelled`, as a pause
 says them. A call waiting for its verdict as the drain begins does not
 start, even if allowed then, and a model call that failed sends no retry:
-the turn parks, and its retry count starts over when it continues. No
-prompt-cache refresh goes out during a drain either. The time the daemon
+the turn parks, and its retry count starts over when it continues. The time the daemon
 was down is not counted in `paced_ms`. A client's `wait` still open is
 answered as its deadline would answer it, the parked turn reported pending
 as it stands. Background commands and terminals end with the daemon as
@@ -1343,7 +1362,9 @@ does not, and each is one op:
   10 seconds each and 15 for the whole request) and
   answers `providers.NAME.models` as `{id, name?, context_tokens?,
   output_tokens?}`, or `providers.NAME.error` for a provider that would not
-  list. It runs off the dispatch path, only when asked, under the same
+  list, each with `providers.NAME.family` and `providers.NAME.efforts` as the
+  daemon binds it now (a
+  provider a config reload added after the client connected included). It runs off the dispatch path, only when asked, under the same
   connection admission as a turn, and each provider keeps its answer, a
   refusal included, five minutes, while the listings (kept as their JSON
   text) and refusals kept across all providers stay within 2 MiB (past that
@@ -1361,7 +1382,9 @@ does not, and each is one op:
   ChatGPT plan login asks `https://api.openai.com/v1/models` with its
   bearer and keeps `models[]` entries listed as `visibility: "list"`, by
   `slug`. Nothing else reads it: a turn runs whatever model it names.
-  `agent models --discover` uses it once to write `~/.agent/models`.
+  Each daemon start a client makes (`serve --models`) asks it once it is
+  ready to rewrite `~/.agent/models.discovered`, and `agent models --discover`
+  on demand; see [CLI.md](CLI.md).
 - `stats` returns the daemon's live state without sampling its process from
   outside: open sessions, active turns against the bound, parked turns,
   running processes against the process bound and how many of them are
@@ -1457,7 +1480,9 @@ name, the sandbox's four as `sandbox`) that differed; the same request again
 changes nothing, so a resend is harmless. A change is told to the bot's
 followers as a live `configured` event with the same fields, which is not
 kept, so a client that attaches later reads the bot as it is. It is refused with `bot_busy`
-while a turn runs or waits parked, and the next turn sends the
+while a turn runs or waits parked, except a change of `rules` alone, which
+the running turn's next round takes ([command rules](#command-rules));
+otherwise the next turn sends the
 new instructions: the provider's cache of the old ones is not read again,
 replayed thinking written after them is withheld as when any context in
 front of it changes, and a fork keys its own prompt cache from then on.
@@ -1489,7 +1514,7 @@ Protocol 23 adds `usage`, what bots' turns spent, also a read on the reader
 connection: one grouped statement over `turns`, so one snapshot. `name` keeps
 the bots a `bots` GLOB would (absent is every bot), and `since_ms` the turns
 started at or after it (absent or 0 is all of them); a turn counts wholly where
-it started, compaction and keep-warm calls included, since they are recorded on
+it started, compaction calls included, since they are recorded on
 it. The answer has the totals (`turns`, `input_tokens`, `cached_input_tokens`,
 `output_tokens`; cached is part of input), `bots` with the `limit` (1 to 256,
 default 64) that spent most input plus output first and `other_bots` summing
@@ -1531,7 +1556,9 @@ halving the cursor range, a few point reads however many events are kept;
 events with no time count as older. It is the `usage` op's word for a start
 time, and `agent follow --since 1h` sends it.
 `follow` replays durable events after the cursor as notifications, emits
-`follow_live` with the cursor reached, and then delivers live events. The
+`follow_live` with the cursor reached (at least the newest event already
+published, so a follow resumed from it repeats nothing from before the
+switch, whatever kinds it names), and then delivers live events. The
 switch happens inside a storage job, so no committed event falls between the
 last replayed page and the first live delivery, and replayed cursors are never
 repeated live. Non-durable `text_delta` and `thinking_delta` notifications are
@@ -1585,7 +1612,11 @@ stale child-to-parent submissions after name reuse. The record, the `created` an
 carry both; the two events also carry the record's list fields (`id`,
 `provider`, `model`, `workspace`, `status`, `running_turn`), so a follower
 seats a new bot without a request per creation. Bots remain peers: the field is lineage for people and
-clients, never authority.
+clients, never authority. Each record, both events and `bots` pages also carry `depth`, the
+generations below the bot that starts the bot's line, which `--max-depth` bounds; `starts_line:
+true` on `create` makes a bot with a creator start a line of its own, at 0, and is refused on a
+sandboxed bot's own socket (`not_permitted`), since a confined bot that could start lines could make
+bots without end.
 
 `from: {bot, turn}` on `submit` says a bot's model wrote the prompt, in
 that turn; a prompt without it is a person's. The CLI sends it from
@@ -1821,8 +1852,7 @@ the turn's id and handle at once, and `wait`, `turns`, and
   provider now bound to another family, with `provider_family_mismatch`.
   Admission counts the comma the request puts before each item. A steer
   joins only a turn that can call again: after a summary or a final
-  reply that spent the budget or the last round, counting a cache
-  refresh the reply left in flight, it stays queued. One still queued
+  reply that spent the budget or the last round, it stays queued. One still queued
   when the turn ends starts as its own turn when the line moves (a
   strict steer, which names that turn, fails with `stale_turn`).
   Usage comes from cumulative byte and depth totals at the head and the parent
@@ -1887,7 +1917,8 @@ queued work as `bot_busy`. `stats` reports queued and ready turns together
 as `queued_turns`, a count the storage worker keeps at each transition
 and recounts at open, so admission and `stats` cost the store nothing.
 `agent run --delivery MODE` sets the field, defaulting
-to `AGENT_DELIVERY` in the client's environment, then `reject`; with
+to `AGENT_DELIVERY` in the client's environment, then `steer` (`queue`
+with `--workspace` or `--turn-budget-tokens`); with
 `--detach` a peer can hand a busy bot work or a mid-turn message without
 racing on `bot_busy`.
 
@@ -1922,7 +1953,13 @@ open. The schema version lives in SQLite's `user_version`; a store created
 before versioning is refused with `store_schema_unsupported`, one written by a
 newer binary with `store_schema_newer`, and an older versioned store is
 migrated inside the opening transaction when its data can be converted without
-guessing. Schema 18 requires each bot's tool selection. Older stores with bots
+guessing. Before it migrates, the store is copied with `VACUUM INTO` to
+`<store>.schema-<version>.backup` beside it, with the store's permissions,
+and the copy is checked (it opens, passes `PRAGMA integrity_check`, and is at
+that version); the two newest copies are kept. A store that cannot be copied,
+for a full disk say, is not migrated: opening fails with
+`store_backup_failed`, which says why, and the store stays as it was. To go
+back a release, stop the daemon and put the copy in the store's place. Schema 18 requires each bot's tool selection. Older stores with bots
 but no recorded selection are refused with `store_migration_tools_unknown`;
 their data and schema version remain intact. Keep those stores and use a new
 store path. Empty stores can migrate. Schema 19 rebuilds cache counters from
@@ -2138,8 +2175,7 @@ restart. The last
 of them, a retry included when a billed failure made it the last, goes with the bot's tools shown but `tool_choice` `none` (both
 families), so the model must answer in words, and the turn ends on that reply
 instead of failing with its work done and unreported; a live
-`tool_calls_withheld` event (`reason: "tool_round_limit"`) marks it. That call
-sends no keep-warm refresh, and on Anthropic, where `tool_choice` is part of
+`tool_calls_withheld` event (`reason: "tool_round_limit"`) marks it. On Anthropic, where `tool_choice` is part of
 the cached prefix, it rewrites the message cache once. A model that calls a
 tool anyway has those calls run, as any committed plan's, and the turn then
 fails `tool_round_limit`.
@@ -2523,7 +2559,8 @@ cannot build an invisible backlog behind the process bound. The operating
 system counts processes; it never sees this line, which is why the daemon
 counts it (one counter, one comparison per accepted command). `stats` reports
 it as `queued_processes`, a subset of `running_processes`, which counts every
-accepted command whose result is not yet recorded. stdout and stderr are each
+accepted background command whose result is not yet recorded and every
+foreground command running now. stdout and stderr are each
 retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
 the `artifact` operation, or written to the bot's `outputs` folder (see
@@ -2593,7 +2630,8 @@ SIGHUP, does not outlive it. Each bot keeps at most 16; starting another
 first kills the one it used least recently, as Codex prunes its sessions,
 so that one's slot is free for it. Only the
 bot that started a terminal types into it (`terminal_not_running` for any
-other, and for one that ended), and terminals end when the daemon stops. A
+other, and for one that ended; `not_a_terminal` for its own background
+command, which takes no input), and terminals end when the daemon stops. A
 terminal never leaves its bot's sandbox (`tty` with `require_escalated` is
 refused), so input to a sandboxed bot's terminal runs without review, as its
 commands do; an unsandboxed bot's `write_stdin` is gated like `shell`.
@@ -2763,6 +2801,32 @@ programs its config names (an fsmonitor, a filter) even to list its files,
 so a repository an agent made would run what it left there as the person.
 Sonny runs its own git in such places this way (#597).
 
+`agent sandbox --bot NAME [--bot-id ID] -- COMMAND [ARGS...]` runs one
+command as one of that bot's own commands runs, for a client running a
+command a bot wrote outside its turns, as Codex runs whatever an agent wrote
+in its sandbox: Sonny's automation gates (`--if`) that an agent added.
+One `lend` request (protocol 54), `{"op":"lend","bot":NAME,"bot_id":ID?}`,
+answers `{bot, bot_id, policy, env}`: the sandbox the daemon builds for the
+bot's commands (null for a bot whose commands run unconfined), held by
+the daemon for as long as the session that asked lasts as one of the bot's
+own commands is: its capped socket open, and its placeholders for missing
+protected folders counted with those of the daemon's own commands, so
+neither removes one the other's sandbox still mounts. With it comes the
+whole environment its commands get: the daemon's own, without the
+credentials it holds or the variables `--shell-exclude` withholds, with its
+`AGENT_*` variables, the bot's `env` setting, `AGENT_BOT`, `AGENT_BOT_ID` and
+`AGENT_SOCKET` reaching the daemon through that socket. The command runs in
+that policy with that environment in place of the caller's, so it keeps
+everything the daemon keeps from the bot (`--protect-path`, `--wall`, its
+store) and nothing of the caller's environment reaches it. Only a session
+outside every sandbox may lend (`not_permitted`), so a confined command
+cannot reach another bot's socket; `bot_id` that is not the bot's is
+`bot_not_found`. The lend costs one round trip and, for a bot whose socket
+was not listening, one bind.
+`agent sandbox` exits as its command does, or 125 when it
+could not run it (a usage error, no sandbox here, the bot not found), as
+`env` and `timeout` do, with the error on stderr.
+
 ### Command rules
 
 Command rules are Codex's execpolicy: `prefix_rule`s that say which
@@ -2790,6 +2854,19 @@ command run by an absolute path that no rule matches as written is
 matched by its program's name, as Codex resolves it: when
 `host_executables` lists that path for the name, or lists nothing for it;
 by the name's `allow` rules, only at a path it lists.
+
+A command under a wrapper is also matched as the command the wrapper
+runs, read by the wrapper's own words: `timeout` (with its options and a
+duration), `nice` (with an adjustment), `nohup` and `time` run it as it
+would run alone, so `timeout 60 mcpx call` is allowed by an `mcpx` rule
+and `timeout 60 git push` refused by a `git push` one; `env` (bare, or
+with `-i`, `-u`, `-C` and assignments) and the shell's own `NAME=VALUE`
+before a command change what it runs with, so through them only the
+rules that ask or refuse match. Nor does a wrapper let out a program it
+runs by its path: the wrapper is found on `PATH`, so only a program by
+its name, found the same way, is allowed through it. A wrapper by its path, or in a form not
+read here (another option, such as `env -S`), is matched as written
+only. Rules for the wrapper itself still match too.
 `invalid`, with why, says the client couldn't read the rules: every shell
 call fails `rules_invalid` with it, where Codex would refuse to start. A
 pattern or list of choices that is empty, an empty justification, or a
@@ -2827,8 +2904,11 @@ only as trusted as the folders there. A turn takes its bot's rules when
 its first round begins, and each call a round plans keeps what they made
 of it, which a parked turn reads back as it resumes: a call runs as its
 round was announced, also after a park or a restart and whatever the
-rules say by then. A turn started after a `configure` takes the new
-rules.
+rules say by then. A `configure` that changes only `rules` is taken while
+a turn runs: its next round, and every one after, rules its calls by the
+new ones; a turn parked then reads them as it resumes. The bots it made,
+and theirs, go by its rules, and so do their running turns, each from its
+next round.
 
 A bot made by another (its `created_by`) goes by its creator's rules: it
 takes them when it is made, whatever its own client gives, and follows
@@ -2862,6 +2942,10 @@ Where this differs from Codex:
   host, which the daemon doesn't have; a sandbox's network is on or off.
   Sonny refuses a rules file that has one, so no rule is taken as kept
   that isn't.
+- Codex matches a command as written; here a wrapper read as above is
+  seen through, as Codex's own dangerous-command check sees through
+  `env` and `sudo`, so an agent that wraps a call in `timeout` is ruled as
+  it would be without it, a refusal included.
 - Codex lets a program run by any absolute path out by its name's
   `allow` rules when no `host_executable` names it. Here such a path is
   only asked about or refused by them, since a sandboxed bot could write
@@ -2914,7 +2998,8 @@ stops waiting: `expire_ms` after it started (1 to 3,600,000, default
 60,000). A client finds such calls by following the bot, or every bot with
 `*`, and lists those still waiting with
 `{"op":"tool_calls","tag","after"?,"limit"?}`: oldest first, each with
-`bot`, `turn`, `call_id`, `name`, `arguments` and `expires_ms`, at most
+`bot`, `turn`, `call_id`, `name`, `arguments`, `expires_ms` and
+`taken_ms`, at most
 `limit` (1 to 256, default 64) and 256 KiB a page, continued from
 `next_after`. It answers with
 `{"op":"tool_result","bot","turn","call_id","output"}`, the text the model
@@ -2934,6 +3019,22 @@ picture does. The client scales a picture; the daemon sends it as given. The fir
 `no_pending_call` or, once its turn ended, `stale_turn`. There is no lease: a tag is the client's
 to serve.
 
+Protocol version 49 lets a client take a call before it runs it, so that
+no call runs twice: `{"op":"take_call","bot","turn","call_id"}` records
+when (`taken_ms`, returned with `bot`, `turn` and `call_id`), and the
+calls `tool_calls` lists say it, `null` for one not taken. A second take,
+by a client that restarted or by another one, is `call_taken` with the
+first take's `taken_ms` beside its detail; the call may have done its work,
+and only the client that took it knows, so a client answers such a call
+rather than running it again (Sonny answers `tool_outcome_unknown`). A take
+is refused as an answer is: an answered call is `call_already_answered`,
+one that ended or ran out of time is `no_pending_call` or `stale_turn`.
+Taking is the client's choice and never expires; a taken call is answered
+with `tool_result` as before. The daemon never runs its own tools twice
+either: one a restart cut off ends `tool_outcome_unknown`. Schema 79 counts
+every call still unanswered when a store upgrades to it as taken, since an
+older client may have run it with nothing to say so.
+
 The call waits as a gated call waits for its verdict. Its turn holds live
 for the bot's `approval_hold_ms`, but at most 250 ms, and an answer in that
 time is held by the storage worker and written with the call's result, so
@@ -2952,8 +3053,10 @@ parameters is refused at once and waits for no answer.
 
 Protocol version 22 lets a declared tool take free-form text, as
 `apply_patch` does: a tool declared with `grammar`, a Lark grammar its
-input follows, is declared on Responses as a custom tool whose call is the
-text itself, and elsewhere as a function of that text, so its `parameters`
+input follows, is declared on OpenAI's own API (a key or the ChatGPT plan)
+as a custom tool whose call is the text itself, and elsewhere, other
+Responses endpoints among them, as a function of that text: Grok on Bedrock
+refuses custom tools. So its `parameters`
 must take `input` as a required string (`invalid_declare` otherwise).
 Either way the call's `arguments` are `{"input": TEXT}` and its answer is
 the provider's custom tool output where it has one. The grammar counts
@@ -3453,8 +3556,7 @@ those two may bill: each sending at most the view, the tools and both
 instructions at a token to a byte, and generating at most the summarizer's
 output bound; with no known output bound (a Responses provider without
 `max_output_tokens`), a budgeted bot's summary does not run beside. A summary beside the call that an interrupt cancels still adds its
-retries and pacing to the turn's. A refresh does not keep warm the view of
-a call whose summary has written its replacement.
+retries and pacing to the turn's.
 Otherwise, and at a turn's start or as a parked turn resumes, when the
 cache the copy reads may have lapsed, the summary goes before the call. A
 summary beside the turn uses its own connection rather than the bot's
@@ -3528,7 +3630,9 @@ converges while a step covers more than one round adds. The complete
 summarizer input is byte-bounded including its previous summary and request
 marker and the item count, and the final marker gives the summarizer its
 maximum summary size in UTF-8 bytes. Oversized summaries are rejected above a third of the byte budget
-or 64 KiB, whichever is smaller. At installation, verbatim prompt copies are further bounded so
+or 64 KiB, whichever is smaller; a rejected one is asked for again, in a request
+of its own, at half the size it was asked for, for as long as each comes back
+shorter than the one before (each a billed round). At installation, verbatim prompt copies are further bounded so
 they fit alongside the encoded summary within half the byte envelope. A middle
 range is removed, retaining the oldest and newest excerpts when they fit. Original prompts remain available through history; installed
 prefixes are unchanged until the next compaction. A replacement must reduce encoded bytes,
@@ -3538,7 +3642,16 @@ the old view intact. Such completed calls are still billed. `compacted` events
 include `context_before`, `context_after`, `input_limit`, `reclaimed_bytes`,
 `reclaimed_items`, `headroom_bytes`, and `headroom_items`. These describe the
 complete logical view since the cut; headroom can be negative during catch-up,
-while the actual request still uses a bounded window. These failures leave the bot usable and
+while the actual request still uses a bounded window. `trigger` says what
+started it: its `reason` (`bytes` or `items` past the threshold, `requested`
+by a client, or `overflow`, a view that could not be sent), the model's context
+`window` and the `compact_tokens` threshold it gives, what the last call `sent`
+in bytes and the tokens counted for it, the view's threshold in bytes
+(`at_bytes`), the instructions and tools sent beside the view
+(`overhead_bytes`), the room kept for the reply (`reserve_bytes`) and the
+newest bytes the summary was to leave whole (`keep_bytes`). `room_bytes` is
+`at_bytes` less the view after: how much the conversation can grow before the
+next compaction. These failures leave the bot usable and
 original history retrievable. The
 CLI ships a default compaction text for new bots and `--no-compaction`,
 `--compaction-instructions`, `--compaction-instructions-file`, and
@@ -3583,10 +3696,11 @@ is set. `apply_patch` takes Codex's patch format: one patch adds, deletes,
 updates and moves any number of files, every change checked before any file is
 written, so a patch that does not apply changes nothing. Its context lines
 match exactly, then ignoring trailing and surrounding whitespace, then with
-typographic punctuation read as ASCII. On Responses it is a custom tool whose
+typographic punctuation read as ASCII. On OpenAI's own API it is a custom tool whose
 call is the patch itself, constrained by its Lark grammar, and its result a
-`custom_tool_call_output`; on Anthropic, a function taking the patch as
-`input`. Paths are relative to the workspace unless absolute; nothing confines a
+`custom_tool_call_output`; on any other endpoint, a function taking the patch as
+`input`. A history holding custom calls replays as it is: Bedrock's GPT takes
+it beside the function (checked 2026-11-07). Paths are relative to the workspace unless absolute; nothing confines a
 tool to the workspace, and tools run with the service's OS permissions.
 Native file tools accept regular files, including symlinks to regular files.
 Known pipes, devices, and other special files return `file_not_regular`. Opens
@@ -3600,12 +3714,12 @@ namespace, which the daemon answers by posting the call's commands to the
 provider's `alpha/search` (bounded at 1 MiB and two minutes) and returning its
 `output`. Searches are paced in a pool of their own and their failures classed
 as a model call's: a rate limit closes the pool, a server or connection failure
-backs off, and both retry within the two minutes before the model hears of them. Bedrock's GPT models get the hosted `web_search` tool over indexed
+backs off, and both retry within the two minutes before the model hears of them. Bedrock Mantle's GPT models get the hosted `web_search` tool over indexed
 results, and Anthropic's API gets its hosted server tool, `web_search_20260209`
 for Claude 4.6 and later but Haiku, `web_search_20250305` otherwise; the
 provider runs both, its blocks and citations are kept in the history as sent,
 and a `pause_turn` stop asks again without a new message. A ChatGPT plan login,
-Claude on Bedrock and any other gateway offer none: `create` refuses the tool
+Claude on Bedrock, Bedrock runtime's OpenAI route and any other gateway offer none: `create` refuses the tool
 there with `web_search_unavailable`, and `ready` says per provider whether it
 searches (`web_search`). It runs without approval, as Codex's does.
 

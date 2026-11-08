@@ -14,14 +14,15 @@ struct Lab {
     /// The agent whose call the lookout runs: the lead, unless a test
     /// says another.
     bot: std::cell::RefCell<String>,
+    /// The model the calling agent runs, AGENT_MODEL, when a test sets it.
+    model: std::cell::RefCell<Option<String>>,
 }
 
 impl Lab {
     /// A repository with a commit and an uncommitted edit under `src`,
     /// and an `agent` that logs what `run` was given.
     fn new(test: &str) -> Lab {
-        // Outside the temporary folders, which every sandbox writes and so
-        // no snapshot's sealed folder may be in.
+        // Outside the temporary folders, which every sandbox writes.
         let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("sonny-task-{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
@@ -33,10 +34,11 @@ impl Lab {
         std::fs::write(
             &agent,
             "#!/bin/sh\ncase \"$1\" in\n\
-             run) for a in \"$@\"; do if [ \"$a\" = - ]; then cat; echo; else printf '%s\\n' \"$a\"; fi; done > \"$AGENT_LOG\"; [ -z \"$AGENT_FAIL\" ] || exit 1; echo '{\"handle\":\"h\"}';;\n\
+             run) [ ! -e \"$AGENT_LOG.refuse\" ] || { cat \"$AGENT_LOG.refuse\" >&2; exit 1; }; \
+             if [ -e \"$AGENT_LOG.slow\" ]; then for a in \"$@\"; do [ \"$a\" != --speed ] || { cat \"$AGENT_LOG.slow\" >&2; exit 1; }; done; fi; for a in \"$@\"; do if [ \"$a\" = - ]; then cat; echo; else printf '%s\\n' \"$a\"; fi; done > \"$AGENT_LOG\"; [ -z \"$AGENT_FAIL\" ] || exit 1; echo '{\"handle\":\"h\"}';;\n\
              ls) cat \"$AGENT_LOG.ls\" 2>/dev/null || echo '[]';;\n\
-             rm) printf '%s\\n' \"$@\" > \"$AGENT_LOG.rm\";;\n\
-             fork) printf '%s\\n' \"$@\" > \"$AGENT_LOG.fork\";;\nesac\n",
+             inspect) cat \"$AGENT_LOG.inspect\" 2>/dev/null || exit 1;;\n\
+             rm) printf '%s\\n' \"$@\" > \"$AGENT_LOG.rm\";;\nesac\n",
         )
         .unwrap();
         std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -46,6 +48,7 @@ impl Lab {
             scratch,
             agent,
             bot: std::cell::RefCell::new("demo.lead".into()),
+            model: std::cell::RefCell::new(None),
         };
         for args in [
             &["init", "-q", "-b", "main"][..],
@@ -84,6 +87,7 @@ impl Lab {
             .env("AGENT_BOT", self.bot.borrow().as_str())
             .env("AGENT_BOT_ID", "1")
             .env("HOME", &self.home)
+            .env_remove("XDG_STATE_HOME")
             .env("AGENT_BIN", &self.agent)
             .env("AGENT_LOG", self.scratch.join("run.log"))
             .env("AGENT_STORE", self.store())
@@ -98,6 +102,10 @@ impl Lab {
         if fail {
             command.env("AGENT_FAIL", "1");
         }
+        match self.model.borrow().as_deref() {
+            Some(model) => command.env("AGENT_MODEL", model),
+            None => command.env_remove("AGENT_MODEL"),
+        };
         if stdin.is_some() {
             command.stdin(std::process::Stdio::piped());
         }
@@ -188,16 +196,6 @@ impl Lab {
         std::fs::read_to_string(file)
             .ok()
             .map(|text| text.trim().to_owned())
-    }
-
-    /// Where the store's snapshots are kept: under the FNV-1a hash of its
-    /// path, as snapshot.rs names it.
-    fn refs(&self) -> String {
-        let hash = (self.store().as_os_str().as_encoded_bytes().iter())
-            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-                (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-            });
-        format!("refs/agent/snapshots/{hash:016x}")
     }
 
     /// What `agent run` was given, one argument a line.
@@ -341,6 +339,38 @@ fn a_brief_that_names_the_lead_s_folder_names_the_task_s_copy() {
 }
 
 #[test]
+fn a_task_runs_at_its_lead_s_speed_or_standard_where_refused() {
+    let lab = Lab::new("speed");
+    *lab.model.borrow_mut() = Some("a/lead".into());
+    let log = lab.scratch.join("run.log");
+    let at = |suffix: &str| PathBuf::from(format!("{}.{suffix}", log.display()));
+    std::fs::write(
+        at("inspect"),
+        r#"{"name":"demo.lead","settings":{"speed":"fast"}}"#,
+    )
+    .unwrap();
+    let (ok, said) = lab.task(false, false);
+    assert!(ok, "{said}");
+    let ran = lab.ran();
+    let speed = ran.iter().position(|a| a == "--speed").expect("a speed");
+    assert_eq!(ran[speed + 1], "fast");
+    assert!(!said.contains("standard speed"), "{said}");
+    lab.remove(&lab.repo, true);
+    // A provider that does not serve it: the task starts at standard, and
+    // the start says why.
+    std::fs::write(
+        at("slow"),
+        r#"{"error":"invalid_speed","detail":"this provider serves anthropic at standard speed only","speeds":[]}"#,
+    )
+    .unwrap();
+    let (ok, said) = lab.task(false, false);
+    assert!(ok, "{said}");
+    assert!(!lab.ran().iter().any(|a| a == "--speed"));
+    assert!(said.contains("It runs at standard speed"), "{said}");
+    assert!(said.contains("standard speed only"), "{said}");
+}
+
+#[test]
 fn a_task_that_does_not_start_leaves_no_worktree_or_branch() {
     let lab = Lab::new("worktree-fails");
     let (ok, said) = lab.task(true, false);
@@ -435,6 +465,7 @@ fn a_task_starts_with_the_agent_installed_beside_sonny() {
         .current_dir(&lab.repo)
         .env("GIT_CEILING_DIRECTORIES", env!("CARGO_TARGET_TMPDIR"))
         .env("HOME", &lab.home)
+        .env_remove("XDG_STATE_HOME")
         .env("AGENT_BOT", "demo.lead")
         .env_remove("AGENT_BIN")
         .env("AGENT_LOG", lab.scratch.join("run.log"))
@@ -484,7 +515,7 @@ fn a_done_worktree_task_is_removed_with_its_merged_branch() {
 }
 
 #[test]
-fn a_task_outside_git_is_removed_with_no_snapshots_to_drop() {
+fn a_task_outside_git_is_removed() {
     let lab = Lab::new("rm-outside");
     let workspace = lab.scratch.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
@@ -496,274 +527,6 @@ fn a_task_outside_git_is_removed_with_no_snapshots_to_drop() {
     let (ok, said) = lab.remove(&workspace, false);
     assert!(ok, "{said}");
     assert!(lab.scratch.join("run.log.rm").exists());
-}
-
-/// Keep the worktree's files as the lookout does after a completed turn
-/// (snapshot.rs): bot 5's turn `turn`, at history node `checkpoint`.
-fn snapshot(lab: &Lab, worktree: &Path, turn: i64, checkpoint: i64) {
-    snapshot_in(lab, worktree, turn, checkpoint, None);
-}
-
-/// As `snapshot`, naming `folder` as the one its turn worked in.
-fn snapshot_in(lab: &Lab, worktree: &Path, turn: i64, checkpoint: i64, folder: Option<&str>) {
-    let index = lab.scratch.join("snapshot.index");
-    let add = |args: &[&str]| {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(worktree)
-            .args(args)
-            .env("GIT_INDEX_FILE", &index)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@example.com")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@example.com")
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{args:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    };
-    add(&["read-tree", "HEAD"]);
-    add(&["add", "-A"]);
-    let tree = add(&["write-tree"]);
-    let mut message = format!("Files after turn {turn}\n\nAgent-Checkpoint: {checkpoint}");
-    if let Some(folder) = folder {
-        message.push_str(&format!("\nAgent-Folder: {folder}"));
-    }
-    let commit = add(&["commit-tree", &tree, "-p", "HEAD", "-m", &message]);
-    lab.git(
-        worktree,
-        &["update-ref", &format!("{}/5/{turn}", lab.refs()), &commit],
-    );
-}
-
-#[test]
-fn a_fork_is_made_in_its_source_s_repository_from_a_lead_folder_outside_git() {
-    let lab = Lab::new("fork-nested");
-    let (ok, said) = lab.task(false, false);
-    assert!(ok, "{said}");
-    let source = lab.home.join(".agent/worktrees/demo.fix");
-    std::fs::write(source.join("src/lib.rs"), "three\n").unwrap();
-    snapshot(&lab, &source, 12, 77);
-    let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5,
-        "workspace": source.join("src")}]);
-    std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
-    // A lead's folder that holds repositories and is in none.
-    let workspace = lab.scratch.join("workspace");
-    std::fs::create_dir(&workspace).unwrap();
-    let (ok, said) = lab.tool(
-        &workspace,
-        "start_task",
-        serde_json::json!({"name": "try", "brief": "b", "from": "fix"}),
-        false,
-    );
-    assert!(ok, "{said}");
-    let copy = lab.home.join(".agent/worktrees/demo.try");
-    assert_eq!(
-        std::fs::read_to_string(copy.join("src/lib.rs")).unwrap(),
-        "three\n"
-    );
-    let ran = lab.ran();
-    assert_eq!(ran[5], copy.join("src").to_string_lossy());
-    // A worktree of the source's repository, on the fork's branch.
-    assert_eq!(
-        lab.git(&copy, &["branch", "--show-current"]),
-        "agent/demo.try"
-    );
-    let listed = lab.git(&lab.repo, &["worktree", "list", "--porcelain"]);
-    assert!(listed.contains("demo.try"), "{listed}");
-}
-
-#[test]
-fn a_fork_whose_files_lead_out_of_its_worktree_starts_nothing() {
-    let lab = Lab::new("fork-out");
-    let (ok, said) = lab.task(false, false);
-    assert!(ok, "{said}");
-    // A task's files, as any task can write them, make the folder it
-    // works in a link to the home, then a folder again.
-    let source = lab.home.join(".agent/worktrees/demo.fix");
-    std::fs::rename(source.join("src"), source.join("kept")).unwrap();
-    std::os::unix::fs::symlink(&lab.home, source.join("src")).unwrap();
-    snapshot(&lab, &source, 12, 77);
-    std::fs::remove_file(source.join("src")).unwrap();
-    std::fs::rename(source.join("kept"), source.join("src")).unwrap();
-    let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5,
-        "workspace": source.join("src")}]);
-    std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
-    let (ok, err) = lab.tool(
-        &lab.repo.join("src"),
-        "start_task",
-        serde_json::json!({"name": "try", "brief": "b", "from": "fix"}),
-        false,
-    );
-    assert!(
-        !ok && err.contains("the task's folder in its worktree"),
-        "{err}"
-    );
-    assert!(!lab.home.join(".agent/worktrees/demo.try").exists());
-    assert!(!lab.scratch.join("run.log.fork").exists());
-}
-
-#[test]
-fn a_fork_whose_snapshot_names_a_folder_above_its_worktree_starts_nothing() {
-    let lab = Lab::new("fork-up");
-    let (ok, said) = lab.task(false, false);
-    assert!(ok, "{said}");
-    let source = lab.home.join(".agent/worktrees/demo.fix");
-    snapshot_in(&lab, &source, 12, 77, Some("../.."));
-    let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5,
-        "workspace": source.join("src")}]);
-    std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
-    // Hooks of a folder a task could write, which making the fork's branch
-    // and taking it back would run.
-    let (hooks, ran) = (lab.scratch.join("hooks"), lab.scratch.join("hooked"));
-    std::fs::create_dir(&hooks).unwrap();
-    for hook in ["reference-transaction", "post-checkout"] {
-        let hook = hooks.join(hook);
-        std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let set = (std::process::Command::new("git").arg("-C").arg(&lab.repo))
-        .args(["config", "core.hooksPath"])
-        .arg(&hooks)
-        .status();
-    assert!(set.unwrap().success());
-    let (ok, err) = lab.tool(
-        &lab.repo.join("src"),
-        "start_task",
-        serde_json::json!({"name": "try", "brief": "b", "from": "fix"}),
-        false,
-    );
-    assert!(!ok && err.contains("not a folder inside it"), "{err}");
-    assert!(!lab.home.join(".agent/worktrees/demo.try").exists());
-    assert!(!lab.scratch.join("run.log.fork").exists());
-    assert!(!ran.exists());
-}
-
-#[test]
-fn a_fork_from_a_turn_that_emptied_its_folder_starts_in_that_folder_made_anew() {
-    let lab = Lab::new("fork-empty");
-    let (ok, said) = lab.task(false, false);
-    assert!(ok, "{said}");
-    let source = lab.home.join(".agent/worktrees/demo.fix");
-    std::fs::remove_dir_all(source.join("src")).unwrap();
-    std::fs::create_dir(source.join("src")).unwrap();
-    snapshot(&lab, &source, 12, 77);
-    let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5,
-        "workspace": source.join("src")}]);
-    std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
-    let (ok, said) = lab.tool(
-        &lab.repo.join("src"),
-        "start_task",
-        serde_json::json!({"name": "try", "brief": "b", "from": "fix"}),
-        false,
-    );
-    assert!(ok, "{said}");
-    let copy = lab.home.join(".agent/worktrees/demo.try");
-    assert!(copy.join("src").is_dir());
-    assert_eq!(lab.ran()[5], copy.join("src").to_string_lossy());
-}
-
-#[test]
-fn a_task_forked_from_another_s_turn_gets_its_files_then_in_a_worktree_of_its_own() {
-    let lab = Lab::new("fork");
-    let (ok, said) = lab.task(false, false);
-    assert!(ok, "{said}");
-    let source = lab.home.join(".agent/worktrees/demo.fix");
-    std::fs::write(source.join("src/lib.rs"), "three\n").unwrap();
-    std::fs::write(source.join("src/new.rs"), "made\n").unwrap();
-    snapshot(&lab, &source, 12, 77);
-    // Work after the turn is not in the fork.
-    std::fs::write(source.join("src/lib.rs"), "four\n").unwrap();
-    let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5,
-        "workspace": source.join("src")}]);
-    std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
-
-    let start =
-        |call: serde_json::Value| lab.tool(&lab.repo.join("src"), "start_task", call, false);
-    let (ok, err) = start(
-        serde_json::json!({"name": "other", "brief": "b", "from": "fix",
-        "model": "openai/x"}),
-    );
-    assert!(!ok && err.contains("keeps its source's role"), "{err}");
-    let (ok, err) =
-        start(serde_json::json!({"name": "other", "brief": "b", "from": "fix", "turn": 11}));
-    assert!(!ok && err.contains("turn 11 has no snapshot"), "{err}");
-    assert!(!lab.home.join(".agent/worktrees/demo.other").exists());
-
-    // Setup, which runs outside any sandbox, never runs on a task's files.
-    let setup = lab.repo.join("src/.agents/setup");
-    std::fs::create_dir_all(setup.parent().unwrap()).unwrap();
-    std::fs::write(&setup, "#!/bin/sh\ntouch ran\n").unwrap();
-    std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let (ok, said) = start(
-        serde_json::json!({"name": "try", "brief": "try another way",
-        "from": "fix", "setup": true}),
-    );
-    assert!(ok, "{said}");
-    assert!(
-        said.contains("demo.fix's files as they were after its turn 12"),
-        "{said}"
-    );
-    assert!(said.contains(".agents/setup did not run"), "{said}");
-    let copy = lab.home.join(".agent/worktrees/demo.try");
-    assert!(!copy.join("src/ran").exists());
-    let workspace = copy.join("src").to_string_lossy().into_owned();
-    let forked = std::fs::read_to_string(lab.scratch.join("run.log.fork")).unwrap();
-    let forked: Vec<&str> = forked.lines().collect();
-    assert_eq!(
-        forked,
-        [
-            "fork",
-            "--source",
-            "demo.fix",
-            "--bot",
-            "demo.try",
-            "--checkpoint",
-            "77",
-            "--workspace",
-            &workspace
-        ]
-    );
-    // Only the brief: the fork keeps its source's instructions.
-    let ran = lab.ran();
-    assert_eq!(
-        ran[..6],
-        [
-            "run",
-            "--detach",
-            "--bot",
-            "demo.try",
-            "--workspace",
-            &workspace
-        ]
-    );
-    // One prompt on stdin, as `run` joins its words: the copy's note,
-    // then the brief.
-    assert_eq!(ran[6], "--");
-    assert!(ran[7].contains(&format!("in '{workspace}'")), "{}", ran[7]);
-    assert!(
-        ran[7].ends_with(". Work only there. try another way"),
-        "{}",
-        ran[7]
-    );
-    assert_eq!(ran.len(), 8);
-    let read = |name: &str| std::fs::read_to_string(copy.join(name)).unwrap();
-    assert_eq!(read("src/lib.rs"), "three\n");
-    assert_eq!(read("src/new.rs"), "made\n");
-    assert_eq!(
-        lab.git(&copy, &["branch", "--show-current"]),
-        "agent/demo.try"
-    );
-    assert_eq!(lab.git(&copy, &["diff", "--cached", "--name-only"]), "");
-
-    // Removing the source drops its snapshots.
-    let (ok, err) = lab.remove(&lab.repo, true);
-    assert!(ok, "{err}");
-    assert_eq!(
-        lab.git(&lab.repo, &["for-each-ref", "refs/agent/snapshots/"]),
-        ""
-    );
 }
 
 #[test]
@@ -800,16 +563,19 @@ fn a_task_outside_git_works_in_an_empty_folder_of_its_own() {
     assert_eq!(after("--workspace"), folder.to_string_lossy());
     // Told the rules of the lead's folder, not of its empty one.
     assert!(ran.join("\n").contains("Build with the workspace tool."));
-    // It writes no folder but its own, and Sonny's zen folder every
-    // sandboxed row writes.
+    // It writes no folder but its own, Sonny's zen folder every sandboxed
+    // row writes, and its lead's state folder, made for the lead alone.
     let writable: Vec<&String> = (ran.iter().zip(ran.iter().skip(1)))
         .filter(|(flag, _)| *flag == "--writable")
         .map(|(_, folder)| folder)
         .collect();
+    let state = std::fs::canonicalize(lab.home.join(".local/state/sonny/agents/demo.lead"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(writable.contains(&&state), "{ran:?}");
     assert!(
-        writable
-            .iter()
-            .all(|folder| folder.ends_with(".agent/sonny/zen")),
+        (writable.iter()).all(|folder| folder.ends_with(".agent/sonny/zen") || **folder == state),
         "{ran:?}"
     );
     // The lead's folder is as it was.
@@ -1091,61 +857,6 @@ fn a_task_of_a_lead_in_a_submodule_is_removed_with_its_worktree() {
 }
 
 #[test]
-fn a_fork_of_a_task_in_a_repository_inside_the_lead_s_folder_is_removed_from_the_lead_s() {
-    let lab = Lab::new("fork-inside");
-    let ws = lab.scratch.join("ws");
-    std::fs::create_dir_all(ws.join("src")).unwrap();
-    let api = ws.join("src/api");
-    std::fs::rename(&lab.repo, &api).unwrap();
-    let start = serde_json::json!({"name": "fix", "brief": "b", "folder": "src/api"});
-    let (ok, said) = lab.tool(&ws, "start_task", start, false);
-    assert!(ok, "{said}");
-    let source = lab.home.join(".agent/worktrees/demo.fix");
-    std::fs::write(source.join("src/lib.rs"), "three\n").unwrap();
-    snapshot(&lab, &source, 12, 77);
-    let listed = serde_json::json!([{"name": "demo.fix", "bot_id": 5, "workspace": source}]);
-    std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
-    let fork = serde_json::json!({"name": "try", "brief": "b", "from": "fix"});
-    let (ok, said) = lab.tool(&ws, "start_task", fork, false);
-    assert!(ok, "{said}");
-    let copy = lab.home.join(".agent/worktrees/demo.try");
-    assert_eq!(
-        std::fs::read_to_string(copy.join("src/lib.rs")).unwrap(),
-        "three\n"
-    );
-    let call = serde_json::json!({"task": "demo.try", "discard": true});
-    let (ok, said) = lab.tool(&ws, "remove_task", call, false);
-    assert!(ok, "{said}");
-    assert!(!copy.exists());
-    assert_eq!(lab.git(&api, &["branch", "--list", "agent/demo.try"]), "");
-}
-
-#[test]
-fn no_fork_comes_back_through_a_sealed_folder_a_bot_s_folder_holds() {
-    let lab = Lab::new("fork-housed");
-    let (ok, said) = lab.task(false, false);
-    assert!(ok, "{said}");
-    let source = lab.home.join(".agent/worktrees/demo.fix");
-    snapshot(&lab, &source, 12, 77);
-    // A bot may write the folder that holds the store and its sealed one.
-    let listed = serde_json::json!([
-        {"name": "demo.fix", "bot_id": 5, "workspace": source.join("src")},
-        {"name": "demo.wide", "bot_id": 6, "workspace": lab.repo,
-            "settings": {"writable": [lab.scratch]}},
-    ]);
-    std::fs::write(lab.scratch.join("run.log.ls"), listed.to_string()).unwrap();
-    let (ok, err) = lab.tool(
-        &lab.repo.join("src"),
-        "start_task",
-        serde_json::json!({"name": "try", "brief": "b", "from": "fix"}),
-        false,
-    );
-    assert!(!ok && err.contains("where a bot works"), "{err}");
-    assert!(!lab.home.join(".agent/worktrees/demo.try").exists());
-    assert!(!lab.scratch.join("run.log.fork").exists());
-}
-
-#[test]
 fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
     let lab = Lab::new("helper");
     let src = lab.repo.join("src");
@@ -1193,15 +904,24 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
     );
     let ran = lab.ran();
     assert_eq!(ran[3..5], ["--bot", "demo.review"]);
-    // Its helper, two below the lead, starts none of its own.
+    // Its helper, two below the lead, asks the daemon for one of its own,
+    // which refuses it past its max_depth: the call says what the daemon
+    // said, and leaves no folder behind.
     let helper = serde_json::json!({"name": "demo.review", "bot_id": 3, "created_by": "demo.fix",
-        "created_by_id": 2, "workspace": review.join("src")});
+        "created_by_id": 2, "workspace": review.join("src"), "depth": 2});
     listed(serde_json::json!([lead, task, helper]));
     *lab.bot.borrow_mut() = "demo.review".into();
+    let refused = lab.scratch.join("run.log.refuse");
+    std::fs::write(
+        &refused,
+        r#"{"error":"depth_limit","detail":"demo.deeper would be 3 generations below the bot that starts its line; max_depth is 2","depth":3,"max_depth":2}"#,
+    )
+    .unwrap();
     let call = serde_json::json!({"name": "deeper", "brief": "b"});
     let (ok, said) = lab.tool(&review.join("src"), "start_task", call.clone(), false);
     assert!(!ok);
-    assert!(said.contains("task_depth (2)"), "{said}");
+    assert!(said.contains("depth_limit"), "{said}");
+    assert!(said.contains("max_depth is 2"), "{said}");
     assert!(!lab.home.join(".agent/worktrees/demo.deeper").exists());
     // Nor removes what it did not start.
     let call = serde_json::json!({"task": "fix"});
@@ -1209,13 +929,8 @@ fn a_task_starts_its_own_helper_on_its_branch_as_deep_as_the_config_lets_it() {
     assert!(!ok);
     assert!(said.contains("not a task you or yours started"), "{said}");
     assert!(fix.exists());
-    // With no end to a line, it does.
-    std::fs::create_dir_all(lab.home.join(".agent")).unwrap();
-    std::fs::write(
-        lab.home.join(".agent/config.toml"),
-        "[sonny]\ntask_depth = 0\n",
-    )
-    .unwrap();
+    // With a daemon that lets lines go deeper, it does.
+    std::fs::remove_file(&refused).unwrap();
     let call = serde_json::json!({"name": "deeper", "brief": "b"});
     let (ok, said) = lab.tool(&review.join("src"), "start_task", call, false);
     assert!(ok, "{said}");
@@ -1284,19 +999,8 @@ fn a_helper_of_a_task_in_a_repository_inside_the_lead_s_folder_starts_on_its_bra
         std::fs::read_to_string(review.join("src/lib.rs")).unwrap(),
         "fixed\n"
     );
-    // A fork of the task is made where the task works, not told a folder.
-    snapshot(&lab, &fix, 12, 77);
     let task = serde_json::json!({"name": "demo.fix", "bot_id": 5,
         "created_by": "demo.lead", "workspace": fix});
-    std::fs::write(
-        lab.scratch.join("run.log.ls"),
-        serde_json::json!([lead, task]).to_string(),
-    )
-    .unwrap();
-    let call = serde_json::json!({"name": "try", "brief": "b", "from": "fix"});
-    let (ok, said) = lab.tool(&fix, "start_task", call, false);
-    assert!(ok, "{said}");
-    assert!(lab.home.join(".agent/worktrees/demo.try").exists());
     // And the task removes its helper from there.
     let helper = serde_json::json!({"name": "demo.review", "bot_id": 6, "created_by": "demo.fix",
         "created_by_id": 5});

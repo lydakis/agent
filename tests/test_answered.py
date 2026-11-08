@@ -60,7 +60,7 @@ class AnsweredToolTests(ModelFixture):
             refused = client.request('create', bot='Bad', workspace=str(self.path), declare=[tool])
             self.assertEqual(refused['error'], 'invalid_declare', detail)
 
-    def test_a_tool_with_a_grammar_takes_free_text_and_is_answered_as_custom(self):
+    def test_a_tool_with_a_grammar_takes_free_text_as_a_function_off_openai(self):
         client = self.client('echo')
         exec_tool = {'name': 'exec', 'description': 'Run a script.', 'grammar': 'start: /[\\s\\S]+/',
                      'parameters': {'type': 'object', 'properties': {'input': {'type': 'string'}},
@@ -76,7 +76,9 @@ class AnsweredToolTests(ModelFixture):
         refused = client.request('create', bot='Bad', workspace=str(self.path), declare=[dict(exec_tool, grammar='')])
         self.assertEqual(refused['error'], 'invalid_declare')
         client = self.lead(tool=exec_tool, client=client)
-        self.model.call_script = [('exec', 'text("hi")')]
+        # Off OpenAI's own API it is a function taking the text, so the
+        # model calls it with arguments.
+        self.model.call_script = [('exec', {'input': 'text("hi")'})]
         turn = self.submit(client)
         self.started(client, turn)
         [call] = client.request('tool_calls', tag='sonny')['result']['calls']
@@ -87,9 +89,9 @@ class AnsweredToolTests(ModelFixture):
         while not self.model.requests.empty():
             requests.append(self.model.requests.get())
         [declared] = [t for t in requests[0]['tools'] if t['name'] == 'exec']
-        self.assertEqual((declared['type'], declared['format']['definition']), ('custom', 'start: /[\\s\\S]+/'))
+        self.assertEqual((declared['type'], declared['parameters']['required']), ('function', ['input']))
         [answered] = [i for i in requests[-1]['input'] if i.get('call_id') == 'script-0' and 'output' in i]
-        self.assertEqual((answered['type'], answered['output']), ('custom_tool_call_output', 'hi'))
+        self.assertEqual((answered['type'], answered['output']), ('function_call_output', 'hi'))
 
     def test_an_answer_within_the_hold_is_the_result_and_the_turn_never_parks(self):
         client = self.lead()
@@ -115,13 +117,36 @@ class AnsweredToolTests(ModelFixture):
         self.assertEqual(client.request('tool_calls', tag='sonny')['result']['calls'], [])
         self.assertEqual(self.answer(client, turn, output='again')['error'], 'stale_turn')
 
+    def test_a_call_is_taken_once_so_no_client_runs_it_twice(self):
+        client = self.lead(settings={'approval_hold_ms': 0})
+        turn = self.submit(client)
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        [call] = client.request('tool_calls', tag='sonny')['result']['calls']
+        self.assertIsNone(call['taken_ms'])
+        take = {'bot': 'Lead', 'turn': turn, 'call_id': 'script-0'}
+        self.assertEqual(client.request('take_call', **dict(take, call_id='nope'))['error'], 'no_pending_call')
+        self.assertEqual(client.request('take_call', **dict(take, bot='Other'))['error'], 'turn_not_found')
+        took = client.request('take_call', **take)['result']
+        [call] = client.request('tool_calls', tag='sonny')['result']['calls']
+        self.assertEqual(call['taken_ms'], took['taken_ms'])
+        again = client.request('take_call', **take)
+        self.assertEqual((again['error'], again['taken_ms']), ('call_taken', took['taken_ms']))
+        self.assertIn('result', self.answer(client, turn, error={'code': 'tool_outcome_unknown'}))
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertIn(client.request('take_call', **take)['error'], ('call_already_answered', 'stale_turn'))
+
     def test_a_slow_answer_parks_the_turn_and_its_error_is_the_result(self):
         client = self.lead(settings={'approval_hold_ms': 0})
         turn = self.submit(client)
         waiting = client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)['data']
         self.assertEqual((waiting['call_id'], waiting['answer']), ('script-0', 'sonny'))
-        stats = client.request('stats')['result']
-        self.assertEqual((stats['active_turns'], stats['waiting_turns']), (0, 1))
+        # turn_waiting commits as the turn parks; its slot is let go as its
+        # task ends, just after.
+        deadline = time.monotonic() + 5
+        while (stats := client.request('stats')['result'])['active_turns']:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        self.assertEqual(stats['waiting_turns'], 1)
         [view] = client.request('turns', bot='Lead', newest=True, limit=1)['result']['turns']
         self.assertEqual(view['waiting_on'], {'call_id': 'script-0', 'answer': 'sonny',
                                               'deadline_ms': waiting['deadline_ms']})

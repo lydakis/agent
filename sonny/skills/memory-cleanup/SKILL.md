@@ -20,7 +20,9 @@ of it ends `tool_unserved`, run the same command with
 
 1. Call the memory tool with `cleanup` `start`. It commits what agents saved
    since the last cleanup. If it says `"duplicate": true`, an earlier
-   cleanup was cut short: carry on from where memory is now.
+   run was cut short and its cleanup is now yours: carry on from where
+   memory is now. If it refuses with `loss_guard`, that run's cleanup
+   removed too much and is now closed: stop for tonight.
 2. Call it with `user`, then with `project` NAME for each folder in
    `projects/`, to show their indexes. Read the facts `start` listed as
    `saved` since the last cleanup (paths under `~/.agents/memory`), and any fact whose index line looks

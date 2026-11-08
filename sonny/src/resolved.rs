@@ -1,7 +1,7 @@
-//! Tasks marked resolved, as threads are: a task resolves itself once
-//! nothing is left to do in it, and its lead can resolve any of its tasks,
-//! both with the `resolve_task` tool Sonny declares, and `/status` files
-//! the task out of the way. A task's own call is read from its history: its
+//! Tasks marked done, as threads are resolved: a task marks itself done
+//! once nothing is left to do in it, and its lead can mark any of its tasks,
+//! both with the `mark_done` tool Sonny declares, and `/status` files the
+//! task under Done, out of the way. A task's own call is read from its history: its
 //! newest turn resolved it. The lead's Sonny keeps a mark for each of the
 //! lead's calls beside the store, read from the lead's history as the
 //! calls land: the task's newest turn finished by then, so one still
@@ -13,32 +13,32 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// The name of the tool a task or its lead resolves the task with.
-pub const TOOL: &str = "resolve_task";
+pub const TOOL: &str = "mark_done";
 
-/// The `resolve_task` tool as Sonny declares it on a lead, which the
+/// The `mark_done` tool as Sonny declares it on a lead, which the
 /// tasks it starts take too, and on a task.
 pub fn tool() -> Value {
     json!({
         "name": TOOL,
-        "description": "Mark a task resolved once nothing is left to do in it: its pull request merged, \
-            its answer passed on, or the person dropped the work. As a task, resolve yourself, naming no \
+        "description": "Mark a task done once nothing is left to do in it: its pull request merged, \
+            its answer passed on, or the person dropped the work. As a task, mark yourself, naming no \
             task, in the turn that finishes the work, and still end that turn with your report: your reply \
             after this call is what your lead reads. As a lead, name one of your tasks. The person's status \
-            view files it under Resolved, out of their way, and its window closes once its turn ends. New \
+            view files it under Done, out of their way, and its window closes once its turn ends. New \
             work sent to the task reopens it. A task that waits on the person, or on work still to come, is \
-            not resolved.",
+            not done.",
         "parameters": {
             "type": "object",
             "properties": {
-                "task": {"type": "string", "description": "The task's name, as it was started; none to resolve yourself."}
+                "task": {"type": "string", "description": "The task's name, as it was started; none to mark yourself."}
             },
             "additionalProperties": false
         },
-        "result": "Resolved."
+        "result": "Marked done."
     })
 }
 
-/// Whether a `resolve_task` call with `arguments`, made by `bot`, resolves
+/// Whether a `mark_done` call with `arguments`, made by `bot`, resolves
 /// `bot` itself: it names no task, or its own name, whole or past its
 /// project's, which may hold dots too.
 pub fn itself(arguments: &Value, bot: &str) -> bool {
@@ -87,13 +87,18 @@ impl Own {
         }
     }
 
+    /// Whether `bot`'s turn `turn` resolved it, still to ask once it ends.
+    pub fn resolves(&self, bot: &str, turn: i64) -> bool {
+        self.turns.contains(&(bot.to_owned(), turn))
+    }
+
     /// Whether `bot`'s turn `turn` resolved it, asked once it ended.
     pub fn ended(&mut self, bot: &str, turn: i64) -> bool {
         self.turns.remove(&(bot.to_owned(), turn))
     }
 }
 
-/// The task a `resolve_task` call with `arguments` names, in full, for
+/// The task a `mark_done` call with `arguments` names, in full, for
 /// the lead of `project`.
 pub fn call(arguments: &Value, project: &str) -> Option<String> {
     let task = arguments["task"].as_str()?.trim();

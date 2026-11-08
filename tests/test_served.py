@@ -65,7 +65,7 @@ class ServedToolTests(ModelFixture):
         return self.companion('tool-host', 'serving', **extra)
 
     def lookout(self, **extra):
-        """The lookout, which tells leads and checks goals."""
+        """The lookout, which tells leads."""
         return self.companion('lookout', 'watching', **extra)
 
     def call(self, bot, name, arguments, wait=5, **submit):
@@ -90,6 +90,51 @@ class ServedToolTests(ModelFixture):
     def git(self, folder, *args):
         subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@example.com', *args], cwd=folder,
                        check=True, capture_output=True)
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_rule_reaches_an_agent_at_work_at_its_next_round(self):
+        self.daemon.close()
+        self.daemon = SocketClient(self.binary, self.store, self.url, 'shell')
+        self.addCleanup(self.daemon.close)
+        rules = self.path / '.agent/rules/default.rules'
+        rules.parent.mkdir(parents=True)
+        rules.write_text('prefix_rule(pattern=["cp"], decision="prompt")\n')
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', settings={'sandbox': 'workspace-write'},
+                            declare=[declared('show_agent')], approve=['shell'], approver='manual')
+        self.host()
+
+        def ruled(word):
+            deadline = time.monotonic() + 20
+            while word not in json.dumps(self.daemon.request('inspect', bot='calc.lead')['result']['settings']):
+                self.assertLess(time.monotonic(), deadline, f'no rule for {word} reached the agent')
+                time.sleep(.1)
+        ruled('cp')
+        self.model.call_script = [('shell', {'command': f'cp /dev/null {self.path}/copied'}),
+                                  ('shell', {'command': f'mkdir {self.path}/made'})]
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='work', prompt='script')['result']['turn']
+        deadline = time.monotonic() + 20
+        while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
+            self.assertLess(time.monotonic(), deadline, 'no approval was asked')
+            time.sleep(.05)
+        # While it waits, the person forbids what it does next and gives its
+        # model a fallback, which waits for it to be idle.
+        rules.write_text('prefix_rule(pattern=["cp"], decision="prompt")\n'
+                         'prefix_rule(pattern=["mkdir"], decision="forbidden")\n')
+        (self.path / '.agent/config.toml').write_text('[fallbacks]\n"openai/synthetic-model" = "openai/other"\n')
+        ruled('mkdir')
+        self.assertIsNone(self.daemon.request('inspect', bot='calc.lead')['result']['fallback'])
+        [call] = asked
+        self.daemon.request('answer', bot='calc.lead', turn=turn, call_id=call['call_id'], request=call['request'],
+                            decision='allow', by='test')
+        self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+        self.assertEqual(json.loads(self.output('calc.lead', turn))['error'], 'command_forbidden')
+        self.assertFalse((self.path / 'made').exists())
+        # Idle, it takes the rest.
+        deadline = time.monotonic() + 20
+        while self.daemon.request('inspect', bot='calc.lead')['result']['fallback'] != 'openai/other':
+            self.assertLess(time.monotonic(), deadline, 'the fallback never reached the agent')
+            time.sleep(.1)
 
     def test_a_lead_starts_a_task_in_a_worktree_of_its_own(self):
         repo = self.path / 'calc'
@@ -116,9 +161,13 @@ class ServedToolTests(ModelFixture):
         # It works in a sandbox, reaching the network, and may commit to the
         # repository its worktree shares.
         self.assertEqual(record['settings']['sandbox'], 'workspace-write')
-        # and writes Sonny's zen folder, as every sandboxed row does.
+        # and writes Sonny's zen folder, as every sandboxed row does, and its
+        # lead's state folder, made for the lead alone.
+        state = self.path / '.local/state/sonny/agents/calc.lead'
+        self.assertEqual(state.stat().st_mode & 0o777, 0o700)
         self.assertEqual(sorted(record['settings']['writable']),
-                         sorted([str((repo / '.git').resolve()), str((self.path / '.agent/sonny/zen').resolve())]))
+                         sorted([str((repo / '.git').resolve()), str((self.path / '.agent/sonny/zen').resolve()),
+                                 str(state.resolve())]))
         self.assertTrue(record['settings']['network'])
         # The brief names the task's copy, not the lead's folder.
         turns = self.daemon.request('turns', bot='calc.fix')['result']['turns']
@@ -175,7 +224,7 @@ class ServedToolTests(ModelFixture):
         self.assertFalse((self.path / 'setup.done').exists())
         self.assertEqual(self.daemon.request('bots', name='calc.fix')['result']['bots'], [])
 
-    def test_a_tool_host_that_gives_way_mid_setup_stops_it_and_the_next_serves_the_call(self):
+    def test_a_tool_host_that_gives_way_mid_setup_stops_it_and_the_next_never_runs_it_again(self):
         repo = self.path / 'calc'
         (repo / '.agents').mkdir(parents=True)
         setup = repo / '.agents/setup'
@@ -205,9 +254,11 @@ class ServedToolTests(ModelFixture):
         while running(first):
             self.assertLess(time.monotonic(), deadline, 'the first setup still runs')
             time.sleep(.05)
+        # The call was taken and stopped part way: the next host answers
+        # that its outcome is unknown, and runs no second setup.
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        self.assertTrue(self.output('calc.lead', turn).startswith('Started calc.fix: '))
-        self.assertEqual(len(pids.read_text().split()), 2)
+        self.assertEqual(json.loads(self.output('calc.lead', turn))['error'], 'tool_outcome_unknown')
+        self.assertEqual(len(pids.read_text().split()), 1)
 
     def test_a_start_the_person_denies_runs_no_setup(self):
         repo = self.path / 'calc'
@@ -256,7 +307,10 @@ class ServedToolTests(ModelFixture):
         self.host()
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         # The commons, on unless set off, is a source of Sonny's own.
-        self.assertEqual(json.loads(self.output('calc.lead', turn)), {'subscriptions': [], 'sources': [{'name': 'commons', 'events': 0}]})
+        # No lookout runs here, so none has taken them.
+        self.assertEqual(json.loads(self.output('calc.lead', turn)),
+                         {'subscriptions': [], 'sources': [{'name': 'commons', 'events': 0}],
+                          'lookout': {'running': False, 'current': False, 'took_ms': None, 'rereads_every_s': 15}})
 
     def test_an_agent_s_script_calls_an_mcp_server_the_host_keeps_up(self):
         server = Path(__file__).with_name('mcp_server.py')
@@ -551,7 +605,11 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
 
         post = {'name': 'fake-home', 'title': 'Live tests want a fake HOME', 'text': 'For both binaries.'}
         started = turn('calc.a', {'post': post})
-        self.assertEqual((started['posts'], started['subscription']), (1, 'commons.fake-home'), started)
+        self.assertEqual((started['posts'], started['subscription']['name']), (1, 'commons.fake-home'), started)
+        # The answer says how the thread's posts will reach it, and how to change that.
+        self.assertEqual(started['subscription']['digest'], '0', started)
+        self.assertIn('as they come, the commons source\'s digest', started['subscription']['about'])
+        self.assertIn('subscriptions tool', started['subscription']['about'])
         # Posting subscribes the poster to the thread.
         subscribed = json.loads((self.path / 'state.sqlite.lookout/calc.a.json').read_text())
         # Held by this bot, not one that takes its name later.
@@ -559,8 +617,9 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         self.assertEqual(subscribed['subscriptions'],
                          [{'name': 'commons.fake-home', 'sources': ['commons:fake-home'], 'bot_id': calc_a}])
         replied = turn('shop.b', {'reply': {'thread': 'fake-home', 'text': 'Confirmed here too.'}})
-        self.assertEqual((replied['posts'], replied['told'], replied['subscription']),
-                         (2, [], 'commons.fake-home'), replied)
+        self.assertEqual((replied['posts'], replied['subscription']['name']), (2, 'commons.fake-home'), replied)
+        # A reply wakes no one itself: subscriptions carry it.
+        self.assertNotIn('told', replied)
         thread = (self.path / '.agents/commons/fake-home.jsonl').read_text().splitlines()
         self.assertEqual([json.loads(line)['by'] for line in thread], ['calc.a', 'shop.b'])
         # The lookout tells calc.a of the reply, and shop.b nothing of its own.
@@ -572,6 +631,10 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
             self.assertFalse(prompts and prompts[0]['text'].startswith('From your sources: '), prompts)
         listed = turn('shop.b', {})
         self.assertEqual([t['thread'] for t in listed['threads']], ['fake-home'])
+        # Search finds it by its words, case aside, with the posts that hold them.
+        found = turn('shop.b', {'search': 'confirmed HERE'})
+        self.assertEqual([(t['thread'], [m['by'] for m in t['matches']]) for t in found['threads']],
+                         [('fake-home', ['shop.b'])], found)
 
     def test_a_new_thread_invites_an_agent_whose_turns_touch_it(self):
         for bot in ('calc.a', 'shop.b', 'mail.c'):
@@ -594,10 +657,12 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         prompts = self.daemon.request('prompts', bot='shop.b', turn=turns[-1]['turn'])['result']['prompts']
         self.assertEqual(prompts[0]['text'],
                          '[calc.a started the commons thread stalls, "Checkpoint stalls under load", '
-                         'which your turns touch on. The invite pays for this turn, and, if yours is among '
-                         'the first 3 replies its invites bring, for 1.0M tokens in the thread: while any are '
-                         'left, a reply there starts your turn.]')
-        self.assertEqual(turns[-1]['budget_tokens'], 1_000_000)
+                         'which your turns touch on. The invite pays for this turn, up to 1.0M tokens of work. '
+                         'Posting there subscribes you to its later posts.]')
+        # The invite's tokens are its turn's budget, counted as work: the
+        # one turn the commons starts.
+        self.assertEqual((turns[-1]['budget_tokens'], turns[-1].get('budget_counts')), (1_000_000, 'work'),
+                         turns[-1])
         listed = json.loads(self.call('calc.a', 'commons', {}))
         self.assertEqual(listed['invites'], {'today': 1, 'a_day': 3, 'reach': 3, 'answered': 0, 'this_week': 1,
                                              'agents': 3})
@@ -611,14 +676,13 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         self.assertEqual(listed['invites'], {'today': 1, 'a_day': 4, 'reach': 3, 'answered': 1, 'this_week': 1,
                                              'agents': 3})
         # mail.c's turn ran the script from its start, so it replied in the
-        # thread too: that wakes the invited shop.b while its invite has
-        # tokens left, its turn capped at what is left.
-        deadline = time.monotonic() + 5
-        while not (woken := [t for t in self.daemon.request('turns', bot='shop.b')['result']['turns']
-                             if t['request_id'].endswith('.woken')]):
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(.05)
-        self.assertLess(woken[0]['budget_tokens'], 1_000_000, woken)
+        # thread too: the invited shop.b, which replied, hears of it through
+        # its subscription alone, and the reply starts no turn of its own.
+        thread = (self.path / '.agents/commons/stalls.jsonl').read_text().splitlines()
+        self.assertIn('mail.c', [json.loads(line)['by'] for line in thread])
+        commons = [t['request_id'] for t in self.daemon.request('turns', bot='shop.b')['result']['turns']
+                   if t['request_id'].startswith('commons.')]
+        self.assertEqual(commons, ['commons.invite.stalls'])
 
     def test_a_lead_made_for_a_subfolder_reads_its_own_memory_and_follows_its_folder(self):
         ws = self.path / 'ws'
@@ -655,23 +719,6 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
             time.sleep(.2)
         self.fail(f'{bot} heard nothing saying {having!r}')
 
-    def goal_watch(self):
-        """calc.fix, calc.lead's task with the goal tool, watched by its
-        lead, which hears its turns; the host serving them, and the lookout
-        checking the goal: the lookout's process."""
-        lead = self.daemon.request('create', bot='calc.lead', workspace=str(self.path),
-                                   model='openai/synthetic-model', instructions='Lead.',
-                                   declare=[declared('goal')])['result']
-        self.daemon.request('create', bot='calc.fix', workspace=str(self.path), model='openai/synthetic-model',
-                            instructions='Task.', declare=[declared('goal')], created_by='calc.lead',
-                            created_by_id=lead['bot_id'])
-        folder = self.path / 'state.sqlite.lookout'
-        folder.mkdir(exist_ok=True)
-        watch = {'name': 'tasks', 'tasks_of': [], 'bots': ['calc.fix'], 'on': ['said', 'ended'], 'updates': True}
-        (folder / 'calc.lead.json').write_text(json.dumps({'subscriptions': [watch]}))
-        self.host()
-        return self.lookout()
-
     def lines_of(self, path, at_least, timeout=30):
         """The lines of `path` once it has `at_least` of them."""
         deadline = time.monotonic() + timeout
@@ -680,162 +727,70 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
             time.sleep(.05)
         return path.read_text().splitlines()
 
-    def goal_run(self, check):
-        """calc.fix sets itself a goal with `check`: the lead's note once
-        the goal ends, and the prompts of calc.fix's turns."""
-        self.goal_watch()
-        set_ = json.loads(self.call('calc.fix', 'goal', {'set': {'done_when': 'the flag exists', 'check': check}}))
-        self.assertIn('goal', set_, set_)
-        self.assertEqual(set_['goal']['check'], check)
-        note = self.note_for('calc.lead', 'its goal')
-        prompts = [self.daemon.request('prompts', bot='calc.fix', turn=t['turn'])['result']['prompts'][0]['text']
-                   for t in self.daemon.request('turns', bot='calc.fix')['result']['turns']]
-        return note, prompts
-
-    def test_a_goal_keeps_its_agent_working_until_its_check_passes(self):
-        # Fails once, leaving the flag that passes it the next time.
-        note, prompts = self.goal_run('test -f flag || { touch flag; echo not yet; exit 1; }')
-        self.assertEqual(len(prompts), 2, prompts)
-        self.assertTrue(prompts[1].startswith('Your goal is not met yet: `test -f flag'), prompts[1])
-        self.assertIn('exits 1.\n```\nnot yet\n```\nKeep working until the flag exists.', prompts[1])
-        # The lead hears the turn that met it, and nothing of the one before.
-        self.assertIn('- calc.fix: turn:calc.fix/2 completed, asked by goal, and met its goal:', note)
-        self.assertNotIn('calc.fix/1', note)
-        self.assertFalse((self.path / 'state.sqlite.lookout/goals/calc.fix.json').exists())
-
-    def test_a_goal_whose_agent_only_answers_stops(self):
-        note, prompts = self.goal_run('false')
-        # The turn that set it called the tool; two that only answered end it.
-        self.assertEqual(len(prompts), 3, prompts)
-        self.assertIn('turn:calc.fix/3 completed, asked by goal, and stopped pursuing its goal: 2 turns in a row',
-                      note)
-        self.assertIn('its check still exits 1', note)
-
-    def test_a_goal_its_lead_sets_counts_from_the_task_turn_that_ends_next(self):
-        self.goal_watch()
-        ran = self.path / 'ran'
-        set_ = json.loads(self.call('calc.lead', 'goal', {'set': {'bot': 'calc.fix', 'done_when': 'it ran',
-                                                                    'check': f'echo . >> {ran}'}}))
-        self.assertEqual(set_['goal']['bot'], 'calc.fix', set_)
-        # Ends at once, well before the lookout reads its goals again.
-        turn = self.daemon.request('submit', bot='calc.fix', request_id='work', prompt='Work.')['result']['turn']
-        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        note = self.note_for('calc.lead', 'its goal')
-        self.assertIn(f'- calc.fix: turn:calc.fix/{turn} completed, asked by the person, and met its goal:', note)
-        self.assertEqual(len(ran.read_text().splitlines()), 1)
-
-    def test_a_turn_that_ends_while_its_goal_is_checked_starts_no_other_check(self):
-        self.goal_watch()
-        runs = self.path / 'runs'
-        # Slow, and passing the second time it runs.
-        check = f'echo . >> {runs}; sleep 2; test $(wc -l < {runs}) -ge 2'
-        self.call('calc.fix', 'goal', {'set': {'done_when': 'it ran twice', 'check': check}})
-        self.lines_of(runs, 1)
-        # The person writes in while it runs; the turn ends before it does.
-        turn = self.daemon.request('submit', bot='calc.fix', request_id='more', prompt='More.')['result']['turn']
-        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        note = self.note_for('calc.lead', 'its goal')
-        self.assertIn('asked by goal, and met its goal:', note)
-        # One check for the turn that set it, one for the goal's own turn.
-        self.assertEqual(len(runs.read_text().splitlines()), 2)
-
-    def test_a_goal_checked_when_its_lookout_gives_way_is_checked_by_the_next(self):
-        old = self.goal_watch()
-        runs = self.path / 'runs'
-        check = f'echo . >> {runs}; sleep 30; exit 1'
-        self.call('calc.fix', 'goal', {'set': {'done_when': 'it ran again', 'check': check}})
-        self.lines_of(runs, 1)
-        # The cursor it keeps stays before the turn's end, which waits on
-        # the check.
-        [ended] = [e['cursor'] for e in self.daemon.request('events', bot='calc.fix', after=0, limit=256)
-                   ['result']['events'] if e['event'] == 'turn_finished']
-        saved = self.lines_of(self.path / 'state.sqlite.lookout.cursor', 1)
-        self.assertLess(int(saved[0].split()[0]), ended)
-        # Another build's lookout takes over, stopping this one's check.
-        (self.path / 'state.sqlite.lookout.sonny').write_text('0.0.1 1')
-        (self.path / 'state.sqlite.lookout/goals/calc.fix.json').write_text(json.dumps(dict(
-            json.loads((self.path / 'state.sqlite.lookout/goals/calc.fix.json').read_text()),
-            check=f'echo . >> {runs}')))
-        self.lookout()
-        old.wait(timeout=10)
-        # The turn that set it is checked again, and now passes.
-        note = self.note_for('calc.lead', 'its goal')
-        self.assertIn('- calc.fix: turn:calc.fix/1 completed, asked by the person, and met its goal:', note)
-        self.assertEqual(len(self.lines_of(runs, 2)), 2)
-
-    def test_a_goal_no_one_watches_is_checked_again_after_a_restart(self):
-        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
-                            instructions='Lead.', declare=[declared('goal')])
+    def test_a_sandboxed_agent_no_one_reviews_sees_its_automations_and_adds_none(self):
+        made = self.daemon.request('create', bot='calc.lead', workspace=str(self.path),
+                                   model='openai/synthetic-model', instructions='Lead.',
+                                   settings={'sandbox': 'read-only'},
+                                   declare=[{**declared('automations'), 'steps': True}])
+        self.assertIn('result', made)
         self.host()
-        old = self.lookout()
-        runs = self.path / 'runs'
-        self.call('calc.lead', 'goal', {'set': {'done_when': 'it ran again', 'check': f'echo . >> {runs}; sleep 30'}})
-        self.lines_of(runs, 1)
-        [ended] = [e['cursor'] for e in self.daemon.request('events', bot='calc.lead', after=0, limit=256)
-                   ['result']['events'] if e['event'] == 'turn_finished']
-        # Past a save of the cursor, which stays before the turn's end
-        # though no subscriber holds it.
-        time.sleep(1.5)
-        saved = self.lines_of(self.path / 'state.sqlite.lookout.cursor', 1)
-        self.assertLess(int(saved[0].split()[0]), ended)
-        old.kill()
-        old.wait(timeout=10)
-        self.lookout()
-        self.assertEqual(len(self.lines_of(runs, 2)), 2)
+        # A look acts on nothing, so it needs no reviewer.
+        self.assertEqual(json.loads(self.call('calc.lead', 'automations', {})),
+                         {'automations': [], 'next_after': None})
+        missing = json.loads(self.call('calc.lead', 'automations', {'show': 'watch'}))
+        self.assertIn('automation_not_found', missing['detail'])
+        # Adding one acts outside its sandbox, and no one reviews it.
+        refused = json.loads(self.call('calc.lead', 'automations', {'add': {'every': '30m', 'message': 'Check.'}}))
+        self.assertEqual(refused['error'], 'escalation_refused')
+        self.assertFalse((self.path / '.agent/automations/jobs').exists())
 
-    def goal_down(self, **goal):
-        """calc.fix and its lead with no lookout running, `goal` on disk as
-        the goal tool writes it, and the cursor a lookout that went down
-        just now left: what happens next is news to the one that starts."""
-        old = self.goal_watch()
-        old.kill()
-        old.wait(timeout=10)
-        fix = self.daemon.request('inspect', bot='calc.fix')['result']
-        folder = self.path / 'state.sqlite.lookout/goals'
-        folder.mkdir(parents=True, exist_ok=True)
-        if 'check' in goal:
-            (folder / 'calc.fix.json').write_text(json.dumps(dict(
-                bot='calc.fix', bot_id=fix['bot_id'], done_when='it ran twice', workspace=str(self.path),
-                set_by='calc.lead', set_ms=1, timeout_s=60, **goal)))
-        at = max(e['cursor'] for bot in ('calc.lead', 'calc.fix')
-                 for e in self.daemon.request('events', bot=bot, after=0, limit=256)['result']['events'])
-        (self.path / 'state.sqlite.lookout.cursor').write_text(f'{at} {at}')
-        return fix
+    def test_an_agent_s_automation_waits_for_its_gate(self):
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', approve=['automations'], approver='manual',
+                            declare=[{**declared('automations'), 'steps': True}])
+        self.host()
+        # A look goes by without the gate.
+        self.assertEqual(json.loads(self.call('calc.lead', 'automations', {}))['automations'], [])
+        self.assertEqual(self.daemon.request('approvals', bot='calc.lead')['result']['approvals'], [])
+        # A run is put to it first, and refused there.
+        self.script.append(('automations', {'run': 'watch'}))
+        self.model.call_script = self.script
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='run', prompt='script')['result']['turn']
+        deadline = time.monotonic() + 30
+        while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
+            self.assertLess(time.monotonic(), deadline, 'no approval was asked')
+            time.sleep(.05)
+        self.assertEqual((asked[0]['name'], asked[0]['arguments']), ('automations', {'run': 'watch'}))
+        self.daemon.request('answer', bot='calc.lead', turn=turn, call_id=asked[0]['call_id'],
+                            request=asked[0]['request'], decision='deny', by='test')
+        self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+        self.assertIn('automations was not approved', self.output('calc.lead', turn))
 
-    def test_two_goal_turns_that_ended_while_the_lookout_was_down_are_both_checked(self):
-        runs = self.path / 'runs'
-        self.goal_down(check=f'echo . >> {runs}; test $(wc -l < {runs}) -ge 2')
-        first = self.daemon.request('submit', bot='calc.fix', request_id='work', prompt='Work.')['result']['turn']
-        self.assertEqual(self.daemon.finished(first)['data']['status'], 'completed')
-        # The turn the first check goes on in, made before the lookout went
-        # down: its request ID is the one the check asks for again.
-        second = self.daemon.request('submit', bot='calc.fix', request_id=f'goal-calc.fix-{first}', prompt='More.',
-                                     origin='goal')['result']['turn']
-        self.assertEqual(self.daemon.finished(second)['data']['status'], 'completed')
-        self.lookout()
-        note = self.note_for('calc.lead', 'its goal')
-        self.assertIn(f'- calc.fix: turn:calc.fix/{second} completed, asked by goal, and met its goal:', note)
-        self.assertEqual(len(self.lines_of(runs, 2)), 2)
-
-    def test_how_a_goal_ended_reaches_the_lead_after_a_restart(self):
-        fix = self.goal_down()
-        turn = self.daemon.request('submit', bot='calc.fix', request_id='work', prompt='Work.')['result']['turn']
-        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        # The goal ended with that turn, and the lookout went down before
-        # its lead heard.
-        ended = self.path / 'state.sqlite.lookout/goals/ended'
-        ended.mkdir(parents=True)
-        (ended / 'calc.fix.json').write_text(json.dumps(dict(
-            turn=turn, bot_id=fix['bot_id'], check='false', met=False,
-            outcome=', and gave up its goal, saying why in that turn')))
-        self.lookout()
-        note = self.note_for('calc.lead', 'its goal')
-        self.assertIn(f'- calc.fix: turn:calc.fix/{turn} completed, asked by the person, and gave up its goal', note)
+    def test_an_automation_s_time_stands_still_while_its_gate_weighs_it(self):
+        # Its answer is due two seconds after the call; the gate takes longer.
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', approve=['automations'], approver='manual',
+                            declare=[{**declared('automations'), 'steps': True, 'expire_ms': 2000}])
+        self.host()
+        self.script.append(('automations', {'remove': 'watch'}))
+        self.model.call_script = self.script
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='remove', prompt='script')['result']['turn']
+        deadline = time.monotonic() + 30
+        while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
+            self.assertLess(time.monotonic(), deadline, 'no approval was asked')
+            time.sleep(.05)
+        time.sleep(3)
+        self.daemon.request('answer', bot='calc.lead', turn=turn, call_id=asked[0]['call_id'],
+                            request=asked[0]['request'], decision='allow', by='test')
+        self.assertEqual(self.daemon.finished(turn, 30)['data']['status'], 'completed')
+        output = self.output('calc.lead', turn)
+        self.assertNotIn('ran out of time', output)
+        self.assertIn('watch', output)
 
     @unittest.skipIf(sys.platform == 'darwin', "launchd runs Sonny's scheduler on a Mac")
     def test_a_trigger_with_no_systemd_running_is_refused_and_says_why(self):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
-                            instructions='Lead.', declare=[declared('automations')])
+                            instructions='Lead.', declare=[{**declared('automations'), 'steps': True}])
         # A runtime folder no user manager serves.
         runtime = self.path / 'runtime'
         runtime.mkdir()
@@ -1152,13 +1107,14 @@ there.wait()
             challenge = json.loads(reader.readline())['challenge']
             # As a sandboxed command would: it names the file but cannot write it.
             conn.sendall((json.dumps({'proof': challenge}) + '\n').encode())
-            conn.sendall((json.dumps({'call': {'tool': 'exec', 'payload': {'input': 'text(1)'}}}) + '\n').encode())
             conn.settimeout(10)
-            # Closed, unanswered: a close with the call still unread comes
-            # as a reset.
+            # Closed, unanswered. The host may close as soon as it reads the
+            # proof, before the call is even written (a broken pipe), or with
+            # the call still unread (a reset): either way no call is sent.
             try:
+                conn.sendall((json.dumps({'call': {'tool': 'exec', 'payload': {'input': 'text(1)'}}}) + '\n').encode())
                 said = reader.readline()
-            except ConnectionResetError:
+            except (BrokenPipeError, ConnectionResetError):
                 said = ''
             self.assertEqual(said, '')
 

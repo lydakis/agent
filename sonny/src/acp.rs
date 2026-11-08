@@ -284,7 +284,7 @@ impl Agent {
     }
 
     /// A thread's options: its model, picked from what the providers list
-    /// as `/model` lists it, with `~/.agent/models`' notes and the models
+    /// as `/model` lists it, with the model list's notes and the models
     /// only it names, and its effort. Sonny's own choice is first in both.
     /// A bot's thread offers only its family's models, since a bot changes
     /// model only within it, and its family's efforts; `bound` is the
@@ -335,11 +335,17 @@ impl Agent {
     }
 
     /// What the providers list now, as `/model` asks them, with what
-    /// `~/.agent/models` says of them and the models only it names. A
+    /// the model list says of them and the models only it names. A
     /// listing that does not come in time leaves the file's.
     async fn list(&self, client: Option<&Client>) {
-        let file = agent_client::models::path()
-            .and_then(|path| agent_client::models::read(&path).ok())
+        let path = agent_client::models::path();
+        let file = path
+            .as_deref()
+            .and_then(|path| agent_client::models::read(path).ok())
+            .unwrap_or_default();
+        let hidden = path
+            .as_deref()
+            .map(agent_client::models::hidden)
             .unwrap_or_default();
         let mut offer = Offer::default();
         if let Some(client) = client {
@@ -353,7 +359,9 @@ impl Agent {
                 names.sort();
                 for name in names {
                     for model in providers[name]["models"].as_array().into_iter().flatten() {
-                        if let Some(id) = model["id"].as_str() {
+                        if let Some(id) = model["id"].as_str()
+                            && !hidden.contains(&format!("{name}/{id}"))
+                        {
                             offer.models.push(Listed {
                                 id: format!("{name}/{id}"),
                                 name: model["name"].as_str().map(str::to_owned),
@@ -658,7 +666,7 @@ struct Offer {
 }
 
 /// A model a thread may pick: `provider/model`, the name its provider's
-/// listing gives it, and `~/.agent/models`' note.
+/// listing gives it, and the model list's note.
 #[derive(Clone)]
 struct Listed {
     id: String,
@@ -1139,12 +1147,17 @@ impl Session {
         let Some(bound) = &state.bound else {
             return Err((FAILED, "the thread has no bot".into()));
         };
+        // As in Sonny's window: a steer, joining the running turn or one
+        // started meanwhile, else starting one; a move needs a turn of its
+        // own, which a steer may not be, so a prompt that moves the lead
+        // queues.
         let steer = state.running.is_some();
+        let moving = (!steer).then_some(bound.moving.as_ref()).flatten();
         let mut asked = json!({"bot": bound.bot, "bot_id": bound.bot_id,
-            "request_id": crate::unique("acp"), "prompt": crate::stamp::now(&text),
-            "delivery": if steer { "steer" } else { "reject" },
+            "request_id": crate::unique("acp"), "prompt": crate::stamp::person(&text, &bound.bot),
+            "delivery": if moving.is_some() { "queue" } else { "steer" },
             "images": if images.is_empty() { Value::Null } else { json!(images) }});
-        if !steer && let Some(dir) = &bound.moving {
+        if let Some(dir) = moving {
             asked["workspace"] = json!(dir);
         }
         let client = bound.client.clone();
@@ -1820,15 +1833,17 @@ async fn setup_lead(
     ) {
         asked["instructions"] = json!(text);
     }
-    let declare = declared::declare(&record, crate::served::Role::of(0));
+    let declare = declared::declare(&record, crate::served::Role::LEAD);
     if let Some(declare) = &declare {
         asked["declare"] = declare.clone();
     }
     let mode = approvals::mode(&record);
+    let state = crate::state::of(&record, &lead.bot);
+    let sandbox = |mode| approvals::sandbox(mode, Path::new(&workspace), state.as_deref());
     let mut gating = lead.new.then(approvals::default);
     if gating.is_none()
         && let Some(mode) = mode.filter(|mode| *mode != "full")
-        && !approvals::sandboxed_as(&record, &approvals::sandbox(mode, Path::new(&workspace)))
+        && !approvals::sandboxed_as(&record, &sandbox(mode))
     {
         gating = Some(mode);
     }
@@ -1846,10 +1861,11 @@ async fn setup_lead(
             mode,
             &approvals::gateable(&tools, declared),
         ));
-        fields.insert(
-            "settings".into(),
-            Value::Object(approvals::sandbox(mode, Path::new(&workspace))),
-        );
+        fields.insert("settings".into(), Value::Object(sandbox(mode)));
+    }
+    // Its shell names its state folder, in every row.
+    if let Some(env) = (state.as_deref()).and_then(|state| crate::state::env(&record, state)) {
+        asked["settings"]["env"] = env;
     }
     // A lead at work keeps its setup until the next thread finds it idle.
     if asked.as_object().is_some_and(|fields| fields.len() > 1) {

@@ -346,6 +346,7 @@ class ApprovalTests(ModelFixture):
             dict(child, bot='Deeper', workspace=str(self.path / 'kid'), declare=[dict(run, inherit=2)]),
             dict(child, bot='Endless', workspace=str(self.path / 'kid'), declare=[run]),
             dict(child, bot='Stepper', workspace=str(self.path / 'kid'), declare=[dict(run, steps=True)]),
+            dict(child, bot='Root', workspace=str(self.path / 'kid'), starts_line=True),
             dict(op='resume'),
         ]
         (self.path / 'requests.json').write_text(json.dumps(requests))
@@ -389,13 +390,15 @@ class ApprovalTests(ModelFixture):
         self.assertFalse(probed['borrowed'])
         (bots, configure, answer, shutdown, kid, out, liar, delete_alice, delete_kid, copy,
          ask, hand, tooled, away, again, src, twin, delete_src, twin_again, runner, deeper, endless, stepper,
-         resume) = probed['answers']
+         root, resume) = probed['answers']
         self.assertIn('Bob', [bot['name'] for bot in bots['result']['bots']])
         # Passed on as it has it, not as a tool whose steps alone are gated,
         # and no further down than it goes.
         self.assertIn('result', runner)
+        # Nor may it do what its socket isn't for, such as starting a line of
+        # its own, which would let it make bots without end.
         for refused in (configure, answer, shutdown, out, liar, delete_alice, copy, hand, tooled, away, deeper,
-                        endless, stepper, resume):
+                        endless, stepper, root, resume):
             self.assertEqual(refused['error'], 'not_permitted', refused)
         # What it makes is its own and no less sandboxed.
         self.assertEqual((kid['result']['created_by'], kid['result']['settings']['sandbox']),
@@ -441,6 +444,57 @@ class ApprovalTests(ModelFixture):
         # The one that asks to leave it still runs alone, and is refused.
         self.assertEqual(self.tool_output(client, 'shell-3')[1]['error'], 'escalation_refused')
         self.assertEqual(list(outside.iterdir()), [])
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_rules_given_while_a_turn_runs_rule_its_next_round(self):
+        rules = {'prefix_rules': [{'pattern': ['cp'], 'decision': 'prompt', 'source': 'default.rules:1'}]}
+        client = self.gated(settings={'sandbox': 'workspace-write', 'rules': rules})
+        self.model.call_script = [('shell', {'command': f'cp /dev/null {self.path}/asked'}),
+                                  ('shell', {'command': f'mkdir {self.path}/made'})]
+        turn = client.request('submit', bot='Bob', request_id='script', prompt='script')['result']['turn']
+        self.assertEqual([call['call_id'] for call in self.announced(client, turn)], ['script-0'])
+        # While its first round waits, a rule forbids what its next does.
+        given = {'prefix_rules': rules['prefix_rules'] + [
+            {'pattern': ['mkdir'], 'decision': 'forbidden', 'source': 'default.rules:2'}]}
+        self.assertEqual(client.request('configure', bot='Bob', settings={'rules': given})['result']['changed'],
+                         ['rules'])
+        # Nothing else about the bot changes while it works.
+        busy = client.request('configure', bot='Bob', settings={'rules': rules, 'approval_hold_ms': 5000})
+        self.assertEqual(busy['error'], 'bot_busy', busy)
+        self.answer(client, turn, 'script-0')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'script-1')[1]['error'], 'command_forbidden')
+        self.assertFalse((self.path / 'made').exists())
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_rules_given_reach_the_running_turns_of_the_bots_it_made_and_theirs(self):
+        rules = {'prefix_rules': [{'pattern': ['cp'], 'decision': 'prompt', 'source': 'default.rules:1'}]}
+        client = self.gated(settings={'sandbox': 'workspace-write', 'rules': rules})
+        creator = 'Bob'
+        for name in ('Kid', 'Grandkid'):
+            made_by = client.request('inspect', bot=creator)['result']['bot_id']
+            client.request('create', bot=name, workspace=str(self.path), tools=['echo', 'shell'],
+                           created_by=creator, created_by_id=made_by, approve=['shell'], approver='manual')
+            creator = name
+        self.assertEqual(client.request('inspect', bot='Grandkid')['result']['settings']['rules'], rules)
+        self.model.call_script = [('shell', {'command': f'cp /dev/null {self.path}/asked'}),
+                                  ('shell', {'command': f'mkdir {self.path}/made'})]
+        bots = ('Bob', 'Kid', 'Grandkid')
+        turns = {bot: client.request('submit', bot=bot, request_id='script', prompt='script')['result']['turn']
+                 for bot in bots}
+        for bot in bots:
+            self.assertEqual([call['call_id'] for call in self.announced(client, turns[bot])], ['script-0'])
+        # While each waits in its first round, the creator's rules tighten:
+        # every one of them goes by them from its next round.
+        given = {'prefix_rules': rules['prefix_rules'] + [
+            {'pattern': ['mkdir'], 'decision': 'forbidden', 'source': 'default.rules:2'}]}
+        self.assertEqual(client.request('configure', bot='Bob', settings={'rules': given})['result']['changed'],
+                         ['rules'])
+        for bot in bots:
+            self.answer(client, turns[bot], 'script-0', bot=bot)
+            self.assertEqual(client.finished(turns[bot])['data']['status'], 'completed')
+            self.assertEqual(self.tool_output(client, 'script-1', bot=bot)[1]['error'], 'command_forbidden', bot)
+        self.assertFalse((self.path / 'made').exists())
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_command_rules_let_a_command_out_ask_about_it_or_forbid_it(self):
@@ -543,8 +597,13 @@ class ApprovalTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:printf late')['result']['turn']
         waiting = client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
         self.assertEqual(waiting['data'], {'call_id': 'shell-1', 'approval': True, 'deadline_ms': None})
-        stats = client.request('stats')['result']
-        self.assertEqual((stats['active_turns'], stats['waiting_turns']), (0, 1))
+        # turn_waiting commits as the turn parks; its slot is let go as its
+        # task ends, just after.
+        deadline = time.monotonic() + 5
+        while (stats := client.request('stats')['result'])['active_turns']:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        self.assertEqual(stats['waiting_turns'], 1)
         self.assertEqual(client.request('inspect', bot='Bob')['result']['status'], 'waiting')
         self.assertEqual(len(client.request('approvals')['result']['approvals']), 1)
         self.assertEqual(self.answer(client, turn, 'shell-1', request=0)['error'], 'approval_superseded')
@@ -1238,7 +1297,7 @@ class Judge:
         if self.failures:
             self.failures -= 1
             return 'They look fine to me.'
-        return json.dumps({id: assessed(self.answer(round, id)) for id in round['assess']})
+        return verdicts(round, lambda id: assessed(self.answer(round, id)))
 
 
 def risky(round, id):
@@ -1251,14 +1310,21 @@ def risky(round, id):
 def assessed(p):
     """A model judge's assessment for a call the stand-in scores `p`."""
     if p < .5:
-        return {'outcome': 'allow'}
+        return {'risk_level': 'low', 'user_authorization': 'unknown', 'outcome': 'allow',
+                'rationale': ''}
     return {'risk_level': 'high', 'user_authorization': 'unknown', 'outcome': 'deny',
             'rationale': 'It deletes data nobody asked to delete.'}
 
 
+def verdicts(round, assessment):
+    """A model judge's reply to a round, as its verdict schema holds it:
+    `assessment(id)` for every call it asks about."""
+    return json.dumps({'assessments': [{'id': id, **assessment(id)} for id in round['assess']]})
+
+
 def allow_all(user):
     """A model judge's reply allowing every call a round asks about."""
-    return json.dumps({id: {'outcome': 'allow'} for id in json.loads(user)['assess']})
+    return verdicts(json.loads(user), lambda id: assessed(0))
 
 
 REJECTED = 'This action was rejected due to unacceptable risk'
@@ -1348,8 +1414,8 @@ class AutoApproverTests(ModelFixture):
                 return None
             round = json.loads(user)
             asked.put((request, round))
-            answers = {id: assessed(risky(round, id)) for id in round['assess']}
-            return 'Answers: ' + json.dumps(answers) if parsed[0] else 'They look fine to me.'
+            return verdicts(round, lambda id: assessed(risky(round, id))) if parsed[0] \
+                else 'They look fine to me.'
         self.model.reply_for = reply
         self.model.models = ('synthetic-model', 'judge-model')
         daemon = self.daemon(tools='echo,shell,wait,read')
@@ -1407,6 +1473,10 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(request['model'], 'judge-model')
         self.assertEqual(sorted(t['name'] for t in request.get('tools') or []), sorted(LOOKING))
         self.assertIn('You judge tool calls', json.dumps(request))
+        # The provider holds its reply to the verdict's schema.
+        shape = request['text']['format']
+        self.assertEqual((shape['type'], shape['strict']), ('json_schema', True))
+        self.assertEqual(shape['schema']['required'], ['assessments'])
         self.assertEqual(round['state']['request'], [{'by': 'person', 'text': 'shell:printf safe > out'}])
         self.assertEqual(round['assess'], ['c1'])
         self.assertIn('# Outcome policy', json.dumps(request))
@@ -1418,15 +1488,16 @@ class AutoApproverTests(ModelFixture):
         reason = self.denial(daemon, risky_turn)
         self.assertTrue(reason.startswith(REJECTED + ' (risk: high, authorization: unknown).\nReason: It deletes'),
                         reason)
-        # A reply without every assessment is a failed check, not an allow.
+        # A reply that is not the verdict's JSON is a failed check, not an
+        # allow, and says so.
         parsed[0] = False
         vague = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf vague')['result']['turn']
         self.assertEqual(daemon.finished(vague)['data']['status'], 'completed')
-        self.assertTrue(self.denial(daemon, vague).startswith(FAILED + "the judge's answer did not parse."))
+        self.assertTrue(self.denial(daemon, vague).startswith(FAILED + "the judge's answer was not the JSON asked for."))
         events = [lines.get(timeout=5) for _ in range(3)]
         # The reply it could not read is kept, redacted, to be read later.
         self.assertIn({'event': 'judge_failed', 'bot': 'Bob', 'turn': vague,
-                       'detail': "the judge's answer did not parse", 'reply': 'They look fine to me.'}, events)
+                       'detail': "the judge's answer was not the JSON asked for", 'reply': 'They look fine to me.'}, events)
         # Each round's fork expires if the approver stops, and goes once it
         # is answered; the base stays.
         base = bots['approver.auto']['bot_id']

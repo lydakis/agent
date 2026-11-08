@@ -162,8 +162,19 @@ enum Judged {
     /// An assessment for every call, by its id.
     Answers { answers: Value, usage: Usage },
     /// Why, and the start of a reply that could not be read.
-    Failed { why: String, reply: Option<String> },
+    Failed {
+        why: String,
+        reply: Option<String>,
+        timing: Option<judge::Timing>,
+    },
 }
+
+/// The judge's reply: held to the verdict's schema by its provider, then
+/// read whole, an assessment for each call asked and no other.
+const VERDICT: judge::Reply = judge::Reply {
+    schema: policy::VERDICT_SCHEMA,
+    parse: policy::assessments,
+};
 
 struct Judge {
     base: judge::Base,
@@ -185,21 +196,14 @@ impl Judge {
         let prompt = policy::model_prompt(state, ids);
         let answered = self
             .base
-            .ask_with(
-                client,
-                &prompt,
-                ids,
-                policy::assessments,
-                workspace,
-                deadline,
-            )
+            .ask_with(client, &prompt, ids, &VERDICT, workspace, deadline)
             .await;
         match answered {
             Ok((answers, usage)) => Judged::Answers {
                 answers: Value::Object(answers),
                 usage,
             },
-            Err(Failed { why, reply }) => Judged::Failed { why, reply },
+            Err(Failed { why, reply, timing }) => Judged::Failed { why, reply, timing },
         }
     }
 }
@@ -468,7 +472,13 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
         counts["recent"].as_u64().unwrap_or(0),
     );
     let key = (bot.clone(), turn);
+    // Where the check's time went, over every attempt: reading the turn
+    // for the evidence, and each judge turn that ended, so a slow failed
+    // attempt counts too. One still running when it gave up, or whose
+    // history could not be read whole, is untimed.
     let mut usage = Usage::default();
+    let mut spent = Spent::default();
+    let mut attempts = 0;
     let verdicts: Vec<Verdict> = if shared.tripped.lock().unwrap().contains(&key) {
         // The turn kept going after it was told to stop: end it now.
         interrupt(&shared, &bot, turn).await;
@@ -489,18 +499,15 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
     } else {
         // A check that failed is tried again while the round has time, up
         // to Codex's attempts: a failure is the approver's, not the call's.
-        let mut attempt = 1;
         loop {
-            match judge(&shared, &bot, turn, &calls, deadline).await {
+            attempts += 1;
+            match judge(&shared, &bot, turn, &calls, deadline, &mut spent).await {
                 Ok((verdicts, used)) => {
                     usage = used;
                     break verdicts;
                 }
                 Err(Unreviewed::Failed(_))
-                    if attempt < policy::ATTEMPTS && Instant::now() < deadline =>
-                {
-                    attempt += 1
-                }
+                    if attempts < policy::ATTEMPTS && Instant::now() < deadline => {}
                 Err(Unreviewed::Failed(_)) if Instant::now() >= deadline => {
                     break vec![policy::timed_out(); calls.len()];
                 }
@@ -543,10 +550,15 @@ async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
         answered.push(json!({"call_id":call["call_id"],"request":call["request"],
             "decision":decision,"reason":reason,"error":error}));
     }
+    let timing = spent.timing;
     report(
         json!({"event":"judged","bot":bot,"turn":turn,"calls":answered,
         "judge_ms":judge_ms,"input_tokens":usage.input,"cached_tokens":usage.cached,
-        "output_tokens":usage.output}),
+        "output_tokens":usage.output,"attempts":attempts,"timed_attempts":spent.timed,
+        "evidence_ms":spent.evidence.as_millis() as u64,"queued_ms":timing.queued_ms,
+        "looking_ms":timing.looking_ms,"tools_ms":timing.tools_ms,
+        "verdict_ms":timing.verdict_ms,"paced_ms":timing.paced_ms,
+        "model_rounds":timing.rounds,"provider_retries":timing.retries}),
     );
 }
 
@@ -587,6 +599,24 @@ async fn interrupt(shared: &Shared, bot: &str, turn: i64) {
         .await;
 }
 
+/// Where one check's attempts spent their time: reading the turn for the
+/// evidence, and the judge turns that ended, `timed` of them.
+#[derive(Default)]
+struct Spent {
+    evidence: Duration,
+    timing: judge::Timing,
+    timed: u32,
+}
+
+impl Spent {
+    fn judged(&mut self, timing: Option<&judge::Timing>) {
+        if let Some(timing) = timing {
+            self.timing.add(timing);
+            self.timed += 1;
+        }
+    }
+}
+
 /// Why a round has no verdicts from the judge.
 enum Unreviewed {
     /// Reading the turn or asking the judge failed, and why: worth another
@@ -603,23 +633,26 @@ async fn judge(
     turn: i64,
     calls: &[Value],
     deadline: Instant,
+    spent: &mut Spent,
 ) -> std::result::Result<(Vec<Verdict>, Usage), Unreviewed> {
     let late = || Unreviewed::Not(policy::timed_out());
     let long = |why: &str| Unreviewed::Not(policy::too_long(why));
-    let intent =
-        match tokio::time::timeout_at(deadline.into(), intent(shared, bot, turn, calls)).await {
-            Err(_) => return Err(late()),
-            Ok(Err(Unjudged::TooLong)) => return Err(long("the call is too long to show")),
-            Ok(Err(Unjudged::Unnamed)) => {
-                return Err(long(
-                    "an earlier call this turn changed files it no longer names",
-                ));
-            }
-            Ok(Err(Unjudged::Failed)) => {
-                return Err(Unreviewed::Failed("the turn could not be read".into()));
-            }
-            Ok(Ok(intent)) => intent,
-        };
+    let reading = Instant::now();
+    let read = tokio::time::timeout_at(deadline.into(), intent(shared, bot, turn, calls)).await;
+    spent.evidence += reading.elapsed();
+    let intent = match read {
+        Err(_) => return Err(late()),
+        Ok(Err(Unjudged::TooLong)) => return Err(long("the call is too long to show")),
+        Ok(Err(Unjudged::Unnamed)) => {
+            return Err(long(
+                "an earlier call this turn changed files it no longer names",
+            ));
+        }
+        Ok(Err(Unjudged::Failed)) => {
+            return Err(Unreviewed::Failed("the turn could not be read".into()));
+        }
+        Ok(Ok(intent)) => intent,
+    };
     let state = match policy::build(&intent, &shared.redactor) {
         State::TooLong => return Err(long("the calls are too long to show")),
         State::Built { state, .. } => state,
@@ -636,7 +669,8 @@ async fn judge(
         )
         .await
     {
-        Judged::Failed { why, reply } => {
+        Judged::Failed { why, reply, timing } => {
+            spent.judged(timing.as_ref());
             let reply = reply.map(|reply| logged_reply(&shared.redactor, &reply));
             report(
                 json!({"event":"judge_failed","bot":bot,"turn":turn,"detail":why,
@@ -645,6 +679,7 @@ async fn judge(
             Err(Unreviewed::Failed(why))
         }
         Judged::Answers { answers, usage } => {
+            spent.judged(usage.timing.as_ref());
             let verdicts = intent
                 .planned
                 .iter()
@@ -752,10 +787,15 @@ fn own_home_in(home: PathBuf, given: &[String]) -> policy::Home {
     }
     folders.sort();
     folders.dedup();
+    // Where tasks' worktrees are made, as each of its spellings names it.
+    let work = (std::iter::once(&agent).chain(&real))
+        .map(|agent| agent.join("worktrees"))
+        .collect();
     policy::Home {
         home,
         agent: std::iter::once(agent).chain(real).collect(),
         given: folders,
+        work,
     }
 }
 
@@ -1190,7 +1230,7 @@ async fn intent(
         .iter()
         .filter_map(|call| call["call_id"].as_str())
         .collect();
-    let transcript = transcript(client, &shared.redactor, bot, &judged).await?;
+    let (transcript, decisions) = transcript(client, &shared.redactor, bot, &judged).await?;
     let inspected = client.request("inspect", json!({"bot":bot})).await?;
     let settings = &inspected["settings"];
     let sandbox = matches!(
@@ -1274,19 +1314,23 @@ async fn intent(
         earlier,
         transcript,
         instructions,
+        decisions,
     })
 }
 
 /// The bot's own history the judge is shown, read newest first until the
 /// transcript is full: its messages, calls, and their outputs. The calls
-/// being judged are left to the state's own entries.
+/// being judged are left to the state's own entries. With it, the asks put
+/// to the person in what was read, and their answers ([`crate::asks::decisions`]).
 async fn transcript(
     client: &Client,
     redactor: &Redactor,
     bot: &str,
     judged: &[&str],
-) -> std::result::Result<Transcript, Unjudged> {
+) -> std::result::Result<(Transcript, Vec<policy::Decision>), Unjudged> {
     let mut transcript = Transcript::default();
+    // What was read, newest first, each item with its turn.
+    let mut read_items: Vec<(i64, Value)> = Vec::new();
     let mut from = Value::Null;
     let mut read = 0;
     'read: while read < HISTORY_NODES {
@@ -1302,6 +1346,9 @@ async fn transcript(
             .flatten()
             .filter_map(|node| node["node"].as_i64())
             .collect();
+        let turns: HashMap<i64, i64> = (page["nodes"].as_array().into_iter().flatten())
+            .filter_map(|node| Some((node["node"].as_i64()?, node["turn"].as_i64()?)))
+            .collect();
         read += nodes.len();
         let mut next = 0;
         while next < nodes.len() {
@@ -1314,11 +1361,27 @@ async fn transcript(
             if items.is_empty() {
                 return Err(Unjudged::Failed);
             }
-            next += items.len();
-            for entry in &items {
+            for (entry, node) in items.iter().zip(wanted) {
                 if entry.get("error").is_some() {
                     transcript.cut = true;
                     continue;
+                }
+                if let Some(turn) = turns.get(node) {
+                    // Who sent a message is the entry's, as the window reads it.
+                    let from = crate::transcript::sender(
+                        entry["from"]["bot"].as_str(),
+                        entry["origin"].as_str(),
+                        entry["person"].as_str(),
+                    );
+                    // Only what bears on an ask is kept, so a long history's
+                    // outputs are let go page by page.
+                    let parts = crate::responses(&entry["item"]).into_iter().rev();
+                    read_items.extend(parts.filter_map(|mut part| {
+                        if let Some(from) = &from {
+                            part["from"] = json!(from);
+                        }
+                        crate::asks::bears_on_asks(&part).then_some((*turn, part))
+                    }));
                 }
                 // An item's entries newest first, as the transcript is read.
                 for said in policy::entries(&entry["item"], judged, redactor)
@@ -1330,14 +1393,15 @@ async fn transcript(
                     }
                 }
             }
+            next += items.len();
         }
         from = page["next_from"].clone();
         if from.is_null() {
-            return Ok(transcript.finish());
+            return Ok((transcript.finish(), crate::asks::decisions(&read_items)));
         }
     }
     transcript.cut = true;
-    Ok(transcript.finish())
+    Ok((transcript.finish(), crate::asks::decisions(&read_items)))
 }
 
 /// A `prompts` read's words with the bot's message before each, its
@@ -1579,6 +1643,7 @@ mod tests {
             home: root.clone(),
             agent: vec![agent.clone()],
             given: vec![root.join("code"), worktree.clone()],
+            work: vec![agent.join("worktrees")],
         };
         let folder = root.join("code");
         let reaches = |tool: &str, arguments: Value, confined: bool| {

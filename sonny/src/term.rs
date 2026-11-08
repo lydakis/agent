@@ -9,7 +9,7 @@
 use std::{
     io::Write,
     sync::{
-        OnceLock,
+        Arc, LazyLock, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -25,9 +25,10 @@ static PROBE: OnceLock<Probe> = OnceLock::new();
 static LIGHT: AtomicBool = AtomicBool::new(true);
 /// The background changed since [`switched`] was last asked.
 static SWITCHED: AtomicBool = AtomicBool::new(false);
-static THEME: OnceLock<Theme> = OnceLock::new();
-/// The theme changed since it was asked, so its colors are not known.
-static STALE: AtomicBool = AtomicBool::new(false);
+/// The theme's colors as the terminal answered them at start, and
+/// whether the background was light then: they are that background's
+/// colors, known again whenever the terminal is back on it.
+static THEME: OnceLock<(Theme, bool)> = OnceLock::new();
 /// Sonny turned the terminal's grapheme clustering on, to be turned off
 /// again as it leaves.
 static CLUSTERED: AtomicBool = AtomicBool::new(false);
@@ -35,7 +36,8 @@ static CLUSTERED: AtomicBool = AtomicBool::new(false);
 pub type Rgb = (u8, u8, u8);
 
 /// The theme's own colors, each as the terminal answered at start; none
-/// it did not answer, and none at all once the theme has switched.
+/// it did not answer, and none at all while the background is the other
+/// one of light and dark, whose colors were never asked.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Theme {
     pub foreground: Option<Rgb>,
@@ -45,9 +47,14 @@ pub struct Theme {
 }
 
 pub fn theme() -> Theme {
-    match STALE.load(Ordering::Relaxed) {
-        true => Theme::default(),
-        false => THEME.get().copied().unwrap_or_default(),
+    theme_on(THEME.get().copied(), light())
+}
+
+/// The colors `answered` gives for a background that is `light` now.
+fn theme_on(answered: Option<(Theme, bool)>, light: bool) -> Theme {
+    match answered {
+        Some((theme, answered_light)) if answered_light == light => theme,
+        _ => Theme::default(),
     }
 }
 
@@ -69,7 +76,7 @@ pub fn graphics() -> bool {
 /// size, else as it answered at start (Rex answers 8×16 for a block it has
 /// not laid out yet, and the real size once it has).
 pub fn cell() -> (u32, u32) {
-    if let Ok(size) = ratatui::crossterm::terminal::window_size()
+    if let Ok(size) = size()
         && size.columns > 0
         && size.rows > 0
         && size.width >= size.columns
@@ -93,7 +100,10 @@ pub async fn laid_out() {
     }
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if ratatui::crossterm::terminal::window_size().is_ok_and(|size| size.width > 0) {
+        // Read anew each time, as nothing here waits for the signal its
+        // resize sends.
+        resized();
+        if size().is_ok_and(|size| size.width > 0) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -105,7 +115,6 @@ pub async fn laid_out() {
 pub fn detect() {
     let reply = query().unwrap_or_default();
     let mac = appearance();
-    let _ = THEME.set(answered(&reply));
     let light = parse(&reply)
         .map(|rgb| luminance(rgb) > 0.5)
         .or_else(|| scheme(&reply))
@@ -113,6 +122,7 @@ pub fn detect() {
         .or(mac)
         .unwrap_or(true);
     LIGHT.store(light, Ordering::Relaxed);
+    let _ = THEME.set((answered(&reply), light));
     let _ = PROBE.set(Probe {
         graphics: reply.contains("_Gi=31;OK"),
         cell: cell_size(&reply).unwrap_or((8, 16)),
@@ -139,11 +149,100 @@ pub fn detect() {
                 if let Some(now) = appearance()
                     && LIGHT.swap(now, Ordering::Relaxed) != now
                 {
-                    STALE.store(true, Ordering::Relaxed);
                     SWITCHED.store(true, Ordering::Relaxed);
                 }
             }
         });
+    }
+}
+
+/// The window's size, in cells and in pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Size {
+    pub columns: u16,
+    pub rows: u16,
+    /// Its pixels, 0 by 0 where the terminal does not say them.
+    pub width: u16,
+    pub height: u16,
+}
+
+/// The window's size as last read, and whether it may have changed since.
+struct Kept {
+    size: Option<Size>,
+}
+
+impl Kept {
+    /// The size kept, read again with `read` when there is none yet or it
+    /// is `stale`. A read that fails keeps nothing, so the next reads again.
+    fn get(
+        &mut self,
+        stale: bool,
+        read: impl FnOnce() -> std::io::Result<Size>,
+    ) -> std::io::Result<Size> {
+        match self.size {
+            Some(size) if !stale => Ok(size),
+            _ => {
+                self.size = None;
+                let size = read()?;
+                self.size = Some(size);
+                Ok(size)
+            }
+        }
+    }
+}
+
+static KEPT: Mutex<Kept> = Mutex::new(Kept { size: None });
+
+/// Set when the window may have changed size since it was last read: by
+/// the kernel's SIGWINCH as it resizes the terminal, by SIGCONT as the
+/// process goes on after a stop (a resize meanwhile went to the shell),
+/// and by [`resized`]. None when the signals could not be watched: the
+/// size is then read every time.
+static STALE: LazyLock<Option<Arc<AtomicBool>>> = LazyLock::new(|| {
+    let stale = Arc::new(AtomicBool::new(true));
+    #[cfg(unix)]
+    for signal in [signal_hook::consts::SIGWINCH, signal_hook::consts::SIGCONT] {
+        signal_hook::flag::register(signal, Arc::clone(&stale)).ok()?;
+    }
+    Some(stale)
+});
+
+/// The window's size, read from the terminal only once it may have
+/// changed: crossterm opens /dev/tty for each read, and a frame took the
+/// size five times, ten frames a second, in every window.
+pub fn size() -> std::io::Result<Size> {
+    let mut kept = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Taken before the read, so a resize during it is read next time.
+    let stale = STALE
+        .as_ref()
+        .is_none_or(|stale| stale.swap(false, Ordering::AcqRel));
+    kept.get(stale, read_size)
+}
+
+/// The window may have changed size: the next [`size`] reads it. For
+/// what the signals do not cover, as a full repaint the person asked for.
+pub fn resized() {
+    if let Some(stale) = STALE.as_ref() {
+        stale.store(true, Ordering::Release);
+    }
+}
+
+/// The window's size as the terminal says it now: its cells and pixels
+/// with one ioctl, else its cells as crossterm finds them otherwise.
+fn read_size() -> std::io::Result<Size> {
+    use ratatui::crossterm::terminal;
+    match terminal::window_size() {
+        Ok(size) if size.columns > 0 && size.rows > 0 => Ok(Size {
+            columns: size.columns,
+            rows: size.rows,
+            width: size.width,
+            height: size.height,
+        }),
+        _ => terminal::size().map(|(columns, rows)| Size {
+            columns,
+            rows,
+            ..Size::default()
+        }),
     }
 }
 
@@ -319,6 +418,48 @@ pub fn copy(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_size_is_read_again_only_once_it_may_have_changed() {
+        let mut kept = Kept { size: None };
+        let reads = std::cell::Cell::new(0);
+        let read = |columns| {
+            let reads = &reads;
+            move || -> std::io::Result<Size> {
+                reads.set(reads.get() + 1);
+                Ok(Size {
+                    columns,
+                    rows: 24,
+                    ..Size::default()
+                })
+            }
+        };
+        // None yet: read, though nothing said it changed.
+        assert_eq!(kept.get(false, read(80)).unwrap().columns, 80);
+        assert_eq!(kept.get(false, read(100)).unwrap().columns, 80);
+        assert_eq!(reads.get(), 1);
+        assert_eq!(kept.get(true, read(100)).unwrap().columns, 100);
+        // A read that fails keeps nothing: the next one reads again.
+        let failed = kept.get(true, || Err(std::io::Error::other("no tty")));
+        assert!(failed.is_err());
+        assert_eq!(kept.get(false, read(90)).unwrap().columns, 90);
+        assert_eq!(reads.get(), 3);
+    }
+
+    #[test]
+    fn the_theme_answered_holds_again_once_back_on_its_background() {
+        let dark = Theme {
+            foreground: Some((0xce, 0xcd, 0xc3)),
+            background: Some((0x10, 0x0f, 0x0f)),
+            ..Theme::default()
+        };
+        // Answered on a dark background: known there, not on a light one,
+        // and known again once the terminal switches back.
+        assert_eq!(theme_on(Some((dark, false)), false), dark);
+        assert_eq!(theme_on(Some((dark, false)), true), Theme::default());
+        assert_eq!(theme_on(Some((dark, false)), false), dark);
+        assert_eq!(theme_on(None, false), Theme::default());
+    }
 
     #[test]
     fn grapheme_clustering_reads_as_on_off_or_unknown() {

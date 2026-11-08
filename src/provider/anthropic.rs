@@ -3,7 +3,7 @@
 //! signatures so tool-using turns can continue.
 use super::{
     Completion, Delta, Frame, MAX_OUTPUT, ModelTokens, ToolCall, Usage, detail_of, encoded_len,
-    valid_call_id,
+    unparsed, valid_call_id,
 };
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
@@ -54,19 +54,6 @@ pub(crate) fn usage(usage: &Value, hour: bool) -> Usage {
         cache_write_1h_tokens: hourly,
         ..Usage::default()
     }
-}
-
-/// A whole message's usage and the model that answered it: per attempt
-/// when a server-side fallback ran, as the stream's final usage is read.
-pub(crate) fn message_usage(message: &Value, hour: bool) -> Usage {
-    let report = &message["usage"];
-    let mut state = State::new(hour);
-    state.usage = usage(report, hour);
-    state.usage.served_model = served(message);
-    if let Some(iterations) = report["iterations"].as_array() {
-        state.iterations(iterations);
-    }
-    state.usage
 }
 
 /// The model a message or an attempt names.
@@ -132,7 +119,7 @@ impl State {
             .ok_or(Error::new("invalid_content_index"))
     }
     pub fn frame(&mut self, frame: &[u8]) -> Result<Frame> {
-        let event: Value = serde_json::from_slice(frame)?;
+        let event: Value = serde_json::from_slice(frame).map_err(|e| unparsed(e, frame))?;
         if self.done {
             return fail("event_after_completion");
         }
@@ -646,29 +633,6 @@ mod tests {
         assert_eq!(item["content"][1]["content"][0]["encrypted_content"], "e");
         assert_eq!(item["content"][2]["text"], "Rust is");
         assert_eq!(item["content"][2]["citations"][0]["encrypted_index"], "i");
-    }
-    /// A message's usage, as a refresh's is read, counts every attempt a
-    /// server-side fallback billed, as the stream's final usage does.
-    #[test]
-    fn a_whole_messages_usage_counts_each_billed_attempt() {
-        let report = json!({"input_tokens":0,"cache_read_input_tokens":9,"output_tokens":0,
-            "iterations":[
-                {"type":"message","model":"claude-opus-5-5","input_tokens":0,
-                 "cache_read_input_tokens":9,"cache_creation_input_tokens":0,"output_tokens":0},
-                {"type":"fallback_message","model":"claude-opus-4-8","input_tokens":2,
-                 "cache_read_input_tokens":0,"cache_creation_input_tokens":7,"output_tokens":0}]});
-        let usage = super::message_usage(&json!({"model":"claude-opus-5-5","usage":report}), false);
-        assert_eq!(usage.models.len(), 1);
-        assert_eq!(usage.models[0].model, "claude-opus-4-8");
-        assert_eq!((usage.input_tokens, usage.cache_write_tokens), (9, 7));
-        // The attempt that answered names the model, not the one asked.
-        assert_eq!(usage.served_model, "claude-opus-4-8");
-        let plain = super::message_usage(
-            &json!({"model":"claude-opus-5-5","usage":{"cache_read_input_tokens":9}}),
-            false,
-        );
-        assert_eq!((plain.input_tokens, plain.cached_input_tokens), (9, 9));
-        assert_eq!(plain.served_model, "claude-opus-5-5");
     }
     /// Hour-long writes are read from the split when Anthropic reports one,
     /// and otherwise follow what the request asked for.

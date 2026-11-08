@@ -53,6 +53,10 @@ struct Options {
     store: PathBuf,
     socket: PathBuf,
     providers: Vec<String>,
+    /// Whether the providers came from `~/.agent/config.toml` (or, with no
+    /// `provider` there, from the key variables set), not the command line
+    /// or AGENT_PROVIDER.
+    providers_from_config: bool,
     /// Daemon-scoped values the caller stated, checked against a running
     /// daemon at attach. Defaults and environment-implied values never conflict.
     providers_explicit: bool,
@@ -104,6 +108,8 @@ struct Options {
     budget_tokens: Option<u64>,
     /// `run --turn-budget-tokens`: the submitted turn's own cap.
     turn_budget_tokens: Option<u64>,
+    /// `--budget-counts`: what the budgets given count.
+    budget_counts: Option<&'static str>,
     /// `run --image`: pictures sent with the prompt, by path.
     images: Vec<String>,
     /// `run --quote`: turns whose words the prompt quotes.
@@ -149,6 +155,7 @@ fn parse(args: &[String]) -> Result<Options> {
         socket: PathBuf::new(),
         store: PathBuf::new(),
         providers: Vec::new(),
+        providers_from_config: false,
         providers_explicit: false,
         tools_explicit: false,
         tools: String::new(),
@@ -186,6 +193,7 @@ fn parse(args: &[String]) -> Result<Options> {
         bucket_ms: None,
         budget_tokens: None,
         turn_budget_tokens: None,
+        budget_counts: None,
         images: Vec::new(),
         quotes: Vec::new(),
         turn: None,
@@ -360,7 +368,8 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--max-pending"
                     | "--max-pending-bytes"
                     | "--max-input-bytes"
-                    | "--max-readers" => {
+                    | "--max-readers"
+                    | "--max-depth" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
@@ -400,13 +409,6 @@ fn parse(args: &[String]) -> Result<Options> {
                         options
                             .settings
                             .insert("approval_hold_ms".to_owned(), json!(ms));
-                        options.settings_flags.push(flag.to_owned());
-                    }
-                    "--keep-warm" => {
-                        let seconds = crate::cli::duration_secs(flag, &value)?;
-                        options
-                            .settings
-                            .insert("keep_warm".to_owned(), json!(seconds));
                         options.settings_flags.push(flag.to_owned());
                     }
                     "--sandbox" => {
@@ -490,6 +492,13 @@ fn parse(args: &[String]) -> Result<Options> {
                             Error::with("usage", "--turn-budget-tokens needs an integer")
                         })?)
                     }
+                    "--budget-counts" => {
+                        options.budget_counts = Some(match value.as_str() {
+                            "tokens" => "tokens",
+                            "work" => "work",
+                            _ => return fail_with("usage", "--budget-counts needs tokens or work"),
+                        })
+                    }
                     "--turn" => {
                         options.turn = Some(
                             value
@@ -531,6 +540,10 @@ fn parse(args: &[String]) -> Result<Options> {
     if options.providers.is_empty() {
         options.providers =
             environment_providers(&|name| std::env::var(name).ok(), &|| Ok(config()?.provider))?;
+        // Providers the config file names follow it while the daemon runs;
+        // ones given on the command line or by AGENT_PROVIDER stay as given.
+        options.providers_from_config =
+            std::env::var("AGENT_PROVIDER").map_or(true, |specs| specs.trim().is_empty());
     }
     Ok(options)
 }
@@ -541,7 +554,7 @@ fn parse(args: &[String]) -> Result<Options> {
 /// well-known key variable is set. Like `AGENT_MODEL`, they are defaults: a
 /// running daemon is not checked against them, since every shell a bot runs
 /// inherits the daemon's environment.
-fn environment_providers(
+pub(crate) fn environment_providers(
     var: &dyn Fn(&str) -> Option<String>,
     configured: &dyn Fn() -> Result<Option<String>>,
 ) -> Result<Vec<String>> {
@@ -768,6 +781,7 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             "--max-input-bytes" => "input_bytes",
             "--max-readers" => "readers",
             "--max-load" => "load",
+            "--max-depth" => "depth",
             "--stall-timeout" => "stall_timeout_seconds",
             "--idle-exit" => "idle_exit_seconds",
             _ => continue,
@@ -786,7 +800,7 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             "--stall-timeout" | "--idle-exit" => crate::cli::duration_secs(flag, value).ok(),
             _ => value.parse::<u64>().ok(),
         }
-        .filter(|value| flag != "--idle-exit" || *value != 0);
+        .filter(|value| !matches!(flag.as_str(), "--idle-exit" | "--max-depth") || *value != 0);
         if running.as_u64() != requested {
             differences.push(format!(
                 "{flag}: requested {value} but daemon has {}",
@@ -809,16 +823,84 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
 
 fn ensure_daemon(options: &Options) -> Result<Connection> {
     match connect_or_start(options) {
-        // Only an agent that can start a daemon of its own stops the older
-        // one, or the socket would be left with none.
-        Err(error)
-            if !options.no_spawn
-                && !options.providers.is_empty()
-                && replace_older(&error, &options.socket)? =>
-        {
-            connect_or_start(options)
-        }
+        Err(error) if older_daemon(&error).is_some() => match kept_older(options) {
+            // The command, refused by the older daemon, goes to the new one.
+            None if replace_older(&error, &options.socket)? => connect_or_start(options),
+            None => Err(error),
+            Some(why) => Err(kept(error, why)),
+        },
         result => result,
+    }
+}
+
+/// A connection to the daemon already running, for a command on its bots,
+/// which never starts one where none runs: one older than this agent is
+/// replaced first, as `start` replaces it, and the command goes to the new
+/// one.
+fn connect_running(options: &Options) -> Result<Connection> {
+    match Connection::connect(&options.socket) {
+        Err(error) if older_daemon(&error).is_some() && !serves(options) => Err(kept(
+            error,
+            "nothing was sent: the socket is not the store's own, so which store the daemon \
+             serves is not known here; `agent start` with its --store and --socket replaces it",
+        )),
+        Err(error) if older_daemon(&error).is_some() => ensure_existing_daemon(options),
+        result => result,
+    }
+}
+
+/// Whether the daemon on this agent's socket serves its store: the socket
+/// is the one a daemon of that store listens on unless told otherwise. A
+/// replacement starts on the store, so one for another store's daemon
+/// would put this store's daemon in its place.
+fn serves(options: &Options) -> bool {
+    // Where `path` is, its folder resolved, as a store's own socket is
+    // named from its resolved path.
+    crate::client_path::default_socket(&options.store)
+        .is_ok_and(|own| same_socket(&own, &options.socket))
+}
+
+/// Whether `a` and `b` name one socket: each made absolute, so a bare
+/// name's folder is the current one, and its folder resolved.
+fn same_socket(a: &Path, b: &Path) -> bool {
+    let resolved = |path: &Path| {
+        let path = std::path::absolute(path).ok()?;
+        let folder = path.parent()?.canonicalize().ok()?;
+        Some(folder.join(path.file_name()?))
+    };
+    resolved(a).is_some_and(|a| Some(a) == resolved(b))
+}
+
+/// Why this agent leaves an older daemon running rather than replacing it:
+/// none when it may. Only an agent that can start a daemon of its own stops
+/// the older one, or the socket would be left with none, and never one a
+/// bot's own shell runs, since replacing it waits for that bot's turn.
+fn kept_older(options: &Options) -> Option<&'static str> {
+    if std::env::var_os("AGENT_BOT_ID").is_some() {
+        Some(
+            "this agent was upgraded while the daemon ran, and a command from inside a bot's \
+             turn does not replace the daemon running that turn, since replacing it waits for \
+             the turn. Nothing was sent. `agent start` from outside any bot's turn replaces \
+             it, as a client starting the daemon does, and the turn resumes on the new daemon",
+        )
+    } else if options.no_spawn {
+        Some("nothing was sent: --no-spawn keeps it running, and `agent start` replaces it")
+    } else if options.providers.is_empty() {
+        Some(
+            "nothing was sent: replacing it starts a new daemon, which needs a provider \
+             (--provider, AGENT_PROVIDER, a provider key, or `provider` in config.toml)",
+        )
+    } else {
+        None
+    }
+}
+
+/// `error`, the older daemon's refusal, saying why it was kept.
+fn kept(error: Error, why: &str) -> Error {
+    let said = error.detail.clone().unwrap_or_default();
+    Error {
+        detail: Some(format!("{said}: {why}")),
+        ..error
     }
 }
 
@@ -832,15 +914,12 @@ const REPLACE_GRACE: Duration = Duration::from_secs(120);
 /// Stop the older daemon `error` found on `socket`, once its running turns
 /// end or `REPLACE_GRACE` passes, so this agent's own can start: true once
 /// it is gone. The store keeps every chat, and the new daemon upgrades it
-/// as it opens. A newer daemon, or one an agent asks from inside its own
-/// turn, which would wait on itself, is left alone and `error` stands.
+/// as it opens. A newer daemon is left alone and `error` stands; who may
+/// replace one at all, `kept_older` says.
 fn replace_older(error: &Error, socket: &PathBuf) -> Result<bool> {
     let Some(pid) = older_daemon(error) else {
         return Ok(false);
     };
-    if std::env::var_os("AGENT_BOT_ID").is_some() {
-        return Ok(false);
-    }
     let grace_ms = REPLACE_GRACE.as_millis() as u64;
     // Daemons since 0.6.0 take shutdown with a grace; an older one refuses
     // the field, or does not answer in time, and is sent SIGTERM, which
@@ -876,6 +955,30 @@ fn older_daemon(error: &Error) -> Option<i32> {
         .filter(|pid| *pid > 1)
 }
 
+/// The daemon's lend of a bot's sandbox, for `agent sandbox --bot`: the
+/// policy and environment its commands get, and the connection whose life
+/// the bot's own socket listens for.
+pub struct Lent {
+    pub answer: Value,
+    _connection: Connection,
+}
+
+/// Ask the daemon `flags` name (`--store`, `--socket`, else as any command
+/// finds it) to lend bot `bot`'s sandbox, starting it as a command on a
+/// bot does.
+pub fn lend(flags: &[String], bot: &str, bot_id: Option<i64>) -> Result<Lent> {
+    let args: Vec<String> = std::iter::once("sandbox".to_owned())
+        .chain(flags.iter().cloned())
+        .collect();
+    let options = parse(&args)?;
+    let mut connection = ensure_daemon(&options)?;
+    let answer = connection.request("lend", json!({"bot": bot, "bot_id": bot_id}))?;
+    Ok(Lent {
+        answer,
+        _connection: connection,
+    })
+}
+
 fn connect_or_start(options: &Options) -> Result<Connection> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let connect = || match Connection::connect_until(&options.socket, deadline) {
@@ -902,7 +1005,7 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     if options.providers.is_empty() {
         return fail_with(
             "provider_required",
-            "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, bedrock, bedrock-openai, or NAME=FAMILY,URL,KEY_ENV), set AGENT_PROVIDER, or export a provider key",
+            "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, bedrock, bedrock-openai, bedrock-openai-runtime, or NAME=FAMILY,URL,KEY_ENV), set AGENT_PROVIDER, or export a provider key",
         );
     }
     // The daemon's folder and log are its user's alone, as the daemon
@@ -979,8 +1082,25 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     if let Some(run) = agent_client::config::run() {
         command.arg("--wall").arg(run);
     }
-    for pattern in config()?.shell_environment_policy.excludes() {
+    let file = config()?;
+    for pattern in file.shell_environment_policy.excludes() {
         command.arg("--shell-exclude").arg(pattern);
+    }
+    for (pattern, tokens) in &file.context_windows {
+        command
+            .arg("--context-window")
+            .arg(format!("{pattern}={tokens}"));
+    }
+    // Where the providers came from, so an edit there applies live.
+    if let Some(file) = agent_client::config::path().filter(|_| options.providers_from_config) {
+        command.arg("--provider-config").arg(file);
+    }
+    // Discovery's catalog, rewritten by every start of the home store's
+    // daemon; a daemon on another store leaves it alone.
+    if let Some(models) = home_models(&options.store) {
+        command
+            .arg("--models")
+            .arg(agent_client::models::discovered(&models));
     }
     agent_client::own_session(&mut command);
     let mut child = command
@@ -1469,26 +1589,56 @@ fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
     Ok(())
 }
 
-/// The models clients offer, from `~/.agent/models`; reading it needs no
-/// daemon. `--discover` first writes one from the listings of the providers
-/// the daemon runs, and never replaces a list that exists.
+/// The models clients offer: the person's `~/.agent/models` over
+/// discovery's catalog beside it; reading them needs no daemon.
+/// `--discover` rewrites the catalog from the listings of the providers the
+/// daemon runs, as every daemon start does, and says on stderr what changed.
+/// The person's model list, when `store` is the home store beside it
+/// (`state.sqlite`): only that store's daemon writes discovery's catalog,
+/// so a test, a side daemon or another file in the same folder never
+/// replaces it. The folder is compared resolved, so an alias of it counts.
+fn home_models(store: &Path) -> Option<PathBuf> {
+    agent_client::models::path().filter(|models| {
+        let place = |path: &Path| {
+            Some((
+                std::fs::canonicalize(path.parent()?).ok()?,
+                path.file_name()?.to_owned(),
+            ))
+        };
+        let home = place(&models.with_file_name("state.sqlite"));
+        home.is_some() && home == place(store)
+    })
+}
+
 fn models(options: &Options) -> Result<i32> {
     let path = agent_client::models::path().ok_or(Error::with("usage", "set HOME"))?;
     if options.discover {
-        if path.exists() {
+        let mut connection = ensure_daemon(options)?;
+        if home_models(&options.store).is_none() {
             return fail_with(
-                "models_file_exists",
-                format!(
-                    "{}: edit it, or remove it to discover again",
-                    path.display()
-                ),
+                "usage",
+                "--discover rewrites the home store's catalog; this store is another one (--store or AGENT_STORE), and its daemon's provider_models lists what its providers serve",
             );
         }
-        let mut connection = ensure_daemon(options)?;
+        let catalog = agent_client::models::discovered(&path);
         let listing = connection.request("provider_models", json!({}))?;
-        let text = agent_client::models::render(&listing, &[]).map_err(Error::from)?;
-        agent_client::models::install(&path, &text).map_err(Error::from)?;
-        eprintln!("wrote {}", path.display());
+        let refreshed = agent_client::models::refresh(&catalog, &listing).map_err(Error::from)?;
+        for (provider, said) in &refreshed.refused {
+            eprintln!("{}: {}", visible(provider), visible(said));
+        }
+        for (sign, ids) in [('+', &refreshed.added), ('-', &refreshed.removed)] {
+            for id in ids.iter().filter(|_| !refreshed.created) {
+                eprintln!("{sign} {}", visible(id));
+            }
+        }
+        match (
+            refreshed.created,
+            refreshed.added.len() + refreshed.removed.len(),
+        ) {
+            (true, _) => eprintln!("wrote {}", catalog.display()),
+            (false, 0) => eprintln!("{} is up to date", catalog.display()),
+            (false, _) => eprintln!("updated {}", catalog.display()),
+        }
     }
     let models = agent_client::models::read(&path).map_err(Error::from)?;
     if options.pretty {
@@ -1498,17 +1648,19 @@ fn models(options: &Options) -> Result<i32> {
                 None => say!("{}", visible(&model.id)),
             }
         }
-        if models.is_empty() {
-            eprintln!(
-                "no models listed in {}; agent models --discover writes a first list",
-                path.display()
-            );
-        }
     } else {
         print_json(
             &Value::Array(models.iter().map(|model| model.json()).collect()),
             false,
         )?;
+    }
+    // On stderr, so `[]` on stdout stays what a program reads.
+    if models.is_empty() {
+        eprintln!(
+            "no models listed in {} or {}; agent models --discover lists the providers' models",
+            path.display(),
+            agent_client::models::discovered(&path).display()
+        );
     }
     Ok(0)
 }
@@ -1624,11 +1776,16 @@ fn run(options: &Options) -> Result<i32> {
         let tools: Vec<String> = match role.as_ref().and_then(|r| r.tools.clone()) {
             Some(tools) if !options.tools_explicit => tools,
             _ if !options.tools_explicit => {
-                let search = config()?.web_search;
-                agent_client::default_tools(&connection.ready["providers"], &model, search)
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect()
+                let config = config()?;
+                agent_client::default_tools(
+                    &connection.ready["providers"],
+                    &model,
+                    config.web_search,
+                    &config.web_search_off,
+                )
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
             }
             _ => options
                 .tools
@@ -1651,7 +1808,8 @@ fn run(options: &Options) -> Result<i32> {
         }
         let mut create = json!({"bot":bot,"workspace":workspace,"model":model,
             "instructions":instructions,"effort":effort,
-            "budget_tokens":options.budget_tokens,"tools":tools,
+            "budget_tokens":options.budget_tokens,
+            "budget_counts":options.budget_tokens.and(options.budget_counts),"tools":tools,
             "created_by":created_by,"created_by_id":created_by_id,
             "compaction_instructions":options.compaction_instructions,
             "compaction_model":options.compaction_model,"fallback":fallback,
@@ -1680,7 +1838,16 @@ fn run(options: &Options) -> Result<i32> {
         .iter()
         .map(|path| image(path))
         .collect::<Result<Vec<_>>>()?;
-    let delivery = options.delivery.as_deref().unwrap_or("reject");
+    // Unsaid, a message steers: it joins the running turn at its next
+    // round, or starts one, as the person's own words do. A folder or a
+    // turn cap belongs to a turn of its own, which a steer may not be, so
+    // with either it queues instead.
+    let delivery = options.delivery.as_deref().unwrap_or(
+        match options.workspace.is_some() || options.turn_budget_tokens.is_some() {
+            true => "queue",
+            false => "steer",
+        },
+    );
     if options.attach_wait_ms.is_some() && delivery != "attach" {
         return fail_with("usage", "--attach-wait needs --delivery attach");
     }
@@ -1708,7 +1875,9 @@ fn run(options: &Options) -> Result<i32> {
                 "effort":if created { Value::Null } else { json!(options.effort) },
                 "delivery":delivery,"expected_turn":options.turn,"from":from,
                 "quotes":(!options.quotes.is_empty()).then_some(&options.quotes),
-                "budget_tokens":options.turn_budget_tokens,"wait_ms":wait_ms}),
+                "budget_tokens":options.turn_budget_tokens,
+                "budget_counts":options.turn_budget_tokens.and(options.budget_counts),
+                "wait_ms":wait_ms}),
         )
         .map_err(|error| ways_past_busy(&bot, error))?;
     // An attached message has no turn of its own to follow.
@@ -1880,7 +2049,7 @@ fn follow(options: &Options) -> Result<i32> {
     if options.all {
         // Every bot's events from a store-wide cursor, then live, until the
         // connection ends: the fleet controller's view.
-        let mut connection = Connection::connect(&options.socket)?;
+        let mut connection = connect_running(options)?;
         let mut request = follow_from(options)?;
         request["bot"] = json!("*");
         connection.request("follow", request)?;
@@ -1894,7 +2063,7 @@ fn follow(options: &Options) -> Result<i32> {
         .bot
         .clone()
         .ok_or(Error::with("usage", "follow needs --bot or --all"))?;
-    let mut connection = Connection::connect(&options.socket)?;
+    let mut connection = connect_running(options)?;
     // Choose the turn before subscribing. If it finishes during attachment,
     // replay still delivers its terminal event; a later idle snapshot cannot
     // make us abandon events queued while waiting for an RPC response.
@@ -1927,7 +2096,7 @@ fn fork(options: &Options) -> Result<i32> {
             "fork needs --source and --bot; --checkpoint N picks a message, default is an idle source's head or a running turn's newest finished round",
         );
     };
-    let mut connection = Connection::connect(&options.socket)?;
+    let mut connection = connect_running(options)?;
     let result = make_fork(
         options,
         &mut connection,
@@ -1951,7 +2120,8 @@ fn make_fork(
     let (created_by, created_by_id) = created_by()?;
     let mut request = json!({"source":source,"checkpoint":options.checkpoint,"bot":bot,
         "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
-        "budget_tokens":options.budget_tokens,"request_id":request_id,
+        "budget_tokens":options.budget_tokens,
+        "budget_counts":options.budget_tokens.and(options.budget_counts),"request_id":request_id,
         "created_by":created_by,"created_by_id":created_by_id,"expire_ms":options.expire_ms});
     if let Some(allow) = &options.allow {
         let allow: Vec<&str> = allow.split(',').filter(|t| !t.is_empty()).collect();
@@ -1978,7 +2148,7 @@ fn interrupt(options: &Options) -> Result<i32> {
         .bot
         .clone()
         .ok_or(Error::with("usage", "interrupt needs --bot"))?;
-    let mut connection = Connection::connect(&options.socket)?;
+    let mut connection = connect_running(options)?;
     // A named turn may be one still queued, which then never runs.
     let turn = match options.turn {
         Some(turn) => turn,
@@ -2047,7 +2217,7 @@ fn wait(options: &Options) -> Result<i32> {
     if options.bot.is_some() == !options.positional.is_empty() {
         return fail_with("usage", "wait needs handles or --bot, not both");
     }
-    let mut connection = Connection::connect(&options.socket)?;
+    let mut connection = connect_running(options)?;
     let handles = match &options.bot {
         Some(bot) => vec![current_turn(&mut connection, bot, options.bot_id)?],
         None => options.positional.clone(),
@@ -2067,6 +2237,14 @@ fn wait(options: &Options) -> Result<i32> {
         };
         enough && completed.all(|v| v.get("error").is_none_or(Value::is_null))
     });
+    if !clean {
+        // Why a turn failed, on stderr, as a failed run says it. A wait
+        // that timed out says so in `pending` alone: nothing went wrong.
+        let results = result["results"].as_object().into_iter().flatten();
+        for (handle, end) in results.filter(|(_, v)| v["error"].is_string()) {
+            eprintln!("agent: {handle} {}", ended(end, ""));
+        }
+    }
     Ok(if clean { 0 } else { 1 })
 }
 
@@ -2387,7 +2565,7 @@ fn turns(options: &Options) -> Result<i32> {
 /// The bots in name order, filtered by the daemon, paged through
 /// completely or up to `--limit`; JSON array or a table.
 fn list(options: &Options) -> Result<i32> {
-    let mut connection = Connection::connect(&options.socket)?;
+    let mut connection = connect_running(options)?;
     let mut after = Value::Null;
     let mut left = options.limit.unwrap_or(usize::MAX);
     let mut first = true;
@@ -2527,7 +2705,13 @@ impl Renderer {
         if !self.pretty {
             say!("{event}");
             let _ = std::io::stdout().flush();
-            return Ok(finished.then(|| exit_code(&event["data"])));
+            let code = finished.then(|| exit_code(&event["data"]));
+            // A run that fails says why where a caller looks for it, not
+            // only in the event on stdout.
+            if code.is_some_and(|code| code != 0) {
+                eprintln!("agent: {}", ended(&event["data"], ""));
+            }
+            return Ok(code);
         }
         if let Some(turn) = self.turn
             && event
@@ -2628,17 +2812,7 @@ impl Renderer {
                 match status {
                     "completed" => eprintln!("agent: ✔ completed{tokens}"),
                     "steered" => eprintln!("agent: ✔ steered into turn {}", data["into"]),
-                    _ => eprintln!(
-                        "agent: ✘ {status}{}{}{tokens}",
-                        data["error"]
-                            .as_str()
-                            .map(|e| format!(": {e}"))
-                            .unwrap_or_default(),
-                        data["detail"]
-                            .as_str()
-                            .map(|d| format!(" ({d})"))
-                            .unwrap_or_default()
-                    ),
+                    _ => eprintln!("agent: ✘ {}", ended(data, &tokens)),
                 }
                 return Ok(Some(exit_code(data)));
             }
@@ -2825,6 +2999,23 @@ fn report(per_bot: bool, bot: &str, state: &str) -> String {
         body.push_str(&format!(":app=agent:title={title}"));
     }
     format!("\x1b]7501;{body}\x1b\\")
+}
+
+/// How a turn that did not complete ended, from its `turn_finished`:
+/// its status, error and detail, then `tokens`.
+fn ended(data: &Value, tokens: &str) -> String {
+    format!(
+        "{}{}{}{tokens}",
+        data["status"].as_str().unwrap_or("unknown"),
+        data["error"]
+            .as_str()
+            .map(|e| format!(": {e}"))
+            .unwrap_or_default(),
+        data["detail"]
+            .as_str()
+            .map(|d| format!(" ({d})"))
+            .unwrap_or_default()
+    )
 }
 
 fn exit_code(data: &Value) -> i32 {
@@ -3268,11 +3459,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_socket_named_bare_or_in_full_is_the_same_socket() {
+        let here = std::env::current_dir().unwrap();
+        let bare = Path::new("state.db.sock");
+        assert!(same_socket(&here.join(bare), bare));
+        assert!(same_socket(&here.join(bare), &Path::new(".").join(bare)));
+        assert!(!same_socket(&here.join(bare), Path::new("other.sock")));
+    }
+
+    #[test]
     fn a_reported_error_keeps_every_fact() {
         let ended = json!({"status":"failed","turn":3,"error":"budget_exhausted",
-            "detail":"220 of 200 tokens used","budget_tokens":200,"tokens_used":220});
+            "detail":"220 of 200 tokens of work done","budget_tokens":200,"work_tokens":220});
         let error = Error::reported(&ended).unwrap();
-        assert_eq!(error.detail.as_deref(), Some("220 of 200 tokens used"));
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("220 of 200 tokens of work done")
+        );
         let facts = error.facts.unwrap();
         assert_eq!(
             (&facts["budget_tokens"], &facts["turn"]),

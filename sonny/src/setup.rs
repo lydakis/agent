@@ -31,7 +31,7 @@ pub struct Step {
 }
 
 /// Each step an upgrade can offer; first-run setup offers them itself.
-pub const STEPS: [Step; 2] = [
+pub const STEPS: [Step; 3] = [
     Step {
         id: "mcp-import",
         what: "the MCP servers the person's other agents (Claude Code, Codex, OpenCode, Kiro) reach, brought into Sonny",
@@ -51,7 +51,78 @@ pub const STEPS: [Step; 2] = [
         how: "sonny setup backup URL",
         done: || crate::home::Places::home().is_ok_and(|places| crate::home::done(&places)),
     },
+    Step {
+        id: "browser-profile",
+        what: "agents' browsers started signed in where the person is: agent-browser's own \
+               ~/.agent-browser/config.json naming {\"profile\": \"Default\"}, so each session \
+               starts from a copy of their Chrome's Default profile (their own Chrome is left \
+               alone). Leaving it unset keeps a fresh browser, signed in nowhere",
+        how: "sonny setup --browser-signed-in",
+        done: || !browser_profile_offered(),
+    },
 ];
+
+/// Whether there is a signed-in browser to offer: agent-browser here, its
+/// settings naming no profile, and Chrome's own profile to copy.
+fn browser_profile_offered() -> bool {
+    on_path("agent-browser")
+        && !browser_profile_set()
+        && crate::browser::chrome_has_profile(crate::browser::SEEDED_PROFILE)
+}
+
+/// Whether agent-browser's own settings name a profile, or are there and
+/// cannot be read, so Sonny leaves them alone.
+fn browser_profile_set() -> bool {
+    crate::browser::settings_file()
+        .is_none_or(|file| crate::browser::profile_in(&file) != crate::browser::Profile::Unset)
+}
+
+/// What setup knows of the browser's profile, for `--json`: agent-browser's
+/// settings file, the profile it names (null for none), and the links whose
+/// own `browser_profile` differs from the one a session here starts from.
+fn browser_profile(config: &agent_client::config::Config) -> Value {
+    let file = crate::browser::settings_file();
+    let named = match file.as_deref().map(crate::browser::profile_in) {
+        Some(crate::browser::Profile::Named(name)) => Some(name),
+        _ => None,
+    };
+    let here = named.clone().unwrap_or_default();
+    let differ: Vec<Value> = (config.sonny.links.iter())
+        .filter(|(_, link)| link.browser_profile != here)
+        .map(|(name, link)| json!({"link": name, "browser_profile": link.browser_profile}))
+        .collect();
+    json!({"file": file, "profile": named, "links_differ": differ})
+}
+
+/// Offer to start agents' browsers signed in, where agent-browser is here
+/// and its settings name no profile; an answer other than yes leaves it.
+fn signed_in_browser() -> Result<(), String> {
+    if !browser_profile_offered() {
+        return Ok(());
+    }
+    let file = crate::browser::settings_file().ok_or("set HOME")?;
+    println!(
+        "\nAgents' browsers start fresh, signed in nowhere. agent-browser can start each from a\ncopy of your Chrome's Default profile instead, signed in where you are (your own\nChrome is left alone), by naming it in {}.",
+        crate::tilde(&file.display().to_string())
+    );
+    let answer = line("Start them signed in? [Y/n] ")?;
+    if !matches!(answer.to_ascii_lowercase().as_str(), "" | "y" | "yes") {
+        return Ok(());
+    }
+    seed_saying(&file)
+}
+
+/// Seed the profile in `file`, saying what was written.
+fn seed_saying(file: &Path) -> Result<(), String> {
+    if crate::browser::seed_profile(file)? {
+        println!(
+            "Wrote \"profile\": \"{}\" to {}.",
+            crate::browser::SEEDED_PROFILE,
+            crate::tilde(&file.display().to_string())
+        );
+    }
+    Ok(())
+}
 
 /// Someone is there to answer.
 pub fn interactive() -> bool {
@@ -399,7 +470,7 @@ fn hand_off(index: usize) -> Result<bool, String> {
             Some(PathBuf::from(home).join(".agents/skills/sonny-setup/SKILL.md"))
         })
         .ok_or("set HOME")?;
-    let sonny = std::env::current_exe().map_err(|e| e.to_string())?;
+    let sonny = crate::named::me().map_err(|e| e.to_string())?;
     let prompt = format!(
         "Set up Sonny, the coding-agent client on this machine, so its agents reach a model. \
          Follow the skill at {}. Sonny is {}; start with `{} setup --json` to see what this \
@@ -431,12 +502,14 @@ fn hand_off(index: usize) -> Result<bool, String> {
 pub const USAGE: &str = "\
 usage: sonny setup [--provider chatgpt|anthropic|openai|openrouter|bedrock]
                    [--profile AWS_PROFILE] [--key-stdin] [--model PROVIDER/MODEL]
-                   [--import-mcp [codex,claude,opencode,kiro]] [--json]
+                   [--import-mcp [codex,claude,opencode,kiro]] [--browser-signed-in] [--json]
 With no flags, asks in a terminal. With flags, sets what they name and asks
 nothing, for scripts and agents: --key-stdin reads the provider's key from
 stdin into ~/.agent/env; --import-mcp brings the MCP servers of those agents
-(all, when it names none) but those from files in this folder; --json prints
-what this machine has and what is set, after any change.";
+(all, when it names none) but those from files in this folder;
+--browser-signed-in names the Default Chrome profile in agent-browser's own
+settings when they name none and Chrome has it; --json prints what this machine has and what
+is set, after any change.";
 
 /// `sonny setup` with flags: what they name set, nothing asked.
 pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
@@ -446,6 +519,7 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
     let mut model = None;
     let mut import = None;
     let mut json = false;
+    let mut signed_in = false;
     let mut args = args.iter().peekable();
     while let Some(arg) = args.next() {
         let mut value = |flag: &str| {
@@ -459,6 +533,7 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
             "--model" => model = Some(value("--model")?),
             "--key-stdin" => key_stdin = true,
             "--json" => json = true,
+            "--browser-signed-in" => signed_in = true,
             "--import-mcp" => {
                 let named = args.next_if(|next| !next.starts_with("--"));
                 import = Some(named.cloned().unwrap_or_default());
@@ -579,6 +654,27 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
         }
         None => Vec::new(),
     };
+    let seeded = match signed_in {
+        true => {
+            crate::skills::note_offered("browser-profile");
+            if !crate::browser::chrome_has_profile(crate::browser::SEEDED_PROFILE) {
+                return Err(format!(
+                    "no Chrome profile {} here to start agents' browsers from: sign in to Chrome, then this again",
+                    crate::browser::SEEDED_PROFILE
+                ));
+            }
+            let file = crate::browser::settings_file().ok_or("set HOME")?;
+            crate::browser::seed_profile(&file)?
+        }
+        false => false,
+    };
+    if signed_in && !seeded {
+        let kept = "agent-browser's settings name a browser profile already, or cannot be read: left as they are.";
+        match json {
+            true => eprintln!("{kept}"),
+            false => println!("{kept}"),
+        }
+    }
     if reached()? != before && Client::connect(socket).await.is_ok() {
         let notice = "The running daemon keeps the provider and keys it started with until it restarts: `sonny agent shutdown` stops it once agents' turns end.";
         match json {
@@ -593,6 +689,12 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
                 provider.map(|p| format!("provider {p}")),
                 model.map(|m| format!("model {m}")),
                 (!brought.is_empty()).then(|| format!("MCP {}", brought.join(", "))),
+                seeded.then(|| {
+                    format!(
+                        "the browser's profile {} in agent-browser's own settings",
+                        crate::browser::SEEDED_PROFILE
+                    )
+                }),
             ];
             let changed: Vec<String> = changed.into_iter().flatten().collect();
             match changed.is_empty() {
@@ -633,6 +735,7 @@ fn state(home: &Path) -> Result<Value, String> {
             json!({"name": name, "command": command, "on_path": on_path(command)})
         }).collect::<Vec<_>>(),
         "mcp_to_import": crate::mcp_import::json(&mcp),
+        "browser_profile": browser_profile(&config),
         "missing": missing_tools(),
         "steps": STEPS.iter().map(|step| {
             json!({"id": step.id, "what": step.what, "how": step.how, "done": (step.done)()})
@@ -746,6 +849,12 @@ pub async fn model(client: &Client) -> Result<String, String> {
         && error != "setup cancelled"
     {
         println!("{DIM}agent-desktop not installed: {error}{RESET}");
+    }
+    crate::skills::note_offered("browser-profile");
+    if let Err(error) = signed_in_browser()
+        && error != "setup cancelled"
+    {
+        println!("{DIM}Browser profile not set: {error}{RESET}");
     }
     summary(&model, &file, &brought, backed);
     Ok(model)
@@ -1073,6 +1182,7 @@ const TEMPLATE: &str = "\
 #                           openrouter, or NAME=FAMILY,URL,KEY_ENV; unset, the
 #                           providers whose keys are set
 # web_search = \"disabled\"   new agents search and fetch the web unless this says so
+# web_search_off = [\"bedrock-openai/xai.*\"]   models a new agent gets no search on
 #
 # [sonny]
 # lead_effort, task_effort   a new lead's and each new task's effort: low, medium,
@@ -1087,9 +1197,36 @@ const TEMPLATE: &str = "\
 ";
 
 /// `chosen` into the config file at `file`, with the efforts a first run
-/// suggests where the file names none; the person may edit them after. A
-/// new file starts with [`TEMPLATE`].
+/// suggests where the file names none, which it says it wrote (on stderr,
+/// so `--json` keeps stdout); the person may edit them after. A new file
+/// starts with [`TEMPLATE`].
 fn save(file: &Path, chosen: Option<(&str, &str)>) -> Result<(), String> {
+    let suggested = save_quietly(file, chosen)?;
+    if let Some(said) = wrote_defaults(file, &suggested) {
+        eprintln!("{said}");
+    }
+    Ok(())
+}
+
+/// What setup says of the defaults it wrote to `file` unasked, if any.
+fn wrote_defaults(file: &Path, suggested: &[(&str, &str)]) -> Option<String> {
+    let set: Vec<String> = (suggested.iter())
+        .map(|(key, value)| format!("{key} = \"{value}\""))
+        .collect();
+    (!set.is_empty()).then(|| {
+        format!(
+            "Wrote first-run defaults to {}: {} (edit them there or in /config).",
+            file.display(),
+            set.join(", ")
+        )
+    })
+}
+
+/// [`save`], saying nothing: the suggested efforts it wrote.
+fn save_quietly(
+    file: &Path,
+    chosen: Option<(&str, &str)>,
+) -> Result<Vec<(&'static str, &'static str)>, String> {
     if !file.exists() {
         if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -1101,18 +1238,17 @@ fn save(file: &Path, chosen: Option<(&str, &str)>) -> Result<(), String> {
         ("sonny.lead_effort", "medium", sonny.lead_effort),
         ("sonny.task_effort", "high", sonny.task_effort),
     ];
-    let pairs: Vec<(&str, &str)> = (chosen.into_iter())
-        .chain(
-            suggested
-                .iter()
-                .filter(|(.., set)| set.is_none())
-                .map(|(k, v, _)| (*k, *v)),
-        )
+    let suggested: Vec<(&'static str, &'static str)> = (suggested.iter())
+        .filter(|(.., set)| set.is_none())
+        .map(|(k, v, _)| (*k, *v))
         .collect();
-    match pairs.is_empty() {
-        true => Ok(()),
-        false => agent_client::config::set(file, &pairs),
+    let pairs: Vec<(&str, &str)> = (chosen.into_iter())
+        .chain(suggested.iter().copied())
+        .collect();
+    if !pairs.is_empty() {
+        agent_client::config::set(file, &pairs)?;
     }
+    Ok(suggested)
 }
 
 const ACCENT: &str = "\x1b[38;2;255;190;60m";
@@ -1415,11 +1551,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sonny-setup-save-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let file = dir.join("config.toml");
-        save(&file, Some(("model", "openai/gpt-x"))).unwrap();
+        let suggested = save_quietly(&file, Some(("model", "openai/gpt-x"))).unwrap();
+        // What it wrote unasked, it says.
+        assert_eq!(
+            suggested,
+            [
+                ("sonny.lead_effort", "medium"),
+                ("sonny.task_effort", "high")
+            ]
+        );
+        let said = wrote_defaults(&file, &suggested).unwrap();
+        assert!(said.contains(r#"sonny.lead_effort = "medium", sonny.task_effort = "high""#));
+        // Set already, they are not written or said again.
+        let again = save_quietly(&file, Some(("model", "openai/gpt-y"))).unwrap();
+        assert!(again.is_empty());
+        assert_eq!(wrote_defaults(&file, &again), None);
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(text.starts_with("# Sonny's and the agent daemon's settings."));
         let config = agent_client::config::read(&file).unwrap();
-        assert_eq!(config.model.as_deref(), Some("openai/gpt-x"));
+        assert_eq!(config.model.as_deref(), Some("openai/gpt-y"));
         assert_eq!(config.sonny.lead_effort.as_deref(), Some("medium"));
         assert_eq!(config.sonny.task_effort.as_deref(), Some("high"));
         std::fs::remove_dir_all(&dir).unwrap();

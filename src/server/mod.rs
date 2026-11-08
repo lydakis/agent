@@ -2,9 +2,11 @@
 //! the same JSONL protocol; turns run as tasks; events fan out through a hub.
 mod actives;
 mod companions;
+mod file_watch;
 mod handles;
 mod hub;
 mod lane;
+mod reload;
 mod session;
 mod socket;
 mod turn;
@@ -17,8 +19,9 @@ use agent_runtime::{
     output::{self, Output},
     provider::{Listed, Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
-        Answer, Binding, Bot, Decision, Delivery, FOLDERS_JSON, Fork, Gate, MAX_GATES, Publication,
-        RULES_JSON, Settings, Started, Step, Stepped, Store, TurnOptions, Waiting, Wake,
+        Answer, Binding, Bot, Decision, Delivery, ENV_JSON, FOLDERS_JSON, Fork, Gate, MAX_GATES,
+        Publication, RULES_JSON, Settings, Started, Step, Stepped, Store, TurnOptions, Waiting,
+        Wake,
     },
     tools::{
         ANSWER_BYTES, DECLARED_BYTES, Declared, MAX_DECLARED, Outcome, Registry, validate_declared,
@@ -67,6 +70,9 @@ const EXPIRY_SWEEP: usize = 16;
 /// The longest an attached message may wait for a call before it goes as a
 /// steer: a year, as the clients' `attach_wait` bounds it.
 const MAX_WAIT_MS: u64 = agent_client::config::MAX_ATTACH_WAIT_MS;
+/// The most a turn's output schema may be, as JSON: well past any reply
+/// shape a client asks for, and small beside the prompt's own limit.
+const MAX_OUTPUT_SCHEMA_BYTES: usize = 64 * 1024;
 /// Attached messages one look delivers at most; the rest follow at once.
 const LAPSE_SWEEP: usize = 64;
 
@@ -153,18 +159,21 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             }),
             output::encoded_len(&(bot, created_by)),
             // The workspace, the writable folders, the Unix sockets,
-            // canonical, and the command rules, which the reply's settings
-            // repeat; a bot another makes takes its creator's rules, and a
-            // sandboxed one's folders.
+            // canonical, the command rules and the variables, which the
+            // reply's settings repeat; a bot another makes takes its
+            // creator's rules and variables, and a sandboxed one's folders.
             usize::from(workspace.is_some()) * PATH_JSON
                 + match created_by {
-                    Some(_) => 2 * FOLDERS_JSON + RULES_JSON,
+                    Some(_) => 2 * FOLDERS_JSON + RULES_JSON + ENV_JSON,
                     None => {
                         (settings.writable.len() * PATH_JSON).min(FOLDERS_JSON)
                             + (settings.unix_sockets.len() * PATH_JSON).min(FOLDERS_JSON)
                             + (settings.rules.as_ref())
                                 .map_or(0, |rules| output::encoded_len(rules).unwrap_or(RULES_JSON))
                                 .min(RULES_JSON)
+                            + output::encoded_len(&settings.env)
+                                .unwrap_or(ENV_JSON)
+                                .min(ENV_JSON)
                     }
                 },
             // Both the bot and its event carry its gates, most of them
@@ -241,6 +250,8 @@ enum Command {
         instructions: Option<String>,
         effort: Option<String>,
         budget_tokens: Option<u64>,
+        /// What `budget_tokens` counts: `tokens`, the default, or `work`.
+        budget_counts: Option<agent_runtime::store::Counts>,
         /// The tools this bot may call, from the daemon's registered set.
         tools: Option<Vec<String>>,
         /// The bot on whose behalf the client creates this one, if any.
@@ -269,6 +280,20 @@ enum Command {
         /// An idempotency key: resending the request with it gets the bot
         /// it made, `duplicate: true`, instead of `bot_exists`.
         request_id: Option<String>,
+        /// The bot starts a line of its own: its depth is 0 though it has
+        /// a creator. Refused on a sandboxed bot's own socket.
+        #[serde(default)]
+        starts_line: bool,
+    },
+    /// A bot's record, as `inspect` gives it, and the path of its own
+    /// socket, which listens while this session lasts: so a client can run
+    /// a command as one of that bot's, in its sandbox and reaching the
+    /// daemon only as that bot may, such as an automation's check the bot
+    /// wrote. Only a session outside every sandbox may ask.
+    Lend {
+        bot: String,
+        /// The identity `bot` must hold; another is `bot_not_found`.
+        bot_id: Option<i64>,
     },
     /// A bot's whole record: what `bots` lists plus its instructions and
     /// settings. A read; nothing about the bot changes.
@@ -329,6 +354,7 @@ enum Command {
         bot: String,
         workspace: Option<String>,
         budget_tokens: Option<u64>,
+        budget_counts: Option<agent_runtime::store::Counts>,
         created_by: Option<String>,
         created_by_id: Option<i64>,
         /// A gate the fork adds to those it inherits.
@@ -413,15 +439,20 @@ enum Command {
         /// with who wrote them: a turn's prompt, or with `reply` the reply
         /// it ended with.
         quotes: Option<Vec<agent_runtime::store::QuoteRef>>,
-        /// The most input plus output tokens this turn may spend, beside
-        /// the bot's own budget; absent leaves only that.
+        /// The most tokens this turn may spend, beside the bot's own
+        /// budget; absent leaves only that.
         budget_tokens: Option<u64>,
+        /// What `budget_tokens` counts: `tokens`, the default, or `work`.
+        budget_counts: Option<agent_runtime::store::Counts>,
         /// Pictures sent with the prompt, each a media type and base64;
         /// absent or null is none.
         images: Option<Vec<agent_runtime::codec::Image>>,
         /// With `attach`: the most milliseconds it waits for a call to take
         /// it in before it goes as a steer; absent waits as long as it takes.
         wait_ms: Option<u64>,
+        /// A JSON Schema the turn's reply follows, which the provider
+        /// enforces as structured output; absent leaves it free text.
+        output_schema: Option<Value>,
     },
     Interrupt {
         bot: String,
@@ -518,6 +549,13 @@ enum Command {
         call_id: String,
         output: Option<ToolOutput>,
         error: Option<ToolError>,
+    },
+    /// Take a declared call this client answers, to run it: refused with
+    /// `call_taken` once any client took it, so it never runs twice.
+    TakeCall {
+        bot: String,
+        turn: i64,
+        call_id: String,
     },
     /// Put one step of a declared call this client answers to the bot's
     /// gates that name the tool, and answer once it is decided: a script's
@@ -649,6 +687,8 @@ const PAUSE_NAMES: usize = 64;
 /// The variable a Bedrock API key is read from, as the AWS tools name it.
 const BEDROCK_KEY: &str = "AWS_BEARER_TOKEN_BEDROCK";
 pub struct ProviderSpec {
+    /// The spec as given, by which a reload tells a binding it keeps.
+    pub spec: String,
     pub name: String,
     pub family: Family,
     pub url: String,
@@ -675,7 +715,8 @@ impl ProviderSpec {
     /// `bedrock` (Claude) defaults to Bedrock runtime, where cross-region
     /// inference profiles (`global.anthropic.…`) route to whichever region
     /// holds the model, from any source region the profile supports, and `bedrock-openai` to Bedrock Mantle, as Claude
-    /// Code and Codex default. Both are in the region the AWS SDKs would
+    /// Code and Codex default; `bedrock-openai-runtime` is runtime's
+    /// OpenAI-compatible route, for models served only there. All are in the region the AWS SDKs would
     /// use (`aws::region`). Any Bedrock URL without a key variable signs
     /// with SigV4, and one with a key variable sends it as a Bedrock API
     /// key; the defaults take `AWS_BEARER_TOKEN_BEDROCK` when it is set.
@@ -729,6 +770,13 @@ impl ProviderSpec {
             "bedrock-openai" => (
                 "responses",
                 "https://bedrock-mantle.{region}.api.aws/openai/v1",
+                Some(BEDROCK_KEY),
+            ),
+            // Runtime's OpenAI-compatible route, as Codex's
+            // `amazon-bedrock-runtime`: some models are served only there.
+            "bedrock-openai-runtime" => (
+                "responses",
+                "https://bedrock-runtime.{region}.amazonaws.com/openai/v1",
                 Some(BEDROCK_KEY),
             ),
             _ => ("", "", None),
@@ -797,6 +845,7 @@ impl ProviderSpec {
             ));
         }
         Ok(Self {
+            spec: spec.to_owned(),
             sigv4: bedrock && key_env.is_none(),
             chatgpt_login: name == "chatgpt" && key_env.is_none() && url == default_url,
             name: name.to_owned(),
@@ -859,6 +908,19 @@ pub struct Configuration {
     /// Folders whose Unix sockets no sandboxed command reaches, made if
     /// missing, private to the daemon's user.
     pub walled: Vec<PathBuf>,
+    /// The context windows the person set, by model path.
+    pub context_windows: Arc<agent_runtime::provider::Windows>,
+    /// Discovery's model catalog (`~/.agent/models.discovered`),
+    /// rewritten from the providers' listings each time the daemon starts;
+    /// none leaves it be.
+    pub models: Option<PathBuf>,
+    /// The config file the providers came from (`~/.agent/config.toml`'s
+    /// `provider`), watched so an edit applies without a restart; none
+    /// when they were given on the command line or by `AGENT_PROVIDER`.
+    pub provider_config: Option<PathBuf>,
+    /// The most generations below the bot that starts its line a `create`
+    /// or `fork` may make a bot at; none by default.
+    pub max_depth: Option<u64>,
 }
 
 /// `path` by its real path, or, while it doesn't exist, by the real path
@@ -982,6 +1044,20 @@ const IMAGES_BYTES: usize = 5 << 20;
 const MAX_QUOTES: usize = agent_runtime::store::Database::QUOTES;
 /// The most pictures one prompt, or one tool result, may carry.
 const IMAGES: usize = 20;
+
+/// What a budget counts, which only a budget can name.
+fn counts(
+    budget_tokens: Option<u64>,
+    counts: Option<agent_runtime::store::Counts>,
+) -> Result<agent_runtime::store::Counts> {
+    match (budget_tokens, counts) {
+        (None, Some(_)) => fail_with(
+            "invalid_budget",
+            "budget_counts names what budget_tokens counts, so it goes with one",
+        ),
+        (_, counts) => Ok(counts.unwrap_or_default()),
+    }
+}
 
 /// Pictures a provider takes: a media type both families know, base64 of
 /// an image of that type, and within [`IMAGES`] and [`IMAGES_BYTES`].
@@ -1150,6 +1226,8 @@ struct Service {
     companions: companions::Companions,
     transport: Arc<Transport>,
     providers: Arc<HashMap<String, Provider>>,
+    /// How providers are bound again when their config file changes.
+    reload: Option<Box<reload::Reload>>,
     registry: Registry,
     hub: Hub,
     handles: Handles,
@@ -1159,6 +1237,11 @@ struct Service {
     identity: u128,
     /// Open client sessions, kept by the run loop for `stats`.
     sessions: usize,
+    /// What each session was lent, which the daemon holds until it closes:
+    /// the bot's own socket listening, and its sandbox's placeholders, held
+    /// in the one list the daemon's own commands share, so neither side
+    /// removes one the other's sandbox still mounts.
+    lent: HashMap<u64, Vec<agent_runtime::sandbox::Hold>>,
     limit_active: usize,
     /// Per bot: the live turn. A parked turn's task ends while a resumed
     /// task may already own the slot.
@@ -1334,6 +1417,9 @@ struct Active {
     lift: Arc<turn::Lift>,
     /// Released by the task before it submits its finish ([`Slot::release`]).
     slot: Slot,
+    /// Command rules a `configure` gave while the turn runs, which its next
+    /// round takes.
+    given_rules: Arc<std::sync::Mutex<Option<Arc<agent_runtime::rules::Rules>>>>,
 }
 impl Active {
     /// The running turn, unless it has committed or is committing its end;
@@ -1418,36 +1504,38 @@ pub(crate) async fn publish(
     }
 }
 
-pub async fn run(config: Configuration) -> Result<()> {
-    let limits = Limits::resolve(&config);
-    let transport = Transport::new(limits.connecting, limits.connections)?;
-    let stall_timeout = config
-        .stall_timeout
-        .map_or(agent_runtime::provider::STALL_TIMEOUT, Duration::from_secs);
-    let registry = Registry::all()?;
-    let mut providers = HashMap::new();
-    let aws_start = agent_runtime::provider::aws::Start::new();
-    let credentials = agent_runtime::tools::Credentials::default();
-    credentials.redact_also(&config.redact_fields, &config.redact_blocks);
-    // Every tool shell inherits the environment the daemon started with,
-    // so the excludes are matched against it once.
-    for (name, _) in std::env::vars_os() {
-        if let Some(name) = name.to_str()
-            && (config.shell_excludes.iter())
-                .any(|pattern| agent_runtime::tools::name_matches(pattern, name))
-        {
-            credentials.withhold(name);
-        }
-    }
-    let mut bindings = serde_json::Map::new();
-    for spec in &config.providers {
+/// What makes a provider of a spec, the same at start and on a reload.
+#[derive(Clone)]
+struct Binder {
+    transport: Arc<Transport>,
+    credentials: agent_runtime::tools::Credentials,
+    stall_timeout: Duration,
+    windows: Arc<agent_runtime::provider::Windows>,
+}
+
+impl Binder {
+    /// The provider `spec` names and its binding as `ready.providers`
+    /// reports it. SigV4 bindings made together share `aws_start`'s one
+    /// resolution of the AWS credential chain.
+    async fn bind(
+        &self,
+        spec: &ProviderSpec,
+        aws_start: &agent_runtime::provider::aws::Start,
+    ) -> Result<(Provider, Value)> {
+        let (transport, credentials) = (&self.transport, &self.credentials);
         let (key, login) = if spec.chatgpt_login {
             // No variable carries the tokens; the shared set redacts them,
             // and every pair a refresh brings later.
-            let login = agent_runtime::provider::login::Login::open(
-                &agent_runtime::provider::login::default_path()?,
-                Some(credentials.clone()),
-            )?;
+            // Read off the run loop: a reload binds while bots run.
+            let redaction = credentials.clone();
+            let login = tokio::task::spawn_blocking(move || {
+                agent_runtime::provider::login::Login::open(
+                    &agent_runtime::provider::login::default_path()?,
+                    Some(redaction),
+                )
+            })
+            .await
+            .map_err(|_| Error::new("provider_login_unavailable"))??;
             (None, Some(Arc::new(login)))
         } else {
             let key = spec
@@ -1479,13 +1567,10 @@ pub async fn run(config: Configuration) -> Result<()> {
         if spec.sigv4 {
             let url = reqwest::Url::parse(&spec.url)
                 .map_err(|_| Error::with("invalid_provider_url", "the base URL does not parse"))?;
-            let (aws, unresolved) = agent_runtime::provider::aws::Aws::open(
-                &url,
-                Some(credentials.clone()),
-                &aws_start,
-            )
-            .await
-            .map_err(named)?;
+            let (aws, unresolved) =
+                agent_runtime::provider::aws::Aws::open(&url, Some(credentials.clone()), aws_start)
+                    .await
+                    .map_err(named)?;
             let mut signed = json!({"auth":"sigv4","region":aws.region(),
                 "credentials":aws.source()});
             // Keys the CLI cannot resolve yet leave this binding waiting on a
@@ -1504,17 +1589,53 @@ pub async fn run(config: Configuration) -> Result<()> {
         if spec.socket {
             provider = provider.with_socket()?;
         }
-        let provider = provider.with_stall_timeout(stall_timeout)?;
+        let provider = provider
+            .with_stall_timeout(self.stall_timeout)?
+            .with_windows(&spec.name, self.windows.clone());
         let (searches, speeds) = (provider.searches(), provider.speeds());
-        if providers.insert(spec.name.clone(), provider).is_some() {
-            return fail_with("duplicate_provider", spec.name.as_str());
-        }
         let mut binding = json!({"family":spec.family.name(),"url":spec.url,
             "transport":spec.transport(),"efforts":spec.family.efforts(),
             "speeds":speeds,
             "web_search":searches});
         if let Some(Value::Object(auth)) = auth {
             binding.as_object_mut().expect("object").extend(auth);
+        }
+        Ok((provider, binding))
+    }
+}
+
+pub async fn run(config: Configuration) -> Result<()> {
+    let limits = Limits::resolve(&config);
+    let transport = Transport::new(limits.connecting, limits.connections)?;
+    let stall_timeout = config
+        .stall_timeout
+        .map_or(agent_runtime::provider::STALL_TIMEOUT, Duration::from_secs);
+    let registry = Registry::all()?;
+    let mut providers = HashMap::new();
+    let aws_start = agent_runtime::provider::aws::Start::new();
+    let credentials = agent_runtime::tools::Credentials::default();
+    credentials.redact_also(&config.redact_fields, &config.redact_blocks);
+    // Every tool shell inherits the environment the daemon started with,
+    // so the excludes are matched against it once.
+    for (name, _) in std::env::vars_os() {
+        if let Some(name) = name.to_str()
+            && (config.shell_excludes.iter())
+                .any(|pattern| agent_runtime::tools::name_matches(pattern, name))
+        {
+            credentials.withhold(name);
+        }
+    }
+    let binder = Binder {
+        transport: transport.clone(),
+        credentials: credentials.clone(),
+        stall_timeout,
+        windows: config.context_windows.clone(),
+    };
+    let mut bindings = serde_json::Map::new();
+    for spec in &config.providers {
+        let (provider, binding) = binder.bind(spec, &aws_start).await?;
+        if providers.insert(spec.name.clone(), provider).is_some() {
+            return fail_with("duplicate_provider", spec.name.as_str());
         }
         bindings.insert(spec.name.clone(), binding);
     }
@@ -1525,16 +1646,18 @@ pub async fn run(config: Configuration) -> Result<()> {
     }
     let (store, publications) = Store::open_with(&config.store, limits.readers).await?;
     let (pending, pending_bytes) = (limits.pending, limits.pending_bytes);
+    let max_depth = config.max_depth;
     store
         .call(move |db| {
             db.set_pending_limits(pending, pending_bytes);
+            db.set_max_depth(max_depth);
             Ok(())
         })
         .await?;
     let mut environment = vec![
         (
             "AGENT_BIN".into(),
-            std::env::current_exe()?.to_string_lossy().into_owned(),
+            agent_bin()?.to_string_lossy().into_owned(),
         ),
         (
             "AGENT_STORE".into(),
@@ -1623,17 +1746,34 @@ pub async fn run(config: Configuration) -> Result<()> {
     let identity = store.instance_identity(lineage)?;
     // A pause outlives the daemon that took it.
     let paused = store.op("pause", |db| db.pause()).await?;
-    let ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
+    let reload = config.provider_config.clone().map(|path| {
+        Box::new(reload::Reload {
+            config: path,
+            binder: binder.clone(),
+            specs: config
+                .providers
+                .iter()
+                .map(|spec| spec.spec.clone())
+                .collect(),
+            bindings: bindings.clone(),
+            building: false,
+            again: false,
+            refreshing: None,
+            last: Value::Null,
+        })
+    });
+    let mut ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
         "paused":paused,
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
         "limits":{"processes":limits.processes,"lasting":limits.lasting,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,"input_bytes":limits.input_bytes,
             "readers":limits.readers,"connections":limits.connections,
             "load":(limits.load > 0.0).then_some(limits.load),
-            "idle_exit_seconds":config.idle_exit,
+            "idle_exit_seconds":config.idle_exit,"depth":config.max_depth,
             "stall_timeout_seconds":stall_timeout.as_secs()},
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
+        "context_windows":config.context_windows.json(),
         "durability":"sqlite_full","partial_text_durable":false});
     let mut sessions: HashMap<u64, Output> = HashMap::new();
     // The sandboxed bot each session on a bot's own socket answers as.
@@ -1750,11 +1890,13 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut service = Service {
         store,
         stepping: HashMap::new(),
+        lent: HashMap::new(),
         step_checks: JoinSet::new(),
         companions,
         identity,
         transport,
         providers: Arc::new(providers),
+        reload,
         registry,
         hub,
         handles,
@@ -1793,6 +1935,30 @@ pub async fn run(config: Configuration) -> Result<()> {
     // the config): every held turn is tried again at once.
     service.retry_held(None).await?;
     service.holds_due().await?;
+    if let Some(path) = config.models.clone() {
+        let refreshing = tokio::spawn(refresh_models(service.providers.clone(), path));
+        if let Some(reload) = service.reload.as_mut() {
+            reload.refreshing = Some(refreshing.abort_handle());
+        }
+    }
+    // The providers' config file, watched by the kernel: nothing runs
+    // until it changes.
+    let mut provider_changes = match service.reload.as_ref() {
+        Some(reload) => file_watch::watch(&reload.config).await,
+        None => None,
+    };
+    let (reloaded_sender, mut reloaded) = mpsc::unbounded_channel();
+    // An edit made while the daemon started, before the watch, is read
+    // once now; a file that names the set already bound binds nothing.
+    if provider_changes.is_some()
+        && let Some(reload) = service.reload.as_mut()
+    {
+        reload.start(
+            service.providers.clone(),
+            service.store.clone(),
+            reloaded_sender.clone(),
+        );
+    }
     let idle_exit = config
         .idle_exit
         .filter(|_| config.socket.is_some())
@@ -1822,6 +1988,16 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
                 Some(error) = failures.recv() => return Err(error),
                 _ = service.replays.join_next(), if !service.replays.is_empty() => {}
+                Some(()) = async { provider_changes.as_mut()?.recv().await } => {
+                    if let Some(reload) = service.reload.as_mut() {
+                        reload.start(service.providers.clone(), service.store.clone(), reloaded_sender.clone());
+                    }
+                }
+                Some(built) = reloaded.recv() => {
+                    if let Some(bindings) = service.reloaded(built, &reloaded_sender, config.models.clone()).await? {
+                        ready["providers"] = Value::Object(bindings);
+                    }
+                }
                 _ = service.retention.join_next(), if !service.retention.is_empty() => {}
                 joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
                     let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
@@ -1943,6 +2119,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                         Inbound::Closed(id) => {
                             sessions.remove(&id);
                             callers.remove(&id);
+                            service.lent.remove(&id);
                             companion_sessions.remove(&id);
                             service.sessions = sessions.len();
                             service.hub.close_session(id);
@@ -2200,9 +2377,12 @@ impl Service {
                 return refuse("serve approvals");
             }
             Command::ToolResult { .. } => return refuse("answer a declared tool call"),
+            Command::TakeCall { .. } => return refuse("take a declared tool call"),
             Command::ApproveStep { .. } => return refuse("put a declared call's step to a gate"),
             Command::StepResult { .. } => return refuse("record a declared call's step"),
             Command::Shutdown { .. } => return refuse("stop the daemon"),
+            // Its own is the one it has; another bot's would answer as it.
+            Command::Lend { .. } => return refuse("borrow a bot's socket"),
             // Any agent may pull the cord; letting the line go on is the
             // person's, from outside any sandbox.
             Command::Resume { .. } => return refuse("resume a pause"),
@@ -2264,9 +2444,15 @@ impl Service {
                 created_by,
                 created_by_id,
                 declare,
+                starts_line,
                 ..
             } => {
                 claim(created_by, created_by_id)?;
+                // Where a line starts is the person's, from outside any
+                // sandbox, or a confined bot could make a line without end.
+                if *starts_line {
+                    return refuse("start a line");
+                }
                 if declare.iter().flatten().any(|tool| !passes(tool)) {
                     return refuse("declare a tool a client answers that it can't pass on");
                 }
@@ -2691,6 +2877,55 @@ impl Service {
             Err(error) => Err(error),
         }
     }
+    /// A finished reload build: an applied set is swapped in for the turns
+    /// that start from now on, held turns are tried again (a provider they
+    /// waited on may be back), and the model list is refreshed from the
+    /// new set. The new `ready.providers` when the set changed.
+    async fn reloaded(
+        &mut self,
+        built: Result<Option<reload::Built>>,
+        again: &mpsc::UnboundedSender<Result<Option<reload::Built>>>,
+        models: Option<PathBuf>,
+    ) -> Result<Option<serde_json::Map<String, Value>>> {
+        if self.reload.is_none() {
+            return Ok(None);
+        }
+        // Asked again in the run loop, after every admission already
+        // stored: one accepted while the set was built is counted too.
+        let built = match built {
+            Ok(Some(built)) => reload::unused(&self.store, &built.unusable)
+                .await
+                .map(|()| Some(built)),
+            other => other,
+        };
+        let Some(reload) = self.reload.as_mut() else {
+            return Ok(None);
+        };
+        let rebuild = reload.finished(&built);
+        let applied = match built {
+            Ok(Some(built)) => {
+                self.providers = Arc::new(built.providers);
+                Some(built.bindings)
+            }
+            _ => None,
+        };
+        if rebuild && let Some(reload) = self.reload.as_mut() {
+            reload.start(self.providers.clone(), self.store.clone(), again.clone());
+        }
+        if applied.is_some() {
+            self.retry_held(None).await?;
+            if let Some(path) = models {
+                let refreshing = tokio::spawn(refresh_models(self.providers.clone(), path));
+                if let Some(reload) = self.reload.as_mut()
+                    && let Some(older) = reload.refreshing.replace(refreshing.abort_handle())
+                {
+                    older.abort();
+                }
+            }
+        }
+        Ok(applied)
+    }
+
     /// Try every held turn again now, or only `bot`'s, as the person may
     /// have fixed what held them: those parked on a call wake, and those
     /// held in line go to the dispatcher. Returns how many.
@@ -3114,6 +3349,7 @@ impl Service {
         if lifted {
             lift.arm();
         }
+        let given_rules: Arc<std::sync::Mutex<_>> = Arc::default();
         let slot = (self.active)
             .start(bot.clone(), |slot| Active {
                 turn,
@@ -3123,6 +3359,7 @@ impl Service {
                 compact: compact.clone(),
                 lift: lift.clone(),
                 slot,
+                given_rules: given_rules.clone(),
             })
             .slot
             .clone();
@@ -3138,6 +3375,7 @@ impl Service {
             background_failures: self.background_failures.clone(),
             settings: Default::default(),
             rules: Default::default(),
+            given_rules,
             ruled: Default::default(),
             window: Default::default(),
             resumed,
@@ -3262,6 +3500,7 @@ impl Service {
                 instructions,
                 effort,
                 budget_tokens,
+                budget_counts,
                 tools,
                 created_by,
                 created_by_id,
@@ -3274,10 +3513,12 @@ impl Service {
                 mut settings,
                 declare,
                 request_id,
+                starts_line,
             } => {
                 if budget_tokens == Some(0) {
                     return fail_with("invalid_budget", "budget_tokens must be at least 1");
                 }
+                let budget_counts = counts(budget_tokens, budget_counts)?;
                 if let Some(key) = &request_id {
                     name("request_id", key)?;
                 }
@@ -3372,6 +3613,7 @@ impl Service {
                                 instructions: &instructions,
                                 effort: effort.as_deref(),
                                 budget_tokens,
+                                budget_counts,
                                 tools: &tools,
                                 created_by: created_by.as_deref(),
                                 created_by_id,
@@ -3382,6 +3624,7 @@ impl Service {
                                 settings: *settings,
                                 declared: declare.as_deref(),
                                 request_id: request_id.as_deref(),
+                                starts_line,
                             },
                         )?;
                         let cursor = event.as_ref().and_then(|e| e["cursor"].as_i64());
@@ -3558,7 +3801,20 @@ impl Service {
                 if let Some(declare) = &declare {
                     validate_declared(declare)?;
                 }
-                if let Some(turn) = self.active.get(&bot).and_then(Active::running) {
+                // The command rules alone may change while a turn runs: its
+                // next round takes them, and a round already announced keeps
+                // the rules it was announced under.
+                let rules_only = settings
+                    .as_ref()
+                    .is_some_and(|changes| changes.len() == 1 && changes.contains_key("rules"))
+                    && instructions.is_none()
+                    && model.is_none()
+                    && gate.is_none()
+                    && declare.is_none()
+                    && fallback.is_none()
+                    && compaction_instructions.is_none()
+                    && compaction_model.is_none();
+                if !rules_only && let Some(turn) = self.active.get(&bot).and_then(Active::running) {
                     return Err(Error::with(
                         "bot_busy",
                         format!("turn {turn} of {bot} is running"),
@@ -3670,11 +3926,17 @@ impl Service {
                     }
                     None => None,
                 };
+                // Rules given reach turns running now, its own (which only
+                // a change of rules alone may meet) and its kin's.
+                let given_rules = (named.iter().any(|key| key == "rules"))
+                    .then_some(given.as_ref())
+                    .flatten()
+                    .map(|given| given.rules.clone().unwrap_or_default());
                 let answer = store
                     .op("configure", move |db| {
                         let id = db.identity(&bot, bot_id)?;
                         // A parked turn reads the bot again when it resumes.
-                        if let Some(turn) = db.inspect(&bot)?.running_turn {
+                        if !rules_only && let Some(turn) = db.inspect(&bot)?.running_turn {
                             return Err(Error::with(
                                 "bot_busy",
                                 format!("turn {turn} of {bot} is running"),
@@ -3688,8 +3950,12 @@ impl Service {
                         {
                             changed.push("gates".into());
                         }
+                        let mut kin = Vec::new();
                         if let Some(given) = &given {
-                            changed.extend(db.set_settings(&bot, Some(id), &named, given)?);
+                            let (set, of_kin) =
+                                db.set_settings_of_kin(&bot, Some(id), &named, given)?;
+                            changed.extend(set);
+                            kin = of_kin;
                         }
                         if let Some((provider, name)) = &model
                             && db.set_model(&bot, Some(id), provider, name, effort.as_deref())?
@@ -3721,11 +3987,29 @@ impl Service {
                             .into_iter()
                             .map(String::from),
                         );
-                        Ok(json!({"bot":bot,"bot_id":id,"changed":changed}))
+                        Ok((json!({"bot":bot,"bot_id":id,"changed":changed}), kin))
                     })
                     .await?;
+                let (answer, kin) = answer;
                 // Followers read the bot again; nothing durable to replay.
                 if answer["changed"].as_array().is_some_and(|c| !c.is_empty()) {
+                    let name = answer["bot"].as_str().unwrap_or_default();
+                    // Its running turn and those of the bots it made, and
+                    // theirs, which go by its rules, each at its next round:
+                    // the walk the store made for them names them, so a
+                    // change costs one look per such bot and no round pays.
+                    if let Some(policy) = given_rules {
+                        let rules = Arc::new(agent_runtime::rules::Rules::new(policy));
+                        for running in std::iter::once(name)
+                            .chain(kin.iter().map(String::as_str))
+                            .filter_map(|bot| self.active.get(bot))
+                        {
+                            *running
+                                .given_rules
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(rules.clone());
+                        }
+                    }
                     let mut event = answer.clone();
                     event["event"] = json!("configured");
                     event["durable"] = json!(false);
@@ -3772,6 +4056,53 @@ impl Service {
                 }
                 Ok(answer)
             }
+            Command::Lend { bot, bot_id } => {
+                let record = store
+                    .op("inspect", move |db| {
+                        if bot_id.is_some() {
+                            db.identity(&bot, bot_id)?;
+                        }
+                        db.inspect(&bot)
+                    })
+                    .await?;
+                let id = record.bot_id;
+                // As its turns' commands get them, past what only a turn has.
+                let mut environment: Vec<(String, String)> = (record.settings.env.iter())
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                environment.push(("AGENT_BOT".into(), record.name.clone()));
+                environment.push(("AGENT_BOT_ID".into(), id.to_string()));
+                let mut policy = None;
+                if record.sandboxed() {
+                    let root = (record.workspace.clone().map(std::path::PathBuf::from))
+                        .ok_or_else(|| {
+                            Error::with("sandbox_unavailable", "the bot has no folder")
+                        })?;
+                    // Opening its socket may bind: off the runtime thread,
+                    // as for its turns.
+                    let (daemon, settings) =
+                        (self.registry.daemon().clone(), record.settings.clone());
+                    policy = tokio::task::spawn_blocking(move || {
+                        turn::bot_sandbox(&settings, &root, id, &daemon)
+                    })
+                    .await
+                    .map_err(|_| Error::new("sandbox_unavailable"))??;
+                }
+                if let Some(policy) = policy.as_mut() {
+                    // Held for the session, as for one of the bot's own
+                    // commands: its socket, and its placeholders and what
+                    // its command may not leave, gone once the session is.
+                    let hold = agent_runtime::sandbox::hold(policy).await;
+                    self.lent.entry(session).or_default().push(hold);
+                    policy.listening = None;
+                    if let Some(own) = policy.reach() {
+                        environment.push(("AGENT_SOCKET".into(), own.display().to_string()));
+                    }
+                }
+                let env =
+                    agent_runtime::tools::shell_environment_whole(&self.registry, &environment);
+                Ok(json!({"bot": record.name, "bot_id": id, "policy": policy, "env": env}))
+            }
             Command::Inspect { bot, bot_id } => {
                 store
                     .op("inspect", move |db| {
@@ -3786,25 +4117,7 @@ impl Service {
                 // Off the dispatch path: a listing waits on the network.
                 let (providers, output) = (self.providers.clone(), output.clone());
                 tokio::spawn(async move {
-                    let mut names: Vec<String> = providers.keys().cloned().collect();
-                    names.sort();
-                    // A few at a time, so bodies being read stay a few limits'
-                    // worth, and all within one deadline however many there are.
-                    let by = tokio::time::Instant::now() + Duration::from_secs(15);
-                    let asks = names.clone().into_iter().map(|name| {
-                        let providers = providers.clone();
-                        async move {
-                            tokio::time::timeout_at(by, providers[&name].models())
-                                .await
-                                .unwrap_or_else(|_| Err(Error::new("provider_models_deadline")))
-                        }
-                    });
-                    let listed: Vec<_> = futures_util::StreamExt::collect(
-                        futures_util::StreamExt::buffered(futures_util::stream::iter(asks), 4),
-                    )
-                    .await;
-                    let answer = fit_listings(names.into_iter().zip(listed), output::MAX_EVENT)
-                        .map(|answer| json!({"providers": answer}));
+                    let answer = provider_models(providers).await;
                     retention_reply(session, &output, id, answer).await;
                 });
                 Err(Error::new("deferred"))
@@ -3955,7 +4268,10 @@ impl Service {
                     "pending_bytes": pending_bytes,
                     "pending_limit": self.limits.pending,
                     "pending_bytes_limit": self.limits.pending_bytes,
-                    "running_processes": running,
+                    // What process_limit bounds: the background commands
+                    // whose results the store has yet to record, waiting
+                    // for a slot or not, and the foreground ones running.
+                    "running_processes": running + self.registry.foreground_running() as i64,
                     "queued_processes": self.registry.pending(),
                     "process_limit": self.limits.processes,
                     // Terminals and detached commands, which --max-lasting
@@ -3969,6 +4285,7 @@ impl Service {
                         .map(|shut| json!({"limit": self.limits.load, "shut": shut})),
                     "transport": {"in_flight_by_shard": self.transport.loads()},
                     "providers": providers,
+                    "provider_reload": self.reload.as_ref().map(|reload| &reload.last),
                     "store": store.stats(),
                     "tokens": self.tokens.snapshot(),
                     "handles": {"waiters": waiters, "retained": retained},
@@ -4239,6 +4556,16 @@ impl Service {
                     })
                     .await
             }
+            Command::TakeCall { bot, turn, call_id } => {
+                if call_id.is_empty() {
+                    return fail_with("invalid_call_id", "call_id may not be empty");
+                }
+                store
+                    .op("take_call", move |db| {
+                        db.take_call(&bot, turn, &call_id, now_ms())
+                    })
+                    .await
+            }
             Command::ToolCalls { tag, after, limit } => {
                 store
                     .op("tool_calls", move |db| {
@@ -4371,6 +4698,7 @@ impl Service {
                 bot,
                 workspace: path,
                 budget_tokens,
+                budget_counts,
                 created_by,
                 created_by_id,
                 approve,
@@ -4383,6 +4711,7 @@ impl Service {
                 if budget_tokens == Some(0) {
                     return fail_with("invalid_budget", "budget_tokens must be at least 1");
                 }
+                let budget_counts = counts(budget_tokens, budget_counts)?;
                 if expire_ms.is_some_and(|ms| !(1000..=MAX_EXPIRE_MS).contains(&ms)) {
                     return fail_with("invalid_expire", "expire_ms is from 1 s to 7 days");
                 }
@@ -4435,6 +4764,7 @@ impl Service {
                                 checkpoint,
                                 workspace: path.as_deref(),
                                 budget_tokens,
+                                budget_counts,
                                 created_by: created_by.as_deref(),
                                 created_by_id,
                                 gate: gate.as_ref(),
@@ -4583,8 +4913,10 @@ impl Service {
                 person,
                 quotes,
                 budget_tokens,
+                budget_counts,
                 images,
                 wait_ms,
+                output_schema,
             } => {
                 name("request_id", &request_id)?;
                 let images = images_checked(
@@ -4664,6 +4996,36 @@ impl Service {
                         "attach joins the bot's next model call, so it takes no workspace, model, effort or budget_tokens",
                     );
                 }
+                // A steer or an attached message joins a turn whose reply
+                // was asked for already.
+                if output_schema.is_some() && matches!(delivery, Delivery::Steer | Delivery::Attach)
+                {
+                    return fail_with(
+                        "invalid_delivery",
+                        "output_schema shapes the reply of the turn it starts; a steer or an attached message joins one, so send it with reject or queue",
+                    );
+                }
+                let output_schema = match output_schema {
+                    None => None,
+                    Some(schema @ Value::Object(_)) => {
+                        let text = schema.to_string();
+                        if text.len() > MAX_OUTPUT_SCHEMA_BYTES {
+                            return fail_with(
+                                "invalid_output_schema",
+                                format!(
+                                    "output_schema may be up to {MAX_OUTPUT_SCHEMA_BYTES} bytes as JSON"
+                                ),
+                            );
+                        }
+                        Some(text)
+                    }
+                    Some(_) => {
+                        return fail_with(
+                            "invalid_output_schema",
+                            "output_schema is a JSON Schema object",
+                        );
+                    }
+                };
                 if wait_ms.is_some() && delivery != Delivery::Attach {
                     return fail_with(
                         "invalid_delivery",
@@ -4682,6 +5044,7 @@ impl Service {
                         format!("budget_tokens must be from 1 to {}", i64::MAX),
                     );
                 }
+                let budget_counts = counts(budget_tokens, budget_counts)?;
                 // A turn may run in another checkout or on another model of
                 // the same family; the conversation encoding never changes.
                 let options = TurnOptions {
@@ -4695,8 +5058,10 @@ impl Service {
                     person,
                     quotes,
                     budget_tokens,
+                    budget_counts,
                     images,
                     wait_ms,
+                    output_schema,
                 };
                 // A slot is promised before the commit that may take it, so
                 // admissions queued together cannot start more turns than
@@ -5097,6 +5462,55 @@ async fn retention_reply(session: u64, output: &Output, id: Value, result: Resul
     sent
 }
 
+/// Every provider's listing, as `provider_models` answers: a few asked at
+/// a time, so bodies being read stay a few limits' worth, and all within
+/// one deadline however many there are.
+async fn provider_models(providers: Arc<HashMap<String, Provider>>) -> Result<Value> {
+    let mut names: Vec<String> = providers.keys().cloned().collect();
+    names.sort();
+    let by = tokio::time::Instant::now() + Duration::from_secs(15);
+    let asks = names.clone().into_iter().map(|name| {
+        let providers = providers.clone();
+        async move {
+            tokio::time::timeout_at(by, providers[&name].models())
+                .await
+                .unwrap_or_else(|_| Err(Error::new("provider_models_deadline")))
+        }
+    });
+    let listed: Vec<_> = futures_util::StreamExt::collect(futures_util::StreamExt::buffered(
+        futures_util::stream::iter(asks),
+        4,
+    ))
+    .await;
+    // Each entry names its provider's API family and effort levels, as
+    // `ready.providers` does, so a client connected before a reload added
+    // a provider can still tell which models its agent may switch to and
+    // at what effort; room for that is held back from the listings.
+    const BOUND: usize = 128;
+    let limit = output::MAX_EVENT.saturating_sub(BOUND * names.len());
+    let mut answer = fit_listings(names.into_iter().zip(listed), limit)?;
+    for (name, entry) in answer.iter_mut() {
+        if let (Some(provider), Some(entry)) = (providers.get(name), entry.as_object_mut()) {
+            let family = provider.family();
+            entry.insert("family".into(), json!(family.name()));
+            entry.insert("efforts".into(), json!(family.efforts()));
+        }
+    }
+    Ok(json!({"providers": answer}))
+}
+
+/// The model catalog at `path`, rewritten from every provider's listing
+/// once the daemon serves: after `ready`, so a start waits on no provider,
+/// and the listings stay kept for the clients that ask next. A provider
+/// that did not answer keeps its lines as they were.
+async fn refresh_models(providers: Arc<HashMap<String, Provider>>, path: PathBuf) {
+    let Ok(listing) = provider_models(providers).await else {
+        return;
+    };
+    let _ =
+        tokio::task::spawn_blocking(move || agent_client::models::refresh(&path, &listing)).await;
+}
+
 /// One `provider_models` reply carries every listing, so it must fit one
 /// event of `limit` bytes: a listing past what is left is refused by name
 /// rather than failing the whole answer. Room for each refusal is held back
@@ -5148,6 +5562,32 @@ fn fit_listings(
     Ok(answer)
 }
 
+/// The program this daemon hands its agents as `AGENT_BIN`: the one its
+/// starter named in `AGENT_BIN` when that is this same program (the same
+/// file under another name, or a copy of it of the same length and time of
+/// writing), as a client that starts the daemon by a name of its own
+/// gives it; else this daemon's own.
+fn agent_bin() -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let exe = std::env::current_exe()?;
+    let named = std::env::var_os("AGENT_BIN").map(std::path::PathBuf::from);
+    let same = |given: &std::path::Path| {
+        let (Ok(given), Ok(own)) = (std::fs::metadata(given), std::fs::metadata(&exe)) else {
+            return false;
+        };
+        (given.dev(), given.ino()) == (own.dev(), own.ino())
+            || (given.len() == own.len()
+                && given.modified().ok().is_some()
+                && given.modified().ok() == own.modified().ok())
+    };
+    Ok(
+        match named.filter(|given| given.is_absolute() && same(given)) {
+            Some(given) => given,
+            None => exe,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -5185,6 +5625,7 @@ mod tests {
             compact: Arc::default(),
             lift: Arc::default(),
             slot: Slot::alone(),
+            given_rules: Default::default(),
         };
         assert!(active.cancel(turn::INTERRUPTED));
         assert!(active.cancel(turn::SHUTDOWN));
@@ -5284,6 +5725,13 @@ mod tests {
             "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
         );
         assert!(openai.sigv4);
+        let runtime = parse("bedrock-openai-runtime");
+        assert_eq!(runtime.family, Family::Responses);
+        assert_eq!(
+            runtime.url,
+            "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"
+        );
+        assert!(runtime.sigv4);
         // AWS_DEFAULT_REGION is the fallback name the AWS CLI also reads.
         let fallback = |name: &str| (name == "AWS_DEFAULT_REGION").then(|| "eu-west-1".to_owned());
         assert_eq!(
@@ -5305,7 +5753,7 @@ mod tests {
             "AWS_REGION" => Some("us-west-2".to_owned()),
             _ => None,
         };
-        for name in ["bedrock", "bedrock-openai"] {
+        for name in ["bedrock", "bedrock-openai", "bedrock-openai-runtime"] {
             let keyed = ProviderSpec::parse_with(name, &keyed_env, &none).unwrap();
             assert_eq!(keyed.key_env.as_deref(), Some("AWS_BEARER_TOKEN_BEDROCK"));
             assert!(!keyed.sigv4 && keyed.url.contains(".us-west-2."));
@@ -5427,6 +5875,7 @@ mod tests {
                         instructions: "test",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -5437,6 +5886,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )?;
                 let turn = db
@@ -5456,6 +5906,7 @@ mod tests {
         let mut service = Service {
             store: store.clone(),
             stepping: HashMap::new(),
+            lent: HashMap::new(),
             step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
@@ -5465,6 +5916,7 @@ mod tests {
             identity: 0,
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
+            reload: None,
             registry: Registry::new("wait").unwrap(),
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),
@@ -5491,6 +5943,7 @@ mod tests {
                 compact: Arc::default(),
                 lift: Arc::default(),
                 slot,
+                given_rules: Default::default(),
             }),
             next_task: 1,
             jobs: JoinSet::new(),
@@ -5577,6 +6030,7 @@ mod tests {
             compact: Arc::default(),
             lift: Arc::default(),
             slot: Slot::alone(),
+            given_rules: Default::default(),
         };
         // A pause only parks the turn: an interrupt after it ends it.
         let (cancel, cause) = watch::channel(None);
@@ -5612,6 +6066,7 @@ mod tests {
                         instructions: "test",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -5622,6 +6077,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )?;
                 let turn = db
@@ -5663,6 +6119,7 @@ mod tests {
         let mut service = Service {
             store: store.clone(),
             stepping: HashMap::new(),
+            lent: HashMap::new(),
             step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
@@ -5672,6 +6129,7 @@ mod tests {
             identity: 0,
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
+            reload: None,
             registry: Registry::new("wait").unwrap(),
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),
@@ -5698,6 +6156,7 @@ mod tests {
                 compact: Arc::default(),
                 lift: Arc::default(),
                 slot,
+                given_rules: Default::default(),
             }),
             next_task: 1,
             jobs: JoinSet::new(),
@@ -5831,8 +6290,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saturated_dispatch_reconciles_duplicates_but_rejects_new_work() {
-        let dir = std::env::temp_dir().join(format!("agent-admission-test-{}", std::process::id()));
+    async fn a_provider_an_unfinished_turn_names_is_in_use() {
+        let dir = std::env::temp_dir().join(format!("agent-in-use-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
         let binding = || Binding {
             provider: "openai",
@@ -5841,6 +6301,7 @@ mod tests {
             instructions: "test",
             effort: None,
             budget_tokens: None,
+            budget_counts: Default::default(),
             tools: &[],
             created_by: None,
             created_by_id: None,
@@ -5851,6 +6312,70 @@ mod tests {
             settings: Default::default(),
             declared: None,
             request_id: None,
+            starts_line: false,
+        };
+        let in_use = |providers: &[&str]| {
+            let providers: Vec<String> = providers.iter().map(|p| (*p).to_owned()).collect();
+            let store = store.clone();
+            async move {
+                store
+                    .op("bots_on_providers", move |db| {
+                        db.bots_on_providers(&providers)
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        store
+            .op("create", move |db| {
+                db.create("Bob", Some("/synthetic"), binding())?;
+                db.create("Cy", Some("/synthetic"), binding())?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(in_use(&["other"]).await.is_empty());
+        assert_eq!(in_use(&["openai"]).await, ["Bob", "Cy"]);
+        // Bob's next turn asks for a model of another provider.
+        store
+            .op("begin", |db| {
+                let options = TurnOptions {
+                    model: Some("other/synthetic-model".into()),
+                    ..Default::default()
+                };
+                db.begin("Bob", "r1", "work", true, &options, |_, _| Ok(()))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(in_use(&["other"]).await, ["Bob"]);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saturated_dispatch_reconciles_duplicates_but_rejects_new_work() {
+        let dir = std::env::temp_dir().join(format!("agent-admission-test-{}", std::process::id()));
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let binding = || Binding {
+            provider: "openai",
+            family: Family::Responses,
+            model: "synthetic-model",
+            instructions: "test",
+            effort: None,
+            budget_tokens: None,
+            budget_counts: Default::default(),
+            tools: &[],
+            created_by: None,
+            created_by_id: None,
+            compaction_instructions: None,
+            compaction_model: None,
+            fallback: None,
+            gate: None,
+            settings: Default::default(),
+            declared: None,
+            request_id: None,
+            starts_line: false,
         };
         let turn = store
             .op("create", move |db| {
@@ -5883,6 +6408,7 @@ mod tests {
             identity: 0,
             store: store.clone(),
             stepping: HashMap::new(),
+            lent: HashMap::new(),
             step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
@@ -5891,6 +6417,7 @@ mod tests {
             ),
             transport,
             providers: Arc::new(HashMap::from([("openai".to_owned(), provider)])),
+            reload: None,
             registry,
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),
@@ -5918,6 +6445,7 @@ mod tests {
                     compact: Arc::default(),
                     lift: Arc::default(),
                     slot,
+                    given_rules: Default::default(),
                 })
             }),
             next_task: 0,
@@ -6023,8 +6551,10 @@ mod tests {
             person: None,
             quotes: None,
             budget_tokens: None,
+            budget_counts: Default::default(),
             images: None,
             wait_ms: None,
+            output_schema: None,
         }
     }
     /// Take requests the way the run loop does: an admission with room joins
@@ -6094,6 +6624,7 @@ mod tests {
                                 instructions: "",
                                 effort: None,
                                 budget_tokens: None,
+                                budget_counts: Default::default(),
                                 tools: &[],
                                 created_by: None,
                                 created_by_id: None,
@@ -6104,6 +6635,7 @@ mod tests {
                                 settings: Default::default(),
                                 declared: None,
                                 request_id: None,
+                                starts_line: false,
                             },
                         )?;
                         let turn = db
@@ -6128,6 +6660,7 @@ mod tests {
             identity: 0,
             store: store.clone(),
             stepping: HashMap::new(),
+            lent: HashMap::new(),
             step_checks: JoinSet::new(),
             companions: companions::Companions::new(
                 std::path::Path::new("/nonexistent"),
@@ -6136,6 +6669,7 @@ mod tests {
             ),
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
+            reload: None,
             registry: Registry::new("echo").unwrap(),
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),
@@ -6205,6 +6739,50 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_parked_task_reaped_after_its_turn_resumed_leaves_the_new_task_in_place() {
+        let dir = std::env::temp_dir().join(format!("agent-late-reap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turns = running(&store, &["Bob".into()]).await;
+        let bob = turns[0].1;
+        let mut service = bare_service(&store);
+        // Task 1 parked Bob's turn; a wake-up resumed it as task 2 before
+        // task 1 was reaped.
+        service.active.start("Bob".into(), |slot| Active {
+            turn: bob,
+            task: 2,
+            cancel: watch::channel(None).0,
+            steers: Arc::default(),
+            compact: Arc::default(),
+            lift: Arc::default(),
+            slot,
+            given_rules: Default::default(),
+        });
+        let later = now_ms() + 60_000;
+        for exit in [turn::Exit::Paced(later), turn::Exit::Parked] {
+            service
+                .complete("Bob".into(), bob, 1, Ok(exit))
+                .await
+                .unwrap();
+            // Task 2 still owns the bot and its slot, and the old park sets
+            // no wake-up for a turn that already runs.
+            assert_eq!(service.active.get("Bob").map(|a| a.task), Some(2));
+            assert_eq!(service.active.holding(), 1);
+            assert_eq!(service.wakes.next(), None);
+        }
+        // Task 2's own completion is the one that lets the bot go.
+        service
+            .complete("Bob".into(), bob, 2, Ok(turn::Exit::Paced(later)))
+            .await
+            .unwrap();
+        assert!(service.active.is_empty());
+        assert_eq!(service.wakes.next(), Some(later));
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -6405,6 +6983,7 @@ mod tests {
                         instructions: "",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -6415,6 +6994,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )?;
                 // No slot was free when it was accepted, so it queued.
@@ -6492,6 +7072,7 @@ mod tests {
                         instructions: "",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -6502,6 +7083,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )
                 .map(|_| ())
@@ -6740,6 +7322,7 @@ mod tests {
             instructions: Some(String::new()),
             effort: None,
             budget_tokens: None,
+            budget_counts: Default::default(),
             tools: Some(Vec::new()),
             created_by: None,
             created_by_id: None,
@@ -6752,6 +7335,7 @@ mod tests {
             settings: Box::default(),
             declare: None,
             request_id: None,
+            starts_line: false,
         }
     }
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -7462,6 +8046,7 @@ mod tests {
                             instructions: "",
                             effort: None,
                             budget_tokens: None,
+                            budget_counts: Default::default(),
                             tools: &tools,
                             created_by: creator.as_ref().map(|c| c.name.as_str()),
                             created_by_id: creator.as_ref().map(|c| c.bot_id),
@@ -7472,6 +8057,7 @@ mod tests {
                             settings: Default::default(),
                             declared: None,
                             request_id: None,
+                            starts_line: false,
                         },
                     )?;
                     creator = Some(bot);
@@ -7747,6 +8333,7 @@ mod tests {
                         instructions: "",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &tools,
                         created_by: None,
                         created_by_id: None,
@@ -7757,6 +8344,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )?;
                 let turn = db

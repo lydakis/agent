@@ -38,7 +38,7 @@ pub enum Mode {
 const GIT_PROTECTED: [&str; 5] = ["hooks", "config", "config.worktree", "modules", "commondir"];
 
 /// A folder the bot may write, and what inside it stays read-only.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Root {
     pub path: PathBuf,
     /// Existing paths inside the root that stay read-only.
@@ -53,8 +53,9 @@ pub struct Root {
 }
 
 /// What a sandboxed command may do: write its roots, and reach the network
-/// when `network` is on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// when `network` is on. `lend` sends it as the daemon built it, all but
+/// what keeps the bot's socket listening, which stays in the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
     /// Shallowest first: a deeper root decides for what is inside it.
     pub roots: Vec<Root>,
@@ -68,6 +69,7 @@ pub struct Policy {
     pub capability: Option<PathBuf>,
     /// What keeps that socket listening: it lives while the policy, or a
     /// command's [`Hold`] of it, does.
+    #[serde(skip)]
     pub listening: Option<Listening>,
     /// The agent binary a confined write runs in ([`WRITE`]).
     pub helper: Option<PathBuf>,

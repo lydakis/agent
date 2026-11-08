@@ -5,20 +5,28 @@
 //!
 //! ```toml
 //! model = "anthropic/claude-opus-5-5"  # a new agent's, with none named
-//! provider = "chatgpt"          # the daemon's, with no AGENT_PROVIDER
+//! provider = "chatgpt"          # the daemon's, with no AGENT_PROVIDER; an edit applies to its next turns
 //! web_search = "disabled"       # "live", the default, lets new agents search and fetch
+//! web_search_off = ["bedrock-openai/xai.*"]  # models a new agent gets no search on, * and ? wildcards
 //! senders = "hidden"            # "shown", the default, labels what agents send
 //! attach_wait = "1d"            # how long an attached note waits for a call, the default; "0" as long as it takes
 //! hold = "5d"                   # how long a new agent's turn waits on a cause you can fix before it fails, the default; "0" fails at once
+//! prices = "~/sheets/llm.toml"  # the price sheet /usage costs from, ~/.agent/prices.toml by default; see `prices`
 //!
 //! [daemon]                      # what the agent CLI starts the daemon with; restart it to apply
 //! processes = "cpus * 64"       # commands running at once, the default
 //! load = "cpus * 2"             # new commands wait while the load average is this, the default; 0 no gate
 //! input_bytes = "memory / 16"   # also lasting, active, connecting, pending, pending_bytes, readers
 //! stall_timeout = "10m"         # a provider stream with no content this long is retried, the default
+//! depth = 3                     # generations a new agent may be below the one that starts its line, 2 by default; 0 no end
 //!
 //! [fallbacks]                   # the model a declined request goes to, by model
 //! "anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"
+//!
+//! [context_windows]             # tokens a model's context holds, over its provider's listing; restart the daemon to apply
+//! "bedrock/*" = 400000          # by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
+//! "bedrock/*openai.*" = 1000000 # every OpenAI model on Bedrock
+//! "anthropic/claude-opus-5-5" = 500000  # lower than the model's own on purpose
 //!
 //! [judge]
 //! model = "openai/gpt-6-luna"   # who judges for the approver and the lookout
@@ -31,29 +39,39 @@
 //! [sonny]
 //! lead_effort = "medium"        # a new lead's effort
 //! task_effort = "high"          # each new task's
+//! task_speed = "fast"          # each new task's speed where its provider serves it; else its starter's on the same model
 //! lead_profile = "my-lead"      # the role a new lead starts in, not lead
 //! task_profile = "worker"       # what every other agent is told, not task
-//! side_chat = "fork"            # "answer", the default, calls no tool
+//! side_chat = "answer"          # calls no tool; "fork", the default, may do anything its agent may
 //! chime = false                 # rings when work ends or waits, the default
+//! steps = true                  # the agent's steps between what is said; words only by default
 //! verbose = true                # every tool call drawn, not the clean view
 //! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
 //! margin_opens = "never"         # "always", the default, or "unless-closed"
+//! margin_notes = 8              # the most notes a margin holds, 6 by default; past it a new one is refused
+//! margin_note_lines = 20         # the most lines a note's Markdown runs to, 12 by default; past it the note is refused
 //! agent_opens = "beside"        # a click on an agent's name: "tab", the default, or "beside"
 //! suggest = false               # no guess at the next message, on by default
+//! needs_check = false           # no copy says whether a reply waits on you, on by default
+//! task_done_check = 24          # hours a task sits idle before a copy says whether it is done, 8 by default; 0 never
 //! commons = false               # agents go without the commons, on by default
 //! commons_invites = 3           # least threads a day that send invites (more with the square root of the week's agents), 0 none; answers add up to as many again
-//! commons_invite_tokens = 1000000  # what an invite pays for in its thread
+//! commons_invite_tokens = 1000000  # the budget of the turn an invite starts, in tokens of work
 //! ask_wait_minutes = 60         # how long an unanswered ask waits to go ahead or remind; 0 never
+//! task_tabs = "every"         # which tasks open in a tab: "asked", the default, those an agent or you asked for; "every", each as its turn starts
 //! task_windows = 64            # task windows a lead keeps open, 32 by default; past it the least recently used closes, never one not looked at yet; 0 no limit
-//! task_depth = 3                # generations of tasks below a lead, 2 by default (tasks' own start none); 0 no end
-//! sky_haikus = 0                # haikus a day from the sky's busiest agent, 8 by default; 0 none
+//! sky_haikus = false            # no haikus from the sky's busiest agent, on by default
+//! sky_haiku_daily = 8           # haikus a day at most; 0, the default, no limit but the title's hold
+//! sky_haiku_keep = 168          # hours haikus are kept for replays, 24 by default; 0 keeps all
 //! sky_haiku_window = 10         # minutes of messages and tool calls that make an agent busiest
 //! sky_haiku_margin = 50         # how much busier, in percent, a challenger must be to take the title
 //! sky_haiku_hold = 10           # minutes the title is held before it can pass
-//! tool_processes = 8            # processes Sonny runs for agents at once in all: tool calls 3/4, goal checks 1/4; 0, the default, four times the CPUs
+//! tool_processes = 8            # processes Sonny runs for agents' tool calls at once in all; 0, the default, four times the CPUs
 //! lookout_waiting = 4096        # events from sources that wait for one agent, 1024 by default; past it newer ones are not kept, and its next note says so; 0 no limit
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
+//! hours = ["Mon-Fri 09:00-19:00"]  # the person's working hours, local; outside them Sonny goes quiet once no window is used for quiet_after. Unset, the default: quiet only with /quiet
+//! quiet_after = "30m"           # how long no Sonny window is used, outside hours, before quiet starts; 30m by default
 //!
 //! [sonny.permissions.strict]    # a /permissions row of the person's own, as Codex's profiles
 //! description = "Offline, commits ask"
@@ -77,6 +95,9 @@
 //! every = "1m"                  # how long after it exits it runs again
 //! digest = "15m"                # a subscriber hears it at most this often; unset, as it comes
 //! steer = { from = ["boss"] }   # what cuts into a busy subscriber's turn, as a filter is written
+//! watch = ["~/bin/slack-poll"]  # files whose edit starts it again on them; unset, none
+//! icon = "▲"                    # one character marking it wherever Sonny names it: /status, /background, news rows
+//! wants = "channel"             # a field of its events: the values subscriptions' filters name are written for the command
 //! [sonny.sources.commons]       # Sonny's own source: the commons threads an agent posted in
 //! digest = "15m"                # the default; 0 at once. Takes digest and steer alone
 //! ```
@@ -89,6 +110,9 @@ use std::path::{Path, PathBuf};
 /// The largest file the reader takes.
 pub const LIMIT: u64 = 64 * 1024;
 
+/// The least context window `[context_windows]` sets, as the daemon takes it.
+pub const MIN_WINDOW: u64 = 1024;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Config {
     /// `provider/model` for a new agent that names none.
@@ -99,6 +123,11 @@ pub struct Config {
     /// and `web_fetch`, as Codex's `web_search` key says: `"live"`, the
     /// default, or `"disabled"`.
     pub web_search: WebSearch,
+    /// `web_search_off`: `PROVIDER/MODEL` patterns, `*` and `?` wildcards,
+    /// of models a new agent gets no search on though their provider
+    /// offers it, for a model the provider's hosted search refuses (Grok
+    /// on Bedrock Mantle). It still fetches pages.
+    pub web_search_off: Vec<String>,
     /// Whether a new agent's model reads what another agent or a client
     /// sent it with no line naming the sender: `senders = "hidden"`;
     /// `"shown"`, the default, names it.
@@ -117,6 +146,15 @@ pub struct Config {
     /// agent on that model that names none sends a request a safety
     /// classifier declined to it, that request alone.
     pub fallbacks: BTreeMap<String, String>,
+    /// `[context_windows]`: the context window, in tokens, of each model
+    /// whose `PROVIDER/MODEL` path a pattern matches, `*` and `?` wildcards,
+    /// the most specific pattern winning, over what its provider lists.
+    /// Unset, the provider's listing, else the daemon's own default. The
+    /// agent CLI starts the daemon with them.
+    pub context_windows: BTreeMap<String, u64>,
+    /// `prices`: the price sheet's file, from `/` or `~/`; unset,
+    /// `~/.agent/prices.toml`. See `prices`.
+    pub prices: Option<String>,
     pub judge: Judge,
     pub shell_environment_policy: ShellEnvironmentPolicy,
     pub sonny: Sonny,
@@ -131,6 +169,36 @@ pub struct Config {
 pub const ATTACH_WAIT_MS: u64 = 86_400_000;
 /// The longest the daemon lets an attached message wait: a year.
 pub const MAX_ATTACH_WAIT_MS: u64 = 365 * ATTACH_WAIT_MS;
+
+/// What a million tokens cost on a model, in the person's currency.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Price {
+    /// Input read fresh.
+    pub input: f64,
+    /// Input read from the provider's prompt cache.
+    pub cached: f64,
+    /// Input written to the cache for five minutes.
+    pub cache_write: f64,
+    /// Input written to the cache for an hour.
+    pub cache_write_1h: f64,
+    pub output: f64,
+}
+
+impl Price {
+    /// What a call or a sum of them cost: `input` holds the `cached` reads
+    /// and the cache writes, `written` of them, `written_1h` of those for
+    /// an hour, each at its own rate.
+    pub fn cost(&self, input: u64, cached: u64, written: u64, written_1h: u64, output: u64) -> f64 {
+        let hour = written_1h.min(written);
+        let fresh = input.saturating_sub(cached).saturating_sub(written);
+        (fresh as f64 * self.input
+            + cached as f64 * self.cached
+            + (written - hour) as f64 * self.cache_write
+            + hour as f64 * self.cache_write_1h
+            + output as f64 * self.output)
+            / 1e6
+    }
+}
 
 impl Config {
     /// The `wait_ms` a client sends with delivery attach: none when
@@ -163,7 +231,7 @@ pub fn duration_ms(value: &str) -> Option<u64> {
 /// the agent CLI starts a daemon with when the file gives none: none is
 /// the daemon's own default. A count rounds down; `load` keeps its
 /// fraction.
-pub const DAEMON_LIMITS: [(&str, &str, Option<&str>); 9] = [
+pub const DAEMON_LIMITS: [(&str, &str, Option<&str>); 10] = [
     ("processes", "--max-processes", None),
     ("lasting", "--max-lasting", None),
     ("active", "--max-active", None),
@@ -174,6 +242,9 @@ pub const DAEMON_LIMITS: [(&str, &str, Option<&str>); 9] = [
     ("readers", "--max-readers", None),
     // As make -l: a busy machine's new commands wait while one runs.
     ("load", "--max-load", Some("cpus * 2")),
+    // As Codex's agents.max_depth: an agent's helpers may start their own,
+    // which start none.
+    ("depth", "--max-depth", Some("2")),
 ];
 
 /// The machine a formula is worked out for: its logical CPUs and its
@@ -383,6 +454,37 @@ impl ShellEnvironmentPolicy {
     }
 }
 
+/// Whether `path` matches `pattern`: `*` any run of characters and `?`
+/// any one, in any ASCII case.
+pub fn matches(pattern: &str, path: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let path: Vec<char> = path.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let (mut p, mut n) = (0, 0);
+    // The last `*` seen, and where in the path its run ends so far.
+    let mut star: Option<(usize, usize)> = None;
+    while n < path.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                star = Some((p, n));
+                p += 1;
+            }
+            Some(&c) if c == '?' || c == path[n] => {
+                p += 1;
+                n += 1;
+            }
+            _ => match star {
+                Some((at, end)) => {
+                    star = Some((at, end + 1));
+                    p = at + 1;
+                    n = end + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == '*')
+}
+
 /// Codex's `web_search` modes this runtime serves. Codex's `cached`, an
 /// index without the live web, is not one: Anthropic's search has no such
 /// mode.
@@ -406,6 +508,9 @@ pub struct Judge {
 pub struct Sonny {
     pub lead_effort: Option<String>,
     pub task_effort: Option<String>,
+    /// `standard`, `fast` or `ultrafast`: each new task's speed, in place
+    /// of its starter's.
+    pub task_speed: Option<String>,
     /// The profile a lead runs as, in place of `lead`.
     pub lead_profile: Option<String>,
     /// The profile every other agent Sonny starts is told, in place of
@@ -424,6 +529,10 @@ pub struct Sonny {
     pub side_chat: SideChat,
     /// Whether finished and waiting work rings. Notifications show either way.
     pub chime: bool,
+    /// Whether the conversation shows the agent's steps between what is
+    /// said (calls, news in, messages between agents, how long a turn
+    /// took), or only the person's words and the agent's (the default).
+    pub steps: bool,
     /// Whether every tool call is drawn, or only the bot's words and the
     /// calls that move the work on (the clean view, the default).
     pub verbose: bool,
@@ -433,12 +542,24 @@ pub struct Sonny {
     pub text_width: u64,
     /// When a note the agent puts up or changes opens the margin.
     pub margin_opens: MarginOpens,
+    /// The most notes a margin holds: a new one past it is refused, and
+    /// the agent told why. At least 1.
+    pub margin_notes: u64,
+    /// The most lines a note's Markdown runs to, counted in the text, not
+    /// the rows drawn: a longer one is refused. At least 1.
+    pub margin_note_lines: u64,
     /// Where a click on an agent's name takes the person; a right click
     /// takes them to the other.
     pub agent_opens: AgentOpens,
     /// Whether a copy of the agent guesses the person's next message after
     /// a turn they started, shown in the empty composer for Tab to take.
     pub suggest: bool,
+    /// Whether, once an agent's turn ends with words and no question open,
+    /// a copy of it says whether they wait on the person.
+    pub needs_check: bool,
+    /// Hours a task sits idle before a copy of it, with no tools, says
+    /// whether its work is done, which marks it done; 0 never.
+    pub task_done_check: u64,
     /// Whether the daemon starts when the machine does, for a box whose
     /// agents keep working after a restart. Sonny keeps the job.
     pub start_at_boot: bool,
@@ -449,7 +570,8 @@ pub struct Sonny {
     /// earn more, the square root of the week's agents when that is more:
     /// each answered thread adds one, up to as many again.
     pub commons_invites: u64,
-    /// The tokens an invite pays for in its thread.
+    /// The tokens of work an invite pays for: the budget of the turn it
+    /// starts.
     pub commons_invite_tokens: u64,
     /// The commons as a source, `[sonny.sources.commons]`: its `digest`
     /// and `steer`, as the person's sources take them; it has no command.
@@ -458,17 +580,21 @@ pub struct Sonny {
     /// before its agent goes on with what it recommended, where it said
     /// it could, or is reminded of it; 0 lets every ask wait for them.
     pub ask_wait_minutes: u64,
+    /// Which tasks open in a tab of their own in the lead's multiplexer.
+    pub task_tabs: TaskTabs,
     /// How many of its tasks' windows a lead keeps open in its
     /// multiplexer: past it, a new one closes the window the person used
     /// least recently, never one they have not looked at yet; 0 for no
     /// limit.
     pub task_windows: u64,
-    /// How many generations below a lead its line goes: a lead's tasks
-    /// are the first, and an agent of the last starts none; 0 for no end.
-    pub task_depth: u64,
-    /// The haikus a day the sky's busiest agent writes, each time the
-    /// title passes; 0 for none.
-    pub sky_haikus: u64,
+    /// Whether the sky's busiest agent writes a haiku each time the title
+    /// passes.
+    pub sky_haikus: bool,
+    /// The most haikus a day; 0 for no limit, the title's hold being
+    /// bound enough.
+    pub sky_haiku_daily: u64,
+    /// The hours haikus are kept for replays; 0 keeps them all.
+    pub sky_haiku_keep: u64,
     /// The minutes of messages and tool calls that make an agent busiest.
     pub sky_haiku_window: u64,
     /// How much busier, in percent, a challenger must be to take the
@@ -476,9 +602,8 @@ pub struct Sonny {
     /// thermostat's margin and hold, so it does not flicker.
     pub sky_haiku_margin: u64,
     pub sky_haiku_hold: u64,
-    /// The processes Sonny runs for agents at once in all: three quarters
-    /// for tool calls the tool host answers, a quarter for goal checks,
-    /// each at least one. 0 for four times the CPUs.
+    /// The processes Sonny runs for agents at once in all, for tool calls
+    /// the tool host answers. 0 for four times the CPUs.
     pub tool_processes: u64,
     /// How many events from sources wait for one agent at most: past it,
     /// newer ones are not kept, and its next note says how many, from
@@ -492,6 +617,106 @@ pub struct Sonny {
     /// The hosts this machine is linked to over SSH, by name, whose agents
     /// may use this machine's browser, MCP servers and opens.
     pub links: BTreeMap<String, Link>,
+    /// The person's working hours, local time: outside them, once no
+    /// window has been used for `quiet_after`, Sonny goes quiet. None, the
+    /// default, is no clock: quiet starts only when the person asks.
+    pub hours: Vec<Hours>,
+    /// How long no Sonny window is used, outside `hours`, before quiet
+    /// starts, in seconds.
+    pub quiet_after: u64,
+}
+
+/// One range of `[sonny] hours`, as `"Mon-Fri 09:00-19:00"`: the days it
+/// starts on, Sunday first, and its start and end in minutes from local
+/// midnight. An end at or before the start runs past midnight into the
+/// next day, as `"Fri 22:00-02:00"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hours {
+    pub days: [bool; 7],
+    pub start: u16,
+    pub end: u16,
+}
+
+/// How long no window is used, outside hours, before quiet starts, unless
+/// `quiet_after` says otherwise: long enough for a break, short enough
+/// that an evening's replies do not pile up.
+pub const QUIET_AFTER: u64 = 30 * 60;
+
+/// The speeds a task may be given: the daemon's tiers by name.
+pub const SPEEDS: [&str; 3] = ["standard", "fast", "ultrafast"];
+
+/// The days `hours` names, as the time stamp writes them.
+pub const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// A range of `[sonny] hours` read: one day or a run of days (`Mon-Fri`,
+/// `Fri-Mon` going round the week), a space, then `HH:MM-HH:MM`.
+pub fn hours(text: &str) -> Result<Hours, String> {
+    let bad = || {
+        format!(
+            "sonny.hours takes ranges as \"Mon-Fri 09:00-19:00\" or \"Sat 10:00-12:00\", not {text:?}"
+        )
+    };
+    let (days, times) = text.trim().split_once(' ').ok_or_else(bad)?;
+    let day = |name: &str| DAYS.iter().position(|day| *day == name).ok_or_else(bad);
+    let (first, last) = match days.split_once('-') {
+        Some((first, last)) => (day(first)?, day(last)?),
+        None => (day(days)?, day(days)?),
+    };
+    let mut on = [false; 7];
+    let mut at = first;
+    loop {
+        on[at] = true;
+        if at == last {
+            break;
+        }
+        at = (at + 1) % 7;
+    }
+    let minute = |time: &str| -> Result<u16, String> {
+        let (hour, minute) = time.split_once(':').ok_or_else(bad)?;
+        let digits = |s: &str| s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit());
+        if !digits(hour) || !digits(minute) {
+            return Err(bad());
+        }
+        let (hour, minute): (u16, u16) = (
+            hour.parse().map_err(|_| bad())?,
+            minute.parse().map_err(|_| bad())?,
+        );
+        match (hour, minute) {
+            (24, 0) => Ok(24 * 60),
+            (0..=23, 0..=59) => Ok(hour * 60 + minute),
+            _ => Err(bad()),
+        }
+    };
+    let (start, end) = times.trim().split_once('-').ok_or_else(bad)?;
+    let (start, end) = (minute(start)?, minute(end)?);
+    if start == 24 * 60 || start == end {
+        return Err(bad());
+    }
+    Ok(Hours {
+        days: on,
+        start,
+        end,
+    })
+}
+
+impl std::fmt::Display for Hours {
+    /// As the config writes it: `Mon-Fri 09:00-19:00`. The days are one
+    /// run, as `hours` reads them; all seven read as Mon-Sun.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let first = (0..7)
+            .find(|&day| self.days[day] && !self.days[(day + 6) % 7])
+            .unwrap_or(1);
+        let mut last = first;
+        while self.days[(last + 1) % 7] && (last + 1) % 7 != first {
+            last = (last + 1) % 7;
+        }
+        let days = match first == last {
+            true => DAYS[first].to_owned(),
+            false => format!("{}-{}", DAYS[first], DAYS[last]),
+        };
+        let time = |minutes: u16| format!("{:02}:{:02}", minutes / 60, minutes % 60);
+        write!(f, "{days} {}-{}", time(self.start), time(self.end))
+    }
 }
 
 /// A link, `[sonny.links.NAME]`: this machine dials `host` over SSH and
@@ -531,6 +756,16 @@ pub const COMMONS_DIGEST: &str = "15m";
 /// 100 (rustfmt's own width), so they stay whole at 100.
 pub const TEXT_WIDTH: u64 = 100;
 
+/// The most notes a margin holds unless `margin_notes` says otherwise:
+/// a working set to glance at, as Codex's plan and Claude Code's todo
+/// list are, not an archive.
+pub const MARGIN_NOTES: u64 = 6;
+
+/// The most lines a note's Markdown runs to unless `margin_note_lines`
+/// says otherwise: something to glance at beside the conversation; a
+/// longer text goes in a file the note shows.
+pub const MARGIN_NOTE_LINES: u64 = 12;
+
 /// The narrowest `text_width` other than 0, the margin's own least width:
 /// a narrower column wraps a path or a line of code at every turn.
 pub const TEXT_WIDTH_LEAST: u64 = 40;
@@ -561,6 +796,7 @@ impl Default for Sonny {
         Sonny {
             lead_effort: None,
             task_effort: None,
+            task_speed: None,
             lead_profile: None,
             task_profile: None,
             unsandboxed: Vec::new(),
@@ -569,39 +805,48 @@ impl Default for Sonny {
             mcp_servers: BTreeMap::new(),
             side_chat: SideChat::default(),
             suggest: true,
+            needs_check: true,
+            task_done_check: 8,
             commons: true,
             commons_invites: 3,
             commons_invite_tokens: 1_000_000,
             commons_source: commons_source(),
             ask_wait_minutes: 60,
+            task_tabs: TaskTabs::default(),
             task_windows: 32,
-            task_depth: 2,
-            sky_haikus: 8,
+            sky_haikus: true,
+            sky_haiku_daily: 0,
+            sky_haiku_keep: 24,
             sky_haiku_window: 10,
             sky_haiku_margin: 50,
             sky_haiku_hold: 10,
             tool_processes: 0,
             lookout_waiting: 1024,
             chime: true,
+            steps: false,
             verbose: false,
             text_width: TEXT_WIDTH,
             start_at_boot: false,
             margin_opens: MarginOpens::default(),
+            margin_notes: MARGIN_NOTES,
+            margin_note_lines: MARGIN_NOTE_LINES,
             agent_opens: AgentOpens::default(),
             sources: Vec::new(),
             browser_confirm: BROWSER_CONFIRM.map(str::to_owned).to_vec(),
             links: BTreeMap::new(),
+            hours: Vec::new(),
+            quiet_after: QUIET_AFTER,
         }
     }
 }
 
-/// What the copy `/side` talks to may do: `"answer"`, the default, from
-/// what its agent knows, calling no tool; or `"fork"`, anything its agent
-/// may, with its tools, in its folder, under its approvals.
+/// What the copy `/side` talks to may do: `"fork"`, the default, anything
+/// its agent may, with its tools, in its folder, under its approvals; or
+/// `"answer"`, from what its agent knows, calling no tool.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SideChat {
-    #[default]
     Answer,
+    #[default]
     Fork,
 }
 
@@ -663,6 +908,17 @@ pub enum AgentOpens {
     Beside,
 }
 
+/// Which tasks open in a tab of their own in the lead's multiplexer:
+/// `"asked"`, the default, those their starter asked a tab for, those an
+/// agent shows, those the person opens and those that come to need them;
+/// or `"every"`, each task as a turn of its starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TaskTabs {
+    #[default]
+    Asked,
+    Every,
+}
+
 /// A command Sonny's lookout runs, whose every printed line is news for
 /// the agents subscribed to it by name.
 #[derive(Clone, Debug, PartialEq)]
@@ -679,6 +935,17 @@ pub struct Source {
     /// An event pattern, as a subscription's filter is written: an event
     /// it matches steers, as one the command marks so does.
     pub steer: Option<serde_json::Value>,
+    /// Files whose change starts it again on them, as a service manager
+    /// restarts a unit on its new binary: each from `/` or `~/`.
+    pub watch: Vec<String>,
+    /// One character cell that marks it wherever Sonny names it: on the
+    /// `/status` row of each agent that follows it, its follows in
+    /// `/background`, and the "From your sources" row.
+    pub icon: Option<String>,
+    /// A field of its events whose values subscriptions' filters name,
+    /// as `id` or `meta.repo`: the lookout writes those values to a file
+    /// the command reads, so it fetches only what someone subscribed to.
+    pub wants: Option<String>,
 }
 
 /// An MCP server, under Codex's key names for `[mcp_servers.NAME]`: a
@@ -1056,6 +1323,21 @@ fn parse(text: &str) -> Result<Config, String> {
             };
             continue;
         }
+        if name == "web_search_off" {
+            let patterns = value
+                .as_array()
+                .ok_or("web_search_off is a list of PROVIDER/MODEL patterns")?;
+            for pattern in patterns {
+                let pattern = pattern
+                    .as_str()
+                    .filter(|p| p.contains('/') && !p.contains(char::is_whitespace))
+                    .ok_or_else(|| {
+                        format!("web_search_off holds PROVIDER/MODEL patterns, * and ? wildcards, as \"bedrock-openai/xai.*\", not {pattern}")
+                    })?;
+                config.web_search_off.push(pattern.to_owned());
+            }
+            continue;
+        }
         if name == "senders" {
             config.hide_senders = match string(name, value)?.as_str() {
                 "shown" => false,
@@ -1082,6 +1364,36 @@ fn parse(text: &str) -> Result<Config, String> {
                     format!("attach_wait is a duration such as 1h or 1d, up to 365d, or \"0\", not {text}")
                 })?;
             config.attach_wait_ms = Some(ms);
+            continue;
+        }
+        if name == "context_windows" {
+            let models = value.as_table().ok_or("context_windows must be a table")?;
+            for (pattern, tokens) in models {
+                let tokens = tokens
+                    .as_integer()
+                    .filter(|tokens| *tokens >= MIN_WINDOW as i64)
+                    .ok_or_else(|| {
+                        format!(
+                            "context_windows.{pattern} is a number of tokens, at least {MIN_WINDOW}"
+                        )
+                    })?;
+                if !pattern.contains('/') || pattern.contains(char::is_whitespace) {
+                    return Err(format!(
+                        "context_windows keys are PROVIDER/MODEL, * and ? wildcards, as \"bedrock/*\", not {pattern:?}"
+                    ));
+                }
+                config
+                    .context_windows
+                    .insert(pattern.clone(), tokens as u64);
+            }
+            continue;
+        }
+        if name == "prices" {
+            let file = string(name, value)?;
+            if !(file.starts_with('/') || file.starts_with("~/")) {
+                return Err(format!("prices is a file from / or ~/, not {file:?}"));
+            }
+            config.prices = Some(file);
             continue;
         }
         if name == "fallbacks" {
@@ -1150,23 +1462,31 @@ fn parse(text: &str) -> Result<Config, String> {
             "sonny" => &[
                 "lead_effort",
                 "task_effort",
+                "task_speed",
                 "lead_profile",
                 "task_profile",
                 "side_chat",
                 "chime",
+                "steps",
                 "verbose",
                 "text_width",
                 "margin_opens",
+                "margin_notes",
+                "margin_note_lines",
                 "agent_opens",
                 "suggest",
+                "needs_check",
+                "task_done_check",
                 "start_at_boot",
                 "commons",
                 "commons_invites",
                 "commons_invite_tokens",
                 "ask_wait_minutes",
+                "task_tabs",
                 "task_windows",
-                "task_depth",
                 "sky_haikus",
+                "sky_haiku_daily",
+                "sky_haiku_keep",
                 "sky_haiku_window",
                 "sky_haiku_margin",
                 "sky_haiku_hold",
@@ -1175,6 +1495,8 @@ fn parse(text: &str) -> Result<Config, String> {
                 "unsandboxed",
                 "default_permissions",
                 "browser_confirm",
+                "hours",
+                "quiet_after",
             ],
             _ => return Err(format!("unknown table [{name}]")),
         };
@@ -1207,6 +1529,12 @@ fn parse(text: &str) -> Result<Config, String> {
                 config.sonny.permissions = permissions(value)?;
                 continue;
             }
+            if (name.as_str(), key.as_str()) == ("sonny", "task_depth") {
+                return Err(
+                    "sonny.task_depth is now daemon.depth, which the agent CLI starts the daemon with"
+                        .into(),
+                );
+            }
             if !keys.contains(&key.as_str()) {
                 return Err(format!("unknown key {name}.{key}"));
             }
@@ -1232,11 +1560,22 @@ fn parse(text: &str) -> Result<Config, String> {
             if let Some(switch) = match key.as_str() {
                 "chime" => Some(&mut config.sonny.chime),
                 "suggest" => Some(&mut config.sonny.suggest),
+                "needs_check" => Some(&mut config.sonny.needs_check),
                 "commons" => Some(&mut config.sonny.commons),
+                "steps" => Some(&mut config.sonny.steps),
                 "verbose" => Some(&mut config.sonny.verbose),
                 "start_at_boot" => Some(&mut config.sonny.start_at_boot),
+                "sky_haikus" => Some(&mut config.sonny.sky_haikus),
                 _ => None,
             } {
+                // A count was 0.8's: the switch and the day's most are two
+                // keys now, and 0 says "no limit" where it said "none".
+                if key == "sky_haikus" && value.is_integer() {
+                    return Err(format!(
+                        "{name}.{key} is true or false; the most haikus a day is \
+                         {name}.sky_haiku_daily, 0 for no limit"
+                    ));
+                }
                 *switch = value
                     .as_bool()
                     .ok_or_else(|| format!("{name}.{key} must be true or false"))?;
@@ -1247,14 +1586,17 @@ fn parse(text: &str) -> Result<Config, String> {
                 "commons_invite_tokens" => Some(&mut config.sonny.commons_invite_tokens),
                 "ask_wait_minutes" => Some(&mut config.sonny.ask_wait_minutes),
                 "task_windows" => Some(&mut config.sonny.task_windows),
-                "task_depth" => Some(&mut config.sonny.task_depth),
-                "sky_haikus" => Some(&mut config.sonny.sky_haikus),
+                "task_done_check" => Some(&mut config.sonny.task_done_check),
+                "sky_haiku_daily" => Some(&mut config.sonny.sky_haiku_daily),
+                "sky_haiku_keep" => Some(&mut config.sonny.sky_haiku_keep),
                 "sky_haiku_window" => Some(&mut config.sonny.sky_haiku_window),
                 "sky_haiku_margin" => Some(&mut config.sonny.sky_haiku_margin),
                 "sky_haiku_hold" => Some(&mut config.sonny.sky_haiku_hold),
                 "tool_processes" => Some(&mut config.sonny.tool_processes),
                 "lookout_waiting" => Some(&mut config.sonny.lookout_waiting),
                 "text_width" => Some(&mut config.sonny.text_width),
+                "margin_notes" => Some(&mut config.sonny.margin_notes),
+                "margin_note_lines" => Some(&mut config.sonny.margin_note_lines),
                 _ => None,
             } {
                 *count = (value.as_integer())
@@ -1265,6 +1607,16 @@ fn parse(text: &str) -> Result<Config, String> {
                     return Err(format!(
                         "{name}.{key} must be 0, for the window's whole width, \
                          or at least {TEXT_WIDTH_LEAST}, not {width}"
+                    ));
+                }
+                if key == "margin_notes" && config.sonny.margin_notes == 0 {
+                    return Err(format!(
+                        "{name}.{key} is the most notes a margin holds, at least 1, not 0"
+                    ));
+                }
+                if key == "margin_note_lines" && config.sonny.margin_note_lines == 0 {
+                    return Err(format!(
+                        "{name}.{key} is the most lines a margin note runs to, at least 1, not 0"
                     ));
                 }
                 continue;
@@ -1286,6 +1638,28 @@ fn parse(text: &str) -> Result<Config, String> {
                         _ => Err(invalid()),
                     })
                     .collect::<Result<_, _>>()?;
+                continue;
+            }
+            if (name.as_str(), key.as_str()) == ("sonny", "hours") {
+                let invalid = || {
+                    format!("{name}.{key} must be a list of ranges, as [\"Mon-Fri 09:00-19:00\"]")
+                };
+                let ranges = value.as_array().ok_or_else(invalid)?;
+                config.sonny.hours = ranges
+                    .iter()
+                    .map(|range| hours(range.as_str().ok_or_else(invalid)?))
+                    .collect::<Result<_, _>>()?;
+                continue;
+            }
+            if (name.as_str(), key.as_str()) == ("sonny", "quiet_after") {
+                let text = string(&format!("{name}.{key}"), value)?;
+                config.sonny.quiet_after = span("sonny.quiet_after", &text)?;
+                if config.sonny.quiet_after == 0 {
+                    return Err(format!(
+                        "{name}.{key} is how long no window is used before quiet starts, \
+                         as 30m; more than 0"
+                    ));
+                }
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "unsandboxed") {
@@ -1318,6 +1692,25 @@ fn parse(text: &str) -> Result<Config, String> {
                         return Err(format!(
                             "sonny.margin_opens is always, unless-closed or never, not {other}"
                         ));
+                    }
+                };
+                continue;
+            }
+            if key == "task_speed" {
+                if !SPEEDS.contains(&value.as_str()) {
+                    return Err(format!(
+                        "sonny.task_speed is standard, fast or ultrafast, not {value}"
+                    ));
+                }
+                config.sonny.task_speed = Some(value);
+                continue;
+            }
+            if key == "task_tabs" {
+                config.sonny.task_tabs = match value.as_str() {
+                    "asked" => TaskTabs::Asked,
+                    "every" => TaskTabs::Every,
+                    other => {
+                        return Err(format!("sonny.task_tabs is asked or every, not {other}"));
                     }
                 };
                 continue;
@@ -1471,6 +1864,9 @@ fn commons_source() -> Source {
         every: None,
         digest: Some(COMMONS_DIGEST.into()),
         steer: None,
+        watch: Vec::new(),
+        icon: None,
+        wants: None,
     }
 }
 
@@ -1496,10 +1892,13 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
         let mut every = None;
         let mut digest = None;
         let mut steer = None;
+        let mut watch = Vec::new();
+        let mut icon = None;
+        let mut wants = None;
         let own = name == COMMONS_SOURCE;
         for (field, value) in fields {
             match field.as_str() {
-                "command" | "every" if own => {
+                "command" | "every" | "watch" | "wants" if own => {
                     return Err(format!(
                         "{}: the commons is a source of Sonny's own, which takes digest and steer alone; \
                          name yours another way",
@@ -1513,6 +1912,16 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
                     span(&key(field), &value)?;
                     digest = Some(value);
                 }
+                "icon" => {
+                    let value = string(&key(field), value)?;
+                    if value.chars().count() != 1 || value.chars().any(char::is_control) {
+                        return Err(format!(
+                            "{} is one character, as \"▲\", not {value:?}",
+                            key(field)
+                        ));
+                    }
+                    icon = Some(value);
+                }
                 "steer" => {
                     if !value.is_table() {
                         return Err(format!(
@@ -1522,12 +1931,41 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
                     }
                     steer = Some(serde_json::to_value(value).map_err(|e| e.to_string())?);
                 }
+                "watch" => {
+                    let paths = (value.as_array()).ok_or_else(|| {
+                        format!("{} is a list of files, as [\"~/bin/poll\"]", key(field))
+                    })?;
+                    for path in paths {
+                        let path = string(&key(field), path)?;
+                        if !(path.starts_with('/') || path.starts_with("~/")) {
+                            return Err(format!("{}: {path:?} is a file from / or ~/", key(field)));
+                        }
+                        watch.push(path);
+                    }
+                }
+                "wants" => {
+                    let value = string(&key(field), value)?;
+                    let plain = |part: &str| {
+                        !part.is_empty()
+                            && part.len() <= 64
+                            && (part.bytes())
+                                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+                    };
+                    if value.split('.').count() > 6 || !value.split('.').all(plain) {
+                        return Err(format!(
+                            "{} names a field of its events, as \"id\" or \"meta.repo\"",
+                            key(field)
+                        ));
+                    }
+                    wants = Some(value);
+                }
                 _ => return Err(format!("unknown key {}", key(field))),
             }
         }
         if own {
             commons.digest = digest.or(commons.digest);
             commons.steer = steer;
+            commons.icon = icon;
             continue;
         }
         sources.push(Source {
@@ -1536,9 +1974,141 @@ fn sources(value: &toml::Value) -> Result<(Vec<Source>, Source), String> {
             every,
             digest,
             steer,
+            watch,
+            icon,
+            wants,
         });
     }
     Ok((sources, commons))
+}
+
+/// The largest price sheet the reader takes.
+pub const SHEET_LIMIT: u64 = 1024 * 1024;
+
+/// The person's price sheet: the file config's `prices` names, else
+/// `~/.agent/prices.toml`; none when there is no such file. Each key is a
+/// `PROVIDER/MODEL` pattern, `*` and `?` wildcards, and each value what a
+/// million tokens cost on the models it matches:
+///
+/// ```toml
+/// "anthropic/claude-opus-5*" = { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25 }
+/// "openai/*" = { input = 1.25, cached = 0.125, output = 10 }
+/// ```
+///
+/// `input` and `output` are required; `cached` and `cache_write` are
+/// `input`'s when unset, and `cache_write_1h` is `cache_write`'s. The
+/// patterns come most specific first, as `price` looks them up. Nothing is
+/// priced unless the person says.
+pub fn prices(config: &Config) -> Result<Vec<(String, Price)>, String> {
+    let file = match &config.prices {
+        Some(file) => match file.strip_prefix("~/") {
+            Some(rest) => match std::env::var_os("HOME") {
+                Some(home) => PathBuf::from(home).join(rest),
+                None => return Ok(Vec::new()),
+            },
+            None => PathBuf::from(file),
+        },
+        None => match home() {
+            Some(home) => home.join("prices.toml"),
+            None => return Ok(Vec::new()),
+        },
+    };
+    let text = match std::fs::File::open(&file) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("prices_unreadable: {}: {error}", file.display())),
+        Ok(opened) => {
+            let mut text = String::new();
+            (opened.take(SHEET_LIMIT + 1).read_to_string(&mut text))
+                .map_err(|e| format!("prices_unreadable: {}: {e}", file.display()))?;
+            if text.len() as u64 > SHEET_LIMIT {
+                return Err(format!(
+                    "prices_invalid: {}: larger than 1 MiB",
+                    file.display()
+                ));
+            }
+            text
+        }
+    };
+    sheet(&text).map_err(|reason| format!("prices_invalid: {}: {reason}", file.display()))
+}
+
+/// A price sheet's text, its patterns most specific first.
+fn sheet(text: &str) -> Result<Vec<(String, Price)>, String> {
+    let table: toml::Table = text
+        .parse()
+        .map_err(|e: toml::de::Error| e.message().to_owned())?;
+    let mut prices = Vec::new();
+    for (pattern, price) in &table {
+        if !pattern.contains('/') || pattern.contains(char::is_whitespace) {
+            return Err(format!(
+                "keys are PROVIDER/MODEL, * and ? wildcards, as \"anthropic/claude-opus-5*\", not {pattern:?}"
+            ));
+        }
+        prices.push((pattern.clone(), price_of(pattern, price)?));
+    }
+    // Literal paths first, then the patterns with the most literal
+    // characters, as the daemon ranks `[context_windows]`.
+    let wild = |c: char| matches!(c, '*' | '?');
+    let rank = |pattern: &str| {
+        let literal = pattern.chars().filter(|c| !wild(*c)).count();
+        (pattern.chars().any(wild), std::cmp::Reverse(literal))
+    };
+    prices.sort_by(|(a, _), (b, _)| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+    Ok(prices)
+}
+
+/// The price for `path`, `PROVIDER/MODEL`, in `prices` as `prices` reads
+/// them: the first, most specific, pattern that matches it.
+pub fn price(prices: &[(String, Price)], path: &str) -> Option<Price> {
+    (prices.iter())
+        .find(|(pattern, _)| matches(pattern, path))
+        .map(|(_, price)| *price)
+}
+
+/// A price sheet's entry: input and output, and any of cached, cache_write
+/// and cache_write_1h, each a number of 0 or more; an unset one is the
+/// rate it would fall back to without a cache.
+fn price_of(pattern: &str, value: &toml::Value) -> Result<Price, String> {
+    let shape = || {
+        format!(
+            "{pattern:?} is {{ input = 5, output = 25 }} with any of cached, cache_write and cache_write_1h, each per million tokens"
+        )
+    };
+    let fields = value.as_table().ok_or_else(shape)?;
+    let mut rates: [Option<f64>; 5] = [None; 5];
+    for (key, rate) in fields {
+        let at = ["input", "cached", "cache_write", "cache_write_1h", "output"]
+            .iter()
+            .position(|known| known == key)
+            .ok_or_else(|| format!("{pattern:?} has no key {key}: {}", shape()))?;
+        let rate = match rate {
+            toml::Value::Integer(n) => *n as f64,
+            toml::Value::Float(n) => *n,
+            _ => f64::NAN,
+        };
+        if !(rate.is_finite() && rate >= 0.0) {
+            return Err(format!("{pattern:?}.{key} is a number of 0 or more"));
+        }
+        rates[at] = Some(rate);
+    }
+    let [
+        Some(input),
+        cached,
+        cache_write,
+        cache_write_1h,
+        Some(output),
+    ] = rates
+    else {
+        return Err(shape());
+    };
+    let cache_write = cache_write.unwrap_or(input);
+    Ok(Price {
+        input,
+        cached: cached.unwrap_or(input),
+        cache_write,
+        cache_write_1h: cache_write_1h.unwrap_or(cache_write),
+        output,
+    })
 }
 
 fn string(key: &str, value: &toml::Value) -> Result<String, String> {
@@ -1751,6 +2321,45 @@ mod tests {
     }
 
     #[test]
+    fn hours_are_runs_of_days_with_a_time_range_and_none_is_no_clock() {
+        assert_eq!(parse("").unwrap().sonny.hours, Vec::new());
+        assert_eq!(parse("").unwrap().sonny.quiet_after, QUIET_AFTER);
+        let week = hours("Mon-Fri 09:00-19:00").unwrap();
+        assert_eq!(week.days, [false, true, true, true, true, true, false]);
+        assert_eq!((week.start, week.end), (9 * 60, 19 * 60));
+        assert_eq!(week.to_string(), "Mon-Fri 09:00-19:00");
+        // Round the week, and past midnight.
+        let late = hours("Fri-Mon 22:00-02:00").unwrap();
+        assert_eq!(late.days, [true, true, false, false, false, true, true]);
+        assert_eq!(late.to_string(), "Fri-Mon 22:00-02:00");
+        assert_eq!(
+            hours("Sat 10:00-24:00").unwrap().to_string(),
+            "Sat 10:00-24:00"
+        );
+        assert_eq!(
+            hours("Sun-Sat 00:00-24:00").unwrap().to_string(),
+            "Mon-Sun 00:00-24:00"
+        );
+        for bad in [
+            "Mon-Fri",
+            "Monday 09:00-17:00",
+            "Mon 9:00-17:00",
+            "Mon 09:00-09:00",
+            "Mon 24:00-01:00",
+            "Mon 09:60-10:00",
+            "Mon 09:00",
+        ] {
+            assert!(hours(bad).is_err(), "{bad}");
+        }
+        let config = parse("[sonny]\nhours = [\"Mon-Fri 09:00-19:00\", \"Sat 10:00-12:00\"]\nquiet_after = \"45m\"\n").unwrap();
+        assert_eq!(config.sonny.hours.len(), 2);
+        assert_eq!(config.sonny.quiet_after, 45 * 60);
+        assert!(parse("[sonny]\nhours = \"Mon-Fri 09:00-19:00\"\n").is_err());
+        assert!(parse("[sonny]\nhours = [\"weekdays\"]\n").is_err());
+        assert!(parse("[sonny]\nquiet_after = \"0\"\n").is_err());
+    }
+
+    #[test]
     fn daemon_limits_are_numbers_or_formulas_of_the_machine() {
         let gib = 1024.0 * 1024.0 * 1024.0;
         let at = |text| formula("x", text, 8.0, 16.0 * gib);
@@ -1786,9 +2395,19 @@ mod tests {
         let small = parse("[daemon]\nload = 0.001\n").unwrap();
         let flags = daemon_flags(&small.daemon).unwrap();
         assert!(flags.contains(&("--max-load".into(), "0.001".into())));
-        // With none given, only the gate's default is passed.
+        // With none given, only the defaults are passed: the gate's, and
+        // the depth's.
         let flags = daemon_flags(&BTreeMap::new()).unwrap();
-        assert_eq!(flags, [("--max-load".to_owned(), (cpus * 2).to_string())]);
+        assert_eq!(
+            flags,
+            [
+                ("--max-load".to_owned(), (cpus * 2).to_string()),
+                ("--max-depth".to_owned(), "2".to_owned())
+            ]
+        );
+        let deep = parse("[daemon]\ndepth = 0\n").unwrap();
+        let flags = daemon_flags(&deep.daemon).unwrap();
+        assert!(flags.contains(&("--max-depth".into(), "0".into())));
         assert_eq!(
             parse("[daemon]\nprocess = 4\n").unwrap_err(),
             "unknown key daemon.process"
@@ -1909,14 +2528,26 @@ mod tests {
         assert!(parse("[sonny]\nbrowser_confirm = \"eval\"").is_err());
         assert!(parse("[sonny]\ncommons_invites = -1").is_err());
         assert!(parse("[sonny]\ncommons_invites = \"3\"").is_err());
-        let sky = (config.sonny.sky_haikus, config.sonny.sky_haiku_window);
-        assert_eq!(sky, (8, 10));
+        let sky = (config.sonny.sky_haikus, config.sonny.sky_haiku_daily);
+        assert_eq!(sky, (true, 0));
+        assert_eq!(config.sonny.sky_haiku_keep, 24);
+        assert_eq!(config.sonny.sky_haiku_window, 10);
         let sky = (config.sonny.sky_haiku_margin, config.sonny.sky_haiku_hold);
         assert_eq!(sky, (50, 10));
-        assert_eq!(
-            parse("[sonny]\nsky_haikus = 0").unwrap().sonny.sky_haikus,
-            0
+        assert!(
+            !(parse("[sonny]\nsky_haikus = false")
+                .unwrap()
+                .sonny
+                .sky_haikus)
         );
+        let daily = parse("[sonny]\nsky_haiku_daily = 8\nsky_haiku_keep = 0").unwrap();
+        assert_eq!(
+            (daily.sonny.sky_haiku_daily, daily.sonny.sky_haiku_keep),
+            (8, 0)
+        );
+        // 0.8's count is refused by name, never read as "no limit".
+        let old = parse("[sonny]\nsky_haikus = 0").unwrap_err();
+        assert!(old.contains("sky_haiku_daily"), "{old}");
         assert!(parse("[sonny]\nsky_haiku_margin = 1.5").is_err());
         assert_eq!(config.sonny.text_width, 100);
         let text_width = |text: &str| parse(text).map(|config| config.sonny.text_width);
@@ -1931,22 +2562,51 @@ mod tests {
             )
         );
         assert!(text_width("[sonny]\ntext_width = -1").is_err());
-        assert_eq!(config.sonny.task_depth, 2);
+        let notes = |text: &str| parse(text).map(|config| config.sonny.margin_notes);
+        assert_eq!(notes(""), Ok(MARGIN_NOTES));
+        assert_eq!(notes("[sonny]\nmargin_notes = 40"), Ok(40));
         assert_eq!(
-            parse("[sonny]\ntask_depth = 0").unwrap().sonny.task_depth,
-            0
+            notes("[sonny]\nmargin_notes = 0"),
+            Err("sonny.margin_notes is the most notes a margin holds, at least 1, not 0".into())
         );
-        assert!(parse("[sonny]\ntask_depth = -1").is_err());
+        let lines = |text: &str| parse(text).map(|config| config.sonny.margin_note_lines);
+        assert_eq!(lines(""), Ok(MARGIN_NOTE_LINES));
+        assert_eq!(lines("[sonny]\nmargin_note_lines = 30"), Ok(30));
+        assert_eq!(
+            lines("[sonny]\nmargin_note_lines = 0"),
+            Err("sonny.margin_note_lines is the most lines a margin note runs to, at least 1, not 0".into())
+        );
+        assert_eq!(
+            parse("[sonny]\ntask_depth = 3").unwrap_err(),
+            "sonny.task_depth is now daemon.depth, which the agent CLI starts the daemon with"
+        );
         assert_eq!(
             parse("[sonny]\nsuggest = \"no\"").unwrap_err(),
             "sonny.suggest must be true or false"
         );
         let off = parse("web_search = \"disabled\"").unwrap();
         assert_eq!(off.web_search, WebSearch::Disabled);
+        let named = parse("web_search_off = [\"bedrock-openai/xai.*\"]").unwrap();
+        assert_eq!(named.web_search_off, ["bedrock-openai/xai.*"]);
+        assert!(matches(
+            &named.web_search_off[0],
+            "bedrock-openai/xai.grok-4.6"
+        ));
+        assert!(!matches(
+            &named.web_search_off[0],
+            "bedrock-openai/openai.gpt-6-astra"
+        ));
+        for bad in [
+            "web_search_off = \"x/y\"",
+            "web_search_off = [\"grok\"]",
+            "web_search_off = [1]",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
         assert!(!config.hide_senders);
-        assert_eq!(config.sonny.side_chat, SideChat::Answer);
-        let fork = parse("[sonny]\nside_chat = \"fork\"").unwrap();
-        assert_eq!(fork.sonny.side_chat, SideChat::Fork);
+        assert_eq!(config.sonny.side_chat, SideChat::Fork);
+        let answer = parse("[sonny]\nside_chat = \"answer\"").unwrap();
+        assert_eq!(answer.sonny.side_chat, SideChat::Answer);
         assert_eq!(config.sonny.margin_opens, MarginOpens::Always);
         let never = parse("[sonny]\nmargin_opens = \"never\"").unwrap();
         assert_eq!(never.sonny.margin_opens, MarginOpens::Never);
@@ -1954,6 +2614,10 @@ mod tests {
         let beside = parse("[sonny]\nagent_opens = \"beside\"").unwrap();
         assert_eq!(beside.sonny.agent_opens, AgentOpens::Beside);
         assert!(parse("[sonny]\nagent_opens = \"window\"").is_err());
+        assert_eq!(config.sonny.task_tabs, TaskTabs::Asked);
+        let every = parse("[sonny]\ntask_tabs = \"every\"").unwrap();
+        assert_eq!(every.sonny.task_tabs, TaskTabs::Every);
+        assert!(parse("[sonny]\ntask_tabs = \"all\"").is_err());
         let closed = parse("[sonny]\nmargin_opens = \"unless-closed\"").unwrap();
         assert_eq!(closed.sonny.margin_opens, MarginOpens::UnlessClosed);
         assert!(config.sonny.chime && !config.sonny.verbose);
@@ -1967,6 +2631,79 @@ mod tests {
         assert_eq!(fallbacks.get("a/big").map(String::as_str), Some("a/other"));
         assert!(parse("[fallbacks]\n\"a/big\" = 1\n").is_err());
         assert!(parse("fallbacks = \"a/other\"").is_err());
+        let prices = sheet(
+            "\"anthropic/*\" = { input = 3, output = 15 }\n\
+             \"anthropic/claude-opus-5*\" = { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25 }\n",
+        )
+        .unwrap();
+        let opus = price(&prices, "anthropic/claude-opus-5-5").unwrap();
+        assert_eq!((opus.input, opus.cached, opus.output), (5.0, 0.5, 25.0));
+        // A million fresh, a million read, a million written of which half
+        // for an hour, and a million out.
+        let cost = opus.cost(3_000_000, 1_000_000, 1_000_000, 500_000, 1_000_000);
+        assert!(
+            (cost - (5.0 + 0.5 + 3.125 + 5.0 + 25.0)).abs() < 1e-9,
+            "{cost}"
+        );
+        let other = price(&prices, "anthropic/claude-haiku-4-5").unwrap();
+        assert_eq!(
+            (other.cached, other.cache_write, other.cache_write_1h),
+            (3.0, 3.0, 3.0),
+            "the cache's rates are input's when unset"
+        );
+        assert_eq!(price(&prices, "openai/gpt-6"), None);
+        for wrong in [
+            "\"anthropic\" = { input = 1, output = 1 }\n",
+            "\"a/b\" = { input = 1 }\n",
+            "\"a/b\" = { input = 1, output = -1 }\n",
+            "\"a/b\" = { input = 1, output = \"$1\" }\n",
+            "\"a/b\" = { input = 1, output = 1, reasoning = 1 }\n",
+            "\"a/b\" = 5\n",
+        ] {
+            assert!(sheet(wrong).is_err(), "{wrong}");
+        }
+        // The sheet is a file of its own: the config may name one.
+        assert_eq!(
+            parse("prices = \"~/sheets/llm.toml\"")
+                .unwrap()
+                .prices
+                .as_deref(),
+            Some("~/sheets/llm.toml")
+        );
+        for wrong in [
+            "prices = \"sheets/llm.toml\"",
+            "[prices]\n\"a/b\" = { input = 1, output = 1 }\n",
+        ] {
+            assert!(parse(wrong).is_err(), "{wrong}");
+        }
+        let dir = std::env::temp_dir().join(format!("agent-prices-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("llm.toml");
+        std::fs::write(&file, "\"a/*\" = { input = 1, output = 2 }\n").unwrap();
+        let named = Config {
+            prices: Some(file.display().to_string()),
+            ..Config::default()
+        };
+        assert_eq!(super::prices(&named).unwrap().len(), 1);
+        std::fs::remove_file(&file).unwrap();
+        assert!(
+            super::prices(&named).unwrap().is_empty(),
+            "no file, no prices"
+        );
+        std::fs::remove_dir(&dir).unwrap();
+        let windows = parse("[context_windows]\n\"bedrock/*\" = 400000\n\"a/b\" = 1024\n")
+            .unwrap()
+            .context_windows;
+        assert_eq!(windows.get("bedrock/*"), Some(&400_000));
+        assert_eq!(windows.get("a/b"), Some(&1024));
+        for wrong in [
+            "[context_windows]\n\"bedrock\" = 400000\n",
+            "[context_windows]\n\"a/b\" = 1000\n",
+            "[context_windows]\n\"a/b\" = \"1M\"\n",
+            "context_windows = 400000\n",
+        ] {
+            assert!(parse(wrong).is_err(), "{wrong}");
+        }
         for (text, error) in [
             (
                 "web_search = \"cached\"",
@@ -2235,6 +2972,23 @@ mod tests {
             Some(serde_json::json!({"from": ["boss"], "text": [{"prefix": "[prod]"}]}))
         );
         assert_eq!(config.sonny.sources[0].steer, None);
+        // Only the files it names are watched; unset, none.
+        let watched = parse(
+            "[sonny.sources.slack]\ncommand = \"python3 ~/bin/poll.py --cursor state.json\"\nwatch = [\"~/bin/poll.py\", \"/opt/poll/lib.py\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            watched.sonny.sources[0].watch,
+            ["~/bin/poll.py", "/opt/poll/lib.py"]
+        );
+        assert!(config.sonny.sources[0].watch.is_empty());
+        let watching =
+            parse("[sonny.sources.cr]\ncommand = \"x\"\nwants = \"meta.repo\"\n").unwrap();
+        assert_eq!(
+            watching.sonny.sources[0].wants.as_deref(),
+            Some("meta.repo")
+        );
+        assert_eq!(config.sonny.sources[0].wants, None);
         // The commons is a source of Sonny's own, set as any other.
         assert_eq!(config.sonny.commons_source.digest.as_deref(), Some("15m"));
         let commons =
@@ -2274,6 +3028,18 @@ mod tests {
                 "sonny.sources.commons.command: the commons is a source of Sonny's own, which takes digest and steer alone; name yours another way",
             ),
             (
+                "[sonny.sources.slack]\ncommand = \"x\"\nwatch = \"poll.py\"",
+                "sonny.sources.slack.watch is a list of files, as [\"~/bin/poll\"]",
+            ),
+            (
+                "[sonny.sources.slack]\ncommand = \"x\"\nwatch = [\"poll.py\"]",
+                "sonny.sources.slack.watch: \"poll.py\" is a file from / or ~/",
+            ),
+            (
+                "[sonny.sources.commons]\nwatch = [\"~/x\"]",
+                "sonny.sources.commons.watch: the commons is a source of Sonny's own, which takes digest and steer alone; name yours another way",
+            ),
+            (
                 "[sonny.sources.commons]\ndigest = \"an hour\"",
                 "sonny.sources.commons.digest is a number and s, m or h, as 30s or 5m, not \"an hour\"",
             ),
@@ -2284,6 +3050,14 @@ mod tests {
             (
                 "[sonny.sources.slack]\ncommand = \"x\"\nargs = \"y\"",
                 "unknown key sonny.sources.slack.args",
+            ),
+            (
+                "[sonny.sources.slack]\ncommand = \"x\"\nwants = \"a b\"",
+                "sonny.sources.slack.wants names a field of its events, as \"id\" or \"meta.repo\"",
+            ),
+            (
+                "[sonny.sources.commons]\nwants = \"topic\"",
+                "sonny.sources.commons.wants: the commons is a source of Sonny's own, which takes digest and steer alone; name yours another way",
             ),
             (
                 "[sonny.sources.\"a b\"]\ncommand = \"x\"",

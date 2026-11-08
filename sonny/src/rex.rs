@@ -563,7 +563,7 @@ if out is not None:
         let (bin, dir) = fake(
             "home",
             serde_json::json!({
-                "01home": {"label": "lydakis", "blocks": [
+                "01home": {"label": "home", "blocks": [
                     block("block:lead", "graft.lead"),
                     block("block:task", "graft.fix"),
                 ]},
@@ -573,7 +573,7 @@ if out is not None:
         let rex = super::Rex::open(bin, None, "graft", false, None).unwrap();
         assert_eq!(
             (rex.session.as_str(), rex.name.as_str()),
-            ("01home", "lydakis")
+            ("01home", "home")
         );
         assert!(!rex.here);
         let mut rex = crate::mux::Layout::new(Box::new(rex));

@@ -8,12 +8,16 @@
 //! is written. The daemon deletes the copy once idle two minutes should
 //! Sonny not get to, and the sky draws no copy the daemon will throw
 //! away. The last one, and how many were written today, are kept in
-//! `~/.agent/sonny/haiku.json`, so every sky shows the same one and the
-//! daily cap holds across them; the day's before it too, so a replay
-//! shows the one that was up then.
+//! `~/.agent/sonny/haiku.json`, so every sky shows the same one and a
+//! day's cap, when the person sets one, holds across them. Each one
+//! written is added to `~/.agent/sonny/haikus.jsonl` too, kept as long as
+//! `[sonny] sky_haiku_keep` says, so a replay shows the one that was up
+//! then: a line added each time, never the whole rewritten, and read by a
+//! replay alone, so keeping them all costs the live sky nothing.
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
+use std::io::{BufRead, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -21,8 +25,6 @@ use std::time::{Duration, Instant};
 const WAIT: Duration = Duration::from_secs(60);
 /// A copy left behind is deleted once idle this long.
 const EXPIRE: Duration = Duration::from_secs(120);
-/// How long a haiku is kept for replays: as far back as one reaches.
-pub const KEPT: Duration = Duration::from_secs(24 * 3600);
 /// The longest line kept: the chat log's column, less a margin.
 pub const WIDTH: usize = 34;
 
@@ -34,8 +36,12 @@ Call no tool. Reply with ONLY the three lines, no title, quotes or explanation."
 /// The rule, as `[sonny]` sets it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rule {
-    /// Haikus a day; 0 for none.
+    /// Whether haikus are written at all.
+    pub on: bool,
+    /// The most a day; 0 for no limit, the hold bounding them.
     pub daily: u64,
+    /// How long one is kept for replays; none keeps them all.
+    pub keep: Option<Duration>,
     pub window: Duration,
     /// How much busier, in percent, a challenger must be.
     pub margin: u64,
@@ -48,8 +54,15 @@ impl Rule {
         let sonny = agent_client::config::load()
             .map(|config| config.sonny)
             .unwrap_or_default();
+        Rule::of(&sonny)
+    }
+
+    fn of(sonny: &agent_client::config::Sonny) -> Self {
         Rule {
-            daily: sonny.sky_haikus,
+            on: sonny.sky_haikus,
+            daily: sonny.sky_haiku_daily,
+            keep: (sonny.sky_haiku_keep > 0)
+                .then(|| Duration::from_secs(sonny.sky_haiku_keep.saturating_mul(3600))),
             window: Duration::from_secs(sonny.sky_haiku_window.max(1) * 60),
             margin: sonny.sky_haiku_margin,
             hold: Duration::from_secs(sonny.sky_haiku_hold * 60),
@@ -59,13 +72,7 @@ impl Rule {
 
 impl Default for Rule {
     fn default() -> Self {
-        let sonny = agent_client::config::Sonny::default();
-        Rule {
-            daily: sonny.sky_haikus,
-            window: Duration::from_secs(sonny.sky_haiku_window * 60),
-            margin: sonny.sky_haiku_margin,
-            hold: Duration::from_secs(sonny.sky_haiku_hold * 60),
-        }
+        Rule::of(&agent_client::config::Sonny::default())
     }
 }
 
@@ -106,7 +113,7 @@ impl Title {
     /// `at` sent or was told a message, or called a tool. Nothing is kept
     /// when no haiku is written, nor past the window.
     pub fn note(&mut self, now: Instant, name: &str) {
-        if self.rule.daily == 0 {
+        if !self.rule.on {
             return;
         }
         self.forget(now);
@@ -182,7 +189,8 @@ impl Title {
     }
 }
 
-/// The last haiku and today's count, as every sky keeps them.
+/// The last haiku and today's count, as every sky keeps them; the ones
+/// before it are in the [`Past`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Kept {
     /// The daemon's socket, so another daemon's haiku isn't shown.
@@ -203,9 +211,6 @@ pub struct Kept {
     pub claim: (String, i64),
     /// Why the last claim wrote no haiku, when it wrote none.
     pub unwritten: Option<Unwritten>,
-    /// The haikus written over the last [`KEPT`], the last one among
-    /// them, oldest first.
-    pub past: Vec<Poem>,
 }
 
 /// Why a claim wrote no haiku. The haiku before it shows on.
@@ -283,7 +288,7 @@ pub struct Poem {
 }
 
 impl Poem {
-    fn read(kept: &Value) -> Poem {
+    pub(crate) fn read(kept: &Value) -> Poem {
         Poem {
             by: kept["by"].as_str().unwrap_or("").to_owned(),
             lines: (kept["lines"].as_array().into_iter().flatten())
@@ -294,9 +299,83 @@ impl Poem {
         }
     }
 
-    fn json(&self) -> Value {
-        json!({"by": self.by, "lines": self.lines, "at_ms": self.at_ms,
-            "since_ms": self.since_ms})
+    /// Its line in the past, for `socket`'s daemon.
+    fn line(socket: &str, poem: &Poem) -> String {
+        json!({"socket": socket, "by": poem.by, "lines": poem.lines,
+            "at_ms": poem.at_ms, "since_ms": poem.since_ms})
+        .to_string()
+    }
+}
+
+/// The past as a replay reads it, from `from` (Unix ms) on and the hour
+/// before, the one up then among them: read where it left off each time,
+/// so a haiku another sky writes while it plays shows when the replay
+/// reaches it, and a replay holds only its own span.
+#[derive(Debug)]
+pub struct Past {
+    socket: String,
+    from: i64,
+    /// Where the file was read to, and which file it was, should it be
+    /// rewritten under it.
+    read: u64,
+    file: Option<(u64, u64)>,
+    pub poems: Vec<Poem>,
+}
+
+impl Past {
+    pub fn new(socket: &Path, from: i64) -> Past {
+        Past {
+            socket: socket.display().to_string(),
+            from: from - 3_600_000,
+            read: 0,
+            file: None,
+            poems: Vec::new(),
+        }
+    }
+
+    /// What was added since the last read; the whole again when the file
+    /// was rewritten, as when old ones were let go.
+    pub fn read(&mut self, store: &Store) {
+        use std::os::unix::fs::MetadataExt;
+        let Some(path) = store.past() else {
+            return;
+        };
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            return;
+        };
+        let Ok(meta) = file.metadata() else {
+            return;
+        };
+        let id = (meta.dev(), meta.ino());
+        if self.file != Some(id) || meta.len() < self.read {
+            (self.file, self.read) = (Some(id), 0);
+            self.poems.clear();
+        }
+        if meta.len() == self.read || file.seek(std::io::SeekFrom::Start(self.read)).is_err() {
+            return;
+        }
+        let mut added = Vec::new();
+        if file.read_to_end(&mut added).is_err() {
+            return;
+        }
+        // A line still being written waits for its end.
+        let whole = added
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |end| end + 1);
+        self.read += whole as u64;
+        for line in added[..whole].split(|&b| b == b'\n') {
+            let Ok(kept) = serde_json::from_slice::<Value>(line) else {
+                continue;
+            };
+            if kept["socket"].as_str() != Some(self.socket.as_str()) {
+                continue;
+            }
+            let poem = Poem::read(&kept);
+            if poem.lines.len() == 3 && poem.at_ms >= self.from {
+                self.poems.push(poem);
+            }
+        }
     }
 }
 
@@ -349,9 +428,176 @@ pub fn upgrade(store: &Store) {
         }
         store.write(&Value::Object(all)).is_ok()
     });
+    crate::upgrade::once(&record, PAST, || {
+        if !file.exists() {
+            return true;
+        }
+        let Some(_lock) = store.lock() else {
+            return false;
+        };
+        let Some(Value::Object(all)) = (std::fs::read(&file).ok())
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        else {
+            return false;
+        };
+        move_past(store, all)
+    });
 }
 
-/// Where every sky keeps its haikus: `~/.agent/sonny/haiku.json`.
+/// The upgrade migration that moves each daemon's day of haikus out of
+/// `haiku.json`, which every sky reads each second, into `haikus.jsonl`,
+/// which only a replay reads (0.9.0).
+pub const PAST: &str = "haiku-past";
+
+/// `all`, `haiku.json` as read, with each daemon's `past` moved to the
+/// past file, among what it holds, oldest first: a run cut short and run
+/// again adds none twice. Whether it is done.
+fn move_past(store: &Store, mut all: serde_json::Map<String, Value>) -> bool {
+    let Some(path) = store.past() else {
+        return false;
+    };
+    let mut poems: Vec<(String, Poem)> = Vec::new();
+    let mut moved = false;
+    for (socket, kept) in all.iter_mut() {
+        let Some(Value::Array(past)) = kept.as_object_mut().and_then(|kept| kept.remove("past"))
+        else {
+            continue;
+        };
+        moved = true;
+        poems.extend(
+            (past.iter().map(Poem::read))
+                .filter(|poem| poem.lines.len() == 3)
+                .map(|poem| (socket.clone(), poem)),
+        );
+    }
+    if !moved {
+        return true;
+    }
+    let had = match std::fs::read_to_string(&path) {
+        Ok(had) => had,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return false,
+    };
+    for kept in had
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        if let Some(socket) = kept["socket"].as_str() {
+            poems.push((socket.to_owned(), Poem::read(&kept)));
+        }
+    }
+    poems.sort_by_key(|(socket, poem)| (poem.at_ms, socket.clone()));
+    poems.dedup_by(|a, b| a.0 == b.0 && a.1.at_ms == b.1.at_ms);
+    let text: String = (poems.iter())
+        .map(|(socket, poem)| Poem::line(socket, poem) + "\n")
+        .collect();
+    let part = path.with_extension(format!("jsonl.{}", std::process::id()));
+    let written = std::fs::write(&part, text).and_then(|()| std::fs::rename(&part, &path));
+    written.is_ok() && store.write(&Value::Object(all)).is_ok()
+}
+
+/// The upgrade migration that names `[sonny] sky_haikus`, a count in
+/// 0.8, as the switch and the day's most it now is (0.9.0): `0` turned
+/// haikus off, any other count is `sky_haiku_daily`.
+pub const DAILY: &str = "haiku-daily";
+
+/// At start, once, before the config is read: a count in `sky_haikus`
+/// moved to where it means the same now.
+pub fn at_start() {
+    let (Some(home), Some(path)) = (
+        std::env::var_os("HOME").map(PathBuf::from),
+        agent_client::config::path(),
+    ) else {
+        return;
+    };
+    // No config, nothing to move: and nothing made, not even a HOME gone.
+    if !path.exists() {
+        return;
+    }
+    crate::upgrade::once(&home.join(".agent/sonny/migrated"), DAILY, || {
+        config_daily(&path)
+    });
+}
+
+/// The config at `path` with a count in `sky_haikus` moved, each other
+/// line as the person wrote it. Whether it is done: one it can't move
+/// cleanly is left as it is, for the config's own error to name the key,
+/// and tried again next time.
+fn config_daily(path: &Path) -> bool {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+    };
+    match dailied(&text) {
+        Err(()) => false,
+        Ok(None) => true,
+        Ok(Some(moved)) => {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777);
+            agent_client::files::replace_mode(path, moved.as_bytes(), mode).is_ok()
+        }
+    }
+}
+
+/// `text` as [`config_daily`] writes it: none when `[sonny] sky_haikus`
+/// is no count. The line written must parse to the config with only
+/// that key moved, so a string holding `sky_haikus =` is never touched,
+/// and a key lines can't move (a dotted key, an inline table) is an
+/// error.
+fn dailied(text: &str) -> Result<Option<String>, ()> {
+    use toml::Value;
+    let old: toml::Table = text.parse().map_err(drop)?;
+    let count = (old.get("sonny").and_then(Value::as_table))
+        .and_then(|sonny| sonny.get("sky_haikus"))
+        .and_then(Value::as_integer);
+    let Some(count) = count else {
+        return Ok(None);
+    };
+    let mut expected = old.clone();
+    let Some(Value::Table(sonny)) = expected.get_mut("sonny") else {
+        return Err(());
+    };
+    let line = match count {
+        0 => {
+            sonny.insert("sky_haikus".into(), Value::Boolean(false));
+            "sky_haikus = false".to_owned()
+        }
+        n => {
+            sonny.remove("sky_haikus");
+            sonny.insert("sky_haiku_daily".into(), Value::Integer(n));
+            format!("sky_haiku_daily = {n}")
+        }
+    };
+    let mut table = String::new();
+    let mut moved = false;
+    let mut lines = Vec::new();
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            table = trimmed.trim_matches(['[', ']']).trim().to_owned();
+        }
+        let key = trimmed.split_once('=').map(|(key, _)| key.trim());
+        if table == "sonny" && key == Some("sky_haikus") && !moved {
+            let indent = &raw[..raw.len() - raw.trim_start().len()];
+            lines.push(format!("{indent}{line}"));
+            moved = true;
+            continue;
+        }
+        lines.push(raw.to_owned());
+    }
+    let mut new = lines.join("\n");
+    if text.ends_with('\n') {
+        new.push('\n');
+    }
+    match new.parse::<toml::Table>() {
+        Ok(parsed) if moved && parsed == expected => Ok(Some(new)),
+        _ => Err(()),
+    }
+}
+
+/// Where every sky keeps its haikus: the last one and the day's count in
+/// `~/.agent/sonny/haiku.json`, every one written in `haikus.jsonl` beside
+/// it.
 #[derive(Clone, Debug)]
 pub struct Store {
     file: Option<PathBuf>,
@@ -377,6 +623,63 @@ impl Store {
         Store {
             file: Some(dir.join("haiku.json")),
         }
+    }
+
+    /// Every haiku written, a line each, oldest first.
+    fn past(&self) -> Option<PathBuf> {
+        Some(self.file.as_ref()?.with_file_name("haikus.jsonl"))
+    }
+
+    /// Add `poem`, written for `socket`'s daemon, to the past, and let go
+    /// of what is older than `keep`, if anything is: a line added, the
+    /// file rewritten only when its first line has aged out, under the
+    /// lock the caller holds.
+    pub(crate) fn remember(
+        &self,
+        socket: &str,
+        poem: &Poem,
+        keep: Option<Duration>,
+    ) -> std::io::Result<()> {
+        let path = self.past().ok_or(std::io::ErrorKind::NotFound)?;
+        if let Some(keep) = keep {
+            let since = poem.at_ms - keep.as_millis() as i64;
+            self.forget(&path, since)?;
+        }
+        let mut line = Poem::line(socket, poem);
+        line.push('\n');
+        let mut file = (std::fs::OpenOptions::new().create(true).append(true)).open(&path)?;
+        file.write_all(line.as_bytes())
+    }
+
+    /// The past at `path` with only what was written after `since`: left
+    /// as it is when its first haiku is, so most writes read a line.
+    fn forget(&self, path: &Path, since: i64) -> std::io::Result<()> {
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let mut lines = std::io::BufReader::new(file).lines();
+        let at = |line: &str| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|poem| poem["at_ms"].as_i64())
+        };
+        match lines.next().transpose()? {
+            Some(first) if at(&first).is_some_and(|at| at <= since) => {}
+            _ => return Ok(()),
+        }
+        let mut kept = String::new();
+        for line in lines {
+            let line = line?;
+            if at(&line).is_some_and(|at| at > since) {
+                kept.push_str(&line);
+                kept.push('\n');
+            }
+        }
+        let part = path.with_extension(format!("jsonl.{}", std::process::id()));
+        std::fs::write(&part, kept)?;
+        std::fs::rename(&part, path)
     }
 
     /// The file's lock, held until it is dropped: one sky reads, changes
@@ -428,10 +731,6 @@ impl Kept {
                 ..Kept::default()
             };
         };
-        let past: Vec<Poem> = (kept["past"].as_array().into_iter().flatten())
-            .map(Poem::read)
-            .filter(|poem| poem.lines.len() == 3)
-            .collect();
         let shown = Poem::read(&kept);
         let claim = (
             kept["claim"]["by"].as_str().unwrap_or("").to_owned(),
@@ -446,7 +745,6 @@ impl Kept {
             since_ms: shown.since_ms,
             claim,
             unwritten: Unwritten::read(&kept["unwritten"]),
-            past,
             socket,
         }
     }
@@ -471,6 +769,7 @@ impl Kept {
     /// Keep `lines` as the haiku `by` wrote for its claim since `since_ms`,
     /// at `now_ms`, if that claim is still the one kept: whether it was.
     /// A newer claim that took over while it was written keeps its own.
+    /// Added to the past too, for replays, kept as long as `keep` says.
     pub fn publish(
         store: &Store,
         socket: &Path,
@@ -478,7 +777,14 @@ impl Kept {
         since_ms: i64,
         lines: &[String; 3],
         now_ms: i64,
+        keep: Option<Duration>,
     ) -> bool {
+        let poem = Poem {
+            by: by.to_owned(),
+            lines: lines.to_vec(),
+            at_ms: now_ms,
+            since_ms,
+        };
         Kept::update(store, socket, |kept| {
             let current = kept.claim == (by.to_owned(), since_ms);
             if current {
@@ -487,14 +793,8 @@ impl Kept {
                 kept.lines = lines.to_vec();
                 kept.at_ms = now_ms;
                 kept.unwritten = None;
-                let day = KEPT.as_millis() as i64;
-                kept.past.retain(|poem| now_ms - poem.at_ms < day);
-                kept.past.push(Poem {
-                    by: by.to_owned(),
-                    lines: lines.to_vec(),
-                    at_ms: now_ms,
-                    since_ms,
-                });
+                // Shown however the past fares: a replay misses it at most.
+                let _ = store.remember(&kept.socket, &poem, keep);
             }
             current
         })
@@ -527,14 +827,16 @@ impl Kept {
     fn save(&self, store: &Store) -> std::io::Result<()> {
         // Each daemon's apart, by its socket; the others' as they are.
         let mut all = store.all();
-        all.insert(
-            self.socket.clone(),
-            json!({"day": self.day, "written": self.written, "by": self.by,
-                "lines": self.lines, "at_ms": self.at_ms, "since_ms": self.since_ms,
-                "claim": {"by": self.claim.0, "since_ms": self.claim.1},
-                "unwritten": self.unwritten.as_ref().map(Unwritten::json),
-                "past": self.past.iter().map(Poem::json).collect::<Vec<_>>()}),
-        );
+        let mut kept = json!({"day": self.day, "written": self.written, "by": self.by,
+            "lines": self.lines, "at_ms": self.at_ms, "since_ms": self.since_ms,
+            "claim": {"by": self.claim.0, "since_ms": self.claim.1},
+            "unwritten": self.unwritten.as_ref().map(Unwritten::json)});
+        // A day of past haikus [`PAST`] has not moved yet stays where it
+        // is, for that migration to move when it runs again.
+        if let Some(past) = all.get(&self.socket).and_then(|old| old.get("past")) {
+            kept["past"] = past.clone();
+        }
+        all.insert(self.socket.clone(), kept);
         store.write(&Value::Object(all))
     }
 
@@ -548,8 +850,9 @@ impl Kept {
     }
 
     /// Whether a haiku may be written now, at `now_ms`, by `by`, holder
-    /// since `since_ms`: today's count is under the cap, and no sky wrote
-    /// one for this same hold already. Counts it, when it may.
+    /// since `since_ms`: haikus are on, today's count is under the cap, if
+    /// there is one, and no sky wrote one for this same hold already.
+    /// Counts it, when it may.
     pub fn claim(&mut self, rule: &Rule, by: &str, since_ms: i64, now_ms: i64) -> bool {
         let today = day(now_ms);
         if self.day != today {
@@ -558,7 +861,7 @@ impl Kept {
         }
         let (held_by, held_since) = &self.claim;
         let same = held_by == by && (since_ms - held_since).abs() < rule.hold.as_millis() as i64;
-        if same || self.written >= rule.daily {
+        if !rule.on || same || (rule.daily > 0 && self.written >= rule.daily) {
             return false;
         }
         self.written += 1;
@@ -617,7 +920,7 @@ async fn ask(client: &Client, name: &str, id: &Value) -> Result<String, Failed> 
         .request(
             "submit",
             json!({"bot": name, "bot_id": id, "request_id": format!("{name}.1"),
-                "prompt": ASK, "delivery": "reject"}),
+                "prompt": ASK, "delivery": "steer"}),
         )
         .await
         .map_err(unreached)?;
@@ -678,7 +981,9 @@ mod tests {
 
     fn rule() -> Rule {
         Rule {
+            on: true,
             daily: 8,
+            keep: Some(Duration::from_secs(24 * 3600)),
             window: Duration::from_secs(600),
             margin: 50,
             hold: Duration::from_secs(600),
@@ -739,7 +1044,13 @@ mod tests {
             title.note(at(s * 60), "a");
         }
         assert!(title.busy.len() <= 11, "{}", title.busy.len());
-        let mut off = Title::new(Rule { daily: 0, ..rule() }, start);
+        let mut off = Title::new(
+            Rule {
+                on: false,
+                ..rule()
+            },
+            start,
+        );
         off.note(at(1), "a");
         assert!(off.busy.is_empty());
     }
@@ -763,36 +1074,261 @@ mod tests {
         assert_eq!(Kept::load(&store, socket).claim, ("a".to_owned(), ms));
         // A haiku is kept only for the claim it was written for.
         let lines = ["x".to_owned(), "y".into(), "z".into()];
-        assert!(!Kept::publish(&store, socket, "a", ms - 1, &lines, ms + 2));
+        let keep = rule.keep;
+        assert!(!Kept::publish(
+            &store,
+            socket,
+            "a",
+            ms - 1,
+            &lines,
+            ms + 2,
+            keep
+        ));
         assert!(Kept::load(&store, socket).lines.is_empty());
-        assert!(Kept::publish(&store, socket, "a", ms, &lines, ms + 3));
+        assert!(Kept::publish(&store, socket, "a", ms, &lines, ms + 3, keep));
         let kept = Kept::load(&store, socket);
         assert_eq!((kept.lines, kept.at_ms), (lines.to_vec(), ms + 3));
         let _ = std::fs::remove_dir_all(store.file.unwrap().parent().unwrap());
     }
 
+    /// Every haiku in the past file, for `socket`, from the start.
+    fn past(store: &Store, socket: &Path) -> Vec<Poem> {
+        let mut past = Past::new(socket, i64::MIN / 2);
+        past.read(store);
+        past.poems
+    }
+
     #[test]
-    fn a_day_of_haikus_is_kept_for_replays() {
+    fn haikus_are_kept_for_replays_as_long_as_the_person_says() {
         let store = Store::new();
-        let rule = Rule { daily: 8, ..rule() };
         let socket = Path::new("/tmp/agent-past.sock");
         let hour = 3_600_000;
         let ms = 1_793_400_000_000;
         let lines = |n: i64| [format!("line {n}"), "y".into(), "z".into()];
-        for (n, by) in [(0, "a"), (1, "b"), (24, "c")] {
+        let write = |rule: &Rule, n: i64, by: &str| {
             let at = ms + n * hour;
-            Kept::update(&store, socket, |kept| kept.claim(&rule, by, at, at)).unwrap();
-            assert!(Kept::publish(&store, socket, by, at, &lines(n), at + 1));
+            Kept::update(&store, socket, |kept| kept.claim(rule, by, at, at)).unwrap();
+            assert!(Kept::publish(
+                &store,
+                socket,
+                by,
+                at,
+                &lines(n),
+                at + 1,
+                rule.keep
+            ));
+        };
+        let day = rule();
+        for (n, by) in [(0, "a"), (1, "b"), (24, "c")] {
+            write(&day, n, by);
         }
         // The first went a day after it was written; the last is among them.
-        let past = Kept::load(&store, socket).past;
-        let kept: Vec<(&str, i64)> = (past.iter())
+        let kept = past(&store, socket);
+        let at: Vec<(&str, i64)> = (kept.iter())
             .map(|poem| (poem.by.as_str(), poem.at_ms))
             .collect();
-        assert_eq!(kept, [("b", ms + hour + 1), ("c", ms + 24 * hour + 1)]);
-        assert_eq!(past[1].lines, lines(24).to_vec());
-        assert_eq!(past[1].since_ms, ms + 24 * hour);
+        assert_eq!(at, [("b", ms + hour + 1), ("c", ms + 24 * hour + 1)]);
+        assert_eq!(kept[1].lines, lines(24).to_vec());
+        assert_eq!(kept[1].since_ms, ms + 24 * hour);
+        // Kept all, nothing goes, a year on; kept two hours, only the last.
+        let all = Rule {
+            keep: None,
+            ..rule()
+        };
+        write(&all, 24 * 365, "d");
+        assert_eq!(past(&store, socket).len(), 3);
+        let two = Rule {
+            keep: Some(Duration::from_secs(7200)),
+            ..rule()
+        };
+        write(&two, 24 * 366, "e");
+        let kept = past(&store, socket);
+        assert_eq!(
+            kept.iter().map(|p| p.by.as_str()).collect::<Vec<_>>(),
+            ["e"]
+        );
+        // The live file keeps only the last: what each sky reads a second.
+        let live = std::fs::read_to_string(store.file.as_ref().unwrap()).unwrap();
+        assert!(
+            !live.contains("line 0") && !live.contains("\"past\""),
+            "{live}"
+        );
         let _ = std::fs::remove_dir_all(store.file.unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn a_replay_reads_only_what_was_added_and_starts_over_on_a_rewrite() {
+        let store = Store::new();
+        let socket = Path::new("/tmp/agent-tail.sock");
+        let ms = 1_793_400_000_000_i64;
+        let poem = |by: &str, at: i64| Poem {
+            by: by.into(),
+            lines: vec!["x".into(), "y".into(), "z".into()],
+            at_ms: at,
+            since_ms: at,
+        };
+        let path = store.past().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // One over an hour before the replay, and another daemon's: not its.
+        let mine = socket.display().to_string();
+        store
+            .remember(&mine, &poem("old", ms - 7_200_000), None)
+            .unwrap();
+        store
+            .remember(&mine, &poem("a", ms - 60_000), None)
+            .unwrap();
+        store
+            .remember("/tmp/other.sock", &poem("o", ms), None)
+            .unwrap();
+        let mut replay = Past::new(socket, ms);
+        replay.read(&store);
+        assert_eq!(replay.poems, [poem("a", ms - 60_000)]);
+        // Half a line, as a sky writing it now leaves it, waits for its end.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let line = Poem::line(&socket.display().to_string(), &poem("b", ms + 1));
+        file.write_all(&line.as_bytes()[..10]).unwrap();
+        replay.read(&store);
+        assert_eq!(replay.poems.len(), 1);
+        file.write_all(&line.as_bytes()[10..]).unwrap();
+        file.write_all(b"\n").unwrap();
+        replay.read(&store);
+        assert_eq!(replay.poems, [poem("a", ms - 60_000), poem("b", ms + 1)]);
+        // Rewritten, as when old ones are let go: read again from the start.
+        let keep = Some(Duration::from_secs(60));
+        store
+            .remember(&socket.display().to_string(), &poem("c", ms + 2), keep)
+            .unwrap();
+        replay.read(&store);
+        assert_eq!(replay.poems, [poem("b", ms + 1), poem("c", ms + 2)]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn no_limit_writes_one_each_hold_and_a_cap_still_holds() {
+        let mut kept = Kept::default();
+        let free = Rule { daily: 0, ..rule() };
+        let ms = 1_793_400_000_000;
+        // Holders in turn, at one time, so no day turns over.
+        for n in 0..50 {
+            assert!(kept.claim(&free, &format!("agent-{n}"), ms, ms), "{n}");
+        }
+        assert_eq!(kept.written, 50);
+        let capped = Rule {
+            daily: 50,
+            ..rule()
+        };
+        assert!(!kept.claim(&capped, "another", ms, ms));
+        // Switched off, as the rule a sky reads just before it claims says,
+        // nothing is claimed or counted, limit or none.
+        let off = Rule { on: false, ..free };
+        assert!(!kept.claim(&off, "one more", ms, ms));
+        assert_eq!(kept.written, 50);
+    }
+
+    #[test]
+    fn a_past_not_yet_moved_outlives_a_write_and_moves_once_it_can() {
+        let store = Store::new();
+        let file = store.file.clone().unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let ms = 1_793_400_000_000_i64;
+        let socket = Path::new("/tmp/a.sock");
+        let old = json!({"/tmp/a.sock": {"day": "2026-11-05", "written": 1, "by": "a",
+            "lines": ["x", "y", "z"], "at_ms": ms, "since_ms": ms,
+            "claim": {"by": "a", "since_ms": ms},
+            "past": [{"by": "a", "lines": ["x", "y", "z"], "at_ms": ms, "since_ms": ms}]}});
+        std::fs::write(&file, old.to_string()).unwrap();
+        // The past file can't be read, so the move fails and waits.
+        let past_file = store.past().unwrap();
+        std::fs::create_dir_all(&past_file).unwrap();
+        upgrade(&store);
+        Kept::update(&store, socket, |kept| kept.written += 1).unwrap();
+        let live = std::fs::read_to_string(&file).unwrap();
+        assert!(live.contains("\"past\""), "{live}");
+        std::fs::remove_dir(&past_file).unwrap();
+        upgrade(&store);
+        assert_eq!(past(&store, socket).len(), 1);
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("past"));
+        assert_eq!(Kept::load(&store, socket).written, 2);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn the_day_s_past_moves_out_of_the_file_every_sky_reads() {
+        let store = Store::new();
+        let file = store.file.clone().unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let ms = 1_793_400_000_000_i64;
+        let poem = |by: &str, at: i64| {
+            json!({"by": by, "lines": ["x", "y", "z"],
+            "at_ms": at, "since_ms": at})
+        };
+        let old = json!({
+            "/tmp/a.sock": {"day": "2026-11-05", "written": 2, "by": "b",
+                "lines": ["x", "y", "z"], "at_ms": ms + 3, "since_ms": ms + 3,
+                "claim": {"by": "b", "since_ms": ms + 3},
+                "past": [poem("a", ms + 1), poem("b", ms + 3)]},
+            "/tmp/b.sock": {"day": "2026-11-05", "written": 1, "by": "c",
+                "lines": ["x", "y", "z"], "at_ms": ms + 2, "since_ms": ms + 2,
+                "claim": {"by": "c", "since_ms": ms + 2},
+                "past": [poem("c", ms + 2), {"by": "e", "lines": [], "at_ms": ms}]}});
+        std::fs::write(&file, old.to_string()).unwrap();
+        // A run cut short after the past was written, before the file was.
+        let past_file = store.past().unwrap();
+        let first = Poem::read(&poem("a", ms + 1));
+        std::fs::write(&past_file, Poem::line("/tmp/a.sock", &first) + "\n").unwrap();
+        upgrade(&store);
+        let a = past(&store, Path::new("/tmp/a.sock"));
+        assert_eq!(
+            a.iter().map(|p| p.by.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        let b = past(&store, Path::new("/tmp/b.sock"));
+        assert_eq!(b.iter().map(|p| p.by.as_str()).collect::<Vec<_>>(), ["c"]);
+        let text = std::fs::read_to_string(&past_file).unwrap();
+        let at: Vec<i64> = (text.lines())
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["at_ms"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(at, [ms + 1, ms + 2, ms + 3], "oldest first");
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("past"));
+        let kept = Kept::load(&store, Path::new("/tmp/a.sock"));
+        assert_eq!((kept.by.as_str(), kept.written), ("b", 2));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn a_count_in_sky_haikus_moves_to_where_it_means_the_same() {
+        let moved = |text: &str| dailied(text).unwrap();
+        // 0 turned haikus off; any other count is the day's most.
+        assert_eq!(
+            moved("[sonny]\nchime = false\nsky_haikus = 0\n").as_deref(),
+            Some("[sonny]\nchime = false\nsky_haikus = false\n")
+        );
+        assert_eq!(
+            moved("[sonny]\n  sky_haikus = 12 # a dozen\nsky_haiku_hold = 5").as_deref(),
+            Some("[sonny]\n  sky_haiku_daily = 12\nsky_haiku_hold = 5")
+        );
+        let moved = moved("[sonny]\nsky_haikus = 3\n").unwrap();
+        let dir = std::env::temp_dir().join(format!("sonny-daily-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), &moved).unwrap();
+        let config = agent_client::config::read(&dir.join("config.toml")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(config.sonny.sky_haikus);
+        assert_eq!(config.sonny.sky_haiku_daily, 3);
+        // Nothing to move: a switch already, none, or elsewhere.
+        assert_eq!(dailied("[sonny]\nsky_haikus = true\n"), Ok(None));
+        assert_eq!(dailied("[sonny]\nchime = true\n"), Ok(None));
+        assert_eq!(dailied("[judge]\nmodel = \"x\"\n"), Ok(None));
+        // A key lines can't move is left for the config's own error.
+        assert_eq!(dailied("sonny.sky_haikus = 4\n"), Err(()));
+        assert_eq!(dailied("sonny = { sky_haikus = 4 }\n"), Err(()));
     }
 
     #[test]
@@ -866,7 +1402,7 @@ mod tests {
             "dawn".into(),
         ];
         Kept::update(&store, socket, |kept| kept.claim(&rule, "a", ms, ms)).unwrap();
-        assert!(Kept::publish(&store, socket, "a", ms, &first, ms + 1));
+        assert!(Kept::publish(&store, socket, "a", ms, &first, ms + 1, None));
         // The next holder's copy answers nothing: the claim is spent, the
         // haiku before shows on in every sky, and the file says why.
         let next = ms + 700_000;
@@ -934,7 +1470,15 @@ mod tests {
         // Once: the file as written since is left as it is.
         let lines = ["n".to_owned(), "o".into(), "w".into()];
         let socket = Path::new("/tmp/agent.sock");
-        assert!(Kept::publish(&store, socket, "b", ms + 5, &lines, ms + 20));
+        assert!(Kept::publish(
+            &store,
+            socket,
+            "b",
+            ms + 5,
+            &lines,
+            ms + 20,
+            None
+        ));
         upgrade(&store);
         assert_eq!(Kept::load(&store, socket).lines, lines);
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
@@ -993,7 +1537,9 @@ mod scale {
             .map(|n| format!("p{}.task-{n}", n % 100))
             .collect();
         let rule = Rule {
+            on: true,
             daily: 8,
+            keep: None,
             window: Duration::from_secs(600),
             margin: 50,
             hold: Duration::from_secs(600),

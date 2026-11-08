@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --max-load --stall-timeout --idle-exit";
+const STARTUP: &str = "--provider --max-processes --max-lasting --max-active --max-connecting --max-pending --max-pending-bytes --max-input-bytes --max-readers --max-load --max-depth --stall-timeout --idle-exit";
 
 struct Command {
     name: &'static str,
@@ -20,15 +20,15 @@ const COMMANDS: &[Command] = &[
         name: "run",
         about: "Send a prompt to a bot, or make one with --new; prints the turn as it runs",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
-        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --keep-warm --cache-ttl --speed --sandbox --writable --network --hide-senders --quiet-background --hold --unix-socket --outputs",
+        flags: "--bot --new --created-by --fork --allow --expires --detach --delivery --attach-wait --turn --model --workspace --effort --turn-budget-tokens --budget-counts --image --quote --agents --profile --request-id --bot-id --pretty --no-spawn",
+        settings: "--tools --instructions --instructions-file --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallback --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --compact-tokens --max-rounds --keep-turns --approval-hold --max-output-tokens --cache-ttl --speed --sandbox --writable --network --hide-senders --quiet-background --hold --unix-socket --outputs",
         startup: true,
     },
     Command {
         name: "follow",
         about: "Stream a bot's events, or every bot's with --all",
         usage: "follow (--bot NAME | --all) [--after CURSOR | --since DURATION]",
-        flags: "--bot --all --after --since --pretty",
+        flags: "--bot --all --after --since --pretty --no-spawn",
         settings: "",
         startup: false,
     },
@@ -36,7 +36,7 @@ const COMMANDS: &[Command] = &[
         name: "fork",
         about: "Copy a bot's conversation up to a message into a new bot",
         usage: "fork --source NAME --bot NAME [--checkpoint NODE] [--allow LIST] [--expires DURATION]",
-        flags: "--source --bot --checkpoint --workspace --budget-tokens --allow --expires --request-id --pretty",
+        flags: "--source --bot --checkpoint --workspace --budget-tokens --budget-counts --allow --expires --request-id --pretty --no-spawn",
         settings: "",
         startup: false,
     },
@@ -44,7 +44,7 @@ const COMMANDS: &[Command] = &[
         name: "interrupt",
         about: "Stop a bot's running turn, or with --turn end one still queued; prints its turn view",
         usage: "interrupt --bot NAME [--turn TURN]",
-        flags: "--bot --turn --pretty",
+        flags: "--bot --turn --pretty --no-spawn",
         settings: "",
         startup: false,
     },
@@ -52,7 +52,7 @@ const COMMANDS: &[Command] = &[
         name: "ls",
         about: "List the bots",
         usage: "ls [--name GLOB] [--active] [--created-by BOT] [--limit N]",
-        flags: "--name --active --created-by --limit --pretty",
+        flags: "--name --active --created-by --limit --pretty --no-spawn",
         settings: "",
         startup: false,
     },
@@ -84,7 +84,7 @@ const COMMANDS: &[Command] = &[
         name: "wait",
         about: "A turn's or command's result: status, text, usage; --timeout 0 polls",
         usage: "wait [--any] [--timeout DURATION] HANDLE... | wait --bot NAME [--bot-id N] [--timeout DURATION]",
-        flags: "--bot --bot-id --any --timeout --pretty",
+        flags: "--bot --bot-id --any --timeout --pretty --no-spawn",
         settings: "",
         startup: false,
     },
@@ -218,9 +218,9 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "sandbox",
-        about: "Run a command in a sandbox: read-only, or writing only the folders named",
-        usage: "sandbox [--writable PATH]... -- COMMAND [ARGS...]",
-        flags: "--writable",
+        about: "Run a command in a sandbox: read-only, writing only the folders named, or as one of a bot's commands",
+        usage: "sandbox [--writable PATH]... [--bot NAME [--bot-id ID]] -- COMMAND [ARGS...]",
+        flags: "--writable --bot --bot-id",
         settings: "",
         startup: false,
     },
@@ -228,7 +228,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --context-window --models --provider-config",
         settings: "",
         startup: true,
     },
@@ -299,7 +299,7 @@ fn print_flags(flags: &str) {
             "--detach" => ("", "Submit and return a JSON turn handle immediately"),
             "--delivery" => (
                 "MODE",
-                "If the bot is busy: reject, queue, or steer; attach adds the message to its next model call without starting a turn; default AGENT_DELIVERY or reject",
+                "If the bot is busy: steer joins its running turn, queue runs after it, reject refuses; attach adds the message to its next model call without starting a turn; default AGENT_DELIVERY, else steer, or queue with --workspace or --turn-budget-tokens",
             ),
             "--attach-wait" => (
                 "DURATION",
@@ -342,6 +342,10 @@ fn print_flags(flags: &str) {
                 "N",
                 "This turn's input + output token cap, beside the bot's own budget",
             ),
+            "--budget-counts" => (
+                "tokens|work",
+                "What the budgets given here count: tokens, the default, or work, what calls add beside the history they send again",
+            ),
             "--image" => (
                 "PATH",
                 "Send this PNG, JPEG, GIF or WebP with the prompt; repeat for more",
@@ -359,7 +363,7 @@ fn print_flags(flags: &str) {
             "--provider" => ("SPEC", "Register a provider; repeat for multiple providers"),
             "--discover" => (
                 "",
-                "Write ~/.agent/models from the providers' own model listings",
+                "Rewrite the model catalog ~/.agent/models.discovered from the providers' own listings, as each daemon start does",
             ),
             "--model" => (
                 "PROVIDER/MODEL",
@@ -386,10 +390,17 @@ fn print_flags(flags: &str) {
                 "N",
                 "Request bytes read ahead of the service; default memory/16; 0 is unbounded",
             ),
-            "--max-readers" => ("N", "Store reader connections; default one per CPU"),
+            "--max-readers" => (
+                "N",
+                "Most store reader connections, opened as reads wait; default one per CPU",
+            ),
             "--max-load" => (
                 "LOAD",
                 "New commands wait while the 1-minute load average is this or more and one is running; 0 is no gate",
+            ),
+            "--max-depth" => (
+                "N",
+                "Most generations a new bot may be below the bot that starts its line; 0 is unbounded",
             ),
             "--max-output-tokens" => (
                 "N",
@@ -399,13 +410,9 @@ fn print_flags(flags: &str) {
                 "DURATION",
                 "Retry a provider stream with no content this long; default 10m",
             ),
-            "--keep-warm" => (
-                "DURATION",
-                "A new bot refreshes its idle Anthropic prompt cache during a tool call after this long; default 4m, 0 disables",
-            ),
             "--cache-ttl" => (
                 "5m|1h",
-                "A new bot's Anthropic prompt-cache lifetime; 1h bills writes at 2x input and sends no refresh; default 5m",
+                "A new bot's Anthropic prompt-cache lifetime; 1h bills writes at 2x input; default 5m",
             ),
             "--speed" => (
                 "standard|fast|ultrafast",
@@ -427,6 +434,18 @@ fn print_flags(flags: &str) {
             "--protect-path" => (
                 "PATH",
                 "Keep PATH, by its absolute path, read-only in every sandbox, and from being made when missing; repeatable",
+            ),
+            "--context-window" => (
+                "PATTERN=TOKENS",
+                "The context window of each model whose PROVIDER/MODEL path matches PATTERN (* and ? wildcards), over its provider's listing; the most specific pattern wins; repeatable; clients pass [context_windows] from ~/.agent/config.toml",
+            ),
+            "--provider-config" => (
+                "PATH",
+                "The config file the providers came from (its `provider`), watched: an edit binds the new set for turns that start after it, running turns finish on the old, and a set that fails to bind or drops a provider agents use is refused; clients pass ~/.agent/config.toml when no --provider or AGENT_PROVIDER names them",
+            ),
+            "--models" => (
+                "PATH",
+                "Rewrite the model catalog at PATH from the providers' listings each time the daemon starts, after it is ready; clients pass ~/.agent/models.discovered",
             ),
             "--wall" => (
                 "FOLDER",
@@ -591,7 +610,6 @@ const DURATIONS: &[(&str, u64, u64, bool, &str)] = &[
         true,
         "in whole seconds; 0 disables",
     ),
-    ("--keep-warm", 0, 299_000, true, "below 5m; 0 disables"),
 ];
 
 /// A duration flag's value in milliseconds: digits and a unit (`ms`, `s`,
@@ -687,6 +705,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--protect-existing"
                     | "--protect-path"
                     | "--wall"
+                    | "--context-window"
             )
         {
             return fail_with("usage", format!("{flag} may only be specified once"));
@@ -808,6 +827,12 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     } else if !matches!(c.name, "run" | "wait" | "companion") && positional != 0 {
         return fail_with("usage", format!("{} takes no positional arguments", c.name));
     }
+    if has("--budget-counts") && !has("--budget-tokens") && !has("--turn-budget-tokens") {
+        return fail_with(
+            "usage",
+            "--budget-counts names what a budget counts; give --budget-tokens or --turn-budget-tokens",
+        );
+    }
     if c.name == "run" && has("--fork") {
         if !has("--bot") {
             return fail_with("usage", "run --fork needs --bot to name the copy");
@@ -884,8 +909,8 @@ mod tests {
         ] {
             assert_eq!(ms(refused), None, "{refused}");
         }
-        assert_eq!(duration_secs("--keep-warm", "4m").ok(), Some(240));
-        assert!(duration_secs("--keep-warm", "1500ms").is_err());
+        assert_eq!(duration_secs("--idle-exit", "4m").ok(), Some(240));
+        assert!(duration_secs("--idle-exit", "1500ms").is_err());
     }
 
     #[test]
@@ -929,7 +954,14 @@ mod tests {
         );
         assert!(prepare(words(&["sandbox", "--writable", "/a"])).is_err());
         assert!(prepare(words(&["sandbox", "--"])).is_err());
-        assert!(prepare(words(&["sandbox", "--bot", "x", "--", "ls"])).is_err());
+        assert!(prepare(words(&["sandbox", "--bot", "x", "--", "ls"])).is_ok());
+        assert!(
+            prepare(words(&[
+                "sandbox", "--bot", "x", "--bot-id", "3", "--", "ls"
+            ]))
+            .is_ok()
+        );
+        assert!(prepare(words(&["sandbox", "--model", "m", "--", "ls"])).is_err());
         // With the network off, it reaches no socket, the daemon's least.
         assert!(prepare(words(&["sandbox", "--network", "--", "ls"])).is_err());
     }

@@ -1,11 +1,11 @@
 use agent_runtime::{
     Error, Result,
     codec::Family,
-    provider::{ToolCall, Usage},
+    provider::{ModelTokens, ToolCall, Usage},
     store::{
-        Answered, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage, Database,
-        Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Planning, QuoteRef, Settings, Strip,
-        TurnBudget, TurnOptions, Wake,
+        Answered, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage, Counts, Database,
+        Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Limit, Planning, QuoteRef, Settings,
+        Strip, TurnBudget, TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome},
 };
@@ -42,6 +42,7 @@ fn binding() -> Binding<'static> {
         instructions: "test",
         effort: None,
         budget_tokens: None,
+        budget_counts: Default::default(),
         tools: &READ,
         created_by: None,
         created_by_id: None,
@@ -52,6 +53,7 @@ fn binding() -> Binding<'static> {
         settings: Default::default(),
         declared: None,
         request_id: None,
+        starts_line: false,
     }
 }
 /// Compaction planning as a turn runs it: a catch-up walk goes in pieces.
@@ -165,8 +167,10 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         person: None,
         quotes: Vec::new(),
         budget_tokens: None,
+        budget_counts: Default::default(),
         images: Vec::new(),
         wait_ms: None,
+        output_schema: None,
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch, |_, _| {
@@ -3274,6 +3278,323 @@ fn schema_77_holds_a_refused_start_in_line() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// A store at schema 77 on disk, in a folder of its own: its path.
+fn store_at_77(name: &str) -> std::path::PathBuf {
+    let folder = std::env::temp_dir().join(format!("agent-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join("state.sqlite");
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP INDEX turns_held; ALTER TABLE turns DROP COLUMN held; PRAGMA user_version=77;",
+        )
+        .unwrap();
+    path
+}
+
+#[test]
+fn an_older_store_is_copied_and_checked_before_it_migrates_and_two_copies_are_kept() {
+    let path = store_at_77("backup");
+    let folder = path.parent().unwrap().to_path_buf();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    // Copies from two earlier upgrades are there already.
+    for old in [70, 75] {
+        std::fs::write(
+            folder.join(format!("state.sqlite.schema-{old}.backup")),
+            b"",
+        )
+        .unwrap();
+    }
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    drop(db);
+    // The copy is the store as it was: schema 77, its bot, no column the
+    // migration added, and it passes SQLite's integrity check.
+    let copy = folder.join("state.sqlite.schema-77.backup");
+    let copied = Connection::open(&copy).unwrap();
+    let at: i32 = copied
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    let check: String = copied
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    let bots: i64 = copied
+        .query_row("SELECT COUNT(*) FROM bots", [], |r| r.get(0))
+        .unwrap();
+    let held: bool = copied
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='held')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!((at, check.as_str(), bots, held), (77, "ok", 1, false));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the copy is as private as the store");
+    }
+    // The two newest copies are kept.
+    let mut left: Vec<String> = std::fs::read_dir(&folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".backup"))
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            "state.sqlite.schema-75.backup",
+            "state.sqlite.schema-77.backup"
+        ]
+    );
+    // A store at the current schema is not copied again.
+    let before = std::fs::metadata(&copy).unwrap().modified().unwrap();
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    assert_eq!(
+        std::fs::metadata(&copy).unwrap().modified().unwrap(),
+        before
+    );
+    std::fs::remove_dir_all(folder).unwrap();
+}
+
+#[test]
+fn a_store_that_cannot_be_copied_is_not_migrated() {
+    let path = store_at_77("backup-fails");
+    let folder = path.parent().unwrap().to_path_buf();
+    // Something already stands where the copy is written.
+    std::fs::create_dir(folder.join("state.sqlite.schema-77.backup.partial")).unwrap();
+    let Err(failed) = Database::initialize(Connection::open(&path).unwrap()) else {
+        panic!("a store that could not be copied was opened");
+    };
+    assert_eq!(failed.code, "store_backup_failed");
+    assert!(
+        failed
+            .detail
+            .unwrap()
+            .ends_with("the store was left at schema 77"),
+        "it says the store is as it was"
+    );
+    let at: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(at, 77);
+    std::fs::remove_dir_all(folder).unwrap();
+}
+
+#[test]
+fn an_older_store_counts_each_bot_s_depth_along_its_makers() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema82-depth-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let mut maker: Option<Bot> = None;
+        for name in ["A", "B", "C", "D"] {
+            let mut b = binding();
+            b.created_by = maker.as_ref().map(|m| m.name.as_str());
+            b.created_by_id = maker.as_ref().map(|m| m.bot_id);
+            let (bot, _) = db.create(name, Some("/synthetic"), b).unwrap();
+            maker = Some(bot);
+        }
+        let b = db.inspect("B").unwrap();
+        let mut by_b = binding();
+        by_b.created_by = Some("B");
+        by_b.created_by_id = Some(b.bot_id);
+        db.create("Orphan", Some("/synthetic"), by_b).unwrap();
+        db.create("Solo", Some("/synthetic"), binding()).unwrap();
+        db.delete_bot("B").unwrap();
+    }
+    // A store from before schema 83 kept no depth.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE bots DROP COLUMN depth; PRAGMA user_version=82;")
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let depth = |name: &str| db.inspect(name).unwrap().depth;
+    // Counted from a bot with no maker, or whose maker is gone.
+    assert_eq!(
+        ["A", "C", "D", "Orphan", "Solo"].map(depth),
+        [0, 0, 1, 0, 0]
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_turn_keeps_the_schema_its_reply_follows() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema80-output-schema-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let schema = r#"{"type":"object"}"#;
+    let shaped = |schema: Option<&str>| TurnOptions {
+        output_schema: schema.map(Into::into),
+        ..TurnOptions::default()
+    };
+    let earlier = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Ann", Some("/synthetic"), binding()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        db.begin("Ann", "r0", "go", true, &shaped(None), allow_provider)
+            .unwrap()
+            .turn
+    };
+    // A store from before schema 81: its turns asked for no schema.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE turns DROP COLUMN output_schema; PRAGMA user_version=80;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let started = db
+        .begin(
+            "Bob",
+            "r1",
+            "go",
+            true,
+            &shaped(Some(schema)),
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(
+        db.context(started.turn).unwrap().output_schema.as_deref(),
+        Some(schema)
+    );
+    // Kept with the turn, which a resumed turn reads its context from.
+    drop(db);
+    let kept = |turn: i64| -> Option<String> {
+        Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT output_schema FROM turns WHERE id=?", [turn], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(kept(earlier), None);
+    assert_eq!(kept(started.turn).as_deref(), Some(schema));
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // Part of the request: a retry names the same one.
+    assert!(
+        !db.begin(
+            "Bob",
+            "r1",
+            "go",
+            true,
+            &shaped(Some(schema)),
+            allow_provider
+        )
+        .unwrap()
+        .fresh
+    );
+    for other in [None, Some(r#"{"type":"array"}"#)] {
+        let conflict = db
+            .begin("Bob", "r1", "go", false, &shaped(other), allow_provider)
+            .unwrap_err();
+        assert_eq!(conflict.code, "idempotency_conflict");
+        assert_eq!(conflict.facts.unwrap()["field"], "output_schema");
+    }
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema78-taken-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    // An older host was serving calls when the upgrade came: what it did
+    // with them is not known.
+    let turn = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let start = Declared {
+            name: "start".into(),
+            description: "Start.".into(),
+            parameters: json!({"type":"object"}),
+            result: "ok".into(),
+            answered_by: Some("sonny".into()),
+            expire_ms: None,
+            grammar: None,
+            steps: false,
+            inherit: Inherit::All,
+        };
+        db.create(
+            "Lead",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(std::slice::from_ref(&start)),
+                ..binding()
+            },
+        )
+        .unwrap();
+        let turn = db
+            .begin(
+                "Lead",
+                "request",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let calls: Vec<ToolCall> = (1..=3)
+            .map(|n| ToolCall {
+                name: "start".into(),
+                call_id: format!("c{n}"),
+                arguments: "{}".into(),
+                custom: false,
+            })
+            .collect();
+        db.append(turn, vec![], &calls, None).unwrap();
+        for call in &calls {
+            db.tool_start(turn, call).unwrap();
+        }
+        // The turn waits on c1's answer, as a turn waits across a restart.
+        assert!(
+            db.suspend_answer(turn, "c1", &calls[1..], 0, None, None)
+                .unwrap()
+                .is_some()
+        );
+        turn
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE answers DROP COLUMN taken_ms; PRAGMA user_version=78;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // Each counts as taken, so no client runs it again.
+    let untaken: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM answers WHERE taken_ms IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(untaken, 0);
+    let Err(taken) = db.take_call("Lead", turn, "c1", 0) else {
+        panic!("a call left unanswered was taken again after the upgrade");
+    };
+    assert_eq!(taken.code, "call_taken");
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn schema_70_finds_each_attached_message_from_its_event() {
     let path = std::env::temp_dir().join(format!(
@@ -3438,6 +3759,70 @@ fn an_event_is_never_written_before_the_one_before_it() {
         .collect();
     assert_eq!(times, [ahead, ahead], "{page}");
     assert_eq!(db.cursor_since(ahead).unwrap(), 0);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_follow_of_every_bot_of_some_kinds_pages_the_streams_own_events_of_them() {
+    let path = std::env::temp_dir().join(format!("agent-kinds-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Ann", Some("/synthetic"), binding()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    drop(db);
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<3000)
+             INSERT INTO events(bot,turn,kind,data)
+             SELECT CASE i%3 WHEN 0 THEN 'Ann' ELSE 'Bob' END,1,
+              CASE WHEN i%97=0 THEN 'turn_finished' WHEN i%101=0 THEN 'accepted'
+                   ELSE 'tool_started' END,'{}' FROM n",
+            [],
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let kinds = ["turn_finished", "accepted", "created", "turn_finished"];
+    let wanted = |e: &Value| kinds.contains(&e["event"].as_str().unwrap());
+    {
+        let (mut all, mut after) = (Vec::new(), 0);
+        loop {
+            let page = db.events_after(after, 256).unwrap();
+            let events = page["events"].as_array().unwrap();
+            if events.is_empty() {
+                break;
+            }
+            all.extend(events.iter().filter(|e| wanted(e)).cloned());
+            after = page["next_cursor"].as_i64().unwrap();
+        }
+        assert!(all.len() > 40, "{}", all.len());
+        for limit in [1, 7, 256] {
+            let (mut paged, mut after) = (Vec::new(), 0);
+            loop {
+                let page = db.events_of_kinds(&kinds, after, limit).unwrap();
+                let events = page["events"].as_array().unwrap();
+                if events.is_empty() {
+                    break;
+                }
+                assert!(events.len() <= limit);
+                paged.extend(events.iter().cloned());
+                after = page["next_cursor"].as_i64().unwrap();
+            }
+            assert_eq!(paged, all, "by {limit}");
+        }
+        // As many kinds as a page takes give the same; one more is refused.
+        let names: Vec<String> = (3..agent_runtime::store::EVENT_PAGE_KINDS)
+            .map(|at| format!("kind_{at}"))
+            .collect();
+        let mut many: Vec<&str> = (kinds.iter().copied())
+            .chain(names.iter().map(String::as_str))
+            .collect();
+        let page = db.events_of_kinds(&many, 0, 256).unwrap();
+        assert_eq!(page["events"].as_array().unwrap(), &all);
+        many.push("one_too_many");
+        assert!(db.events_of_kinds(&many, 0, 256).is_err());
+    }
     drop(db);
     std::fs::remove_file(path).unwrap();
 }
@@ -4346,7 +4731,6 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     let settings = Settings {
         context_bytes: Some(4096),
         keep_turns: Some(1),
-        keep_warm: Some(0),
         cache_ttl: Some(CacheTtl::Hour),
         speed: Some(agent_runtime::provider::Speed::Fast),
         ..Settings::default()
@@ -4367,8 +4751,8 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
             "compact_keep":25,"compact_tokens":null,"keep_turns":1,"max_rounds":null,"approval_hold_ms":2000,"max_output_tokens":null,
-            "keep_warm":0,"cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
-            "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null})
+            "cache_ttl":"1h","speed":"fast","sandbox":null,"writable":[],"network":false,"outputs":null,"hide_senders":false,
+            "quiet_background":false,"hold_ms":432000000,"unix_sockets":[],"rules":null,"env":{}})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -4453,10 +4837,6 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         },
         Settings {
             max_output_tokens: Some(0),
-            ..Settings::default()
-        },
-        Settings {
-            keep_warm: Some(300),
             ..Settings::default()
         },
     ] {
@@ -4649,6 +5029,99 @@ fn a_tool_declared_for_some_generations_goes_that_far_down_and_no_further() {
     assert_eq!(read(json!(0)).unwrap(), Inherit::Generations(0));
     assert_eq!(read(json!(3)).unwrap(), Inherit::Generations(3));
     assert!(read(json!(-1)).is_err() && read(json!("all")).is_err());
+}
+
+#[test]
+fn a_call_is_taken_once_and_a_second_take_is_refused_so_it_never_runs_twice() {
+    let mut db = db();
+    let start = Declared {
+        name: "start".into(),
+        description: "Start.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        grammar: None,
+        steps: false,
+        inherit: Inherit::All,
+    };
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(std::slice::from_ref(&start)),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let calls: Vec<ToolCall> = (1..=3)
+        .map(|n| ToolCall {
+            name: "start".into(),
+            call_id: format!("c{n}"),
+            arguments: "{}".into(),
+            custom: false,
+        })
+        .collect();
+    db.append(turn, vec![], &calls, None).unwrap();
+    let mut expires = 0;
+    for call in &calls {
+        expires = db.tool_start(turn, call).unwrap()["data"]["expires_ms"]
+            .as_u64()
+            .unwrap();
+    }
+    // An answered call is held, so it is not there to take.
+    db.answer_call("Lead", turn, "c1", result("started"), 0)
+        .unwrap();
+    let Err(held) = db.take_call("Lead", turn, "c1", 0) else {
+        panic!("an answered call was taken");
+    };
+    assert_eq!(held.code, "call_already_answered");
+    // Taken once, the call says when; a second take, by a client that
+    // restarted or another one, is refused with that time.
+    let took = db.take_call("Lead", turn, "c2", 7).unwrap();
+    assert_eq!(took["taken_ms"], 7);
+    let Err(again) = db.take_call("Lead", turn, "c2", 9) else {
+        panic!("a call was taken twice");
+    };
+    assert_eq!(again.code, "call_taken");
+    assert_eq!(again.facts.unwrap()["taken_ms"], 7);
+    // The waiting calls say which one was taken.
+    let page = db.tool_calls("sonny", 0, 10).unwrap();
+    let taken: Vec<(String, Value)> = page["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|call| {
+            (
+                call["call_id"].as_str().unwrap().into(),
+                call["taken_ms"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(taken, [("c2".into(), json!(7)), ("c3".into(), Value::Null)]);
+    // Taken or not, it is answered as before; out of time, it can't be taken.
+    db.answer_call("Lead", turn, "c2", result("done"), 9)
+        .unwrap();
+    let Err(late) = db.take_call("Lead", turn, "c3", expires) else {
+        panic!("a call out of time was taken");
+    };
+    assert_eq!(late.code, "no_pending_call");
+    // Another bot's turn is not this one's to take.
+    let Err(other) = db.take_call("Other", turn, "c3", 0) else {
+        panic!("another bot took the call");
+    };
+    assert_eq!(other.code, "turn_not_found");
 }
 
 #[test]
@@ -5341,8 +5814,10 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         person: None,
         quotes: Vec::new(),
         budget_tokens: None,
+        budget_counts: Default::default(),
         images: Vec::new(),
         wait_ms: None,
+        output_schema: None,
     };
     let started = db
         .begin("Bob", "r1", "work", true, &options, allow_provider)
@@ -5474,8 +5949,10 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         person: None,
         quotes: Vec::new(),
         budget_tokens: None,
+        budget_counts: Default::default(),
         images: Vec::new(),
         wait_ms: None,
+        output_schema: None,
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options, allow_provider)
@@ -6043,66 +6520,110 @@ fn turn_pages_read_newest_first_from_the_end() {
     );
 }
 
-#[test]
-fn budgets_count_tokens_and_turn_listings_carry_accounting() {
-    use agent_runtime::provider::Usage;
-    let mut db = db();
-    let mut capped = binding();
-    capped.budget_tokens = Some(150);
-    db.create("Bob", Some("/synthetic"), capped).unwrap();
-    let turn = db
-        .begin(
-            "Bob",
-            "r1",
-            "work",
-            true,
-            &TurnOptions::default(),
-            allow_provider,
-        )
-        .unwrap()
-        .turn;
-    let usage = Usage {
-        input_tokens: 100,
-        output_tokens: 20,
+/// What a provider reports for one call: `input` sent, `output` generated,
+/// on `model`.
+fn usage(input: u64, output: u64, model: &str) -> Usage {
+    Usage {
+        input_tokens: input,
+        output_tokens: output,
         cached_input_tokens: 0,
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
         sent_ms: 0,
         models: Vec::new(),
-        served_model: String::new(),
+        served_model: model.into(),
         context_window: 0,
-    };
-    db.append(turn, vec![assistant("one")], &[], Some(&usage))
-        .unwrap();
-    assert_eq!(db.inspect("Bob").unwrap().tokens_used, 120);
+    }
+}
+/// A model round whose request sent `added` input tokens new.
+fn round(db: &mut Database, turn: i64, text: &str, usage: Usage, added: u64) {
+    db.append_under(
+        turn,
+        vec![assistant(text)],
+        &[],
+        Some(&usage),
+        &Default::default(),
+        None,
+        added,
+    )
+    .unwrap();
+}
+fn begun(db: &mut Database, bot: &str, key: &str) -> i64 {
+    db.begin(
+        bot,
+        key,
+        "work",
+        true,
+        &TurnOptions::default(),
+        allow_provider,
+    )
+    .unwrap()
+    .turn
+}
+
+#[test]
+fn budgets_count_work_and_turn_listings_carry_accounting() {
+    let mut db = db();
+    let mut capped = binding();
+    (capped.budget_tokens, capped.budget_counts) = (Some(150), Counts::Work);
+    db.create("Bob", Some("/synthetic"), capped).unwrap();
+    let turn = begun(&mut db, "Bob", "r1");
+    // A bot's first call has no history yet: all it sends is new.
+    db.append(
+        turn,
+        vec![assistant("one")],
+        &[],
+        Some(&usage(100, 20, "m")),
+    )
+    .unwrap();
+    let bot = db.inspect("Bob").unwrap();
+    assert_eq!((bot.tokens_used, bot.work.used), (120, 120));
     db.finish(turn, None).unwrap();
-    // Below the cap, a second turn is admitted; its own call pushes past it.
-    let second = db
-        .begin(
-            "Bob",
-            "r2",
-            "more",
-            true,
-            &TurnOptions::default(),
-            allow_provider,
-        )
-        .unwrap()
-        .turn;
-    db.append(second, vec![assistant("two")], &[], Some(&usage))
-        .unwrap();
+    // Below the cap, a second turn is admitted. Its call sends the 120 the
+    // first sent and got back again, which is free, and 30 new.
+    let second = begun(&mut db, "Bob", "r2");
+    round(&mut db, second, "two", usage(150, 20, "m"), 30);
     db.finish(second, None).unwrap();
-    assert_eq!(
-        db.begin(
+    let bot = db.inspect("Bob").unwrap();
+    assert_eq!((bot.tokens_used, bot.work.used), (290, 170));
+    let refused = db
+        .begin(
             "Bob",
             "r3",
             "again",
             true,
             &TurnOptions::default(),
-            allow_provider
+            allow_provider,
         )
-        .unwrap_err()
-        .code,
-        "budget_exhausted"
+        .unwrap_err();
+    assert_eq!(refused.code, "budget_exhausted");
+    assert_eq!(
+        refused.facts.map(|facts| Value::Object(*facts)),
+        Some(json!({"budget_tokens":150,"budget_counts":"work","work_tokens":170}))
+    );
+    // By default a cap counts the provider's tokens, the history included:
+    // the same calls spend Ann's after one turn.
+    let mut capped = binding();
+    capped.budget_tokens = Some(150);
+    db.create("Ann", Some("/synthetic"), capped).unwrap();
+    for (key, input, added) in [("a1", 100, 100), ("a2", 150, 30)] {
+        let turn = begun(&mut db, "Ann", key);
+        round(&mut db, turn, key, usage(input, 20, "m"), added);
+        db.finish(turn, None).unwrap();
+    }
+    let refused = db
+        .begin(
+            "Ann",
+            "a3",
+            "again",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap_err();
+    assert_eq!(
+        refused.facts.map(|facts| Value::Object(*facts)),
+        Some(json!({"budget_tokens":150,"budget_counts":"tokens","tokens_used":290}))
     );
     let page = db.turns("Bob", 0, None, 1, false).unwrap();
     let first = &page["turns"][0];
@@ -6110,16 +6631,219 @@ fn budgets_count_tokens_and_turn_listings_carry_accounting() {
         (
             first["turn"].as_i64(),
             first["input_tokens"].as_i64(),
-            first["output_tokens"].as_i64()
+            first["output_tokens"].as_i64(),
+            first["work_tokens"].as_i64()
         ),
-        (Some(turn), Some(100), Some(20))
+        (Some(turn), Some(100), Some(20), Some(120))
     );
     assert_eq!(first["status"], "completed");
     assert!(first["started_ms"].as_i64().unwrap() <= first["finished_ms"].as_i64().unwrap());
     assert_eq!(page["next_after"], turn);
     let rest = db.turns("Bob", turn, None, 64, false).unwrap();
     assert_eq!(rest["turns"].as_array().unwrap().len(), 1);
+    assert_eq!(rest["turns"][0]["work_tokens"], 50);
     assert!(rest["next_after"].is_null());
+}
+
+#[test]
+fn work_charges_what_a_request_sends_new_once_and_survives_a_restart() {
+    let path = std::env::temp_dir().join(format!("agent-work-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Bob", "r1");
+    let work = |db: &Database| {
+        let bot = db.inspect("Bob").unwrap();
+        (bot.work.used, bot.work.read, bot.head)
+    };
+    // Before any call nothing is read: the first call's input is all new,
+    // and its history is read through its own items.
+    assert_eq!(work(&db).1, None);
+    db.append(turn, vec![assistant("a")], &[], Some(&usage(1000, 10, "m")))
+        .unwrap();
+    let (used, read, head) = work(&db);
+    assert_eq!((used, read), (1010, head));
+    // A round is charged its output and what its request sent new.
+    round(&mut db, turn, "b", usage(1050, 10, "m"), 40);
+    let (used, read, head) = work(&db);
+    assert_eq!((used, read), (1060, head));
+    // A failed attempt is charged what it sent new and its output, and
+    // reads through what it sent, so its retry sends nothing new.
+    db.failed_usage(turn, &usage(1090, 5, "m"), 30, head)
+        .unwrap();
+    assert_eq!(work(&db), (1095, head, head));
+    round(&mut db, turn, "c", usage(1090, 10, "m"), 0);
+    let (used, _, head) = work(&db);
+    assert_eq!(used, 1105);
+    // A summary re-reads the history: its output alone, and what was read
+    // stays read.
+    db.compaction_usage(turn, Some(&usage(1100, 50, "m")))
+        .unwrap();
+    assert_eq!(work(&db), (1155, head, head));
+    db.finish(turn, None).unwrap();
+    drop(db);
+    // A restart reads on from the same node.
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(work(&db), (1155, head, head));
+    let turn = begun(&mut db, "Bob", "r2");
+    round(&mut db, turn, "d", usage(260, 10, "m"), 50);
+    db.finish(turn, None).unwrap();
+    let (used, read, head) = work(&db);
+    assert_eq!((used, read), (1215, head));
+    let turns = db.turns("Bob", 0, None, 8, false).unwrap();
+    let rows: Vec<i64> = (turns["turns"].as_array().unwrap().iter())
+        .map(|t| t["work_tokens"].as_i64().unwrap())
+        .collect();
+    assert_eq!(rows, [1155, 60]);
+    // Each usage event says what it charged.
+    let events = db.events("Bob", 0, 256).unwrap();
+    let charged: Vec<i64> = (events["events"].as_array().unwrap().iter())
+        .filter(|e| e["event"] == "usage")
+        .map(|e| e["data"]["work_tokens"].as_i64().unwrap())
+        .collect();
+    assert_eq!(charged, [1010, 50, 35, 10, 50, 60]);
+    // A fork's history is its source's: what the source's calls read is
+    // read, through the checkpoint at most.
+    let head = head.unwrap();
+    for (name, checkpoint) in [("Now", head), ("Before", head - 2)] {
+        db.fork(
+            "Bob",
+            name,
+            Fork {
+                checkpoint: Some(checkpoint),
+                ..Fork::default()
+            },
+        )
+        .unwrap();
+        let fork = db.inspect(name).unwrap();
+        assert_eq!((fork.work.used, fork.work.read), (0, Some(checkpoint)));
+    }
+    // A source whose calls have not read through the checkpoint leaves
+    // what follows its read new to the fork too.
+    db.create("Cy", Some("/synthetic"), binding()).unwrap();
+    let turn = begun(&mut db, "Cy", "c1");
+    db.append(turn, vec![assistant("e")], &[], Some(&usage(100, 10, "m")))
+        .unwrap();
+    let read = db.inspect("Cy").unwrap().work.read;
+    db.append(turn, vec![assistant("f")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    let tip = db.inspect("Cy").unwrap().head;
+    assert!(tip > read);
+    db.fork(
+        "Cy",
+        "Later",
+        Fork {
+            checkpoint: tip,
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.inspect("Later").unwrap().work.read, read);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_turn_that_completes_on_a_limits_last_call_names_the_limit() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    // Its last call went without tool calls for the turn's budget, and the
+    // turn completed on its reply: it ended at that budget, not failing.
+    let turn = begun(&mut db, "Bob", "r1");
+    db.append_under(
+        turn,
+        vec![assistant("done so far")],
+        &[],
+        Some(&usage(100, 10, "m")),
+        &Default::default(),
+        Some(Limit::TurnBudget),
+        110,
+    )
+    .unwrap();
+    let ended = db.finish(turn, None).unwrap();
+    let data = &ended.last().unwrap()["data"];
+    assert_eq!(
+        (&data["status"], &data["limit"]),
+        (&json!("completed"), &json!("turn_budget"))
+    );
+    let row = &db.turns("Bob", 0, None, 8, false).unwrap()["turns"][0];
+    assert_eq!(
+        (&row["status"], &row["limit"]),
+        (&json!("completed"), &json!("turn_budget"))
+    );
+    // One whose limited call was followed by another, or that did not
+    // complete, names none.
+    let limited = |db: &mut Database, turn, limit| {
+        db.append_under(
+            turn,
+            vec![assistant("x")],
+            &[],
+            None,
+            &Default::default(),
+            limit,
+            0,
+        )
+        .unwrap();
+    };
+    let turn = begun(&mut db, "Bob", "r2");
+    limited(&mut db, turn, Some(Limit::Rounds));
+    limited(&mut db, turn, None);
+    db.finish(turn, None).unwrap();
+    let turn = begun(&mut db, "Bob", "r3");
+    limited(&mut db, turn, Some(Limit::Budget));
+    let ended = db
+        .finish(turn, Some(&Error::new("provider_incomplete")))
+        .unwrap();
+    assert!(ended.last().unwrap()["data"].get("limit").is_none());
+    let rows = db.turns("Bob", 0, None, 8, false).unwrap();
+    for row in &rows["turns"].as_array().unwrap()[1..] {
+        assert!(row.get("limit").is_none(), "{row}");
+    }
+}
+
+#[test]
+fn schema_79_counts_on_from_usage_and_reads_through_a_history() {
+    let path =
+        std::env::temp_dir().join(format!("agent-schema79-work-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let turn = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let mut capped = binding();
+        capped.budget_tokens = Some(1000);
+        db.create("Bob", Some("/synthetic"), capped).unwrap();
+        db.create("New", Some("/synthetic"), binding()).unwrap();
+        let turn = begun(&mut db, "Bob", "r1");
+        db.append(turn, vec![assistant("a")], &[], Some(&usage(500, 10, "m")))
+            .unwrap();
+        turn
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE bots DROP COLUMN work; ALTER TABLE bots DROP COLUMN work_read;
+             ALTER TABLE turns DROP COLUMN work;
+             ALTER TABLE turns DROP COLUMN limited; ALTER TABLE bots DROP COLUMN budget_counts;
+             ALTER TABLE turns DROP COLUMN budget_counts; PRAGMA user_version=79;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // What was counted stays counted, for the bot and its turn.
+    assert_eq!(db.inspect("Bob").unwrap().work.used, 510);
+    let row = &db.turns("Bob", 0, None, 8, false).unwrap()["turns"][0];
+    assert_eq!(
+        (row["turn"].as_i64(), row["work_tokens"].as_i64()),
+        (Some(turn), Some(510))
+    );
+    // Its history is read through its head: what joins it is new.
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!(bob.work.read, bob.head);
+    assert!(bob.head.is_some());
+    // A bot with no history has everything to send.
+    let fresh = begun(&mut db, "New", "n1");
+    db.append(fresh, vec![assistant("d")], &[], Some(&usage(40, 10, "m")))
+        .unwrap();
+    assert_eq!(db.inspect("New").unwrap().work.used, 50);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -6374,6 +7098,114 @@ fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
             db.create("Creator", Some("/synthetic"), binding()).unwrap();
         }
     }
+}
+
+#[test]
+fn a_bot_is_made_no_deeper_below_the_start_of_its_line_than_the_bound() {
+    let mut db = db();
+    db.set_max_depth(Some(2));
+    let by = |name: &'static str, bot: &Bot| {
+        let mut b = binding();
+        b.created_by = Some(name);
+        b.created_by_id = Some(bot.bot_id);
+        b
+    };
+    let fork_by = |name: &'static str, bot: &Bot| Fork {
+        created_by: Some(name),
+        created_by_id: Some(bot.bot_id),
+        ..Fork::default()
+    };
+    // No creator starts a line; each bot another makes is one below it.
+    let (lead, event) = db.create("Lead", Some("/synthetic"), binding()).unwrap();
+    assert_eq!(
+        (lead.depth, &event.unwrap()["data"]["depth"]),
+        (0, &json!(0))
+    );
+    let (task, _) = db
+        .create("Task", Some("/synthetic"), by("Lead", &lead))
+        .unwrap();
+    let (helper, _) = db
+        .create("Helper", Some("/synthetic"), by("Task", &task))
+        .unwrap();
+    assert_eq!((task.depth, helper.depth), (1, 2));
+    // Past the bound, a typed refusal with the facts, and nothing made.
+    let before = db.list(None, 64, None, false, None).unwrap();
+    let refused = db
+        .create("Deeper", Some("/synthetic"), by("Helper", &helper))
+        .unwrap_err();
+    assert_eq!(refused.code, "depth_limit");
+    assert_eq!(
+        refused.detail.as_deref(),
+        Some("Deeper would be 3 generations below the bot that starts its line; max_depth is 2")
+    );
+    let facts = refused.facts.as_deref().unwrap();
+    assert_eq!(
+        (&facts["depth"], &facts["max_depth"]),
+        (&json!(3), &json!(2))
+    );
+    assert_eq!(db.list(None, 64, None, false, None).unwrap(), before);
+    // A fork another makes is one below its maker, wherever its source is:
+    // a bot at the bound can't fork its way back up.
+    let refused = db
+        .fork("Lead", "Up", fork_by("Helper", &helper))
+        .unwrap_err();
+    assert_eq!(refused.code, "depth_limit");
+    let (twin, _) = db.fork("Helper", "Twin", fork_by("Lead", &lead)).unwrap();
+    assert_eq!(twin.depth, 1);
+    // One its source makes, a side copy, stands where its source does.
+    let (copy, event) = db
+        .fork("Helper", "Copy", fork_by("Helper", &helper))
+        .unwrap();
+    assert_eq!(
+        (copy.depth, &event.unwrap()["data"]["depth"]),
+        (2, &json!(2))
+    );
+    // One no bot makes starts a line.
+    let (theirs, _) = db.fork("Helper", "Theirs", Fork::default()).unwrap();
+    assert_eq!(theirs.depth, 0);
+    // A bot made to start a line is at 0 though another made it.
+    let mut fresh = by("Helper", &helper);
+    fresh.starts_line = true;
+    let (fresh, _) = db.create("Fresh", Some("/synthetic"), fresh).unwrap();
+    assert_eq!((fresh.depth, fresh.created_by_id), (0, Some(helper.bot_id)));
+    db.create("Below", Some("/synthetic"), by("Fresh", &fresh))
+        .unwrap();
+    // Listed and inspected with it.
+    let listed = db.list(None, 64, None, false, None).unwrap();
+    let depth_of = |name: &str| {
+        (listed["bots"].as_array().unwrap().iter())
+            .find(|bot| bot["name"] == name)
+            .map(|bot| bot["depth"].clone())
+    };
+    assert_eq!(depth_of("Helper"), Some(json!(2)));
+    assert_eq!(depth_of("Below"), Some(json!(1)));
+    assert_eq!(db.inspect("Below").unwrap().depth, 1);
+    // A keyed creation resent answers as before, whatever the bound is
+    // now, and one that names another mark is another request.
+    let keyed = |starts_line: bool| Binding {
+        request_id: Some("k"),
+        starts_line,
+        ..by("Task", &task)
+    };
+    db.create("Keyed", Some("/synthetic"), keyed(false))
+        .unwrap();
+    db.set_max_depth(Some(1));
+    assert_eq!(
+        db.create("Keyed", Some("/synthetic"), keyed(false))
+            .unwrap()
+            .1,
+        None
+    );
+    assert_eq!(
+        db.create("Keyed", Some("/synthetic"), keyed(true))
+            .unwrap_err()
+            .code,
+        "idempotency_conflict"
+    );
+    // With no bound, any depth.
+    db.set_max_depth(None);
+    db.create("Deeper", Some("/synthetic"), by("Helper", &helper))
+        .unwrap();
 }
 
 #[test]
@@ -6664,8 +7496,10 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 person: None,
                 quotes: Vec::new(),
                 budget_tokens: None,
+                budget_counts: Default::default(),
                 images: Vec::new(),
                 wait_ms: None,
+                output_schema: None,
             },
             allow_provider,
         )
@@ -9423,6 +10257,8 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                     served_model: String::new(),
                     context_window: 0,
                 },
+                100,
+                None,
             )
             .unwrap();
             db.finish(second, Some(&Error::new("provider_incomplete")))
@@ -9559,6 +10395,7 @@ fn schema_46_settings_keep_turns_as_prune_names_it() {
     let made = || Binding {
         settings: settings.clone(),
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     {
@@ -9634,6 +10471,7 @@ fn schema_47_turns_take_their_own_token_cap() {
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let capped = TurnOptions {
         budget_tokens: Some(300),
+        budget_counts: Counts::Work,
         ..TurnOptions::default()
     };
     let turn = db
@@ -9647,27 +10485,32 @@ fn schema_47_turns_take_their_own_token_cap() {
         bot.turn_budget = db.context(turn).unwrap().budget;
         bot
     };
-    db.append(turn, vec![assistant("two")], &[], Some(&usage(100, 20)))
-        .unwrap();
+    // Its history is read through its head: the call sends nothing new.
+    round(&mut db, turn, "two", usage(100, 20), 0);
     let bot = check(&db);
     let cap = TurnBudget {
         tokens: 300,
         until: 420,
+        counts: Counts::Work,
     };
-    assert_eq!((bot.turn_budget, bot.ceiling()), (Some(cap), Some(420)));
+    assert_eq!(
+        (bot.turn_budget, bot.room()),
+        (Some(cap), Some((280, Limit::TurnBudget)))
+    );
     assert!(bot.exhausted().is_none());
-    db.append(turn, vec![assistant("three")], &[], Some(&usage(180, 20)))
-        .unwrap();
+    // A call that sends 280 new, and 20 come out.
+    round(&mut db, turn, "three", usage(400, 20), 280);
     let error = check(&db).exhausted().unwrap();
     assert_eq!(error.code, "turn_budget_exhausted");
     assert_eq!(
         error.facts.map(|facts| Value::Object(*facts)),
-        Some(json!({"turn_budget_tokens":300,"turn_tokens_used":320}))
+        Some(json!({"turn_budget_tokens":300,"budget_counts":"work","turn_work_tokens":320}))
     );
     db.finish(turn, None).unwrap();
     // A resend names the same cap; the earlier turn reports none.
     let other = TurnOptions {
         budget_tokens: Some(200),
+        budget_counts: Counts::Work,
         ..TurnOptions::default()
     };
     assert_eq!(
@@ -14454,6 +15297,7 @@ fn a_resent_keyed_creation_gets_its_bot_and_a_changed_one_names_the_field() {
     let mut db = db();
     let keyed = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     let (bob, event) = db.create("Bob", Some("/synthetic"), keyed()).unwrap();
@@ -14487,6 +15331,7 @@ fn a_resent_keyed_creation_gets_its_bot_and_a_changed_one_names_the_field() {
                 Some("/synthetic"),
                 Binding {
                     request_id,
+                    starts_line: false,
                     ..binding()
                 },
             )
@@ -14538,6 +15383,7 @@ fn a_resent_keyed_fork_gets_its_fork_wherever_the_source_moved() {
     // A bot created under the key is not a fork of it.
     let made = Binding {
         request_id: Some("branch"),
+        starts_line: false,
         ..binding()
     };
     db.create("Made", Some("/synthetic"), made).unwrap();
@@ -14573,6 +15419,7 @@ fn a_deleted_identity_is_gone_and_a_later_namesake_is_not() {
     // A keyed creation resent after its bot was deleted does not make it again.
     let keyed = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     let (kay, _) = db.create("Kay", Some("/synthetic"), keyed()).unwrap();
@@ -14601,6 +15448,7 @@ fn schema_43_bots_were_made_without_a_key() {
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let keyed = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     assert_eq!(
@@ -14759,6 +15607,7 @@ fn a_keyed_creation_resends_after_its_instructions_change() {
     let mut db = db();
     let made = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     let (bot, _) = db.create("Bob", None, made()).unwrap();
@@ -14782,6 +15631,7 @@ fn schema_48_creations_keep_the_instructions_they_were_sent_with() {
     let _ = std::fs::remove_file(&path);
     let made = || Binding {
         request_id: Some("once"),
+        starts_line: false,
         ..binding()
     };
     {
@@ -15385,6 +16235,166 @@ fn usage_sums_turns_by_bot_model_and_bucket_from_where_each_started() {
 }
 
 #[test]
+fn usage_files_each_call_under_the_model_that_spent_it_with_its_cache_writes() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let attempt = |provider: Option<&str>, model: &str, input, written, output| ModelTokens {
+        model: model.to_owned(),
+        provider: provider.map(str::to_owned),
+        input_tokens: input,
+        output_tokens: output,
+        cached_input_tokens: 0,
+        cache_write_tokens: written,
+        cache_write_1h_tokens: 0,
+    };
+    let of = |models: Vec<ModelTokens>| Usage {
+        input_tokens: models.iter().map(|m| m.input_tokens).sum(),
+        output_tokens: models.iter().map(|m| m.output_tokens).sum(),
+        cache_write_tokens: models.iter().map(|m| m.cache_write_tokens).sum(),
+        models,
+        ..Usage::default()
+    };
+    // Two rounds on the turn's own model, one with cache writes.
+    let own = Usage {
+        input_tokens: 1000,
+        cached_input_tokens: 600,
+        cache_write_tokens: 300,
+        cache_write_1h_tokens: 100,
+        output_tokens: 50,
+        ..Usage::default()
+    };
+    db.append(turn, vec![assistant("one")], &[], Some(&own))
+        .unwrap();
+    db.append(turn, vec![assistant("two")], &[], Some(&own))
+        .unwrap();
+    // A summary on another binding's model, a refused request's fallback,
+    // and a provider-side fallback whose attempts name no binding.
+    db.compaction_usage(
+        turn,
+        Some(&of(vec![attempt(
+            Some("bedrock"),
+            "summarizer",
+            400,
+            0,
+            40,
+        )])),
+    )
+    .unwrap();
+    db.failed_usage(
+        turn,
+        &of(vec![attempt(Some("anthropic"), "backup", 200, 20, 10)]),
+        0,
+        None,
+    )
+    .unwrap();
+    db.append(
+        turn,
+        vec![assistant("three")],
+        &[],
+        Some(&of(vec![
+            attempt(None, "synthetic-model", 70, 0, 0),
+            attempt(None, "sturdier-model", 80, 8, 8),
+        ])),
+    )
+    .unwrap();
+    db.finish(turn, None).unwrap();
+
+    let usage = db.usage(None, 0, None, 64).unwrap();
+    assert_eq!(usage["turns"], 1);
+    assert_eq!(
+        usage["input_tokens"], 2750,
+        "every call counts in the total"
+    );
+    let models: Vec<_> = usage["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["model"].as_str().unwrap(),
+                m["input_tokens"].as_i64().unwrap(),
+                m["cached_input_tokens"].as_i64().unwrap(),
+                m["cache_write_tokens"].as_i64().unwrap(),
+                m["cache_write_1h_tokens"].as_i64().unwrap(),
+                m["output_tokens"].as_i64().unwrap(),
+                m["turns"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        models,
+        [
+            ("openai/synthetic-model", 2070, 1200, 600, 200, 100, 1),
+            ("bedrock/summarizer", 400, 0, 0, 0, 40, 1),
+            ("anthropic/backup", 200, 0, 20, 0, 10, 1),
+            ("openai/sturdier-model", 80, 0, 8, 0, 8, 1),
+        ],
+        "most spent first, each under its own binding or the turn's"
+    );
+    assert!(usage["bots"][0].get("cache_write_tokens").is_none());
+}
+
+#[test]
+fn schema_85_files_each_earlier_turn_whole_under_its_own_model() {
+    let path = std::env::temp_dir().join(format!("agent-spend-85-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        for request in ["1", "2"] {
+            let turn = db
+                .begin(
+                    "Bob",
+                    request,
+                    "work",
+                    true,
+                    &TurnOptions::default(),
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            if request == "1" {
+                let usage = Usage {
+                    input_tokens: 500,
+                    cached_input_tokens: 100,
+                    output_tokens: 50,
+                    ..Usage::default()
+                };
+                db.append(turn, vec![assistant("done")], &[], Some(&usage))
+                    .unwrap();
+            }
+            db.finish(turn, None).unwrap();
+        }
+    }
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE turn_models; PRAGMA user_version=84;")
+        .unwrap();
+    let db = Database::initialize(conn).unwrap();
+    let usage = db.usage(None, 0, None, 64).unwrap();
+    assert_eq!(usage["turns"], 2);
+    assert_eq!(
+        usage["models"],
+        json!([{"model":"openai/synthetic-model","turns":1,"input_tokens":500,
+            "cached_input_tokens":100,"output_tokens":50,
+            "cache_write_tokens":0,"cache_write_1h_tokens":0}]),
+        "a turn that spent nothing has no row"
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn a_waiting_step_ended_in_a_group_that_fails_is_told_of_once_one_commits() {
     let mut db = db();
     let run = Declared {
@@ -15591,7 +16601,7 @@ fn a_planned_call_keeps_what_the_rules_made_of_it() {
     let (git, git_call) = shell_call("fc_2", "c2", "git push");
     let (ls, ls_call) = shell_call("fc_3", "c3", "ls");
     let calls = [rm_call.clone(), git_call.clone(), ls_call.clone()];
-    db.append_under(turn, vec![rm, git, ls], &calls, None, &rules)
+    db.append_under(turn, vec![rm, git, ls], &calls, None, &rules, None, 0)
         .unwrap();
     // The prompt one is announced.
     let page = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
@@ -15743,6 +16753,88 @@ fn a_bot_made_by_another_goes_by_its_creators_rules() {
         ..Default::default()
     };
     let refused = db.set_settings("Ann", None, &named, &empty).unwrap_err();
+    assert_eq!(refused.code, "invalid_setting");
+}
+
+#[test]
+fn a_bot_s_variables_are_its_creator_s() {
+    let mut db = db();
+    let env = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+        (pairs.iter())
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    };
+    let with = |pairs: &[(&str, &str)]| Settings {
+        env: env(pairs),
+        ..Default::default()
+    };
+    db.create(
+        "Ann",
+        Some("/synthetic"),
+        Binding {
+            settings: with(&[("SONNY_STATE", "/state/Ann")]),
+            ..binding()
+        },
+    )
+    .unwrap();
+    // Whatever a child is made with, it takes its creator's: none plants
+    // a variable that changes what its approved commands run.
+    let made = |db: &mut Database, name: &str, by: &str| {
+        let by_id = db.inspect(by).unwrap().bot_id;
+        db.create(
+            name,
+            Some("/synthetic"),
+            Binding {
+                created_by: Some(by),
+                created_by_id: Some(by_id),
+                settings: with(&[("LD_PRELOAD", "/tmp/x.so")]),
+                ..binding()
+            },
+        )
+        .unwrap();
+    };
+    made(&mut db, "Bob", "Ann");
+    made(&mut db, "Cat", "Bob");
+    assert_eq!(
+        db.inspect("Cat").unwrap().settings.env,
+        env(&[("SONNY_STATE", "/state/Ann")])
+    );
+    // Nor can it be given its own.
+    let named = ["env".to_owned()];
+    let refused = db
+        .set_settings("Bob", None, &named, &with(&[("PATH", "/tmp")]))
+        .unwrap_err();
+    assert_eq!(refused.code, "invalid_setting");
+    // The creator's change reaches every bot it made, and theirs.
+    let moved = with(&[("SONNY_STATE", "/state/Ann2")]);
+    let changed = db.set_settings("Ann", None, &named, &moved).unwrap();
+    assert_eq!(changed, ["env"]);
+    for name in ["Bob", "Cat"] {
+        assert_eq!(db.inspect(name).unwrap().settings.env, moved.env);
+    }
+    let changed = db
+        .set_settings("Ann", None, &named, &Settings::default())
+        .unwrap();
+    assert_eq!(changed, ["env"]);
+    assert_eq!(db.inspect("Cat").unwrap().settings, Settings::default());
+    // The daemon's own names, names no shell sets and NUL are refused.
+    for (name, value) in [
+        ("AGENT_SOCKET", "/s"),
+        ("agent_bot", "x"),
+        ("1X", "x"),
+        ("A-B", "x"),
+        ("", "x"),
+        ("OK", "a\0b"),
+    ] {
+        let refused = db
+            .set_settings("Ann", None, &named, &with(&[(name, value)]))
+            .unwrap_err();
+        assert_eq!(refused.code, "invalid_setting", "{name}");
+    }
+    let big = "x".repeat(17 << 10);
+    let refused = db
+        .set_settings("Ann", None, &named, &with(&[("BIG", &big)]))
+        .unwrap_err();
     assert_eq!(refused.code, "invalid_setting");
 }
 
@@ -16066,4 +17158,123 @@ fn held_rows(db: &Database) -> Vec<Value> {
         .as_array()
         .unwrap()
         .clone()
+}
+
+/// A store at `path` with three finished turns of Bob's: a short prompt, one
+/// past the size a turn shares its prompt node at, and a short one again.
+fn three_prompts(path: &std::path::Path) -> String {
+    let _ = std::fs::remove_file(path);
+    let long = format!("{}\nsecond line", "w".repeat(5000));
+    let mut db = Database::initialize(Connection::open(path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            &long,
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(turn, vec![assistant("r2")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    converse(&mut db, "Bob", 3);
+    long
+}
+
+/// What each listing says of Bob's prompts: the omitted-turns note before
+/// turn 3, the history listing, and the turn listing, previews and lengths.
+fn listed_prompts(db: &Database) -> Value {
+    let start: i64 = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["event"] == "accepted")
+        .unwrap()["data"]["node"]
+        .as_i64()
+        .unwrap();
+    let history = db.history_turns("Bob", 8).unwrap()["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| json!([t["turn"], t["prompt"], t["prompt_bytes"]]))
+        .collect::<Vec<_>>();
+    let turns = db.turns("Bob", 0, None, 8, false).unwrap()["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| json!([t["prompt_preview"], t["prompt_bytes"]]))
+        .collect::<Vec<_>>();
+    json!({"omitted": db.omitted_turns(start, 48).unwrap(), "history": history, "turns": turns})
+}
+
+#[test]
+fn listings_read_each_prompts_opening_never_its_item() {
+    let path = std::env::temp_dir().join(format!("agent-openings-{}.sqlite", std::process::id()));
+    let long = three_prompts(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let before = listed_prompts(&db);
+    let chars = long.chars().count();
+    assert_eq!(before["turns"][1], json!([long[..200], chars]));
+    assert_eq!(before["history"][1], json!([2, long[..200], chars]));
+    assert_eq!(before["omitted"][0][0], json!(2));
+    assert!(before["omitted"][0][1].as_str().unwrap().ends_with('…'));
+    // Prompt items that no longer parse: a listing that opened one fails.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE nodes SET item=zeroblob(70000) WHERE turn_seq IS NOT NULL
+                OR id IN (SELECT prompt_node FROM turns)",
+        )
+        .unwrap();
+    assert_eq!(listed_prompts(&db), before);
+    // A store from before openings gets every prompt's at open.
+    drop(db);
+    std::fs::remove_file(&path).unwrap();
+    three_prompts(&path);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE openings; PRAGMA user_version=78;")
+        .unwrap();
+    db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE nodes SET item=zeroblob(70000) WHERE turn_seq IS NOT NULL
+                OR id IN (SELECT prompt_node FROM turns)",
+        )
+        .unwrap();
+    assert_eq!(listed_prompts(&db), before);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_declined_prompt_is_noted_as_the_model_is_sent_it() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "something declined",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(turn, Some(&Error::new("provider_refusal")))
+        .unwrap();
+    converse(&mut db, "Bob", 2);
+    converse(&mut db, "Bob", 3);
+    let listed = listed_prompts(&db);
+    // The model hears of the note it is sent in the prompt's place; the
+    // person's listing keeps what they wrote.
+    assert_eq!(listed["omitted"][1], json!([1, "[Left out.]"]));
+    assert_eq!(listed["history"][2], json!([1, "[Left out.]", 11]));
+    assert_eq!(listed["turns"][0][0], json!("something declined"));
 }

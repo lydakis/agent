@@ -73,11 +73,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// `providers` is `ready.providers`; a model whose provider it does not
 /// name gets `edit`. Web search comes too where the provider offers it,
 /// unless `search` is the person's `web_search = "disabled"`, as Codex
-/// turns it on.
+/// turns it on, or `off` (their `web_search_off`) names the model.
 pub fn default_tools(
     providers: &Value,
     model: &str,
     search: config::WebSearch,
+    off: &[String],
 ) -> Vec<&'static str> {
     let provider = model
         .split_once('/')
@@ -98,7 +99,9 @@ pub fn default_tools(
     if search == config::WebSearch::Live {
         // Search is the provider's to offer; the daemon fetches a page
         // for any.
-        if providers[provider]["web_search"] == true {
+        if providers[provider]["web_search"] == true
+            && !off.iter().any(|pattern| config::matches(pattern, model))
+        {
             tools.push("web_search");
         }
         tools.push("web_fetch");
@@ -108,7 +111,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 48;
+pub const PROTOCOL: u64 = 55;
 /// How long the daemon holds a turn on a cause a person can fix before it
 /// fails with it, for a bot that sets no `hold_ms`: five days, as mail is
 /// retried (RFC 5321 suggests four to five) before it is returned.
@@ -256,6 +259,9 @@ pub struct Client {
     /// `ready.providers`: each binding's family and the efforts it takes.
     providers: Value,
     paused: Value,
+    /// `ready.limits.depth`: the most generations below the bot that
+    /// starts its line a bot may be made at; `None` for no bound.
+    max_depth: Option<u64>,
     /// Requests this client keeps in flight at once, when bounded.
     in_flight: std::sync::OnceLock<Semaphore>,
 }
@@ -330,6 +336,7 @@ impl Client {
         let identity = ready["store"]["identity"].as_str().map(str::to_owned);
         let providers = ready["providers"].clone();
         let paused = ready["paused"].clone();
+        let max_depth = ready["limits"]["depth"].as_u64();
         let pending: Pending = Arc::default();
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (events, receiver) = mpsc::channel(QUEUE);
@@ -399,6 +406,7 @@ impl Client {
                 identity,
                 providers,
                 paused,
+                max_depth,
                 in_flight: std::sync::OnceLock::new(),
             }),
             Events(receiver),
@@ -426,6 +434,12 @@ impl Client {
     /// The daemon's provider bindings as `ready` announced them.
     pub fn providers(&self) -> &Value {
         &self.providers
+    }
+
+    /// The most generations below the bot that starts its line the daemon
+    /// makes a bot at, as `ready` announced it; `None` for no bound.
+    pub fn max_depth(&self) -> Option<u64> {
+        self.max_depth
     }
 
     /// The pause that held the daemon as this client connected, or null;
@@ -526,7 +540,7 @@ mod tests {
             "anthropic": {"family": "anthropic", "web_search": true}});
         let live = config::WebSearch::Live;
         assert_eq!(
-            default_tools(&providers, "chatgpt/gpt-6-sol", live),
+            default_tools(&providers, "chatgpt/gpt-6-sol", live, &[]),
             [
                 "shell",
                 "write_stdin",
@@ -541,7 +555,7 @@ mod tests {
         // Search comes where the provider offers it, and fetch everywhere,
         // unless turned off.
         assert_eq!(
-            default_tools(&providers, "anthropic/claude-opus-5-5", live),
+            default_tools(&providers, "anthropic/claude-opus-5-5", live, &[]),
             [
                 "shell",
                 "write_stdin",
@@ -558,9 +572,24 @@ mod tests {
             &providers,
             "anthropic/claude-opus-5-5",
             config::WebSearch::Disabled,
+            &[],
         );
         assert!(!off.contains(&"web_search") && !off.contains(&"web_fetch"));
-        assert_eq!(default_tools(&providers, "unknown/model", live)[4], "edit");
+        // A model the person's web_search_off names keeps fetch alone.
+        let named = default_tools(
+            &providers,
+            "anthropic/claude-opus-5-5",
+            live,
+            &["Anthropic/claude-*".into()],
+        );
+        assert!(!named.contains(&"web_search") && named.contains(&"web_fetch"));
+        let other = ["anthropic/claude-haiku-*".into()];
+        let unnamed = default_tools(&providers, "anthropic/claude-opus-5-5", live, &other);
+        assert!(unnamed.contains(&"web_search"));
+        assert_eq!(
+            default_tools(&providers, "unknown/model", live, &[])[4],
+            "edit"
+        );
     }
 
     #[tokio::test]
@@ -576,6 +605,7 @@ mod tests {
             identity: None,
             providers: Value::Null,
             paused: Value::Null,
+            max_depth: None,
             in_flight: std::sync::OnceLock::new(),
         });
         let mut lines = BufReader::new(peer).lines();
@@ -609,6 +639,7 @@ mod tests {
             identity: None,
             providers: Value::Null,
             paused: Value::Null,
+            max_depth: None,
             in_flight: std::sync::OnceLock::new(),
         });
         client.bound(1);
@@ -652,6 +683,7 @@ mod tests {
             identity: None,
             providers: Value::Null,
             paused: Value::Null,
+            max_depth: None,
             in_flight: std::sync::OnceLock::new(),
         });
         let mut lines = BufReader::new(peer).lines();
@@ -693,6 +725,7 @@ mod tests {
             identity: None,
             providers: Value::Null,
             paused: Value::Null,
+            max_depth: None,
             in_flight: std::sync::OnceLock::new(),
         });
         let request = tokio::spawn({

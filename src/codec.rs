@@ -248,13 +248,20 @@ impl Family {
                 "media_type":image.media_type,"data":image.data}}),
         }
     }
-    pub fn tools(self, tools: &[ToolSchema]) -> Value {
+    /// The request's `tools`. `grammars`: the endpoint takes OpenAI's
+    /// custom tools, so a grammar tool is declared as one; elsewhere it is
+    /// a function taking its text as `input`, as on Anthropic.
+    pub fn tools(self, tools: &[ToolSchema], grammars: bool) -> Value {
         let encoded: Vec<Value> = tools
             .iter()
             .map(|tool| match self {
-                Family::Responses if let Some(grammar) = &tool.grammar => json!({"type":"custom",
+                Family::Responses
+                    if let Some(grammar) = tool.grammar.as_ref().filter(|_| grammars) =>
+                {
+                    json!({"type":"custom",
                     "name":tool.name,"description":tool.description,
-                    "format":{"type":"grammar","syntax":"lark","definition":grammar}}),
+                    "format":{"type":"grammar","syntax":"lark","definition":grammar}})
+                }
                 Family::Responses => json!({"type":"function","name":tool.name,
                     "description":tool.description,"parameters":tool.parameters,"strict":false}),
                 Family::Anthropic => json!({"name":tool.name,"description":tool.description,
@@ -609,10 +616,17 @@ mod tests {
             parameters: json!({"type":"object","properties":{"input":{"type":"string"}}}),
             grammar: Some("start: \"x\"".into()),
         };
-        let declared = Family::Responses.tools(std::slice::from_ref(&patch));
+        let declared = Family::Responses.tools(std::slice::from_ref(&patch), true);
         assert_eq!(declared[0]["type"], "custom");
         assert_eq!(declared[0]["format"]["definition"], "start: \"x\"");
-        let declared = Family::Anthropic.tools(std::slice::from_ref(&patch));
+        // An endpoint that takes no custom tools gets a function.
+        let declared = Family::Responses.tools(std::slice::from_ref(&patch), false);
+        assert_eq!(declared[0]["type"], "function");
+        assert_eq!(
+            declared[0]["parameters"]["properties"]["input"]["type"],
+            "string"
+        );
+        let declared = Family::Anthropic.tools(std::slice::from_ref(&patch), true);
         assert_eq!(
             declared[0]["input_schema"]["properties"]["input"]["type"],
             "string"

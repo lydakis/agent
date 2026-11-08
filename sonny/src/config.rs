@@ -39,6 +39,12 @@ fn span(setting: &Setting) -> bool {
         && agent_client::config::span(setting.key, setting.default).is_ok()
 }
 
+/// Whether a setting is `[sonny] hours`: a list in the file, typed as its
+/// runs joined with a comma.
+fn hours(setting: &Setting) -> bool {
+    setting.key == "sonny.hours"
+}
+
 /// The rows `/config` takes with room for all: the blank one, a heading
 /// for each table, and the settings.
 pub fn height() -> usize {
@@ -56,7 +62,7 @@ fn short(key: &str) -> &str {
 }
 
 /// Every key `agent_client::config` reads.
-pub const SETTINGS: [Setting; 32] = [
+pub const SETTINGS: &[Setting] = &[
     Setting {
         key: "model",
         about: "a new agent's model, when none is named (provider/model)",
@@ -106,6 +112,12 @@ pub const SETTINGS: [Setting; 32] = [
         default: "its lead's",
     },
     Setting {
+        key: "sonny.task_speed",
+        about: "each new task's speed, where its provider serves it",
+        values: &agent_client::config::SPEEDS,
+        default: "its starter's on the same model",
+    },
+    Setting {
         key: "sonny.lead_profile",
         about: "the profile a new lead runs as",
         values: &[],
@@ -119,15 +131,21 @@ pub const SETTINGS: [Setting; 32] = [
     },
     Setting {
         key: "sonny.side_chat",
-        about: "/side's copy answers calling no tool, or is a fork that can do anything its agent can",
-        values: &["answer", "fork"],
-        default: "answer",
+        about: "/side's copy is a fork that can do anything its agent can, or answers calling no tool",
+        values: &["fork", "answer"],
+        default: "fork",
     },
     Setting {
         key: "sonny.chime",
         about: "whether finished and waiting work rings; notifications show either way",
         values: SWITCH,
         default: "true",
+    },
+    Setting {
+        key: "sonny.steps",
+        about: "the agent's steps between what is said (calls, news in, messages between agents, how long a turn took), or only your words and the agent's",
+        values: SWITCH,
+        default: "false",
     },
     Setting {
         key: "sonny.verbose",
@@ -148,10 +166,34 @@ pub const SETTINGS: [Setting; 32] = [
         default: "always",
     },
     Setting {
+        key: "sonny.margin_notes",
+        about: "the most notes a margin holds; past it the agent's new note is refused, and it is told why",
+        values: &[],
+        default: "6",
+    },
+    Setting {
+        key: "sonny.margin_note_lines",
+        about: "the most lines a margin note's text runs to; a longer one is refused, and the agent told to show a file instead",
+        values: &[],
+        default: "12",
+    },
+    Setting {
         key: "sonny.agent_opens",
         about: "where a click on an agent's name takes you: its tab in Rex, Herdr or cmux, or a look beside the conversation; a right click, the other",
         values: &["tab", "beside"],
         default: "tab",
+    },
+    Setting {
+        key: "sonny.needs_check",
+        about: "once an agent's turn ends with words and no question asked, a copy of it with no tools says whether they wait on you, and it counts as needing you; one small call, read from the warm cache",
+        values: SWITCH,
+        default: "true",
+    },
+    Setting {
+        key: "sonny.task_done_check",
+        about: "hours a task sits idle before a copy of it with no tools says whether its work is done; done marks it done, its row saying the check did and why, and new work reopens it; one call that reads its history, once per idle stretch; 0 for never",
+        values: &[],
+        default: "8",
     },
     Setting {
         key: "sonny.suggest",
@@ -179,7 +221,7 @@ pub const SETTINGS: [Setting; 32] = [
     },
     Setting {
         key: "sonny.commons_invite_tokens",
-        about: "the tokens an invite pays for in its thread: its turn, and the turns replies there start while any are left",
+        about: "the tokens of work an invite pays for: the budget of the one turn it starts, a golden ticket's twice that; later replies reach the agent through its subscription",
         values: &[],
         default: "1000000",
     },
@@ -196,22 +238,34 @@ pub const SETTINGS: [Setting; 32] = [
         default: "auto",
     },
     Setting {
+        key: "sonny.task_tabs",
+        about: "which tasks open in a tab of their own in Rex, Herdr or cmux: those an agent asks a tab for, shows you, or you open, and any that comes to need you; or every task as its turn starts",
+        values: &["asked", "every"],
+        default: "asked",
+    },
+    Setting {
         key: "sonny.task_windows",
         about: "task windows a lead keeps open in its multiplexer: past it, a new one closes the one you used least recently, never one you have not looked at yet, that needs you, failed or runs something it asked for (with only unseen ones to close, the new one waits for /status); 0 for no limit",
         values: &[],
         default: "32",
     },
     Setting {
-        key: "sonny.task_depth",
-        about: "how many generations of tasks a lead's line has: 2 lets its tasks start their own, which start none; 0 for no end",
-        values: &[],
-        default: "2",
+        key: "sonny.sky_haikus",
+        about: "a haiku from the agent the sky finds busiest, written by a copy of it that calls no tool each time the title passes",
+        values: SWITCH,
+        default: "true",
     },
     Setting {
-        key: "sonny.sky_haikus",
-        about: "haikus a day from the agent the sky finds busiest, each written by a copy of it that calls no tool when the title passes; 0 for none",
+        key: "sonny.sky_haiku_daily",
+        about: "the most haikus a day; 0 for no limit, the title's hold keeping them a hold apart",
         values: &[],
-        default: "8",
+        default: "0",
+    },
+    Setting {
+        key: "sonny.sky_haiku_keep",
+        about: "the hours haikus are kept, for a replay to show the one up at its time; 0 keeps them all",
+        values: &[],
+        default: "24",
     },
     Setting {
         key: "sonny.sky_haiku_window",
@@ -233,9 +287,21 @@ pub const SETTINGS: [Setting; 32] = [
     },
     Setting {
         key: "sonny.tool_processes",
-        about: "processes Sonny runs for agents at once in all: the tool host's tool calls take three quarters, the lookout's goal checks a quarter, each at least one, and each agent at most half of either; 0 for four times the CPUs",
+        about: "processes Sonny runs for agents' tool calls at once in all, each agent at most half; 0 for four times the CPUs",
         values: &[],
         default: "0",
+    },
+    Setting {
+        key: "sonny.hours",
+        about: "your working hours, local time; set, Sonny goes quiet once they end and no window is used for quiet_after; unset, it keeps no clock and goes quiet only on /quiet",
+        values: &[],
+        default: "none",
+    },
+    Setting {
+        key: "sonny.quiet_after",
+        about: "how long no Sonny window is used, outside the hours in [sonny] hours, before Sonny goes quiet: agents work on, nothing rings, and they are told the person is away until the person writes again",
+        values: &[],
+        default: "30m",
     },
     Setting {
         key: "sonny.lookout_waiting",
@@ -249,7 +315,115 @@ pub const SETTINGS: [Setting; 32] = [
         values: &[],
         default: "15m",
     },
+    Setting {
+        key: "daemon.depth",
+        about: "how many generations below the agent that starts a line (a lead, or an agent you made) a new agent may be: 2 lets a lead's tasks start their own, which start none; 0 for no end; read when the daemon starts",
+        values: &[],
+        default: "2",
+    },
 ];
+
+/// The migration that moves `[sonny] task_depth` to `[daemon] depth`.
+pub const DEPTH: &str = "task-depth-daemon";
+
+/// At start, once, before the config is read: a line depth the person set
+/// for Sonny moved to the daemon, which bounds it now.
+pub fn at_start() {
+    let (Some(home), Some(path)) = (
+        std::env::var_os("HOME").map(PathBuf::from),
+        agent_client::config::path(),
+    ) else {
+        return;
+    };
+    // No config, nothing to move: and nothing made, not even a HOME gone.
+    if !path.exists() {
+        return;
+    }
+    crate::upgrade::once(&home.join(".agent/sonny/migrated"), DEPTH, || {
+        config_depth(&path)
+    });
+}
+
+/// The config at `path` with `[sonny] task_depth` moved, each other line
+/// as the person wrote it. Whether it is done: one it can't move cleanly
+/// is left as it is, for the config's own error to say where the key went,
+/// and tried again next time.
+fn config_depth(path: &std::path::Path) -> bool {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+    };
+    match depth_moved(&text) {
+        Err(()) => false,
+        Ok(None) => true,
+        Ok(Some(moved)) => {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777);
+            agent_client::files::replace_mode(path, moved.as_bytes(), mode).is_ok()
+        }
+    }
+}
+
+/// `text` as [`config_depth`] writes it: none when `[sonny]` sets no
+/// `task_depth`. Its line goes, and `depth` joins `[daemon]`, made at the
+/// end when there is none, unless the file sets it there already. What is
+/// written must parse to the config with only that key moved, so a key
+/// lines can't move (a dotted key, an inline table) is an error.
+fn depth_moved(text: &str) -> Result<Option<String>, ()> {
+    use toml::Value;
+    let old: toml::Table = text.parse().map_err(drop)?;
+    let depth = (old.get("sonny").and_then(Value::as_table))
+        .and_then(|sonny| sonny.get("task_depth"))
+        .and_then(Value::as_integer);
+    let Some(depth) = depth else {
+        return Ok(None);
+    };
+    let mut expected = old.clone();
+    let Some(Value::Table(sonny)) = expected.get_mut("sonny") else {
+        return Err(());
+    };
+    sonny.remove("task_depth");
+    let daemon = expected
+        .entry("daemon")
+        .or_insert_with(|| Value::Table(toml::Table::new()));
+    let Value::Table(daemon) = daemon else {
+        return Err(());
+    };
+    let add = !daemon.contains_key("depth");
+    if add {
+        daemon.insert("depth".into(), Value::Integer(depth));
+    }
+    let line = format!("depth = {depth}");
+    let (mut table, mut removed, mut added) = (String::new(), false, !add);
+    let mut lines = Vec::new();
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            table = trimmed.trim_matches(['[', ']']).trim().to_owned();
+        }
+        let key = trimmed.split_once('=').map(|(key, _)| key.trim());
+        if table == "sonny" && key == Some("task_depth") && !removed {
+            removed = true;
+            continue;
+        }
+        lines.push(raw.to_owned());
+        if table == "daemon" && trimmed.starts_with('[') && !added {
+            lines.push(line.clone());
+            added = true;
+        }
+    }
+    let mut new = lines.join("\n");
+    if text.ends_with('\n') || !added {
+        new.push('\n');
+    }
+    if !added {
+        new.push_str(&format!("\n[daemon]\n{line}\n"));
+    }
+    match new.parse::<toml::Table>() {
+        Ok(parsed) if removed && parsed == expected => Ok(Some(new)),
+        _ => Err(()),
+    }
+}
 
 /// The `sonny-config` skill: where the settings live and every key of the
 /// file, from [`SETTINGS`], so it says what this Sonny reads.
@@ -258,6 +432,9 @@ pub fn skill() -> String {
         .iter()
         .map(|setting| {
             let values = match setting.values {
+                [] if hours(setting) => {
+                    "day runs, each with a time range, as `Mon-Fri 09:00-19:00`, more joined with a comma".to_owned()
+                }
                 [] if number(setting) => "a whole number".to_owned(),
                 [] if span(setting) => "a span, as `30s`, `15m` or `1h`".to_owned(),
                 [] => "a name".to_owned(),
@@ -326,6 +503,12 @@ impl View {
                 let first = table.get(path.next().unwrap_or_default());
                 let value = path.try_fold(first, |at, key| Some(at?.get(key))).flatten();
                 value.and_then(|v| match v {
+                    toml::Value::Array(runs) => Some(
+                        (runs.iter())
+                            .filter_map(toml::Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
                     toml::Value::Boolean(on) => Some(on.to_string()),
                     toml::Value::Integer(n) => Some(n.to_string()),
                     v => v.as_str().map(str::to_owned),
@@ -339,6 +522,13 @@ impl View {
     fn write(&mut self, value: Option<String>) {
         let setting = &SETTINGS[self.pick];
         let value = value.map(|value| match (setting.values == SWITCH, number(setting)) {
+            _ if hours(setting) => toml::Value::Array(
+                (value.split(','))
+                    .map(str::trim)
+                    .filter(|run| !run.is_empty())
+                    .map(|run| toml::Value::String(run.to_owned()))
+                    .collect(),
+            ),
             (true, _) => toml::Value::Boolean(value == "true"),
             (_, true) => value
                 .parse()
@@ -546,7 +736,7 @@ mod tests {
         assert!(skill.starts_with("---\nname: sonny-config\n"));
         assert!(!skill.contains("{{"));
         assert!(skill.contains(env!("CARGO_PKG_VERSION")));
-        for setting in &SETTINGS {
+        for setting in SETTINGS {
             assert!(
                 skill.contains(&format!("| `{}` |", setting.key)),
                 "{}",
@@ -565,6 +755,32 @@ mod tests {
     }
 
     #[test]
+    fn a_line_depth_set_for_sonny_moves_to_the_daemon() {
+        // Into the daemon's table where there is one, the rest as written.
+        let text = "# mine\n[sonny]\nchime = true\ntask_depth = 3\n\n[daemon]\nload = 0\n";
+        assert_eq!(
+            depth_moved(text),
+            Ok(Some(
+                "# mine\n[sonny]\nchime = true\n\n[daemon]\ndepth = 3\nload = 0\n".into()
+            ))
+        );
+        // Into one of its own where there is none.
+        assert_eq!(
+            depth_moved("[sonny]\ntask_depth = 0\n"),
+            Ok(Some("[sonny]\n\n[daemon]\ndepth = 0\n".into()))
+        );
+        // One the daemon's table sets already stays as set.
+        assert_eq!(
+            depth_moved("[daemon]\ndepth = 4\n[sonny]\ntask_depth = 3\n"),
+            Ok(Some("[daemon]\ndepth = 4\n[sonny]\n".into()))
+        );
+        // Nothing to move.
+        assert_eq!(depth_moved("[sonny]\nchime = true\n"), Ok(None));
+        // A key lines can't move is left for the reader's error.
+        assert_eq!(depth_moved("sonny.task_depth = 3\n"), Err(()));
+    }
+
+    #[test]
     fn every_key_the_file_takes_is_listed() {
         // A key or value the reader does not take would be refused.
         let dir = std::env::temp_dir().join(format!("sonny-config-keys-{}", std::process::id()));
@@ -579,6 +795,7 @@ mod tests {
         for (at, setting) in SETTINGS.iter().enumerate() {
             view.pick = at;
             let named = match (number(setting), span(setting)) {
+                _ if hours(setting) => "Mon-Fri 09:00-19:00, Sat 10:00-14:00",
                 // Wide enough for a text width.
                 (true, _) => "70",
                 (_, true) => "15m",
@@ -646,14 +863,20 @@ mod tests {
         };
         view.values = view.read().unwrap();
         assert_eq!(view.values[6].as_deref(), Some("low"));
-        // The side chat: a fork, then its default again either way.
-        view.pick = 10;
+        // The side chat: one that answers, then its default again either way.
+        view.pick = 11;
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[10].as_deref(), Some("fork"));
+        assert_eq!(view.values[11].as_deref(), Some("answer"));
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[10], None);
+        assert_eq!(view.values[11], None);
         press(&mut view, KeyCode::Left);
-        assert_eq!(view.values[10].as_deref(), Some("fork"));
+        assert_eq!(view.values[11].as_deref(), Some("answer"));
+        // A task's speed steps through the tiers, taken back to its starter's.
+        view.pick = 8;
+        press(&mut view, KeyCode::Right);
+        assert_eq!(view.values[8].as_deref(), Some("standard"));
+        press(&mut view, KeyCode::Backspace);
+        assert_eq!(view.values[8], None);
         // Efforts step through every level.
         view.pick = 5;
         press(&mut view, KeyCode::Left);
@@ -679,12 +902,12 @@ mod tests {
         press(&mut view, KeyCode::Backspace);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "# mine\n[sonny]\nside_chat = \"fork\"\n"
+            "# mine\n[sonny]\nside_chat = \"answer\"\n"
         );
         // A switch is written as TOML's own.
-        view.pick = 11;
+        view.pick = 12;
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[11].as_deref(), Some("false"));
+        assert_eq!(view.values[12].as_deref(), Some("false"));
         assert!(!agent_client::config::read(&path).unwrap().sonny.chime);
         assert!(
             std::fs::read_to_string(&path)
@@ -692,7 +915,7 @@ mod tests {
                 .ends_with("chime = false\n")
         );
         press(&mut view, KeyCode::Right);
-        assert_eq!(view.values[11], None);
+        assert_eq!(view.values[12], None);
         // A value the reader refuses is said, and the file kept.
         view.pick = 7;
         view.typing = None;

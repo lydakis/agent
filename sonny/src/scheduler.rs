@@ -30,8 +30,14 @@ use std::time::Duration;
 
 /// `sonny scheduler`, what the job runs.
 pub const VERB: &str = "scheduler";
-/// The job's label, and its systemd unit's name, before its HOME's tag.
-const LABEL: &str = "me.lydakis.agent.scheduler.";
+/// The job's label, and its systemd unit's name, before its HOME's tag:
+/// unique among the person's jobs, as launchd and systemd need, and no
+/// one's name, as Homebrew's `homebrew.mxcl.NAME` is no one's domain.
+const LABEL: &str = "sonny.scheduler.";
+/// What the label was before 0.9.0, which [`relabel`] moves off once.
+const OLD_LABEL: &str = "me.lydakis.agent.scheduler.";
+/// The record of [`relabel`] in `~/.agent/sonny/migrated`.
+pub const RELABELED: &str = "scheduler-label";
 /// The longest it sleeps: a clock set forward, a sleep that paused its
 /// timer, or a ring it missed is seen within this.
 const LOOK_EVERY: Duration = Duration::from_secs(60);
@@ -140,15 +146,25 @@ pub fn ensure() -> Result<(), String> {
         UserManager::find()?;
     }
     let sonny = crate::skills::sonny_path().ok_or("no path to this Sonny")?;
+    // Run by its own name, made again when Sonny changes, which a job
+    // running the old Sonny then starts again for.
+    let was = crate::named::current(&sonny, crate::named::SCHEDULER);
+    let job = crate::named::named(&sonny, crate::named::SCHEDULER);
+    let renamed = job != sonny && !was;
     let (file, label) = (job_file(scheduler, &home), label(&home));
     let there = std::fs::read_to_string(&file).ok();
-    if there
-        .as_deref()
-        .is_some_and(|text| text.contains(&program(scheduler, &sonny)))
+    if !renamed
+        && there
+            .as_deref()
+            .is_some_and(|text| text.contains(&program(scheduler, &job)))
     {
         return start(scheduler, &file, &label);
     }
-    let text = definition(scheduler, &label, &sonny, &trigger::environment());
+    let mut environment = trigger::environment();
+    if job != sonny {
+        environment.push((crate::named::PROGRAM, sonny.to_string_lossy().into_owned()));
+    }
+    let text = definition(scheduler, &label, &job, &environment);
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -159,14 +175,18 @@ pub fn ensure() -> Result<(), String> {
     start(scheduler, &file, &label)
 }
 
-/// Whether the job is there and runs another Sonny than this one.
+/// Whether the job is there and runs another Sonny than this one: by
+/// another path, or by its name while the name is not this Sonny.
 fn stale() -> bool {
     let (Some(home), Some(sonny)) = (std::env::var_os("HOME"), crate::skills::sonny_path()) else {
         return false;
     };
     let scheduler = Scheduler::here();
-    std::fs::read_to_string(job_file(scheduler, Path::new(&home)))
-        .is_ok_and(|text| !text.contains(&program(scheduler, &sonny)))
+    let job = crate::named::path(crate::named::SCHEDULER);
+    std::fs::read_to_string(job_file(scheduler, Path::new(&home))).is_ok_and(|text| {
+        !text.contains(&program(scheduler, &job))
+            || !crate::named::current(&sonny, crate::named::SCHEDULER)
+    })
 }
 
 /// Start a job the system has, else load it from its file.
@@ -314,14 +334,42 @@ pub(crate) fn retire_old(label: &str) {
     }
 }
 
-/// At Sonny's start: the job runs this Sonny, when it ran one from
-/// elsewhere (an install that keeps each version in its own folder), even
-/// while the old one still answers its doorbell; and the scheduler
-/// running, when any trigger is there.
+/// The job under its label from before 0.9.0 in `home`, when there is
+/// one: let go of, its file removed, and the job made again by `make`,
+/// under [`LABEL`]. Whether it is done, so a job that could not be made
+/// is made at the next start.
+fn relabel(home: &Path, scheduler: Scheduler, make: impl FnOnce() -> Result<(), String>) -> bool {
+    let old = format!("{OLD_LABEL}{}", trigger::home_tag(home.as_os_str()));
+    let dir = scheduler.jobs(home);
+    let file = dir.join(format!("{old}{}", scheduler.suffix()));
+    if !file.exists() {
+        return true;
+    }
+    let_go(scheduler, &dir, &old);
+    let _ = std::fs::remove_file(&file);
+    match make() {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("{}", trigger::error_json(&error));
+            false
+        }
+    }
+}
+
+/// At Sonny's start: the job under its own label, runs this Sonny, when
+/// it ran one from elsewhere (an install that keeps each version in its
+/// own folder), even while the old one still answers its doorbell; and
+/// the scheduler running, when any trigger is there.
 pub fn at_start() {
     let Ok(places) = Places::home() else {
         return;
     };
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let record = home.join(".agent/sonny/migrated");
+        crate::upgrade::once(&record, RELABELED, || {
+            relabel(&home, Scheduler::here(), ensure)
+        });
+    }
     if stale()
         && let Err(error) = ensure()
     {
@@ -1656,12 +1704,47 @@ mod tests {
     }
 
     #[test]
+    fn the_job_under_its_old_label_is_made_again_under_one_that_names_no_one() {
+        let root = std::env::temp_dir().join(format!("relabel-{}", std::process::id()));
+        let home = root.join("home");
+        let scheduler = Scheduler::Launchd;
+        let dir = scheduler.jobs(&home);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tag = trigger::home_tag(home.as_os_str());
+        let old = dir.join(format!("me.lydakis.agent.scheduler.{tag}.plist"));
+        std::fs::write(&old, "old").unwrap();
+        assert_eq!(label(&home), format!("sonny.scheduler.{tag}"));
+        assert!(!label(&home).contains("lydakis"));
+        // The new job could not be made: the old one is gone and it is
+        // tried again at the next start.
+        let mut made = 0;
+        assert!(!relabel(&home, scheduler, || {
+            made += 1;
+            Err("no".into())
+        }));
+        assert!(!old.exists());
+        std::fs::write(&old, "old").unwrap();
+        assert!(relabel(&home, scheduler, || {
+            made += 1;
+            Ok(())
+        }));
+        assert!(!old.exists());
+        // With none under the old label, nothing to make.
+        assert!(relabel(&home, scheduler, || {
+            made += 1;
+            Ok(())
+        }));
+        assert_eq!(made, 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn the_job_is_one_and_runs_the_scheduler() {
         let sonny = Path::new("/opt/Sonny Dir/sonny");
         let environment = [("SHELL", "/bin/zsh".to_owned())];
         let plist = definition(
             Scheduler::Launchd,
-            "me.lydakis.agent.scheduler.0a",
+            "sonny.scheduler.0a",
             sonny,
             &environment,
         );

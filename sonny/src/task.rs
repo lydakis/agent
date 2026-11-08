@@ -58,10 +58,6 @@ pub struct Start {
     /// lead's own, such as a repository it holds, of which the task then
     /// gets a worktree.
     pub folder: Option<String>,
-    /// A task to fork, with its files as they were after its turn `turn`,
-    /// else its newest that has them.
-    pub from: Option<String>,
-    pub turn: Option<i64>,
     /// The task starting this one as its own helper, which builds on its
     /// work: in the repository it works in, unless `folder` or
     /// `own_folder` says otherwise, from the last commit on its branch.
@@ -75,16 +71,6 @@ pub struct Start {
     /// that lead's task while its brief stays the person's words; an
     /// agent's shell starts tasks as its own agent.
     pub made_by: Option<String>,
-}
-
-/// The task a fork copies, and its files after the turn it copies.
-struct Source {
-    name: String,
-    /// The top of its worktree, which its snapshot holds, and where in
-    /// it the task worked.
-    top: PathBuf,
-    prefix: PathBuf,
-    snapshot: crate::snapshot::Snapshot,
 }
 
 /// Start the task `start` asks for in `project`, whose lead's folder is
@@ -130,14 +116,12 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         flags.extend(["--effort".to_owned(), effort]);
     }
     // A helper works in the repository inside the lead's folder that its
-    // task works in, unless told another; a fork works where its source did.
+    // task works in, unless told another.
     let theirs = match (&start.builds_on, start.own_folder) {
-        (Some(task), false) if start.folder.is_none() && start.from.is_none() => {
-            match recorded(task) {
-                Some((source, Made::Worktree(repo))) if same(&source, here) => Some(repo),
-                _ => None,
-            }
-        }
+        (Some(task), false) if start.folder.is_none() => match recorded(task) {
+            Some((source, Made::Worktree(repo))) if same(&source, here) => Some(repo),
+            _ => None,
+        },
         _ => None,
     };
     let theirs = theirs.map(|repo| repo.to_string_lossy().into_owned());
@@ -168,33 +152,30 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         }
         None => here.to_owned(),
     };
-    let source = match &start.from {
-        Some(_) if folder.is_some() || start.own_folder => {
-            return Err(
-                "a fork works where its source did; give neither folder nor own_folder".into(),
-            );
-        }
-        Some(from) => Some(source(&agent, project, from, start)?),
-        None => None,
-    };
     // The worktree of the task a helper builds on, whose files it starts
-    // with as they were at its last commit; files a task wrote, as a
-    // fork's are.
+    // with as they were at its last commit: files a task wrote.
     let mut helped = None;
-    let mut written = source.is_some();
+    let mut written = false;
     // The lead's mode, whose sandbox the task works in, and Sonny's git for
-    // it in a sandbox too unless the lead has none.
-    let mode = lead_mode(&agent, &start.env, starter).unwrap_or_else(crate::approvals::default);
-    let confine = crate::approvals::sandbox(mode, here)
+    // it in a sandbox too unless the lead has none; and the lead's state
+    // folder, which the task writes as the lead does.
+    let lead = lead_record(&agent, &start.env, starter);
+    let mode = (lead.as_ref())
+        .and_then(crate::approvals::mode)
+        .unwrap_or_else(crate::approvals::default);
+    let state = match &lead {
+        Some(lead) => crate::state::of(lead, starter),
+        None => crate::state::folder(starter),
+    };
+    let confine = crate::approvals::sandbox(mode, here, None)
         .get("sandbox")
         .and_then(Value::as_str)
         != Some("danger-full-access");
-    let mut place = match &source {
-        Some(source) => forked(&agent, name, source)?,
-        None if info["threads_in"] == "project" => in_place(here, name, true),
-        None if start.here && folder.is_none() => in_place(here, name, false),
-        None if start.own_folder => own_folder(here, name)?,
-        None => {
+    let mut place = match () {
+        () if info["threads_in"] == "project" => in_place(here, name, true),
+        () if start.here && folder.is_none() => in_place(here, name, false),
+        () if start.own_folder => own_folder(here, name)?,
+        () => {
             // On the last commit of the branch of the task it helps, in
             // the repository the helper is made of, when it has one there.
             let base = (start.builds_on.as_deref()).and_then(|task| branch_of(&at, task));
@@ -220,7 +201,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
                 .collect::<Option<Vec<_>>>()
         });
         let made = match below {
-            Some(parts) => crate::snapshot::folders(path, &parts, true).map_err(|e| e.to_string()),
+            Some(parts) => crate::git::folders(path, &parts, true).map_err(|e| e.to_string()),
             None => Err("not a folder inside it".to_owned()),
         };
         if let Err(e) = made {
@@ -289,21 +270,6 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             recorded = Some(record);
         }
     }
-    // A fork of a task Sonny recorded, made in the same repository, is
-    // recorded as it is, so the lead that started it removes it there.
-    if let Some(source) = &source
-        && let Some((_, Made::Worktree(_))) = self::recorded(&source.name)
-        && let (Some((top, _)), Ok(record)) = (&place.copy, record_of(name))
-    {
-        let text = format!("{}\n{}\n", here.display(), top.display());
-        let wrote = std::fs::create_dir_all(record.parent().unwrap_or(Path::new("/")))
-            .and_then(|()| std::fs::write(&record, text));
-        if let Err(e) = wrote {
-            undo(&place.undo);
-            return Err(format!("{}: {e}", record.display()));
-        }
-        recorded = Some(record);
-    }
     // Only a run that started can have made the task, which then keeps
     // its folder; anything that failed before leaves nothing behind.
     let failed = |place: &Place, ran: bool, error: String| {
@@ -320,9 +286,8 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // Never a repository's inside it: its `.agents`, unlike the lead's, is
     // no more kept from the lead's sandbox than the rest of it, and the
     // script runs outside any.
-    // A fork's files, and a helper's on its task's branch, are what a
-    // task wrote, so setup never runs on them: the agent runs it in its
-    // own.
+    // A helper's files on its task's branch are what a task wrote, so
+    // setup never runs on them: the agent runs it in its own.
     let script = here.join(".agents/setup");
     if start.setup
         && written
@@ -365,7 +330,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     }
     // A new worktree takes clones of the lead's build folders only once
     // setup has run: setup runs outside any sandbox and must not run what
-    // the lead's folders hold. A fork or a task's helper takes none: Sonny
+    // the lead's folders hold. A task's helper takes none: Sonny
     // writes nothing of its own among files a task wrote, whose links
     // could lead it out.
     if let (Undo::Worktree { path, .. }, Some((top, _)), false) =
@@ -381,21 +346,28 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             ));
         }
     }
-    let lead_picks = (env_of(start, "AGENT_MODEL"), env_of(start, "AGENT_EFFORT"));
+    // The starter's speed is a setting of its own, which its record holds.
+    let speed = (lead.as_ref())
+        .and_then(|lead| lead["settings"]["speed"].as_str())
+        .map(str::to_owned);
+    let lead_picks = Picks {
+        model: env_of(start, "AGENT_MODEL"),
+        effort: env_of(start, "AGENT_EFFORT"),
+        speed,
+    };
+    let task_picks = Picks {
+        model: None,
+        effort: config.sonny.task_effort,
+        speed: config.sonny.task_speed,
+    };
     let flags: Vec<&String> = flags.iter().collect();
-    let flags = with_defaults(&info, &flags, lead_picks, config.sonny.task_effort);
+    let flags = with_defaults(&info, &flags, lead_picks, task_picks);
     let flags: Vec<&String> = flags.iter().collect();
     // Roles are the lead's project's, which `info` names, as its files are
     // now: the ones the lead or the person picked from, even uncommitted,
     // never a worktree's copy as of its last commit, nor a folder inside.
     let roles = here;
-    // A fork's instructions are its source's, kept by the daemon; a role
-    // named now may not be in the files it gets back.
-    let composed = match &source {
-        Some(_) => Ok(Vec::new()),
-        None => told(&place.told, roles, here, &info, &flags),
-    };
-    let mut flags = match composed {
+    let mut flags = match told(&place.told, roles, here, &info, &flags) {
         Ok(flags) => flags,
         Err(error) => return failed(&place, false, error),
     };
@@ -404,7 +376,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // committing to its repository and running the commands the config
     // lets out of it, or, in `full`, unconfined, as nothing would answer a
     // call that asks to leave.
-    for (key, value) in crate::approvals::sandbox(mode, &place.dir) {
+    for (key, value) in crate::approvals::sandbox(mode, &place.dir, state.as_deref()) {
         let flag = format!("--{key}");
         match value {
             Value::String(value) => flags.extend([flag, value]),
@@ -418,25 +390,8 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         }
     }
     // A path in the lead's folder would have the task write there instead
-    // of in its copy, where nothing keeps it apart from the lead's work;
-    // so would one in the folder of a task it forks.
+    // of in its copy, where nothing keeps it apart from the lead's work.
     let mut brief = vec![start.brief.clone()];
-    if let Some(source) = &source {
-        brief.insert(
-            0,
-            format!(
-                "You are a copy of {} as it was after its turn {}, now {name}, in {}: a \
-                 worktree of its own with the files as they were then. Work only there.",
-                source.name,
-                source.snapshot.turn,
-                shell_quote(&place.dir)
-            ),
-        );
-        // Its files are where they were in its worktree, from the top.
-        if let Some((_, worktree)) = &place.copy {
-            brief = in_copy(&brief, &source.top, worktree).0;
-        }
-    }
     // A helper's are where they were in its task's worktree.
     if let (Some(top), Some((_, worktree))) = (&helped, &place.copy) {
         brief = in_copy(&brief, top, worktree).0;
@@ -445,60 +400,45 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         Some((from, to)) => in_copy(&brief, from, to),
         None => (brief, 0),
     };
-    if let Some(source) = &source {
-        // A fork keeps its source's instructions, role, model and sandbox.
-        let forked = crate::agent_command(&agent)?
-            .args([
-                "fork",
-                "--source",
-                &source.name,
-                "--bot",
-                name,
-                "--checkpoint",
-            ])
-            .arg(source.snapshot.checkpoint.to_string())
-            .arg("--workspace")
-            .arg(&place.dir)
-            .stdin(Stdio::null())
-            .output();
-        match forked {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => {
-                let said = String::from_utf8_lossy(&output.stderr);
-                return failed(
-                    &place,
-                    true,
-                    format!("{name} was not forked: {}", said.trim()),
-                );
-            }
-            Err(e) => {
-                return failed(&place, false, format!("running {}: {e}", agent.display()));
-            }
-        }
-        flags.clear();
-    }
-    command.args(["run", "--detach"]);
-    if source.is_none() {
-        command.arg("--new");
+    let brief = brief.join(" ");
+    let run = |mut command: Command, flags: &[String]| {
+        command.args(["run", "--detach", "--new"]);
         if let Some(lead) = &start.made_by {
             for key in ["AGENT_BOT", "AGENT_BOT_ID", "AGENT_TURN"] {
                 command.env_remove(key);
             }
             command.args(["--created-by", lead]);
         }
+        // The brief goes in on stdin, never as an argument: Linux refuses an
+        // argument of 128 KiB or more, and a pasted brief can be longer.
+        command
+            .args(["--bot", name, "--workspace"])
+            .arg(&place.dir)
+            .args(flags)
+            .args(["--", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|child| given(child, brief.clone()))
+    };
+    let mut output = run(command, &flags);
+    // A speed the task's provider does not serve is refused before the
+    // task is made: it starts at standard instead, and says so.
+    let mut slowed = None;
+    if let Ok(refused) = &output
+        && !refused.status.success()
+        && refused_speed(&refused.stderr)
+        && let Some(standard) = without_speed(&flags)
+    {
+        slowed = Some(String::from_utf8_lossy(&refused.stderr).trim().to_owned());
+        let mut again = match crate::agent_command(&agent) {
+            Ok(command) => command,
+            Err(error) => return failed(&place, false, error),
+        };
+        again.envs(start.env.iter().map(|(key, value)| (key, value)));
+        output = run(again, &standard);
     }
-    // The brief goes in on stdin, never as an argument: Linux refuses an
-    // argument of 128 KiB or more, and a pasted brief can be longer.
-    let output = command
-        .args(["--bot", name, "--workspace"])
-        .arg(&place.dir)
-        .args(flags)
-        .args(["--", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|child| given(child, brief.join(" ")));
     let output = match output {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
@@ -514,17 +454,10 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         }
     };
     // The profile it runs as, which nothing the daemon keeps names: the
-    // one asked for, else what the project tells every task; a fork's is
-    // its source's. Only said where it is shown, so a failed write starts
-    // the task all the same.
+    // one asked for, else what the project tells every task. Only said
+    // where it is shown, so a failed write starts the task all the same.
     let store = started_on(start);
-    let profile = match &source {
-        Some(source) => (store.as_ref()).and_then(|store| noted_profile(store, &source.name)),
-        None => start
-            .profile
-            .clone()
-            .or_else(|| crate::project::task_profile(&info).ok()),
-    };
+    let profile = (start.profile.clone()).or_else(|| crate::project::task_profile(&info).ok());
     if let Some(store) = &store {
         match profile {
             Some(profile) => {
@@ -538,6 +471,11 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         String::from_utf8_lossy(&output.stdout).trim()
     )];
     said.extend(place.note.clone());
+    if let Some(refusal) = slowed {
+        said.push(format!(
+            "It runs at standard speed: its provider refused the speed it was to have ({refusal})."
+        ));
+    }
     if let (Some((from, to)), 1..) = (&place.copy, moved) {
         said.push(format!(
             "The brief named {} {moved} time{}; it names the task's copy {} instead.",
@@ -662,18 +600,36 @@ fn env_of(start: &Start, key: &str) -> Option<String> {
         .or_else(|| std::env::var(key).ok())
 }
 
-/// The run flags with the task's model and effort, unless they name their
-/// own: the project's `threads_model`, else the lead's (`lead`, its
-/// AGENT_MODEL and AGENT_EFFORT), so a role (--profile) never swaps it;
-/// and the project's `threads_effort`, else `task_effort`
-/// (the config's `[sonny] task_effort`), else the lead's own when the task
-/// runs its model.
-fn with_defaults(
-    info: &Value,
-    flags: &[&String],
-    lead: (Option<String>, Option<String>),
-    task_effort: Option<String>,
-) -> Vec<String> {
+/// A model, effort and speed a task may start with.
+#[derive(Default)]
+struct Picks {
+    model: Option<String>,
+    effort: Option<String>,
+    speed: Option<String>,
+}
+
+/// Whether `run` refused the task for a speed its provider does not serve:
+/// its stderr is the CLI's one JSON object.
+fn refused_speed(stderr: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(stderr).is_ok_and(|error| error["error"] == "invalid_speed")
+}
+
+/// The run flags without `--speed`, or None when they name none.
+fn without_speed(flags: &[String]) -> Option<Vec<String>> {
+    let at = flags.iter().position(|flag| flag == "--speed")?;
+    let mut flags = flags.to_vec();
+    flags.drain(at..(at + 2).min(flags.len()));
+    Some(flags)
+}
+
+/// The run flags with the task's model, effort and speed, unless they
+/// name their own: the project's `threads_model`, else the lead's (`lead`,
+/// its AGENT_MODEL and AGENT_EFFORT, and the speed its record holds), so a
+/// role (--profile) never swaps it; the project's `threads_effort`, else
+/// the config's `[sonny] task_effort` (`task`), else the lead's own when
+/// the task runs its model; and the speed the same way, from
+/// `threads_speed` and `[sonny] task_speed`. Standard needs no flag.
+fn with_defaults(info: &Value, flags: &[&String], lead: Picks, task: Picks) -> Vec<String> {
     let mut flags: Vec<String> = flags.iter().map(|flag| flag.to_string()).collect();
     // A value flag is --flag VALUE or --flag=VALUE.
     let value = |flags: &[String], name: &str| -> Option<Option<String>> {
@@ -685,7 +641,11 @@ fn with_defaults(
             None => flags.get(at + 1).cloned(),
         })
     };
-    let (lead_model, lead_effort) = lead;
+    let Picks {
+        model: lead_model,
+        effort: lead_effort,
+        speed: lead_speed,
+    } = lead;
     let model = match value(&flags, "--model") {
         Some(model) => model,
         None => {
@@ -703,10 +663,20 @@ fn with_defaults(
         let effort = info["threads_effort"]
             .as_str()
             .map(str::to_owned)
-            .or(task_effort)
+            .or(task.effort)
             .or(lead_effort.filter(|_| model.is_some() && model == lead_model));
         if let Some(effort) = effort {
             flags.extend(["--effort".to_owned(), effort]);
+        }
+    }
+    if value(&flags, "--speed").is_none() {
+        let speed = info["threads_speed"]
+            .as_str()
+            .map(str::to_owned)
+            .or(task.speed)
+            .or(lead_speed.filter(|_| model.is_some() && model == lead_model));
+        if let Some(speed) = speed.filter(|speed| speed != "standard") {
+            flags.extend(["--speed".to_owned(), speed]);
         }
     }
     flags
@@ -969,8 +939,8 @@ fn ends_name(after: &str, part_of_name: impl Fn(char) -> bool) -> bool {
     }
 }
 
-/// The permissions row of the lead `name`, from its gates and sandbox.
-fn lead_mode(agent: &Path, env: &[(String, String)], name: &str) -> Option<&'static str> {
+/// The lead `name` as `inspect` gives it: none when it can't be read.
+fn lead_record(agent: &Path, env: &[(String, String)], name: &str) -> Option<Value> {
     let output = Command::new(agent)
         .envs(env.iter().map(|(key, value)| (key, value)))
         .args(["inspect", "--bot", name])
@@ -978,8 +948,7 @@ fn lead_mode(agent: &Path, env: &[(String, String)], name: &str) -> Option<&'sta
         .stderr(Stdio::null())
         .output()
         .ok()?;
-    let record: Value = serde_json::from_slice(&output.stdout).ok()?;
-    crate::approvals::mode(&record)
+    serde_json::from_slice(&output.stdout).ok()
 }
 
 /// Whether the daemon has a task `name`: one whose start failed after it
@@ -1149,7 +1118,7 @@ fn listed_on(agent: &Path, env: &[(String, String)], name: &str) -> bool {
 fn undo(undo: &Undo) {
     match undo {
         Undo::Nothing => {}
-        Undo::Worktree { here, path, branch } => crate::snapshot::unwind(here, path, branch),
+        Undo::Worktree { here, path, branch } => crate::git::unwind(here, path, branch),
         Undo::Folder { path, record } => {
             let _ = std::fs::remove_dir_all(path);
             let _ = std::fs::remove_file(record);
@@ -1336,7 +1305,7 @@ fn worktree(here: &Path, name: &str, base: &str, confine: bool) -> Result<Place,
             ));
         }
         Undo::Nothing
-    } else if crate::snapshot::plain(
+    } else if crate::git::plain(
         here,
         &[
             "rev-parse",
@@ -1442,8 +1411,8 @@ fn add_confined(
         &target,
         base,
     ];
-    crate::snapshot::plain(here, &add)?;
-    let own = crate::snapshot::plain(path, &["rev-parse", "--absolute-git-dir"])?;
+    crate::git::plain(here, &add)?;
+    let own = crate::git::plain(path, &["rev-parse", "--absolute-git-dir"])?;
     let own = std::fs::canonicalize(own.trim()).map_err(|e| format!("{own}: {e}"))?;
     // The folders a sandbox keeps read-only at its top, agents' settings,
     // that the commit holds: git writes them as the commit has them, which
@@ -1455,7 +1424,7 @@ fn add_confined(
         .filter(|name| **name != ".git")
     {
         let listed =
-            crate::snapshot::plain(path, &["ls-tree", "-d", "--name-only", "HEAD", "--", name])?;
+            crate::git::plain(path, &["ls-tree", "-d", "--name-only", "HEAD", "--", name])?;
         if listed.lines().any(|line| line == *name) {
             let folder = path.join(name);
             std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
@@ -1467,23 +1436,6 @@ fn add_confined(
     confined_in(agent, path, &["checkout", "-f", "-q"], &writable).map(drop)
 }
 
-/// Whether `dir` is in a worktree Sonny made a task.
-pub fn in_worktree(dir: &Path) -> bool {
-    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
-    home_dir().is_ok_and(|home| real(dir).starts_with(real(&home.join(".agent/worktrees"))))
-}
-
-/// Whether `top` is the top of one of Sonny's task worktrees itself, whose
-/// git config no task can write, and not a repository made inside one.
-pub fn is_worktree(top: &Path) -> bool {
-    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
-    home_dir().is_ok_and(|home| {
-        real(top).parent() == Some(&real(&home.join(".agent/worktrees")))
-            && top.join(".git").is_file()
-    })
-}
-
-/// The bot `name` as the daemon lists it.
 /// The bot `name` as the daemon lists it, read with the CLI.
 pub fn record_of_bot(name: &str) -> Option<Value> {
     record(&crate::agent_bin()?, name)
@@ -1498,113 +1450,6 @@ fn record(agent: &Path, name: &str) -> Option<Value> {
         .ok()?;
     let bots: Vec<Value> = serde_json::from_slice(&output.stdout).ok()?;
     bots.into_iter().find(|bot| bot["name"] == name)
-}
-
-/// The task of `project` named `from` that a start forks, and its files
-/// after `start.turn`, or after its newest turn that kept them.
-fn source(agent: &Path, project: &str, from: &str, start: &Start) -> Result<Source, String> {
-    if start.profile.is_some() || start.model.is_some() || start.effort.is_some() {
-        return Err("a fork keeps its source's role, model and effort; name none".into());
-    }
-    let name = crate::resolved::call(&serde_json::json!({"task": from}), project)
-        .ok_or("from names a task, without /")?;
-    let bot = record(agent, &name).ok_or_else(|| format!("{name} is not an agent here"))?;
-    let workspace = PathBuf::from(bot["workspace"].as_str().unwrap_or_default());
-    if !in_worktree(&workspace) {
-        return Err(format!(
-            "{name} works in no worktree of its own, so no turn of it kept its files"
-        ));
-    }
-    let bot_id = bot["bot_id"]
-        .as_i64()
-        .ok_or("the daemon listed no bot_id")?;
-    // Its repository, which need not be the lead's: a lead's folder may
-    // hold several, or be in none.
-    let top = crate::snapshot::top(&workspace)
-        .filter(|top| is_worktree(top))
-        .ok_or_else(|| format!("{name} works in no worktree of its own"))?;
-    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
-    let now = (real(&workspace).strip_prefix(real(&top)))
-        .map_err(|_| format!("{name} works outside its worktree"))?
-        .to_owned();
-    let refs = crate::snapshot::refs(&crate::daemon_paths(None, None)?.0);
-    let snapshot = crate::snapshot::find(&top, &refs, bot_id, start.turn)
-        .map_err(|e| format!("{name}: {e}"))?;
-    // Where it worked in that turn, which may not be where it works now.
-    let prefix = snapshot.folder.clone().unwrap_or(now);
-    Ok(Source {
-        name,
-        top,
-        prefix,
-        snapshot,
-    })
-}
-
-/// A git worktree of `source`'s repository on branch agent/NAME holding
-/// the files it had after its turn, on the commit it was on, in the folder
-/// of it `source` worked in.
-fn forked(agent: &Path, name: &str, source: &Source) -> Result<Place, String> {
-    // The repository's own checkout, whose paths a brief names; a bare
-    // one has none, and the source's worktree stands in.
-    let args = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
-    let common = PathBuf::from(git(&source.top, &args)?);
-    let here = match common.file_name().is_some_and(|name| name == ".git") {
-        true => common.parent().map_or(source.top.clone(), Path::to_owned),
-        false => source.top.clone(),
-    };
-    let path = home_dir()?.join(".agent/worktrees").join(name);
-    let branch = format!("agent/{name}");
-    if path.exists() {
-        return Err(format!("{} exists; pick another name", path.display()));
-    }
-    let indexes = crate::snapshot::indexes(&crate::daemon_paths(None, None)?.0);
-    // A bot that can write the sealed folder the files come back through
-    // could change it between its making and git's reading of it.
-    let output = Command::new(agent)
-        .arg("ls")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("running {}: {e}", agent.display()))?;
-    let bots: Vec<Value> = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("{} ls: {e}", agent.display()))?;
-    let folders: Vec<PathBuf> = (bots.iter())
-        .flat_map(crate::snapshot::writable)
-        .chain(crate::snapshot::shared())
-        .collect();
-    if let Some(folder) = crate::snapshot::holder(&indexes, folders.iter().map(PathBuf::as_path)) {
-        return Err(format!(
-            "{} is inside {}, where a bot works, so no fork's files come back through it",
-            indexes.display(),
-            folder.display()
-        ));
-    }
-    crate::snapshot::restore(&here, &source.snapshot, &path, &branch, &indexes)?;
-    let mut note = format!(
-        "{name}: a worktree at {} on branch {branch}, with {}'s files as they were after its \
-         turn {}, changes since its last commit uncommitted as they were",
-        shell_quote(&path),
-        source.name,
-        source.snapshot.turn
-    );
-    if source.snapshot.late {
-        note.push_str(
-            "; an agent was working in that folder again as they were kept, so they may hold \
-             some of that later work",
-        );
-    }
-    let dir = within(&path, &source.prefix);
-    Ok(Place {
-        told: dir.clone(),
-        dir,
-        note: Some(note),
-        undo: Undo::Worktree {
-            here: here.clone(),
-            path: path.clone(),
-            branch,
-        },
-        copy: Some((here, path)),
-    })
 }
 
 /// Whether `path` is a worktree of the repository `here` is in, on `branch`.
@@ -1662,7 +1507,7 @@ fn confined_in(
     args: &[&str],
     writable: &[&Path],
 ) -> Result<Vec<u8>, String> {
-    let git = crate::snapshot::git_program();
+    let git = crate::git::git_program();
     let mut command = match agent {
         Some(agent) => {
             let mut command = Command::new(agent);
@@ -1702,7 +1547,7 @@ fn sandboxer() -> Option<&'static Path> {
             let agent = crate::agent_bin()?;
             Command::new(&agent)
                 .args(["sandbox", "--"])
-                .arg(crate::snapshot::git_program())
+                .arg(crate::git::git_program())
                 .arg("--version")
                 .stdin(Stdio::null())
                 .stderr(Stdio::null())
@@ -1875,7 +1720,6 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
         Ok(())
     };
     kept()?;
-    let bot_id = record(&agent, name).and_then(|bot| bot["bot_id"].as_i64());
     if listed(&agent, name) {
         let output = crate::agent_command(&agent)?
             .args(["rm", "--bot", name])
@@ -1894,22 +1738,16 @@ pub fn remove(here: &Path, name: &str, discard: bool) -> Result<String, String> 
         // is skipped (`--force`, which still keeps a locked worktree), and
         // no hook runs.
         let path = path.to_string_lossy();
-        crate::snapshot::plain(repo, &["worktree", "remove", "--force", &path])?;
+        crate::git::plain(repo, &["worktree", "remove", "--force", &path])?;
         if let Ok(record) = record_of(name) {
             let _ = std::fs::remove_file(record);
-        }
-        // Its snapshots go with it once its folder is gone, so one still
-        // being taken of it fails rather than lands after.
-        if let Some(bot_id) = bot_id {
-            let refs = crate::snapshot::refs(&crate::daemon_paths(None, None)?.0);
-            crate::snapshot::forget(repo, &refs, bot_id)?;
         }
         let delete = if discard { "-D" } else { "-d" };
         let ours = git(here, &["rev-parse", "--show-toplevel"])
             .ok()
             .and_then(|top| std::fs::canonicalize(top).ok())
             .is_some_and(|top| &top == repo);
-        if crate::snapshot::plain(repo, &["branch", delete, &branch]).is_err() {
+        if crate::git::plain(repo, &["branch", delete, &branch]).is_err() {
             return Ok(match ours {
                 true => format!(
                     "Removed {name}. {branch} is kept, since it has commits not merged here; \
@@ -2197,13 +2035,16 @@ mod tests {
     fn a_task_runs_as_the_person_set_tasks_up() {
         let run = |info: Value, flags: &[&str], task: Option<&str>| {
             let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
-            let lead = (Some("a/lead".to_owned()), Some("high".to_owned()));
-            with_defaults(
-                &info,
-                &flags.iter().collect::<Vec<_>>(),
-                lead,
-                task.map(str::to_owned),
-            )
+            let lead = Picks {
+                model: Some("a/lead".to_owned()),
+                effort: Some("high".to_owned()),
+                speed: None,
+            };
+            let task = Picks {
+                effort: task.map(str::to_owned),
+                ..Picks::default()
+            };
+            with_defaults(&info, &flags.iter().collect::<Vec<_>>(), lead, task)
         };
         let none = serde_json::json!({});
         // Nothing set: the lead's own model and effort, as before.
@@ -2245,6 +2086,77 @@ mod tests {
     }
 
     #[test]
+    fn a_task_runs_at_its_starters_speed_on_its_model() {
+        let run = |info: Value, flags: &[&str], lead: Option<&str>, task: Option<&str>| {
+            let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            let lead = Picks {
+                model: Some("a/lead".to_owned()),
+                speed: lead.map(str::to_owned),
+                ..Picks::default()
+            };
+            let task = Picks {
+                speed: task.map(str::to_owned),
+                ..Picks::default()
+            };
+            with_defaults(&info, &flags.iter().collect::<Vec<_>>(), lead, task)
+        };
+        let none = serde_json::json!({});
+        // A fast lead's task on its model is fast too.
+        assert_eq!(
+            run(none.clone(), &[], Some("fast"), None),
+            ["--model", "a/lead", "--speed", "fast"]
+        );
+        // Standard is the daemon's own: no flag.
+        assert_eq!(
+            run(none.clone(), &[], Some("standard"), None),
+            ["--model", "a/lead"]
+        );
+        // Another model leaves the lead's speed, which its provider or
+        // model may not serve.
+        assert_eq!(
+            run(none.clone(), &["--model", "b/other"], Some("fast"), None),
+            ["--model", "b/other"]
+        );
+        let other = serde_json::json!({"threads_model": "b/other"});
+        assert_eq!(
+            run(other.clone(), &[], Some("fast"), None),
+            ["--model", "b/other"]
+        );
+        // The config's task speed applies on any model.
+        assert_eq!(
+            run(other, &[], Some("fast"), Some("ultrafast")),
+            ["--model", "b/other", "--speed", "ultrafast"]
+        );
+        // The project's file over the config and the lead, standard too.
+        let file = serde_json::json!({"threads_speed": "standard"});
+        assert_eq!(
+            run(file, &[], Some("fast"), Some("ultrafast")),
+            ["--model", "a/lead"]
+        );
+        let file = serde_json::json!({"threads_speed": "ultrafast"});
+        assert_eq!(
+            run(file, &[], None, Some("fast")),
+            ["--model", "a/lead", "--speed", "ultrafast"]
+        );
+    }
+
+    #[test]
+    fn a_refused_speed_is_dropped_for_standard() {
+        let refusal = br#"{"error":"invalid_speed","detail":"this provider serves anthropic at standard speed only","speeds":[]}"#;
+        assert!(refused_speed(refusal));
+        assert!(!refused_speed(br#"{"error":"model_required"}"#));
+        assert!(!refused_speed(b"not json"));
+        let flags: Vec<String> = ["--model", "a/b", "--speed", "fast", "--effort", "high"]
+            .map(str::to_owned)
+            .into();
+        assert_eq!(
+            without_speed(&flags).unwrap(),
+            ["--model", "a/b", "--effort", "high"]
+        );
+        assert!(without_speed(&flags[..2]).is_none());
+    }
+
+    #[test]
     fn a_task_s_profile_is_noted_beside_the_store_it_was_started_on() {
         let dir = std::env::temp_dir().join(format!("sonny-task-store-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2259,8 +2171,6 @@ mod tests {
             own_folder: false,
             here: false,
             folder: None,
-            from: None,
-            turn: None,
             builds_on: None,
             env: vec![("AGENT_STORE".into(), store.to_string_lossy().into_owned())],
             made_by: None,

@@ -3,7 +3,8 @@
 //! rows pair a sandbox with a reviewer. Four rows are Sonny's own; the
 //! person's `[sonny.permissions.NAME]` rows follow them. Agents the lead
 //! makes keep the row it had when it made them, until the person picks
-//! one: it overrides what every one was made with.
+//! one: it overrides what every one was made with, and the list says how
+//! many that is ([`reach_line`]) before the pick.
 use agent_client::approver::AUTO_UNGATED;
 use agent_client::config::{Permissions, Reviewer};
 use serde_json::{Map, Value, json};
@@ -256,10 +257,12 @@ fn mode_in(record: &Value, modes: &[Mode]) -> Option<&'static str> {
     let network = settings["network"].as_bool().unwrap_or(false);
     let reached = list(settings, "unix_sockets");
     // Its own folders, past its repositories' git folders and the zen
-    // folder every sandboxed row writes.
+    // and state folders every sandboxed row writes.
     let zen = zen_root();
     let folders: Vec<&str> = (writable.iter().copied())
-        .filter(|path| !path.ends_with(".git") && Some(*path) != zen.as_deref())
+        .filter(|path| {
+            !path.ends_with(".git") && Some(*path) != zen.as_deref() && !crate::state::within(path)
+        })
         .collect();
     // How well a row fits: whether its folders there now are the bot's,
     // then how many there are.
@@ -380,21 +383,35 @@ pub fn create_gate(name: &str, tools: &[String]) -> Map<String, Value> {
 }
 
 /// The sandbox fields, as `configure` takes them and `create`'s settings
-/// hold them, for an agent in the row `name` working in `workspace`. The
-/// commands let out of it are the daemon's command rules'. A row's repositories are the folder's own and each
+/// hold them, for an agent in the row `name` working in `workspace`, with
+/// `state`, the state folder of the lead it works for ([`crate::state`]).
+/// The commands let out of it are the daemon's command rules'. A row's repositories are the folder's own and each
 /// inside it, given as folders of their own so the daemon keeps their
 /// hooks and config read-only; a row's other folders are those that are
 /// there, by their real paths. A row no longer in the config is the
 /// default's.
-pub fn sandbox(name: &str, workspace: &std::path::Path) -> Map<String, Value> {
-    let mut fields = sandbox_with(name, workspace);
-    // Sonny's own folder an agent's shell writes, by `sonny zen`, as Codex
-    // adds its own folders to the roots it may write.
-    if let Some(Value::Array(writable)) = fields.get_mut("writable")
-        && writable.len() < MAX_WRITABLE
-        && let Some(zen) = zen_root()
-    {
-        writable.push(json!(zen));
+pub fn sandbox(name: &str, workspace: &std::path::Path, state: Option<&str>) -> Map<String, Value> {
+    owned(sandbox_with(name, workspace), state)
+}
+
+/// Sandbox `fields` with Sonny's own folders an agent's shell writes, as
+/// Codex adds its own folders to the roots it may write: the zen folder,
+/// by `sonny zen`, and the lead's state folder `state`. Each takes the
+/// place of the deepest repository when the daemon would take no more.
+fn owned(mut fields: Map<String, Value>, state: Option<&str>) -> Map<String, Value> {
+    if let Some(Value::Array(writable)) = fields.get_mut("writable") {
+        for own in [zen_root(), state.map(str::to_owned)].into_iter().flatten() {
+            if writable.iter().any(|have| *have == own) {
+                continue;
+            }
+            if writable.len() >= MAX_WRITABLE {
+                writable.pop();
+            }
+            writable.insert(0, json!(own));
+        }
+        while serde_json::to_string(&writable).map_or(0, |json| json.len()) > MAX_WRITABLE_JSON {
+            writable.pop();
+        }
     }
     fields
 }
@@ -689,11 +706,13 @@ fn set(value: &Value, key: &str) -> Vec<String> {
 pub struct Sandboxes(std::collections::HashMap<(String, String), Map<String, Value>>);
 
 impl Sandboxes {
-    /// The sandbox fields of the row `mode` in `workspace`.
-    pub fn of(&mut self, mode: &str, workspace: &str) -> &Map<String, Value> {
-        (self.0)
+    /// The sandbox fields of the row `mode` in `workspace`, with the state
+    /// folder `state`.
+    pub fn of(&mut self, mode: &str, workspace: &str, state: Option<&str>) -> Map<String, Value> {
+        let found = (self.0)
             .entry((mode.to_owned(), workspace.to_owned()))
-            .or_insert_with(|| sandbox(mode, std::path::Path::new(workspace)))
+            .or_insert_with(|| sandbox_with(mode, std::path::Path::new(workspace)));
+        owned(found.clone(), state)
     }
 }
 
@@ -729,6 +748,8 @@ pub fn gateable(tools: &[String], declared: &Value) -> Vec<String> {
 
 /// The agents `lead` made, and those they made, from a `bots` listing:
 /// by the maker's identity, so a reused name's children are strangers.
+/// Each maker's children are found from one index of the listing, so a
+/// listing of thousands is read once, not once per maker.
 pub fn made_by<'a>(bots: &'a [Value], lead: &str) -> Vec<&'a Value> {
     let Some(lead) = bots
         .iter()
@@ -737,13 +758,19 @@ pub fn made_by<'a>(bots: &'a [Value], lead: &str) -> Vec<&'a Value> {
     else {
         return Vec::new();
     };
+    let mut children: std::collections::HashMap<i64, Vec<&Value>> = Default::default();
+    for bot in bots {
+        if let Some(maker) = bot["created_by_id"].as_i64() {
+            children.entry(maker).or_default().push(bot);
+        }
+    }
     let mut makers = vec![lead];
+    let mut seen = std::collections::HashSet::from([lead]);
     let mut made: Vec<&Value> = Vec::new();
     while let Some(maker) = makers.pop() {
-        for bot in bots.iter().filter(|bot| bot["created_by_id"] == maker) {
+        for &bot in children.get(&maker).into_iter().flatten() {
             if let Some(id) = bot["bot_id"].as_i64()
-                && id != lead
-                && !made.iter().any(|seen| seen["bot_id"] == id)
+                && seen.insert(id)
             {
                 made.push(bot);
                 makers.push(id);
@@ -753,12 +780,70 @@ pub fn made_by<'a>(bots: &'a [Value], lead: &str) -> Vec<&'a Value> {
     made
 }
 
+/// How far a `/permissions` pick on an agent reaches, from a `bots`
+/// listing: the agents it made, and those they made, and how many of
+/// them and it are in a turn, which take the pick when the turn ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Reach {
+    pub made: usize,
+    pub busy: usize,
+}
+
+impl Reach {
+    pub fn of(bots: &[Value], agent: &str) -> Self {
+        let made = made_by(bots, agent);
+        let lead = bots.iter().find(|bot| bot["name"] == agent);
+        let busy = (lead.into_iter().chain(made.iter().copied()))
+            .filter(|bot| !bot["running_turn"].is_null())
+            .count();
+        Self {
+            made: made.len(),
+            busy,
+        }
+    }
+}
+
+/// The line under `/permissions`' rows saying what a pick reaches: the
+/// agent `name`, those it made (and those they made) and any new ones,
+/// since each takes its maker's row; and that one in a turn switches when
+/// the turn ends. `reach` is `None` until the listing is read. At most
+/// `width` wide: the new ones go first, then the words are cut.
+pub fn reach_line(name: &str, reach: Option<Reach>, width: usize) -> String {
+    let made = |new: bool| {
+        let new = if new { " and any new ones" } else { "" };
+        match reach.map(|reach| reach.made) {
+            None => format!("Reaches {name} and its agents"),
+            Some(0) => format!("Reaches {name} and any agent it makes"),
+            Some(1) if new.is_empty() => format!("Reaches {name} and its agent"),
+            Some(1) => format!("Reaches {name}, its agent{new}"),
+            Some(n) if new.is_empty() => format!("Reaches {name} and its {n} agents"),
+            Some(n) => format!("Reaches {name}, its {n} agents{new}"),
+        }
+    };
+    let busy = match reach.map(|reach| reach.busy) {
+        None | Some(0) => "busy ones switch when their turn ends".to_owned(),
+        Some(1) => "1 is busy and switches when its turn ends".to_owned(),
+        Some(n) => format!("{n} are busy and switch when their turns end"),
+    };
+    let whole = format!("{}; {busy}", made(true));
+    if unicode_width::UnicodeWidthStr::width(whole.as_str()) <= width {
+        return whole;
+    }
+    crate::transcript::cut(&format!("{}; {busy}", made(false)), width)
+}
+
 /// The `configure` fields that give a bot `mode`, with the sandbox the
 /// mode gives an agent in its folder, or `None` when its gate is already
 /// the one `gate` makes and its sandbox the mode's: the same approver over the same tools,
 /// with no expiry. `record` is the bot as `inspect` gives it, with the
-/// tools its client declared; its folder's sandbox comes from `sandboxes`.
-pub fn regate(record: &Value, mode: &str, sandboxes: &mut Sandboxes) -> Option<Map<String, Value>> {
+/// tools its client declared, and `name` its name; its folder's sandbox
+/// comes from `sandboxes`, with its state folder ([`crate::state::of`]).
+pub fn regate(
+    record: &Value,
+    mode: &str,
+    name: &str,
+    sandboxes: &mut Sandboxes,
+) -> Option<Map<String, Value>> {
     let tools: Vec<String> = record["tools"]
         .as_array()
         .into_iter()
@@ -792,9 +877,10 @@ pub fn regate(record: &Value, mode: &str, sandboxes: &mut Sandboxes) -> Option<M
     let mut fields = fields;
     let mut confined = true;
     if let Some(workspace) = record["workspace"].as_str() {
-        let sandbox = sandboxes.of(mode, workspace);
-        confined = sandboxed_as(record, sandbox);
-        fields.insert("settings".into(), Value::Object(sandbox.clone()));
+        let state = crate::state::of(record, name);
+        let sandbox = sandboxes.of(mode, workspace, state.as_deref());
+        confined = sandboxed_as(record, &sandbox);
+        fields.insert("settings".into(), Value::Object(sandbox));
     }
     (!has || !confined).then_some(fields)
 }
@@ -802,6 +888,61 @@ pub fn regate(record: &Value, mode: &str, sandboxes: &mut Sandboxes) -> Option<M
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lead_and_its_tasks_write_the_lead_s_state_folder() {
+        let dir = std::env::temp_dir().join(format!("sonny-stated-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let state = crate::state::folder("stated.lead").unwrap();
+        let zen = zen_root().unwrap();
+        // Every row that writes writes it, beside the zen folder; read only
+        // and full access name no folders.
+        for mode in ["auto", "ask"] {
+            let fields = sandbox(mode, &dir, Some(&state));
+            assert_eq!(set(&json!(fields), "writable"), {
+                let mut both = vec![state.clone(), zen.clone()];
+                both.sort();
+                both
+            });
+        }
+        assert_eq!(
+            sandbox("read-only", &dir, Some(&state)).get("writable"),
+            None
+        );
+        assert_eq!(sandbox("full", &dir, Some(&state)).get("writable"), None);
+        // The folder is Sonny's own, as the zen folder is: the row reads back
+        // as the one that gave it.
+        let gate = gate("auto", &["shell".to_owned()]);
+        let lead = json!({"workspace": dir, "tools": ["shell"],
+            "gates": [{"tag": "auto", "tools": gate["approve"]}],
+            "settings": sandbox("auto", &dir, Some(&state))});
+        assert_eq!(mode(&lead), Some("auto"));
+        assert_eq!(
+            regate(&lead, "auto", "stated.lead", &mut Sandboxes::default()),
+            None
+        );
+        // A lead made before state folders gets its own, and a task its
+        // lead's, when its row is set again.
+        let older = json!({"workspace": dir, "tools": ["shell"], "gates": lead["gates"],
+            "settings": sandbox("auto", &dir, None)});
+        assert_eq!(mode(&older), Some("auto"));
+        let again = regate(&older, "auto", "stated.lead", &mut Sandboxes::default()).unwrap();
+        assert!(set(&again["settings"], "writable").contains(&state));
+        let mut task = older.clone();
+        task["created_by"] = json!("stated.lead");
+        let again = regate(&task, "auto", "stated.fix", &mut Sandboxes::default()).unwrap();
+        assert!(set(&again["settings"], "writable").contains(&state));
+        // One that has it keeps it, whatever its name.
+        let kept = json!({"workspace": dir, "tools": ["shell"], "gates": lead["gates"],
+            "created_by": "stated.fix",
+            "settings": sandbox("auto", &dir, Some(&state))});
+        assert_eq!(
+            regate(&kept, "auto", "stated.fix.check", &mut Sandboxes::default()),
+            None
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn an_agent_is_confined_but_in_full_mode() {
@@ -835,12 +976,15 @@ mod tests {
         let task = json!({"workspace": dir, "gates": [],
             "settings": {"sandbox": "workspace-write", "writable": [git], "network": true}});
         assert_eq!(
-            regate(&task, "full", &mut Sandboxes::default()).unwrap()["settings"]["sandbox"],
+            regate(&task, "full", "lead", &mut Sandboxes::default()).unwrap()["settings"]["sandbox"],
             "danger-full-access"
         );
         let freed = json!({"workspace": dir, "gates": [],
             "settings": {"sandbox": "danger-full-access", "writable": [], "network": false}});
-        assert_eq!(regate(&freed, "full", &mut Sandboxes::default()), None);
+        assert_eq!(
+            regate(&freed, "full", "lead", &mut Sandboxes::default()),
+            None
+        );
         let unconfined = json!({"settings": {"sandbox": "danger-full-access", "writable": [], "network": false}});
         assert!(sandboxed_as(&unconfined, &full));
         // A lead made before leads were confined is confined again, and
@@ -1257,29 +1401,42 @@ mod tests {
         ];
         let names: Vec<_> = made_by(&bots, "lead").iter().map(|b| &b["name"]).collect();
         assert_eq!(names, [&json!("task"), &json!("helper")]);
+        // A pick on the lead reaches those two; on the task, its helper.
+        assert_eq!(Reach::of(&bots, "lead"), Reach { made: 2, busy: 0 });
+        assert_eq!(Reach::of(&bots, "task"), Reach { made: 1, busy: 0 });
+        assert_eq!(Reach::of(&bots, "gone"), Reach { made: 0, busy: 0 });
         // Each takes the mode unless it has it already; a gate Sonny did
         // not set is replaced too.
         assert_eq!(
-            regate(&bots[1], "full", &mut Sandboxes::default()),
+            regate(&bots[1], "full", "lead", &mut Sandboxes::default()),
             Some(gate("full", &[]))
         );
-        assert_eq!(regate(&bots[1], "auto", &mut Sandboxes::default()), None);
-        assert!(regate(&bots[2], "auto", &mut Sandboxes::default()).is_some());
+        assert_eq!(
+            regate(&bots[1], "auto", "lead", &mut Sandboxes::default()),
+            None
+        );
+        assert!(regate(&bots[2], "auto", "lead", &mut Sandboxes::default()).is_some());
         // Nothing to gate: already as `full` leaves it.
         let reader = json!({"name": "r", "tools": ["read"], "gates": []});
-        assert_eq!(regate(&reader, "auto", &mut Sandboxes::default()), None);
-        assert_eq!(regate(&reader, "ask", &mut Sandboxes::default()), None);
+        assert_eq!(
+            regate(&reader, "auto", "lead", &mut Sandboxes::default()),
+            None
+        );
+        assert_eq!(
+            regate(&reader, "ask", "lead", &mut Sandboxes::default()),
+            None
+        );
         // The same tag over fewer tools, or one that lapses, is set again.
         let partial = json!({"tools": ["shell", "read", "write"],
             "gates": [{"tag": "manual", "tools": ["shell"]}]});
-        assert!(regate(&partial, "ask", &mut Sandboxes::default()).is_some());
+        assert!(regate(&partial, "ask", "lead", &mut Sandboxes::default()).is_some());
         let lapsing = json!({"tools": ["shell", "read"],
             "gates": [{"tag": "auto", "tools": ["shell"], "expire_ms": 45000}]});
-        assert!(regate(&lapsing, "auto", &mut Sandboxes::default()).is_some());
+        assert!(regate(&lapsing, "auto", "lead", &mut Sandboxes::default()).is_some());
         // Of the tools its client declared, those that can drop work, run
         // something outside the sandbox or send words elsewhere wait for
         // the verdict too.
-        let panes = json!({"tools": ["shell", "read"], "declared": crate::declared::tools(crate::served::Role::at(0, 2)),
+        let panes = json!({"tools": ["shell", "read"], "declared": crate::declared::tools(crate::served::Role::LEAD),
             "gates": [{"tag": "auto", "tools": ["shell"]}]});
         let mut waiting = json!([
             "shell",
@@ -1288,8 +1445,7 @@ mod tests {
             "new_project",
             "subscriptions",
             "run_in_pane",
-            "automations",
-            "goal"
+            "automations"
         ]);
         // The browser, there when agent-browser is, reaches outside.
         if crate::browser::tool().is_some() {
@@ -1300,7 +1456,7 @@ mod tests {
             waiting.as_array_mut().unwrap().push(json!("desktop"));
         }
         assert_eq!(
-            regate(&panes, "auto", &mut Sandboxes::default()).unwrap()["approve"],
+            regate(&panes, "auto", "lead", &mut Sandboxes::default()).unwrap()["approve"],
             waiting
         );
     }
@@ -1324,12 +1480,80 @@ mod tests {
         crate::task::git(&dir.join("one"), &["init", "-q"]).unwrap();
         let workspace = dir.to_str().unwrap();
         let mut sandboxes = Sandboxes::default();
-        let first = sandboxes.of("auto", workspace).clone();
+        let first = sandboxes.of("auto", workspace, None);
         std::fs::create_dir_all(dir.join("two")).unwrap();
         crate::task::git(&dir.join("two"), &["init", "-q"]).unwrap();
-        assert_eq!(sandboxes.of("auto", workspace), &first);
+        assert_eq!(sandboxes.of("auto", workspace, None), first);
+        // Each agent with its own lead's state folder, from the same walk.
+        let state = crate::state::folder("walked.lead").unwrap();
+        let theirs = sandboxes.of("auto", workspace, Some(&state));
+        assert_eq!(theirs["writable"][0], json!(state));
+        assert_eq!(
+            set(&json!(theirs), "writable").len(),
+            set(&json!(first), "writable").len() + 1
+        );
         // The next pick looks again.
-        assert_ne!(Sandboxes::default().of("auto", workspace), &first);
+        assert_ne!(Sandboxes::default().of("auto", workspace, None), first);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pick_says_how_far_it_reaches_and_when_busy_agents_take_it() {
+        let bot = |name: &str, id: i64, by: Option<i64>, running: Option<i64>| json!({"name": name, "bot_id": id, "created_by_id": by, "running_turn": running});
+        let bots = [
+            bot("shop.lead", 1, None, Some(9)),
+            bot("shop.cart", 2, Some(1), Some(4)),
+            bot("shop.tests", 3, Some(2), None),
+            bot("other.lead", 4, None, Some(1)),
+        ];
+        // The lead and one of its agents are in a turn; another lead isn't
+        // counted.
+        let reach = Reach::of(&bots, "shop.lead");
+        assert_eq!(reach, Reach { made: 2, busy: 2 });
+        let line = |reach, width| reach_line("shop lead", reach, width);
+        assert_eq!(
+            line(Some(reach), 200),
+            "Reaches shop lead, its 2 agents and any new ones; \
+             2 are busy and switch when their turns end"
+        );
+        assert_eq!(
+            line(Some(Reach { made: 1, busy: 1 }), 200),
+            "Reaches shop lead, its agent and any new ones; \
+             1 is busy and switches when its turn ends"
+        );
+        assert_eq!(
+            line(Some(Reach::default()), 200),
+            "Reaches shop lead and any agent it makes; \
+             busy ones switch when their turn ends"
+        );
+        // Before the listing is read, the same in general words.
+        assert_eq!(
+            line(None, 200),
+            "Reaches shop lead and its agents; busy ones switch when their turn ends"
+        );
+        // Narrower, the new ones go first, then the words are cut.
+        assert_eq!(
+            line(Some(reach), 80),
+            "Reaches shop lead and its 2 agents; 2 are busy and switch when their turns end"
+        );
+        let cut = line(Some(reach), 40);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(cut.as_str()), 40);
+        assert!(cut.starts_with("Reaches shop lead and its 2 agents") && cut.ends_with('…'));
+    }
+
+    #[test]
+    fn made_by_reads_a_large_listing_once() {
+        // A chain 3000 deep and 3000 strangers: each maker's children come
+        // from one index, so this is quick, and the order is the walk's.
+        let mut bots = vec![json!({"name": "lead", "bot_id": 0})];
+        for id in 1..3000 {
+            bots.push(json!({"name": format!("t{id}"), "bot_id": id, "created_by_id": id - 1}));
+            bots.push(json!({"name": format!("s{id}"), "bot_id": 10_000 + id,
+                "created_by_id": 50_000}));
+        }
+        let made = made_by(&bots, "lead");
+        assert_eq!(made.len(), 2999);
+        assert_eq!(made[0]["name"], "t1");
+        assert_eq!(made[2998]["name"], "t2999");
     }
 }

@@ -1,5 +1,7 @@
 """The agent command: daemon startup, run/follow/ls, peers, and socket rendezvous."""
 import fcntl
+import shutil
+import sys
 import json
 import re
 import concurrent.futures
@@ -139,6 +141,8 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(failing.returncode, 1)
         last = json.loads(failing.stdout.splitlines()[-1])
         self.assertEqual((last['event'], last['data']['error']), ('turn_finished', 'missing_completion'))
+        # A failed run says why on stderr too, where a caller that checks the exit looks.
+        self.assertIn('agent: failed: missing_completion', failing.stderr)
         pretty = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--pretty', 'truncate', check=False)
         self.assertIn('missing_completion', pretty.stderr)
         self.agent('shutdown', '--store', str(self.store))
@@ -295,15 +299,21 @@ class SocketAndCliTests(ModelFixture):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
         busy = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'slow').stdout)
         self.assertEqual(busy['status'], 'running')
-        refused = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'never', check=False)
+        # Unsaid, a message to a busy bot steers: it waits to join the running turn.
+        joined = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'also').stdout)
+        self.assertEqual(joined['status'], 'queued')
+        turns = json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)
+        self.assertEqual(next(t for t in turns if t['turn'] == joined['turn'])['delivery'], 'steer')
+        refused = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', '--delivery', 'reject',
+                             'never', check=False)
         self.assertEqual(refused.returncode, 1)
         # A failure is one JSON object on stderr: the daemon's fields, and a
         # hint in flags.
         busy_error = json.loads(refused.stderr)
         self.assertEqual((busy_error['error'], busy_error['running_turn']), ('bot_busy', busy['turn']))
         self.assertIn('hint', busy_error)
-        pretty = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', '--pretty', 'never',
-                            check=False)
+        pretty = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', '--pretty',
+                            '--delivery=reject', 'never', check=False)
         self.assertRegex(pretty.stderr, r'^agent: bot_busy: turn \d+ is running; resend with --delivery')
         # The refusal gives flags to copy, not a description of them, and the
         # fork it offers works while the turn runs.
@@ -541,14 +551,14 @@ class SocketAndCliTests(ModelFixture):
     def test_daemon_limits_match_on_startup_and_attach_and_bots_keep_their_settings(self):
         flags = ['--idle-exit', '0', '--stall-timeout', '30s']
         self.agent('run', *self.common, *flags, '--context-bytes', '1024', '--context-items', '2',
-                   '--keep-warm', '0', '--cache-ttl', '1h', '--new', '--bot', 'Bob', 'hi')
+                   '--cache-ttl', '1h', '--new', '--bot', 'Bob', 'hi')
         self.agent('run', *self.again, *flags, '--bot', 'Bob', 'again')
         control = Connection(self.socket)
         self.addCleanup(control.close)
         settings = control.request('inspect', bot='Bob')['result']['settings']
         self.assertEqual((settings['context_bytes'], settings['context_items'], settings['compact_at'],
-                          settings['keep_warm'], settings['cache_ttl'], settings['max_output_tokens']),
-                         (1024, 2, 75, 0, '1h', None))
+                          settings['cache_ttl'], settings['max_output_tokens']),
+                         (1024, 2, 75, '1h', None))
         # The daemon checks each setting's range and creates nothing it refuses.
         small = self.agent('run', *self.common, '--context-bytes', '512', '--new', '--bot', 'Small', 'hi', check=False)
         self.assertEqual(small.returncode, 1)
@@ -560,7 +570,7 @@ class SocketAndCliTests(ModelFixture):
         refused = self.agent('stats', '--store', str(self.store), '--stall-timeout', '2m', check=False)
         self.assertIn('--stall-timeout: requested 2m but daemon has 30s', refused.stderr)
         # How a bot calls its model is chosen when it is made, not by the daemon.
-        for flag, value in (('--keep-warm', '4m'), ('--cache-ttl', '5m'), ('--max-output-tokens', '4096')):
+        for flag, value in (('--cache-ttl', '5m'), ('--max-output-tokens', '4096')):
             refused = self.agent('stats', '--store', str(self.store), flag, value, check=False)
             self.assertEqual(refused.returncode, 2)
             self.assertIn(f'does not accept {flag}', refused.stderr)
@@ -592,8 +602,6 @@ class SocketAndCliTests(ModelFixture):
             ('run', '--stall-timeout', '0', 'hi'),
             ('run', '--stall-timeout', '25h', 'hi'),
             ('run', '--stall-timeout', '30', 'hi'),
-            ('run', '--keep-warm', '5m', 'hi'),
-            ('run', '--keep-warm', '1500ms', 'hi'),
             ('wait', '--timeout-ms', '5', 'proc:1'),
             ('run', '--retain-turns', '2', 'hi'),
             ('run', '--cache-ttl', '2h', 'hi'),
@@ -829,6 +837,8 @@ class SocketAndCliTests(ModelFixture):
         timed = self.agent('wait', '--store', str(self.store), '--timeout', '200ms', again, check=False)
         self.assertEqual(timed.returncode, 1)
         self.assertEqual(json.loads(timed.stdout)['pending'], [again])
+        # A timeout is no failure: `pending` says it, and stderr stays quiet.
+        self.assertEqual(timed.stderr, '')
         inside = subprocess.run([*self.base, 'wait', '--store', str(self.store), again],
                                 env={**clean_env(), 'AGENT_SHELL_CONTEXT': '1'}, capture_output=True, text=True, timeout=5)
         self.assertNotEqual(inside.returncode, 0)
@@ -844,7 +854,7 @@ class SocketAndCliTests(ModelFixture):
         self.assertTrue({'processes', 'active', 'connecting', 'connections', 'idle_exit_seconds'} <= set(ready['limits']))
         self.assertEqual(ready['limits']['stall_timeout_seconds'], 600)
         # How a bot calls its model is its own setting, not the daemon's.
-        self.assertFalse({'output_tokens', 'keep_warm_seconds', 'cache_ttl'} & set(ready['limits']))
+        self.assertFalse({'output_tokens', 'cache_ttl'} & set(ready['limits']))
         self.assertEqual(ready['limits']['connections'], -(-ready['limits']['active'] // 64))
 
     def test_burst_eviction_exits_client_and_replay_recovers_terminal_event(self):
@@ -1004,6 +1014,118 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('bot_not_found', (self.path / 'route.err').read_text())
         self.assertEqual(control.request('inspect', bot='Bob')['result']['head'], replacement['head'])
 
+    def test_a_bot_s_variables_reach_its_shell_and_the_bots_it_makes(self):
+        self.agent('run', *self.common, '--new', '--bot', 'Bob', 'hello')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        configured = control.request('configure', bot='Bob', settings={'env': {'SONNY_STATE': '/state/Bob'}})
+        self.assertEqual(configured['result']['changed'], ['env'])
+        # Its own shell sees it, and so does a bot its shell makes, which
+        # takes its creator's whatever it asks for.
+        nested = ('"$AGENT_BIN" run --detach --no-spawn --new --bot Alice -- '
+                  '\'shell:printf "%s" "$SONNY_STATE" > alice-state\'')
+        ran = self.agent('run', *self.again, '--bot', 'Bob', '--pretty',
+                         f'shell:printf "%s" "$SONNY_STATE" > bob-state; {nested}')
+        deadline = time.monotonic() + 5
+        while not (self.path / 'alice-state').exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertEqual((self.path / 'bob-state').read_text(), '/state/Bob')
+        self.assertTrue((self.path / 'alice-state').exists(), ran.stdout)
+        self.assertEqual((self.path / 'alice-state').read_text(), '/state/Bob')
+        alice = control.request('inspect', bot='Alice')['result']
+        self.assertEqual(alice['settings']['env'], {'SONNY_STATE': '/state/Bob'})
+        # The daemon's own names stay its own.
+        refused = control.request('configure', bot='Bob', settings={'env': {'AGENT_BOT': 'x'}})
+        self.assertEqual(refused['error'], 'invalid_setting')
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_command_run_as_a_bot_has_its_sandbox_socket_and_variables(self):
+        self.agent('run', *self.common, '--new', '--bot', 'Reader', '--sandbox', 'read-only', 'hello')
+        self.agent('run', *self.common, '--new', '--bot', 'Free', 'hello')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        control.request('configure', bot='Reader', settings={'env': {'SONNY_STATE': '/state/Reader'}})
+        reader = control.request('inspect', bot='Reader')['result']
+        store = ['--store', str(self.store)]
+        check = ('printf "%s %s %s\n" "$SONNY_STATE" "$AGENT_BOT" "$AGENT_BOT_ID"; '
+                 '"$AGENT_BIN" ls > /dev/null && echo reached; '
+                 'touch written 2> /dev/null || echo confined; '
+                 '"$AGENT_BIN" sandbox --bot Reader -- true 2> /dev/null; echo "nested $?"; exit 3')
+        ran = self.agent('sandbox', *store, '--bot', 'Reader', '--bot-id', str(reader['bot_id']),
+                         '--', '/bin/sh', '-c', check, check=False)
+        # The command's own status, and what it saw: the bot's variables,
+        # the daemon through the bot's own socket, which lends nothing.
+        self.assertEqual(ran.returncode, 3, ran.stderr)
+        self.assertEqual(ran.stdout.split('\n')[:4],
+                         [f'/state/Reader Reader {reader["bot_id"]}', 'reached', 'confined', 'nested 125'])
+        self.assertFalse((self.path / 'written').exists())
+        # A bot whose commands run unconfined runs this one so too.
+        self.agent('sandbox', *store, '--bot', 'Free', '--', '/bin/sh', '-c', 'touch written')
+        self.assertTrue((self.path / 'written').exists())
+        # Another identity, or a bot that is not there, runs nothing.
+        for flags in (('--bot', 'Reader', '--bot-id', str(reader['bot_id'] + 100)), ('--bot', 'Nobody')):
+            refused = self.agent('sandbox', *store, *flags, '--', 'touch', 'refused', check=False)
+            self.assertEqual((refused.returncode, json.loads(refused.stderr)['error']),
+                             (125, 'bot_not_found'))
+        self.assertFalse((self.path / 'refused').exists())
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_command_run_as_a_bot_keeps_what_the_daemon_keeps_from_its_commands(self):
+        kept = self.path / 'kept'
+        kept.mkdir()
+        daemon = SocketClient(self.binary, self.store, self.url, 'shell',
+                              extra=['--protect-path', str(kept), '--shell-exclude', 'SECRET_*'],
+                              env={**clean_env(), 'SECRET_TOKEN': 'daemon'})
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Writer', workspace=str(self.path), settings={'sandbox': 'workspace-write'})
+        check = ('touch wrote; touch kept/x 2> /dev/null || echo kept; '
+                 'printf "[%s][%s]\n" "$SECRET_TOKEN" "$CALLER_ONLY"')
+        ran = subprocess.run([str(self.binary), 'sandbox', '--store', str(self.store), '--socket', str(daemon.socket_path),
+                              '--bot', 'Writer', '--', '/bin/sh', '-c', check],
+                             env={**clean_env(), 'SECRET_TOKEN': 'caller', 'CALLER_ONLY': 'caller'},
+                             capture_output=True, text=True, timeout=30, cwd=self.path)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        # It writes its folder but not what the daemon protects, and has the
+        # environment the bot's commands have: none of the daemon's withheld
+        # variables, nor the caller's.
+        self.assertEqual(ran.stdout.split('\n')[:2], ['kept', '[][]'])
+        self.assertTrue((self.path / 'wrote').exists())
+        self.assertFalse((kept / 'x').exists())
+
+    @unittest.skipUnless(shutil.which('bwrap'), 'placeholders are bubblewrap\'s')
+    def test_a_lent_sandbox_s_placeholders_stay_while_any_command_mounts_them(self):
+        daemon = SocketClient(self.binary, self.store, self.url, 'shell', extra=['--protect', '.codex'], env=clean_env())
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Writer', workspace=str(self.path), settings={'sandbox': 'workspace-write'})
+        sandbox = [str(self.binary), 'sandbox', '--store', str(self.store), '--socket', str(daemon.socket_path),
+                   '--bot', 'Writer', '--']
+        # A missing .codex is held as an empty placeholder while any command
+        # mounts it: the first to start ending first must not remove it from
+        # under a later one still running, which could then write there.
+        def started(name):
+            deadline = time.monotonic() + 15
+            while not (self.path / name).exists():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.05)
+        first = subprocess.Popen([*sandbox, '/bin/sh', '-c',
+                                  'touch first; while [ ! -e go ]; do sleep 0.05; done'],
+                                 env=clean_env(), cwd=self.path)
+        self.addCleanup(first.kill)
+        started('first')
+        later = subprocess.Popen([*sandbox, '/bin/sh', '-c',
+                                  'touch later; while [ ! -e done ]; do sleep 0.05; done; '
+                                  'mkdir -p .codex 2> /dev/null; touch .codex/x 2> /dev/null || echo kept'],
+                                 env=clean_env(), cwd=self.path, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(later.kill)
+        started('later')
+        (self.path / 'go').touch()
+        self.assertEqual(first.wait(timeout=30), 0)
+        (self.path / 'done').touch()
+        out, _ = later.communicate(timeout=30)
+        self.assertEqual(later.returncode, 0)
+        self.assertEqual(out.strip(), 'kept')
+        self.assertFalse((self.path / '.codex' / 'x').exists())
+
     def test_creator_identity_is_required_and_survives_daemon_restart(self):
         self.agent('run', *self.common, '--new', '--bot', 'Creator',
                    'shell:printf "%s" "$AGENT_BOT_ID" > own-id')
@@ -1041,6 +1163,30 @@ class SocketAndCliTests(ModelFixture):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertNotIn('result', control.request('inspect', bot='Child'))
         self.assertEqual(control.request('inspect', bot='Creator')['result']['head'], replacement['head'])
+
+    def test_a_bot_s_shell_makes_bots_no_deeper_than_the_daemon_lets_lines_go(self):
+        # The CLI starts the daemon with [daemon] depth, 2 unless set.
+        self.agent('run', *self.common, '--new', '--bot', 'Lead', 'hello')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+
+        def made_by(maker, name):
+            record = control.request('inspect', bot=maker)['result']
+            turn = control.request('turns', bot=maker)['result']['turns'][-1]['turn']
+            env = dict(clean_env(), AGENT_BOT=maker, AGENT_BOT_ID=str(record['bot_id']),
+                       AGENT_TURN=str(turn))
+            return subprocess.run([*self.base, 'run', *self.common, '--new', '--bot', name, 'hello'],
+                                  env=env, cwd=self.path, capture_output=True, text=True, timeout=15)
+
+        for maker, name, depth in (('Lead', 'Task', 1), ('Task', 'Helper', 2)):
+            made = made_by(maker, name)
+            self.assertEqual(made.returncode, 0, made.stderr)
+            self.assertEqual(control.request('inspect', bot=name)['result']['depth'], depth)
+        refused = made_by('Helper', 'Deeper')
+        self.assertNotEqual(refused.returncode, 0)
+        error = json.loads(refused.stderr.strip().splitlines()[-1])
+        self.assertEqual((error['error'], error['depth'], error['max_depth']), ('depth_limit', 3, 2), error)
+        self.assertEqual(control.request('inspect', bot='Deeper')['error'], 'bot_not_found')
 
     def test_large_shell_output_is_previewed_and_retained_as_an_artifact(self):
         run = self.agent('run', *self.common, '--new', '--bot', 'Bob',
@@ -1392,17 +1538,36 @@ class CliTests(ModelFixture):
         # or does not answer), waits for it to exit, then starts this one on
         # the same socket. One another client already replaced is not asked;
         # an agent asking from inside a turn, or one with no provider to
-        # start a daemon with, leaves it running and the error stands.
+        # start a daemon with, leaves it running and the error says why,
+        # and that nothing was sent. A command on the bots, which never
+        # starts a daemon where none runs, replaces it the same way, then
+        # goes to the new one.
         provider = ['--provider', 'openai=responses,http://127.0.0.1:9/v1']
-        cases = (('ok', False, provider), ('refused', False, provider), ('silent', False, provider),
-                 ('replaced', False, provider), ('ok', True, provider), ('ok', False, []))
-        for answer, inside, flags in cases:
-            with self.subTest(answer=answer, inside=inside, provider=bool(flags)), \
+        cases = (('ok', False, provider, 'start'), ('refused', False, provider, 'start'),
+                 ('silent', False, provider, 'start'), ('replaced', False, provider, 'start'),
+                 ('ok', True, provider, 'start'), ('ok', False, [], 'start'),
+                 ('ok', False, provider, 'ls'), ('ok', True, provider, 'ls'),
+                 ('ok', False, provider, 'ls --no-spawn'), ('ok', False, provider, 'ls elsewhere'))
+        for answer, inside, flags, command in cases:
+            with self.subTest(answer=answer, inside=inside, provider=bool(flags), command=command), \
                     tempfile.TemporaryDirectory(dir='/tmp') as directory:
-                path, store = Path(directory)/'daemon.sock', Path(directory)/'state.db'
+                store = Path(directory)/'state.db'
+                # The older daemon's store, which `ls` never creates.
+                store.touch()
+                command, *extra = command.split()
+                # A command on the bots replaces only the daemon on its
+                # store's own socket, which is the one it serves.
+                own = command == 'ls' and extra != ['elsewhere']
+                path = Path(directory)/('state.db.sock' if own else 'daemon.sock')
+                extra = [flag for flag in extra if flag.startswith('--')]
                 daemon = subprocess.Popen(['sleep', '30'])
                 self.addCleanup(self.stop_process, daemon)
                 env = {**clean_env(), **({'AGENT_BOT_ID': '7'} if inside else {})}
+                if command == 'ls':
+                    # A command on the bots takes its provider as a default,
+                    # as the shells of agents do.
+                    env['AGENT_PROVIDER'] = ' '.join(flags[1:])
+                    flags = []
                 asked = []
                 listener = socket.socket(socket.AF_UNIX)
                 listener.bind(str(path))
@@ -1443,11 +1608,12 @@ class CliTests(ModelFixture):
                         pass
                 server = threading.Thread(target=older, daemon=True)
                 server.start()
-                result = subprocess.run([str(self.binary), 'start', '--store', str(store), '--socket', str(path), *flags],
+                result = subprocess.run([str(self.binary), command, '--store', str(store), '--socket', str(path), *flags, *extra],
                                         env=env, capture_output=True, timeout=40)
-                if inside or not flags:
+                if inside or extra or not own and command == 'ls' or not (flags or command == 'ls'):
                     self.assertEqual(result.returncode, 1)
                     self.assertIn(b'daemon_protocol_mismatch', result.stderr)
+                    self.assertIn(b'nothing was sent', result.stderr.lower())
                     self.assertIsNone(daemon.poll())
                     self.assertEqual(asked, [])
                     continue
@@ -1460,7 +1626,11 @@ class CliTests(ModelFixture):
                 else:
                     self.assertEqual([(r['op'], r['grace_ms']) for r in asked], [('shutdown', 120000)])
                 self.assertEqual(daemon.wait(timeout=3), -15)
-                self.assertEqual(json.loads(result.stdout)['protocol'], PROTOCOL)
+                if command == 'ls':
+                    # Its listing came from the new daemon.
+                    self.assertEqual(json.loads(result.stdout), [])
+                else:
+                    self.assertEqual(json.loads(result.stdout)['protocol'], PROTOCOL)
 
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')
@@ -1582,7 +1752,7 @@ class ListingModel(Model):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class ModelListTests(ModelFixture):
-    """~/.agent/models: what clients offer, written once by --discover, never read by the daemon."""
+    """What clients offer: discovery's catalog, rewritten by every start and --discover, under the person's own list; the daemon reads neither."""
     handler = ListingModel
 
     def setUp(self):
@@ -1590,7 +1760,10 @@ class ModelListTests(ModelFixture):
         self.home = self.path / 'home'
         self.home.mkdir()
         self.list = self.home / '.agent' / 'models'
-        self.store = ['--store', str(self.path / 'state.sqlite')]
+        self.catalog = self.home / '.agent' / 'models.discovered'
+        # The daemon of the store beside the list keeps it current.
+        self.state = self.home / '.agent' / 'state.sqlite'
+        self.store = ['--store', str(self.state)]
         self.providers = ['--provider', f'openai=responses,{self.url}',
                           '--provider', 'gone=responses,http://127.0.0.1:1/v1',
                           '--provider', f'huge=responses,{self.url.removesuffix("/v1")}/huge/v1',
@@ -1604,13 +1777,22 @@ class ModelListTests(ModelFixture):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result
 
+    def wait_for_listings(self, count):
+        deadline = time.monotonic() + 20
+        while len(getattr(self.model, 'paths', [])) < count:
+            self.assertLess(time.monotonic(), deadline, getattr(self.model, 'paths', []))
+            time.sleep(0.05)
+
     def test_listings_kept_share_one_budget(self):
         base = self.url.removesuffix('/v1')
         big = [arg for i in (1, 2, 3) for arg in ('--provider', f'big{i}=responses,{base}/big{i}/v1')]
-        self.agent('models', '--discover', *self.store, *big)
+        # The start itself asks each provider once, after it is ready.
+        self.agent('stats', *self.store, *big)
+        self.wait_for_listings(3)
+        time.sleep(0.5)
         self.assertEqual(len(self.model.paths), 3)
         with socket.socket(socket.AF_UNIX) as s:
-            s.connect(str(self.path / 'state.sqlite.sock'))
+            s.connect(str(self.state) + '.sock')
             lines = s.makefile('rw')
             lines.readline()
             lines.write(json.dumps({'id': 1, 'op': 'provider_models'}) + '\n')
@@ -1626,7 +1808,7 @@ class ModelListTests(ModelFixture):
         # The command line's own wins over the file's.
         self.agent('stats', *self.store, *self.providers[:2], '--max-processes', '9')
         with socket.socket(socket.AF_UNIX) as s:
-            s.connect(str(self.path / 'state.sqlite.sock'))
+            s.connect(str(self.state) + '.sock')
             limits = json.loads(s.makefile('r').readline())['limits']
         self.assertEqual((limits['processes'], limits['readers'], limits['load']), (9, 2, 1.5))
         # A mistake in the file is refused by name, before any daemon starts.
@@ -1636,22 +1818,142 @@ class ModelListTests(ModelFixture):
         self.assertEqual(refused.returncode, 1, refused.stderr)
         self.assertIn('daemon.processes', refused.stderr)
 
+    def test_every_start_rewrites_the_catalog_and_never_the_person_s_list(self):
+        providers = ['--provider', f'openai=responses,{self.url}']
+        self.agent('stats', *self.store, *providers)
+        deadline = time.monotonic() + 20
+        while not self.catalog.exists():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        self.assertIn('openai/synthetic-model  # Synthetic, 4096 context\nopenai/other-model\n',
+                      self.catalog.read_text())
+        self.assertFalse(self.list.exists())
+        # The person hides one model, notes another and adds one of their own.
+        mine = 'openai/synthetic-model  # mine\n-openai/other-model\nopenai/by-hand\n'
+        self.list.write_text(mine)
+        self.agent('shutdown', *self.store)
+        self.agent('stats', *self.store, *providers)
+        self.assertEqual(self.agent('models', '--discover', *self.store).stderr.strip().splitlines()[-1],
+                         f'{self.catalog} is up to date')
+        self.assertEqual(self.list.read_text(), mine)
+        self.assertEqual(json.loads(self.agent('models').stdout),
+                         [{'id': 'openai/synthetic-model', 'note': 'mine'}, {'id': 'openai/by-hand'}])
+
+    def test_a_daemon_on_another_store_leaves_the_list_alone(self):
+        other = ['--store', str(self.path / 'side.sqlite')]
+        self.addCleanup(lambda: self.agent('shutdown', *other, check=False))
+        self.agent('stats', *other, '--provider', f'openai=responses,{self.url}')
+        # Nor does one on another store in the home store's own folder.
+        beside = ['--store', str(self.state.with_name('side.sqlite'))]
+        self.addCleanup(lambda: self.agent('shutdown', *beside, check=False))
+        self.agent('stats', *beside, '--provider', f'openai=responses,{self.url}')
+        time.sleep(1)
+        self.assertFalse(self.catalog.exists())
+        self.assertEqual(getattr(self.model, 'listings', 0), 0)
+        # Nor does --discover through one: it refuses and writes nothing.
+        refused = self.agent('models', '--discover', *other, check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('another one', refused.stderr)
+        self.assertFalse(self.catalog.exists())
+
+    def test_an_edit_to_the_config_s_providers_applies_without_a_restart(self):
+        config = self.home / '.agent' / 'config.toml'
+        config.parent.mkdir(exist_ok=True)
+        base = self.url.removesuffix('/v1')
+        config.write_text(f'provider = "openai=responses,{self.url}"\n')
+
+        def stats():
+            # Over the socket: the CLI itself refuses a config that does not parse.
+            with socket.socket(socket.AF_UNIX) as s:
+                s.connect(str(self.state) + '.sock')
+                lines = s.makefile('rw')
+                lines.readline()
+                lines.write(json.dumps({'id': 1, 'op': 'stats'}) + '\n')
+                lines.flush()
+                return next(m for m in map(json.loads, lines) if m.get('id') == 1)['result']
+
+        self.agent('stats', *self.store)
+
+        def settled(check):
+            deadline = time.monotonic() + 20
+            while True:
+                current = stats()
+                if check(current):
+                    return current
+                self.assertLess(time.monotonic(), deadline, current.get('provider_reload'))
+                time.sleep(0.05)
+
+        before = stats()
+        self.assertEqual(sorted(before['providers']), ['openai'])
+        self.assertIsNone(before['provider_reload'])
+        # A bot runs on openai.
+        self.agent('run', *self.store, '--model', 'openai/synthetic-model', '--new', '--bot', 'Bob', 'hello')
+
+        # Adding a provider binds it for the next turns; openai is kept as it was.
+        config.write_text(f'provider = "openai=responses,{self.url} second=responses,{self.url}"\n')
+        after = settled(lambda s: 'second' in s['providers'])
+        self.assertEqual(after['provider_reload']['status'], 'applied')
+        self.assertEqual(after['provider_reload']['added'], ['second'])
+        self.assertEqual(after['provider_reload']['changed'], [])
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect(str(self.state) + '.sock')
+            ready = json.loads(s.makefile('r').readline())
+        self.assertEqual(sorted(ready['providers']), ['openai', 'second'], 'a new session is told the new set')
+        self.agent('run', *self.store, '--model', 'second/synthetic-model', '--new', '--bot', 'Ann', 'hello')
+
+        # Removing the provider Bob runs on is refused, naming him; the set stays.
+        config.write_text(f'provider = "second=responses,{self.url}"\n')
+        refused = settled(lambda s: (s['provider_reload'] or {}).get('status') == 'refused')
+        self.assertEqual(refused['provider_reload']['error'], 'provider_in_use')
+        self.assertIn('Bob', refused['provider_reload']['detail'])
+        self.assertNotIn('Ann', refused['provider_reload']['detail'])
+        self.assertEqual(sorted(refused['providers']), ['openai', 'second'])
+
+        # A file that does not parse is refused too, and nothing changes.
+        config.write_text('provider = \n')
+        broken = settled(lambda s: s['provider_reload']['error'] != 'provider_in_use')
+        self.assertEqual(broken['provider_reload']['status'], 'refused')
+        self.assertEqual(sorted(broken['providers']), ['openai', 'second'])
+
+        # Binding Bob's provider to another API family is refused like a removal.
+        config.write_text(f'provider = "openai=anthropic,{base} second=responses,{self.url}"\n')
+        retyped = settled(lambda s: s['provider_reload']['error'] == 'provider_in_use')
+        self.assertIn('Bob', retyped['provider_reload']['detail'])
+        self.assertEqual(retyped['provider_reload']['facts']['providers'], ['openai'])
+
+        # A changed spec binds that provider again; the turn after uses it.
+        config.write_text(f'provider = "openai=responses,{self.url} second=responses,{base}/elsewhere/v1"\n')
+        changed = settled(lambda s: s['provider_reload']['status'] == 'applied')
+        self.assertEqual(changed['provider_reload']['changed'], ['second'])
+        self.assertEqual(changed['provider_reload']['added'], [])
+
+    def test_providers_given_on_the_command_line_are_not_reloaded(self):
+        config = self.home / '.agent' / 'config.toml'
+        config.parent.mkdir(exist_ok=True)
+        config.write_text(f'provider = "openai=responses,{self.url}"\n')
+        self.agent('stats', *self.store, '--provider', f'given=responses,{self.url}')
+        config.write_text(f'provider = "other=responses,{self.url}"\n')
+        time.sleep(1)
+        current = json.loads(self.agent('stats', *self.store).stdout)
+        self.assertEqual(sorted(current['providers']), ['given'])
+        self.assertIsNone(current['provider_reload'])
+
     def test_discover_writes_nothing_when_no_provider_lists(self):
         refused = self.agent('models', '--discover', *self.store,
                              '--provider', 'gone=responses,http://127.0.0.1:1/v1', check=False)
         self.assertEqual(refused.returncode, 1)
         self.assertIn('models_none_listed', refused.stderr)
         self.assertIn('gone: provider_', refused.stderr)
-        self.assertFalse(self.list.exists(), 'a list of refusals is not installed')
+        self.assertFalse(self.catalog.exists(), 'a catalog of refusals is not installed')
 
     def test_a_fresh_install_names_the_missing_provider_and_stats_starts_its_daemon(self):
         refused = self.agent('stats', *self.store, check=False)
         self.assertEqual(refused.returncode, 2)
         self.assertEqual(json.loads(refused.stderr)['error'], 'provider_required')
-        self.assertFalse((self.path / 'state.sqlite').exists())
+        self.assertFalse(self.state.exists())
         stats = json.loads(self.agent('stats', *self.store, '--provider', f'openai=responses,{self.url}').stdout)
         self.assertEqual(stats['active_turns'], 0)
-        self.assertTrue((self.path / 'state.sqlite').exists())
+        self.assertTrue(self.state.exists())
         # A command on a bot still never makes a store of its own.
         other = ['--store', str(self.path / 'other.sqlite')]
         missing = self.agent('inspect', *other, '--bot', 'Bob', check=False)
@@ -1663,15 +1965,17 @@ class ModelListTests(ModelFixture):
                              '--provider', f'custom=responses,{url}', check=False)
         self.assertEqual(refused.returncode, 1)
         self.assertIn('models_none_listed', refused.stderr)
-        self.assertFalse(self.list.exists())
+        self.assertFalse(self.catalog.exists())
 
     def test_discover_writes_a_first_list_that_clients_and_bots_read(self):
-        self.assertEqual(json.loads(self.agent('models').stdout), [])
+        bare = self.agent('models')
+        self.assertEqual(json.loads(bare.stdout), [])
+        self.assertIn('agent models --discover', bare.stderr)
         self.assertIn('agent models --discover', self.agent('models', '--pretty').stderr)
-        self.assertFalse((self.path / 'state.sqlite').exists(), 'reading the list starts no daemon')
+        self.assertFalse(self.state.exists(), 'reading the list starts no daemon')
 
         self.agent('models', '--discover', *self.store, *self.providers)
-        text = self.list.read_text()
+        text = self.catalog.read_text()
         self.assertIn('openai/synthetic-model  # Synthetic, 4096 context\nopenai/other-model\n', text)
         self.assertRegex(text, r'# gone: provider_\w+')
         # A listing too large for the reply is refused by name; the rest still arrive.
@@ -1681,14 +1985,15 @@ class ModelListTests(ModelFixture):
         self.assertEqual(listed, [{'id': 'openai/synthetic-model', 'note': 'Synthetic, 4096 context'},
                                   {'id': 'openai/other-model'}, {'id': 'paged/first-model'},
                                   {'id': 'paged/second-model'}])
-        # It is the user's file from here on: discovery never replaces it.
-        again = self.agent('models', '--discover', *self.store, check=False)
-        self.assertEqual(again.returncode, 1)
-        self.assertIn('models_file_exists', again.stderr)
+        # Asked again, nothing changed: the file stays as it is.
+        again = self.agent('models', '--discover', *self.store)
+        self.assertIn(f'{self.catalog} is up to date', again.stderr)
+        self.assertIn('gone: provider_', again.stderr)
+        self.assertEqual(self.catalog.read_text(), text)
 
         # The daemon asked each provider once and keeps the answers, the refused one too.
         with socket.socket(socket.AF_UNIX) as s:
-            s.connect(str(self.path / 'state.sqlite.sock'))
+            s.connect(str(self.state) + '.sock')
             lines = s.makefile('rw')
             lines.readline()
             lines.write(json.dumps({'id': 1, 'op': 'provider_models'}) + '\n')

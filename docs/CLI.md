@@ -33,6 +33,18 @@ terminal it was started in (`TMUX`, `TMUX_PANE`, Rex's, Herdr's and cmux's
 places, `agent_client::TERMINAL_PLACES`), so a bot's command never lands in
 that terminal. A running daemon keeps the excludes it started with, and
 a variable a bot or caller sets with `--env` is still set.
+
+A model's context window, which sets where its bots compact unless they set
+`--compact-tokens`, is what its provider lists, else the window Anthropic
+publishes for a Claude model, else 200K. `serve --context-window
+PROVIDER/MODEL=TOKENS`, repeatable, sets it instead for every model whose path
+matches, with `*` and `?` wildcards: `bedrock/*` for every Bedrock model,
+`bedrock/*openai.*` for OpenAI's there, or one exact model. The most specific
+pattern wins (an exact path over any wildcard, then the most characters that
+are not wildcards, then the first by name), and it wins over the provider's listing, so a window can be set lower
+on purpose. A client that starts a daemon passes `[context_windows]` from
+`~/.agent/config.toml`; the daemon announces them in `ready` as
+`context_windows`, and a running daemon keeps the ones it started with.
 `serve --redact-field NAME` has the value printed after a field named like
 NAME (its end, any case, `_` and `-` ignored) redacted from tool output, and
 `serve --redact-block LABEL` the body of each PEM block whose header names
@@ -57,6 +69,11 @@ a formula of the machine, as `processes = "cpus * 64"` or
 daemon's to end, as `make -l` does, a turn held long parking until then.
 `stall_timeout = "15m"` sets how long a provider stream may send no
 content before it is retried (`--stall-timeout`, 10 minutes by default).
+`depth = 2`, the default for `--max-depth`, is how many generations below
+the bot that starts its line a new bot may be, as Codex's
+`agents.max_depth`: a bot run with no `AGENT_BOT` starts one, its children
+are at 1 and theirs at 2, and a `run --new` or `fork` deeper is refused as
+`depth_limit`; 0 is no end.
 A key it does not know, or a formula it cannot work out for this machine
 (one below 0 here included), is `config_invalid` when the file is read.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
@@ -106,9 +123,12 @@ tries its held turns at once.
   `--bot NAME`; a fork uses `--source NAME` and `--bot DESTINATION`.
 - `--all` selects all bots for `follow`; `--any` selects first-completion
   behavior for `wait`. `follow --all --bot NAME` is an error.
-- `run --delivery MODE` is `reject`, `queue`, `steer`, or `attach`: what the
+- `run --delivery MODE` is `steer`, `queue`, `attach`, or `reject`: what the
   submission does when the bot is busy. Without the flag, `AGENT_DELIVERY`
-  applies, then `reject`. `--turn N` with `steer` makes it strict: for that
+  applies, then `steer`, as a person's message to a busy bot does; with
+  `--workspace` or `--turn-budget-tokens`, which only a turn of its own
+  takes, `queue`. `reject` refuses a busy bot with `bot_busy`, for a
+  program that must start now or hear why. `--turn N` with `steer` makes it strict: for that
   running turn or `stale_turn`. The daemon has no default of its own: the client
   always sends the mode it resolved, so one person's preference never
   changes what a program's submission means. A blocking `run` with `queue`
@@ -132,10 +152,16 @@ tries its held turns at once.
   `~/.agent/config.toml` applies, then `1d`. Like the mode, the CLI always
   sends the wait it resolved; the daemon keeps no default.
 - `run --turn-budget-tokens N` caps this turn's input plus output tokens,
-  beside the bot's lifetime `--budget-tokens`. The turn fails with
-  `turn_budget_exhausted` before a call once it has spent N; the cap is
-  the turn's own, so the next turn starts from zero. A steer joins a turn
-  that already has its cap, so `steer` with the flag is `invalid_delivery`.
+  beside the bot's lifetime `--budget-tokens`. Once a call reaches N the
+  turn's next call goes without tool calls, and the turn completes on its
+  reply with `limit: "turn_budget"`; the cap is the turn's own, so the next
+  turn starts from zero. A steer joins a turn that already has its cap, so
+  `steer` with the flag is `invalid_delivery`.
+- `--budget-counts work` makes the budgets given with it (`--budget-tokens`,
+  `--turn-budget-tokens`) count work instead: each call's output and the
+  input it adds, not the history it sends again, so a bot with a long
+  history can take a small allowance. `tokens`, the default, counts every
+  call's whole input.
 - `run --image PATH` sends a PNG, JPEG, GIF or WebP with the prompt, after
   its words; repeat it for more (up to 20, 5 MiB together). It goes with a
   steer or a turn of its own alike.
@@ -194,9 +220,8 @@ tries its held turns at once.
 - Every time flag takes a duration with its unit: `500ms`, `30s`, `5m`,
   `1h`, or a bare `0`. A bare number is refused, so no flag guesses a unit:
   `--timeout`, `--approval-hold`, `--grace`, `--stall-timeout`,
-  `--idle-exit` and `--keep-warm`. The last three count whole seconds. The
-  protocol keeps its own units (`timeout_ms`, `grace_ms`, `approval_hold_ms`,
-  `keep_warm` seconds). `--approval-hold` is how long a new bot's gated calls
+  `--idle-exit`. The last two count whole seconds. The
+  protocol keeps its own units (`timeout_ms`, `grace_ms`, `approval_hold_ms`). `--approval-hold` is how long a new bot's gated calls
   wait live for a verdict, and its terminal reads for output, before the turn
   parks (default `2s`; `0` parks at once). `--after` is an exclusive event cursor for `follow` and an exclusive
   turn ID for `turns`. `--checkpoint` is a history node ID.
@@ -213,7 +238,8 @@ tries its held turns at once.
   end, so `turns --bot NAME --newest --limit 3` is a bot's last three turns.
 - `usage` prints what the bots' turns spent as one JSON object: tokens in
   all, by bot (the `--limit` that spent most, 64 by default, the rest summed),
-  and by model. `--name GLOB` keeps the bots `ls --name` would, `--since 7d`
+  and by the model that spent them, with each model's cache writes, so a
+  summary or fallback on another model counts under that model. `--name GLOB` keeps the bots `ls --name` would, `--since 7d`
   counts only turns started that long ago or since, and `--bucket 6h` adds a
   `series` of what was spent every six hours from then. Durations take `ms`,
   `s`, `m`, `h` or `d`.
@@ -222,7 +248,7 @@ tries its held turns at once.
   setting, applied after each of its turns.
 - `run` sets a new bot's own settings with `--context-bytes`, `--context-items`,
   `--note-turns`, `--compact-at`, `--compact-keep`, `--compact-tokens`, `--keep-turns`,
-  `--approval-hold`, `--max-output-tokens`, `--keep-warm`, `--cache-ttl`,
+  `--approval-hold`, `--max-output-tokens`, `--cache-ttl`,
   `--sandbox`, `--writable` (repeatable, made absolute from the current
   folder), `--network`, `--hide-senders`, `--quiet-background`, `--hold`, `--unix-socket` (repeatable: an
   absolute socket, or folder of them, its commands reach) and `--outputs` (made absolute; a new
@@ -375,8 +401,16 @@ turn, where `AGENT_BOT_ID` is set, since that turn is one it would wait on):
 it is asked to shut down with a 2-minute grace, so running turns park at their
 next boundary while none starts, or sent SIGTERM when it refuses that request, as daemons
 before 0.6.0 do; once it exits, this `agent`'s daemon starts on the same
-socket and upgrades the store. Sonny starts the daemon this way, so opening it
-after an upgrade replaces the old daemon, and it says so first. `stats` starts it as `start` does, so it answers on a fresh install;
+socket and upgrades the store, and the command goes to it. The commands on
+running bots that never start a daemon where none runs (`ls`, `wait`,
+`follow`, `fork`, `interrupt`) replace an older one the same way, with the
+provider their environment names, when it listens on their store's own socket
+(a socket named apart from its store may serve another store). One that keeps
+the older daemon says why in its `daemon_protocol_mismatch` detail, and that
+nothing was sent: from inside a bot's turn, with `--no-spawn`, with no provider
+to start a new one, or on a socket that is not the store's own. Sonny
+starts the daemon this way, so opening it after an upgrade replaces the old
+daemon, and it says so first. `stats` starts it as `start` does, so it answers on a fresh install;
 `turns`, `rm`, `prune`, `approvals`, and `answer` may restart it only for an
 existing store (`store_not_found` otherwise). These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an
@@ -390,6 +424,26 @@ separated by whitespace), else `provider` in `~/.agent/config.toml` (the
 same), else the providers whose key variable is set; a
 running daemon is not checked against either. With none of them, starting
 fails with `provider_required`.
+Providers taken from the config file (no `--provider`, no `AGENT_PROVIDER`)
+follow it while the daemon runs (`serve --provider-config`): the kernel
+tells the daemon when the file changes (inotify, kqueue; nothing runs in
+between), including the file a linked `config.toml` names, and the new set is built and checked beside the old, then swapped
+in whole. Turns that start after the swap use it; running turns finish on
+the providers they started with, and a turn parked meanwhile (on a tool
+wait or an approval) resumes on the set in use when it resumes, as it would
+after a restart, so a rotated key or a moved endpoint reaches it. A provider whose spec is unchanged is kept
+as it was, with its pacing, connections and keys. A file that does not
+parse, a spec that does not bind (a key variable the daemon was not started
+with, say), and the removal of a provider an agent's model, fallback or
+compaction model, or an unfinished turn's own model, still names, or that
+binds such a provider to another API family (`provider_in_use`, naming
+them), are refused
+whole, and the old set stays. `stats.provider_reload` says what the last
+change came to (`applied` with `added`, `removed` and `changed`, or
+`refused` with its error); new sessions' `ready.providers` show the set in
+use, `provider_models` names each provider's family and efforts for sessions that
+connected before (a provider's speeds still come with `ready`, so `/fast`
+offers a newly added provider's faster tiers after Sonny reconnects), and held turns are tried again after a change is applied.
 `run --model` names a new bot's model or an existing bot's turn model; the
 daemon has no model of its own, so a new bot needs `--model`, `AGENT_MODEL`,
 or `model` in `~/.agent/config.toml`, in that order. Both are only creation
@@ -419,7 +473,9 @@ with the CLI's built-in text as the default; the daemon has none. `run
 default `shell,write_stdin,read,write,wait,history` with the file editor its model
 family is trained on: `apply_patch` for a Responses model, else `edit`, and
 `web_search` where the provider offers it and `web_fetch` for any, unless
-`~/.agent/config.toml` sets `web_search = "disabled"`. An
+`~/.agent/config.toml` sets `web_search = "disabled"` (or names the model in
+`web_search_off`, `PROVIDER/MODEL` patterns with `*` and `?`, which leaves
+search out and keeps `web_fetch`). An
 existing bot keeps its own,
 so `--tools` while continuing one is a usage error.
 `run --fallback PROVIDER/MODEL` gives a new bot a model, in its family, that
@@ -435,19 +491,32 @@ that entry as it changes; a bot the CLI made keeps the one it took, and
 ```
 Other client commands require an already running daemon.
 
-`models` prints `~/.agent/models`, the models clients offer, as JSON
-`[{id, note?}]` (`--pretty`: one line each). The file holds one
-`PROVIDER/MODEL` per line, with anything after `#` a note; no file is an
-empty list, and a malformed line fails with `models_invalid` naming it.
-Reading it needs no daemon, and the daemon never reads it: any model runs.
-`models --discover` writes a first file from the listings of the providers
-the daemon runs (starting one like `run`), with each model's name and
-context size as its note and a comment for a provider that listed nothing.
-When no usable model survives rendering within the file limit, it writes
-nothing and fails with
-`models_none_listed`, naming each refusal, so it can run again after a
-login. It refuses with `models_file_exists` once the file exists: after
-that it is the user's to edit. Bots see the same list by running `models`.
+`models` prints the models clients offer as JSON `[{id, note?}]`
+(`--pretty`: one line each), from two files with one owner each.
+`~/.agent/models.discovered` is discovery's catalog: what the providers list,
+rewritten whole, so an edit there is replaced. `~/.agent/models` is the
+person's, and nothing writes it: a `PROVIDER/MODEL` line adds a model, or puts
+a listed one first with its note, and a `-PROVIDER/MODEL` line hides one. In
+both, anything after `#` is a note. The person's models come first in their
+order, then the catalog's they did not name, less what they hide; no files is
+an empty list, and a malformed line fails with `models_invalid` naming it.
+Reading needs no daemon, and the daemon never reads either file: any model
+runs. Model ids are compared as strings, never read for versions or families.
+The daemon a client starts on the store beside them (`~/.agent/state.sqlite`)
+rewrites the catalog (`serve --models`): each time it starts, once it is
+ready, it asks every provider for its listing, so a start never waits on a
+provider. A daemon on another store, such as a test's or a side daemon's,
+leaves it alone. `models --discover` does the same on demand through the
+daemon (starting one like `run`) and says on stderr what changed (`+ id`,
+`- id`) and which providers did not answer. Each model's name and context
+size are its note, with a comment for a provider that listed nothing; a
+provider that does not answer keeps its lines from the catalog there, and one
+the daemon no longer runs loses them. When no usable model survives rendering
+within the file limit, nothing is written and it fails with
+`models_none_listed`, naming each refusal, so it can run again after a login.
+The catalog is written beside itself and renamed into place, so a reader sees
+the old one or the new one, and a link put there is replaced, never written or
+read through. Bots see the same list by running `models`.
 
 `serve` requires explicit `--store` and `--provider` options. It runs the daemon
 directly, with Unix-socket service when `--socket` is

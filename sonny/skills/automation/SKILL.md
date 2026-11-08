@@ -13,7 +13,9 @@ the job keeps its state in files in its folder and reads them each run.
 ## Setting one up
 
 Give the job its own agent and folder, created with `--agents` so it reads
-the folder's rules and skills, then add an automation for it with the
+the folder's rules and skills. Make the folder in your state folder,
+`"$SONNY_STATE"/jobs/NAME`: you, your tasks and the agents you make write
+it in every permissions row, and it outlives them. Then add an automation for it with the
 automations tool: `add` with `bot` NAME, `cron` 'MIN HOUR DAY MONTH WEEKDAY'
 and `message` MESSAGE. Automations need the system's scheduler to keep the time:
 launchd on macOS, systemd's user manager on Linux. Without one `add` is
@@ -97,10 +99,11 @@ and a new `add` would lose it. `run` NAME runs it now, waits for the run,
 and returns its `outcome` and the `handle` of the turn it sent, to pass to
 `wait`; it says `pending` when the run has not said within 90 seconds.
 
-An automation's `turn_budget_tokens` caps each run on its own, and a run past
-it fails with `turn_budget_exhausted`. It counts every request's input, the
-agent's history included, so a cap below that history fails every run
-before it starts: set one only when the person asks for a spending limit.
+An automation's `turn_budget_tokens` caps each run on its own: once a call
+reaches it, the run's next call goes without tool calls, and the run ends on
+its reply. It counts every request's input, the agent's history included, so
+a cap below that history ends every run on its first reply: set one only when
+the person asks for a spending limit.
 
 ## Monitors
 
@@ -112,8 +115,9 @@ the lead as the destination and, when the person wants one, a destination
 for urgent items, such as a direct message to the person.
 
 Run it often and gate each run: `add` with `bot` NAME, `every` `10m`,
-`if` `cd FOLDER && ! ./quiet` and `message` MESSAGE. The `if` command runs
-in your own folder, hence the `cd`.
+`if` `cd "$SONNY_STATE"/jobs/NAME && ! ./quiet` and `message` MESSAGE. The
+`if` command runs in your own folder, hence the `cd`, and as your own
+commands do: in your sandbox, with your variables.
 
 `every` runs at all hours. To check only in working hours, use `cron`
 instead, for example `*/10 8-18 * * 1-5` for every 10 minutes from 8:00 to

@@ -824,24 +824,12 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     for it. Detached shell commands are bounded, with terminals, by `--max-lasting` (4 per logical CPU)
     and reaped as they exit, so they neither pile up nor linger as zombies.
 
-42. Anthropic prompt-cache refreshes during long tool calls, measured before
-    kept. [Built](RUST_PROTOTYPE.md#keeping-the-anthropic-cache-warm):
-    `--keep-warm` (240 seconds by default) resends the last call with
-    `max_tokens: 0` while a tool runs. Anthropic recommends this over the
-    one-hour cache only on Fable 5.1 and Mythos 5.1. `--cache-ttl 1h` is
-    built, with one-hour writes priced at their own rate. A live check on
-    2026-09-25 (Sonnet 5 with adaptive thinking and effort) found both
-    accepted: each refresh read the whole prefix, with a signed thinking
-    block in history too, and carried the cache over a 330-second tool that
-    missed it completely with `--keep-warm 0`. The 2026-09-25 Sonnet 5 rerun
-    found six replies that streamed past five minutes on their own, so a
-    refresh now also runs while a reply streams. Next, a matched long-tool task
-    with three arms: the five-minute cache alone (`--keep-warm 0`),
-    `--cache-ttl 1h`, and refreshes. Anthropic shares a cache across an
-    organization, so each arm needs bytes of its own, such as a nonce in its
-    instructions, or one arm's refreshes keep another's cache warm. Open: parked
-    `wait` turns, whose helpers can run past five minutes with no live task
-    to refresh them, and Bedrock.
+42. Anthropic prompt-cache refreshes during long tool calls: built, then
+    removed on 2026-11-07. Claude bots take the one-hour cache
+    ([cache lifetime](RUST_PROTOTYPE.md#the-anthropic-cache-lifetime)), so
+    the refreshes kept warm a cache few bots used, at the cost of a second
+    request path in every turn. `--cache-ttl 1h` is built, with one-hour
+    writes priced at their own rate.
 
 43. Forking a running bot. `fork` without a checkpoint refuses a bot whose
     turn is running, and a model has no way to find a closed node to fork
@@ -970,7 +958,10 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     config file clients read (the app, and `agent models`, which the preamble
     names so a bot starting a peer sees the same choices); `agent models
     --discover` writes a first one from the providers' own listings through
-    the daemon's `provider_models`. Source read 2026-09-27: Codex (9db8162)
+    the daemon's `provider_models`. Since 2026-11-07 every daemon start
+    rewrites discovery's catalog, `~/.agent/models.discovered`, whole, and
+    `~/.agent/models` is the person's own additions and `-` hides over it
+    (George: discover on every start, never on a timer; one owner per file). Source read 2026-09-27: Codex (9db8162)
     refreshes its bundled catalog from the Codex backend's `/models`,
     OpenCode (b471c2b) and Pi (badlogic/pi-mono 2b0a123) from models.dev
     catalogs. The daemon never reads the list. Done
@@ -1095,10 +1086,9 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     restarts it, and so does a second window on another store after the first
     changes settings. Asking the attached daemon instead means a
     `provider_models` call, which asks every provider, on each open; that
-    waits for a cheap way to ask a daemon what it runs. Follow-up: connecting
-    a provider refreshes the whole list, so a model added to `~/.agent/models`
-    by hand under a provider that answers is dropped; asking only the new
-    provider needs `provider_models` and the list's writer to take a subset.
+    waits for a cheap way to ask a daemon what it runs. Connecting a provider
+    rewrites only discovery's catalog, so a model added to `~/.agent/models`
+    by hand stays (done 2026-11-07).
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

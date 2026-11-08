@@ -1,12 +1,11 @@
 //! `sonny tool-host`: the daemon's companion that answers the tools Sonny
-//! gives its agents (`served`): starting tasks, memory, goals, the commons,
+//! gives its agents (`served`): starting tasks, memory, the commons,
 //! and `exec`, whose MCP servers it keeps up between calls. One a store,
 //! apart from the lookout, which only watches and tells: a tool that runs
 //! long, crashes or grows does so here, never in the news a lead hears.
 
 use agent_client::Client;
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,6 +25,12 @@ const GONE_AFTER: Duration = Duration::from_secs(30);
 /// The events that tell the host a call waits, or that a turn whose calls
 /// it runs ended. The calls themselves it reads from the daemon.
 const KINDS: [&str; 2] = ["tool_started", "turn_finished"];
+
+/// How often the host's place in the stream is saved, when it moved: every
+/// tool call of every agent moves it, so saving each would write a file a
+/// call. The calls waiting are read from the daemon whenever the host
+/// starts, so starting again a moment back only reads a few events twice.
+const SAVE_EVERY: Duration = Duration::from_secs(1);
 
 /// `sonny tool-host`: one tool host for the store's daemon.
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -62,7 +67,7 @@ pub fn running(store: &Path) -> bool {
     crate::lookout::held(&beside(store, &format!(".{NAME}.lock")))
 }
 
-/// The lookout's line on `/status`, told too when no tool host answers
+/// The lookout's line on `/background`, told too when no tool host answers
 /// the tools Sonny gives its agents, which then wait.
 pub fn with_status(lookout: String, store: &Path) -> String {
     match (running(store), lookout.is_empty()) {
@@ -75,7 +80,8 @@ pub fn with_status(lookout: String, store: &Path) -> String {
 async fn serve(store: PathBuf, socket: PathBuf) -> Result<(), String> {
     println!("{}", json!({"event": "serving", "pid": std::process::id()}));
     // Asked to give way, as by another build's host: the calls it still
-    // answers stop first, since that one answers them again.
+    // answers stop first. They were taken, so that one answers that their
+    // outcome is unknown and never runs them again.
     if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
     {
         tokio::spawn(async move {
@@ -86,6 +92,7 @@ async fn serve(store: PathBuf, socket: PathBuf) -> Result<(), String> {
     }
     let server = Server::start(store.clone(), socket.clone());
     let mut cursor = saved(&store);
+    let mut kept = cursor;
     let mut started = true;
     let mut gone: Option<Instant> = None;
     loop {
@@ -104,15 +111,23 @@ async fn serve(store: PathBuf, socket: PathBuf) -> Result<(), String> {
             let follow = json!({"bot": "*", "after": cursor, "kinds": KINDS});
             match client.request("follow", follow).await {
                 Ok(_) => {
-                    while let Some(event) = events.recv().await {
-                        server.event(&event);
-                        if let Some(at) = event["cursor"].as_i64()
-                            && at > cursor
-                        {
-                            cursor = at;
-                            save(&store, cursor);
+                    let mut tick = tokio::time::interval(SAVE_EVERY);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tokio::select! {
+                            event = events.recv() => {
+                                let Some(event) = event else { break };
+                                server.event(&event);
+                                if let Some(at) = event["cursor"].as_i64()
+                                    && at > cursor
+                                {
+                                    cursor = at;
+                                }
+                            }
+                            _ = tick.tick() => keep(&store, cursor, &mut kept),
                         }
                     }
+                    keep(&store, cursor, &mut kept);
                     println!("{}", json!({"event": "disconnected", "cursor": cursor}));
                 }
                 Err(error) => println!(
@@ -147,6 +162,14 @@ fn saved(store: &Path) -> i64 {
         .unwrap_or(0)
 }
 
+/// Save `cursor` unless it is what was `kept` last.
+fn keep(store: &Path, cursor: i64, kept: &mut i64) {
+    if cursor != *kept {
+        save(store, cursor);
+        *kept = cursor;
+    }
+}
+
 fn save(store: &Path, cursor: i64) {
     let path = beside(store, &format!(".{NAME}.cursor"));
     let partial = path.with_extension(format!("cursor.{}.partial", std::process::id()));
@@ -160,21 +183,6 @@ fn save(store: &Path, cursor: i64) {
 /// as a task out of sight, gets a tool added since. A busy one is tried
 /// again each minute, for an hour.
 async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
-    // Where each stands in its lead's line, from the listing.
-    let limit = crate::served::depth_limit();
-    let by_id: HashMap<i64, &Value> = (bots.iter())
-        .filter_map(|bot| Some((bot["bot_id"].as_i64()?, bot)))
-        .collect();
-    let depths: HashMap<i64, u64> = (bots.iter())
-        .filter_map(|bot| {
-            let (depth, _) = crate::declared::line_by(bot, limit, |at| {
-                by_id
-                    .get(&at["created_by_id"].as_i64()?)
-                    .map(|&by| by.clone())
-            });
-            Some((bot["bot_id"].as_i64()?, depth))
-        })
-        .collect();
     let mut left = bots;
     for _ in 0..60 {
         let mut busy = Vec::new();
@@ -190,10 +198,7 @@ async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
             };
             record["name"] = bot["name"].clone();
             record["bot_id"] = bot["bot_id"].clone();
-            let depth = (bot["bot_id"].as_i64())
-                .and_then(|id| depths.get(&id).copied())
-                .unwrap_or(1);
-            let Some(fields) = crate::declared::refresh(&record, depth) else {
+            let Some(fields) = crate::declared::refresh(&record) else {
                 continue;
             };
             match client.request("configure", Value::Object(fields)).await {
@@ -217,14 +222,16 @@ async fn refresh_tools(client: Arc<Client>, bots: Vec<Value>) {
 }
 
 /// How often the host looks at `config.toml`, and asks a busy agent
-/// again: an agent takes a change at the first idle point after.
+/// again: an agent takes a change at the first idle point after, and the
+/// command rules at its next round.
 const CONFIG_EVERY: Duration = Duration::from_secs(5);
 
 /// Keep Sonny's agents on what `config.toml` gives an agent when it is
 /// made: each model's fallback and whether senders are named, and on the
 /// command rules in `~/.agent/rules`. Read at first and whenever either
-/// changes; an agent at work is asked again until it is idle, since
-/// `configure` waits for the turn to end.
+/// changes. The daemon takes the rules alone from an agent at work, for
+/// its next round; the rest it is asked again until it is idle, since
+/// `configure` otherwise waits for the turn to end.
 async fn follow_config(client: Arc<Client>) {
     let stamp = || {
         let found = agent_client::config::path().and_then(|path| std::fs::metadata(path).ok());
@@ -301,12 +308,30 @@ async fn apply_config(client: &Client, given: &Given<'_>, bots: Vec<Value>) -> V
         };
         fields.insert("bot".into(), bot["name"].clone());
         fields.insert("bot_id".into(), bot["bot_id"].clone());
+        let rules = (fields.get("settings"))
+            .and_then(|settings| settings.get("rules"))
+            .cloned();
         match client.request("configure", Value::Object(fields)).await {
             Ok(answer) => println!(
                 "{}",
                 json!({"event": "config_applied", "bot": bot["name"], "changed": answer["changed"]})
             ),
-            Err(error) if error.code == "bot_busy" => busy.push(bot),
+            Err(error) if error.code == "bot_busy" => {
+                // The rules alone reach an agent at work, at its next
+                // round; the rest waits for it to be idle.
+                if let Some(rules) = rules {
+                    let alone = json!({"bot": bot["name"], "bot_id": bot["bot_id"],
+                        "settings": {"rules": rules}});
+                    if let Ok(answer) = client.request("configure", alone).await {
+                        println!(
+                            "{}",
+                            json!({"event": "config_applied", "bot": bot["name"],
+                                "changed": answer["changed"]})
+                        );
+                    }
+                }
+                busy.push(bot)
+            }
             Err(error) => println!(
                 "{}",
                 json!({"event": "config_failed", "bot": bot["name"], "error": error.code})
@@ -477,6 +502,13 @@ mod tests {
         assert_eq!(saved(&store), 40);
         save(&store, 90);
         assert_eq!(saved(&store), 90);
+        // Saved only when it moved.
+        let mut kept = 90;
+        std::fs::remove_file(beside(&store, &format!(".{NAME}.cursor"))).unwrap();
+        keep(&store, 90, &mut kept);
+        assert_eq!(saved(&store), 40);
+        keep(&store, 95, &mut kept);
+        assert_eq!((saved(&store), kept), (95, 95));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -176,17 +176,20 @@ const FAILED: Color = Color::Red;
 const AGENTS: Color = Color::Blue;
 const YOU: Color = Color::Magenta;
 /// The models' colours on `m`, an exception to one meaning per hue as the
-/// usage chart's are: telling models apart needs a fill each. Hues the
-/// sky's messages and tools don't take first, then the bright twins.
+/// usage chart's are: telling models apart needs a fill each. The six
+/// hues first, those the sky's messages and tools don't take leading, and
+/// only then the bright twins, which many themes draw as a duller shade of
+/// the same hue (Flexoki's bright green is an olive beside its green) or
+/// as grays (Solarized), so two models in neighbouring hues stay apart.
 const MODEL_HUES: [Color; 8] = [
     Color::Green,
     Color::Yellow,
-    Color::LightGreen,
-    Color::LightYellow,
+    Color::Blue,
+    Color::Magenta,
+    Color::Cyan,
+    Color::Red,
     Color::LightBlue,
     Color::LightMagenta,
-    Color::LightCyan,
-    Color::LightRed,
 ];
 
 /// What the follow brings the view.
@@ -201,7 +204,7 @@ enum Feed {
     /// that ended unsure of them.
     Scans(mpsc::UnboundedSender<(String, Option<i64>)>),
     /// An agent's history read for its questions: none when it could not be.
-    Asked(String, Option<crate::needs::Seen>),
+    Asked(String, Option<Box<crate::needs::Seen>>),
     Live(Value),
     /// An agent's model, read again after it was configured.
     Model(String, String),
@@ -308,6 +311,9 @@ struct Agent {
     /// When it was last lit.
     lit: Option<Instant>,
     twinkle: Option<(Instant, Color, Work)>,
+    /// When it last came to need the person, live: its name's `?` beats
+    /// a few times from then, as the footer's count does.
+    asked: Option<Instant>,
     /// A commons post's ripple: when, and how far it spreads.
     ripple: Option<(Instant, f32)>,
     /// When one of its schedules last woke it: its tick flashes.
@@ -345,6 +351,13 @@ struct Agent {
 }
 
 impl Agent {
+    /// Whether its `?` is on a beat `now`: it needs the person and came
+    /// to a moment ago, so the mark beats a few times and then holds.
+    fn beats(&self, now: Instant) -> bool {
+        self.state() == Some(State::NeedsYou)
+            && (self.asked).is_some_and(|at| crate::look::beat(now.saturating_duration_since(at)))
+    }
+
     /// Its model, as `m` colours it: by name and provider, so one
     /// model's ids from one provider, as two Bedrock regions', share a
     /// colour.
@@ -441,9 +454,18 @@ pub struct View {
     /// The agents in the tree's order, each with its depth, for the list.
     order: Vec<(usize, usize)>,
     live: bool,
+    /// The follow said it is ready: who is here, what they did and what
+    /// they hold are read.
+    ready: bool,
+    /// Whose questions the opening asked for and has not heard back: the
+    /// sky draws once none is left, so nothing pops in after.
+    unread: HashSet<String>,
     paused: bool,
     /// Where the follow reads agents' questions, once it says.
     scans: Option<mpsc::UnboundedSender<(String, Option<i64>)>>,
+    /// The folder of marks a window's check keeps of what a reply left
+    /// waiting on the person, as last read, and when it was looked at.
+    marks: (crate::waiting::Marks, Instant),
     /// What each mark, colour and shape means, and the counts, in the
     /// chat log's place.
     pub legend: bool,
@@ -457,6 +479,9 @@ pub struct View {
     centre: Option<String>,
     /// The star picked with the arrows, to centre on with Enter.
     pick: Option<String>,
+    /// Where the last card drew each agent, and the person: what a click
+    /// there centres on.
+    hits: Vec<Hit>,
     /// Where the person is: the middle, or a ring of a centred sky.
     person: Glide,
     /// When the stars last set off for new places.
@@ -524,7 +549,7 @@ enum Heard {
     Poem(String, i64, Vec<String>),
     /// The file as read, and the rule when it was read again too.
     Read(Box<haiku::Kept>, Option<haiku::Rule>),
-    /// The day's haikus, for a replay to show each when it was up.
+    /// The haikus of a replay's span, for it to show each when it was up.
     Poems(Vec<haiku::Poem>),
     /// The daemon's triggers as read, soonest first.
     Schedules(Vec<crate::trigger::Upcoming>),
@@ -586,8 +611,9 @@ struct Replay {
     /// talked is whole from the first frame, as live; what goes off the
     /// tape's start joins it.
     prior: Prior,
-    /// The day's haikus, and when the one shown was written: the one up
-    /// at the replay's time shows, as it did then.
+    /// The haikus of its span, read as it plays, and when the one shown
+    /// was written: the one up at the replay's time shows, as it did then.
+    past: std::sync::Arc<std::sync::Mutex<haiku::Past>>,
     poems: Vec<haiku::Poem>,
     poem: Option<i64>,
 }
@@ -723,7 +749,7 @@ impl Replay {
         }
     }
 
-    fn new(from: i64) -> Self {
+    fn new(from: i64, socket: &std::path::Path) -> Self {
         Replay {
             from,
             at: from as f64,
@@ -737,9 +763,30 @@ impl Replay {
             cut: false,
             folded: Vec::new(),
             prior: Prior::default(),
+            past: std::sync::Arc::new(std::sync::Mutex::new(haiku::Past::new(socket, from))),
             poems: Vec::new(),
             poem: None,
         }
+    }
+}
+
+/// Cells of a card a click centres on: a star, its name, its row of the
+/// list, or its name in the chat log; `agent` none for the person's.
+/// By the agent's place, so a frame clones no names.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Hit {
+    row: usize,
+    from: usize,
+    to: usize,
+    agent: Option<usize>,
+}
+
+impl Hit {
+    fn moved(mut self, rows: usize, cols: usize) -> Self {
+        self.row += rows;
+        self.from += cols;
+        self.to += cols;
+        self
     }
 }
 
@@ -749,7 +796,9 @@ struct Note {
     text: String,
     /// The hue of what needs you or failed.
     hue: Option<Color>,
-    /// The agents it is about, so a centred sky keeps only its agent's.
+    /// The agents it is about, so a centred sky keeps only its agent's;
+    /// in the order its words name them, so a click on a name finds its
+    /// own agent where two share a short name.
     about: Vec<String>,
     /// In a replay, when it happened, in Unix ms, which it says for its
     /// time.
@@ -819,6 +868,8 @@ impl View {
         let (send, feed) = mpsc::unbounded_channel();
         let task = tokio::spawn(follow(socket.clone(), send));
         let mut view = Self::with(socket, feed, task);
+        // What is marked as it opens is read with each agent's questions.
+        view.marks.0.moved(&store, |_| true);
         view.resolved = store;
         view
     }
@@ -869,13 +920,17 @@ impl View {
             laid: false,
             order: Vec::new(),
             live: false,
+            ready: false,
+            unread: HashSet::new(),
             paused: false,
             scans: None,
+            marks: (crate::waiting::Marks::default(), Instant::now()),
             legend: false,
             zen: false,
             models: false,
             centre: None,
             pick: None,
+            hits: Vec::new(),
             person: Glide::default(),
             moved: None,
             listing: false,
@@ -943,6 +998,8 @@ impl View {
         // is read again from the turns kept.
         self.forget();
         self.live = false;
+        self.ready = false;
+        self.unread.clear();
         self.down = None;
         // The new connection's greeting says whether it still hangs.
         self.cord = None;
@@ -964,7 +1021,7 @@ impl View {
     /// Play the past back from `from` (Unix ms), or, with none, watch live
     /// again. Either way the sky is read anew, and the chat log with it.
     pub fn replay(&mut self, from: Option<i64>) {
-        self.replay = from.map(Replay::new);
+        self.replay = from.map(|from| Replay::new(from, &self.socket));
         self.ticker.clear();
         self.recent.clear();
         self.calls.clear();
@@ -972,7 +1029,7 @@ impl View {
         // file's shows anew.
         (self.verse, self.fading) = (None, None);
         self.shown = (String::new(), 0);
-        // Read at once, the day's haikus or the file's.
+        // Read at once, the replay's haikus or the file's.
         self.weighed = None;
         self.restart();
     }
@@ -1079,8 +1136,9 @@ impl View {
                         agent.waits.held(held, |bot| bot == name);
                         if !agent.gone
                             && let Some(scans) = &self.scans
+                            && scans.send((name.clone(), None)).is_ok()
                         {
-                            let _ = scans.send((name, None));
+                            self.unread.insert(name);
                         }
                     }
                 }
@@ -1088,15 +1146,18 @@ impl View {
                 // Read as of when it was asked: what an event since left
                 // unsure is read again when its turn ends.
                 Feed::Asked(name, Some(seen)) => {
+                    self.unread.remove(&name);
                     if let Some(at) = self.agent(&name)
                         && !self.agents[at].waits.unsure(&name)
                     {
                         let running = self.agents[at].running.is_some();
-                        let ask = seen.open(&self.resolved, &name, running);
+                        let ask = (*seen).open(&self.resolved, &name, running);
                         self.agents[at].waits.asked(&name, ask);
                     }
                 }
-                Feed::Asked(_, None) => {}
+                Feed::Asked(name, None) => {
+                    self.unread.remove(&name);
+                }
                 Feed::Live(event) => {
                     self.live = true;
                     self.event(&event, now, true);
@@ -1120,7 +1181,7 @@ impl View {
                         self.agents[at].set_model(&model);
                     }
                 }
-                Feed::Ready => self.live = true,
+                Feed::Ready => (self.live, self.ready) = (true, true),
                 Feed::Down(why) => self.down = Some(why),
             }
         }
@@ -1131,11 +1192,30 @@ impl View {
             let from = replay.from as f64;
             self.seek(from, now);
         }
+        self.look_at_marks(now);
         self.play(now);
         self.sweep();
         self.sweep_cord(now);
         self.land(now);
         self.reign(now);
+    }
+
+    /// Read again, live, the questions of each agent whose mark of what
+    /// its reply left waiting on the person changed: a check sets it after
+    /// the turn ended, so no event says so. One stat a second.
+    fn look_at_marks(&mut self, now: Instant) {
+        if self.replay.is_some() || now.duration_since(self.marks.1) < MARKS_LOOK {
+            return;
+        }
+        self.marks.1 = now;
+        let Some(scans) = &self.scans else {
+            return;
+        };
+        for bot in (self.marks.0).moved(&self.resolved, |_| true) {
+            if self.index.contains_key(&bot) {
+                let _ = scans.send((bot, None));
+            }
+        }
     }
 
     /// Take the haikus written and let an hour-old one go; then, live,
@@ -1192,13 +1272,22 @@ impl View {
         // /config says now and then: haikus turned on or off, or the cap
         // moved, since the sky opened.
         if !self.reading && self.replay.is_some() {
-            // A replay reads the day's haikus again as it goes: one another
-            // sky writes while it plays shows when the replay reaches it.
+            // A replay reads the haikus written since it last read as it
+            // goes: one another sky writes while it plays shows when the
+            // replay reaches it.
             self.reading = true;
-            let (store, socket) = (self.store.clone(), self.socket.clone());
+            let store = self.store.clone();
+            let past = (self.replay.as_ref()).map(|replay| replay.past.clone());
             let send = self.heard.0.clone();
             self.runtime.spawn_blocking(move || {
-                let _ = send.send(Heard::Poems(haiku::Kept::load(&store, &socket).past));
+                let Some(past) = past else {
+                    return;
+                };
+                let Ok(mut past) = past.lock() else {
+                    return;
+                };
+                past.read(&store);
+                let _ = send.send(Heard::Poems(past.poems.clone()));
             });
         } else if !self.reading {
             self.reading = true;
@@ -1237,7 +1326,7 @@ impl View {
                 let _ = send.send(Heard::Schedules(found));
             });
         }
-        if self.replay.is_some() || self.title.rule.daily == 0 {
+        if self.replay.is_some() || !self.title.rule.on {
             return;
         }
         if let Some((name, since)) = self.heir.take()
@@ -1270,18 +1359,21 @@ impl View {
                     kept.claim(&rule, &claim_name, since, since)
                 })
                 .is_some_and(|(claimed, _)| claimed)
+                .then_some(rule.keep)
             });
-            if !matches!(claimed.await, Ok(true)) {
+            let Ok(Some(keep)) = claimed.await else {
                 return;
-            }
+            };
             // One that writes none leaves the haiku before showing, here
             // and in every sky, and says why in the file.
             let written = haiku::write(socket.clone(), name.clone()).await;
             let kept = tokio::task::spawn_blocking(move || {
                 let at = wall_ms();
                 match written {
-                    Ok(lines) => haiku::Kept::publish(&store, &socket, &name, since, &lines, at)
-                        .then(|| Heard::Poem(name, at, lines.to_vec())),
+                    Ok(lines) => {
+                        haiku::Kept::publish(&store, &socket, &name, since, &lines, at, keep)
+                            .then(|| Heard::Poem(name, at, lines.to_vec()))
+                    }
                     Err(why) => {
                         haiku::Kept::unwritten(&store, &socket, &name, since, why, at);
                         None
@@ -1356,7 +1448,8 @@ impl View {
         };
         // What the schedule is first, as the log is narrow.
         let said = format!("{whom} {}, by {maker}", said_when(&booking.when));
-        let about: Vec<usize> = std::iter::once(by).chain(to).collect();
+        // In the order the line names them: whom, then its maker.
+        let about: Vec<usize> = to.into_iter().chain(std::iter::once(by)).collect();
         self.say(now, said, None, &about);
         if let Some(to) = to {
             // A spark of its own: no message, so no count of them.
@@ -1440,8 +1533,9 @@ impl View {
     }
 
     /// The haiku's rows: its three lines streaming in a word at a time,
-    /// muted, each word up from faint, then its writer signed in faint;
-    /// the one before all faint as it fades; in a replay, the one up then.
+    /// in the text's own weight, each word up from faint through muted,
+    /// then its writer signed muted; the one before all faint as it fades;
+    /// in a replay, the one up then.
     fn haiku(&self, now: Instant) -> Vec<Line<'static>> {
         let showing = self.verse.as_ref().filter(|verse| now >= verse.from);
         let (verse, faded) = match (showing, &self.fading) {
@@ -1464,9 +1558,10 @@ impl View {
                 if !faded && t < shows {
                     continue;
                 }
-                let ink = match faded || t < shows + WORD {
-                    true => Ink::Faint,
-                    false => Ink::Muted,
+                let ink = match () {
+                    _ if faded || t < shows + WORD / 2.0 => Ink::Faint,
+                    _ if t < shows + WORD => Ink::Muted,
+                    _ => Ink::Plain,
                 };
                 if !spans.is_empty() {
                     spans.push(Span::raw(" "));
@@ -1485,8 +1580,9 @@ impl View {
                 .saturating_duration_since(verse.since);
             let minutes = (held.as_secs() / 60).max(1);
             lines.push(Line::default());
+            let ink = if faded { Ink::Faint } else { Ink::Muted };
             for signed in signature(&name, minutes, haiku::WIDTH) {
-                lines.push(Line::from(Span::styled(signed, Ink::Faint.style())));
+                lines.push(Line::from(Span::styled(signed, ink.style())));
             }
         }
         lines
@@ -1842,6 +1938,9 @@ impl View {
         let waiting = self.agents[at].state() == Some(State::NeedsYou);
         if own && live {
             self.agents[at].waits.event(event);
+            if !waiting && self.agents[at].state() == Some(State::NeedsYou) {
+                self.agents[at].asked = Some(now);
+            }
         }
         match event["event"].as_str().unwrap_or("") {
             kind @ ("queued" | "accepted" | "steered") => {
@@ -1899,17 +1998,6 @@ impl View {
                     }
                 }
                 let origin = data["origin"].as_str().unwrap_or("");
-                // An agent's goal asks it to go on: its own loop, so its
-                // star pulses, and nothing flies.
-                if live && origin == "goal" && from != End::Person {
-                    let agent = &mut self.agents[at];
-                    // Cooled to now first, as a message's heat is.
-                    agent.heat = agent.warmth(now) + 1.0;
-                    (agent.lit, agent.heated, agent.flash) = (Some(now), Some(now), None);
-                    let said = format!("{} keeps at its goal", self.short(at));
-                    self.say(now, said, None, &[at]);
-                    return;
-                }
                 // A schedule woke it: in from the edge, its tick flashing.
                 if live && crate::trigger::sent_it(origin) {
                     self.agents[at].fired = Some(now);
@@ -2722,6 +2810,28 @@ impl View {
         }
     }
 
+    /// A click on the card's `row` at `col`: on a star or an agent's name,
+    /// centred on it, as the arrows and Enter centre on a pick; on `you`,
+    /// the person back in the middle. False when nothing there is one.
+    pub fn click(&mut self, row: usize, col: usize) -> bool {
+        // The last drawn is on top: a name over a star's edge.
+        let Some(hit) = (self.hits.iter().rev())
+            .find(|hit| hit.row == row && (hit.from..hit.to).contains(&col))
+        else {
+            return false;
+        };
+        let name = hit.agent.map(|at| self.agents[at].name.clone());
+        self.centre_clicked(name);
+        true
+    }
+
+    /// Centred on `name`, or the person, as a click on it does: what was
+    /// picked with the arrows is let go.
+    pub fn centre_clicked(&mut self, name: Option<String>) {
+        self.pick = None;
+        self.centre_on(name);
+    }
+
     /// A key the sky takes: the arrows pick a star, Enter centres on it,
     /// `?` the legend, `z` zen, `m` the models' colours. Esc lets go of the
     /// pick, then of the centre; false when there was nothing to let go
@@ -2826,13 +2936,30 @@ impl View {
         }
     }
 
+    /// Still reading who is here, what they did, what they hold and what
+    /// they ask: the follow has not said it is ready, or a question asked
+    /// for at the start is unread. A replay and a lost follow show what
+    /// they have.
+    fn opening(&self) -> bool {
+        self.replay.is_none() && self.down.is_none() && (!self.ready || !self.unread.is_empty())
+    }
+
     /// The sky `cols` wide and `rows` high, what happened under it.
     pub fn card(&mut self, cols: usize, rows: usize) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        self.hits.clear();
+        // The sky opens whole: until who is here, what they did, what they
+        // hold and what they ask are all read, one quiet line, and laid out
+        // once, so no star moves for what was only late. A follow lost on
+        // the way shows what it read, and says so.
+        if self.opening() {
+            lines.push(Line::from("Catching up with who is here…"));
+            return lines;
+        }
         let now = Instant::now();
         self.lay(now);
         self.glide(now);
         let cols = cols.max(20);
-        let mut lines = Vec::new();
         let shown = self.agents.iter().filter(|a| !a.gone).count();
         if shown == 0 {
             lines.push(Line::from(match (&self.down, self.live) {
@@ -2850,14 +2977,20 @@ impl View {
                 (false, true) => LEGEND,
                 (false, false) => 2,
             };
-            lines.extend(self.list(now, cols, rows.saturating_sub(under).max(3)));
+            let (list, hits) = self.list(now, cols, rows.saturating_sub(under).max(3));
+            lines.extend(list);
+            self.hits = hits;
             // The list takes the rows; the log, its newest line, the one
             // kept for it under the list's blank.
             if !self.zen {
-                lines.extend(match self.legend {
-                    true => legend(true),
+                let (log, hits) = match self.legend {
+                    true => (legend(true), Vec::new()),
                     false => self.ticked(now, cols, under - 1, false),
-                });
+                };
+                let at = lines.len();
+                self.hits
+                    .extend(hits.into_iter().map(|hit| hit.moved(at, 0)));
+                lines.extend(log);
             }
             return lines;
         }
@@ -2892,7 +3025,15 @@ impl View {
             Some(End::Person) => Style::default().fg(NEEDS).bold(),
             _ => Style::default().bold(),
         };
-        sky.text_at(self.person.at, "you", you);
+        let mut hits = Vec::new();
+        if let Some((row, from, to)) = sky.text_at(self.person.at, "you", you) {
+            hits.push(Hit {
+                row,
+                from,
+                to,
+                agent: None,
+            });
+        }
         // Who made whom: dotted lines, dim, as all that says how things
         // stand rather than what happens.
         for (at, agent) in self.agents.iter().enumerate().filter(|(_, a)| !a.gone) {
@@ -3049,8 +3190,8 @@ impl View {
             // What needs the person or failed, still in its colour; a
             // working star breathes. As in 0.7.0, those are blobs, and so
             // is one a message lights; one at rest is a single dot.
-            // On `m`, each in its model's colour instead, bold while it
-            // works.
+            // On `m`, each a blob in its model's colour instead, bold, so a
+            // hue reads on a star at rest too.
             let hue = (self.models)
                 .then(|| hues.get(agent.model_or_unknown()).copied())
                 .flatten();
@@ -3061,16 +3202,25 @@ impl View {
                 // The stop holds the rest still, as it reaches them; what
                 // needs the person or failed keeps its colour.
                 (_, None | Some(State::Working)) if stilled => (Ink::Muted, false),
-                (Some(hue), state) => {
-                    let big = state.is_some() || agent.glow(now) > 0.4;
-                    (Ink::Color(hue, big), big)
-                }
+                (Some(hue), _) => (Ink::Color(hue, true), true),
                 (None, Some(State::Working)) => {
                     (shade.breathe(agent.breath(now, self.opened)), true)
                 }
                 (None, _) => (Ink::Plain, agent.glow(now) > 0.4),
             };
             sky.star(agent.at, ink, big);
+            // Every row it paints: a blob across a row's edge takes two.
+            let (_, cols) = sky.covers(agent.at);
+            let (from, to) = (*cols.start(), cols.end() + 1);
+            for row in sky.painted(agent.at, big).filter(|&row| row < sky_rows) {
+                let agent = Some(index);
+                hits.push(Hit {
+                    row,
+                    from,
+                    to,
+                    agent,
+                });
+            }
         }
         for &(at, radius, ink) in cord.iter().flat_map(|cord| &cord.flares) {
             sky.circle(at, radius, ink);
@@ -3135,10 +3285,16 @@ impl View {
             let agent = &self.agents[at];
             // The mark says what the colour does: `? ` for an agent that
             // needs you, `✗ ` for one that failed. Bold while it works.
+            // A `?` new since a moment ago beats, reversed, then holds.
             let mark = match agent.state() {
                 Some(state @ (State::NeedsYou | State::Failed)) => {
                     let (mark, color, _) = state.mark();
-                    Some((mark, Style::default().fg(color).bold()))
+                    let style = Style::default().fg(color).bold();
+                    let style = match agent.beats(now) {
+                        true => style.reversed(),
+                        false => style,
+                    };
+                    Some((mark, style))
                 }
                 _ => None,
             };
@@ -3149,12 +3305,24 @@ impl View {
                 // The pick reversed, as a picker's selection is.
                 (true, _) => Style::default().reversed(),
                 (_, true) => Style::default().bold(),
-                _ => name_style(agent.state(), agent.glow(now)),
+                // On `m`, the name in its star's colour too: a star's mark
+                // is a few dots, its name the most of it there is.
+                _ => match hues.get(agent.model_or_unknown()) {
+                    Some(&hue) => name_style(agent.state(), 1.0).fg(hue),
+                    None => name_style(agent.state(), agent.glow(now)),
+                },
             };
-            if !sky.label(agent.at, mark, &short(&agent.name), style)
-                && agent.state() == Some(State::NeedsYou)
-            {
-                *unnamed.entry(agent.arm).or_default() += 1;
+            match sky.label(agent.at, mark, &short(&agent.name), style) {
+                Some((row, from, to)) => hits.push(Hit {
+                    row,
+                    from,
+                    to,
+                    agent: Some(at),
+                }),
+                None if agent.state() == Some(State::NeedsYou) => {
+                    *unnamed.entry(agent.arm).or_default() += 1;
+                }
+                None => {}
             }
         }
         for (arm, n) in unnamed {
@@ -3184,6 +3352,7 @@ impl View {
             }
         }
         let drawn = sky.lines();
+        self.hits = hits;
         if beside {
             let column = match self.legend {
                 true => self.key(now, rows),
@@ -3191,7 +3360,13 @@ impl View {
                     // The haiku at the top, in the blank the log leaves.
                     // A blank under its newest line, as over the haiku: two
                     // from the footer, as two from the key hints.
-                    let mut column = self.ticked(now, LOG_COLS, rows.saturating_sub(1), true);
+                    // As wide as the haiku over it, so both keep the same
+                    // margin from the pane's edge.
+                    let room = rows.saturating_sub(1);
+                    let (mut column, hits) = self.ticked(now, haiku::WIDTH, room, true);
+                    let side = sky_cols + GAP;
+                    self.hits
+                        .extend(hits.into_iter().map(|hit| hit.moved(0, side)));
                     column.push(Line::default());
                     for (row, line) in self.haiku(now).into_iter().enumerate() {
                         let row = HAIKU_TOP + row;
@@ -3214,10 +3389,14 @@ impl View {
         lines.extend(drawn);
         if !self.zen {
             lines.push(Line::default());
-            lines.extend(match self.legend {
-                true => self.legend_under(cols),
+            let (log, hits) = match self.legend {
+                true => (self.legend_under(cols), Vec::new()),
                 false => self.ticked(now, cols, TICKER, false),
-            });
+            };
+            let at = lines.len();
+            self.hits
+                .extend(hits.into_iter().map(|hit| hit.moved(at, 0)));
+            lines.extend(log);
         }
         lines
     }
@@ -3227,9 +3406,17 @@ impl View {
     /// hue. In a column of its own, `tall`, it fills the column with the
     /// newest at the bottom, the newest few plain, older ones muted, the
     /// oldest faint, and a line just come in fades up from faint. Or that
-    /// the follow is lost, or nothing has happened yet.
-    fn ticked(&self, now: Instant, cols: usize, room: usize, tall: bool) -> Vec<Line<'static>> {
+    /// the follow is lost, or nothing has happened yet. With the names in
+    /// it a click centres on, by the lines' rows and columns.
+    fn ticked(
+        &self,
+        now: Instant,
+        cols: usize,
+        room: usize,
+        tall: bool,
+    ) -> (Vec<Line<'static>>, Vec<Hit>) {
         let mut lines = Vec::new();
+        let mut hits = Vec::new();
         // Centred, only what the agent in the middle said or was told.
         let centre = self.centred().map(|at| &self.agents[at].name);
         let kept: Vec<_> = (self.ticker.iter())
@@ -3247,8 +3434,8 @@ impl View {
                 at,
                 text,
                 hue,
+                about,
                 written,
-                ..
             },
         ) in entries.iter().copied().enumerate()
         {
@@ -3275,13 +3462,24 @@ impl View {
                 _ => Ink::Muted.style(),
             };
             // A replay says when it happened, as a chat log's time does.
+            // Its time starts where the haiku does, two cells from its words.
             let when = match written {
                 Some(written) => format!("{} ", clock(*written)),
-                None => format!("{:>4}  ", ago(now, *at)),
+                None => format!("{:>3}  ", ago(now, *at)),
             };
+            let room = cols.saturating_sub(when.width());
+            let said = cut(text, room);
+            for (from, to, name) in named(&said, about) {
+                hits.push(Hit {
+                    row: lines.len(),
+                    from: when.width() + from,
+                    to: when.width() + to,
+                    agent: self.agent(name),
+                });
+            }
             lines.push(Line::from(vec![
                 Span::styled(when, age),
-                Span::styled(cut(text, cols.saturating_sub(6)), words),
+                Span::styled(said, words),
             ]));
         }
         if let Some(why) = &self.down {
@@ -3308,8 +3506,9 @@ impl View {
         if tall {
             let blank = room.saturating_sub(lines.len());
             lines.splice(0..0, std::iter::repeat_n(Line::default(), blank));
+            hits = hits.into_iter().map(|hit| hit.moved(blank, 0)).collect();
         }
-        lines
+        (lines, hits)
     }
 
     /// The legend and the counts, in the chat log's column: what each mark
@@ -3542,7 +3741,7 @@ impl View {
     /// state's mark, and the last it said or was told. When they don't all
     /// fit, what needs the person, what failed, works or is lit come
     /// first, the leads after them.
-    fn list(&self, now: Instant, cols: usize, rows: usize) -> Vec<Line<'static>> {
+    fn list(&self, now: Instant, cols: usize, rows: usize) -> (Vec<Line<'static>>, Vec<Hit>) {
         let picked = self.pick.as_deref().and_then(|name| self.agent(name));
         let rank = |at: usize| {
             let agent = &self.agents[at];
@@ -3566,6 +3765,7 @@ impl View {
             kept.truncate(rows.saturating_sub(1));
         }
         let mut lines = Vec::new();
+        let mut hits = Vec::new();
         for &(at, depth) in self.order.iter().filter(|(at, _)| kept.contains(at)) {
             let agent = &self.agents[at];
             let glow = agent.glow(now);
@@ -3574,10 +3774,14 @@ impl View {
                 g if g > 0.08 => Span::raw("•"),
                 _ => Span::raw("·").dim(),
             };
+            // The same beat as in the sky for a `?` just raised.
             let mark = match agent.state() {
                 Some(state) => {
                     let (mark, color, _) = state.mark();
-                    Span::raw(mark).fg(color)
+                    match agent.beats(now) {
+                        true => Span::raw(mark).fg(color).reversed(),
+                        false => Span::raw(mark).fg(color),
+                    }
                 }
                 None => Span::raw(" "),
             };
@@ -3603,14 +3807,22 @@ impl View {
                 let said = format!("{said} · {}", ago(now, *when));
                 spans.push(Span::raw(format!("  {}", cut(&said, cols - used - 2))).dim());
             }
-            lines.push(Line::from(spans));
+            // Its whole row, as a list's row is picked.
+            let line = Line::from(spans);
+            hits.push(Hit {
+                row: lines.len(),
+                from: 0,
+                to: line.width(),
+                agent: Some(at),
+            });
+            lines.push(line);
         }
         if more > 0 {
             let hidden = self.order.len() - kept.len();
             lines.push(Line::from(format!("  … {hidden} more, quiet")).dim());
         }
         lines.push(Line::default());
-        lines
+        (lines, hits)
     }
 
     /// Counts as the footer gives them, each mark with its word: everyone,
@@ -3619,6 +3831,10 @@ impl View {
     pub fn footer(&self, width: usize) -> Line<'static> {
         if let Some(replay) = &self.replay {
             return replay_line(replay, width);
+        }
+        // The counts come with the sky, whole.
+        if self.opening() {
+            return Line::default();
         }
         let shown: Vec<&Agent> = self.agents.iter().filter(|a| !a.gone).collect();
         let count = shown.len();
@@ -3672,7 +3888,7 @@ impl View {
                 }
                 spans.push(Span::raw(" ·").dim());
                 spans.push(Span::raw(" ⠛").fg(hue));
-                spans.push(Span::raw(format!(" {model}")).dim());
+                spans.push(Span::raw(format!(" {model}")).fg(hue));
             }
         }
         let states = match self.models {
@@ -3947,6 +4163,31 @@ fn signature(name: &str, minutes: u64, room: usize) -> Vec<String> {
     vec![format!("— {named}"), format!("  busiest for {minutes}m")]
 }
 
+/// Where in `said` each of the agents `about` is named, by its short
+/// name as the log writes it: the columns it takes. `about` is in the
+/// order the line names them, so each is looked for after the last one
+/// found: two of one short name each find their own place.
+fn named<'a>(said: &str, about: &'a [String]) -> Vec<(usize, usize, &'a str)> {
+    let edge = |c: Option<char>| c.is_none_or(|c| !(c.is_alphanumeric() || "._-".contains(c)));
+    let mut after = 0;
+    let mut found = Vec::new();
+    for name in about {
+        let short = short(name);
+        let place = (said[after..].match_indices(short.as_str()))
+            .map(|(at, _)| after + at)
+            .find(|&at| {
+                edge(said[..at].chars().next_back())
+                    && edge(said[at + short.len()..].chars().next())
+            });
+        if let Some(at) = place {
+            after = at + short.len();
+            let from = said[..at].width();
+            found.push((from, from + short.width(), name.as_str()));
+        }
+    }
+    found
+}
+
 /// Words cut to `room` columns, an ellipsis saying so.
 fn cut(text: &str, room: usize) -> String {
     if text.width() <= room {
@@ -3974,32 +4215,49 @@ fn radial(
 ) -> (Vec<Option<((f32, f32), f32)>>, Vec<(usize, usize)>) {
     let mut places = vec![None; nodes];
     let mut order = Vec::new();
-    // How many generations below the leads the deepest line goes.
-    fn height(at: usize, children: &[Vec<usize>], depth: usize) -> usize {
-        match depth > children.len() {
-            true => depth,
-            false => (children[at].iter())
-                .map(|&kid| height(kid, children, depth + 1))
-                .fold(depth, usize::max),
+    // The leaves under each node, and how many generations below the
+    // leads the deepest line goes, in one pass from the roots: each node
+    // is visited once, children summed before their parent. A node met
+    // again (a tree has none) adds what it had when first met.
+    let mut weights = vec![0usize; nodes];
+    let mut seen = vec![false; nodes];
+    let mut deepest = 0;
+    let mut stack: Vec<(usize, usize, bool)> =
+        (roots.iter().rev()).map(|&root| (root, 0, false)).collect();
+    while let Some((at, depth, summed)) = stack.pop() {
+        if summed {
+            weights[at] = (children[at].iter())
+                .map(|&kid| weights[kid])
+                .sum::<usize>()
+                .max(1);
+            continue;
         }
+        if std::mem::replace(&mut seen[at], true) {
+            continue;
+        }
+        deepest = deepest.max(depth);
+        stack.push((at, depth, true));
+        stack.extend(children[at].iter().map(|&kid| (kid, depth + 1, false)));
     }
-    let deepest = (roots.iter())
-        .map(|&root| height(root, children, 0))
-        .max()
-        .unwrap_or(0);
-    #[allow(clippy::too_many_arguments)]
-    fn place(
-        at: usize,
-        from: f32,
-        span: f32,
-        depth: usize,
-        deepest: usize,
-        children: &[Vec<usize>],
-        places: &mut Vec<Option<((f32, f32), f32)>>,
-        order: &mut Vec<(usize, usize)>,
-    ) {
+    // Each arm as wide as the square root of what is under it, so one
+    // big project can't squeeze the rest to nothing.
+    let root_weights: Vec<f32> = (roots.iter())
+        .map(|&root| (weights[root] as f32).sqrt())
+        .collect();
+    let total: f32 = root_weights.iter().sum::<f32>().max(1.0);
+    // Each node then its children, depth first in the tree's order: a node,
+    // the arc it spans from where, and its generation.
+    let mut arcs: Vec<(usize, f32, f32, usize)> = Vec::with_capacity(roots.len());
+    let mut from = -PI / 2.0;
+    for (&root, weight) in roots.iter().zip(root_weights) {
+        let span = TAU * weight / total;
+        arcs.push((root, from, span, 0));
+        from += span;
+    }
+    arcs.reverse();
+    while let Some((at, from, span, depth)) = arcs.pop() {
         if places[at].is_some() {
-            return;
+            continue;
         }
         // Leads on the inner ring and every agent that made none on the
         // outer, as a cluster dendrogram puts its leaves (d3.cluster), so
@@ -4015,47 +4273,15 @@ fn radial(
         places[at] = Some(((radius * angle.cos(), radius * angle.sin()), angle));
         order.push((at, depth));
         let kids = &children[at];
-        let weights: Vec<f32> = kids
-            .iter()
-            .map(|&kid| weight(kid, children) as f32)
-            .collect();
-        let total: f32 = weights.iter().sum();
+        let total: f32 = kids.iter().map(|&kid| weights[kid] as f32).sum();
         let mut start = from;
-        for (kid, w) in kids.iter().zip(weights) {
-            let part = span * w / total;
-            place(
-                *kid,
-                start,
-                part,
-                depth + 1,
-                deepest,
-                children,
-                places,
-                order,
-            );
+        let first = arcs.len();
+        for &kid in kids {
+            let part = span * weights[kid] as f32 / total;
+            arcs.push((kid, start, part, depth + 1));
             start += part;
         }
-    }
-    // Each arm as wide as the square root of what is under it, so one
-    // big project can't squeeze the rest to nothing.
-    let weights: Vec<f32> = (roots.iter())
-        .map(|&root| (weight(root, children) as f32).sqrt())
-        .collect();
-    let total: f32 = weights.iter().sum::<f32>().max(1.0);
-    let mut from = -PI / 2.0;
-    for (&root, weight) in roots.iter().zip(weights) {
-        let span = TAU * weight / total;
-        place(
-            root,
-            from,
-            span,
-            0,
-            deepest,
-            children,
-            &mut places,
-            &mut order,
-        );
-        from += span;
+        arcs[first..].reverse();
     }
     let far = (places.iter().flatten())
         .map(|((x, y), _)| x.hypot(*y))
@@ -4075,19 +4301,6 @@ fn hashed(name: &str) -> f32 {
         (h ^ u32::from(b)).wrapping_mul(16777619)
     });
     (hash % 10_000) as f32 / 10_000.0
-}
-
-fn weight(at: usize, children: &[Vec<usize>]) -> usize {
-    fn go(at: usize, children: &[Vec<usize>], depth: usize) -> usize {
-        if depth > children.len() {
-            return 1;
-        }
-        let below: usize = (children[at].iter())
-            .map(|&kid| go(kid, children, depth + 1))
-            .sum();
-        below.max(1)
-    }
-    go(at, children, 0)
 }
 
 /// Whether a `commons` call's arguments, a JSON preview that may be cut
@@ -4194,9 +4407,10 @@ impl Ink {
     }
 }
 
-/// The two ends a working star breathes between: the theme's text and the
-/// text taken further from the background, toward white on a dark theme
-/// and black on a light one. Where the theme's colours are not known, or
+/// The two ends a working star breathes between: muted text, as the theme
+/// draws it, and the text taken further from the background, toward white
+/// on a dark theme and black on a light one; wide enough apart to see from
+/// the corner of the eye (F12), smooth and slow, so it never blinks. Where the theme's colours are not known, or
 /// with `NO_COLOR`, the star holds still in bold: a breath stepped through
 /// bold and plain would blink, the most distracting motion there is.
 struct Shade(Option<(crate::term::Rgb, crate::term::Rgb)>);
@@ -4206,13 +4420,16 @@ impl Shade {
         let theme = crate::term::theme();
         Shade(
             match (crate::look::no_color(), theme.foreground, theme.background) {
-                (false, Some(foreground), Some(_)) => {
+                (false, Some(foreground), Some(background)) => {
                     let far = if crate::term::light() {
                         (0, 0, 0)
                     } else {
                         (255, 255, 255)
                     };
-                    Some((foreground, crate::look::blend(far, foreground, 0.6)))
+                    Some((
+                        crate::look::muted(foreground, background),
+                        crate::look::blend(far, foreground, 0.6),
+                    ))
                 }
                 _ => None,
             },
@@ -4328,6 +4545,15 @@ impl Sky {
         }
     }
 
+    /// The rows a star at a point paints: a blob's dots, half a dot above
+    /// and below it, may fall in the rows either side of its own.
+    fn painted(&self, at: (f32, f32), big: bool) -> std::ops::RangeInclusive<usize> {
+        let (_, y) = self.spot(at);
+        let reach = if big { 0.5 } else { 0.0 };
+        let row = |y: f32| y.max(0.0) as usize / 4;
+        row(y - reach)..=row(y + reach)
+    }
+
     /// The row and columns a star at a point covers.
     fn covers(&self, at: (f32, f32)) -> (usize, std::ops::RangeInclusive<usize>) {
         let (x, y) = self.spot(at);
@@ -4426,7 +4652,7 @@ impl Sky {
         mark: Option<(&str, Style)>,
         words: &str,
         style: Style,
-    ) -> bool {
+    ) -> Option<(usize, usize, usize)> {
         let (_, y) = self.spot(at);
         let row = (y / 4.0) as usize;
         let marked = match mark {
@@ -4436,7 +4662,7 @@ impl Sky {
         let words = marked.as_str();
         let width = words.width();
         if row >= self.rows || width + 2 > self.cols {
-            return false;
+            return None;
         }
         // A blank cell between the words and their star, whichever cells
         // the star covers.
@@ -4456,20 +4682,18 @@ impl Sky {
             .map(|start| (row, start, Some(own.clone()))))
         .chain((row > 0).then(|| (row - 1, centred, None)))
         .chain((row + 1 < self.rows).then(|| (row + 1, centred, None)));
-        let Some((row, start)) = spots.into_iter().find_map(|(row, start, own)| {
+        let (row, start) = spots.into_iter().find_map(|(row, start, own)| {
             (start + width <= self.cols
                 && self.clear_of_stars(row, start, width, own.as_ref())
                 && self.put(row, start, words, style))
             .then_some((row, start))
-        }) else {
-            return false;
-        };
+        })?;
         if let Some((mark, mark_style)) = mark {
             for (cell, ch) in (row * self.cols + start..).zip(mark.chars()) {
                 self.text[cell] = Some((ch, mark_style));
             }
         }
-        true
+        Some((row, start, start + words.chars().count()))
     }
 
     /// No other agent's star in the cells words would take or the blank
@@ -4486,12 +4710,18 @@ impl Sky {
         })
     }
 
-    /// Words centred on a point.
-    fn text_at(&mut self, at: (f32, f32), words: &str, style: Style) {
+    /// Words centred on a point, and the row and columns they took.
+    fn text_at(
+        &mut self,
+        at: (f32, f32),
+        words: &str,
+        style: Style,
+    ) -> Option<(usize, usize, usize)> {
         let (x, y) = self.spot(at);
         let (col, row) = ((x / 2.0) as usize, (y / 4.0) as usize);
         let start = col.saturating_sub(words.width() / 2);
-        self.put(row, start, words, style);
+        (row < self.rows && self.put(row, start, words, style))
+            .then(|| (row, start, start + words.chars().count()))
     }
 
     /// Words put at a place in a row, a blank cell kept either side and
@@ -4587,6 +4817,10 @@ impl Sky {
 
 /// How often `sonny sky` draws: smooth enough for a spark's flight.
 const FRAME: Duration = Duration::from_millis(60);
+
+/// How often the sky looks whether a check changed what an agent's reply
+/// left waiting on the person.
+const MARKS_LOOK: Duration = Duration::from_secs(1);
 /// How long `sonny sky` waits before following a daemon that went again.
 const RETRY: Duration = Duration::from_secs(3);
 /// What the keys do in `sonny sky`.
@@ -4619,8 +4853,13 @@ pub fn watch(
     // The theme's colours, so muted reads as the measured gray it is in
     // the conversation, and `NO_COLOR` is honoured here too.
     crate::term::detect();
-    let _ = execute!(std::io::stdout(), EnterAlternateScreen, cursor::Hide);
-    let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+    let _ = execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        cursor::Hide,
+        event::EnableMouseCapture
+    );
+    let backend = crate::frames::Backend::new(std::io::stdout());
     let drawn = ratatui::Terminal::new(backend)
         .map_err(|e| e.to_string())
         .and_then(|mut terminal| {
@@ -4646,17 +4885,32 @@ pub fn watch(
                 if !event::poll(FRAME).map_err(|e| e.to_string())? {
                     continue;
                 }
-                if let event::Event::Key(key) = event::read().map_err(|e| e.to_string())?
-                    && key.kind != event::KeyEventKind::Release
-                {
-                    // Esc lets go of the pick and the centre before it leaves.
-                    if !view.press(key.code) && quits(&key) {
-                        return Ok(());
+                match event::read().map_err(|e| e.to_string())? {
+                    event::Event::Key(key) if key.kind != event::KeyEventKind::Release => {
+                        // Esc lets go of the pick and the centre before it leaves.
+                        if !view.press(key.code) && quits(&key) {
+                            return Ok(());
+                        }
                     }
+                    // A star or a name centred on: the card is drawn a
+                    // column in and two rows down, under the title.
+                    event::Event::Mouse(mouse)
+                        if mouse.kind == event::MouseEventKind::Down(event::MouseButton::Left)
+                            && mouse.column > 0
+                            && mouse.row > 1 =>
+                    {
+                        view.click(usize::from(mouse.row - 2), usize::from(mouse.column - 1));
+                    }
+                    _ => {}
                 }
             }
         });
-    let _ = execute!(std::io::stdout(), cursor::Show, LeaveAlternateScreen);
+    let _ = execute!(
+        std::io::stdout(),
+        event::DisableMouseCapture,
+        cursor::Show,
+        LeaveAlternateScreen
+    );
     crate::term::restore();
     let _ = terminal::disable_raw_mode();
     drawn
@@ -4746,7 +5000,7 @@ async fn follow(socket: PathBuf, send: mpsc::UnboundedSender<Feed>) {
     tokio::spawn(async move {
         while let Some((bot, turn)) = asked.recv().await {
             let seen = crate::needs::scan(&reader, &bot, turn).await;
-            if told.send(Feed::Asked(bot, seen)).is_err() {
+            if told.send(Feed::Asked(bot, seen.map(Box::new))).is_err() {
                 return;
             }
         }
@@ -5112,6 +5366,161 @@ async fn roll(client: &Client, send: &mpsc::UnboundedSender<Feed>) -> bool {
 mod tests {
     use super::*;
 
+    /// The layout as it was drawn before it took one pass: each child's
+    /// weight walked again for every node above it.
+    #[allow(clippy::type_complexity)]
+    fn radial_by_walks(
+        roots: &[usize],
+        children: &[Vec<usize>],
+        nodes: usize,
+    ) -> (Vec<Option<((f32, f32), f32)>>, Vec<(usize, usize)>) {
+        fn weight(at: usize, children: &[Vec<usize>]) -> usize {
+            let below: usize = children[at].iter().map(|&kid| weight(kid, children)).sum();
+            below.max(1)
+        }
+        fn height(at: usize, children: &[Vec<usize>], depth: usize) -> usize {
+            (children[at].iter())
+                .map(|&kid| height(kid, children, depth + 1))
+                .fold(depth, usize::max)
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn place(
+            at: usize,
+            from: f32,
+            span: f32,
+            depth: usize,
+            deepest: usize,
+            children: &[Vec<usize>],
+            places: &mut Vec<Option<((f32, f32), f32)>>,
+            order: &mut Vec<(usize, usize)>,
+        ) {
+            let radius = match (deepest, depth) {
+                (0, _) => 0.62,
+                (_, 0) => 0.45,
+                _ if children[at].is_empty() => 1.0,
+                (deepest, depth) => 0.45 + 0.55 * depth as f32 / deepest as f32,
+            };
+            let angle = from + span / 2.0;
+            places[at] = Some(((radius * angle.cos(), radius * angle.sin()), angle));
+            order.push((at, depth));
+            let weights: Vec<f32> = (children[at].iter())
+                .map(|&kid| weight(kid, children) as f32)
+                .collect();
+            let total: f32 = weights.iter().sum();
+            let mut start = from;
+            for (kid, w) in children[at].iter().zip(weights) {
+                let part = span * w / total;
+                place(
+                    *kid,
+                    start,
+                    part,
+                    depth + 1,
+                    deepest,
+                    children,
+                    places,
+                    order,
+                );
+                start += part;
+            }
+        }
+        let (mut places, mut order) = (vec![None; nodes], Vec::new());
+        let deepest = roots
+            .iter()
+            .map(|&r| height(r, children, 0))
+            .max()
+            .unwrap_or(0);
+        let weights: Vec<f32> = (roots.iter())
+            .map(|&root| (weight(root, children) as f32).sqrt())
+            .collect();
+        let total: f32 = weights.iter().sum::<f32>().max(1.0);
+        let mut from = -PI / 2.0;
+        for (&root, weight) in roots.iter().zip(weights) {
+            let span = TAU * weight / total;
+            place(
+                root,
+                from,
+                span,
+                0,
+                deepest,
+                children,
+                &mut places,
+                &mut order,
+            );
+            from += span;
+        }
+        let far = (places.iter().flatten())
+            .map(|((x, y), _)| x.hypot(*y))
+            .fold(0.0f32, f32::max);
+        if far > 0.0 {
+            let grow = 0.9 / far;
+            for ((x, y), _) in places.iter_mut().flatten() {
+                (*x, *y) = (*x * grow, *y * grow);
+            }
+        }
+        (places, order)
+    }
+
+    /// A forest of `nodes`: roots, then each node made by one before it,
+    /// as `shape` picks its maker.
+    fn forest(
+        nodes: usize,
+        shape: impl Fn(usize) -> Option<usize>,
+    ) -> (Vec<usize>, Vec<Vec<usize>>) {
+        let (mut roots, mut children) = (Vec::new(), vec![Vec::new(); nodes]);
+        for at in 0..nodes {
+            match shape(at) {
+                Some(by) => children[by].push(at),
+                None => roots.push(at),
+            }
+        }
+        (roots, children)
+    }
+
+    #[test]
+    fn the_radial_layout_places_every_shape_as_before_in_one_pass() {
+        let mut seed = 7u64;
+        let mut random = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        let picks: Vec<usize> = (0..400).map(|_| random()).collect();
+        type Maker = Box<dyn Fn(usize) -> Option<usize>>;
+        let shapes: [(&str, Maker); 5] = [
+            ("chain", Box::new(|at| at.checked_sub(1))),
+            ("star", Box::new(|at| (at > 0).then_some(0))),
+            (
+                "projects",
+                Box::new(|at| (at % 50 != 0).then(|| at - at % 50)),
+            ),
+            (
+                "random",
+                Box::new(move |at| (at % 37 != 0).then(|| picks[at] % at)),
+            ),
+            ("lone", Box::new(|_| None)),
+        ];
+        for (name, shape) in shapes {
+            let (roots, children) = forest(400, shape);
+            assert_eq!(
+                radial(&roots, &children, 400),
+                radial_by_walks(&roots, &children, 400),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_line_of_agents_is_laid_out_in_one_pass() {
+        // Walking each node's weight again for every node above it was
+        // quadratic here, and its recursion as deep as the line.
+        let (roots, children) = forest(200_000, |at| at.checked_sub(1));
+        let (places, order) = radial(&roots, &children, 200_000);
+        assert_eq!(order.len(), 200_000);
+        assert!(places.iter().all(Option::is_some));
+        assert_eq!(order.last(), Some(&(199_999, 199_999)));
+    }
+
     fn view() -> (View, mpsc::UnboundedSender<Feed>) {
         let (send, feed) = mpsc::unbounded_channel();
         let task = tokio::spawn(async {});
@@ -5298,6 +5707,7 @@ mod tests {
             json!({"name": "shop.lead", "running_turn": 3}),
         ]))
         .unwrap();
+        send.send(Feed::Ready).unwrap();
         view.drain();
         let area = ratatui::layout::Rect::new(0, 0, 60, 30);
         let mut buf = ratatui::buffer::Buffer::empty(area);
@@ -5425,6 +5835,7 @@ mod tests {
         };
         send.send(roll(&[("zoo.lead", 1), ("apps.lead", 2)]))
             .unwrap();
+        send.send(Feed::Ready).unwrap();
         view.drain();
         view.card(120, 40);
         let angle = |view: &View, name: &str| view.agents[view.index[name]].angle;
@@ -5451,6 +5862,7 @@ mod tests {
             json!({"name": "d.lead", "model": "chatgpt/gpt-6.1-sol"}),
         ]))
         .unwrap();
+        send.send(Feed::Ready).unwrap();
         view.drain();
         view.card(160, 40);
         assert!(view.press(KeyCode::Char('m')));
@@ -5477,6 +5889,7 @@ mod tests {
             json!({"name": "notes.lead", "model": "m1"}),
         ]))
         .unwrap();
+        send.send(Feed::Ready).unwrap();
         view.drain();
         view.card(120, 40);
         // Asked for by its project, the lead goes to the middle.
@@ -5532,7 +5945,7 @@ mod tests {
         use ratatui::crossterm::event::KeyCode;
         let (mut view, send) = view();
         let from = wall_ms() - 3_600_000;
-        view.replay = Some(Replay::new(from));
+        view.replay = Some(Replay::new(from, &view.socket));
         send.send(Feed::Roll(vec![
             json!({"name": "shop.lead", "running_turn": 4}),
             json!({"name": "shop.login", "created_by": "shop.lead"}),
@@ -5587,7 +6000,7 @@ mod tests {
         view.listing = false;
         assert!(view.agent("shop.cart").is_some());
         assert_eq!(view.ticker.len(), 2);
-        let log = text(&view.ticked(Instant::now(), 40, 12, true));
+        let log = text(&view.ticked(Instant::now(), 40, 12, true).0);
         assert!(log.contains(&clock(from + 90_000)), "{log}");
         // Paused, nothing moves; slower and faster halve and double.
         assert!(view.press(KeyCode::Char(' ')));
@@ -5616,7 +6029,7 @@ mod tests {
     async fn a_replay_draws_who_had_talked_before_it_and_the_haiku_up_then() {
         let (mut view, send) = view();
         let from = wall_ms() - 2 * 3_600_000;
-        view.replay = Some(Replay::new(from));
+        view.replay = Some(Replay::new(from, &view.socket));
         send.send(Feed::Roll(vec![
             json!({"name": "shop.lead"}),
             json!({"name": "shop.login", "created_by": "shop.lead"}),
@@ -5640,7 +6053,7 @@ mod tests {
         assert_eq!(prior.told.len(), 2);
         assert!(prior.told.values().all(|e| e["data"]["prompt"].is_null()));
         send.send(Feed::Prior(prior)).unwrap();
-        // The day's haikus as the file keeps them.
+        // Haikus as the past file keeps them.
         let lines = |first: &str| vec![first.to_owned(), "b".into(), "c".into()];
         let poem = |by: &str, at: i64, first: &str| haiku::Poem {
             by: by.into(),
@@ -5648,12 +6061,13 @@ mod tests {
             at_ms: at,
             since_ms: at - 300_000,
         };
-        haiku::Kept::update(&view.store, &view.socket, |kept| {
-            kept.past = vec![
-                poem("shop.cart", from - 2 * 3_600_000, "old"),
-                poem("shop.lead", from + 1_800_000, "dawn"),
-            ];
-        });
+        let socket = view.socket.display().to_string();
+        for poem in [
+            poem("shop.cart", from - 2 * 3_600_000, "old"),
+            poem("shop.lead", from + 1_800_000, "dawn"),
+        ] {
+            view.store.remember(&socket, &poem, None).unwrap();
+        }
         send.send(Feed::Ready).unwrap();
         view.drain();
         // The web of who had talked is there from the first frame, as live.
@@ -5672,7 +6086,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
             view.drain();
         }
-        assert_eq!(view.replay.as_ref().unwrap().poems.len(), 2);
+        // Its span's, and the hour before it: not the one written before.
+        assert_eq!(view.replay.as_ref().unwrap().poems.len(), 1);
         assert!(view.verse.is_none());
         view.seek(from as f64 + 1_860_000.0, Instant::now());
         view.drain();
@@ -5709,9 +6124,8 @@ mod tests {
         assert!(text(&view.haiku(Instant::now())).contains("busiest for 5m"));
         // One another sky writes while the replay plays is read as it goes,
         // and shows when the replay reaches it.
-        haiku::Kept::update(&view.store, &view.socket, |kept| {
-            kept.past.push(poem("shop.cart", from + 5_700_000, "late"));
-        });
+        let late = poem("shop.cart", from + 5_700_000, "late");
+        view.store.remember(&socket, &late, None).unwrap();
         view.weighed = None;
         view.drain();
         while view.reading {
@@ -5733,7 +6147,7 @@ mod tests {
         assert_eq!((prior.told.len(), prior.pairs.len()), (PRIOR, PRIOR));
         assert_eq!(prior.told.values().next().unwrap()["bot"], "a5");
         // What goes off the tape's start joins it.
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         replay.keep(json!({"event": "accepted", "bot": "b", "written_ms": 0,
             "data": {"from": {"bot": "lead"}}}));
         for at in 1..=TAPE as i64 {
@@ -5937,7 +6351,7 @@ mod tests {
 
     #[test]
     fn a_replay_s_tape_lets_its_oldest_tenth_go_past_its_bound() {
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         for at in 0..TAPE as i64 {
             replay.keep(json!({"event": "queued", "written_ms": at}));
         }
@@ -5949,7 +6363,7 @@ mod tests {
         assert!(!replay.cut);
         // Loading the past, nothing played: twice the bound is kept to it,
         // the newest of it, and the replay starts where that does.
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         for at in 0..2 * TAPE as i64 {
             replay.keep(json!({"event": "queued", "written_ms": at}));
         }
@@ -5962,7 +6376,7 @@ mod tests {
             2 * TAPE as i64 - 1
         );
         // Paused with a fifth played, twice the bound more stays bound too.
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         for at in 0..TAPE as i64 {
             replay.keep(json!({"event": "queued", "written_ms": at}));
         }
@@ -5972,7 +6386,7 @@ mod tests {
         }
         assert!(replay.tape.len() <= TAPE);
         // Who was made, or removed, in what went is in the cast now.
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         replay.cast = vec![json!({"name": "old"})];
         replay.keep(json!({"event": "created", "bot": "new", "data": {"bot_id": 9}}));
         replay.keep(json!({"event": "deleted", "bot": "old"}));
@@ -6014,7 +6428,7 @@ mod tests {
     #[tokio::test]
     async fn who_the_tape_let_go_of_stays_in_the_cast_past_the_last_listing() {
         let (mut view, send) = view();
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         // Made at the tape's start, deleted after it: the listing of now
         // no longer names it.
         replay.keep(json!({"event": "created", "bot": "shop.x", "data": {"bot_id": 4}}));
@@ -6036,7 +6450,7 @@ mod tests {
     #[tokio::test]
     async fn who_the_tape_let_go_of_stays_though_its_name_is_used_again() {
         let (mut view, send) = view();
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         // Made at the tape's start; deleted, and its name used again, after.
         replay.keep(json!({"event": "created", "bot": "shop.x", "data": {"bot_id": 4}}));
         for at in 0..TAPE as i64 {
@@ -6059,7 +6473,7 @@ mod tests {
 
     #[test]
     fn a_replay_seats_an_agent_with_its_new_model_after_a_step_back() {
-        let mut replay = Replay::new(0);
+        let mut replay = Replay::new(0, std::path::Path::new("/tmp/agent.sock"));
         replay.cast = vec![json!({"name": "a", "model": "m1"})];
         replay.keep(json!({"event": "created", "bot": "b", "data": {"model": "m1"}}));
         replay.remodel(&HashMap::from([("a", "m2"), ("b", "m3")]));
@@ -6071,7 +6485,7 @@ mod tests {
     async fn a_replay_keeps_who_had_a_name_before_it_was_used_again() {
         let (mut view, send) = view();
         let from = wall_ms() - 3_600_000;
-        view.replay = Some(Replay::new(from));
+        view.replay = Some(Replay::new(from, &view.socket));
         send.send(Feed::Roll(vec![json!({"name": "shop.a", "bot_id": 1})]))
             .unwrap();
         send.send(Feed::Tape(json!({"event": "deleted", "bot": "shop.a",
@@ -6089,7 +6503,7 @@ mod tests {
     #[tokio::test]
     async fn a_replay_takes_the_listing_s_model_for_an_agent_it_saw_made() {
         let (mut view, send) = view();
-        view.replay = Some(Replay::new(0));
+        view.replay = Some(Replay::new(0, &view.socket));
         send.send(Feed::Tape(
             json!({"event": "created", "bot": "b", "written_ms": 1, "data": {"model": "m1"}}),
         ))
@@ -6139,6 +6553,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_click_on_a_star_or_a_name_centres_on_it_and_on_you_lets_go() {
+        let (mut view, send) = view();
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead"}),
+            json!({"name": "shop.login", "created_by": "shop.lead"}),
+            json!({"name": "shop.cart", "created_by": "shop.login"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        let from = json!({"bot": "shop.cart", "turn": 1});
+        send.send(Feed::Live(
+            json!({"cursor": 1, "event": "accepted", "bot": "shop.login", "turn": 2, "data": {"from": from}}),
+        ))
+        .unwrap();
+        view.drain();
+        // What a hit's cells hold, as the card drew them.
+        let under = |lines: &[Line], hit: &Hit| -> String {
+            let row: String = lines[hit.row]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            row.chars().skip(hit.from).take(hit.to - hit.from).collect()
+        };
+        for (cols, rows) in [(120, 40), (70, 40)] {
+            view.centre_on(None);
+            let lines = view.card(cols, rows);
+            let hits = view.hits.clone();
+            // Each name a click finds is the name drawn there, in the sky
+            // and in the log; a star's cells are its dots.
+            let words: Vec<(String, Option<String>)> = (hits.iter())
+                .map(|hit| {
+                    (
+                        under(&lines, hit),
+                        hit.agent.map(|at| view.agents[at].name.clone()),
+                    )
+                })
+                .filter(|(text, _)| text.chars().any(|c| c.is_alphabetic()))
+                .collect();
+            assert!(words.contains(&("you".into(), None)), "{cols}: {words:?}");
+            for name in ["cart", "login"] {
+                let full = Some(format!("shop.{name}"));
+                let named = words
+                    .iter()
+                    .filter(|(text, of)| text == name && *of == full);
+                // Its label beside its star, and the log's "cart → login".
+                assert_eq!(named.count(), 2, "{cols}: {name} in {words:?}");
+            }
+            for hit in hits.iter().filter(|hit| under(&lines, hit) == "cart") {
+                view.centre_on(None);
+                assert!(view.click(hit.row, hit.from));
+                assert_eq!(view.centre.as_deref(), Some("shop.cart"));
+            }
+            let star = hits.iter().find(|hit| {
+                hit.agent == Some(view.index["shop.login"]) && under(&lines, hit) != "login"
+            });
+            let star = star.expect("login's star");
+            assert!(view.click(star.row, star.to - 1));
+            assert_eq!(view.centre.as_deref(), Some("shop.login"));
+            let you = hits.iter().find(|hit| hit.agent.is_none()).unwrap();
+            assert!(view.click(you.row, you.from));
+            assert_eq!(view.centre, None);
+        }
+        // Off every star and name, a click does nothing.
+        let lines = view.card(120, 40);
+        let blank = (0..lines.len()).find(|&row| view.hits.iter().all(|hit| hit.row != row));
+        assert!(!view.click(blank.unwrap(), 0));
+        // A list's row centres on its agent, the pick let go.
+        view.card(40, 12);
+        view.pick = Some("shop.lead".into());
+        let cart = Some(view.index["shop.cart"]);
+        let row = view.hits.iter().find(|hit| hit.agent == cart);
+        let row = row.unwrap().row;
+        assert!(view.click(row, 3));
+        assert_eq!(
+            (view.centre.as_deref(), view.pick.as_deref()),
+            (Some("shop.cart"), None)
+        );
+    }
+
+    #[test]
+    fn a_big_star_across_a_row_s_edge_is_clicked_in_both_rows_it_paints() {
+        let mut sky = Sky::new(40, 5);
+        let (_, down) = sky.scale();
+        // Its centre a fifth of a dot above the middle row's bottom edge.
+        let at = (0.0, 1.8 / down);
+        assert_eq!(sky.painted(at, true), 2..=3);
+        assert_eq!(sky.painted(at, false), 2..=2);
+        sky.star(at, Ink::Plain, true);
+        let inked = |row: usize| (0..40).any(|col| sky.dots[row * 40 + col] != 0);
+        assert!(inked(2) && inked(3));
+    }
+
+    #[test]
+    fn a_name_in_the_log_is_found_for_its_own_agent_in_the_order_it_is_named() {
+        // Two agents of one short name: each takes its own place.
+        let about = ["shop.cart".to_owned(), "other.cart".to_owned()];
+        let said = "cart at 9:00, by cart";
+        assert_eq!(
+            named(said, &about),
+            vec![(0, 4, "shop.cart"), (17, 21, "other.cart")]
+        );
+        // A name inside a longer word is not it; one not written is skipped.
+        let about = ["shop.cart".to_owned(), "shop.login".to_owned()];
+        assert_eq!(named("carts → cart", &about), vec![(8, 12, "shop.cart")]);
+    }
+
+    #[tokio::test]
     async fn a_centred_sky_follows_who_talks_and_a_small_pane_picks_in_its_list() {
         use ratatui::crossterm::event::KeyCode;
         let (mut view, send) = view();
@@ -6148,6 +6671,7 @@ mod tests {
             json!({"name": "shop.cart", "created_by": "shop.login"}),
         ]))
         .unwrap();
+        send.send(Feed::Ready).unwrap();
         view.drain();
         view.centre_on(Some("shop.lead".into()));
         view.card(120, 40);
@@ -6211,6 +6735,7 @@ mod tests {
             );
         }
         send.send(Feed::Roll(bots)).unwrap();
+        send.send(Feed::Ready).unwrap();
         send.send(Feed::Live(
             json!({"cursor": 1, "event": "tool_started", "bot": "shop.t7",
             "turn": 1, "data": {"name": "ask"}}),
@@ -6278,6 +6803,7 @@ mod tests {
             json!({"name": "shop.login", "created_by": "shop.lead"}),
         ]))
         .unwrap();
+        send.send(Feed::Ready).unwrap();
         let from = json!({"bot": "shop.lead", "turn": 3});
         for kind in ["queued", "accepted"] {
             send.send(Feed::Live(
@@ -6380,7 +6906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn what_comes_in_comes_from_who_sent_it_and_a_goal_flies_nowhere() {
+    async fn what_comes_in_comes_from_who_sent_it() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![
             json!({"name": "shop.lead"}),
@@ -6389,7 +6915,7 @@ mod tests {
         .unwrap();
         send.send(Feed::Ready).unwrap();
         view.drain();
-        let (lead, login) = (view.index["shop.lead"], view.index["shop.login"]);
+        let lead = view.index["shop.lead"];
         // A margin note closed: the person's.
         assert_eq!(view.sender(&json!({"origin": "margin"}), lead), End::Person);
         // Task updates name no task: what they quote is the person's
@@ -6410,12 +6936,6 @@ mod tests {
         );
         assert_eq!(commons_invite("commons.release-notes.4.woken"), None);
         assert_eq!(commons_invite("lookout-abc"), None);
-        // A goal: the star pulses, nothing flies, the log says so.
-        send.send(Feed::Live(
-            json!({"event": "accepted", "bot": "shop.login", "turn": 1,
-            "data": {"origin": "goal"}}),
-        ))
-        .unwrap();
         // A schedule: in from the edge, its tick flashing.
         send.send(Feed::Live(
             json!({"event": "accepted", "bot": "shop.lead", "turn": 1,
@@ -6423,15 +6943,11 @@ mod tests {
         ))
         .unwrap();
         view.drain();
-        assert!(view.agents[login].heated.is_some());
         let froms: Vec<End> = view.sparks.iter().map(|s| s.from).collect();
         assert_eq!(froms, [End::Rim(lead)]);
         assert!(view.agents[lead].fired.is_some());
         let logged: Vec<&str> = view.ticker.iter().map(|n| n.text.as_str()).collect();
-        assert_eq!(
-            logged,
-            ["login keeps at its goal", "an automation → shop lead"]
-        );
+        assert_eq!(logged, ["an automation → shop lead"]);
     }
 
     #[tokio::test]
@@ -6607,7 +7123,7 @@ mod tests {
         view.drain();
         assert!(view.sparks.is_empty());
         assert_eq!(view.agents[auto].state(), None);
-        assert!(!text(&view.ticked(Instant::now(), 40, 12, true)).contains("a judge"));
+        assert!(!text(&view.ticked(Instant::now(), 40, 12, true).0).contains("a judge"));
         send.send(Feed::Live(
             json!({"event": "deleted", "bot": "approver.auto.1.9.0"}),
         ))
@@ -6813,9 +7329,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_haiku_reads_as_text_the_log_keeps_its_margin_and_models_colour_names() {
+        let (mut view, send) = view();
+        let long = "shop.a-long-task-name-for-the-log";
+        send.send(Feed::Roll(vec![
+            json!({"name": "shop.lead", "model": "openai/m1"}),
+            json!({"name": long, "created_by": "shop.lead", "model": "anthropic/m2"}),
+        ]))
+        .unwrap();
+        send.send(Feed::Ready).unwrap();
+        send.send(Feed::Live(
+            json!({"event": "accepted", "bot": long, "turn": 1,
+            "data": {"from": {"bot": "shop.lead"}}}),
+        ))
+        .unwrap();
+        view.drain();
+        let now = Instant::now();
+        view.verse = Some(Verse {
+            by: "shop.lead".into(),
+            lines: vec!["stars wake one by one".into(), "b".into(), "c".into()],
+            from: now - Duration::from_secs(60),
+            written: now - Duration::from_secs(60),
+            since: now - Duration::from_secs(600),
+            until: None,
+            story: None,
+        });
+        for note in view.ticker.iter_mut() {
+            note.at = now - Duration::from_secs(20);
+        }
+        // Once in, the haiku's words are in the text's own weight.
+        let haiku = view.haiku(now);
+        assert!(
+            (haiku[0].spans.iter())
+                .filter(|span| !span.content.trim().is_empty())
+                .all(|span| span.style == Style::default()),
+            "{:?}",
+            haiku[0]
+        );
+        // The log's time starts where the haiku does, and its words end
+        // within the haiku's width: the same margin from the edge.
+        let card = text(&view.card(140, 40));
+        let rows: Vec<&str> = card.lines().collect();
+        let col = |row: &str, at: usize| row[..at].width();
+        let poem = rows
+            .iter()
+            .find_map(|row| Some(col(row, row.find("stars wake")?)));
+        let start = poem.expect("the haiku beside the sky");
+        let logged = (rows.iter())
+            .find(|row| row.contains("20s  shop lead → "))
+            .expect("the log line");
+        let time = logged.find("20s").unwrap();
+        assert_eq!(col(logged, time), start, "{logged}");
+        assert!(
+            logged.trim_end().width() <= start + haiku::WIDTH,
+            "{logged}"
+        );
+        // On `m`, a name takes its star's colour.
+        assert!(view.press(ratatui::crossterm::event::KeyCode::Char('m')));
+        let hues: HashMap<String, Color> = view.hues().into_iter().collect();
+        let lines = view.card(140, 40);
+        let named = (lines.iter().flat_map(|line| &line.spans))
+            .find(|span| span.content.contains("lead"))
+            .expect("the lead's name");
+        assert_eq!(named.style.fg, hues.get("m1").copied(), "{named:?}");
+    }
+
+    #[tokio::test]
     async fn a_commons_post_ripples_and_an_origin_comes_from_the_rim() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![json!({"name": "a"})])).unwrap();
+        send.send(Feed::Ready).unwrap();
         send.send(Feed::Live(
             json!({"event": "tool_started", "bot": "a", "turn": 1, "data": {
             "name": "commons", "arguments": r#"{"post":{"name":"flaky-tests","title":"Flaky tests","text":"Seen twice"}}"#}}),
@@ -6830,7 +7413,8 @@ mod tests {
         assert_eq!(view.sparks[0].from, End::Rim(0));
         let shown = text(&view.card(60, 30));
         assert!(shown.contains("a posted to the commons"), "{shown}");
-        assert!(shown.contains("a follow → a"), "{shown}");
+        // Named for what it brings, not the lookout's word for asking.
+        assert!(shown.contains("its sources → a"), "{shown}");
     }
 
     #[tokio::test]
@@ -7104,6 +7688,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_sky_opens_whole_once_who_is_here_and_what_they_ask_are_read() {
+        let (mut view, send) = view();
+        let (scans, mut asked) = mpsc::unbounded_channel();
+        send.send(Feed::Scans(scans)).unwrap();
+        send.send(Feed::Roll(vec![json!({"name": "a"}), json!({"name": "b"})]))
+            .unwrap();
+        send.send(Feed::Past(
+            json!({"event": "accepted", "bot": "a", "turn": 1, "data": {}}),
+        ))
+        .unwrap();
+        view.drain();
+        let waiting = text(&view.card(80, 30));
+        assert_eq!(waiting.trim(), "Catching up with who is here…");
+        // What they hold is in and their questions are asked for: still one
+        // line, ready or not, until each agent's questions are read.
+        send.send(Feed::Held(Vec::new())).unwrap();
+        send.send(Feed::Ready).unwrap();
+        view.drain();
+        let mut sent = Vec::new();
+        while let Ok((name, _)) = asked.try_recv() {
+            sent.push(name);
+        }
+        sent.sort();
+        assert_eq!(sent, ["a", "b"]);
+        assert_eq!(
+            text(&view.card(80, 30)).trim(),
+            "Catching up with who is here…"
+        );
+        send.send(Feed::Asked("a".into(), None)).unwrap();
+        view.drain();
+        assert_eq!(
+            text(&view.card(80, 30)).trim(),
+            "Catching up with who is here…"
+        );
+        send.send(Feed::Asked("b".into(), None)).unwrap();
+        view.drain();
+        let open = text(&view.card(80, 30));
+        assert!(!open.contains("Catching up"), "{open}");
+        assert!(
+            open.contains("you") && open.contains("Quiet. Messages"),
+            "{open}"
+        );
+        // A fresh follow opens whole again.
+        view.pause();
+        view.resume();
+        assert_eq!(
+            text(&view.card(80, 30)).trim(),
+            "Catching up with who is here…"
+        );
+    }
+
+    #[tokio::test]
     async fn a_lost_follow_is_told_under_the_messages() {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![json!({"name": "a"})])).unwrap();
@@ -7134,6 +7770,7 @@ mod tests {
             json!({"name": "shop.cart", "created_by": "shop.lead"}),
         ]))
         .unwrap();
+        send.send(Feed::Ready).unwrap();
         let live = |bot: &str, kind: &str, turn: i64, data: Value| {
             Feed::Live(json!({"event": kind, "bot": bot, "turn": turn, "data": data}))
         };
@@ -7181,6 +7818,24 @@ mod tests {
         let shown = text(&view.card(100, 40));
         assert!(shown.contains("? shop lead"), "{shown}");
         assert!(shown.contains("✗ cart"), "{shown}");
+        // A `?` just raised beats reversed, then holds still.
+        // The compact list a small pane draws beats the same.
+        let beating = |view: &mut View, cols: usize, rows: usize| {
+            (view
+                .card(cols, rows)
+                .iter()
+                .flat_map(|line| line.spans.iter()))
+            .filter(|span| span.content.contains('?'))
+            .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .count()
+        };
+        assert_eq!(beating(&mut view, 100, 40), 2);
+        assert_eq!(beating(&mut view, 50, 20), 2);
+        for agent in &mut view.agents {
+            agent.asked = agent.asked.map(|at| at - Duration::from_secs(2));
+        }
+        assert_eq!(beating(&mut view, 100, 40), 0);
+        assert_eq!(beating(&mut view, 50, 20), 0);
         assert_eq!(
             text(&[view.footer(100)]),
             "  3 agents · ? 2 need you · ● 0 working · ✗ 1 failed · 3 messages in the last minute"
@@ -7221,21 +7876,24 @@ mod tests {
         ]))
         .unwrap();
         let seen = |turn: i64| crate::needs::Seen {
-            ask: Some("q1".into()),
+            ask: crate::asks::call(
+                &crate::asks::id(2, "q1"),
+                &json!({"question": "q1", "options": [{"label": "a"}]}),
+            ),
             itself: false,
             turn: Some(turn),
         };
         // Its lead resolved the cart past the turn that asked; the login
         // still asks, as does the cart once a later turn reopens it.
-        send.send(Feed::Asked("shop.cart".into(), Some(seen(4))))
+        send.send(Feed::Asked("shop.cart".into(), Some(Box::new(seen(4)))))
             .unwrap();
-        send.send(Feed::Asked("shop.login".into(), Some(seen(4))))
+        send.send(Feed::Asked("shop.login".into(), Some(Box::new(seen(4)))))
             .unwrap();
         view.drain();
         let state = |view: &View, name: &str| view.agents[view.index[name]].state();
         assert_ne!(state(&view, "shop.cart"), Some(State::NeedsYou));
         assert_eq!(state(&view, "shop.login"), Some(State::NeedsYou));
-        send.send(Feed::Asked("shop.cart".into(), Some(seen(6))))
+        send.send(Feed::Asked("shop.cart".into(), Some(Box::new(seen(6)))))
             .unwrap();
         view.drain();
         assert_eq!(state(&view, "shop.cart"), Some(State::NeedsYou));
@@ -7344,6 +8002,7 @@ mod tests {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![json!({"name": "shop.lead"})]))
             .unwrap();
+        send.send(Feed::Ready).unwrap();
         view.drain();
         view.legend = true;
         let shown = text(&view.card(80, 30));
@@ -7361,7 +8020,7 @@ mod tests {
         assert!(wide.contains("   working: it breathes"), "{wide}");
         assert!(wide.contains(" leads         1"), "{wide}");
         view.legend = false;
-        assert!(text(&view.card(80, 30)).contains("Catching up"));
+        assert!(text(&view.card(80, 30)).contains("Quiet. Messages light up here"));
     }
 
     #[tokio::test]
@@ -7369,6 +8028,7 @@ mod tests {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![json!({"name": "a"}), json!({"name": "b"})]))
             .unwrap();
+        send.send(Feed::Ready).unwrap();
         for turn in 1..=3 {
             send.send(Feed::Live(
                 json!({"event": "accepted", "bot": "b", "turn": turn,
@@ -7423,6 +8083,7 @@ mod tests {
             bots.push(json!({"name": format!("shop.t{n}"), "created_by": "shop.lead"}));
         }
         send.send(Feed::Roll(bots)).unwrap();
+        send.send(Feed::Ready).unwrap();
         send.send(Feed::Live(
             json!({"event": "accepted", "bot": "shop.t29", "turn": 1,
             "data": {"from": {"bot": "shop.lead"}}}),
@@ -7667,7 +8328,10 @@ mod scale {
         // A replay's tape, full, with the view let go first.
         drop(view);
         let live_gone = rss_kib();
-        let mut replay = Replay::new(wall_ms() - 3_600_000);
+        let mut replay = Replay::new(
+            wall_ms() - 3_600_000,
+            std::path::Path::new("/tmp/agent.sock"),
+        );
         let start = Instant::now();
         for n in 0..TAPE + TAPE / 20 {
             replay.keep(slim(busy(n, count, projects)));

@@ -26,8 +26,9 @@ pub struct Markdown {
     /// How far the last line's wrapped rows are indented: under a list
     /// item's text, so a continuation does not read as a new item.
     hang: usize,
-    /// The last line is a quote's, so its wrapped rows keep its bar.
-    quoted: bool,
+    /// How deep in quotes the last line is, so its wrapped rows keep
+    /// its bars.
+    quoted: usize,
     /// A table's rows, held until it ends, so its columns can be fitted.
     table: Vec<String>,
     /// Inside display math, gathered in `picture`: what closes it,
@@ -146,8 +147,8 @@ impl Markdown {
 
     /// What the last line's wrapped rows start with, inside a reply.
     pub fn rest(&self) -> Span<'static> {
-        if self.quoted {
-            return Span::raw("  ▌ ").dim();
+        if self.quoted > 0 {
+            return Span::raw(format!("  {}", "▌ ".repeat(self.quoted))).dim();
         }
         Span::raw(format!("  {}", " ".repeat(self.hang)))
     }
@@ -220,7 +221,7 @@ impl Markdown {
     pub fn line(&mut self, text: &str) -> Option<Line<'static>> {
         let trimmed = text.trim_start();
         self.hang = 0;
-        self.quoted = false;
+        self.quoted = 0;
         // $$ display math $$, on one line or around several, and the
         // \[ display math \] many models write.
         let line = trimmed.trim_end();
@@ -336,9 +337,18 @@ impl Markdown {
             spans.extend(inline(rest, Style::new()));
             return Some(Line::from(spans));
         }
-        if let Some(rest) = trimmed.strip_prefix("> ") {
-            self.quoted = true;
-            let mut spans = vec![Span::raw("▌ ").dim()];
+        if let Some(mut rest) = quote_line(trimmed) {
+            // A quote in a quote, `> >`, draws a bar for each, up to
+            // `QUOTE_DEPTH`: marks past it are kept as written, so a line
+            // of a thousand `>` costs its length, not bars on every row.
+            let mut depth = 1;
+            while depth < QUOTE_DEPTH
+                && let Some(inner) = quote_line(rest.trim_start())
+            {
+                (rest, depth) = (inner, depth + 1);
+            }
+            self.quoted = depth;
+            let mut spans = vec![Span::raw("▌ ".repeat(depth)).dim()];
             spans.extend(inline(rest, Style::new().italic()));
             return Some(Line::from(spans));
         }
@@ -1211,20 +1221,37 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
         Some((question, answer)) => (Some(crate::asks::answering(question, width)), answer),
         None => (None, text),
     };
-    // A long paste shows its start; the rest is in the conversation.
+    // A long paste shows its start, and a row a click opens to the rest.
     let lines: Vec<&str> = text.lines().collect();
-    let shown = if lines.len() > PROMPT_LINES + 2 {
-        PROMPT_LINES
-    } else {
-        lines.len()
-    };
+    let shown = shown_lines(lines.len());
     // On its band with a row of it above and below, as the composer it
     // was written in: the words sit in the middle, not on an edge.
-    let band = crate::look::band();
+    let band = crate::look::BAND;
     out.push(Line::default().bg(band));
     out.extend(answering.map(|row| row.bg(band)));
-    for (i, line) in lines[..shown].iter().enumerate() {
-        let lead = if i == 0 { "› " } else { "  " };
+    out.extend(prompt_rows(&lines[..shown], 0, width));
+    if lines.len() > shown {
+        out.extend(prompt_rest(lines.len() - shown, None, width));
+    }
+    out.push(Line::default().bg(band));
+    out
+}
+
+/// How many of a prompt's `count` lines show while it is folded: all of
+/// a short one, the first [`PROMPT_LINES`] of a long one.
+fn shown_lines(count: usize) -> usize {
+    match count > PROMPT_LINES + 2 {
+        true => PROMPT_LINES,
+        false => count,
+    }
+}
+
+/// A prompt's `lines` on its band, the first of them its `at`th.
+fn prompt_rows(lines: &[&str], at: usize, width: usize) -> Vec<Line<'static>> {
+    let band = crate::look::BAND;
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let lead = if at + i == 0 { "› " } else { "  " };
         out.extend(wrap(
             Line::from(line.to_string()).bg(band),
             width,
@@ -1232,15 +1259,46 @@ pub fn prompt(text: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>
             Span::raw("  "),
         ));
     }
-    if lines.len() > shown {
-        out.push(
-            Line::from(format!("  … +{} lines", lines.len() - shown))
-                .dim()
-                .bg(band),
-        );
-    }
-    out.push(Line::default().bg(band));
     out
+}
+
+/// The rows of a long prompt past its first lines, `more` of them: its
+/// fold row alone while shut (`open` none), and open, those lines
+/// (`open`, from its first hidden one) and the row under them, which a
+/// click shuts again.
+fn prompt_rest(more: usize, open: Option<&[&str]>, width: usize) -> Vec<Line<'static>> {
+    let band = crate::look::BAND;
+    let mut out = match open {
+        Some(lines) => prompt_rows(lines, PROMPT_LINES, width),
+        None => Vec::new(),
+    };
+    let row = match open {
+        Some(_) => format!("  +{more} lines ▾"),
+        None => format!("  … +{more} lines ▸"),
+    };
+    out.push(Line::from(row).dim().bg(band));
+    out
+}
+
+/// Where a prompt drawn by [`prompt`] folds: its fold row's place among
+/// its rows, at `width`; none for one that shows whole.
+pub fn prompt_fold(text: &str, width: usize) -> Option<usize> {
+    let (_, body) = crate::asks::split(text).unwrap_or(("", text));
+    let count = body.lines().count();
+    if shown_lines(count) == count || news(text).is_some() {
+        return None;
+    }
+    // Its last row is the band's; the fold row is right over it.
+    Some(prompt(text, None, width).len() - 2)
+}
+
+/// A long prompt's rows past its first lines, open or shut: what
+/// replaces its fold row (or those rows) when the row is clicked.
+pub fn prompt_more(text: &str, width: usize, open: bool) -> Vec<Line<'static>> {
+    let (_, body) = crate::asks::split(text).unwrap_or(("", text));
+    let lines: Vec<&str> = body.lines().collect();
+    let shown = shown_lines(lines.len());
+    prompt_rest(lines.len() - shown, open.then_some(&lines[shown..]), width)
 }
 
 /// Whether a message is from another bot or tells the lead of its tasks:
@@ -1249,13 +1307,22 @@ pub fn relays(text: &str, from: Option<&str>) -> bool {
     from.is_some() || news(text).is_some()
 }
 
-/// What sent a prompt from outside, in the words the person reads.
+/// What sent a prompt from outside, in the words the person reads. The
+/// lookout's notes say what they bring, not the lookout's own word for
+/// how an agent asked for them (a follow): its tasks' news, its sources'
+/// news, a message that came back.
 pub fn from_outside(origin: Option<&str>) -> &'static str {
-    match origin.unwrap_or("").split('.').next() {
-        Some("lookout") => "a follow",
+    let origin = origin.unwrap_or("");
+    match origin {
+        crate::lookout::TASKS_ORIGIN => return "task updates",
+        crate::lookout::sources::ORIGIN => return "its sources",
+        crate::lookout::BOUNCE_ORIGIN => return "a returned message",
+        _ => {}
+    }
+    match origin.split('.').next() {
+        Some("lookout") => "the lookout",
         Some("automation" | "trigger") => "an automation",
         Some("commons") => "the commons",
-        Some("goal") => "a goal",
         Some("margin") => "a margin note",
         Some("tasks") => "a task",
         Some("judge") => "a judge",
@@ -1284,7 +1351,7 @@ pub fn sender(bot: Option<&str>, origin: Option<&str>, person: Option<&str>) -> 
 /// row with `▾` and the whole message under it.
 pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<Line<'static>> {
     if !open {
-        return relayed_shut(&relayed_head(text, from), from, width);
+        return relayed_shut(&relayed_head(text, from), width);
     }
     let head = match (news(text), from) {
         (Some(parts), _) => parts[0].clone(),
@@ -1341,7 +1408,7 @@ pub fn with_quotes(
     quotes: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let band = crate::look::band();
+    let band = crate::look::BAND;
     let Some(end) = prompt.pop() else {
         return prompt;
     };
@@ -1354,10 +1421,16 @@ pub fn with_quotes(
     prompt
 }
 
-/// A line of quoted words, as Markdown marks one: `> ` before it, or a
-/// lone `>` for a blank line between them.
+/// The most bars a quote draws, as deep as it is nested; the rest of
+/// its marks are kept as written, as groups past eight deep are.
+const QUOTE_DEPTH: usize = 8;
+
+/// A line of quoted words, as CommonMark marks one: `>` before it and
+/// at most one space after, so `> words`, `>words`, and a lone `>` for a
+/// blank line inside the quote all count.
 fn quote_line(line: &str) -> Option<&str> {
-    line.strip_prefix("> ").or((line == ">").then_some(""))
+    let rest = line.strip_prefix('>')?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
 }
 
 /// What the shut row of words between agents says: who sent them, not
@@ -1376,24 +1449,13 @@ pub fn relayed_head(text: &str, from: Option<&str>) -> String {
 /// short of the window, so a row is read at a glance.
 pub const GLANCE: usize = 48;
 
-/// The shut row of words between agents, from [`relayed_head`].
-pub fn relayed_shut(head: &str, from: Option<&str>, width: usize) -> Vec<Line<'static>> {
+/// The shut row of words between agents, from [`relayed_head`]. Who
+/// sent it is a word like any other: a name that is an agent's opens it,
+/// in the agents' color, as wherever an agent is named.
+pub fn relayed_shut(head: &str, width: usize) -> Vec<Line<'static>> {
     // Cut apart from its arrow, which a narrow window would cut too.
     let head = cut(head, width.saturating_sub(4));
-    // Who said it in the agents' color.
-    let mut spans = vec![Span::raw("↳ ")];
-    let rest = head.as_str();
-    // Only a bot's name takes the agents' color: what sent words from
-    // outside ("the commons") is named in words, with spaces.
-    match from.filter(|from| rest == format!("From {from}") && !from.contains(' ')) {
-        Some(from) => {
-            spans.push(Span::raw("From "));
-            spans.push(Span::raw(from.to_owned()).fg(Color::Blue));
-        }
-        None => spans.push(Span::raw(rest.to_owned())),
-    }
-    spans.push(Span::raw(" ▸"));
-    vec![Line::from(spans).dim()]
+    vec![Line::from(format!("↳ {head} ▸")).dim()]
 }
 
 /// What words attached to a call are, as the row that gathers several
@@ -1437,9 +1499,9 @@ pub fn relayed_kind(text: &str, from: Option<&str>) -> &'static str {
 /// Whom a message between agents is from or about: its sender, the tasks
 /// task updates name, the sources that reported.
 pub fn relayed_names(text: &str, from: Option<&str>) -> Vec<String> {
-    // News names whom it is about, not what sent it ("a follow").
+    // News names whom it is about, not what sent it ("task updates").
     if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
-        return (sourced(rest).into_iter().skip(1))
+        return (sourced(rest, &Default::default()).into_iter().skip(1))
             .filter(|source| !source.starts_with('+'))
             .collect();
     }
@@ -1481,6 +1543,123 @@ pub fn gathered(kinds: &[&str], names: &[String], open: bool, width: usize) -> L
     Line::from(format!("{head} {}", if open { "▾" } else { "▸" })).dim()
 }
 
+/// Calls that send another agent words: what the row gathering them says
+/// as `sent to`.
+const SENDS: [&str; 4] = [
+    "Started a turn for",
+    "Steered",
+    "Queued for",
+    "Left a note for",
+];
+
+/// What `did` (calls as Sonny says them: `Steered`, `calc.fix`) did, in a
+/// few lower-case words each, in the order first done: `sent 4 to
+/// calc.fix`, `followed calc.neg`, `saved 2 memories`.
+pub fn did(did: &[(String, String)]) -> Vec<String> {
+    let mut said: Vec<(String, Vec<String>)> = Vec::new();
+    for (verb, what) in did {
+        let verb = match verb.as_str() {
+            verb if SENDS.contains(&verb) => "sent to",
+            verb => verb,
+        };
+        match said.iter_mut().find(|(v, _)| v == verb) {
+            Some((_, whats)) => whats.push(what.clone()),
+            None => said.push((verb.to_owned(), vec![what.clone()])),
+        }
+    }
+    said.into_iter()
+        .map(|(verb, whats)| {
+            let n = whats.len();
+            let memories = |done: &str| match n {
+                1 => format!("{done} a memory"),
+                n => format!("{done} {n} memories"),
+            };
+            match verb.as_str() {
+                "Saved to memory" => memories("saved"),
+                "Updated in memory" => memories("updated"),
+                "Removed from memory" => memories("removed"),
+                verb => {
+                    let names = crate::calls::once(whats.into_iter());
+                    let verb = lower_first(verb);
+                    match (verb.strip_suffix(" to"), names.len() < n) {
+                        (Some(sent), true) => format!("{sent} {n} to {}", names.join(", ")),
+                        (None, true) => format!("{verb} {} ×{n}", names.join(", ")),
+                        _ => format!("{verb} {}", names.join(", ")),
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+fn lower_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// How far a plan has got, as the row gathering it says: `plan 1/3`,
+/// `plan done`, or `cleared the plan` for none.
+pub fn plan_progress(steps: &[String]) -> String {
+    let done = steps.iter().filter(|step| step.starts_with("[x]")).count();
+    match steps.len() {
+        0 => "cleared the plan".to_owned(),
+        all if done == all => "plan done".to_owned(),
+        all => format!("plan {done}/{all}"),
+    }
+}
+
+/// The row for what went on between two things said: how many of each
+/// `kinds` came in and whom `names` names, as [`gathered`] says them,
+/// then what the agent `did` and where its `plan` stands, `▸` to open;
+/// open, `▾`. Names give way first, then the words for what was done.
+pub fn gap(
+    kinds: &[&str],
+    names: &[String],
+    done: &[(String, String)],
+    plan: Option<&str>,
+    open: bool,
+    width: usize,
+) -> Line<'static> {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for kind in kinds {
+        match counts.iter_mut().find(|(k, _)| k == kind) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((kind, 1)),
+        }
+    }
+    let came: Vec<String> = (counts.into_iter())
+        .map(|(kind, n)| match n {
+            1 => format!("1 {kind}"),
+            n => format!("{n} {kind}s"),
+        })
+        .collect();
+    let mut acts = did(done);
+    acts.extend(plan.map(str::to_owned));
+    let acts = acts.join(", ");
+    let room = width.saturating_sub(2);
+    let text = match (came.is_empty(), acts.is_empty()) {
+        (true, _) => cut(&format!("↳ {acts}"), room),
+        (false, empty) => {
+            let head = format!("↳ {}", came.join(", "));
+            let tail = match empty {
+                true => String::new(),
+                false => format!(" · {acts}"),
+            };
+            let names = crate::calls::once(names.iter().cloned()).join(", ");
+            let left = room.saturating_sub(head.width() + tail.width() + 3);
+            let named = match !names.is_empty() && left >= 8.min(names.width()) {
+                true => format!(" · {}", cut(&names, left).replace(",…", "…")),
+                false => String::new(),
+            };
+            cut(&format!("{head}{named}{tail}"), room)
+        }
+    };
+    Line::from(format!("{text} {}", if open { "▾" } else { "▸" })).dim()
+}
+
 /// `lines` moved `columns` to the right, a wrapped row still known for
 /// one, so a copy joins it as before.
 pub fn indented(lines: Vec<Line<'static>>, columns: usize) -> Vec<Line<'static>> {
@@ -1514,7 +1693,7 @@ const FROM_SOURCES: &str = "From your sources: ";
 /// sources said, as its kind and a few words for each thing it tells.
 fn news(text: &str) -> Option<Vec<String>> {
     if let Some(rest) = text.strip_prefix(FROM_SOURCES) {
-        return Some(sourced(rest));
+        return Some(sourced(rest, &crate::background::source_icons()));
     }
     // "- the lead role: theirs at …" is the lead role, "- set up backup: …"
     // the backup, "- do move; …" the step it asks, and a register's rows
@@ -1589,8 +1768,9 @@ fn news(text: &str) -> Option<Vec<String>> {
 }
 
 /// What each source said, counted: "- slack, from \"ana\" (for your
-/// chat): \"lunch?\"" is one from slack.
-fn sourced(rest: &str) -> Vec<String> {
+/// chat): \"lunch?\"" is one from slack, marked by its `icon` when it has
+/// one, as `/status` and `/background` mark it.
+fn sourced(rest: &str, icons: &std::collections::HashMap<String, String>) -> Vec<String> {
     let mut counts: Vec<(String, usize)> = Vec::new();
     let (mut more, mut unkept) = (None, None);
     for item in rest.lines().filter_map(|line| line.strip_prefix("- ")) {
@@ -1611,9 +1791,19 @@ fn sourced(rest: &str) -> Vec<String> {
         }
     }
     let mut parts = vec!["From your sources".to_owned()];
-    parts.extend(counts.into_iter().map(|(source, n)| match n {
-        1 => source,
-        n => format!("{source} {n}"),
+    parts.extend(counts.into_iter().map(|(source, n)| {
+        // A topic's news names it `SOURCE:TOPIC`; the icon is the source's.
+        let of = source
+            .split_once(':')
+            .map_or(source.as_str(), |(name, _)| name);
+        let named = match icons.get(of) {
+            Some(icon) => format!("{icon} {source}"),
+            None => source,
+        };
+        match n {
+            1 => named,
+            n => format!("{named} {n}"),
+        }
     }));
     parts.extend(more);
     parts.extend(unkept);
@@ -1929,7 +2119,7 @@ pub fn tool(
 }
 
 /// What the clean view keeps of a call: the calls that move the work on,
-/// said as [`tool`] says them (an agent started, messaged or waited for,
+/// said as [`tool`] says them (an agent started, steered or waited for,
 /// a question to the person, the plan, a task resolved, memory, a
 /// trigger, a window opened), and nothing of the rest. A command line keeps only those of
 /// its commands.
@@ -1945,11 +2135,12 @@ pub fn clean(
 }
 
 /// What the clean view keeps, by what Sonny says a call did.
-const KEPT: [&str; 26] = [
+const KEPT: [&str; 27] = [
     "Started",
-    "Messaged",
+    "Started a turn for",
     "Steered",
     "Queued for",
+    "Left a note for",
     "Forked",
     "Interrupted",
     "Removed",
@@ -1982,11 +2173,12 @@ fn kept(said: &crate::calls::Said) -> bool {
 /// and folded into one when several come in a row: those that start,
 /// message, wait for or change agents and what runs for them, which a
 /// lead often makes a few of at once. What they said opens on a click.
-const FOLDS: [&str; 22] = [
+const FOLDS: [&str; 23] = [
     "Started",
-    "Messaged",
+    "Started a turn for",
     "Steered",
     "Queued for",
+    "Left a note for",
     "Waited for",
     "Forked",
     "Interrupted",
@@ -2176,7 +2368,7 @@ fn drawn(
                     own = rows.join("\n");
                 } else if matches!(
                     first.verb.as_str(),
-                    "Started" | "Messaged" | "Queued for" | "Steered"
+                    "Started" | "Started a turn for" | "Steered" | "Queued for" | "Left a note for"
                 ) {
                     own = claim(&mut printed, &|v| {
                         v.get("handle").is_some() || v.get("error").is_some()
@@ -2781,7 +2973,7 @@ fn shown(path: &str, workspace: &str) -> String {
     }
 }
 
-pub fn finished(status: &str, detail: &str, seconds: Option<u64>, width: usize) -> Line<'static> {
+pub fn finished(status: &str, detail: &str, seconds: Option<u64>) -> Line<'static> {
     let mut label = match status {
         "completed" => "Worked".to_owned(),
         "steered" => "Steered".to_owned(),
@@ -2793,20 +2985,13 @@ pub fn finished(status: &str, detail: &str, seconds: Option<u64>, width: usize) 
     if !detail.is_empty() {
         label.push_str(&format!(" · {detail}"));
     }
-    let text = format!("─ {label} ");
-    // No wider than 80 columns, so a pane that narrows later rarely re-wraps it.
-    let fill = width.min(80).saturating_sub(text.width());
-    let style = if matches!(status, "completed" | "steered") {
-        Style::new().dim()
-    } else {
-        Style::new().fg(Color::Red)
+    // Words only, muted: the person's band already parts one turn from the
+    // next, and a rule as wide as the column outweighed the reply above it.
+    let style = match status {
+        "completed" | "steered" => Style::new().dim(),
+        _ => Style::new().fg(Color::Red),
     };
-    // The fill is a span of its own: a row that ends in one is a rule, cut
-    // at the edge rather than wrapped (`screen`).
-    Line::from(vec![
-        Span::styled(text, style),
-        Span::styled("─".repeat(fill), style),
-    ])
+    Line::from(Span::styled(label, style))
 }
 
 /// How full a conversation of `size` tokens is, as the footer says it:
@@ -2863,6 +3048,85 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_row_between_things_said_says_what_came_and_what_was_done() {
+        let call = |verb: &str, what: &str| (verb.to_owned(), what.to_owned());
+        // Sends of any kind are said once, counted when one agent had more.
+        let done = [
+            call("Steered", "calc.add"),
+            call("Queued for", "calc.add"),
+            call("Left a note for", "calc.neg"),
+            call("Followed", "leads"),
+            call("Saved to memory", "flow"),
+            call("Saved to memory", "taste"),
+            call("Scheduled", "lead.next"),
+            call("Scheduled", "lead.next"),
+        ];
+        assert_eq!(
+            did(&done),
+            [
+                "sent 3 to calc.add, calc.neg",
+                "followed leads",
+                "saved 2 memories",
+                "scheduled lead.next ×2",
+            ]
+        );
+        assert_eq!(
+            did(&[call("Started a turn for", "a"), call("Steered", "b")]),
+            ["sent to a, b"]
+        );
+        let plan = |steps: &[&str]| {
+            plan_progress(&steps.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(plan(&["[x] a", "[>] b", "[ ] c"]), "plan 1/3");
+        assert_eq!(plan(&["[x] a", "[x] b"]), "plan done");
+        assert_eq!(plan(&[]), "cleared the plan");
+        // What came in, whom, then what was done; names give way first.
+        let names: Vec<String> = ["sbx-test.lead", "Titanium.lead", "blue.lead", "errand.lead"]
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        let kinds = ["task update", "task update", "message"];
+        let done = [call("Removed the automation", "lead.next")];
+        let row = gap(&kinds, &names, &done, Some("plan done"), false, 140).to_string();
+        assert_eq!(
+            row,
+            "↳ 2 task updates, 1 message · sbx-test.lead, Titanium.lead, blue.lead, errand.lead · \
+             removed the automation lead.next, plan done ▸"
+        );
+        let row = gap(&kinds, &names, &done, Some("plan done"), true, 100).to_string();
+        assert!(row.width() <= 100, "{row}");
+        assert_eq!(
+            row,
+            "↳ 2 task updates, 1 message · sbx-test.lead, Titani… · removed the automation lead.next, plan done ▾"
+        );
+        // Too narrow for names: none, and what was done is cut last.
+        let row = gap(&kinds, &names, &done, Some("plan done"), false, 60).to_string();
+        assert!(row.width() <= 60, "{row}");
+        assert!(
+            row.starts_with("↳ 2 task updates, 1 message · removed the"),
+            "{row}"
+        );
+        // Nothing came in: only what was done.
+        assert_eq!(
+            gap(&[], &[], &done, None, false, 100).to_string(),
+            "↳ removed the automation lead.next ▸"
+        );
+    }
+
+    #[test]
+    fn the_lookout_s_notes_are_named_for_what_they_bring() {
+        assert_eq!(from_outside(Some("lookout.tasks")), "task updates");
+        assert_eq!(from_outside(Some("lookout.sources")), "its sources");
+        assert_eq!(from_outside(Some("lookout.bounce")), "a returned message");
+        assert_eq!(from_outside(Some("lookout.other")), "the lookout");
+        assert_eq!(from_outside(Some("automation.weekly")), "an automation");
+        assert_eq!(
+            sender(None, Some("lookout.sources"), None).as_deref(),
+            Some("its sources")
+        );
+    }
 
     fn text(lines: &[Line]) -> Vec<String> {
         lines.iter().map(|l| l.to_string()).collect()
@@ -2922,15 +3186,50 @@ mod tests {
     }
 
     #[test]
-    fn who_sent_words_between_agents_shows_in_the_agents_color() {
+    fn who_sent_words_between_agents_is_named_whole_and_never_colored_here() {
         let rows = relayed("Tests pass.", Some("calc.neg"), false, 80);
         assert_eq!(text(&rows), ["↳ From calc.neg ▸"]);
-        let sender = rows[0].spans.iter().find(|s| s.content == "calc.neg");
-        assert_eq!(sender.and_then(|s| s.style.fg), Some(Color::Blue));
+        // The color is the link's, which the screen draws once the name
+        // is an agent's: never one a name that opens nothing keeps.
+        assert!(rows[0].spans.iter().all(|s| s.style.fg.is_none()));
         // A window too narrow for any of it still draws the arrow.
         for width in 0..8 {
             relayed("Tests pass.", Some("calc.neg"), false, width);
         }
+    }
+
+    #[test]
+    fn a_quote_keeps_its_bar_over_blank_lines_and_without_a_space() {
+        // CommonMark: `>` and at most one space; a lone `>` is the quote's
+        // blank line, and `> >` a quote inside it.
+        let reply = "> First paragraph.\n>\n>Second, no space.\n> > Nested.\nAfter.";
+        let lead = || Line::from("  ");
+        let rows = markdown(&mut Markdown::default(), reply, 80, (lead(), lead()));
+        assert_eq!(
+            text(&rows),
+            [
+                "  ▌ First paragraph.",
+                "  ▌ ",
+                "  ▌ Second, no space.",
+                "  ▌ ▌ Nested.",
+                "  After.",
+            ]
+        );
+        // A wrapped row keeps every bar its line has.
+        let mut quote = Markdown::default();
+        quote.line("> > a long nested quote");
+        assert_eq!(quote.rest().content, "  ▌ ▌ ");
+        // As deep as it goes, at most eight bars: the rest stays text, so
+        // a run of marks wraps as words do, its rows' leads no longer.
+        let deep = ">".repeat(10_000);
+        let rows = markdown(&mut Markdown::default(), &deep, 80, (lead(), lead()));
+        let bars = format!("  {}", "▌ ".repeat(8));
+        assert_eq!(rows[0].to_string(), bars);
+        assert!(rows[1].to_string().starts_with(&format!("{bars}>")));
+        assert!(rows.iter().all(|row| row.width() <= 80));
+        assert_eq!(quote_line(">"), Some(""));
+        quote.line(&deep);
+        assert_eq!(quote.rest().content.chars().count(), 2 + 2 * 8);
     }
 
     #[test]
@@ -3079,6 +3378,17 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_turn_ends_on_its_words_alone_muted() {
+        let done = finished("completed", "", Some(11));
+        assert_eq!(done.to_string(), "Worked for 11s");
+        assert!(!done.to_string().contains('─'), "no rule");
+        assert!(done.spans[0].style.add_modifier.contains(Modifier::DIM));
+        // A failure is still read in red.
+        let failed = finished("failed", "", None);
+        assert!(failed.spans.iter().all(|s| s.style.fg == Some(Color::Red)));
+    }
+
+    #[test]
     fn an_answer_shows_itself_under_the_question_it_answers() {
         let shown: Vec<String> = prompt("You asked (c1): Ship it?\n\nNot yet", None, 80)
             .iter()
@@ -3088,7 +3398,13 @@ mod tests {
         assert_eq!(shown, ["", "  answering “Ship it?”", "› Not yet", ""]);
         let rows = prompt("You asked (c1): Ship **it**?\n\nNot yet", None, 80);
         assert_eq!(rows[1].to_string(), "  answering “Ship it?”");
-        assert!(rows.iter().all(|row| row.style.bg.is_some()));
+        // The band's role, made the theme's band as each frame is drawn,
+        // so a light/dark switch reaches these rows without drawing them
+        // again.
+        assert!(
+            rows.iter()
+                .all(|row| row.style.bg == Some(crate::look::BAND))
+        );
     }
 
     #[test]
@@ -3152,7 +3468,7 @@ mod tests {
             "task update",
         ];
         assert_eq!(relayed_names(updates, None), ["a.b"]);
-        assert_eq!(relayed_names(updates, Some("a follow")), ["a.b"]);
+        assert_eq!(relayed_names(updates, Some("task updates")), ["a.b"]);
         assert_eq!(relayed_names("Look at this", Some("a.c")), ["a.c"]);
         let names = ["a.b", "a.c", "a.b", "a.d"].map(String::from);
         assert_eq!(
@@ -3242,6 +3558,16 @@ mod tests {
             text(&super::prompt(note, None, 90)),
             ["↳ From your sources · slack 2 · mail · +3 more · 40 not kept"]
         );
+        // A source with an icon is marked by it, as `/status` marks its
+        // followers; one without stays its name.
+        let rest = note.strip_prefix(FROM_SOURCES).unwrap();
+        let icons = [("slack".to_owned(), "▲".to_owned())].into();
+        assert_eq!(super::sourced(rest, &icons)[1..3], ["▲ slack 2", "mail"]);
+        // One topic of it, too.
+        assert_eq!(
+            super::sourced("- slack:deploys (for your chat): \"ship it\"", &icons)[1],
+            "▲ slack:deploys"
+        );
     }
 
     #[test]
@@ -3278,21 +3604,75 @@ mod tests {
         assert!(shown.iter().any(|l| l.contains("+new")), "{shown:?}");
     }
 
-    /// How long `draw` takes on `unit` repeated to `n` bytes, and on twice
-    /// that: work in proportion to the text takes about twice as long, where
-    /// work as its square takes four times.
-    fn scales(
-        unit: &str,
-        n: usize,
-        draw: impl Fn(&str),
-    ) -> (std::time::Duration, std::time::Duration) {
-        let timed = |len: usize| {
-            let text = unit.repeat(len / unit.len());
+    /// Whether `draw` on `unit` repeated to twice `n` bytes takes about twice
+    /// as long as on `n`, not four times, as work as the text's square would.
+    #[track_caller]
+    fn assert_linear(unit: &str, n: usize, draw: impl Fn(&str)) {
+        let (small, large) = (unit.repeat(n / unit.len()), unit.repeat(2 * n / unit.len()));
+        let timed = |longer: bool| {
             let started = std::time::Instant::now();
-            draw(&text);
+            draw(if longer { &large } else { &small });
             started.elapsed()
         };
-        (timed(n), timed(2 * n))
+        if let Some((once, twice)) = outgrows(timed) {
+            panic!("{unit}: {once:?} then {twice:?}");
+        }
+    }
+
+    /// The fastest of each timing when the longer text took three times the
+    /// shorter and 50 ms more; none when it did not. Each size is timed again,
+    /// the two in turn, up to five times while the fastest of each says
+    /// otherwise, so a busy machine pausing the test once is not read as the
+    /// work growing. `timed(true)` times the longer text.
+    fn outgrows(
+        mut timed: impl FnMut(bool) -> std::time::Duration,
+    ) -> Option<(std::time::Duration, std::time::Duration)> {
+        let (mut once, mut twice) = (std::time::Duration::MAX, std::time::Duration::MAX);
+        for _ in 0..5 {
+            once = once.min(timed(false));
+            twice = twice.min(timed(true));
+            if twice < once * 3 + std::time::Duration::from_millis(50) {
+                return None;
+            }
+        }
+        Some((once, twice))
+    }
+
+    #[test]
+    fn work_as_the_square_of_the_text_is_caught_however_often_it_is_timed() {
+        // 80 ms, then 320 ms: four times, against under three and 50 ms more.
+        let mut rounds = 0;
+        let caught = outgrows(|longer| {
+            rounds += usize::from(longer);
+            std::time::Duration::from_millis(if longer { 320 } else { 80 })
+        });
+        assert_eq!(
+            caught,
+            Some((
+                std::time::Duration::from_millis(80),
+                std::time::Duration::from_millis(320)
+            ))
+        );
+        assert_eq!(rounds, 5);
+    }
+
+    #[test]
+    fn a_pause_while_timed_once_is_not_read_as_the_work_growing() {
+        // Work in proportion to the text, the machine busy for 300 ms the
+        // first time the longer text is drawn.
+        let mut paused = false;
+        let mut rounds = 0;
+        let caught = outgrows(|longer| {
+            rounds += usize::from(longer);
+            let pause = if longer && !std::mem::replace(&mut paused, true) {
+                300
+            } else {
+                0
+            };
+            std::time::Duration::from_millis(if longer { 20 } else { 10 } + pause)
+        });
+        assert_eq!(caught, None);
+        assert_eq!(rounds, 2);
     }
 
     #[test]
@@ -3303,13 +3683,9 @@ mod tests {
             "[a", "\\(", "`", "**a", "~~", "*a ", "_a ", "$a", "<b>", "<kbd>", "<!--", "<a x",
             "<del>", "<b x", "![a](",
         ] {
-            let (once, twice) = scales(unit, 1 << 17, |text| {
+            assert_linear(unit, 1 << 17, |text| {
                 inline(text, Style::new());
             });
-            assert!(
-                twice < once * 3 + std::time::Duration::from_millis(50),
-                "{unit}: {once:?} then {twice:?}"
-            );
         }
         // What does close still reads as it did.
         let spans = inline(
@@ -3322,7 +3698,7 @@ mod tests {
 
     #[test]
     fn a_long_word_is_wrapped_in_time_as_its_length() {
-        let (once, twice) = scales("abcdefgh", 1 << 18, |text| {
+        assert_linear("abcdefgh", 1 << 18, |text| {
             let rows = wrap(
                 Line::from(text.to_owned()),
                 80,
@@ -3334,10 +3710,6 @@ mod tests {
                 .collect();
             assert_eq!(kept, text);
         });
-        assert!(
-            twice < once * 3 + std::time::Duration::from_millis(50),
-            "{once:?} then {twice:?}"
-        );
         // Joined emoji are measured alike when cut and after, so no row is
         // wider than the room.
         let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦".repeat(12);
@@ -3483,7 +3855,11 @@ mod tests {
         );
         assert_eq!(
             text(&rows),
-            ["• Ran cd /tmp", "• Messaged calc.fix · turn 2", "  └ Go"]
+            [
+                "• Ran cd /tmp",
+                "• Started a turn for calc.fix · turn 2",
+                "  └ Go"
+            ]
         );
     }
 

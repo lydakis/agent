@@ -19,10 +19,11 @@ use agent_runtime::{
     rules::Ruling,
     sandbox::Policy,
     store::{
-        Bot, CallAnswer, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Halt, Halted,
-        Settings, Slot, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
+        Bot, CallAnswer, Charge, ContextPrefix, ContextUsage, Database, ElisionPlan, Gated, Halt,
+        Halted, Limit, Settings, Slot, Spend, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window,
+        unserved,
     },
-    tools::{Files, Outcome, POLL_YIELD_MS, Prepared, ReadSource, Registry},
+    tools::{Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -198,9 +199,13 @@ pub struct Turn {
     /// record when the turn's rounds begin.
     pub settings: std::sync::OnceLock<Settings>,
     /// The bot's command rules, read with its record as the turn's rounds
-    /// begin: every round rules its calls by them, so one that announces a
-    /// call and the run that starts it agree.
-    pub rules: std::sync::OnceLock<Arc<agent_runtime::rules::Rules>>,
+    /// begin and taken again from `given_rules` at the top of each round:
+    /// a round rules its calls by one set, so one that announces a call and
+    /// the run that starts it agree.
+    pub rules: std::sync::Mutex<Option<Arc<agent_runtime::rules::Rules>>>,
+    /// Rules a `configure` gave the bot while this turn runs, which its
+    /// next round takes.
+    pub given_rules: Arc<std::sync::Mutex<Option<Arc<agent_runtime::rules::Rules>>>>,
     /// While a resumed park's calls run, what the rules made of them as
     /// their round was announced; otherwise the turn's own `rules`.
     pub ruled: std::sync::Mutex<Option<Arc<agent_runtime::rules::Rules>>>,
@@ -326,40 +331,6 @@ impl Fallback {
     }
 }
 
-/// The last model call of a turn, kept so its prompt cache can be refreshed
-/// while the calls it planned run: see [`Turn::run_tool`].
-struct Warm<'a> {
-    provider: &'a Provider,
-    model: &'a str,
-    instructions: &'a str,
-    reasoning: Option<&'a str>,
-    tools: &'a serde_json::value::RawValue,
-    context: &'a Context,
-    /// The items the call sent without thinking: a refresh sends the same.
-    thinking: Strip,
-    /// Whether the call offered web search; a refresh offers the same.
-    web_search: bool,
-    after: std::time::Duration,
-    /// When the cache was last read, by the call or a refresh.
-    read_at: tokio::time::Instant,
-    stopped: bool,
-    /// Tokens the refreshes billed, for the bot's budget.
-    tokens: u64,
-    /// What the bot's and turn's caps leave the refreshes, when either is
-    /// set: they stop once they have billed it.
-    room: Option<u64>,
-    /// The refresh in flight, held by [`Accounting`] so an interrupt that
-    /// drops the turn's rounds still settles one already sent.
-    pending: &'a mut Option<Pending>,
-}
-
-/// A refresh running as its own task, and whether it has been sent.
-struct Pending {
-    refresh: Arc<agent_runtime::provider::Refresh>,
-    /// The usage, and when the refresh was sent.
-    task: tokio::task::JoinHandle<Result<(agent_runtime::provider::Usage, tokio::time::Instant)>>,
-}
-
 /// Lives outside the cancellable rounds future. No allocation or per-attempt
 /// storage write: each execution segment flushes once, including when parked.
 #[derive(Default)]
@@ -380,19 +351,13 @@ struct Accounting {
     /// What the summary call copies, kept in the park record so its retry
     /// sends the same request.
     copied: Option<agent_runtime::store::CopiedCall>,
-    /// A prompt-cache refresh in flight while a reply streams or a tool runs.
-    refresh: Option<Pending>,
-    /// When the last call's cache was last read by a refresh sent while the
-    /// reply streamed, and whether one was refused.
-    warm_read_at: Option<tokio::time::Instant>,
-    warm_stopped: bool,
     /// The provider's sticky-routing token for this turn's model calls,
     /// kept in the park record while the turn waits.
     route: std::sync::OnceLock<String>,
     /// A summary's own, running beside the turn's call.
     beside: bool,
     /// The tokens a summary beside the turn's call holds of its budget.
-    summary_held: u64,
+    summary_held: Spend,
     /// Until when a summary that parked on its pool is not tried again
     /// while the view fits, kept in the park record.
     summary_retry_at: u64,
@@ -405,6 +370,8 @@ struct Accounting {
     /// when the run of holds it belongs to began, kept across tries.
     blocked: Option<agent_runtime::store::Blocked>,
     held_since: Option<u64>,
+    /// The limit the call goes to without tool calls, if one does.
+    limit: Option<Limit>,
 }
 impl Accounting {
     /// Park on a cause a person can fix: the call is tried again after the
@@ -518,7 +485,7 @@ impl Finished {
 }
 
 /// The provider as a bot's settings shape its calls: its output bound,
-/// cache lifetime, keep-warm and speed. The bot's defaults borrow it
+/// cache lifetime and speed. The bot's defaults borrow it
 /// unchanged.
 pub fn shaped<'p>(
     provider: &'p Provider,
@@ -526,7 +493,6 @@ pub fn shaped<'p>(
 ) -> Result<std::borrow::Cow<'p, Provider>> {
     provider.shaped(
         settings.max_output_tokens,
-        settings.keep_warm(),
         settings.cache_hour(),
         settings.speed(),
     )
@@ -539,12 +505,7 @@ fn shaped_other<'p>(
     provider: &'p Provider,
     settings: &Settings,
 ) -> Result<std::borrow::Cow<'p, Provider>> {
-    provider.shaped(
-        settings.max_output_tokens,
-        settings.keep_warm(),
-        settings.cache_hour(),
-        None,
-    )
+    provider.shaped(settings.max_output_tokens, settings.cache_hour(), None)
 }
 
 impl Turn {
@@ -590,17 +551,11 @@ impl Turn {
             (stopped, result) = (Some(Halt::Shutdown), fail(SHUTDOWN));
         }
         // The rounds future is gone, so cancellation cannot discard this flush.
-        // A refresh it had already sent is billed: record what it cost.
-        if let Some(Ok((usage, sent_at))) = settle(&mut accounting.refresh).await
-            && let Err(error) = self.record_refresh(usage, sent_at).await
-        {
-            result = Err(error);
-        }
-        // So is a summary that landed beside a call the rounds ended in, and
+        // A summary that landed beside a call the rounds ended in, and
         // it is installed as a summary before that call would have been; one
         // still running was cancelled with them, as a call is.
         if let Err(error) = self
-            .join_summary(None, &mut landed, &mut 0, &mut 0, &mut accounting)
+            .join_summary(None, &mut landed, None, &mut 0, &mut accounting)
             .await
         {
             result = Err(error);
@@ -810,18 +765,25 @@ impl Turn {
             .get()
             .expect("rounds read the bot's settings first")
     }
-    fn rules(&self) -> &agent_runtime::rules::Rules {
-        self.rules.get().expect("rounds read the rules first")
+    fn rules(&self) -> Arc<agent_runtime::rules::Rules> {
+        let rules = self.rules.lock().unwrap_or_else(|e| e.into_inner());
+        rules.clone().expect("rounds read the rules first")
+    }
+    /// Take the rules a `configure` gave since the last round, if any.
+    fn take_given_rules(&self) {
+        let given = self
+            .given_rules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(given) = given {
+            *self.rules.lock().unwrap_or_else(|e| e.into_inner()) = Some(given);
+        }
     }
     /// The rulings of the calls being run ([`Turn::ruled`]).
     fn ruled(&self) -> Arc<agent_runtime::rules::Rules> {
         let ruled = self.ruled.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        ruled.unwrap_or_else(|| {
-            self.rules
-                .get()
-                .expect("rounds read the rules first")
-                .clone()
-        })
+        ruled.unwrap_or_else(|| self.rules())
     }
     fn set_ruled(&self, ruled: Option<Arc<agent_runtime::rules::Rules>>) {
         *self.ruled.lock().unwrap_or_else(|e| e.into_inner()) = ruled;
@@ -1080,6 +1042,31 @@ impl Turn {
         }
     }
 
+    /// What started a compaction, for its `compacted` event: the `reason`
+    /// (`bytes` or `items` past the threshold, `requested` by a client, or
+    /// `overflow`, a view that could not be sent), the model's context
+    /// window and the token threshold it gives, the last call's bytes and
+    /// the tokens the provider counted for them, the view's threshold in
+    /// bytes (`at_bytes`), the instructions and tools sent beside it
+    /// (`overhead_bytes`), the room kept for the reply (`reserve_bytes`)
+    /// and the newest bytes the summary leaves whole (`keep_bytes`). The
+    /// store adds `room_bytes`, what is left under `at_bytes` after it.
+    fn trigger(
+        &self,
+        record: &agent_runtime::store::Bot,
+        reason: &str,
+        at: Option<usize>,
+        overhead: usize,
+        reserve: usize,
+        keep: i64,
+    ) -> Value {
+        let window = self.window.get().copied();
+        json!({"reason": reason, "window": window,
+            "compact_tokens": window.and_then(|window| self.settings().compact_tokens(window)),
+            "sent": record.sent.map(|(bytes, tokens)| json!({"bytes": bytes, "tokens": tokens})),
+            "at_bytes": at, "overhead_bytes": overhead, "reserve_bytes": reserve, "keep_bytes": keep})
+    }
+
     /// Whether the window has reached the compaction threshold, the point
     /// where answered tool results start going as stubs.
     fn elision_due(&self, context: &Context, output_bytes: Option<usize>, budget: usize) -> bool {
@@ -1259,6 +1246,20 @@ impl Turn {
             route: accounting.route.clone(),
             ..Accounting::default()
         };
+        let at = (budget / 100 * self.settings().compact_at()).min(limit.bytes - reserve);
+        let reason = match () {
+            _ if requested => "requested",
+            _ if pressure.bytes >= at => "bytes",
+            _ => "items",
+        };
+        let trigger = self.trigger(
+            record,
+            reason,
+            Some(at),
+            record.instructions.len() + tools.get().len(),
+            reserve,
+            keep,
+        );
         let planned = self
             .plan(
                 record,
@@ -1272,39 +1273,30 @@ impl Turn {
             .await?;
         let compaction = match planned {
             None => Compaction::Skipped,
-            Some(planned) => {
-                // Under a budget it holds the most its calls may bill, read
-                // from the larger of the view and the view it copies.
+            Some(mut planned) => {
+                planned.choice.trigger = trigger;
+                // Under a budget it holds the most its calls may spend,
+                // read from the larger of the view and the view it copies.
                 let copied = planned
                     .copy
                     .as_ref()
                     .map_or(0, |(view, ..)| view.usage().bytes);
                 let held = beside.as_ref().and_then(|_| {
                     self.summary_bound(record, context.usage().bytes.max(copied), tools)
-                        .filter(|tokens| {
-                            record.ceiling().is_none_or(|ceiling| {
-                                record.tokens_used.saturating_add(*tokens) < ceiling
-                            })
-                        })
+                        .filter(|share| record.left().holds(*share))
                 });
                 match (beside, held) {
-                    (Some(slot), Some(tokens)) => {
+                    (Some(slot), Some(share)) => {
                         // It spends only what it holds: its calls and their
                         // retries count from the rounds left after its
                         // share, and the bot's and turn's caps end at its share.
                         let (mut record, tools) = (record.clone(), tools.clone());
-                        let share = record.tokens_used.saturating_add(tokens);
-                        if let Some(budget) = &mut record.budget_tokens {
-                            *budget = (*budget).min(share);
-                        }
-                        if let Some(cap) = &mut record.turn_budget {
-                            cap.until = cap.until.min(share);
-                        }
+                        record.cap_at(share);
                         spent.beside = true;
-                        accounting.summary_held = tokens;
+                        accounting.summary_held = share;
                         *slot = Some(Box::pin(async move {
                             let (before, start) =
-                                (record.tokens_used, self.settings().max_rounds() - 2);
+                                (record.spent(), self.settings().max_rounds() - 2);
                             let mut rounds = start;
                             let mut spent = Counted {
                                 spent,
@@ -1323,7 +1315,7 @@ impl Turn {
                             Landed {
                                 result,
                                 spent: Spent {
-                                    tokens: record.tokens_used.saturating_sub(before),
+                                    spend: record.spent().minus(before),
                                     rounds: rounds - start,
                                 },
                             }
@@ -1352,19 +1344,18 @@ impl Turn {
         Ok(compaction)
     }
 
-    /// The most a summary's two calls may bill toward a bot's or turn's cap:
-    /// each sends at most `view` bytes, the tools and both instructions, a
-    /// token to a byte at most, and generates at most the summarizer's
-    /// output bound. Nothing without a budget; `None` when that bound is
-    /// unknown, and then the summary goes before the call.
+    /// The most a summary's two calls may add to a bot's or turn's work:
+    /// each re-reads the history and is charged its output, at most the
+    /// summarizer's output bound. Nothing without a budget; `None` when that
+    /// bound is unknown, and then the summary goes before the call.
     fn summary_bound(
         &self,
         record: &agent_runtime::store::Bot,
         view: usize,
         tools: &serde_json::value::RawValue,
-    ) -> Option<u64> {
-        if record.ceiling().is_none() {
-            return Some(0);
+    ) -> Option<Spend> {
+        if !record.capped() {
+            return Some(Spend::default());
         }
         let reference = summarizer(record);
         let (name, model) = split_model(&reference).ok()?;
@@ -1381,7 +1372,11 @@ impl Turn {
                 .as_deref()
                 .map_or(0, str::len)
             + SUMMARY_REQUEST_BYTES;
-        Some(2 * (input + output) as u64)
+        // It re-reads the history: its work is its output.
+        Some(Spend {
+            tokens: 2 * (input + output) as u64,
+            work: 2 * output as u64,
+        })
     }
 
     /// The current turn cannot fit the budget, alone or beside what goes
@@ -1426,6 +1421,14 @@ impl Turn {
                 model,
                 ahead: None,
             });
+            let trigger = self.trigger(
+                record,
+                "overflow",
+                None,
+                record.instructions.len() + tools.get().len(),
+                0,
+                1,
+            );
             match self
                 .compact(
                     record,
@@ -1436,6 +1439,7 @@ impl Turn {
                     (1, 1),
                     true,
                     sent,
+                    trigger,
                 )
                 .await?
             {
@@ -1476,13 +1480,15 @@ impl Turn {
         keeps: (i64, i64),
         again: bool,
         sent: Option<Sent<'_>>,
+        trigger: Value,
     ) -> Result<Compaction> {
         let _held = Held::from_now(&self.side.summary_ms);
         match self
             .plan(record, turn, accounting, tools, keeps, again, sent)
             .await?
         {
-            Some(planned) => {
+            Some(mut planned) => {
+                planned.choice.trigger = trigger;
                 self.summarize_now(planned, record, model_rounds, turn, accounting, tools)
                     .await
             }
@@ -1636,13 +1642,16 @@ impl Turn {
         tools: &serde_json::value::RawValue,
     ) -> Result<Summary> {
         let Planned {
-            plan,
+            mut plan,
             reference,
             summarizer,
             copy: mut made,
             mut choice,
         } = planned;
         let (name, model) = split_model(&reference)?;
+        // The most a summary may take, whatever a retry asks for, and the
+        // shortest one refused as longer.
+        let (limit, mut shortest) = (plan.summary_bytes, usize::MAX);
         let (summary, usage) = loop {
             let mut instructions = record.compaction_instructions.clone().unwrap();
             // Only the first attempt copies; what a park record keeps of
@@ -1696,9 +1705,9 @@ impl Turn {
                 None => match summarizer.family() {
                     agent_runtime::codec::Family::Anthropic => (Body::Span(&plan, stripped), tools),
                     agent_runtime::codec::Family::Responses => {
-                        empty = self
-                            .registry
-                            .encoded(summarizer.family(), &[], &[], false)?;
+                        empty =
+                            self.registry
+                                .encoded(summarizer.family(), false, &[], &[], false)?;
                         (Body::Span(&plan, stripped), &*empty)
                     }
                 },
@@ -1748,18 +1757,18 @@ impl Turn {
             // Success is billable even if its text is empty or too large to use.
             *model_rounds += 1;
             if let Some(usage) = &completion.usage {
-                record.tokens_used = record
-                    .tokens_used
-                    .saturating_add(usage.input_tokens)
-                    .saturating_add(usage.output_tokens);
+                record.charge(usage, Charge::Aside);
             }
             let usage = completion.usage.map(|usage| priced_at(usage, name, model));
             let summary = completion_text(&completion.items);
             // A copy offers the bot's tools; a call there is not a summary.
             let invalid = if !completion.calls.is_empty() {
                 Error::new("compaction_tool_call")
-            } else if summary.len() > plan.summary_bytes {
-                Error::new("compaction_summary_limit")
+            } else if summary.len() > limit {
+                Error::with(
+                    "compaction_summary_limit",
+                    format!("{} bytes, asked for {}", summary.len(), plan.summary_bytes),
+                )
             } else if summary.trim().is_empty() {
                 Error::new("empty_summary")
             } else {
@@ -1770,20 +1779,33 @@ impl Turn {
                     db.compaction_usage(turn, usage.as_ref())
                 })
                 .await?;
+            // A summary longer than the limit is asked for again, in a
+            // request of its own, at half the size it was asked for, as
+            // long as each comes back shorter than the one before: a model
+            // that overshoots a target usually lands under a smaller one,
+            // and the turn is not left uncompacted for one long answer.
+            let smaller = invalid.code == "compaction_summary_limit" && summary.len() < shortest;
+            if invalid.code == "compaction_summary_limit" {
+                shortest = summary.len();
+            }
             // The request of its own is another call, checked as each is.
-            if !copied
-                || invalid.code == "compaction_summary_limit"
+            if !(copied || smaller)
+                || (invalid.code == "compaction_summary_limit" && !smaller)
                 || record.exhausted().is_some()
                 || *model_rounds >= self.settings().max_rounds()
             {
                 self.compaction_failed(turn, &invalid).await?;
                 return Ok(Summary::Skipped);
             }
+            if smaller {
+                plan.summary_bytes = (plan.summary_bytes / 2).max(1);
+            }
             self.hub
                 .live(
                     &self.bot,
                     json!({"event":"compaction_failed","bot":self.bot,"turn":turn,"durable":false,
-                        "error":invalid.code,"detail":invalid.detail,"fallback":true}),
+                        "error":invalid.code,"detail":invalid.detail,"fallback":true,
+                        "summary_bytes":plan.summary_bytes}),
                 )
                 .await?;
         };
@@ -1806,7 +1828,7 @@ impl Turn {
         &self,
         running: Option<Beside<'_>>,
         landed: &mut Option<Landed>,
-        tokens_used: &mut u64,
+        record: Option<&mut agent_runtime::store::Bot>,
         model_rounds: &mut usize,
         accounting: &mut Accounting,
     ) -> Result<bool> {
@@ -1828,7 +1850,7 @@ impl Turn {
         let Some(Landed { result, spent }) = landed.take() else {
             return Ok(false);
         };
-        spent.count(tokens_used, model_rounds);
+        spent.count(record, model_rounds);
         let installed = match (result, slot) {
             (Ok(Summary::Written(written)), Some(slot)) => self.install(slot, *written).await,
             (Ok(Summary::Written(_)), None) => unreachable!("a written summary reserves a slot"),
@@ -2079,9 +2101,11 @@ impl Turn {
         Ok(instructions.len()
             + match family {
                 agent_runtime::codec::Family::Anthropic => tools.get().len(),
-                agent_runtime::codec::Family::Responses => {
-                    self.registry.encoded(family, &[], &[], false)?.get().len()
-                }
+                agent_runtime::codec::Family::Responses => self
+                    .registry
+                    .encoded(family, false, &[], &[], false)?
+                    .get()
+                    .len(),
             })
     }
 
@@ -2157,15 +2181,20 @@ impl Turn {
         let context = self.store.op("context", move |db| db.context(turn)).await?;
         self.settings
             .get_or_init(|| self.with_one_lifetime(&record, &context.model));
-        if self.rules.get().is_none() {
-            let policy = record.settings.rules.clone().unwrap_or_default();
-            let _ = self
-                .rules
-                .set(Arc::new(agent_runtime::rules::Rules::new(policy)));
+        {
+            let mut rules = self.rules.lock().unwrap_or_else(|e| e.into_inner());
+            if rules.is_none() {
+                let policy = record.settings.rules.clone().unwrap_or_default();
+                *rules = Some(Arc::new(agent_runtime::rules::Rules::new(policy)));
+            }
         }
         // A turn may run at its own effort; everything after reads the record.
         record.effort = context.effort.clone();
         record.turn_budget = context.budget;
+        record.output_schema = (context.output_schema.clone())
+            .map(serde_json::value::RawValue::from_string)
+            .transpose()
+            .map_err(|_| Error::new("store_corrupt"))?;
         let (provider, model) = split_model(&context.model)?;
         let Some(provider) = self.providers.get(provider) else {
             let error = Error::with("provider_unavailable", provider);
@@ -2210,13 +2239,17 @@ impl Turn {
         // level when it has one, the bot's own name
         // so a created peer records who created it, this turn so a prompt it
         // submits records whose model wrote it, and its creator so a peer
-        // can address the bot that spawned it.
-        let mut environment = vec![
+        // can address the bot that spawned it. Before them, the variables
+        // its client gave it, its `env` setting.
+        let mut environment: Vec<(String, String)> = (record.settings.env.iter())
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        environment.extend([
             ("AGENT_MODEL".to_owned(), context.model.clone()),
             ("AGENT_BOT".to_owned(), context.bot.clone()),
             ("AGENT_BOT_ID".to_owned(), context.bot_id.to_string()),
             ("AGENT_TURN".to_owned(), turn.to_string()),
-        ];
+        ]);
         if let Some(level) = &record.effort {
             environment.push(("AGENT_EFFORT".to_owned(), level.clone()));
         }
@@ -2359,7 +2392,6 @@ impl Turn {
                         &workspace,
                         &environment,
                         &record,
-                        None,
                         accounting.route.get().map(String::as_str),
                         accounting.summary_retry(),
                     )
@@ -2375,6 +2407,7 @@ impl Turn {
         // This bot's tools, encoded once per distinct selection and shared.
         let tools = self.registry.encoded(
             provider.family(),
+            provider.grammars(),
             &record.tools,
             &record.declared,
             record.sandboxed(),
@@ -2384,6 +2417,9 @@ impl Turn {
         let elides = record.tools.iter().any(|tool| tool == "read");
         // How a steer stayed queued for lack of room, while one still is.
         let mut capped = None;
+        // Whether a call went without tool calls for a budget: the next
+        // that finds it spent ends the turn.
+        let mut wrapped = false;
         // A steer let in against the whole budget goes to the model before
         // any summary, so no summary spends the round or the budget it went
         // in for; the boundary after that call summarizes as usual.
@@ -2418,13 +2454,17 @@ impl Turn {
             if self.stopping.load(Relaxed) {
                 return Ok(Round::Drained);
             }
-            // A refresh the last call left in flight ends here: the next call
-            // reads the cache itself, and the budget counts what it billed.
-            self.settle_refresh(&mut record, accounting).await?;
+            // Rules given while the turn runs rule this round's calls on.
+            self.take_given_rules();
             // One planned at a boundary that started over has not run.
             beside = None;
-            // The budget is checked before each call, so one call may overshoot.
-            if let Some(error) = record.exhausted() {
+            // The budget is checked before each call. One the turn has
+            // called under ends on a call without tool calls, so it reports
+            // what it did: that call may overshoot.
+            if let Some(error) = record
+                .exhausted()
+                .filter(|_| !wraps_up(model_rounds, wrapped))
+            {
                 return Err(error);
             }
             // Past the threshold, the older turns are summarized before this
@@ -2592,7 +2632,10 @@ impl Turn {
                 (resume_window, steer_first) = (resuming, whole);
                 continue;
             }
-            if let Some(error) = record.exhausted() {
+            if let Some(error) = record
+                .exhausted()
+                .filter(|_| !wraps_up(model_rounds, wrapped))
+            {
                 return Err(error);
             }
             if model_rounds >= self.settings().max_rounds() {
@@ -2645,23 +2688,23 @@ impl Turn {
             let held = running
                 .as_ref()
                 .map(|_| (2, std::mem::take(&mut accounting.summary_held)));
-            if let Some((rounds, tokens)) = held {
+            if let Some((rounds, share)) = held {
                 model_rounds += rounds;
-                record.tokens_used = record.tokens_used.saturating_add(tokens);
+                record.add(share);
             }
             // The round limit's last call goes with the tools shown but no
             // call allowed, so the turn ends on a reply rather than failing
-            // with its work done and unreported.
-            let tool_calls = model_rounds + 1 < self.settings().max_rounds();
-            if !tool_calls {
-                self.hub
-                    .live(
-                        &self.bot,
-                        json!({"event":"tool_calls_withheld","bot":self.bot,"turn":turn,
-                            "durable":false,"reason":"tool_round_limit"}),
-                    )
-                    .await?;
+            // with its work done and unreported; so does the call after one
+            // that spent a budget.
+            accounting.limit = match model_rounds + 1 < self.settings().max_rounds() {
+                false => Some(Limit::Rounds),
+                true => budget_reached(&record),
+            };
+            if let Some(limit) = accounting.limit {
+                wrapped |= limit != Limit::Rounds;
+                self.withheld(turn, limit).await?;
             }
+            let tool_calls = accounting.limit.is_none();
             let called = {
                 let call = self.call(
                     provider,
@@ -2684,9 +2727,6 @@ impl Turn {
                             // It waits outside the rounds once landed, so
                             // an interrupt still installs it.
                             done = summary.as_mut() => {
-                                if let Ok(Summary::Written(_)) = &done.result {
-                                    self.side.replaced.store(true, Relaxed);
-                                }
                                 *landed = Some(done);
                                 (call.await, None)
                             }
@@ -2695,13 +2735,12 @@ impl Turn {
                 }
             };
             let (called, running) = called;
-            self.side.replaced.store(false, Relaxed);
-            if let Some((rounds, tokens)) = held {
+            if let Some((rounds, share)) = held {
                 model_rounds -= rounds;
-                record.tokens_used = record.tokens_used.saturating_sub(tokens);
+                record.take_back(share);
             }
             // A call that withheld its replayed thinking recorded that on
-            // the bot; refreshes send what it sent.
+            // the bot; the context keeps what it sent.
             if context.window.as_ref().is_some_and(|w| {
                 w.family == agent_runtime::codec::Family::Anthropic && !w.ids.is_empty()
             }) {
@@ -2715,7 +2754,7 @@ impl Turn {
                         .join_summary(
                             running,
                             landed,
-                            &mut record.tokens_used,
+                            Some(&mut record),
                             &mut model_rounds,
                             accounting,
                         )
@@ -2728,12 +2767,11 @@ impl Turn {
             sent_here = true;
             accounting.answered = true;
             model_rounds += 1;
-            if let Some(usage) = &response.usage {
-                record.tokens_used = record
-                    .tokens_used
-                    .saturating_add(usage.input_tokens)
-                    .saturating_add(usage.output_tokens);
-            }
+            let (added, read_through) = response.usage.as_ref().map_or((0, None), |usage| {
+                let (added, through) = added_input(&record, &context, &tools, usage);
+                record.charge(usage, Charge::Round { added });
+                (added, through)
+            });
             let items = response.items;
             let calls: Vec<ToolCall> = response.calls.clone();
             let usage = response.usage.clone();
@@ -2749,19 +2787,18 @@ impl Turn {
                 });
             record.sent = sent.or(record.sent);
             let name = self.bot.clone();
+            let rules = self.rules();
             let gated = calls
                 .iter()
-                .any(|call| record.gated(call, &workspace, self.rules()));
-            let rules = self
-                .rules
-                .get()
-                .expect("rounds read the rules first")
-                .clone();
+                .any(|call| record.gated(call, &workspace, &rules));
             // Taken before the commit that stamps the gates' announcement,
             // so a gate's first lapse is never counted late.
             let planned = tokio::time::Instant::now();
+            let limit = accounting.limit.take();
+            wrapped |= limit.is_some_and(|limit| limit != Limit::Rounds);
             let append = self.store.op("append", move |db| {
-                let entries = db.append_under(turn, items, &calls, usage.as_ref(), &rules)?;
+                let entries =
+                    db.append_under(turn, items, &calls, usage.as_ref(), &rules, limit, added)?;
                 if let Some((bytes, tokens)) = sent {
                     db.record_sent(&name, bytes, tokens)?;
                 }
@@ -2790,11 +2827,26 @@ impl Turn {
                         .filter(|entry| entry["event"] == "message")
                         .filter_map(|entry| entry["data"]["node"].as_i64())
                         .collect();
+                    // Its history is read through its own items, or with
+                    // none through what it sent, the head then: as the store
+                    // recorded with its usage.
+                    if response.usage.is_some() {
+                        record.work.read = nodes
+                            .iter()
+                            .copied()
+                            .max()
+                            .or(read_through)
+                            .or(record.work.read);
+                    }
                     provider.recorded(&self.bot, &nodes);
                     verdicts
                 }
                 Err(error) => {
-                    self.failed_usage(response.usage.clone()).await?;
+                    let charge = response.usage.as_ref().map_or(Charge::Aside, |usage| {
+                        let (added, read) = added_input(&record, &context, &tools, usage);
+                        Charge::Failed { added, read }
+                    });
+                    self.failed_usage(response.usage.clone(), charge).await?;
                     return Err(error);
                 }
             };
@@ -2806,7 +2858,7 @@ impl Turn {
                 .join_summary(
                     running,
                     landed,
-                    &mut record.tokens_used,
+                    Some(&mut record),
                     &mut model_rounds,
                     accounting,
                 )
@@ -2835,10 +2887,7 @@ impl Turn {
             if response.calls.is_empty() && !response.paused {
                 // A steer that arrived during the final call keeps the turn
                 // going for one more round rather than ending it unheard,
-                // when the budget and round limit allow one. A refresh the
-                // reply left in flight is billed first, as the next round
-                // would count it.
-                self.settle_refresh(&mut record, accounting).await?;
+                // when the budget and round limit allow one.
                 let whole = self.summarizes(&record);
                 if calls_left(&record, model_rounds)
                     && self
@@ -2855,37 +2904,7 @@ impl Turn {
                 }
                 return Ok(Round::Finished);
             }
-            // The cache's lifetime runs from the sending of the call that
-            // read it, or of a refresh sent while its reply streamed.
-            let read_at = accounting
-                .warm_read_at
-                .unwrap_or_else(tokio::time::Instant::now);
-            let stopped = accounting.warm_stopped;
             let summary_retry = accounting.summary_retry();
-            let pending = &mut accounting.refresh;
-            // No call has sent the view a summary installed here, so there
-            // is no cache of it to keep warm.
-            let mut warm = provider
-                .keep_warm_after(model, record.effort.as_deref())
-                .filter(|_| !installed)
-                .map(|after| Warm {
-                    provider,
-                    model,
-                    instructions: &record.instructions,
-                    reasoning: record.effort.as_deref(),
-                    tools: &tools,
-                    context: &context,
-                    thinking: context.thinking,
-                    web_search: searches(&record),
-                    after,
-                    read_at,
-                    stopped: stopped || record.exhausted().is_some(),
-                    tokens: 0,
-                    room: record
-                        .ceiling()
-                        .map(|c| c.saturating_sub(record.tokens_used)),
-                    pending,
-                });
             let stop = self
                 .execute_calls(
                     response.calls,
@@ -2894,13 +2913,10 @@ impl Turn {
                     &workspace,
                     &environment,
                     &record,
-                    warm.as_mut(),
                     accounting.route.get().map(String::as_str),
                     summary_retry,
                 )
                 .await?;
-            let refreshed = warm.map_or(0, |warm| warm.tokens);
-            record.tokens_used = record.tokens_used.saturating_add(refreshed);
             if let Some(stop) = stop {
                 return Ok(stop.round());
             }
@@ -2934,20 +2950,6 @@ impl Turn {
                     .get(name)
                     .is_some_and(|provider| record.family().is_ok_and(|f| provider.family() == f))
             })
-    }
-
-    /// End a refresh left in flight and count what it billed.
-    async fn settle_refresh(
-        &self,
-        record: &mut agent_runtime::store::Bot,
-        accounting: &mut Accounting,
-    ) -> Result<()> {
-        if let Some(refreshed) = settle(&mut accounting.refresh).await
-            && let Some((tokens, _)) = self.account_refresh(refreshed).await?
-        {
-            record.tokens_used = record.tokens_used.saturating_add(tokens);
-        }
-        Ok(())
     }
 
     /// `attached` takes attached messages along with steers; a reply that
@@ -3087,17 +3089,6 @@ impl Turn {
             record.cache_bot(),
             matches!(body, Body::Span(..)),
         );
-        // A summary's view is replaced once it lands; only the turn's call
-        // is refreshed while it streams.
-        // A refresh renders the turn's request with its calls allowed, so
-        // it would not read what a call without them sent.
-        let mut warm_after = match body {
-            Body::Window(_) if tool_calls => {
-                provider.keep_warm_after(model, record.effort.as_deref())
-            }
-            Body::Window(_) => None,
-            Body::Copied(_) | Body::Span(..) => None,
-        };
         // Replayed thinking a 400 may have come from, withheld from this
         // call's later attempts.
         let mut withheld = None;
@@ -3112,11 +3103,16 @@ impl Turn {
             None => None,
         };
         let mut tool_calls = tool_calls;
+        // A budget a failed attempt spent, said once its retry goes.
+        let mut announce = None;
         loop {
             // A stopping daemon sends no request, first or retry, and the
             // turn parks as at a boundary.
             if self.stopping.load(Relaxed) {
                 return Err(Error::new(SHUTDOWN));
+            }
+            if let Some(limit) = announce.take() {
+                self.withheld(turn, limit).await?;
             }
             // A billed attempt that failed counts as a round: the retry that
             // is the turn's last allowed call goes without calls, as that
@@ -3125,14 +3121,9 @@ impl Turn {
                 && matches!(body, Body::Window(_))
                 && *model_rounds + 1 >= self.settings().max_rounds()
             {
-                (tool_calls, warm_after) = (false, None);
-                self.hub
-                    .live(
-                        &self.bot,
-                        json!({"event":"tool_calls_withheld","bot":self.bot,"turn":turn,
-                            "durable":false,"reason":"tool_round_limit"}),
-                    )
-                    .await?;
+                tool_calls = false;
+                accounting.limit = Some(Limit::Rounds);
+                self.withheld(turn, Limit::Rounds).await?;
             }
             let items = match body {
                 Body::Window(context) => self.items(context, withheld.unwrap_or(context.thinking)),
@@ -3149,7 +3140,6 @@ impl Turn {
                     .map_or(0, |&node| node as u64),
                 _ => 0,
             };
-            (accounting.warm_read_at, accounting.warm_stopped) = (None, false);
             let sent = agent_runtime::provider::Sent::default();
             // The call's own provider and model, and where this attempt goes.
             let (own_provider, own_model) = (provider, model);
@@ -3165,6 +3155,8 @@ impl Turn {
                         reasoning: record.effort.as_deref(),
                         tools,
                         allow_tool_calls: tool_calls && !matches!(body, Body::Span(..)),
+                        // The turn's own reply; a summary is free text.
+                        output_schema: record.output_schema.as_deref().filter(|_| !summary),
                         // A summary offers it too, so its request reads
                         // the cache the bot's calls write.
                         web_search: searches(record),
@@ -3192,38 +3184,7 @@ impl Turn {
                     },
                     &mut accounting.report,
                 );
-            // The fallback's answer is not the request a refresh renders.
-            let result = match (warm_after.filter(|_| fallback.is_none()), body) {
-                (Some(after), Body::Window(context)) => {
-                    let mut warm = Warm {
-                        provider,
-                        model,
-                        instructions,
-                        reasoning: record.effort.as_deref(),
-                        tools,
-                        context,
-                        thinking: withheld.unwrap_or(context.thinking),
-                        web_search: searches(record),
-                        after,
-                        read_at: tokio::time::Instant::now(),
-                        stopped: false,
-                        tokens: 0,
-                        room: record
-                            .ceiling()
-                            .map(|c| c.saturating_sub(record.tokens_used)),
-                        pending: &mut accounting.refresh,
-                    };
-                    let result = self.stream_warm(call, &sent, &mut warm).await;
-                    // The call's own read, unless a refresh read the cache since.
-                    accounting.warm_read_at =
-                        Some(sent.get().map_or(warm.read_at, |at| warm.read_at.max(at)));
-                    accounting.warm_stopped = warm.stopped;
-                    let refreshed = warm.tokens;
-                    record.tokens_used = record.tokens_used.saturating_add(refreshed);
-                    result?
-                }
-                _ => call.await,
-            };
+            let result = call.await;
             let sent_ms = sent.get().map_or(0, epoch_ms);
             let error = match result {
                 Ok(mut completion) => {
@@ -3330,14 +3291,20 @@ impl Turn {
                 return Ok(None);
             }
             // Whatever the provider billed for a failed attempt is still spent.
+            let mut failed = Charge::Aside;
             if let Some(usage) = &mut accounting.report.usage {
                 usage.sent_ms = sent_ms;
                 self.tokens.add(usage);
                 *model_rounds += 1;
-                record.tokens_used = record
-                    .tokens_used
-                    .saturating_add(usage.input_tokens)
-                    .saturating_add(usage.output_tokens);
+                let charge = match body {
+                    Body::Window(context) => {
+                        let (added, read) = added_input(record, context, tools, usage);
+                        Charge::Failed { added, read }
+                    }
+                    _ => Charge::Aside,
+                };
+                record.charge(usage, charge);
+                failed = charge;
             }
             let usage = accounting.report.usage.take();
             if summary {
@@ -3351,7 +3318,7 @@ impl Turn {
                         .await?;
                 }
             } else {
-                self.failed_usage(usage).await?;
+                self.failed_usage(usage, failed).await?;
             }
             let mut resend = false;
             let mut retry = json!({"thinking_withheld":true});
@@ -3378,7 +3345,22 @@ impl Turn {
             }
             // A retry is another billable call: none once failed usage has
             // spent the bot's or turn's budget, or the rounds are used up.
-            let capped = record.exhausted().or_else(|| {
+            // The turn's own call goes once more without tool calls, as at a
+            // boundary, so the turn reports what it did; one that went so
+            // already is retried as it went.
+            let window = matches!(body, Body::Window(_));
+            let capped = match record.exhausted() {
+                Some(_) if window && tool_calls => {
+                    let limit = record.room().map_or(Limit::Budget, |(_, limit)| limit);
+                    tool_calls = false;
+                    accounting.limit = Some(limit);
+                    announce = Some(limit);
+                    None
+                }
+                Some(_) if window => None,
+                exhausted => exhausted,
+            };
+            let capped = capped.or_else(|| {
                 (*model_rounds >= self.settings().max_rounds())
                     .then(|| Error::new("tool_round_limit"))
             });
@@ -3511,6 +3493,21 @@ impl Turn {
         }
     }
 
+    /// Say live that the call goes without tool calls, and the limit why.
+    async fn withheld(&self, turn: i64, limit: Limit) -> Result<()> {
+        let reason = match limit {
+            Limit::Rounds => "tool_round_limit",
+            limit => limit.as_str(),
+        };
+        self.hub
+            .live(
+                &self.bot,
+                json!({"event":"tool_calls_withheld","bot":self.bot,"turn":turn,
+                    "durable":false,"reason":reason}),
+            )
+            .await
+    }
+
     /// Record a retry as the turn's event, so it outlives the live stream.
     async fn retried(&self, data: Value) -> Result<()> {
         let turn = self.turn;
@@ -3519,94 +3516,36 @@ impl Turn {
             .await
     }
 
-    async fn failed_usage(&self, usage: Option<agent_runtime::provider::Usage>) -> Result<()> {
+    async fn failed_usage(
+        &self,
+        usage: Option<agent_runtime::provider::Usage>,
+        charge: Charge,
+    ) -> Result<()> {
+        let (added, read) = match charge {
+            Charge::Failed { added, read } => (added, read),
+            _ => (0, None),
+        };
         if let Some(usage) = usage {
             let turn = self.turn;
             self.store
-                .op("failed_usage", move |db| db.failed_usage(turn, &usage))
+                .op("failed_usage", move |db| {
+                    db.failed_usage(turn, &usage, added, read)
+                })
                 .await?;
         }
         Ok(())
     }
 
-    /// Await a model call, refreshing its own prompt cache each time the
-    /// cache has sat unread for `after`: a reply that streams for longer
-    /// than the cache lives would otherwise let the prefix it read expire
-    /// before the next call. The cache is read from when `sent` records the
-    /// call was sent, which pacing or admission can delay. A refresh still
-    /// in flight when the reply ends is left in `warm.pending`, for the tool
-    /// run or the next round to settle.
-    async fn stream_warm<T>(
-        &self,
-        call: impl std::future::Future<Output = T>,
-        sent: &agent_runtime::provider::Sent,
-        warm: &mut Warm<'_>,
-    ) -> Result<T> {
-        tokio::pin!(call);
-        loop {
-            if warm.stopped {
-                return Ok(call.await);
-            }
-            if warm.pending.is_none() {
-                // Nothing is cached before the send, and one still to come
-                // leaves the cache unread for `after` no sooner than from now.
-                let due = match sent.get() {
-                    Some(at) => warm.read_at.max(at),
-                    None => tokio::time::Instant::now(),
-                } + warm.after;
-                tokio::select! {
-                    biased;
-                    result = &mut call => return Ok(result),
-                    () = tokio::time::sleep_until(due) => {}
-                }
-                let Some(at) = sent.get() else { continue };
-                warm.read_at = warm.read_at.max(at);
-                if warm.read_at + warm.after > tokio::time::Instant::now() {
-                    continue;
-                }
-                // A summary beside the call has written the view that
-                // replaces this one: its cache is not read again.
-                if self.side.replaced.load(Relaxed) {
-                    return Ok(call.await);
-                }
-                // Nor once the daemon is stopping: no call after this one
-                // would read it, and the drain sends no new request.
-                if self.stopping.load(Relaxed) {
-                    return Ok(call.await);
-                }
-                *warm.pending = Some(self.refresh(warm));
-            }
-            let refreshed = {
-                let task = &mut warm.pending.as_mut().expect("a refresh in flight").task;
-                tokio::select! {
-                    biased;
-                    result = &mut call => return Ok(result),
-                    joined = task => joined.unwrap_or_else(|_| fail("keep_warm_lost")),
-                }
-            };
-            *warm.pending = None;
-            self.refreshed(warm, refreshed).await?;
-        }
-    }
-
-    /// Run a prepared tool, refreshing the last model call's prompt cache
-    /// each time it has sat unread for `after`. The outer error is the
-    /// runtime's; the inner one is the tool's result.
-    /// Run a tool while keeping the cache warm. With `lift`, a steer moves
-    /// the run to the background instead, handed back unfinished, once the
-    /// paired signal says it is running: a command still waiting for a
-    /// process slot stays in line in the foreground.
+    /// Run a prepared tool. The outer error is the runtime's; the inner one
+    /// is the tool's result. With `lift`, a steer moves the run to the
+    /// background instead, handed back unfinished, once the paired signal
+    /// says it is running: a command still waiting for a process slot stays
+    /// in line in the foreground.
     async fn run_tool<T, F: Future<Output = Result<T>>>(
         &self,
         run: F,
         lift: Option<(&Lift, oneshot::Receiver<()>)>,
-        warm: Option<&mut Warm<'_>>,
     ) -> Result<Ran<F, T>> {
-        enum Next<T> {
-            Ran(Result<T>),
-            Lifted,
-            Refreshed(Result<(agent_runtime::provider::Usage, tokio::time::Instant)>),
-        }
         let mut run = Box::pin(run);
         let lifted = async {
             // A run that ends before it starts wins the race below.
@@ -3619,184 +3558,11 @@ impl Turn {
             }
         };
         tokio::pin!(lifted);
-        let Some(warm) = warm.filter(|warm| !warm.stopped) else {
-            return Ok(tokio::select! {
-                biased;
-                result = &mut run => Ran::Done(result),
-                () = &mut lifted => Ran::Lifted(run),
-            });
-        };
-        loop {
-            if warm.pending.is_none() {
-                tokio::select! {
-                    biased;
-                    result = &mut run => return Ok(Ran::Done(result)),
-                    () = &mut lifted => return Ok(Ran::Lifted(run)),
-                    () = tokio::time::sleep_until(warm.read_at + warm.after) => {}
-                }
-                // A stopping daemon sends no new refresh: the next call that
-                // would read the cache waits for the next start.
-                if self.stopping.load(Relaxed) {
-                    return Ok(tokio::select! {
-                        biased;
-                        result = &mut run => Ran::Done(result),
-                        () = &mut lifted => Ran::Lifted(run),
-                    });
-                }
-                *warm.pending = Some(self.refresh(warm));
-            }
-            let next = {
-                let task = &mut warm.pending.as_mut().expect("a refresh in flight").task;
-                tokio::select! {
-                    biased;
-                    result = &mut run => Next::Ran(result),
-                    () = &mut lifted => Next::Lifted,
-                    joined = task => Next::Refreshed(joined.unwrap_or_else(|_| fail("keep_warm_lost"))),
-                }
-            };
-            match next {
-                // The tool's result ends the refreshes, as does handing it to
-                // the background. One already sent is billed, so it is
-                // answered and recorded; an unsent one is dropped at no cost.
-                Next::Ran(result) => {
-                    if let Some(refreshed) = settle(warm.pending).await {
-                        self.refreshed(warm, refreshed).await?;
-                    }
-                    return Ok(Ran::Done(result));
-                }
-                // The command keeps running while the refresh is answered,
-                // so its timeout and pipes still apply; one that ends
-                // meanwhile returns as usual.
-                Next::Lifted => {
-                    let mut finished = None;
-                    let refreshed = {
-                        let settled = settle(warm.pending);
-                        tokio::pin!(settled);
-                        tokio::select! {
-                            biased;
-                            refreshed = &mut settled => refreshed,
-                            result = &mut run => {
-                                finished = Some(result);
-                                settled.await
-                            }
-                        }
-                    };
-                    if let Some(refreshed) = refreshed {
-                        self.refreshed(warm, refreshed).await?;
-                    }
-                    return Ok(match finished {
-                        Some(result) => Ran::Done(result),
-                        None => Ran::Lifted(run),
-                    });
-                }
-                Next::Refreshed(refreshed) => {
-                    *warm.pending = None;
-                    self.refreshed(warm, refreshed).await?;
-                }
-            }
-            if warm.stopped {
-                return Ok(tokio::select! {
-                    biased;
-                    result = &mut run => Ran::Done(result),
-                    () = &mut lifted => Ran::Lifted(run),
-                });
-            }
-        }
-    }
-
-    /// Send the last model call's request again, only to refresh its cache,
-    /// as a task of its own: an interrupt that drops the turn's rounds must
-    /// not drop a refresh already sent, which is billed.
-    fn refresh(&self, warm: &Warm<'_>) -> Pending {
-        let refresh = Arc::new(agent_runtime::provider::Refresh::default());
-        let provider = warm.provider.clone();
-        let (model, instructions) = (warm.model.to_owned(), warm.instructions.to_owned());
-        let reasoning = warm.reasoning.map(str::to_owned);
-        let tools = warm.tools.to_owned();
-        let web_search = warm.web_search;
-        let items = self.items(warm.context, warm.thinking);
-        let sent = refresh.clone();
-        let expires = warm.read_at + agent_runtime::provider::CACHE_LIFETIME;
-        let task = tokio::spawn(async move {
-            let request = ModelRequest {
-                model: &model,
-                instructions: &instructions,
-                reasoning: reasoning.as_deref(),
-                tools: &tools,
-                allow_tool_calls: true,
-                web_search,
-                fallback_credit: None,
-                cache_key: None,
-                items,
-                chain: None,
-                route: None,
-                sent: None,
-            };
-            provider.keep_warm(request, &sent, expires).await
-        });
-        Pending { refresh, task }
-    }
-
-    /// Record a refresh against `warm`. A refused one ends the refreshes
-    /// until the next model call, which rebuilds the cache as it would have
-    /// without them.
-    async fn refreshed(
-        &self,
-        warm: &mut Warm<'_>,
-        refreshed: Result<(agent_runtime::provider::Usage, tokio::time::Instant)>,
-    ) -> Result<()> {
-        match self.account_refresh(refreshed).await? {
-            Some((tokens, sent_at)) => {
-                warm.tokens = warm.tokens.saturating_add(tokens);
-                // The refresh's own read, from when it was sent. One carried
-                // over from an earlier attempt can be older than this one's.
-                warm.read_at = warm.read_at.max(sent_at);
-                // A cap reached ends them: no call after it would read the cache.
-                warm.stopped |= warm.room.is_some_and(|room| warm.tokens >= room);
-            }
-            None => warm.stopped = true,
-        }
-        Ok(())
-    }
-
-    /// Record a refresh's answer: billed like any call but not a model
-    /// round. Returns the tokens it billed and when it was sent, or `None`
-    /// when it was refused.
-    async fn account_refresh(
-        &self,
-        refreshed: Result<(agent_runtime::provider::Usage, tokio::time::Instant)>,
-    ) -> Result<Option<(u64, tokio::time::Instant)>> {
-        let (usage, sent_at) = match refreshed {
-            Ok(refreshed) => refreshed,
-            Err(error) => {
-                self.hub
-                    .live(
-                        &self.bot,
-                        json!({"event":"keep_warm_failed","bot":self.bot,"turn":self.turn,
-                            "durable":false,"error":error.code,"detail":error.detail}),
-                    )
-                    .await?;
-                return Ok(None);
-            }
-        };
-        let tokens = usage.input_tokens.saturating_add(usage.output_tokens);
-        self.record_refresh(usage, sent_at).await?;
-        Ok(Some((tokens, sent_at)))
-    }
-
-    async fn record_refresh(
-        &self,
-        mut usage: agent_runtime::provider::Usage,
-        sent_at: tokio::time::Instant,
-    ) -> Result<()> {
-        usage.sent_ms = epoch_ms(sent_at);
-        self.tokens.add(&usage);
-        let turn = self.turn;
-        self.store
-            .op("keep_warm_usage", move |db| {
-                db.keep_warm_usage(turn, &usage)
-            })
-            .await
+        Ok(tokio::select! {
+            biased;
+            result = &mut run => Ran::Done(result),
+            () = &mut lifted => Ran::Lifted(run),
+        })
     }
 
     /// Run planned calls in order. Returns true when a wait parked the turn;
@@ -3814,7 +3580,6 @@ impl Turn {
         workspace: &std::path::Path,
         environment: &[(String, String)],
         record: &Bot,
-        mut warm: Option<&mut Warm<'_>>,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
     ) -> Result<Option<Stop>> {
@@ -3864,7 +3629,7 @@ impl Turn {
                 for _ in 1..batch.len() {
                     calls.next();
                 }
-                self.execute_parallel(batch, record, workspace, environment, warm.as_deref_mut())
+                self.execute_parallel(batch, record, workspace, environment)
                     .await?;
                 continue;
             }
@@ -3971,7 +3736,7 @@ impl Turn {
                             .await
                             .map(Outcome::text)
                     };
-                    match self.run_tool(search, None, warm.as_deref_mut()).await? {
+                    match self.run_tool(search, None).await? {
                         Ran::Done(Ok(outcome)) => {
                             self.kept(outcome, record, workspace, &call.call_id).await
                         }
@@ -4048,7 +3813,7 @@ impl Turn {
                         sandbox,
                         sender,
                     );
-                    match self.run_tool(start, None, warm.as_deref_mut()).await? {
+                    match self.run_tool(start, None).await? {
                         Ran::Done(Ok(outcome)) => {
                             seen = Self::seen(id, &outcome);
                             outcome
@@ -4082,7 +3847,7 @@ impl Turn {
                         self.settings().approval_hold_ms(),
                         sandbox,
                     );
-                    match self.run_tool(hold, None, warm.as_deref_mut()).await? {
+                    match self.run_tool(hold, None).await? {
                         Ran::Done(Ok(Some(outcome))) => {
                             seen = Self::seen(handle, &outcome);
                             outcome
@@ -4101,6 +3866,9 @@ impl Turn {
                             ControlFlow::Continue(outcome) => outcome,
                             ControlFlow::Break(stop) => return Ok(Some(stop)),
                         },
+                        Ran::Done(Err(error)) if error.code == "terminal_not_running" => {
+                            failure(self.no_terminal(handle, error).await?)
+                        }
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
@@ -4119,10 +3887,13 @@ impl Turn {
                         kill,
                         sandbox,
                     );
-                    match self.run_tool(typed, None, warm.as_deref_mut()).await? {
+                    match self.run_tool(typed, None).await? {
                         Ran::Done(Ok(outcome)) => {
                             seen = Self::seen(handle, &outcome);
                             outcome
+                        }
+                        Ran::Done(Err(error)) if error.code == "terminal_not_running" => {
+                            failure(self.no_terminal(handle, error).await?)
                         }
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
@@ -4215,18 +3986,17 @@ impl Turn {
                     background: false,
                 }) => {
                     let (started, running) = oneshot::channel();
+                    let place = self.registry.place();
                     let run = self.registry.foreground(
                         command,
                         workspace.to_path_buf(),
                         timeout_ms,
                         environment.to_vec(),
                         sandbox,
+                        place.clone(),
                         started,
                     );
-                    match self
-                        .run_tool(run, Some((&self.lift, running)), warm.as_deref_mut())
-                        .await?
-                    {
+                    match self.run_tool(run, Some((&self.lift, running))).await? {
                         Ran::Done(Ok(outcome)) => {
                             self.kept(outcome, record, workspace, &call.call_id).await
                         }
@@ -4236,7 +4006,7 @@ impl Turn {
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(run) => {
                             let outputs = self.outputs(record, workspace);
-                            self.lift_shell(&call.call_id, run, outputs).await?
+                            self.lift_shell(&call.call_id, run, &place, outputs).await?
                         }
                     }
                 }
@@ -4245,7 +4015,6 @@ impl Turn {
                         self.registry
                             .execute(prepared, workspace, environment, sandbox),
                         None,
-                        warm.as_deref_mut(),
                     )
                     .await?
                 {
@@ -4325,7 +4094,6 @@ impl Turn {
         record: &Bot,
         workspace: &std::path::Path,
         environment: &[(String, String)],
-        warm: Option<&mut Warm<'_>>,
     ) -> Result<()> {
         let turn = self.turn;
         let starting: Vec<ToolCall> = batch.iter().map(|(call, _)| call.clone()).collect();
@@ -4403,7 +4171,7 @@ impl Turn {
             let (ran, wrote) = tokio::join!(run, write);
             ran.and(wrote)
         };
-        match self.run_tool(record, None, warm).await? {
+        match self.run_tool(record, None).await? {
             Ran::Done(result) => result,
             Ran::Lifted(_) => unreachable!("a batch is not lifted whole"),
         }
@@ -4440,12 +4208,14 @@ impl Turn {
                 background: false,
             } => {
                 let (started, running) = oneshot::channel();
+                let place = self.registry.place();
                 let mut run = Box::pin(self.registry.foreground(
                     command,
                     workspace.to_path_buf(),
                     timeout_ms,
                     environment.to_vec(),
                     sandbox,
+                    place.clone(),
                     started,
                 ));
                 let lifted = async {
@@ -4466,7 +4236,7 @@ impl Turn {
                         let outputs = self.outputs(record, workspace);
                         return (
                             call_id.clone(),
-                            self.lift_shell(&call_id, run, outputs).await,
+                            self.lift_shell(&call_id, run, &place, outputs).await,
                         );
                     }
                 }
@@ -4536,31 +4306,11 @@ impl Turn {
             .workspace
             .as_ref()
             .map_or_else(|| workspace.to_owned(), PathBuf::from);
-        tokio::task::spawn_blocking(move || {
-            // The probe for a sandbox runs once, here off the runtime
-            // thread, also for a bot from before a restart.
-            agent_runtime::sandbox::available()?;
-            // The bot's own socket, so its commands may use the daemon as
-            // far as a sandboxed bot may; opened first, so its folder is
-            // there to be kept read-only.
-            let (capability, listening) = daemon.capability(bot)?.unzip();
-            let policy = Policy::new(
-                settings.sandbox,
-                Some(&root),
-                &settings.writable,
-                settings.network,
-                &daemon,
-            )?;
-            Ok(policy.map(|policy| Policy {
-                capability,
-                listening,
-                ..policy.with_sockets(&settings.unix_sockets)
-            }))
-        })
-        .await
-        .map_err(|_| Error::new("sandbox_unavailable"))
-        .flatten()
-        .map(|policy| policy.map(Arc::new))
+        tokio::task::spawn_blocking(move || bot_sandbox(&settings, &root, bot, &daemon))
+            .await
+            .map_err(|_| Error::new("sandbox_unavailable"))
+            .flatten()
+            .map(|policy| policy.map(Arc::new))
     }
 
     /// Wait for a gated call's verdict: live for the hold, then parked like
@@ -5192,6 +4942,7 @@ impl Turn {
         &self,
         call_id: &str,
         run: std::pin::Pin<Box<F>>,
+        place: &Place,
         outputs: Option<Outputs>,
     ) -> Result<Outcome>
     where
@@ -5204,6 +4955,8 @@ impl Turn {
             .await?;
         let (sender, receiver) = oneshot::channel();
         let run = self.registry.until_pulled(run);
+        // Counted as the process it is now, not as a foreground command too.
+        place.lift();
         tokio::spawn(async move {
             let _ = sender.send(run.await);
         });
@@ -5288,27 +5041,6 @@ impl Turn {
     }
 }
 
-/// Cancel a refresh not yet sent, or wait for the answer to one that was.
-/// It stays in `pending` until answered, so a caller dropped meanwhile
-/// leaves it for the turn's end to settle.
-async fn settle(
-    pending: &mut Option<Pending>,
-) -> Option<Result<(agent_runtime::provider::Usage, tokio::time::Instant)>> {
-    let in_flight = pending.as_mut()?;
-    let refreshed = if in_flight.refresh.cancel() {
-        in_flight.task.abort();
-        None
-    } else {
-        Some(
-            (&mut in_flight.task)
-                .await
-                .unwrap_or_else(|_| fail("keep_warm_lost")),
-        )
-    };
-    *pending = None;
-    refreshed
-}
-
 /// When `at` was, in milliseconds since the Unix epoch.
 fn epoch_ms(at: tokio::time::Instant) -> u64 {
     now_ms().saturating_sub(at.elapsed().as_millis() as u64)
@@ -5338,6 +5070,55 @@ fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
 /// when it offers one, and a fork's allowed list narrows it as any tool.
 fn searches(record: &agent_runtime::store::Bot) -> bool {
     record.callable().iter().any(|tool| tool == "web_search")
+}
+
+/// Whether a turn whose budget is spent makes one more call, without tool
+/// calls: one that has called under it, for an answer, a summary or a failed
+/// attempt, answers on it, unless a call for a budget already went.
+fn wraps_up(model_rounds: usize, wrapped: bool) -> bool {
+    model_rounds > 0 && !wrapped
+}
+
+/// The budget a call already spent, whose next call goes without tool
+/// calls as the turn's last. No call's work is known before it is made, so
+/// none is predicted: that last call may overshoot the cap.
+fn budget_reached(record: &agent_runtime::store::Bot) -> Option<Limit> {
+    record
+        .room()
+        .filter(|&(left, _)| left == 0)
+        .map(|(_, limit)| limit)
+}
+
+/// The input tokens a call's request sent new, as the work measure counts
+/// them, and the newest node it sent: of what the answering model read, the
+/// share of the request its history items after the newest node the bot's
+/// calls have read or written take. One pass over those items alone, from
+/// the window the turn holds: no read, whatever the history's length. A bot
+/// whose calls have read nothing sends all of it new.
+fn added_input(
+    record: &agent_runtime::store::Bot,
+    context: &Context,
+    tools: &serde_json::value::RawValue,
+    usage: &agent_runtime::provider::Usage,
+) -> (u64, Option<i64>) {
+    let input = usage
+        .models
+        .last()
+        .map_or(usage.input_tokens, |m| m.input_tokens);
+    let Some(window) = &context.window else {
+        return (input, record.work.read);
+    };
+    let sent = window.ids.last().copied();
+    let Some(read) = record.work.read else {
+        return (input, sent);
+    };
+    let new: u64 = (window.ids.iter().rev())
+        .zip(window.sizes.iter().rev())
+        .take_while(|(id, _)| **id > read)
+        .map(|(_, size)| u64::from(*size))
+        .sum();
+    let whole = context.usage().bytes + record.instructions.len() + tools.get().len();
+    (agent_runtime::store::share(input, new, whole as u64), sent)
 }
 
 fn calls_left(record: &agent_runtime::store::Bot, model_rounds: usize) -> bool {
@@ -5620,6 +5401,36 @@ fn for_model(results: BTreeMap<String, Arc<Value>>) -> BTreeMap<String, Arc<Valu
         .collect()
 }
 
+/// The sandbox a confined bot's commands run in, rooted at `root`, with
+/// the bot's own socket open: what its turns give each command and `lend`
+/// gives a command run as the bot. Blocking: it may probe and bind.
+pub(super) fn bot_sandbox(
+    settings: &Settings,
+    root: &std::path::Path,
+    bot: i64,
+    daemon: &agent_runtime::sandbox::Daemon,
+) -> Result<Option<Policy>> {
+    // The probe for a sandbox runs once, here off the runtime thread, also
+    // for a bot from before a restart.
+    agent_runtime::sandbox::available()?;
+    // The bot's own socket, so its commands may use the daemon as far as a
+    // sandboxed bot may; opened first, so its folder is there to be kept
+    // read-only.
+    let (capability, listening) = daemon.capability(bot)?.unzip();
+    let policy = Policy::new(
+        settings.sandbox,
+        Some(root),
+        &settings.writable,
+        settings.network,
+        daemon,
+    )?;
+    Ok(policy.map(|policy| Policy {
+        capability,
+        listening,
+        ..policy.with_sockets(&settings.unix_sockets)
+    }))
+}
+
 #[cfg(test)]
 use agent_runtime::store::pinned_item;
 
@@ -5685,12 +5496,14 @@ type Beside<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Landed> + S
 /// What a summary beside the call spent, counted toward the turn.
 #[derive(Default)]
 struct Spent {
-    tokens: u64,
+    spend: Spend,
     rounds: usize,
 }
 impl Spent {
-    fn count(self, tokens_used: &mut u64, model_rounds: &mut usize) {
-        *tokens_used = tokens_used.saturating_add(self.tokens);
+    fn count(self, record: Option<&mut agent_runtime::store::Bot>, model_rounds: &mut usize) {
+        if let Some(record) = record {
+            record.add(self.spend);
+        }
         *model_rounds += self.rounds;
     }
 }
@@ -5703,9 +5516,6 @@ pub struct SideCounts {
     summary_ms: AtomicU64,
     retries: AtomicU64,
     paced_ms: AtomicU64,
-    /// A summary beside the turn's call wrote its replacement for the view
-    /// the call sent, so no refresh keeps that view's cache warm.
-    replaced: AtomicBool,
 }
 
 /// Time from now until dropped, added to a summary counter.
@@ -5927,13 +5737,17 @@ struct Choice {
     copy: Option<usize>,
     copy_cost: Option<usize>,
     own_cost: Option<usize>,
+    /// What started it, from [`Turn::trigger`].
+    trigger: Value,
 }
 impl Choice {
-    /// The `request` field of the `compacted` event.
+    /// The `request` field of the `compacted` event, with the `trigger`
+    /// the store lifts out beside it.
     fn event(&self) -> Value {
         json!({"form": if self.copy.is_some() { "copy" } else { "own" },
             "items": self.copy,
-            "estimate": {"copy": self.copy_cost, "own": self.own_cost}})
+            "estimate": {"copy": self.copy_cost, "own": self.own_cost},
+            "trigger": self.trigger})
     }
 }
 
@@ -6029,6 +5843,7 @@ fn choose(shape: &Shape<'_>) -> Choice {
         copy: copy.filter(|(_, cost)| *cost < own).map(|(len, _)| len),
         copy_cost: copy.map(|(_, cost)| cost),
         own_cost: Some(own),
+        trigger: Value::Null,
     }
 }
 
@@ -6050,6 +5865,26 @@ fn completion_text(items: &[Bytes]) -> String {
         }
     }
     text
+}
+
+impl Turn {
+    /// Why `write_stdin` found no terminal `handle`: `error`, unless the
+    /// handle is a command of this bot's that runs without a terminal.
+    async fn no_terminal(&self, handle: i64, error: Error) -> Result<Error> {
+        let bot = self.bot.clone();
+        let runs = (self.store)
+            .op("runs_for", move |db| db.runs_for(&bot, handle))
+            .await?;
+        Ok(match runs {
+            true => Error::with(
+                "not_a_terminal",
+                format!(
+                    "proc:{handle} is a background command, not a terminal: write_stdin types into and kills only commands started with tty=true; a background command runs until it exits or reaches its timeout_ms, and wait on it reports how it ended"
+                ),
+            ),
+            false => error,
+        })
+    }
 }
 
 fn failure(error: Error) -> Outcome {
@@ -6226,12 +6061,12 @@ mod tests {
     fn a_models_wait_keeps_a_turns_outcome_and_drops_its_accounting() {
         let view = json!({"bot":"Bob","bot_id":2,"turn":3,"handle":"turn:Bob/3",
             "request_id":"r","waiting_on":null,"input_tokens":10,"cached_input_tokens":0,
-            "output_tokens":4,"model_rounds":1,"retries":0,"paced_ms":0,"started_ms":1,
-            "finished_ms":2});
+            "output_tokens":4,"work_tokens":6,"model_rounds":1,"retries":0,"paced_ms":0,
+            "started_ms":1,"finished_ms":2});
         let mut failed = view.clone();
         failed.as_object_mut().unwrap().extend(
-            json!({"status":"failed","error":"turn_budget_exceeded","detail":"over",
-                "budget_tokens":100,"tokens_used":120})
+            json!({"status":"failed","error":"turn_budget_exhausted","detail":"over",
+                "turn_budget_tokens":100,"turn_work_tokens":120})
             .as_object()
             .unwrap()
             .clone(),
@@ -6246,8 +6081,8 @@ mod tests {
         let model = for_model(results);
         assert_eq!(
             *model["turn:Bob/3"],
-            json!({"turn":3,"status":"failed","error":"turn_budget_exceeded","detail":"over",
-                "budget_tokens":100,"tokens_used":120})
+            json!({"turn":3,"status":"failed","error":"turn_budget_exhausted","detail":"over",
+                "turn_budget_tokens":100,"turn_work_tokens":120})
         );
         assert_eq!(
             *model["turn:Bob/4"],
@@ -6280,6 +6115,7 @@ mod tests {
                             instructions: "",
                             effort: None,
                             budget_tokens: None,
+                            budget_counts: Default::default(),
                             tools: &[],
                             created_by: None,
                             created_by_id: None,
@@ -6290,6 +6126,7 @@ mod tests {
                             settings: Default::default(),
                             declared: None,
                             request_id: None,
+                            starts_line: false,
                         },
                     )?;
                     let turn = db
@@ -6372,6 +6209,7 @@ mod tests {
             background_failures: mpsc::unbounded_channel().0,
             settings: Default::default(),
             rules: Default::default(),
+            given_rules: Default::default(),
             ruled: Default::default(),
             window: Default::default(),
             resumed: None,
@@ -6497,6 +6335,7 @@ mod tests {
                         instructions: "",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &[],
                         created_by: None,
                         created_by_id: None,
@@ -6507,6 +6346,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )?;
                 Ok(db
@@ -6551,6 +6391,7 @@ mod tests {
             background_failures: mpsc::unbounded_channel().0,
             settings: Default::default(),
             rules: Default::default(),
+            given_rules: Default::default(),
             ruled: Default::default(),
             window: Default::default(),
             resumed: None,
@@ -6632,6 +6473,7 @@ mod tests {
                         instructions: "",
                         effort: None,
                         budget_tokens: None,
+                        budget_counts: Default::default(),
                         tools: &tools,
                         created_by: None,
                         created_by_id: None,
@@ -6642,6 +6484,7 @@ mod tests {
                         settings: Default::default(),
                         declared: None,
                         request_id: None,
+                        starts_line: false,
                     },
                 )?;
                 let turn = (db.begin(
@@ -6678,6 +6521,7 @@ mod tests {
             60_000,
             Vec::new(),
             None,
+            registry.place(),
             started,
         ));
         running.await.unwrap();
@@ -6701,6 +6545,7 @@ mod tests {
             background_failures: mpsc::unbounded_channel().0,
             settings: Default::default(),
             rules: Default::default(),
+            given_rules: Default::default(),
             ruled: Default::default(),
             window: Default::default(),
             resumed: None,
@@ -6717,9 +6562,7 @@ mod tests {
             {"pattern": ["git", "push"], "decision": "prompt"},
         ]}))
         .unwrap();
-        let _ = task
-            .rules
-            .set(Arc::new(agent_runtime::rules::Rules::new(policy)));
+        *task.rules.lock().unwrap() = Some(Arc::new(agent_runtime::rules::Rules::new(policy)));
         let _ = task.settings.set(record.settings.clone());
         // A forbidden command starts nothing: it is refused at once,
         // however loaded the machine.
@@ -6749,7 +6592,6 @@ mod tests {
                 &dir,
                 &[],
                 &record,
-                None,
                 None,
                 None,
             ),
