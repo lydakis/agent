@@ -26,7 +26,8 @@ pub fn tool() -> Value {
             after this call is what your lead reads. As a lead, name one of your tasks. The person's status \
             view files it under Done, out of their way, and its window closes once its turn ends. New \
             work sent to the task reopens it. A task that waits on the person, or on work still to come, is \
-            not done.",
+            not done. Once the person says a lead's project is done, the lead marks itself, naming no task, \
+            and an outer lead may name that lead: its automations pause until a message reopens it.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -40,10 +41,12 @@ pub fn tool() -> Value {
 
 /// Whether a `mark_done` call with `arguments`, made by `bot`, resolves
 /// `bot` itself: it names no task, or its own name, whole or past its
-/// project's, which may hold dots too.
+/// project's, which may hold dots too. A lead's name names that lead
+/// only whole: `web.lead` is another project's lead to `shop.web.lead`.
 pub fn itself(arguments: &Value, bot: &str) -> bool {
     match arguments["task"].as_str().map(str::trim) {
         None | Some("") => true,
+        Some(task) if crate::project::is_lead(task) => task == bot,
         Some(task) => (bot.strip_suffix(task))
             .is_some_and(|project| project.is_empty() || project.ends_with('.')),
     }
@@ -99,16 +102,27 @@ impl Own {
 }
 
 /// The task a `mark_done` call with `arguments` names, in full, for
-/// the lead of `project`.
+/// the lead of `project`: a lead's name, which no task has, as it is.
 pub fn call(arguments: &Value, project: &str) -> Option<String> {
     let task = arguments["task"].as_str()?.trim();
     if task.is_empty() || task.contains('/') {
         return None;
     }
-    Some(match task.starts_with(&format!("{project}.")) {
-        true => task.to_owned(),
-        false => format!("{project}.{task}"),
-    })
+    Some(
+        match task.starts_with(&format!("{project}.")) || crate::project::is_lead(task) {
+            true => task.to_owned(),
+            false => format!("{project}.{task}"),
+        },
+    )
+}
+
+/// Why a lead's automation does not run now: its newest turn, `newest`,
+/// marked it done (`itself`), or it is marked done, by itself or by its
+/// outer lead, up to `mark`, and no turn of its since reopened it. None
+/// for any other agent.
+pub fn paused(lead: &str, mark: Option<i64>, newest: Option<i64>, itself: bool) -> Option<String> {
+    (crate::project::is_lead(lead) && (itself || holds(mark, newest, false)))
+        .then(|| format!("{lead} is done; its automations run again once a message reopens it"))
 }
 
 /// Where the marks are kept: beside the store, one file per task.
@@ -183,6 +197,25 @@ mod tests {
         assert_eq!(named(""), None);
         assert_eq!(named("../x"), None);
         assert_eq!(call(&json!({}), "calc"), None);
+        // An outer lead names a lead as it is.
+        assert_eq!(named("web.lead"), Some("web.lead".into()));
+        assert_eq!(named("shop.lead.api"), Some("shop.lead.api".into()));
+    }
+
+    #[test]
+    fn a_done_lead_s_automations_pause_until_a_turn_reopens_it() {
+        assert!(
+            paused("web.lead", Some(9), Some(9), false)
+                .unwrap()
+                .contains("web.lead is done")
+        );
+        assert_eq!(paused("web.lead", Some(9), Some(10), false), None);
+        assert_eq!(paused("web.lead", None, Some(9), false), None);
+        // Its newest turn marked it, before any window kept the mark.
+        assert!(paused("web.lead", None, Some(9), true).is_some());
+        // A task marked done is messaged by its automations as ever.
+        assert_eq!(paused("web.fix", Some(9), Some(9), false), None);
+        assert_eq!(paused("web.fix", None, Some(9), true), None);
     }
 
     #[test]
@@ -196,6 +229,10 @@ mod tests {
         assert!(!by(json!({"task": "ix"})));
         // A project's name may hold dots.
         assert!(itself(&json!({"task": "fix"}), "shop.web.fix"));
+        // A lead's name names that lead only whole.
+        assert!(itself(&json!({"task": "shop.web.lead"}), "shop.web.lead"));
+        assert!(!itself(&json!({"task": "web.lead"}), "shop.web.lead"));
+        assert!(itself(&json!({"task": "lead.api"}), "shop.lead.api"));
     }
 
     #[test]

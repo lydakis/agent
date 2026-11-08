@@ -5720,6 +5720,25 @@ fn fire(places: &Places, trigger: &Trigger, ask: Option<&Asked>) {
             return;
         }
     }
+    // A done lead's automations wait for a message to reopen it; one the
+    // person runs now runs. Only a lead costs a look at its newest turn,
+    // and one that can't be looked at runs as ever.
+    if !asked
+        && let Target::Bot { name, .. } = &trigger.target
+        && crate::project::is_lead(name)
+    {
+        // With no store named, no mark is read: its history still says.
+        let store = (trigger.daemon.store.as_deref()).map(|store| {
+            agent_client::socket::canonical_store(store).unwrap_or_else(|_| store.to_owned())
+        });
+        if let Ok(Some(why)) = with_daemon(trigger, async |c| {
+            lead_paused(c, store.as_deref(), name).await
+        }) {
+            let paused = named(json!({"outcome": "paused", "detail": why}));
+            settle(places, trigger, &paused, &kept);
+            return;
+        }
+    }
     let mut why = match asked {
         true => RUN_NOW.to_owned(),
         false => trigger.when.clone(),
@@ -5907,6 +5926,24 @@ fn looked(places: &Places, trigger: &Trigger, seen: &Seen) {
 /// cannot be reached or serves another store.
 /// How often a fire waiting out a pause looks again.
 const PAUSE_LOOK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Why the lead `name`'s automations wait now: its mark beside `store`
+/// says it is done and no turn of its since reopened it, or its newest
+/// turn that ran, past messages steered into it, marked it done, which a
+/// window keeps only once one is open. None when it isn't, or its turns
+/// can't be read.
+async fn lead_paused(client: &Client, store: Option<&Path>, name: &str) -> Option<String> {
+    let ran = crate::last_ran(client, name, None).await.ok()?;
+    let newest = ran["turn"].as_i64();
+    let mark = store.and_then(|store| crate::resolved::read(store, name));
+    // Its history is read only when no mark says it already.
+    let itself = !crate::resolved::holds(mark, newest, false)
+        && match newest {
+            Some(turn) => crate::needs::resolved_turn(client, name, turn).await,
+            None => false,
+        };
+    crate::resolved::paused(name, mark, newest, itself)
+}
 
 /// Wait while `trigger`'s daemon is paused. A daemon that does not answer
 /// is not paused here: the check then runs and says what it finds.
@@ -8785,6 +8822,60 @@ pub(crate) mod tests {
             refused.contains("--until 2026-09-28 09:00 has passed"),
             "{refused}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_done_lead_s_automations_wait_until_a_turn_reopens_it() {
+        let newest = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(9));
+        let seen = newest.clone();
+        let client = crate::tests::daemon_answering(move |request| {
+            let turn = seen.load(std::sync::atomic::Ordering::SeqCst);
+            match request["op"].as_str() {
+                // A message steered into turn 11 is a turn of its own.
+                Some("turns") if turn == 12 => json!({"turns": [
+                    {"turn": 12, "status": "steered"}, {"turn": 11, "status": "completed"}]}),
+                Some("turns") => json!({"turns": [{"turn": turn}]}),
+                // Turn 11 marked the lead done, with no window open to
+                // keep the mark.
+                Some("history_nodes") => json!({"nodes": [
+                    {"node": 41, "turn": 11}, {"node": 40, "turn": 11}, {"node": 30, "turn": 10}]}),
+                Some("history_items") if request["nodes"][0] == 41 => json!({"items": [
+                    {"node": 41, "item": {"type": "function_call_output", "call_id": "c2",
+                        "output": "Marked done."}},
+                    {"node": 40, "item": {"type": "function_call", "call_id": "c2",
+                        "name": "mark_done", "arguments": "{}"}}]}),
+                Some("history_items") => json!({"items": [
+                    {"node": 30, "item": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "More, please."}]}}]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("sonny-lead-paused-{}", std::process::id()));
+        let store = dir.join("store");
+        // Not marked: it runs.
+        assert_eq!(lead_paused(&client, Some(&store), "web.lead").await, None);
+        crate::resolved::keep(&store, "web.lead", 9, "c1").unwrap();
+        let why = lead_paused(&client, Some(&store), "web.lead")
+            .await
+            .unwrap();
+        assert!(why.contains("web.lead is done"), "{why}");
+        // A message reopened it: it runs again.
+        newest.store(10, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(lead_paused(&client, Some(&store), "web.lead").await, None);
+        // It marked itself done again, headless: its history says so.
+        newest.store(11, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            lead_paused(&client, Some(&store), "web.lead")
+                .await
+                .is_some()
+        );
+        // With no store named too.
+        assert!(lead_paused(&client, None, "web.lead").await.is_some());
+        // A message steered into the turn that marked it reopens nothing.
+        newest.store(12, std::sync::atomic::Ordering::SeqCst);
+        assert!(lead_paused(&client, None, "web.lead").await.is_some());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
