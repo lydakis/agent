@@ -10,8 +10,10 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::Span,
 };
+use std::cell::RefCell;
 use std::ops::{Deref, Range};
-use unicode_segmentation::UnicodeSegmentation;
+use std::rc::Rc;
+use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 use unicode_width::UnicodeWidthStr;
 
 /// What the composer's rows start with: the prompt mark on the first,
@@ -30,10 +32,31 @@ pub struct Prompt {
     killed: String,
     /// Where a selection began; it runs to the cursor.
     anchor: Option<usize>,
+    /// The rows last laid out, and what the text was then: a key lays out
+    /// again only the rows its edit reached, so typing into a long paste
+    /// costs what typing into a short one does.
+    laid: RefCell<Option<Laid>>,
+    /// The marks last drawn and the bytes shown then, until the text
+    /// changes: a frame that redraws a long prompt unchanged reads none.
+    styled: RefCell<Option<Styled>>,
+}
+
+/// Marks styling the bytes `shown`, as [`marks_in`] has them.
+type Styled = (Range<usize>, Rc<Vec<(Range<usize>, Style)>>);
+
+/// Rows laid out at a width, and how the text changed since: the bytes
+/// before `from` and the last `tail` bytes are as they were, and the text
+/// was `len` bytes long.
+struct Laid {
+    width: usize,
+    rows: Rc<Vec<Row>>,
+    len: usize,
+    from: usize,
+    tail: usize,
 }
 
 /// One drawn row: the bytes of the text it shows.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Row {
     pub start: usize,
     pub end: usize,
@@ -52,6 +75,8 @@ impl Prompt {
         self.anchor = None;
         self.text.clear();
         self.at = 0;
+        self.laid.take();
+        self.styled.take();
     }
 
     /// Replace the text, with the cursor at its end.
@@ -60,6 +85,8 @@ impl Prompt {
         self.anchor = None;
         self.text = text.to_owned();
         self.at = self.text.len();
+        self.laid.take();
+        self.styled.take();
     }
 
     /// The selected bytes, when any are.
@@ -97,7 +124,7 @@ impl Prompt {
         };
         self.anchor = None;
         self.at = range.start;
-        self.text.drain(range);
+        self.splice(range, "");
         self.settle();
         true
     }
@@ -121,7 +148,7 @@ impl Prompt {
     pub fn insert(&mut self, text: &str) {
         self.goal = None;
         self.cut();
-        self.text.insert_str(self.at, text);
+        self.splice(self.at..self.at, text);
         self.at += text.len();
         self.settle();
     }
@@ -132,7 +159,7 @@ impl Prompt {
             return;
         }
         let start = self.before(self.at);
-        self.text.drain(start..self.at);
+        self.splice(start..self.at, "");
         self.at = start;
         self.settle();
     }
@@ -143,7 +170,7 @@ impl Prompt {
             return;
         }
         let end = self.after(self.at);
-        self.text.drain(self.at..end);
+        self.splice(self.at..end, "");
         self.settle();
     }
 
@@ -247,7 +274,7 @@ impl Prompt {
             self.killed = self.text[range.clone()].to_owned();
         }
         self.at = range.start;
-        self.text.drain(range);
+        self.splice(range, "");
         self.settle();
     }
 
@@ -283,12 +310,28 @@ impl Prompt {
     /// edit joined the graphemes around it (a flag's two halves) or a
     /// move stopped inside one.
     fn settle(&mut self) {
-        self.at = self
-            .text
-            .grapheme_indices(true)
-            .map(|(i, _)| i)
-            .find(|&i| i >= self.at)
-            .unwrap_or(self.text.len());
+        // Read around the cursor alone, not from the start of the text.
+        let len = self.text.len();
+        let mut at = self.at.min(len);
+        while !self.text.is_char_boundary(at) {
+            at += 1;
+        }
+        let mut cursor = GraphemeCursor::new(at, len, true);
+        self.at = match cursor.is_boundary(&self.text, 0) {
+            Ok(true) => at,
+            _ => (cursor.next_boundary(&self.text, 0).ok().flatten()).unwrap_or(len),
+        };
+    }
+
+    /// Put `with` in place of the bytes `range`, noting what changed for
+    /// the next layout.
+    fn splice(&mut self, range: Range<usize>, with: &str) {
+        if let Some(laid) = self.laid.get_mut() {
+            laid.from = laid.from.min(range.start);
+            laid.tail = laid.tail.min(self.text.len() - range.end);
+        }
+        self.styled.take();
+        self.text.replace_range(range, with);
     }
 
     /// Move a drawn row up; false when the cursor is on the first.
@@ -363,52 +406,67 @@ impl Prompt {
 
     /// The text as the composer draws it at `width`: each line wrapped at
     /// word breaks into rows of `width - 1` columns, lead included.
-    pub fn layout(&self, width: usize) -> Vec<Row> {
-        let room = width.saturating_sub(1 + LEAD).max(8);
-        let mut rows = Vec::new();
-        let mut line_start = 0;
-        for line in self.text.split('\n') {
-            let mut start = line_start;
-            let mut used = 0;
-            let mut word_start = line_start;
-            for word in words(line) {
-                let wide = word.trim_end().width();
-                if used + wide > room && used > 0 {
-                    rows.push(Row {
-                        start,
-                        end: word_start,
-                    });
-                    start = word_start;
-                    used = 0;
+    ///
+    /// Kept between calls: after an edit, the rows are wrapped again from
+    /// the row before the one it touched, until a row starts where one
+    /// started before in the text after it, and the rest are moved over.
+    /// A row's start is all its wrapping depends on, so what follows such
+    /// a row is the same. A key in a long text costs a few rows, not the
+    /// text.
+    pub fn layout(&self, width: usize) -> Rc<Vec<Row>> {
+        let mut laid = self.laid.borrow_mut();
+        let len = self.text.len();
+        match laid.as_mut() {
+            Some(laid) if laid.width == width => {
+                if (laid.from, laid.tail) != (len, len) || laid.len != len {
+                    let rows = Rc::make_mut(&mut laid.rows);
+                    relayout(&self.text, width, rows, laid.len, laid.from, laid.tail);
                 }
-                // A word wider than a row is cut where the row ends.
-                for (i, g) in word.grapheme_indices(true) {
-                    let w = g.width();
-                    if used + w > room && used > 0 {
-                        let at = word_start + i;
-                        rows.push(Row { start, end: at });
-                        start = at;
-                        used = 0;
-                    }
-                    used += w;
-                }
-                word_start += word.len();
+                laid.len = len;
+                (laid.from, laid.tail) = (len, len);
+                laid.rows.clone()
             }
-            rows.push(Row {
-                start,
-                end: line_start + line.len(),
-            });
-            line_start += line.len() + 1;
+            _ => {
+                let mut rows = Vec::new();
+                wrap(&self.text, 0, width, &mut rows, |_| None);
+                let rows = Rc::new(rows);
+                *laid = Some(Laid {
+                    width,
+                    rows: rows.clone(),
+                    len,
+                    from: len,
+                    tail: len,
+                });
+                rows
+            }
         }
-        rows
+    }
+
+    /// The marks on the bytes `shown`, as [`marks_in`] finds them in the
+    /// whole text, read from the lines shown alone; kept until the text
+    /// changes or other bytes are shown.
+    pub fn marks(&self, shown: Range<usize>) -> Rc<Vec<(Range<usize>, Style)>> {
+        let mut styled = self.styled.borrow_mut();
+        match &*styled {
+            Some((at, marked)) if *at == shown => marked.clone(),
+            _ => {
+                let mut marked = marks_in(&self.text, shown.clone());
+                marked.retain(|(piece, _)| piece.start <= shown.end && shown.start <= piece.end);
+                let marked = Rc::new(marked);
+                *styled = Some((shown, marked.clone()));
+                marked
+            }
+        }
     }
 
     /// The cursor's drawn row, and its column counting the lead.
     pub fn cursor(&self, rows: &[Row]) -> (usize, usize) {
+        // The last row that starts at or before the cursor: where a word
+        // is cut, the cursor there is on the row it begins.
         let row = rows
-            .iter()
-            .rposition(|row| row.start <= self.at && self.at <= row.end)
-            .unwrap_or(0);
+            .partition_point(|row| row.start <= self.at)
+            .saturating_sub(1)
+            .min(rows.len().saturating_sub(1));
         let col = LEAD + self.text[rows[row].start..self.at].width();
         (row, col)
     }
@@ -445,6 +503,120 @@ impl Prompt {
     }
 }
 
+/// Wrap `text` from `start`, the start of a row, into `rows` at `width`,
+/// until `stop`, asked the start of each next row, says where the rows
+/// laid before take over: then those are put after, and wrapping ends.
+fn wrap(
+    text: &str,
+    start: usize,
+    width: usize,
+    rows: &mut Vec<Row>,
+    mut stop: impl FnMut(usize) -> Option<()>,
+) {
+    let room = width.saturating_sub(1 + LEAD).max(8);
+    #[cfg(test)]
+    let mut rows = Counted(rows);
+    let mut line_start = start;
+    let mut start = start;
+    loop {
+        let line_end = (text[line_start..].find('\n')).map_or(text.len(), |i| line_start + i);
+        let line = &text[line_start..line_end];
+        let mut used = 0;
+        let mut word_start = line_start;
+        for word in words(line) {
+            // A word wider than the rest of a row starts the next one; a
+            // row's first word, however wide, needs no measuring here.
+            if used > 0 && used + word.trim_end().width() > room {
+                rows.push(Row {
+                    start,
+                    end: word_start,
+                });
+                start = word_start;
+                used = 0;
+                if stop(start).is_some() {
+                    return;
+                }
+            }
+            // A word wider than a row is cut where the row ends.
+            for (i, g) in word.grapheme_indices(true) {
+                let w = g.width();
+                if used + w > room && used > 0 {
+                    let at = word_start + i;
+                    rows.push(Row { start, end: at });
+                    start = at;
+                    used = 0;
+                    if stop(start).is_some() {
+                        return;
+                    }
+                }
+                used += w;
+            }
+            word_start += word.len();
+        }
+        rows.push(Row {
+            start,
+            end: line_end,
+        });
+        if line_end == text.len() {
+            return;
+        }
+        line_start = line_end + 1;
+        start = line_start;
+        if stop(start).is_some() {
+            return;
+        }
+    }
+}
+
+/// The rows `wrap` lays out, counted, for the tests to see how many an
+/// edit lays out again.
+#[cfg(test)]
+struct Counted<'a>(&'a mut Vec<Row>);
+
+#[cfg(test)]
+thread_local! {
+    static WRAPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+impl Counted<'_> {
+    fn push(&mut self, row: Row) {
+        WRAPPED.with(|n| n.set(n.get() + 1));
+        self.0.push(row);
+    }
+}
+
+/// Lay `rows`, laid out for a text of `len` bytes, out again for `text`,
+/// whose first `from` bytes and last `tail` bytes are as they were.
+fn relayout(text: &str, width: usize, rows: &mut Vec<Row>, len: usize, from: usize, tail: usize) {
+    // The row before the first the edit touched: a word made shorter may
+    // now fit on it.
+    let first = rows.partition_point(|row| row.end < from).saturating_sub(1);
+    let start = rows.get(first).map_or(0, |row| row.start);
+    let old = rows.split_off(first);
+    // Rows of the old text that start in its unchanged end, by where they
+    // start in the new: once a new row starts at one, the rest are those.
+    let kept = old.partition_point(|row| row.start < len - tail);
+    let moved = |at: usize| at + text.len() - len;
+    let mut taken = None;
+    wrap(text, start, width, rows, |at| {
+        let from_new = text.len() - tail;
+        if at < from_new {
+            return None;
+        }
+        let found = old[kept..].binary_search_by(|row| moved(row.start).cmp(&at));
+        let found = found.ok()?;
+        taken = Some(kept + found);
+        Some(())
+    });
+    if let Some(taken) = taken {
+        rows.extend(old[taken..].iter().map(|row| Row {
+            start: moved(row.start),
+            end: moved(row.end),
+        }));
+    }
+}
+
 /// A line's words, each with the spaces after it.
 fn words(line: &str) -> impl Iterator<Item = &str> {
     let mut rest = line;
@@ -462,25 +634,35 @@ fn words(line: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// The marks of the whole text, as [`marks_in`] reads them.
+#[cfg(test)]
+fn marks(text: &str) -> Vec<(Range<usize>, Style)> {
+    marks_in(text, 0..text.len())
+}
+
 /// How the composer draws what is typed: Markdown's marks kept and dim,
 /// what they mark styled as the conversation draws it (bold, italic,
 /// struck, `code` in code's colour, a `#` line as a heading), so the
 /// person sees what they will send and sends the plain text they typed.
 /// Each styled piece as a byte range; the rest is plain. A slash command
-/// and a `!` command are not Markdown.
-pub fn marks(text: &str) -> Vec<(Range<usize>, Style)> {
+/// and a `!` command are not Markdown. Read from the lines `range`
+/// reaches alone: what a few rows drawn of a long text need.
+fn marks_in(text: &str, range: Range<usize>) -> Vec<(Range<usize>, Style)> {
     let mut marked = Vec::new();
     if text.starts_with('/') || text.starts_with('!') {
         return marked;
     }
-    let mut start = 0;
-    for line in text.split('\n') {
+    let mut start = text[..range.start].rfind('\n').map_or(0, |i| i + 1);
+    for line in text[start..].split('\n') {
         let (lead, base) = opening(line);
         if lead > 0 {
             marked.push((start..start + lead, dim()));
         }
         inline(line, lead, start, base, &mut marked);
         start += line.len() + 1;
+        if start > range.end {
+            break;
+        }
     }
     marked
 }
@@ -610,7 +792,13 @@ fn inline(
             continue;
         }
         let Some((mark, end, style, nested)) = found else {
-            at += rest.chars().next().map_or(1, char::len_utf8);
+            // Past this character to the next that may open a mark: the
+            // plain words between are passed over at once.
+            let step = rest.chars().next().map_or(1, char::len_utf8);
+            at += step
+                + rest[step..]
+                    .find(['`', '*', '_', '~', '['])
+                    .unwrap_or(rest.len() - step);
             continue;
         };
         if plain < at && base != Style::new() {
@@ -1004,5 +1192,136 @@ mod tests {
         let shown: Vec<_> = rows.iter().map(|r| &prompt[r.start..r.end]).collect();
         assert_eq!(shown, ["abcdefghij", "klmnop"]);
         assert_eq!(prompt.cursor(&rows), (1, LEAD + 6));
+    }
+
+    /// A small, fixed sequence of numbers, the same each run.
+    struct Dice(u64);
+    impl Dice {
+        fn roll(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % n
+        }
+    }
+
+    #[test]
+    fn rows_laid_out_again_after_edits_are_the_rows_laid_out_anew() {
+        let pieces = [
+            "a",
+            "word ",
+            "longer words ",
+            "\n",
+            "\n\n",
+            "  ",
+            "🇬🇷",
+            "👩‍👩‍👧",
+            "é",
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+            "x ",
+            "中文字 ",
+            "\t",
+        ];
+        let mut dice = Dice(7);
+        for width in [13, 20, 41] {
+            let mut prompt = Prompt::default();
+            for _ in 0..1500 {
+                let _ = prompt.layout(width);
+                // A few edits between layouts, as keys come between frames.
+                for _ in 0..1 + dice.roll(3) {
+                    let at = dice.roll(prompt.len() + 1);
+                    prompt.select(at, at);
+                    prompt.unselect();
+                    match dice.roll(8) {
+                        0 => prompt.backspace(),
+                        1 => prompt.delete(),
+                        2 => prompt.delete_word(),
+                        3 => prompt.delete_to_end(),
+                        _ => prompt.insert(pieces[dice.roll(pieces.len())]),
+                    }
+                }
+                let anew = typed(&prompt);
+                assert_eq!(*prompt.layout(width), *anew.layout(width), "{:?}", &*prompt);
+                assert_eq!(prompt.cursor(&prompt.layout(width)), {
+                    let rows = anew.layout(width);
+                    let row = rows
+                        .iter()
+                        .rposition(|row| row.start <= prompt.at && prompt.at <= row.end)
+                        .unwrap_or(0);
+                    (row, LEAD + prompt[rows[row].start..prompt.at].width())
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_lays_out_the_same_few_rows_however_long_the_text() {
+        // Doubling the text leaves the rows a key lays out again the same.
+        let mut counts = Vec::new();
+        for kib in [16, 32, 64, 128] {
+            let words = [
+                "a ", "word ", "other ", "longest ", "is ", "between ", "the ",
+            ];
+            let mut dice = Dice(11);
+            let mut text = String::new();
+            let mut n = 0;
+            while text.len() < kib * 1024 {
+                text.push_str(words[dice.roll(words.len())]);
+                n += 1;
+                if n % 20 == 0 {
+                    text.push('\n');
+                }
+            }
+            for line_breaks in [true, false] {
+                let text = match line_breaks {
+                    true => text.clone(),
+                    false => text.replace('\n', " "),
+                };
+                let mut prompt = typed(&text);
+                let half = text.len() / 2;
+                prompt.select(half, half);
+                prompt.unselect();
+                let _ = prompt.layout(80);
+                WRAPPED.with(|n| n.set(0));
+                for key in "and then a few words typed into the middle of it "
+                    .chars()
+                    .cycle()
+                    .take(200)
+                {
+                    prompt.insert(&key.to_string());
+                    let _ = prompt.layout(80);
+                }
+                prompt.backspace();
+                let _ = prompt.layout(80);
+                counts.push((kib, line_breaks, WRAPPED.with(|n| n.get())));
+            }
+        }
+        // About two rows a key on lines, a dozen in one long paragraph,
+        // where a word pushed down moves the rows after it until one
+        // starts where it did; 128 KiB as 16.
+        for (kib, _, wrapped) in &counts {
+            assert!(*wrapped < 200 * 20, "{kib} KiB: {counts:?}");
+        }
+    }
+
+    #[test]
+    fn the_marks_of_shown_lines_are_those_of_the_whole_text() {
+        let text = "# Heading\nsome **bold** and _it_\n- a [link](u) `code`\nplain\n> quote ~~x~~";
+        let all = marks(text);
+        for start in 0..text.len() {
+            if !text.is_char_boundary(start) {
+                continue;
+            }
+            for end in start..=text.len() {
+                let lines = text[..start].rfind('\n').map_or(0, |i| i + 1)
+                    ..text[end..].find('\n').map_or(text.len(), |i| end + i);
+                let within: Vec<_> = (all.iter())
+                    .filter(|(piece, _)| lines.start <= piece.start && piece.end <= lines.end + 1)
+                    .cloned()
+                    .collect();
+                assert_eq!(marks_in(text, start..end), within, "{start}..{end}");
+            }
+        }
     }
 }

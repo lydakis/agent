@@ -14855,13 +14855,22 @@ impl App {
             Some((_, (_, first, _))) => {
                 let first = (*first).min(rows - 1);
                 let row = row.saturating_sub(first).min(keep - 1);
-                (layout.into_iter().skip(first).take(keep).collect(), row)
+                (layout.iter().copied().skip(first).take(keep).collect(), row)
             }
-            None => window(layout, row, keep),
+            None => {
+                let start = rows.saturating_sub(keep).min(row);
+                let shown: Vec<prompt::Row> = layout[start..].iter().copied().take(keep).collect();
+                (shown, row - start)
+            }
         };
         // Markdown shows as it will read, its marks kept: styled on the
-        // rows shown alone, so a long paste costs no more to draw.
-        let marked = prompt::marks(&self.input);
+        // rows shown alone, read from their lines alone, so a long paste
+        // costs no more to draw.
+        let shown = match (layout.first(), layout.last()) {
+            (Some(first), Some(last)) => first.start..last.end,
+            _ => 0..0,
+        };
+        let marked = self.input.marks(shown);
         let rows: Vec<Line<'static>> = layout
             .iter()
             .map(|part| {
@@ -24135,5 +24144,77 @@ mod tests {
         }
         assert!(app.margin.note("repro").is_some());
         assert!(app.notice.is_some());
+    }
+
+    /// Typing into a long prompt: the time each key takes, with the
+    /// composer laid out as a frame lays it, at doubling sizes.
+    /// `cargo test -p sonny --release typing_a_long_prompt -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn typing_a_long_prompt() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let words = [
+            "the",
+            "agent",
+            "reads",
+            "**every**",
+            "file",
+            "in",
+            "`src/`",
+            "and",
+            "then",
+            "writes",
+            "a",
+            "short",
+            "note",
+            "about",
+            "what",
+            "_changed_",
+            "since",
+            "yesterday,",
+        ];
+        let text = |bytes: usize, breaks: bool| {
+            let mut text = String::new();
+            let mut n = 0;
+            while text.len() < bytes {
+                text.push_str(words[n % words.len()]);
+                n += 1;
+                text.push(if breaks && n % 16 == 0 { '\n' } else { ' ' });
+            }
+            text
+        };
+        for breaks in [true, false] {
+            for kib in [16, 32, 64, 128, 256, 512, 1024] {
+                let typed = text(kib * 1024, breaks);
+                for middle in [false, true] {
+                    app.input.set(&typed);
+                    if middle {
+                        let half = typed.len() / 2;
+                        app.input.select(half, half);
+                        app.input.unselect();
+                    }
+                    // Laid out once, as the frame after a paste does.
+                    let _ = app.composer(100);
+                    let keys = 50;
+                    let start = Instant::now();
+                    for _ in 0..keys {
+                        app.key(Event::Key(KeyEvent::new(
+                            KeyCode::Char('x'),
+                            KeyModifiers::NONE,
+                        )))
+                        .await;
+                        let _ = app.composer(100);
+                        let layout = app.input.layout(100);
+                        let _ = app.input.cursor(&layout);
+                    }
+                    let each = start.elapsed() / keys;
+                    eprintln!(
+                        "{} {kib:>5} KiB {}: {each:?} per key",
+                        if breaks { "lines   " } else { "one line" },
+                        if middle { "middle" } else { "end   " },
+                    );
+                }
+            }
+        }
     }
 }
