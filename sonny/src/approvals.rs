@@ -656,7 +656,9 @@ fn repositories(dir: &std::path::Path) -> Vec<String> {
                 continue;
             }
             let name = entry.file_name();
-            if name == ".git" {
+            // A repository's, which holds HEAD; not an empty one a
+            // sandbox left in its place.
+            if name == ".git" && entry.path().join("HEAD").exists() {
                 if depth > 0 {
                     found.extend(std::fs::canonicalize(entry.path()).ok());
                 }
@@ -1085,11 +1087,16 @@ mod tests {
         }
         std::fs::create_dir_all(dir.join("src/linked")).unwrap();
         std::fs::write(dir.join("src/linked/.git"), "gitdir: /elsewhere\n").unwrap();
+        // An empty `.git` a sandbox left in place is no repository: its
+        // folder is looked in like any other.
+        std::fs::create_dir_all(dir.join("src/stray/.git")).unwrap();
+        std::fs::create_dir_all(dir.join("src/stray/inner")).unwrap();
+        crate::task::git(&dir.join("src/stray/inner"), &["init", "-q"]).unwrap();
         let git = |repo: &str| dir.join(repo).join(".git").display().to_string();
         let fields = sandbox_with("auto", &dir);
         assert_eq!(
             fields["writable"],
-            json!([git("src/api"), git("src/web/ui")])
+            json!([git("src/api"), git("src/stray/inner"), git("src/web/ui")])
         );
         // A repository's own folder comes first, and what is inside its
         // tree is its own.
