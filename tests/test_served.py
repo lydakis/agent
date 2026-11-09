@@ -1032,6 +1032,39 @@ there.wait()
             self.assertLess(time.monotonic(), deadline, said)
             time.sleep(.5)
 
+    @unittest.skipUnless(shutil.which('agent-browser'), 'agent-browser is not installed')
+    def test_a_link_s_agents_share_one_chrome_on_a_kept_profile_each_in_its_own_tab(self):
+        program = shutil.which('agent-browser')
+        kept = self.path / 'kept-profile'
+        laptop, _ = self.linked(link=f'browser_profile = {json.dumps(str(kept))}\n',
+                                PATH=f"{Path(program).parent}:{os.environ['PATH']}")
+        sockets = laptop / '.agent/run/sonny'
+        self.addCleanup(lambda: subprocess.run([program, 'close', '--all'], capture_output=True,
+                                               env={**clean_env(), 'HOME': str(laptop),
+                                                    'AGENT_BROWSER_SOCKET_DIR': str(sockets)}))
+
+        def browse(bot, commands):
+            payload = {'commands': commands, 'bot': bot, 'bot_id': hash(bot) % 1000, 'store': str(self.store)}
+            conn, said = self.borrow('browser', payload)
+            # Whatever it asks, or records, the box's gate allows.
+            while 'done' not in (answer := json.loads(said.readline())):
+                if 'ask' in answer:
+                    allowed = {'verdict': {'allowed': 'step'}, 'seq': answer['seq']}
+                    conn.sendall((json.dumps(allowed) + '\n').encode())
+            self.assertIn('output', answer['done'], answer)
+            return json.dumps(answer['done']['output'])
+
+        browse('one.lead', ['open "data:text/html,<title>one</title>"'])
+        browse('two.lead', ['open "data:text/html,<title>two</title>"'])
+        # Each its own tab, whatever the other opened since.
+        self.assertIn('one', browse('one.lead', ['get title']))
+        self.assertIn('two', browse('two.lead', ['get title']))
+        # One Chrome for both, on the profile kept for the link.
+        self.assertTrue((kept / 'Local State').exists())
+        tabs = browse('one.lead', ['tab list'])
+        self.assertIn('one', tabs)
+        self.assertIn('two', tabs)
+
     def test_a_config_that_stops_loading_keeps_the_link_and_says_why(self):
         laptop, _ = self.linked()
         sock = self.path / '.agent/links/laptop.sock'

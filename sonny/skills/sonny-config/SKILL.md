@@ -103,7 +103,11 @@ key `profile`:
   its own way, so keep their credentials where they are.
 - A link's browser starts from `[sonny.links.NAME] browser_profile`
   (below), which `sonny setup --json` lists under `links_differ` where it
-  is not the profile a session here starts from.
+  is not the profile a session here starts from. It is copied once into a
+  profile kept for the link, which its agents share in one Chrome, a tab
+  each: a sign-in or an extension's sync there stays. To start it again
+  from the person's profile, change `browser_profile` (another name, then
+  back) or remove `~/.agent/sonny/links/NAME/chrome`.
 
 ## ~/.agent/config.toml
 

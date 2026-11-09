@@ -93,7 +93,7 @@ fn mine() -> Option<PathBuf> {
 }
 
 /// `dir`, made if need be, that only the person reads.
-fn private(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn private(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
@@ -1511,7 +1511,8 @@ async fn lend(
     let left = Duration::from_millis(payload["timeout_ms"].as_u64().unwrap_or(600_000));
     match called["tool"].as_str() {
         Some(crate::browser::NAME) => {
-            let browsed = crate::browser::lent(payload, &link.host, &link.browser_profile, &steps);
+            let browsed =
+                crate::browser::lent(payload, key, &link.host, &link.browser_profile, &steps);
             match tokio::time::timeout(left.min(crate::browser::TIMEOUT), browsed).await {
                 Ok(answer) => answer,
                 Err(_) => Err(("timed_out", "the browser's commands ran out of time".into())),
