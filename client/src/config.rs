@@ -85,7 +85,7 @@
 //! [sonny.links.devbox]          # devbox's agents use this machine's browser, MCP servers and opens while it is connected
 //! host = "me@devbox"            # what ssh dials
 //! machine = "laptop"            # what the agents there call this machine, its hostname by default
-//! browser_profile = "Default"   # the Chrome profile their browser starts from, Default by default; "" a fresh one
+//! browser_profile = "Default"   # the Chrome profile their shared browser is copied from once, Default by default, or a folder; "" a fresh one each
 //! calls = 16                    # how many of their calls this machine runs at once, 4 per CPU by default
 //! [sonny.sources.slack]         # what Sonny's lookout runs for news
 //! command = "~/bin/slack-poll"  # run with sh -c; each line it prints is one event
@@ -627,9 +627,11 @@ pub struct Link {
     pub machine: String,
     /// Sonny on that host, when its login shell does not find `sonny`.
     pub command: Option<String>,
-    /// The Chrome profile their browser starts from, as agent-browser's
-    /// `--profile` takes it: `Default`, the default, signed in as the
-    /// person is here; empty for a fresh browser.
+    /// The Chrome profile their agents' one shared browser runs on, as
+    /// agent-browser's `--profile` takes it: a profile's name, `Default`
+    /// by default, copied once into a profile kept for the link, signed in
+    /// as the person is here; a folder, used as it is; empty for a fresh
+    /// browser of each agent's own.
     pub browser_profile: String,
     /// How many calls of that host's agents this machine runs at once;
     /// unset, four for each of its CPUs.

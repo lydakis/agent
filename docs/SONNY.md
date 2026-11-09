@@ -1076,7 +1076,7 @@ daemon, and with it the link, comes back at login:
 host = "devbox"                 # what ssh dials
 machine = "laptop"              # what the agents there call this machine; its hostname by default
 command = "/home/me/.local/bin/sonny"   # Sonny there, as setup found it
-browser_profile = "Default"     # the Chrome profile their browser starts from; "" a fresh one
+browser_profile = "Default"     # the Chrome profile their shared browser is copied from once, or a folder; "" a fresh one each
 calls = 16                      # how many of their calls this machine runs at once; 4 per CPU by default
 ```
 
@@ -1095,10 +1095,22 @@ socket.
 The host's agents see each linked machine by name:
 
 - `browser` takes `machine`. The commands run in that machine's
-  agent-browser, in a browser started from its signed-in Chrome profile
-  (agent-browser copies the profile, so the person's own Chrome is left
-  alone). Paths there don't belong to the agent: a screenshot with no path
-  comes back as a picture, and other files are refused.
+  agent-browser, each agent in a tab of its own of one Chrome the link's
+  agents share, signed in as the person is there. That Chrome runs on a
+  profile kept for the link in `~/.agent/sonny/links/NAME/chrome`: copied
+  once from the person's Chrome profile `browser_profile` names, and again
+  only when that name changes, so the person's own Chrome is left alone and
+  what the shared browser picks up (a sign-in, an extension's sync, a
+  device check) stays across restarts. A `browser_profile` that is a
+  folder is used as it is; `""` gives each agent a fresh browser of its
+  own instead. Sonny starts that Chrome itself, the person's own Chrome
+  program (or agent-browser's `executablePath`), with the system's
+  keychain, so the sign-ins copied can be read and a company's device check
+  finds its certificates; agent-browser starts a profile folder with a
+  stand-in keychain. It runs headless unless agent-browser's settings say
+  `headed`, through the proxy agent-browser would give it (one that signs
+  in with a password is refused), and closes 30 minutes after the link's agents last used it. Paths there don't belong to the agent: a screenshot with no
+  path comes back as a picture, and other files are refused.
 - `desktop` takes `machine` while that machine's agents could use its
   desktop (agent-desktop is installed there and it shows a desktop). The
   commands run on its desktop, checked there as its own agents' are, and

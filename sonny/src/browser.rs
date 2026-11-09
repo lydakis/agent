@@ -465,6 +465,9 @@ struct Checked {
 struct Launch {
     confirm: String,
     profile: Option<String>,
+    /// The Chrome it attaches to, a tab of its own, instead of one it
+    /// starts: a link's, which its agents' sessions share.
+    cdp: Option<String>,
     /// Whose share of Sonny's processes its commands take: the agent's,
     /// as its other tools' are, not its session's.
     owner: String,
@@ -1085,36 +1088,25 @@ fn fresh_settings(from: Option<&Path>, dir: &Path) -> Result<PathBuf, String> {
 /// agent-browser finds it: in the first of Chrome's (or Chromium's, or
 /// Brave's) user-data folders that holds a `Local State`.
 pub fn chrome_has_profile(name: &str) -> bool {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return false;
+    chrome_data().is_some_and(|data| {
+        profile_listed(
+            &std::fs::read_to_string(data.join("Local State")).unwrap_or_default(),
+            name,
+        )
+    })
+}
+
+/// The first of Chrome's (or Chromium's, or Brave's) user-data folders
+/// here that holds a `Local State`, as agent-browser finds it.
+fn chrome_data() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let base = match cfg!(target_os = "macos") {
+        true => home.join("Library/Application Support"),
+        false => home.join(".config"),
     };
-    let (base, names): (PathBuf, [&str; 4]) = match cfg!(target_os = "macos") {
-        true => (
-            home.join("Library/Application Support"),
-            [
-                "Google/Chrome",
-                "Google/Chrome Canary",
-                "Chromium",
-                "BraveSoftware/Brave-Browser",
-            ],
-        ),
-        false => (
-            home.join(".config"),
-            [
-                "google-chrome",
-                "google-chrome-unstable",
-                "chromium",
-                "BraveSoftware/Brave-Browser",
-            ],
-        ),
-    };
-    let Some(state) = (names.iter())
-        .map(|dir| base.join(dir).join("Local State"))
-        .find(|state| state.is_file())
-    else {
-        return false;
-    };
-    profile_listed(&std::fs::read_to_string(state).unwrap_or_default(), name)
+    (chrome_browsers().iter())
+        .map(|(dir, _)| base.join(dir))
+        .find(|dir| dir.join("Local State").is_file())
 }
 
 /// Whether a `Local State` text lists the profile folder `name`.
@@ -1179,17 +1171,39 @@ pub fn tool() -> Option<Value> {
 /// agent's folder it would read an `agent-browser.json` there, which can
 /// name the program it launches. Its paths are whole already.
 async fn run(session: &str, args: &[String], launch: &Launch) -> Ran {
+    match output(session, args, launch).await {
+        Ok(out) => {
+            let (stdout, stderr) = (
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            match args.first().map(String::as_str) {
+                Some("confirm") => Ran::confirmed(&stdout, &stderr, out.status.success()),
+                _ => Ran::of(&stdout, &stderr, out.status.success()),
+            }
+        }
+        Err(said) => Ran {
+            said,
+            ok: false,
+            confirmation: None,
+        },
+    }
+}
+
+/// What one of agent-browser's commands for `session` printed, as
+/// [`run`] runs it, or why it did not run.
+async fn output(
+    session: &str,
+    args: &[String],
+    launch: &Launch,
+) -> Result<std::process::Output, String> {
     let confirm = launch.confirm.as_str();
     // Checked again as it starts, so a copy changed since, while the call
     // waited for a confirmation, is admitted again or not run.
     let program = match crate::trusted::program(PROGRAM).await {
         Ok(program) => program,
         Err(e) => {
-            return Ran {
-                said: format!("{PROGRAM} is not run: {e}"),
-                ok: false,
-                confirmation: None,
-            };
+            return Err(format!("{PROGRAM} is not run: {e}"));
         }
     };
     // Its sessions' sockets in Sonny's own folder, which the daemon walls
@@ -1198,11 +1212,7 @@ async fn run(session: &str, args: &[String], launch: &Launch) -> Ran {
     let sockets = match crate::trusted::temporary() {
         Ok(sockets) => sockets,
         Err(e) => {
-            return Ran {
-                said: format!("{PROGRAM} is not run: its sockets' folder: {e}"),
-                ok: false,
-                confirmation: None,
-            };
+            return Err(format!("{PROGRAM} is not run: its sockets' folder: {e}"));
         }
     };
     let mut command = tokio::process::Command::new(&program);
@@ -1219,6 +1229,9 @@ async fn run(session: &str, args: &[String], launch: &Launch) -> Ran {
         .env_remove("AGENT_BROWSER_PROFILE")
         // Asked on no terminal, it would deny every confirmation.
         .env_remove("AGENT_BROWSER_CONFIRM_INTERACTIVE")
+        // Which Chrome it attaches to is Sonny's to say, as below.
+        .env_remove("AGENT_BROWSER_CDP")
+        .env_remove("AGENT_BROWSER_PIN_TAB")
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
     match confirm.is_empty() {
@@ -1231,37 +1244,25 @@ async fn run(session: &str, args: &[String], launch: &Launch) -> Ran {
         Some("") => match fresh_settings(settings_file().as_deref(), &sockets) {
             Ok(file) => command.env("AGENT_BROWSER_CONFIG", file),
             Err(e) => {
-                return Ran {
-                    said: format!("{PROGRAM} is not run: its settings for a fresh browser: {e}"),
-                    ok: false,
-                    confirmation: None,
-                };
+                return Err(format!(
+                    "{PROGRAM} is not run: its settings for a fresh browser: {e}"
+                ));
             }
         },
         Some(profile) => command.env("AGENT_BROWSER_PROFILE", profile),
         None => &mut command,
     };
+    // Its own tab of a Chrome it shares, which no other session takes.
+    if let Some(cdp) = &launch.cdp {
+        command
+            .env("AGENT_BROWSER_CDP", cdp)
+            .env("AGENT_BROWSER_PIN_TAB", "1");
+    }
     // A place among the processes Sonny runs for agents, as a tool call's
     // `sonny tool` takes one, held while agent-browser runs, from the
     // agent's own share.
     let _place = crate::budget::processes().admit(&launch.owner).await;
-    match command.output().await {
-        Ok(out) => {
-            let (stdout, stderr) = (
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr),
-            );
-            match args.first().map(String::as_str) {
-                Some("confirm") => Ran::confirmed(&stdout, &stderr, out.status.success()),
-                _ => Ran::of(&stdout, &stderr, out.status.success()),
-            }
-        }
-        Err(e) => Ran {
-            said: format!("{PROGRAM} could not start: {e}"),
-            ok: false,
-            confirmation: None,
-        },
-    }
+    (command.output().await).map_err(|e| format!("{PROGRAM} could not start: {e}"))
 }
 
 /// Answer `call`, a `browser` call: run its commands in its agent's
@@ -1325,7 +1326,7 @@ pub async fn answer(
     // a side copy's, its source's.
     let bot = call["bot"].as_str().unwrap_or_default();
     let owner = crate::side_copy(&record).unwrap_or(bot);
-    drive(&lines, &reach, &session, owner, None, &steps).await
+    drive(&lines, &reach, &session, owner, Browser::Own, &steps).await
 }
 
 /// Answer a `browser` call the agent `bot` of the machine `from` made over
@@ -1334,6 +1335,7 @@ pub async fn answer(
 /// agent-browser confirms.
 pub async fn lent(
     payload: &Value,
+    key: &str,
     from: &str,
     profile: &str,
     steps: &crate::exec::Steps,
@@ -1353,17 +1355,566 @@ pub async fn lent(
         &format!("link\0{from}\0{store}\0{}", payload["bot_id"]),
         bot,
     );
+    // A fresh browser each, or a tab each of the link's one Chrome, on
+    // the profile kept for it.
+    let browser = match profile.is_empty() {
+        true => Browser::Fresh,
+        false => Browser::Shared(
+            link_browser(key, profile)
+                .await
+                .map_err(|e| ("browser_refused", e))?,
+        ),
+    };
     // An agent of another machine: its share here is its session's, the
     // only place it takes here.
-    drive(
-        &lines,
-        &Reach::lent(),
-        &session,
-        &session,
-        Some(profile),
-        steps,
+    drive(&lines, &Reach::lent(), &session, &session, browser, steps).await
+}
+
+/// The browser a session drives.
+#[derive(Debug)]
+enum Browser {
+    /// One it starts as agent-browser's own settings say.
+    Own,
+    /// One it starts from no profile.
+    Fresh,
+    /// Its own tab of the Chrome at this CDP address, which it shares.
+    Shared(String),
+}
+
+// ---- A link's browser: one Chrome on a profile kept for it ----
+
+/// The folders a kept profile is copied without, as agent-browser copies
+/// one: large, made again by Chrome, and holding no sign-in.
+const NOT_COPIED: [&str; 10] = [
+    "Cache",
+    "Code Cache",
+    "GPUCache",
+    "Service Worker",
+    "blob_storage",
+    "File System",
+    "GCM Store",
+    "optimization_guide",
+    "ShaderCache",
+    "component_crx_cache",
+];
+
+/// How long a link's Chrome stays after its agents' last call, as long as
+/// a session's own browser stays ([`IDLE_MS`]).
+const LINK_IDLE: Duration = Duration::from_secs(30 * 60);
+
+/// How long a link's Chrome has to start and say its address.
+const LINK_START: Duration = Duration::from_secs(30);
+
+/// A link's Chrome, as this tool host knows it.
+#[derive(Default)]
+struct LinkChrome {
+    /// The profile folder it runs on.
+    dir: Option<PathBuf>,
+    /// When the link's agents last called.
+    last: Option<std::time::Instant>,
+    /// Whether a task closes it once it idles.
+    watched: bool,
+}
+
+/// Each link's Chrome, locked while it is found or started, so two calls
+/// never start two on one profile, which Chrome refuses.
+static LINKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<LinkChrome>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Where the Chrome of the link `key`, started from `profile`, can be
+/// attached to: the one its agents share, started on the profile kept for
+/// the link if it is not running.
+///
+/// Sonny starts it, not agent-browser: agent-browser starts a profile
+/// folder with a stand-in keychain (`--use-mock-keychain`,
+/// `--password-store=basic`), so Chrome could not read the sign-ins copied
+/// from the person's profile, nor reach the system's keychain that a
+/// company's device check uses; and it prefers its own Chrome for Testing,
+/// whose keychain entry is not Chrome's. Agents attach to it as
+/// agent-browser's docs say for a browser already running (`--cdp`).
+///
+/// It runs as a task of its own, so a call let go while the profile is
+/// copied or Chrome starts does not let another start the same, with the
+/// lock given up before the work is done.
+async fn link_browser(key: &str, profile: &str) -> Result<String, String> {
+    let (key, profile) = (key.to_owned(), profile.to_owned());
+    tokio::spawn(async move { find_link_browser(&key, &profile).await })
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// [`link_browser`], in its own task.
+async fn find_link_browser(key: &str, profile: &str) -> Result<String, String> {
+    let held = {
+        let mut links = LINKS.lock().unwrap_or_else(|e| e.into_inner());
+        links.entry(key.to_owned()).or_default().clone()
+    };
+    let mut chrome = held.lock().await;
+    let (key_, profile_) = (key.to_owned(), profile.to_owned());
+    let kept = tokio::task::spawn_blocking(move || kept_profile(&key_, &profile_, None))
+        .await
+        .map_err(|e| e.to_string())?;
+    let dir = match kept {
+        Kept::Ready(dir) => dir,
+        // Copied again only with its Chrome closed.
+        Kept::Stale(dir) => {
+            stop_chrome(&dir).await?;
+            let (key_, profile_) = (key.to_owned(), profile.to_owned());
+            let copied = tokio::task::spawn_blocking(move || {
+                kept_profile(&key_, &profile_, chrome_data().as_deref())
+            });
+            match copied.await.map_err(|e| e.to_string())? {
+                Kept::Ready(dir) => dir,
+                Kept::Stale(_) => return Err("the browser's profile could not be copied".into()),
+                Kept::Failed(e) => return Err(e),
+            }
+        }
+        Kept::Failed(e) => return Err(e),
+    };
+    // A profile it no longer names: its Chrome closed.
+    if let Some(old) = chrome.dir.take().filter(|old| *old != dir) {
+        // Left as it is if it will not close: its folder is not touched.
+        let _ = stop_chrome(&old).await;
+    }
+    let url = match chrome_at(&dir).await {
+        Some(url) => url,
+        None => start_chrome(&dir).await?,
+    };
+    chrome.dir = Some(dir);
+    chrome.last = Some(std::time::Instant::now());
+    if !chrome.watched {
+        chrome.watched = true;
+        tokio::spawn(close_when_idle(held.clone()));
+    }
+    Ok(url)
+}
+
+/// Closes a link's Chrome once its agents have not called for
+/// [`LINK_IDLE`].
+async fn close_when_idle(held: Arc<tokio::sync::Mutex<LinkChrome>>) {
+    loop {
+        let mut chrome = held.lock().await;
+        let idle = chrome.last.map_or(LINK_IDLE, |last| last.elapsed());
+        let left = LINK_IDLE.saturating_sub(idle);
+        if left.is_zero() {
+            if let Some(dir) = chrome.dir.take() {
+                let _ = stop_chrome(&dir).await;
+            }
+            chrome.watched = false;
+            return;
+        }
+        drop(chrome);
+        tokio::time::sleep(left).await;
+    }
+}
+
+/// The CDP address of the Chrome running on the profile folder `dir`, if
+/// one is: the address its `DevToolsActivePort` says, if the Chrome
+/// answering there says it too, so a file a Chrome left behind is not
+/// another's address. Only this machine's.
+async fn chrome_at(dir: &Path) -> Option<String> {
+    let said = tokio::fs::read_to_string(dir.join("DevToolsActivePort"))
+        .await
+        .ok()?;
+    let (port, path) = active_port(&said)?;
+    let url = format!("ws://127.0.0.1:{port}{path}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let version = (client.get(format!("http://127.0.0.1:{port}/json/version")))
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    let version: Value = serde_json::from_str(&version).ok()?;
+    (version["webSocketDebuggerUrl"].as_str() == Some(url.as_str())).then_some(url)
+}
+
+/// The port and the browser's path a `DevToolsActivePort` file says.
+fn active_port(said: &str) -> Option<(u16, &str)> {
+    let mut lines = said.lines();
+    let port = lines.next()?.trim().parse::<u16>().ok()?;
+    let path = lines.next()?.trim();
+    let id = path.strip_prefix("/devtools/browser/")?;
+    (port != 0 && !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        .then_some((port, path))
+}
+
+/// Starts Chrome on the profile folder `dir` and says its CDP address.
+async fn start_chrome(dir: &Path) -> Result<String, String> {
+    let program = chrome_program().ok_or(
+        "no Chrome here to start the link's browser: install Google Chrome, or name one as \
+         `executablePath` in ~/.agent-browser/config.json",
+    )?;
+    let _ = std::fs::remove_file(dir.join("DevToolsActivePort"));
+    let mut command = tokio::process::Command::new(&program);
+    command
+        .arg(format!("--user-data-dir={}", dir.display()))
+        .args([
+            "--remote-debugging-port=0",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]);
+    // The proxy agent-browser would start it with.
+    let (proxy, bypass) = proxy();
+    if let Some(proxy) = proxy {
+        command.arg(format!("--proxy-server={}", proxy_server(&proxy)?));
+    }
+    if let Some(bypass) = bypass {
+        command.arg(format!("--proxy-bypass-list={bypass}"));
+    }
+    // Headless unless agent-browser's own settings say otherwise.
+    if !headed() {
+        command.arg("--headless=new");
+    }
+    // Chrome's sandbox needs a user other than root, as agent-browser and
+    // Playwright say.
+    // SAFETY: geteuid takes nothing and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        command.arg("--no-sandbox");
+    }
+    command
+        .arg("about:blank")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // Its own, outliving the call that started it.
+        .process_group(0);
+    let mut child = (command.spawn())
+        .map_err(|e| format!("Chrome ({}) could not start: {e}", program.display()))?;
+    let began = std::time::Instant::now();
+    loop {
+        if let Some(url) = chrome_at(dir).await {
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+            return Ok(url);
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "Chrome ({}) ended as it started: {status}",
+                program.display()
+            ));
+        }
+        if began.elapsed() > LINK_START {
+            let _ = child.kill().await;
+            return Err(format!(
+                "Chrome ({}) did not start within {} s",
+                program.display(),
+                LINK_START.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Closes the Chrome running on the profile folder `dir`, if one runs,
+/// and waits until it has: the process its `SingletonLock` names, while it
+/// answers there as that profile's Chrome. One that holds the folder but
+/// does not answer is not closed, as its process may be another's by now,
+/// and the folder is said to be in use, so nothing replaces it under a
+/// Chrome still running.
+async fn stop_chrome(dir: &Path) -> Result<(), String> {
+    let lock = dir.join("SingletonLock");
+    let held = || {
+        std::fs::read_link(&lock)
+            .ok()
+            .and_then(|to| lock_pid(&to.to_string_lossy()))
+            .filter(|pid| running(*pid))
+    };
+    let Some(pid) = held() else {
+        return Ok(());
+    };
+    let in_use = || format!("a Chrome (process {pid}) still has {} open", dir.display());
+    if chrome_at(dir).await.is_none() {
+        return Err(in_use());
+    }
+    // SAFETY: kill takes a number and a signal and touches no memory here.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    for _ in 0..100 {
+        if held().is_none() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(in_use())
+}
+
+/// Whether the process `pid` runs.
+fn running(pid: i32) -> bool {
+    // SAFETY: signal 0 only asks whether the process exists.
+    let said = unsafe { libc::kill(pid, 0) };
+    said == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// The process a `SingletonLock` names: `HOST-PID`.
+fn lock_pid(to: &str) -> Option<i32> {
+    let pid = to.rsplit_once('-')?.1.parse::<i32>().ok()?;
+    (pid > 1).then_some(pid)
+}
+
+/// The proxy and the hosts that bypass it, as agent-browser takes them for
+/// the Chrome it starts: its own variable, its settings, then the usual
+/// variables.
+fn proxy() -> (Option<String>, Option<String>) {
+    let settings = settings_file()
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_default();
+    let first = |own: &str, key: &str, usual: &[&str]| {
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        var(own)
+            .or_else(|| settings[key].as_str().map(str::to_owned))
+            .or_else(|| usual.iter().find_map(|name| var(name)))
+    };
+    (
+        first(
+            "AGENT_BROWSER_PROXY",
+            "proxy",
+            &[
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ],
+        ),
+        first(
+            "AGENT_BROWSER_PROXY_BYPASS",
+            "proxyBypass",
+            &["NO_PROXY", "no_proxy"],
+        ),
     )
-    .await
+}
+
+/// `proxy` as Chrome's `--proxy-server` takes it, as agent-browser passes
+/// it; one with a user and password is refused, since agent-browser
+/// answers its sign-in only in a browser it starts itself.
+fn proxy_server(proxy: &str) -> Result<String, String> {
+    let host = proxy.split_once("://").map_or(proxy, |(_, rest)| rest);
+    if host
+        .split('/')
+        .next()
+        .is_some_and(|host| host.contains('@'))
+    {
+        return Err(
+            "the link's browser cannot use a proxy that signs in with a user and password; \
+             set one without, or `browser_profile = \"\"` for a fresh browser each"
+                .into(),
+        );
+    }
+    let trimmed = proxy.trim_end_matches('/');
+    Ok(match trimmed.is_empty() || proxy.ends_with("://") {
+        true => proxy.to_owned(),
+        false => trimmed.to_owned(),
+    })
+}
+
+/// Whether agent-browser's settings say to show the browser.
+fn headed() -> bool {
+    settings_file()
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|settings| settings["headed"].as_bool())
+        .unwrap_or(false)
+}
+
+/// The Chrome a link's browser runs: the person's choice for
+/// agent-browser (`AGENT_BROWSER_EXECUTABLE_PATH`, or `executablePath` in
+/// its settings), else the Chrome whose profiles [`chrome_data`] found,
+/// whose keychain entry its sign-ins are sealed with, else the first
+/// installed.
+fn chrome_program() -> Option<PathBuf> {
+    if let Some(program) =
+        std::env::var_os("AGENT_BROWSER_EXECUTABLE_PATH").filter(|program| !program.is_empty())
+    {
+        return Some(PathBuf::from(program));
+    }
+    let set = settings_file()
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|settings| settings["executablePath"].as_str().map(PathBuf::from));
+    if set.is_some() {
+        return set;
+    }
+    let data = chrome_data();
+    let found = |programs: &[&str]| {
+        programs
+            .iter()
+            .find_map(|program| match program.starts_with('/') {
+                true => Some(PathBuf::from(program)).filter(|path| path.is_file()),
+                false => on_path(program),
+            })
+    };
+    let browsers = chrome_browsers();
+    (browsers.iter())
+        .filter(|(folder, _)| data.as_ref().is_some_and(|data| data.ends_with(folder)))
+        .chain(browsers.iter())
+        .find_map(|(_, programs)| found(programs))
+}
+
+/// `program` as the shell would find it on `PATH`.
+fn on_path(program: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(program))
+        .find(|path| path.is_file())
+}
+
+/// The browsers whose profiles Sonny copies: each one's user-data folder,
+/// under [`chrome_data`]'s base, and its programs.
+fn chrome_browsers() -> [(&'static str, &'static [&'static str]); 4] {
+    match cfg!(target_os = "macos") {
+        true => [
+            (
+                "Google/Chrome",
+                &["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
+            ),
+            (
+                "Google/Chrome Canary",
+                &["/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"],
+            ),
+            (
+                "Chromium",
+                &["/Applications/Chromium.app/Contents/MacOS/Chromium"],
+            ),
+            (
+                "BraveSoftware/Brave-Browser",
+                &["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"],
+            ),
+        ],
+        false => [
+            ("google-chrome", &["google-chrome", "google-chrome-stable"]),
+            ("google-chrome-unstable", &["google-chrome-unstable"]),
+            ("chromium", &["chromium", "chromium-browser"]),
+            (
+                "BraveSoftware/Brave-Browser",
+                &["brave-browser", "brave-browser-stable"],
+            ),
+        ],
+    }
+}
+
+/// A link's kept profile, as it stands.
+#[derive(Debug, PartialEq)]
+enum Kept {
+    /// There, from the profile named.
+    Ready(PathBuf),
+    /// Not there, or copied from another profile: to copy once its
+    /// Chrome is closed.
+    Stale(PathBuf),
+    Failed(String),
+}
+
+/// The profile the link `key` keeps for its browser, started from
+/// `profile`: `profile` itself when it is a folder, as agent-browser takes
+/// one; else Sonny's own folder for the link, copied from the person's
+/// Chrome profile of that name, once, and again when the name changes.
+/// With `data`, Chrome's user-data folder, a stale one is copied now.
+fn kept_profile(key: &str, profile: &str, data: Option<&Path>) -> Kept {
+    if !agent_client::config::named(key) {
+        return Kept::Failed(format!("{key} is not a link's name"));
+    }
+    if profile.contains(['/', '\\', '~']) {
+        let dir = match profile.strip_prefix("~/") {
+            Some(rest) => match std::env::var_os("HOME") {
+                Some(home) => PathBuf::from(home).join(rest),
+                None => return Kept::Failed("HOME is not set".into()),
+            },
+            None => PathBuf::from(profile),
+        };
+        return match std::fs::create_dir_all(&dir) {
+            Ok(()) => Kept::Ready(dir),
+            Err(e) => Kept::Failed(format!("{}: {e}", dir.display())),
+        };
+    }
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Kept::Failed("HOME is not set".into());
+    };
+    let links = home.join(".agent/sonny/links");
+    kept_in(&links.join(key), profile, data)
+}
+
+/// [`kept_profile`] of a named profile, kept in `link`'s folder.
+fn kept_in(link: &Path, profile: &str, data: Option<&Path>) -> Kept {
+    let dir = link.join("chrome");
+    let from = link.join("chrome.from");
+    if dir.is_dir() && std::fs::read_to_string(&from).ok().as_deref() == Some(profile) {
+        return Kept::Ready(dir);
+    }
+    let Some(data) = data else {
+        return Kept::Stale(dir);
+    };
+    let state = std::fs::read_to_string(data.join("Local State")).unwrap_or_default();
+    let Some(folder) = profile_folder(&state, profile) else {
+        return Kept::Failed(format!("Chrome here has no profile {profile}"));
+    };
+    let copy = link.join(format!("chrome.{}.partial", std::process::id()));
+    let _ = std::fs::remove_dir_all(&copy);
+    let copied = (|| -> Result<(), String> {
+        std::fs::create_dir_all(link).map_err(|e| e.to_string())?;
+        crate::link::private(link).map_err(|e| e.to_string())?;
+        copy_tree(&data.join(&folder), &copy.join(&folder))?;
+        // Chrome opens the profile it last used: this one.
+        let mut state: Value = serde_json::from_str(&state).unwrap_or_else(|_| json!({}));
+        if state.is_object() {
+            state["profile"]["last_used"] = json!(folder);
+        }
+        std::fs::write(copy.join("Local State"), state.to_string()).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::rename(&copy, &dir).map_err(|e| e.to_string())?;
+        std::fs::write(&from, profile).map_err(|e| e.to_string())
+    })();
+    match copied {
+        Ok(()) => Kept::Ready(dir),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&copy);
+            Kept::Failed(format!("the browser's profile could not be copied: {e}"))
+        }
+    }
+}
+
+/// `from` copied to `to`, but for [`NOT_COPIED`] and Chrome's own locks;
+/// a file that cannot be read, as one Chrome holds, is left out.
+fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
+    let entries = std::fs::read_dir(from).map_err(|e| format!("{}: {e}", from.display()))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_ = name.to_string_lossy();
+        if name_.starts_with("Singleton") {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            if !NOT_COPIED.contains(&name_.as_ref()) {
+                copy_tree(&entry.path(), &to.join(&name))?;
+            }
+        } else if kind.is_file() {
+            let _ = std::fs::copy(entry.path(), to.join(&name));
+        }
+    }
+    Ok(())
+}
+
+/// The folder of the profile `name` in the `Local State` text `state`:
+/// by its folder, or by the name Chrome shows for it.
+fn profile_folder(state: &str, name: &str) -> Option<String> {
+    let state: Value = serde_json::from_str(state).ok()?;
+    let profiles = state["profile"]["info_cache"].as_object()?;
+    if profiles.contains_key(name) {
+        return Some(name.to_owned());
+    }
+    (profiles.iter())
+        .find(|(_, about)| about["name"].as_str() == Some(name))
+        .map(|(folder, _)| folder.clone())
 }
 
 /// A call's command lines, 1 to `COMMANDS` of them.
@@ -1415,9 +1966,14 @@ async fn drive(
     reach: &Reach,
     session: &str,
     owner: &str,
-    profile: Option<&str>,
+    browser: Browser,
     steps: &crate::exec::Steps,
 ) -> Result<Value, (&'static str, String)> {
+    let (profile, cdp) = match &browser {
+        Browser::Own => (None, None),
+        Browser::Fresh => (Some(""), None),
+        Browser::Shared(cdp) => (None, Some(cdp.as_str())),
+    };
     let session = session.to_owned();
     let checked: Vec<Checked> = lines
         .iter()
@@ -1435,6 +1991,7 @@ async fn drive(
     let launch = Launch {
         confirm: confirm.clone(),
         profile: profile.map(str::to_owned),
+        cdp: cdp.map(str::to_owned),
         owner: owner.to_owned(),
     };
     // One call at a time in a session, through its confirmations:
@@ -1448,7 +2005,7 @@ async fn drive(
     // Its browser keeps the confirmations and profile it started with, so
     // a session started under others, or before this tool host, starts
     // again.
-    let started = format!("{confirm}\0{}", profile.unwrap_or_default());
+    let started = format!("{confirm}\0{browser:?}");
     if policy.as_deref() != Some(started.as_str()) {
         let _ = run(&session, &["close".into()], &launch).await;
         *policy = Some(started);
@@ -1634,6 +2191,114 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_link_s_profile_is_copied_once_and_again_when_its_name_changes() {
+        let root = scratch("kept");
+        // The person's Chrome: two profiles, one shown as "Work".
+        let data = root.join("chrome-data");
+        let state = json!({"profile": {"last_used": "Default", "info_cache": {
+            "Default": {"name": "Person"}, "Profile 1": {"name": "Work"}}}});
+        std::fs::create_dir_all(data.join("Profile 1/Cache")).unwrap();
+        std::fs::create_dir_all(data.join("Profile 1/Extensions/x")).unwrap();
+        std::fs::create_dir_all(data.join("Default")).unwrap();
+        std::fs::write(data.join("Local State"), state.to_string()).unwrap();
+        std::fs::write(data.join("Profile 1/Cookies"), "c").unwrap();
+        std::fs::write(data.join("Profile 1/Extensions/x/state"), "synced").unwrap();
+        std::fs::write(data.join("Profile 1/Cache/big"), "x").unwrap();
+        std::fs::write(data.join("Profile 1/SingletonLock"), "").unwrap();
+        let link = root.join("links/box");
+        // Not there yet: copied only once its Chrome is closed.
+        assert_eq!(
+            kept_in(&link, "Work", None),
+            Kept::Stale(link.join("chrome"))
+        );
+        let dir = match kept_in(&link, "Work", Some(&data)) {
+            Kept::Ready(dir) => dir,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            std::fs::read_to_string(dir.join("Profile 1/Cookies")).unwrap(),
+            "c"
+        );
+        assert!(dir.join("Profile 1/Extensions/x/state").exists());
+        assert!(!dir.join("Profile 1/Cache").exists());
+        assert!(!dir.join("Profile 1/SingletonLock").exists());
+        let copied: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("Local State")).unwrap())
+                .unwrap();
+        assert_eq!(copied["profile"]["last_used"], "Profile 1");
+        // Kept: what its browser did there stays, and nothing is copied.
+        std::fs::write(dir.join("Profile 1/Extensions/x/state"), "synced since").unwrap();
+        assert_eq!(kept_in(&link, "Work", None), Kept::Ready(dir.clone()));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("Profile 1/Extensions/x/state")).unwrap(),
+            "synced since"
+        );
+        // Another profile named: copied again, from it.
+        assert_eq!(kept_in(&link, "Default", None), Kept::Stale(dir.clone()));
+        assert_eq!(
+            kept_in(&link, "Default", Some(&data)),
+            Kept::Ready(dir.clone())
+        );
+        assert!(!dir.join("Profile 1").exists());
+        assert!(dir.join("Default").is_dir());
+        assert!(matches!(
+            kept_in(&link, "Nobody", Some(&data)),
+            Kept::Failed(_)
+        ));
+        // A folder is used as it is.
+        let own = root.join("own");
+        assert_eq!(
+            kept_profile("box", own.to_str().unwrap(), None),
+            Kept::Ready(own.clone())
+        );
+        assert!(own.is_dir());
+        assert!(matches!(
+            kept_profile("../x", "Work", None),
+            Kept::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn a_shared_chrome_is_attached_to_only_on_this_machine() {
+        // What Chrome writes beside its profile once it listens.
+        assert_eq!(
+            active_port("36099\n/devtools/browser/0b1e-ab\n"),
+            Some((36099, "/devtools/browser/0b1e-ab"))
+        );
+        // Anything else, such as another host or a path of its choosing,
+        // is no address to attach to.
+        assert_eq!(
+            active_port("36099\n@example.com/devtools/browser/x\n"),
+            None
+        );
+        assert_eq!(active_port("36099\n/devtools/browser/x?y\n"), None);
+        assert_eq!(active_port("0\n/devtools/browser/x\n"), None);
+        assert_eq!(active_port("not a port"), None);
+        // A proxy as agent-browser passes it; one that signs in, refused.
+        assert_eq!(
+            proxy_server("http://proxy:8080/").as_deref(),
+            Ok("http://proxy:8080")
+        );
+        assert!(proxy_server("http://me:secret@proxy:8080").is_err());
+        assert_eq!(
+            proxy_server("socks5://proxy:1080").as_deref(),
+            Ok("socks5://proxy:1080")
+        );
+        // The process its lock names, and no other.
+        assert_eq!(lock_pid("my-mac.local-4242"), Some(4242));
+        assert_eq!(lock_pid("box-1"), None);
+        assert_eq!(lock_pid("box"), None);
+        assert_eq!(
+            profile_folder(
+                r#"{"profile":{"info_cache":{"Profile 2":{"name":"Me"}}}}"#,
+                "Me"
+            )
+            .as_deref(),
+            Some("Profile 2")
+        );
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("sonny-browser-{name}-{}", std::process::id()));
