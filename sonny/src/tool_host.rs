@@ -357,6 +357,16 @@ async fn apply_config(client: &Client, given: &Given<'_>, bots: Vec<Value>) -> V
 /// made by another goes by its creator's rules, which the daemon keeps,
 /// while that creator is there.
 fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<String, Value>> {
+    // Compared with what the agent will be once the daemon takes what it
+    // keeps for its turn's end, so a file that undoes a kept change says so.
+    let kept;
+    let record = match record["configure_pending"].as_object() {
+        Some(pending) => {
+            kept = taken(record, pending);
+            &kept
+        }
+        None => record,
+    };
     let declared = record["declared"].as_array()?;
     if !declared
         .iter()
@@ -384,10 +394,9 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
     }
     // As long as the config says, or the daemon's own when it says none.
     let hold = given.config.hold_ms.unwrap_or(agent_client::HOLD_MS);
-    if record["settings"]["hold_ms"]
-        .as_u64()
-        .is_some_and(|ms| ms != hold)
-    {
+    // None is the daemon's own: a reset kept for the turn's end, say.
+    let held = record["settings"]["hold_ms"].as_u64();
+    if held.unwrap_or(agent_client::HOLD_MS) != hold {
         settings.insert("hold_ms".into(), json!(given.config.hold_ms));
     }
     // A trigger's shadow copy keeps the rules it was made with: the
@@ -407,6 +416,31 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
         fields.insert("settings".into(), Value::Object(settings));
     }
     (!fields.is_empty()).then_some(fields)
+}
+
+/// `record` with the `configure` the daemon keeps for its turn's end laid
+/// over it, as the daemon lays it: `settings` key by key, the rest whole.
+fn taken(record: &Value, pending: &serde_json::Map<String, Value>) -> Value {
+    let mut taken = record.clone();
+    for (key, value) in pending {
+        match (key.as_str(), value) {
+            ("settings", Value::Object(settings)) => {
+                for (name, value) in settings {
+                    taken["settings"][name] = value.clone();
+                }
+            }
+            ("model", Value::String(model)) => {
+                if let Some((provider, model)) = model.split_once('/') {
+                    taken["provider"] = json!(provider);
+                    taken["model"] = json!(model);
+                }
+            }
+            // What `configure` declares, `inspect` reads as declared.
+            ("declare", _) => taken["declared"] = value.clone(),
+            _ => taken[key] = value.clone(),
+        }
+    }
+    taken
 }
 
 #[cfg(test)]
@@ -453,6 +487,33 @@ mod tests {
             configured(&agent(json!("anthropic/other"), true), &given(&config)).map(Value::Object),
             Some(json!({"fallback": null, "settings": {"hide_senders": null}}))
         );
+        // A change the daemon keeps for the turn's end counts as made: a
+        // file that takes it back asks again, and one that matches it
+        // asks nothing.
+        let mut busy = agent(Value::Null, false);
+        busy["configure_pending"] =
+            json!({"fallback": "anthropic/other", "settings": {"hide_senders": true}});
+        assert_eq!(
+            configured(&busy, &given(&config)).map(Value::Object),
+            Some(json!({"fallback": null, "settings": {"hide_senders": null}}))
+        );
+        let mut config = agent_client::config::Config::default();
+        config
+            .fallbacks
+            .insert("anthropic/claude".into(), "anthropic/other".into());
+        config.hide_senders = true;
+        assert_eq!(configured(&busy, &given(&config)), None);
+        // A hold reset kept for the turn's end, and then a hold of its own
+        // in the file: the file's goes over the reset.
+        let mut held = agent(json!("anthropic/other"), true);
+        held["settings"]["hold_ms"] = json!(agent_client::HOLD_MS);
+        held["configure_pending"] = json!({"settings": {"hold_ms": null}});
+        config.hold_ms = Some(5);
+        assert_eq!(
+            configured(&held, &given(&config)).map(Value::Object),
+            Some(json!({"settings": {"hold_ms": 5}}))
+        );
+        let config = agent_client::config::Config::default();
         // Another client's bot is its own.
         let mut other = agent(json!("x/y"), true);
         other["declared"] = json!([]);

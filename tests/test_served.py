@@ -64,6 +64,16 @@ class ServedToolTests(ModelFixture):
         """The tool host, which answers the calls."""
         return self.companion('tool-host', 'serving', **extra)
 
+    def keeps_its_tools(self, host, bot, **made):
+        """`bot` given back what it was `made` with once `host` has brought
+        it up to this build's tools, as a host's first look does to every
+        agent of Sonny's, at once or, one at work, as its turn ends: so a
+        test's agent keeps the few tools it names."""
+        while not ((line := json.loads(host.stdout.readline()))['event'] == 'tools_refreshed'
+                   and line['bot'] == bot):
+            pass
+        self.daemon.request('configure', bot=bot, **made)
+
     def lookout(self, **extra):
         """The lookout, which tells leads."""
         return self.companion('lookout', 'watching', **extra)
@@ -144,11 +154,11 @@ class ServedToolTests(ModelFixture):
         self.git(repo, 'add', '.')
         self.git(repo, 'commit', '-qm', 'one')
         # A lead in `auto`.
+        made = dict(declare=[declared('start_task', inherit=False), declared('show_agent')],
+                    approve=['show_agent'], approver='auto')
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
-                            instructions='Lead.', declare=[declared('start_task', inherit=False),
-                                                           declared('show_agent')],
-                            approve=['show_agent'], approver='auto')
-        self.host()
+                            instructions='Lead.', **made)
+        self.keeps_its_tools(self.host(), 'calc.lead', **made)
         output = self.call('calc.lead', 'start_task', {'name': 'fix', 'brief': f'Fix {repo}/calc.py.'})
         self.assertTrue(output.startswith('Started calc.fix: '), output)
         worktree = self.path / '.agent/worktrees/calc.fix'
@@ -728,12 +738,12 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         return path.read_text().splitlines()
 
     def test_a_sandboxed_agent_no_one_reviews_sees_its_automations_and_adds_none(self):
+        tools = [{**declared('automations'), 'steps': True}]
         made = self.daemon.request('create', bot='calc.lead', workspace=str(self.path),
                                    model='openai/synthetic-model', instructions='Lead.',
-                                   settings={'sandbox': 'read-only'},
-                                   declare=[{**declared('automations'), 'steps': True}])
+                                   settings={'sandbox': 'read-only'}, declare=tools)
         self.assertIn('result', made)
-        self.host()
+        self.keeps_its_tools(self.host(), 'calc.lead', declare=tools)
         # A look acts on nothing, so it needs no reviewer.
         self.assertEqual(json.loads(self.call('calc.lead', 'automations', {})),
                          {'automations': [], 'next_after': None})

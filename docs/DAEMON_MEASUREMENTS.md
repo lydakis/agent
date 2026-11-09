@@ -8146,3 +8146,93 @@ them, which keeps what it freed. The head with only the openings change
 (bot read uncached) showed no such run at either size. No live state grows
 with the change: idle RSS and per idle bot are flat. Capping glibc's arenas
 is its own decision (it costs CPU), and macOS's allocator has no arenas.
+
+## A configure kept for its turn's end (protocol 61, schema 89, #848)
+
+`configure` on a bot whose turn runs no longer answers `bot_busy`: the
+daemon checks the change and keeps it in `bots.configure_pending` for the
+turn's end. What a bot with nothing kept pays, on each path:
+
+- **Submit**: one lookup in an in-memory set of bot names with a change
+  kept. `begin` reads `configure_pending` with the rest of the bot's row
+  it already reads, and starts the turn at once only when it is null.
+- **Turn end, a turn start, a parked turn's interrupt**: the same set
+  lookup.
+- **Daemon start**: one query for bots with a change kept, answered from
+  the partial index `bots_configure_pending` (the query-plan gate refuses
+  a scan).
+
+A bot with a change kept pays, once per change: the `configure` that keeps
+it (one store op: a rolled-back trial of the write, then the keep), and at
+the turn's end one read of whether a turn still runs plus one `configure`
+op that takes it (or one `configure_failed` op that lets it go). A submit
+that arrives while the turn still runs pays the read and leaves the change
+kept.
+
+The hot-path screen (`bench.perf_gate`'s four benches) on the same 4-CPU
+Linux container. Main 13335a3 against head ee094e8, two alternating
+rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 35.645 | 39.798 | +11.6% |
+| admission | burst submit p99, ms | 5.349 | 6.106 | +14.2% |
+| completion | release to terminal p99, ms | 12.44 | 12.015 | -3.4% |
+| footprint | idle RSS, MiB | 15.225 | 15.357 | +0.9% |
+| footprint | per idle bot, KiB | 1.762 | 1.758 | -0.2% |
+| footprint | RSS after a turn each, MiB | 26.633 | 25.658 | -3.7% |
+| footprint | CPU per turn, ms | 1.025 | 1.039 | +1.3% |
+| lifecycle | CPU, s | 0.63 | 0.715 | +13.5% |
+| lifecycle | p95 turn, ms | 586.31 | 594.183 | +1.3% |
+| lifecycle | peak RSS, MiB | 23.482 | 23.27 | -0.9% |
+
+Main 13335a3 against head 5b9fda3 (with the admission guard), three
+alternating rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 38.231 | 42.893 | +12.2% |
+| admission | burst submit p99, ms | 5.438 | 5.52 | +1.5% |
+| completion | release to terminal p99, ms | 12.281 | 12.734 | +3.7% |
+| footprint | idle RSS, MiB | 15.248 | 15.418 | +1.1% |
+| footprint | per idle bot, KiB | 1.77 | 1.802 | +1.8% |
+| footprint | RSS after a turn each, MiB | 25.85 | 26.916 | +4.1% |
+| footprint | CPU per turn, ms | 1.018 | 0.981 | -3.6% |
+| lifecycle | CPU, s | 0.66 | 0.6 | -9.1% |
+| lifecycle | p95 turn, ms | 588.403 | 594.887 | +1.1% |
+| lifecycle | peak RSS, MiB | 23.316 | 23.285 | -0.1% |
+
+Store work is the same on both sides: 128 store jobs for each admission
+phase, and 7.35 to 7.41 jobs a turn in the footprint runs on each.
+
+**Lone submit CPU is noise.** It read about 12% higher on the head in both
+screens, and nothing the head adds to a submit should cost 0.13 ms. Four
+more alternating rounds of the admission bench alone (20 measured runs a
+side), with a third binary that boxes the rare path of the take so the
+submit's future carries a pointer: median 34.7 ms on main, 32.9 on the
+head, 35.5 boxed; best runs 28.9, 29.2 and 29.1. The head is not slower,
+and the box bought nothing, so it is not in the change. Lifecycle CPU went
+the same way: +13.5% over one run a round in the first screen, -9.1% over
+three in the second.
+
+The Perf workflow's screen on the pull request (GitHub runner, base main
+against head ce31262; the daemon is the same at the merged head):
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 23.913 | 23.727 | -0.8% |
+| admission | burst submit p99, ms | 2.589 | 2.423 | -6.4% |
+| completion | release to terminal p99, ms | 6.875 | 6.295 | -8.4% |
+| footprint | idle RSS, MiB | 15.264 | 15.525 | +1.7% |
+| footprint | per idle bot, KiB | 1.854 | 1.74 | -6.1% |
+| footprint | RSS after a turn each, MiB | 31.105 | 31.137 | +0.1% |
+| footprint | CPU per turn, ms | 0.567 | 0.608 | +7.2% |
+| lifecycle | CPU, s | 0.315 | 0.32 | +1.6% |
+| lifecycle | p95 turn, ms | 579.066 | 575.744 | -0.6% |
+| lifecycle | peak RSS, MiB | 23.389 | 23.182 | -0.9% |
+
+Lone submit CPU is flat on the runner too. The same screen warned on two
+Sonny rows the change does not touch: sky replay CPU (7.54 to 9.23 ms per
+1k lines) and RSS (84.5 to 97.9 MiB). Sky's replay reads no configure
+field; this change's Sonny paths are `/permissions` spreading, `regate`
+and the config watcher.

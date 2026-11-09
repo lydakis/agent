@@ -1242,7 +1242,7 @@ async fn spread_pass(
     lead: String,
     (pick, mode): (u64, &'static str),
     lead_set: bool,
-    settled: std::collections::HashSet<i64>,
+    (settled, waited): (std::collections::HashSet<i64>, Vec<String>),
     mut sandboxes: approvals::Sandboxes,
     woken: Arc<tokio::sync::Notify>,
 ) -> Passed {
@@ -1255,6 +1255,13 @@ async fn spread_pass(
         notice: None,
         sandboxes: Default::default(),
     };
+    // The lead's own change is set once the daemon took it, not while it
+    // keeps it for the end of the lead's running turn: until then the
+    // agents it made are bounded by its old permissions. Read before the
+    // listing, so one it makes before taking it is listed.
+    let lead_set = lead_set
+        && (client.request("inspect", json!({"bot": lead})).await)
+            .is_ok_and(|record| record["configure_pending"].is_null());
     let listing = every_bot(&client).await;
     let listed = listing.is_some();
     let bots = listing.unwrap_or_default();
@@ -1311,6 +1318,10 @@ async fn spread_pass(
             }
         };
         let Some(fields) = fields else {
+            // One the last pass left waiting has taken the change since:
+            // on its old permissions it may have made an agent this
+            // listing did not name, so the pick lists them again.
+            passed.again |= waited.contains(&name);
             passed.settled.extend(id);
             continue;
         };
@@ -1319,10 +1330,15 @@ async fn spread_pass(
         asked["bot"] = json!(name);
         asked["bot_id"] = bot["bot_id"].clone();
         let configured = client.request("configure", asked).await;
-        passed.again |= configured.is_ok();
         match configured {
-            Ok(_) if maker_set => passed.settled.extend(id),
-            Ok(_) => {}
+            // Kept for the end of its running turn, it is busy as before:
+            // tried again until the daemon takes it.
+            Ok(answer) if !answer["configure_pending"].is_null() => passed.waiting.push(name),
+            Ok(_) if maker_set => {
+                passed.again = true;
+                passed.settled.extend(id);
+            }
+            Ok(_) => passed.again = true,
             Err(error) if error.code == "bot_busy" => passed.waiting.push(name),
             Err(error) => {
                 passed.notice = Some(format!("{name}'s permissions: {error}"));
@@ -6213,7 +6229,7 @@ impl App {
             self.bot.clone(),
             (spread.pick, spread.mode),
             self.gating.is_none(),
-            spread.settled.clone(),
+            (spread.settled.clone(), spread.waiting.clone()),
             std::mem::take(&mut spread.sandboxes),
             self.woken.clone(),
         )));
@@ -20708,6 +20724,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_permissions_pick_the_daemon_keeps_for_a_turn_s_end_is_not_yet_set() {
+        // The lead's own change is kept for the end of its running turn, and
+        // so is its task's: neither is set, so the task is tried again.
+        let workspace = std::env::temp_dir().join(unique("spread"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let folder = workspace.display().to_string();
+        let task = json!({"name": "b.task", "tools": ["shell"], "gates": [],
+            "settings": {}, "workspace": folder});
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let listed = task.clone();
+        let client = daemon_serving(json!({}), move |request| {
+            seen.lock().unwrap().push(format!("{} {}", request["op"], request["bot"]));
+            match request["op"].as_str() {
+            Some("bots") => json!({"bots": [
+                {"name": "b", "bot_id": 1, "running_turn": 4},
+                {"name": "b.task", "bot_id": 2, "created_by_id": 1, "running_turn": 3},
+            ], "next_after": null}),
+            Some("inspect") if request["bot"] == "b" => {
+                json!({"name": "b", "configure_pending": {"settings": {"sandbox": "workspace"}}})
+            }
+            Some("inspect") => listed.clone(),
+            Some("configure") => json!({"bot": "b.task", "bot_id": 2, "running_turn": 3,
+                "configure_pending": {"approve": ["shell"]}, "changed": []}),
+            _ => json!({}),
+            }
+        })
+        .await;
+        let passed = spread_pass(
+            client.clone(),
+            "b".into(),
+            (1, "ask"),
+            true,
+            Default::default(),
+            Default::default(),
+            Arc::new(tokio::sync::Notify::new()),
+        )
+        .await;
+        assert!(!passed.after_lead, "the lead's change is still kept");
+        assert_eq!(passed.waiting, ["b.task"]);
+        assert!(passed.settled.is_empty());
+        assert!(!passed.again);
+        // The lead is read before the listing: an agent it makes before
+        // taking its change is listed by the pass that finds it taken.
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(
+            asked[..2],
+            ["\"inspect\" \"b\"", "\"bots\" null"],
+            "{asked:?}"
+        );
+        // Both took their change since: the task, left waiting last pass,
+        // may have made an agent on its old permissions after this listing,
+        // so the pick lists them again.
+        // (Full access, whose sandbox names no folder of the test's thread.)
+        let fields = approvals::regate(&task, "full", "b.task", &mut Default::default()).unwrap();
+        let mut has = task.clone();
+        has["settings"] = fields["settings"].clone();
+        assert!(approvals::regate(&has, "full", "b.task", &mut Default::default()).is_none());
+        let taken = daemon_serving(json!({}), move |request| match request["op"].as_str() {
+            Some("bots") => json!({"bots": [
+                {"name": "b", "bot_id": 1},
+                {"name": "b.task", "bot_id": 2, "created_by_id": 1},
+            ], "next_after": null}),
+            Some("inspect") if request["bot"] == "b" => json!({"name": "b"}),
+            Some("inspect") => has.clone(),
+            _ => json!({}),
+        })
+        .await;
+        for (waited, again) in [(vec!["b.task".to_owned()], true), (Vec::new(), false)] {
+            let passed = spread_pass(
+                taken.clone(),
+                "b".into(),
+                (1, "full"),
+                true,
+                (Default::default(), waited),
+                Default::default(),
+                Arc::new(tokio::sync::Notify::new()),
+            )
+            .await;
+            assert!(passed.after_lead);
+            assert_eq!((passed.settled, passed.again), (vec![2], again));
+        }
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn fast_lists_the_speeds_its_provider_serves_and_picks_one() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
@@ -23199,6 +23301,8 @@ mod tests {
                 {"name": "task", "bot_id": 3, "created_by_id": 2},
                 {"name": "helper", "bot_id": 4, "created_by_id": 3},
             ], "next_after": null}),
+            // The lead, read once a pass for a change still kept: it has none.
+            Some("inspect") if asked["bot"] == "b" => json!({"name": "b"}),
             Some("inspect") => {
                 seen.fetch_add(1, Ordering::SeqCst);
                 json!({"tools": ["shell"], "gates": [], "settings": {}})

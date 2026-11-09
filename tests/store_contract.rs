@@ -18232,3 +18232,55 @@ fn a_store_before_bot_status_reads_each_bots_status_from_its_turns() {
     drop(db);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn a_configure_kept_for_a_turns_end_is_kept_once_and_let_go_when_taken() {
+    let mut db = db();
+    let (bot, _) = db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let id = bot.bot_id;
+    let kept = json!({"instructions": "new", "settings": {"rules": {}, "speed": null}});
+    let answer = db.keep_configure("Bob", id, 7, &kept).unwrap();
+    assert_eq!(
+        answer,
+        json!({"bot": "Bob", "bot_id": id, "running_turn": 7, "configure_pending": kept})
+    );
+    // Kept again as it is, it is said once.
+    db.keep_configure("Bob", id, 7, &kept).unwrap();
+    let told = |db: &Database, kind: &str| -> Vec<Value> {
+        db.events_of_kinds(&[kind], 0, 256).unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let said = |db: &Database| told(db, "configure_pending").len();
+    assert_eq!(said(&db), 1);
+    assert_eq!(
+        db.inspect("Bob").unwrap().configure_pending,
+        Some(kept.clone())
+    );
+    assert_eq!(db.configures_kept().unwrap(), ["Bob"]);
+    // A change of rules alone taken while the turn runs lets go of the
+    // older rules kept, and nothing else.
+    db.taken_configure(id, true).unwrap();
+    assert_eq!(
+        db.kept_configure(id).unwrap(),
+        Some(json!({"instructions": "new", "settings": {"speed": null}}))
+    );
+    db.taken_configure(id, false).unwrap();
+    assert_eq!(db.kept_configure(id).unwrap(), None);
+    assert!(db.configures_kept().unwrap().is_empty());
+    // One that cannot be taken is let go, and said with why.
+    db.keep_configure("Bob", id, 8, &kept).unwrap();
+    db.configure_failed("Bob", &Error::with("provider_unavailable", "gone"))
+        .unwrap();
+    assert_eq!(db.kept_configure(id).unwrap(), None);
+    let failed = told(&db, "configure_failed")[0]["data"].clone();
+    assert_eq!(failed["code"], "provider_unavailable");
+    assert_eq!(failed["configure_pending"], kept);
+    // A trial's writes are undone, its answer kept.
+    let set = db
+        .trial(|db| db.set_instructions("Bob", Some(id), "tried"))
+        .unwrap();
+    assert!(set);
+    assert_ne!(db.inspect("Bob").unwrap().instructions, "tried");
+}
