@@ -2842,10 +2842,22 @@ and reaches the network only if both do, as Codex's subagents inherit their
 parent's sandbox. It takes its creator's [command rules](#command-rules)
 too, always.
 
-On Linux, bubblewrap makes an empty folder on the host to mount a missing
-`.git` read-only over; the daemon removes it once no running sandbox holds
-it, and a detached command holds it until it and what it left in its group are gone. A sandbox that needs
-one being removed waits until it is gone.
+On Linux, bubblewrap needs an empty folder on the host to mount a missing
+`.git` read-only over: the daemon makes it, and records it as its own in a
+lock file under `~/.agent/placeholders`, read-only to every sandbox. Every
+sandbox that mounts it holds a read lock on that file while it runs:
+bubblewrap's own init (`--lock-file`), out of the command's reach, and the
+daemon or `agent sandbox` that started it, from before it is made. The last
+one out takes the write lock and removes the placeholder, when it is still
+the empty folder recorded, so a sandbox in another process, or a detached
+command that outlived its daemon, never has its mount lifted under it. The
+kernel lets locks go with whoever held them, so one a crash left behind is
+removed by the next sandbox that holds it; an empty folder anything else
+made there is left, as Codex leaves what it did not make. An empty folder at
+a protected name is taken as missing, as Codex takes it, mounted over afresh
+rather than bound from the disk. A writable folder that is gone is skipped,
+as Codex skips it, rather than refusing every command. A sandbox that needs
+a placeholder being removed waits until it is gone.
 
 `agent sandbox [--writable PATH]... -- COMMAND [ARGS...]` runs one command
 in the same sandbox, with no daemon, as Codex's `codex sandbox` does:
@@ -2868,8 +2880,8 @@ answers `{bot, bot_id, policy, env}`: the sandbox the daemon builds for the
 bot's commands (null for a bot whose commands run unconfined), held by
 the daemon for as long as the session that asked lasts as one of the bot's
 own commands is: its capped socket open, and its placeholders for missing
-protected folders counted with those of the daemon's own commands, so
-neither removes one the other's sandbox still mounts. With it comes the
+protected folders held by the same locks as every sandbox's, so no side
+removes one another's sandbox still mounts. With it comes the
 whole environment its commands get: the daemon's own, without the
 credentials it holds or the variables `--shell-exclude` withholds, with its
 `AGENT_*` variables, the bot's `env` setting, `AGENT_BOT`, `AGENT_BOT_ID` and

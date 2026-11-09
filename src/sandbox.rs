@@ -119,6 +119,14 @@ impl Policy {
         paths.dedup();
         let mut roots = Vec::new();
         for path in paths {
+            // One gone since it was named is skipped, as Codex skips it:
+            // bubblewrap can't bind what isn't there, and would refuse
+            // every command until the bot's folders were named again.
+            if std::fs::symlink_metadata(&path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                continue;
+            }
             roots.push(root(&path, daemon)?);
         }
         Ok(Some(Policy {
@@ -525,7 +533,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
         .chain(daemon.protected_existing.iter().map(|name| (name, false)));
     for (name, kept_missing) in names {
         let kept = path.join(name);
-        if held(&kept) {
+        if kept_missing && placeholder(&kept) {
             missing.push(kept);
             continue;
         }
@@ -556,7 +564,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
     } else if git {
         for name in GIT_PROTECTED {
             let kept = path.join(name);
-            if held(&kept) {
+            if matches!(name, "hooks" | "modules") && placeholder(&kept) {
                 missing.push(kept);
                 continue;
             }
@@ -601,6 +609,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
     // one out past its rule.
     for kept in (daemon.protected_paths.iter())
         .chain(&daemon.walled)
+        .chain(locks())
         .filter(|kept| kept.starts_with(path))
     {
         match std::fs::symlink_metadata(kept) {
@@ -891,6 +900,7 @@ mod linux {
         let filter = loaded(&filter(policy)?)?;
         command
             .args(args(policy, detached))
+            .args(super::lock_args(policy))
             .arg("--seccomp")
             .arg(filter.as_raw_fd().to_string());
         let mut kept = vec![filter];
@@ -1094,40 +1104,184 @@ mod linux {
     }
 }
 
-/// The placeholders that running sandboxes hold for missing protected
-/// folders: how many hold each, and whether it is being removed. bubblewrap
-/// makes a placeholder on the host for its read-only mount; removing it
-/// while any sandbox still mounts it would lift that mount there, so the
-/// last one out removes it, and a sandbox that needs one being removed waits
-/// until it is gone. The lock covers only this list, never the filesystem.
-static HELD: std::sync::Mutex<Vec<Placeholder>> = std::sync::Mutex::new(Vec::new());
-/// Woken when placeholders being removed are gone.
-static REMOVED: tokio::sync::Notify = tokio::sync::Notify::const_new();
-
-struct Placeholder {
-    path: PathBuf,
-    holders: usize,
-    removing: bool,
+/// Whether `path`, a name kept from being made, holds only a placeholder:
+/// an empty folder, which a sandbox's read-only mount made or still makes
+/// there. It is taken as missing, as Codex takes it: mounted over afresh,
+/// never bound from what is on disk, which could be gone by the time
+/// bubblewrap binds it.
+fn placeholder(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|found| found.is_dir())
+        && std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
-/// Whether a running sandbox holds `path` as a placeholder, or it is being
-/// removed: then it is still missing, whatever is there now.
-fn held(path: &Path) -> bool {
-    HELD.lock().unwrap().iter().any(|held| held.path == path)
+/// Where each placeholder's lock file is kept, `~/.agent/placeholders`,
+/// by its real path, read-only to every sandbox; `None` when it can't be
+/// made, and then no placeholder is ever removed.
+///
+/// bubblewrap makes a placeholder on the host for each read-only mount
+/// over a missing name; removing it while any sandbox still mounts it
+/// lifts that mount there, so the command could make what it kept. Each
+/// sandbox holds a read lock on the placeholder's lock file while it runs,
+/// bubblewrap's own init holding it (`--lock-file`), out of the command's
+/// reach, and the daemon or CLI that started it holding another from
+/// before the sandbox is made until it is done. The last one out takes the
+/// write lock and removes the placeholder, when it is one this sandbox
+/// made: an empty folder, the one recorded in the lock file. The kernel
+/// lets the locks go with whoever held them, so a crash leaves none held,
+/// and a placeholder left by one is removed by the next sandbox that
+/// holds it. One made by anything else, Codex included, is left, as Codex
+/// leaves what it did not make.
+fn locks() -> Option<&'static PathBuf> {
+    static LOCKS: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(|| {
+            use std::os::unix::fs::DirBuilderExt;
+            let folder = agent_client::config::home()?.join("placeholders");
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&folder)
+                .ok()?;
+            std::fs::canonicalize(&folder).ok()
+        })
+        .as_ref()
+}
+
+/// The lock file of the placeholder at `path`: named by a stable hash of
+/// the path, so every process and release finds the same one. Two paths
+/// sharing one only wait for each other's sandboxes.
+fn lock_file(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    // FNV-1a.
+    let hash = (path.as_os_str().as_bytes().iter())
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    Some(locks()?.join(format!("{hash:016x}")))
+}
+
+/// The arguments that have bubblewrap's init hold `policy`'s placeholders'
+/// locks while the sandbox runs: each whose lock file is there.
+#[cfg(target_os = "linux")]
+fn lock_args(policy: &Policy) -> Vec<String> {
+    (policy.roots.iter())
+        .flat_map(|root| &root.missing)
+        .filter_map(|path| lock_file(path))
+        .filter(|lock| lock.exists())
+        .flat_map(|lock| ["--lock-file".into(), lock.to_string_lossy().into_owned()])
+        .collect()
+}
+
+/// A lock on the whole of `file`, open file description's own, so each
+/// holder's counts apart even in one process; `wait` blocks for it.
+fn lock(file: &std::fs::File, kind: libc::c_int, wait: bool) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    let command = if wait {
+        libc::F_OFD_SETLKW
+    } else {
+        libc::F_OFD_SETLK
+    };
+    #[cfg(not(target_os = "linux"))]
+    let command = if wait { libc::F_SETLKW } else { libc::F_SETLK };
+    // SAFETY: a zeroed flock is valid; l_pid must be 0 for an OFD lock.
+    let mut whole: libc::flock = unsafe { std::mem::zeroed() };
+    whole.l_type = kind as _;
+    whole.l_whence = libc::SEEK_SET as _;
+    loop {
+        // SAFETY: `whole` outlives the call, and the descriptor is open.
+        if unsafe { libc::fcntl(file.as_raw_fd(), command, &whole) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// The folder at `path`, as its lock file records it.
+fn identity(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let found = std::fs::symlink_metadata(path).ok()?;
+    found
+        .is_dir()
+        .then(|| format!("{} {}", found.dev(), found.ino()))
+}
+
+/// A placeholder held: its path and its lock file, read-locked.
+struct Held {
+    path: PathBuf,
+    lock: std::fs::File,
+}
+
+impl Held {
+    /// Read-lock the placeholder at `path`, waiting out a removal, and make
+    /// it when its folder is there to make it in, recording it as this
+    /// sandbox's. `None` when its lock can't be taken: then it is never
+    /// removed.
+    fn take(path: &Path) -> Option<Held> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(lock_file(path)?)
+            .ok()?;
+        self::lock(&lock, libc::F_RDLCK as _, true).ok()?;
+        // Made here rather than by bubblewrap, so it is known for this
+        // sandbox's. Only one maker succeeds, and only it writes.
+        if std::fs::create_dir(path).is_ok()
+            && let Some(made) = identity(path)
+        {
+            let _ = lock
+                .set_len(0)
+                .and_then(|()| lock.write_all(made.as_bytes()));
+        }
+        Some(Held {
+            path: path.to_owned(),
+            lock,
+        })
+    }
+
+    /// Let go; the last holder removes the placeholder when it is still
+    /// the empty folder made for one.
+    fn free(self) {
+        use std::io::{Read, Seek};
+        let Held { path, mut lock } = self;
+        // Atomic for a record lock: refused while any other holds it.
+        if self::lock(&lock, libc::F_WRLCK as _, false).is_err() {
+            return;
+        }
+        let mut made = String::new();
+        let _ = lock
+            .seek(std::io::SeekFrom::Start(0))
+            .and_then(|_| lock.read_to_string(&mut made));
+        let now = identity(&path);
+        if now.is_none()
+            || now.as_deref() == Some(made.as_str()) && std::fs::remove_dir(&path).is_ok()
+        {
+            let _ = lock.set_len(0);
+        }
+        // Closing the file lets the lock go.
+    }
 }
 
 /// What a running sandbox holds in place; dropping it lets the
 /// placeholders go once no other sandbox holds them, removes what the
 /// command may not leave made, and gives up its share in the bot's socket.
 pub struct Hold(
-    Vec<PathBuf>,
+    Vec<Held>,
     Vec<PathBuf>,
     // Held only to be dropped with the rest.
     #[allow(dead_code)] Option<Listening>,
 );
 
 /// Hold `policy`'s placeholders while its command runs, once any of them
-/// being removed is gone.
+/// being removed is gone. Off the runtime thread: it opens and locks files.
 pub async fn hold(policy: &Policy) -> Hold {
     let paths: Vec<PathBuf> = match cfg!(target_os = "linux") {
         true => policy
@@ -1137,36 +1291,20 @@ pub async fn hold(policy: &Policy) -> Hold {
             .collect(),
         false => Vec::new(),
     };
-    loop {
-        let removed = REMOVED.notified();
-        tokio::pin!(removed);
-        removed.as_mut().enable();
-        {
-            let mut held = HELD.lock().unwrap();
-            let removing = held
-                .iter()
-                .any(|held| held.removing && paths.contains(&held.path));
-            if !removing {
-                for path in &paths {
-                    match held.iter_mut().find(|held| held.path == *path) {
-                        Some(held) => held.holders += 1,
-                        None => held.push(Placeholder {
-                            path: path.clone(),
-                            holders: 1,
-                            removing: false,
-                        }),
-                    }
-                }
-                let left = policy
-                    .roots
-                    .iter()
-                    .flat_map(|root| root.left.iter().cloned())
-                    .collect();
-                return Hold(paths, left, policy.listening.clone());
-            }
-        }
-        removed.await;
-    }
+    let left = policy
+        .roots
+        .iter()
+        .flat_map(|root| root.left.iter().cloned())
+        .collect();
+    let held = match paths.is_empty() {
+        true => Vec::new(),
+        false => tokio::task::spawn_blocking(move || {
+            paths.iter().filter_map(|path| Held::take(path)).collect()
+        })
+        .await
+        .unwrap_or_default(),
+    };
+    Hold(held, left, policy.listening.clone())
 }
 
 /// [`hold`] for a call that may run unconfined.
@@ -1186,52 +1324,33 @@ impl Hold {
     }
 
     fn free(&mut self, here: bool) {
-        let mut released = Vec::new();
-        {
-            let mut held = HELD.lock().unwrap();
-            for path in self.0.drain(..) {
-                if let Some(held) = held.iter_mut().find(|held| held.path == path) {
-                    held.holders -= 1;
-                    if held.holders == 0 {
-                        held.removing = true;
-                        released.push(path);
-                    }
-                }
-            }
-        }
+        let held = std::mem::take(&mut self.0);
         let left = std::mem::take(&mut self.1);
-        if released.is_empty() && left.is_empty() {
+        if held.is_empty() && left.is_empty() {
             return;
         }
-        // Off the runtime thread, and with no lock held: no sandbox takes
-        // one up while it is marked as being removed. On a thread of its
-        // own, since a runtime shutting down drops blocking work not yet
-        // started, which would leave them in place.
+        // Off the runtime thread. On a thread of its own, since a runtime
+        // shutting down drops blocking work not yet started, which would
+        // leave them in place.
         let remove = move || {
             // Git never makes these in a repository's own folder: one there
             // now is the command's.
             for path in &left {
                 let _ = std::fs::remove_file(path);
             }
-            for path in &released {
-                // Only an empty one: a placeholder, never what a command
-                // outside the sandbox made there since.
-                let _ = std::fs::remove_dir(path);
+            for held in held {
+                held.free();
             }
-            HELD.lock()
-                .unwrap()
-                .retain(|held| !(held.removing && released.contains(&held.path)));
-            REMOVED.notify_waiters();
         };
+        if here {
+            return remove();
+        }
         type Job = std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>;
         let run = |job: &Job| {
             if let Some(remove) = job.lock().unwrap().take() {
                 remove();
             }
         };
-        if here {
-            return remove();
-        }
         let job: std::sync::Arc<Job> =
             std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(remove))));
         let theirs = job.clone();
@@ -1973,5 +2092,115 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, "sandbox_unavailable");
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A folder named since but gone is skipped, as Codex skips it, rather
+    /// than refusing every command; an empty protected folder is taken as
+    /// missing, mounted over afresh, never bound from the disk.
+    #[test]
+    fn a_gone_root_is_skipped_and_an_empty_placeholder_is_missing() {
+        let base = std::env::temp_dir().join(format!("agent-sandbox-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join(".agents")).unwrap();
+        std::fs::create_dir_all(base.join(".codex/skills")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let gone = base.join("gone/.git");
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&base),
+            &[gone.to_str().unwrap().to_owned()],
+            false,
+            &protecting(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(policy.roots.iter().all(|root| root.path != gone));
+        let root = policy.roots.iter().find(|root| root.path == base).unwrap();
+        assert!(root.missing.contains(&base.join(".agents")));
+        assert!(!root.read_only.contains(&base.join(".agents")));
+        // One with something in it is the person's, bound as it is.
+        assert!(root.read_only.contains(&base.join(".codex")));
+        assert!(!policy.can_write(&base.join(".agents/x")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A placeholder stays while any sandbox holds it and goes with the
+    /// last; one a crash left is removed by the next to hold it; an empty
+    /// folder this sandbox didn't make is left, as Codex leaves it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_last_holder_removes_only_the_placeholder_it_made() {
+        let base = std::env::temp_dir().join(format!("agent-sandbox-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join(".codex")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&base),
+            &[],
+            false,
+            &protecting(),
+        )
+        .unwrap()
+        .unwrap();
+        let (git, codex) = (base.join(".git"), base.join(".codex"));
+        let first = hold(&policy).await;
+        assert!(git.is_dir(), "made before the sandbox is");
+        let second = hold(&policy).await;
+        first.release();
+        assert!(git.is_dir(), "still held by the second");
+        second.release();
+        assert!(!git.exists(), "the last one out removes it");
+        assert!(codex.is_dir(), "an empty folder it didn't make stays");
+        // A crash: the locks go with the process, the placeholder stays.
+        let mut crashed = hold(&policy).await;
+        drop(std::mem::take(&mut crashed.0));
+        drop(crashed);
+        assert!(git.is_dir());
+        hold(&policy).await.release();
+        assert!(!git.exists(), "the next holder removes what a crash left");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// bubblewrap's init holds the lock while the sandbox runs, out of the
+    /// command's reach: a placeholder a running sandbox mounts is never
+    /// removed under it, whoever lets go first.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_running_sandbox_keeps_its_placeholder() {
+        if available().is_err() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("agent-sandbox-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let policy = Policy::new(
+            Some(Mode::WorkspaceWrite),
+            Some(&base),
+            &[],
+            false,
+            &protecting(),
+        )
+        .unwrap()
+        .unwrap();
+        let git = base.join(".git");
+        let held = hold(&policy).await;
+        let mut child = command(&policy, "sh", &["-c", "sleep 1; mkdir .git/x"], false)
+            .unwrap()
+            .current_dir(&base)
+            .spawn()
+            .unwrap();
+        // The daemon lets go first, as when it restarts under a detached
+        // command: the sandbox's own lock keeps the placeholder.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        held.release();
+        assert!(git.is_dir());
+        let status = child.wait().await.unwrap();
+        assert!(!status.success(), "the placeholder stayed read-only");
+        assert!(!git.join("x").exists());
+        hold(&policy).await.release();
+        assert!(!git.exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

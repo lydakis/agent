@@ -1375,8 +1375,8 @@ struct Service {
     sessions: usize,
     /// What each session was lent, which the daemon holds until it closes:
     /// the bot's own socket listening, and its sandbox's placeholders, held
-    /// in the one list the daemon's own commands share, so neither side
-    /// removes one the other's sandbox still mounts.
+    /// by the same locks every sandbox's are, so no side removes one
+    /// another's sandbox still mounts.
     lent: HashMap<u64, Vec<agent_runtime::sandbox::Hold>>,
     limit_active: usize,
     /// Per bot: the live turn. A parked turn's task ends while a resumed
