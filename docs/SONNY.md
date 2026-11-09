@@ -1103,8 +1103,12 @@ The host's agents see each linked machine by name:
   what the shared browser picks up (a sign-in, an extension's sync, a
   device check) stays across restarts. A `browser_profile` that is a
   folder is used as it is; `""` gives each agent a fresh browser of its
-  own instead. The shared Chrome closes 30 minutes after the link's agents
-  last used it. Paths there don't belong to the agent: a screenshot with no
+  own instead. Sonny starts that Chrome itself, the person's own Chrome
+  program (or agent-browser's `executablePath`), with the system's
+  keychain, so the sign-ins copied can be read and a company's device check
+  finds its certificates; agent-browser starts a profile folder with a
+  stand-in keychain. It runs headless unless agent-browser's settings say
+  `headed`, and closes 30 minutes after the link's agents last used it. Paths there don't belong to the agent: a screenshot with no
   path comes back as a picture, and other files are refused.
 - `desktop` takes `machine` while that machine's agents could use its
   desktop (agent-desktop is installed there and it shows a desktop). The

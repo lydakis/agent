@@ -1042,12 +1042,14 @@ there.wait()
             self.assertLess(time.monotonic(), deadline, said)
             time.sleep(.5)
 
-    @unittest.skipUnless(shutil.which('agent-browser'), 'agent-browser is not installed')
+    @unittest.skipUnless(shutil.which('agent-browser') and os.environ.get('AGENT_BROWSER_EXECUTABLE_PATH'),
+                         'agent-browser, or a Chrome named in AGENT_BROWSER_EXECUTABLE_PATH, is missing')
     def test_a_link_s_agents_share_one_chrome_on_a_kept_profile_each_in_its_own_tab(self):
         program = shutil.which('agent-browser')
         kept = self.path / 'kept-profile'
         laptop, _ = self.linked(link=f'browser_profile = {json.dumps(str(kept))}\n',
-                                PATH=f"{Path(program).parent}:{os.environ['PATH']}")
+                                PATH=f"{Path(program).parent}:{os.environ['PATH']}",
+                                AGENT_BROWSER_EXECUTABLE_PATH=os.environ['AGENT_BROWSER_EXECUTABLE_PATH'])
         sockets = laptop / '.agent/run/sonny'
         self.addCleanup(lambda: subprocess.run([program, 'close', '--all'], capture_output=True,
                                                env={**clean_env(), 'HOME': str(laptop),
@@ -1069,8 +1071,15 @@ there.wait()
         # Each its own tab, whatever the other opened since.
         self.assertIn('one', browse('one.lead', ['get title']))
         self.assertIn('two', browse('two.lead', ['get title']))
-        # One Chrome for both, on the profile kept for the link.
+        # One Chrome for both, on the profile kept for the link, started
+        # with the system's keychain rather than a stand-in.
         self.assertTrue((kept / 'Local State').exists())
+        pid = int(os.readlink(kept / 'SingletonLock').rsplit('-', 1)[1])
+        self.addCleanup(lambda: subprocess.run(['kill', str(pid)], capture_output=True))
+        started = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+        self.assertIn(f'--user-data-dir={kept}'.encode(), started)
+        self.assertNotIn(b'--use-mock-keychain', started)
+        self.assertNotIn(b'--password-store=basic', started)
         tabs = browse('one.lead', ['tab list'])
         self.assertIn('one', tabs)
         self.assertIn('two', tabs)
