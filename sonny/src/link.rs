@@ -517,15 +517,12 @@ fn nonce() -> String {
 
 /// This machine, to the hosts it links to, whatever name it goes by
 /// there: 32 hex digits made once and kept beside its links, so a host
-/// knows a new name for it is a rename, not another machine.
+/// knows a new name for it is a rename, not another machine. Read each
+/// time, so every tool host of this home says what the file says.
 fn this_id() -> Option<String> {
-    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    ID.get_or_init(|| {
-        let dir = mine()?;
-        private(&dir).ok()?;
-        id_in(&dir.join("id"))
-    })
-    .clone()
+    let dir = mine()?;
+    private(&dir).ok()?;
+    id_in(&dir.join("id"))
 }
 
 /// The id kept in `file`, made there if there is none yet.
@@ -538,15 +535,14 @@ fn id_in(file: &Path) -> Option<String> {
     if let Some(id) = read() {
         return Some(id);
     }
-    // Made once: written aside and linked into place, which fails when
-    // one is there, so of two tool hosts making one at once the first
-    // wins and both read it. One that is not an id, as a file cut short,
-    // is made again.
+    // Made once: written aside and linked into place, which leaves one
+    // there alone, so of two tool hosts making one at once the first wins
+    // and both read it. One that is not an id, as a file cut short, is
+    // replaced whole; any host that made another then reads this one.
     let partial = file.with_extension(format!("{}.partial", std::process::id()));
     std::fs::write(&partial, nonce()).ok()?;
-    if read().is_none() {
-        let _ = std::fs::remove_file(file);
-        let _ = std::fs::hard_link(&partial, file);
+    if std::fs::hard_link(&partial, file).is_err() && read().is_none() {
+        let _ = std::fs::rename(&partial, file);
     }
     let _ = std::fs::remove_file(&partial);
     read()
