@@ -242,7 +242,13 @@ class AcpTests(ModelFixture):
         answered, updates = child.answer_of(child.ask('session/prompt', {
             'sessionId': child_session, 'prompt': self.wrapped(brief)}))
         self.assertEqual(answered['result']['stopReason'], 'end_turn')
-        self.assertTrue([u for u in updates if u['sessionUpdate'] == 'agent_message_chunk'])
+        said = [u for u in updates if u['sessionUpdate'] == 'agent_message_chunk']
+        self.assertTrue(said)
+        # Its answer, shown whether the task ended before the thread came or
+        # after, is a reply a client reacts to.
+        reacted, _ = child.answer_of(child.ask('_sonny/react', {
+            'sessionId': child_session, 'messageId': said[-1]['messageId'], 'emoji': '👍'}))
+        self.assertEqual(reacted.get('result'), {}, reacted)
         kept = self.path / '.agent/sonny/t3/sessions' / child_session
         fix = self.daemon.request('inspect', bot='calc.fix')['result']
         # The thread is the task by its identity and store, not its name alone.

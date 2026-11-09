@@ -1469,10 +1469,11 @@ impl Session {
 
     /// The bot's last reply, for a task's thread that came after its turn.
     async fn say_last(&self, agent: &Agent) {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         let Some(bound) = &state.bound else { return };
-        let Ok(page) = (bound.client)
-            .request("history_nodes", json!({"bot": bound.bot, "limit": 64}))
+        let (client, bot, bot_id) = (bound.client.clone(), bound.bot.clone(), bound.bot_id);
+        let Ok(page) = client
+            .request("history_nodes", json!({"bot": bot, "limit": 64}))
             .await
         else {
             return;
@@ -1483,16 +1484,31 @@ impl Session {
             .flatten()
             .filter_map(|node| node["node"].as_i64())
             .collect();
-        // Newest first, as the nodes were asked for.
-        let reply = items(&bound.client, &bound.bot, &nodes)
+        let Ok(read) = client
+            .request("history_items", json!({"bot": bot, "nodes": nodes}))
             .await
-            .into_iter()
-            .filter(|item| item["role"] == "assistant")
-            .map(|item| crate::text(&item))
-            .find(|text| !text.is_empty());
-        if let Some(reply) = reply {
-            agent.out.update(&self.id, json!({"sessionUpdate": "agent_message_chunk",
-                "messageId": format!("{}-last", bound.bot), "content": {"type": "text", "text": reply}}));
+        else {
+            return;
+        };
+        // Newest first, as the nodes were asked for.
+        let reply = (read["items"].as_array().into_iter().flatten())
+            .filter_map(|entry| Some((entry["node"].as_i64()?, crate::responses(&entry["item"]))))
+            .flat_map(|(node, items)| items.into_iter().map(move |item| (node, item)))
+            .filter(|(_, item)| item["role"] == "assistant")
+            .map(|(node, item)| (node, crate::text(&item)))
+            .find(|(_, text)| !text.is_empty());
+        if let Some((node, reply)) = reply {
+            let message = format!("{bot}-last");
+            agent.out.update(
+                &self.id,
+                json!({"sessionUpdate": "agent_message_chunk",
+                "messageId": message, "content": {"type": "text", "text": reply}}),
+            );
+            // A client reacts to it as to any reply it was shown.
+            if state.replies.len() == REPLIES {
+                state.replies.pop_front();
+            }
+            (state.replies).push_back((message, bot_id, node, first_line(&reply)));
         }
     }
 
