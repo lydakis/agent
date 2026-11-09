@@ -38,6 +38,9 @@ pub struct Reactions {
     /// When the file was last read or written here: another program's
     /// write since, as a client's over ACP, is read again.
     read: Option<std::time::SystemTime>,
+    /// Nodes another program's write changed, read by a toggle before
+    /// [`Reactions::refresh`] reported them: reported by its next call.
+    pending: Vec<i64>,
 }
 
 impl Reactions {
@@ -54,6 +57,7 @@ impl Reactions {
                     file: Some(file),
                     on,
                     read,
+                    pending: Vec::new(),
                 }
             }
             None => Reactions::default(),
@@ -69,6 +73,7 @@ impl Reactions {
             file: Some(file),
             on,
             read: None,
+            pending: Vec::new(),
         })
     }
 
@@ -84,19 +89,21 @@ impl Reactions {
     /// Reads the file again when another program wrote it since: the
     /// nodes whose reactions changed.
     pub fn refresh(&mut self) -> Vec<i64> {
+        let mut changed = std::mem::take(&mut self.pending);
         let Some(file) = &self.file else {
-            return Vec::new();
+            return changed;
         };
         let now = modified(file);
         if now.is_none() || now == self.read {
-            return Vec::new();
+            return changed;
         }
         self.read = now;
         let on = read(file).unwrap_or_default();
-        let mut changed: Vec<i64> = (self.on.keys().chain(on.keys()))
-            .filter(|node| self.on.get(node) != on.get(node))
-            .copied()
-            .collect();
+        changed.extend(
+            (self.on.keys().chain(on.keys()))
+                .filter(|node| self.on.get(node) != on.get(node))
+                .copied(),
+        );
         changed.sort_unstable();
         changed.dedup();
         self.on = on;
@@ -107,7 +114,7 @@ impl Reactions {
     /// there, and says whether it is on now. What another program wrote
     /// since is read first, so neither write undoes the other's.
     pub fn toggle(&mut self, node: i64, emoji: &str) -> Result<bool, String> {
-        self.refresh();
+        self.pending = self.refresh();
         let on = self.on.entry(node).or_default();
         let added = match on.iter().position(|e| e == emoji) {
             Some(at) => {
@@ -646,8 +653,10 @@ mod tests {
         assert_eq!(kept.refresh(), Vec::<i64>::new());
         std::thread::sleep(std::time::Duration::from_millis(20));
         assert_eq!(other.toggle(9, "👀"), Ok(true));
-        // Not refreshed: the toggle reads it first, and keeps it.
+        // Not refreshed: the toggle reads it first, and keeps it, and the
+        // next refresh still reports it.
         assert_eq!(kept.toggle(7, "👍"), Ok(false));
+        assert_eq!(kept.refresh(), vec![9]);
         let read: BTreeMap<i64, Vec<String>> =
             serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(read, BTreeMap::from([(9, vec!["🎉".into(), "👀".into()])]));

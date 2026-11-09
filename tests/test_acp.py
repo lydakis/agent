@@ -580,6 +580,8 @@ class AcpTests(ModelFixture):
         repo = self.repo()
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('react')])
+        self.daemon.request('create', bot='calc.lead.billing', workspace=str(repo),
+                            model='openai/synthetic-model', instructions='Lead.')
         env = {k: v for k, v in self.env.items() if not k.startswith('T3_')}
         thread = Thread(self, env, repo)
         thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {},
@@ -633,6 +635,11 @@ class AcpTests(ModelFixture):
         # Taken off: off in the window too, and the lead is not told.
         self.assertIn('result', react({'messageId': older, 'emoji': '🎉', 'remove': True}))
         self.assertEqual(json.loads(file.read_text()), {})
+        # Moved to another lead: the first lead's replies are not its.
+        moved, _ = thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead.billing'}))
+        self.assertEqual(moved['result']['configOptions'][-1]['currentValue'], 'calc.lead.billing')
+        self.assertEqual(react({'messageId': last, 'emoji': '🎉'})['error']['code'], -32602)
 
     def test_the_leads_questions_are_forms_and_a_pick_answers_them(self):
         """A client that fills in forms gets each question the lead puts,

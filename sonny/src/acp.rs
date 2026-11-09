@@ -780,8 +780,9 @@ struct State {
     opening: usize,
     held: Vec<(Value, Value)>,
     /// The bot's replies this thread showed, newest last, each by its
-    /// `messageId` with its node and first line: what a client reacts to.
-    replies: VecDeque<(String, i64, String)>,
+    /// `messageId` with the bot's identity, its node and first line: what
+    /// a client reacts to, while the thread is still that bot.
+    replies: VecDeque<(String, Option<i64>, i64, String)>,
 }
 
 /// How many of the bot's latest replies a client may react to.
@@ -1072,14 +1073,18 @@ impl Session {
                 return Err((INVALID_PARAMS, "the thread has no bot yet".into()));
             };
             let message = params["messageId"].as_str().unwrap_or("");
-            let Some(at) = (state.replies.iter()).rposition(|(id, ..)| id == message) else {
+            // Only the replies of the bot the thread is now.
+            let replies: Vec<_> = (state.replies.iter())
+                .filter(|(_, by, ..)| *by == bound.bot_id)
+                .collect();
+            let Some(at) = replies.iter().rposition(|(id, ..)| id == message) else {
                 return Err((
                     INVALID_PARAMS,
                     "messageId is none of the latest replies this thread showed".into(),
                 ));
             };
-            let (_, node, first) = state.replies[at].clone();
-            let last = at + 1 == state.replies.len();
+            let (_, _, node, first) = replies[at].clone();
+            let last = at + 1 == replies.len();
             (
                 bound.client.clone(),
                 bound.bot.clone(),
@@ -1694,7 +1699,10 @@ impl Session {
                 if state.replies.len() == REPLIES {
                     state.replies.pop_front();
                 }
-                state.replies.push_back((message, node, first_line(&text)));
+                let by = state.bound.as_ref().and_then(|bound| bound.bot_id);
+                state
+                    .replies
+                    .push_back((message, by, node, first_line(&text)));
             }
             "tool_started" => {
                 let (call, name, arguments) = started_call(&client, &bot, data).await;
