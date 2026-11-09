@@ -305,11 +305,13 @@ pub const DEPTH: &str = "task-depth-daemon";
 pub const REVIEWER: &str = "judge-reviewer";
 /// The migration that takes quiet mode's keys, files and skill away.
 pub const QUIET_GONE: &str = "quiet-gone";
+pub const CHECKS_GONE: &str = "checks-gone";
 
 /// At start, once each, before the config is read: a line depth the
 /// person set for Sonny moved to the daemon, which bounds it now; the
-/// reviewer's model and effort under the reviewer's name; and quiet mode,
-/// gone, leaving no key the config would refuse, no file and no skill.
+/// reviewer's model and effort under the reviewer's name; quiet mode,
+/// gone, leaving no key the config would refuse, no file and no skill; and
+/// the reply check's and done check's keys, gone with the checks.
 pub fn at_start() {
     let (Some(home), Some(path)) = (
         std::env::var_os("HOME").map(PathBuf::from),
@@ -331,6 +333,7 @@ pub fn at_start() {
         crate::skills::remove("away");
         rewrite(&path, quiet_gone)
     });
+    crate::upgrade::once(&migrated, CHECKS_GONE, || rewrite(&path, checks_gone));
 }
 
 /// The config at `path` as `change` rewrites it, each other line as the
@@ -451,18 +454,29 @@ fn reviewer_named(text: &str) -> Result<Option<String>, ()> {
 }
 
 /// `text` as [`rewrite`] writes it for [`QUIET_GONE`]: none when `[sonny]`
-/// sets neither `hours` nor `quiet_after`. Their lines go, a list run over
-/// several lines whole, and every other line stays as written. What is
-/// written must parse to the config with only those keys gone, so a key
-/// lines can't take away (a dotted key, an inline table) is an error.
+/// sets neither `hours` nor `quiet_after`.
 fn quiet_gone(text: &str) -> Result<Option<String>, ()> {
-    const GONE: [&str; 2] = ["hours", "quiet_after"];
+    sonny_keys_gone(text, &["hours", "quiet_after"])
+}
+
+/// `text` as [`rewrite`] writes it for [`CHECKS_GONE`]: none when `[sonny]`
+/// sets neither `needs_check` nor `task_done_check`, which `/config` wrote.
+fn checks_gone(text: &str) -> Result<Option<String>, ()> {
+    sonny_keys_gone(text, &["needs_check", "task_done_check"])
+}
+
+/// `text` without the `[sonny]` keys `gone`: none when it sets none of
+/// them. Their lines go, a list run over several lines whole, and every
+/// other line stays as written. What is written must parse to the config
+/// with only those keys gone, so a key lines can't take away (a dotted
+/// key, an inline table) is an error.
+fn sonny_keys_gone(text: &str, gone: &[&str]) -> Result<Option<String>, ()> {
     let old: toml::Table = text.parse().map_err(drop)?;
     let mut expected = old.clone();
     let Some(toml::Value::Table(sonny)) = expected.get_mut("sonny") else {
         return Ok(None);
     };
-    if GONE
+    if gone
         .iter()
         .filter(|key| sonny.remove(**key).is_some())
         .count()
@@ -489,7 +503,7 @@ fn quiet_gone(text: &str) -> Result<Option<String>, ()> {
         let set = trimmed.split_once('=');
         if let Some((key, value)) = set
             && table == "sonny"
-            && GONE.contains(&key.trim())
+            && gone.contains(&key.trim())
         {
             let value = value.trim();
             list = value.starts_with('[') && !value.contains(']');
@@ -885,6 +899,17 @@ mod tests {
         assert_eq!(quiet_gone("[daemon]\ndepth = 2\n"), Ok(None));
         // A key lines can't take away is left for the reader's error.
         assert_eq!(quiet_gone("sonny.quiet_after = \"30m\"\n"), Err(()));
+    }
+
+    #[test]
+    fn the_removed_checks_keys_go_and_the_rest_stays_as_written() {
+        let text = "[sonny]\nchime = true\nneeds_check = false\ntask_done_check = 24  # mine\nverbose = true\n";
+        assert_eq!(
+            checks_gone(text),
+            Ok(Some("[sonny]\nchime = true\nverbose = true\n".into()))
+        );
+        assert_eq!(checks_gone("[sonny]\nchime = true\n"), Ok(None));
+        assert_eq!(checks_gone("sonny.needs_check = false\n"), Err(()));
     }
 
     #[test]

@@ -205,6 +205,13 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::config::QUIET_GONE,
         retire: "0.11.0",
     },
+    // The reply check and the done check are gone: `[sonny] needs_check`
+    // and `task_done_check`, which `/config` wrote, leave the config, which
+    // would refuse them (0.9.1).
+    Migration {
+        id: crate::config::CHECKS_GONE,
+        retire: "0.11.0",
+    },
     // Sonny's own nightly memory cleanup, scheduled before each run started
     // an agent of its own, is scheduled again fresh, keeping its model and
     // time (0.9.0).
