@@ -521,6 +521,21 @@ the thread comes (from tasks that ran in the last week) come first, then
 each as it is asked, from tasks the lead starts later too. T3 Code shows
 a task's questions in that task's own thread instead.
 
+Reactions go both ways, through Sonny's `_sonny/react` extension. When the
+lead reacts to the person's newest message with `react`, the client gets a
+`_sonny/react` notification (`{"sessionId", "emoji", "remove"}`), which it
+may show or ignore; T3 Code is not sent it. A client reacts to one of the
+lead's replies with a `_sonny/react` request (`{"sessionId", "messageId",
+"emoji", "remove"?}`), naming a reply by the `messageId` of its
+`agent_message_chunk`, one of the 64 latest this session showed; the emoji
+must be one emoji, as Sonny's window takes one, so a Slack bridge turns
+`:tada:` into 🎉 itself. It is attached to the lead's next model call, as a
+reaction in Sonny's window is, so it starts no turn: the emoji alone for the
+lead's last reply, after that reply's first line for an older one. One with
+no `_meta.person` is yours, kept where Sonny's window draws it under that
+reply, and `remove` takes it off there; one naming someone reaches the lead
+as theirs. The lead is told only of one added.
+
 Enter sends (and steers a running turn), Tab while a turn runs queues what
 you wrote to run after it, as Codex does, Esc interrupts, `y`/`n` answer a
 pending approval, Ctrl-C clears the composer or quits. Shift-Enter or

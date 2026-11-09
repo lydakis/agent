@@ -242,7 +242,13 @@ class AcpTests(ModelFixture):
         answered, updates = child.answer_of(child.ask('session/prompt', {
             'sessionId': child_session, 'prompt': self.wrapped(brief)}))
         self.assertEqual(answered['result']['stopReason'], 'end_turn')
-        self.assertTrue([u for u in updates if u['sessionUpdate'] == 'agent_message_chunk'])
+        said = [u for u in updates if u['sessionUpdate'] == 'agent_message_chunk']
+        self.assertTrue(said)
+        # Its answer, shown whether the task ended before the thread came or
+        # after, is a reply a client reacts to.
+        reacted, _ = child.answer_of(child.ask('_sonny/react', {
+            'sessionId': child_session, 'messageId': said[-1]['messageId'], 'emoji': '👍'}))
+        self.assertEqual(reacted.get('result'), {}, reacted)
         kept = self.path / '.agent/sonny/t3/sessions' / child_session
         fix = self.daemon.request('inspect', bot='calc.fix')['result']
         # The thread is the task by its identity and store, not its name alone.
@@ -571,6 +577,75 @@ class AcpTests(ModelFixture):
         events = self.daemon.request('events', bot='calc.lead', after=0, limit=256)['result']['events']
         [denied] = [e['data'] for e in events if e['event'] == 'tool_completed']
         self.assertEqual([(v['by'], v['allow']) for v in denied['approvals']], [('bo', False)])
+
+    def test_reactions_go_both_ways_between_the_lead_and_a_client(self):
+        """The lead's own reaction reaches the client as `_sonny/react`; a
+        client's reaction to one of the lead's replies is attached to the
+        lead's next model call, as the person's in Sonny's window, or as the
+        words of the person the client names."""
+        repo = self.repo()
+        self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('react')])
+        self.daemon.request('create', bot='calc.lead.billing', workspace=str(repo),
+                            model='openai/synthetic-model', instructions='Lead.')
+        env = {k: v for k, v in self.env.items() if not k.startswith('T3_')}
+        thread = Thread(self, env, repo)
+        thread.answer_of(thread.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {},
+                                                   'clientInfo': {'name': 'slack-bridge'}}))
+        opened, _ = thread.answer_of(thread.ask('session/new', {'cwd': str(repo), 'mcpServers': []}))
+        session = opened['result']['sessionId']
+        thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead'}))
+        script = [{'type': 'text', 'text': 'script'}]
+        self.model.call_script = [('react', {'emoji': '👀'})]
+        prompt = thread.ask('session/prompt', {'sessionId': session, 'prompt': script})
+        seen = thread.until(lambda m: m.get('id') == prompt and 'method' not in m)
+        self.assertEqual(seen[-1].get('result'), {'stopReason': 'end_turn'}, seen[-1])
+        self.assertEqual([m['params'] for m in seen if m.get('method') == '_sonny/react'],
+                         [{'sessionId': session, 'emoji': '👀', 'remove': False}])
+
+        def reply(seen):
+            [said] = {m['params']['update']['messageId'] for m in seen if m.get('method') == 'session/update'
+                      and m['params']['update']['sessionUpdate'] == 'agent_message_chunk'}
+            return said
+        older = reply(seen)
+        again = thread.ask('session/prompt', {'sessionId': session, 'prompt': script})
+        last = reply(thread.until(lambda m: m.get('id') == again and 'method' not in m))
+
+        def react(params):
+            answered, _ = thread.answer_of(thread.ask('_sonny/react', {'sessionId': session, **params}))
+            return answered
+        self.assertEqual(react({'messageId': 'calc.lead-0-9', 'emoji': '🎉'})['error']['code'], -32602)
+        self.assertEqual(react({'messageId': older, 'emoji': 'nice'})['error']['code'], -32602)
+        self.assertEqual(react({'messageId': older, 'emoji': '🎉'})['result'], {})
+        # The person's own is kept where Sonny's window draws it, under that
+        # reply; one again is the same one, and is not sent twice.
+        kept = self.path / '.agent/sonny/reactions'
+        [file] = [f for f in kept.iterdir() if f.name.endswith('.json') and not f.name.endswith('.by.json')]
+        self.assertEqual(list(json.loads(file.read_text()).values()), [['🎉']])
+        self.assertIn('result', react({'messageId': older, 'emoji': '🎉'}))
+        self.assertIn('result', react({'messageId': last, 'emoji': '👍', '_meta': {'person': 'ana'}}))
+        self.assertEqual(list(json.loads(file.read_text()).values()), [['🎉']])
+        while not self.model.requests.empty():
+            self.model.requests.get_nowait()
+        hello = [{'type': 'text', 'text': 'hello'}]
+        answered, _ = thread.answer_of(thread.ask('session/prompt', {'sessionId': session, 'prompt': hello}))
+        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        said = [part['text'] for item in self.model.requests.get(timeout=5)['input'] if item.get('role') == 'user'
+                for part in item['content'] if part.get('type') == 'input_text']
+        # The older reply quoted; the last, which a teammate reacted to, not.
+        self.assertIn('> done\n\n🎉', said)
+        self.assertEqual(said.count('> done\n\n🎉'), 1)
+        self.assertIn('👍', said)
+        self.assertEqual(said[said.index('👍') + 1], '[Written by ana.]')
+        # Taken off: off in the window too, and the lead is not told.
+        self.assertIn('result', react({'messageId': older, 'emoji': '🎉', 'remove': True}))
+        self.assertEqual(json.loads(file.read_text()), {})
+        # Moved to another lead: the first lead's replies are not its.
+        moved, _ = thread.answer_of(thread.ask('session/set_config_option', {
+            'sessionId': session, 'configId': 'agent', 'type': 'id', 'value': 'calc.lead.billing'}))
+        self.assertEqual(moved['result']['configOptions'][-1]['currentValue'], 'calc.lead.billing')
+        self.assertEqual(react({'messageId': last, 'emoji': '🎉'})['error']['code'], -32602)
 
     def test_the_leads_questions_are_forms_and_a_pick_answers_them(self):
         """A client that fills in forms gets each question the lead puts,
