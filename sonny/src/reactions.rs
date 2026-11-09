@@ -114,23 +114,64 @@ impl Reactions {
     /// there, and says whether it is on now. What another program wrote
     /// since is read first, so neither write undoes the other's.
     pub fn toggle(&mut self, node: i64, emoji: &str) -> Result<bool, String> {
+        self.change(node, emoji, None).map(|(on, _)| on)
+    }
+
+    /// Puts `emoji` on the reply at `node`, or takes it off, as `on` says;
+    /// whether that changed anything.
+    pub fn set(&mut self, node: i64, emoji: &str, on: bool) -> Result<bool, String> {
+        self.change(node, emoji, Some(on))
+            .map(|(_, changed)| changed)
+    }
+
+    /// `emoji` on the reply at `node` as `want` says, else the other way
+    /// round: whether it is on now, and whether that changed. Every writer
+    /// of the file takes its lock for the whole of the read and the write,
+    /// so two programs, or two of a client's requests, never lose one.
+    fn change(
+        &mut self,
+        node: i64,
+        emoji: &str,
+        want: Option<bool>,
+    ) -> Result<(bool, bool), String> {
+        let _held = self.lock()?;
         self.pending = self.refresh();
         let on = self.on.entry(node).or_default();
-        let added = match on.iter().position(|e| e == emoji) {
-            Some(at) => {
-                on.remove(at);
-                false
-            }
-            None => {
-                on.push(emoji.to_owned());
-                true
-            }
-        };
+        let there = on.iter().position(|e| e == emoji);
+        let want = want.unwrap_or(there.is_none());
+        let changed = want != there.is_some();
+        match there {
+            Some(at) if !want => drop(on.remove(at)),
+            None if want => on.push(emoji.to_owned()),
+            _ => {}
+        }
         if on.is_empty() {
             self.on.remove(&node);
         }
-        self.save()?;
-        Ok(added)
+        if changed {
+            self.save()?;
+        }
+        Ok((want, changed))
+    }
+
+    /// The file's lock, held until dropped; none for reactions kept nowhere.
+    fn lock(&self) -> Result<Option<std::fs::File>, String> {
+        let Some(file) = &self.file else {
+            return Ok(None);
+        };
+        let lock = file.with_extension("lock");
+        let failed = |e: std::io::Error| format!("{}: {e}", lock.display());
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir).map_err(failed)?;
+        }
+        let held = (std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true))
+        .open(&lock)
+        .map_err(failed)?;
+        held.lock().map_err(failed)?;
+        Ok(Some(held))
     }
 
     fn save(&mut self) -> Result<(), String> {
@@ -660,6 +701,36 @@ mod tests {
         let read: BTreeMap<i64, Vec<String>> =
             serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(read, BTreeMap::from([(9, vec!["🎉".into(), "👀".into()])]));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn writers_at_once_each_keep_their_reaction() {
+        let dir =
+            std::env::temp_dir().join(format!("sonny-reactions-at-once-{}", std::process::id()));
+        let file = dir.join("b.json");
+        let writers: Vec<_> = (0..8)
+            .map(|node| {
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    let mut kept = Reactions {
+                        file: Some(file),
+                        ..Reactions::default()
+                    };
+                    assert_eq!(kept.set(node, "👍", true), Ok(true));
+                    assert_eq!(kept.set(node, "👍", true), Ok(false));
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let read: BTreeMap<i64, Vec<String>> =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(
+            read,
+            (0..8).map(|node| (node, vec!["👍".to_owned()])).collect()
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

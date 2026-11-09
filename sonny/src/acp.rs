@@ -1099,10 +1099,9 @@ impl Session {
                 let store = agent_client::socket::canonical_store(&agent.options.store)
                     .unwrap_or_else(|_| agent.options.store.clone());
                 let mut kept = reactions::Reactions::load(Some(&reactions::key(&store, bot_id)));
-                if kept.on(node).iter().any(|on| on == emoji) != remove {
+                if !(kept.set(node, emoji, !remove)).map_err(|error| (FAILED, error))? {
                     return Ok(json!({}));
                 }
-                kept.toggle(node, emoji).map_err(|error| (FAILED, error))?;
                 Some(kept)
             }
             _ => None,
@@ -1118,7 +1117,7 @@ impl Session {
         }
         if let Err(error) = client.request("submit", submitted).await {
             if let Some(mut kept) = kept {
-                let _ = kept.toggle(node, emoji);
+                let _ = kept.set(node, emoji, false);
             }
             return Err((FAILED, error.to_string()));
         }
