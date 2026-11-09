@@ -50,6 +50,11 @@ pub struct Root {
     /// their place would stop git. On Linux, removed when the command ends;
     /// elsewhere they are `missing`.
     pub left: Vec<PathBuf>,
+    /// On Linux, the lock files of its `missing` placeholders, made as the
+    /// root is read, off the runtime thread, so a command built before its
+    /// hold still has bubblewrap hold them ([`locks`]).
+    #[serde(default)]
+    pub locks: Vec<PathBuf>,
 }
 
 /// What a sandboxed command may do: write its roots, and reach the network
@@ -202,10 +207,12 @@ fn temporary() -> &'static [(PathBuf, PathBuf)] {
     })
 }
 
-/// Read what the escape check reads once, at start, rather than on the
-/// runtime thread when the first call comes.
+/// Read what the escape check reads once, and make the placeholders' lock
+/// folder, at start, rather than on the runtime thread when the first call
+/// comes.
 pub fn warm() {
     temporary();
+    locks();
 }
 
 impl Mode {
@@ -630,11 +637,16 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             read_only.push(kept.clone());
         }
     }
+    let locks = match cfg!(target_os = "linux") {
+        true => missing.iter().filter_map(|kept| made_lock(kept)).collect(),
+        false => Vec::new(),
+    };
     Ok(Root {
         path: path.to_owned(),
         read_only,
         missing,
         left,
+        locks,
     })
 }
 
@@ -1160,14 +1172,28 @@ fn lock_file(path: &Path) -> Option<PathBuf> {
     Some(locks()?.join(format!("{hash:016x}")))
 }
 
+/// The lock file of the placeholder at `path`, made if it isn't there;
+/// `None` when it can't be.
+fn made_lock(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock = lock_file(path)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock)
+        .ok()?;
+    Some(lock)
+}
+
 /// The arguments that have bubblewrap's init hold `policy`'s placeholders'
-/// locks while the sandbox runs: each whose lock file is there.
+/// locks while the sandbox runs: those made as its roots were read, so
+/// building a command touches no file.
 #[cfg(target_os = "linux")]
 fn lock_args(policy: &Policy) -> Vec<String> {
     (policy.roots.iter())
-        .flat_map(|root| &root.missing)
-        .filter_map(|path| lock_file(path))
-        .filter(|lock| lock.exists())
+        .flat_map(|root| &root.locks)
         .flat_map(|lock| ["--lock-file".into(), lock.to_string_lossy().into_owned()])
         .collect()
 }
@@ -2053,6 +2079,7 @@ mod tests {
                         .collect(),
                     missing: Vec::new(),
                     left: Vec::new(),
+                    locks: Vec::new(),
                     path: path.clone(),
                 }
             })
@@ -2185,12 +2212,12 @@ mod tests {
         .unwrap()
         .unwrap();
         let git = base.join(".git");
+        // Built before its hold, as a detached command is: the lock it names
+        // was made as the policy was.
+        let mut sandboxed =
+            command(&policy, "sh", &["-c", "sleep 1; mkdir .git/x"], false).unwrap();
         let held = hold(&policy).await;
-        let mut child = command(&policy, "sh", &["-c", "sleep 1; mkdir .git/x"], false)
-            .unwrap()
-            .current_dir(&base)
-            .spawn()
-            .unwrap();
+        let mut child = sandboxed.current_dir(&base).spawn().unwrap();
         // The daemon lets go first, as when it restarts under a detached
         // command: the sandbox's own lock keeps the placeholder.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
