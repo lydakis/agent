@@ -35,6 +35,9 @@ pub fn key(store: &Path, bot_id: i64) -> String {
 pub struct Reactions {
     file: Option<PathBuf>,
     on: BTreeMap<i64, Vec<String>>,
+    /// When the file was last read or written here: another program's
+    /// write since, as a client's over ACP, is read again.
+    read: Option<std::time::SystemTime>,
 }
 
 impl Reactions {
@@ -45,10 +48,12 @@ impl Reactions {
         match key.zip(home) {
             Some((key, home)) => {
                 let file = file(&home, key);
-                let on = read(&file).unwrap_or_default();
+                let read = modified(&file);
+                let on = self::read(&file).unwrap_or_default();
                 Reactions {
                     file: Some(file),
                     on,
+                    read,
                 }
             }
             None => Reactions::default(),
@@ -63,6 +68,7 @@ impl Reactions {
         Some(Reactions {
             file: Some(file),
             on,
+            read: None,
         })
     }
 
@@ -75,9 +81,33 @@ impl Reactions {
         (self.on.range(..node)).any(|(_, on)| on.iter().any(|e| e == emoji))
     }
 
+    /// Reads the file again when another program wrote it since: the
+    /// nodes whose reactions changed.
+    pub fn refresh(&mut self) -> Vec<i64> {
+        let Some(file) = &self.file else {
+            return Vec::new();
+        };
+        let now = modified(file);
+        if now.is_none() || now == self.read {
+            return Vec::new();
+        }
+        self.read = now;
+        let on = read(file).unwrap_or_default();
+        let mut changed: Vec<i64> = (self.on.keys().chain(on.keys()))
+            .filter(|node| self.on.get(node) != on.get(node))
+            .copied()
+            .collect();
+        changed.sort_unstable();
+        changed.dedup();
+        self.on = on;
+        changed
+    }
+
     /// Adds `emoji` to the reply at `node`, or takes it off when it was
-    /// there, and says whether it is on now.
+    /// there, and says whether it is on now. What another program wrote
+    /// since is read first, so neither write undoes the other's.
     pub fn toggle(&mut self, node: i64, emoji: &str) -> Result<bool, String> {
+        self.refresh();
         let on = self.on.entry(node).or_default();
         let added = match on.iter().position(|e| e == emoji) {
             Some(at) => {
@@ -96,7 +126,7 @@ impl Reactions {
         Ok(added)
     }
 
-    fn save(&self) -> Result<(), String> {
+    fn save(&mut self) -> Result<(), String> {
         let Some(file) = &self.file else {
             return Ok(());
         };
@@ -107,8 +137,14 @@ impl Reactions {
         let json = serde_json::to_vec(&self.on).map_err(|e| e.to_string())?;
         let next = file.with_extension("json.next");
         std::fs::write(&next, json).map_err(failed)?;
-        std::fs::rename(&next, file).map_err(failed)
+        std::fs::rename(&next, file).map_err(failed)?;
+        self.read = modified(file);
+        Ok(())
     }
+}
+
+fn modified(file: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(file).and_then(|m| m.modified()).ok()
 }
 
 fn file(home: &Path, key: &str) -> PathBuf {
@@ -578,7 +614,7 @@ mod tests {
         let file = dir.join("b.json");
         let mut kept = Reactions {
             file: Some(file.clone()),
-            on: BTreeMap::new(),
+            ..Reactions::default()
         };
         assert_eq!(kept.toggle(7, "👍"), Ok(true));
         assert_eq!(kept.toggle(7, "🎉"), Ok(true));
@@ -588,6 +624,33 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(read, BTreeMap::from([(7, vec!["👍".into(), "🎉".into()])]));
         assert!(kept.on(9).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_reaction_another_program_keeps_is_read_and_never_undone() {
+        let dir = std::env::temp_dir().join(format!("sonny-reactions-by-{}", std::process::id()));
+        let file = dir.join("b.json");
+        let window = || Reactions {
+            file: Some(file.clone()),
+            ..Reactions::default()
+        };
+        let (mut kept, mut other) = (window(), window());
+        assert_eq!(kept.toggle(7, "👍"), Ok(true));
+        assert_eq!(kept.refresh(), Vec::<i64>::new());
+        // Written later than the window's own write, as a client's would be.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(other.toggle(9, "🎉"), Ok(true));
+        assert_eq!(kept.refresh(), vec![9]);
+        assert_eq!(kept.on(9), ["🎉"]);
+        assert_eq!(kept.refresh(), Vec::<i64>::new());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(other.toggle(9, "👀"), Ok(true));
+        // Not refreshed: the toggle reads it first, and keeps it.
+        assert_eq!(kept.toggle(7, "👍"), Ok(false));
+        let read: BTreeMap<i64, Vec<String>> =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(read, BTreeMap::from([(9, vec!["🎉".into(), "👀".into()])]));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

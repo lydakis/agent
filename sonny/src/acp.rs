@@ -17,7 +17,7 @@
 use crate::{approvals, asks, declared, lookout, plan, project, reactions, t3};
 use agent_client::{Client, Events};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -43,6 +43,9 @@ const LISTING: std::time::Duration = std::time::Duration::from_secs(5);
 const INVALID_PARAMS: i64 = -32602;
 const NOT_FOUND: i64 = -32601;
 const FAILED: i64 = -32603;
+/// Sonny's extension for reactions, both ways: a client reacts to one of
+/// the bot's replies, and is told when the bot reacts.
+const REACT: &str = "_sonny/react";
 
 /// The model and effort pickers' first choice: what the thread's bot
 /// runs, or what Sonny gives a new lead.
@@ -237,6 +240,10 @@ impl Agent {
                 None => Err((INVALID_PARAMS, "no such session".into())),
             },
             "session/list" => self.listed(params).await,
+            REACT => match self.session(params) {
+                Some(session) => session.react(&self, params).await,
+                None => Err((INVALID_PARAMS, "no such session".into())),
+            },
             "session/set_config_option" => match self.session(params) {
                 Some(session) => session.set_option(&self, params).await,
                 None => Err((INVALID_PARAMS, "no such session".into())),
@@ -772,7 +779,13 @@ struct State {
     /// meanwhile, held until they are open.
     opening: usize,
     held: Vec<(Value, Value)>,
+    /// The bot's replies this thread showed, newest last, each by its
+    /// `messageId` with its node and first line: what a client reacts to.
+    replies: VecDeque<(String, i64, String)>,
 }
+
+/// How many of the bot's latest replies a client may react to.
+const REPLIES: usize = 64;
 
 struct Bound {
     bot: String,
@@ -1039,6 +1052,72 @@ impl Session {
             &self.id,
             json!({"sessionUpdate": "config_option_update", "configOptions": options}),
         );
+    }
+
+    /// A client's reaction to one of the bot's replies, by its
+    /// `messageId`: attached to the bot's next model call, as a reaction
+    /// in Sonny's window is, so it starts no turn. Without a person named
+    /// it is the person's own, kept where the window draws it, and taking
+    /// it off takes it off there; the bot is told only of one added.
+    async fn react(&self, agent: &Agent, params: &Value) -> Reply {
+        let person = person(params).map_err(|error| (INVALID_PARAMS, error))?;
+        let emoji = params["emoji"].as_str().map(str::trim).unwrap_or("");
+        if crate::transcript::reaction(emoji) != Some(emoji) {
+            return Err((INVALID_PARAMS, "emoji must be one emoji".into()));
+        }
+        let remove = params["remove"] == true;
+        let (client, bot, bot_id, node, first, last) = {
+            let state = self.state.lock().await;
+            let Some(bound) = &state.bound else {
+                return Err((INVALID_PARAMS, "the thread has no bot yet".into()));
+            };
+            let message = params["messageId"].as_str().unwrap_or("");
+            let Some(at) = (state.replies.iter()).rposition(|(id, ..)| id == message) else {
+                return Err((
+                    INVALID_PARAMS,
+                    "messageId is none of the latest replies this thread showed".into(),
+                ));
+            };
+            let (_, node, first) = state.replies[at].clone();
+            let last = at + 1 == state.replies.len();
+            (
+                bound.client.clone(),
+                bound.bot.clone(),
+                bound.bot_id,
+                node,
+                first,
+                last,
+            )
+        };
+        let kept = match (person, bot_id) {
+            (None, Some(bot_id)) => {
+                let store = agent_client::socket::canonical_store(&agent.options.store)
+                    .unwrap_or_else(|_| agent.options.store.clone());
+                let mut kept = reactions::Reactions::load(Some(&reactions::key(&store, bot_id)));
+                if kept.on(node).iter().any(|on| on == emoji) != remove {
+                    return Ok(json!({}));
+                }
+                kept.toggle(node, emoji).map_err(|error| (FAILED, error))?;
+                Some(kept)
+            }
+            _ => None,
+        };
+        if remove {
+            return Ok(json!({}));
+        }
+        let told = reactions::message(emoji, (!last).then_some(first.as_str()));
+        let mut submitted = json!({"bot": bot, "bot_id": bot_id, "request_id": crate::unique("acp"),
+            "prompt": told, "delivery": "attach"});
+        if let Some(person) = person {
+            submitted["person"] = json!(person);
+        }
+        if let Err(error) = client.request("submit", submitted).await {
+            if let Some(mut kept) = kept {
+                let _ = kept.toggle(node, emoji);
+            }
+            return Err((FAILED, error.to_string()));
+        }
+        Ok(json!({}))
     }
 
     /// The person picks a model or an effort. A bot's thread takes a
@@ -1602,22 +1681,35 @@ impl Session {
                     return;
                 }
                 let streamed = std::mem::take(&mut state.streamed);
+                let message = message_id(&bot, turn, state.part);
                 if let Some(rest) = text.strip_prefix(streamed.as_str())
                     && !rest.is_empty()
                 {
                     out.update(
                         id,
                         json!({"sessionUpdate": "agent_message_chunk",
-                        "messageId": message_id(&bot, turn, state.part),
-                        "content": {"type": "text", "text": rest}}),
+                        "messageId": message, "content": {"type": "text", "text": rest}}),
                     );
                 }
+                if state.replies.len() == REPLIES {
+                    state.replies.pop_front();
+                }
+                state.replies.push_back((message, node, first_line(&text)));
             }
             "tool_started" => {
                 let (call, name, arguments) = started_call(&client, &bot, data).await;
                 state.part += 1;
                 state.streamed.clear();
+                // The bot's reaction to the person's newest message here, as
+                // a client may show it; one in another bot is that bot's.
                 if name == reactions::TOOL {
+                    if agent.t3.is_none()
+                        && reactions::target(&arguments).is_none()
+                        && let Some((emoji, remove)) = reactions::call(&arguments)
+                    {
+                        out.send(json!({"jsonrpc": "2.0", "method": REACT,
+                            "params": {"sessionId": id, "emoji": emoji, "remove": remove}}));
+                    }
                     return;
                 }
                 if name == plan::TOOL {
@@ -2672,6 +2764,13 @@ fn cut(text: &str) -> String {
         end -= 1;
     }
     format!("{}\n…", &text[..end])
+}
+
+/// A reply's first line, trimmed and cut, as the bot is told which reply
+/// a reaction answers.
+fn first_line(text: &str) -> String {
+    let first = text.lines().find(|line| !line.trim().is_empty());
+    crate::transcript::cut(first.unwrap_or("").trim(), crate::QUOTED)
 }
 
 fn message_id(bot: &str, turn: Option<i64>, part: u32) -> String {

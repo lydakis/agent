@@ -5808,6 +5808,15 @@ impl App {
             }
             if self.picked_read.elapsed() > Duration::from_secs(1) {
                 self.picked_read = Instant::now();
+                // The person's reactions another program kept, as a client
+                // over ACP does: under their replies, as the window's own.
+                for node in self.reactions.refresh() {
+                    self.flush();
+                    let (row, buttons) = (self.reacted_row(node), self.reacted_buttons(node));
+                    let (under, tag) = (screen::Tag::End(node), screen::Tag::Reactions(node));
+                    self.screen.put_under_with(under, tag, row, buttons);
+                    changed = true;
+                }
                 let mut nodes: Vec<i64> = (self.picked.refresh().into_iter())
                     .map(|(node, ..)| node)
                     .collect();
