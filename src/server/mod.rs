@@ -1196,6 +1196,109 @@ fn confine(settings: &mut Settings) -> Result<()> {
 }
 /// A field given as `null` deserializes to `Some(None)`, apart from one
 /// left out, which `default` makes `None`.
+/// What a `configure` gives, by its names: what a change while a turn runs
+/// keeps for the turn's end, as `inspect` shows it.
+#[derive(Debug, Default, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Configure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approve: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approve_expire_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    declare: Option<Vec<Declared>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settings: Option<serde_json::Map<String, Value>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    fallback: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    compaction_instructions: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    compaction_model: Option<Option<String>>,
+}
+
+impl Configure {
+    /// A change of the command rules alone, which a running turn's next
+    /// round takes.
+    fn rules_only(&self) -> bool {
+        self.settings
+            .as_ref()
+            .is_some_and(|changes| changes.len() == 1 && changes.contains_key("rules"))
+            && self.instructions.is_none()
+            && self.model.is_none()
+            && self.effort.is_none()
+            && self.approve.is_none()
+            && self.approver.is_none()
+            && self.approve_expire_ms.is_none()
+            && self.declare.is_none()
+            && self.fallback.is_none()
+            && self.compaction_instructions.is_none()
+            && self.compaction_model.is_none()
+    }
+
+    /// This change over `older`, one kept before it: what the two would
+    /// leave one after the other. Each field given replaces the older's;
+    /// a model takes its effort with it, a gate its approver and expiry,
+    /// and settings go by name, `sandbox` taking the rest of the sandbox.
+    fn over(self, older: Configure) -> Configure {
+        let mut merged = older;
+        if self.model.is_some() {
+            merged.model = self.model;
+            merged.effort = self.effort;
+        }
+        if self.approve.is_some() || self.approver.is_some() || self.approve_expire_ms.is_some() {
+            merged.approve = self.approve;
+            merged.approver = self.approver;
+            merged.approve_expire_ms = self.approve_expire_ms;
+        }
+        if let Some(changes) = self.settings {
+            let mut settings = merged.settings.take().unwrap_or_default();
+            if changes.contains_key("sandbox") {
+                for key in agent_runtime::store::SANDBOX {
+                    settings.remove(key);
+                }
+            }
+            settings.extend(changes);
+            merged.settings = Some(settings);
+        }
+        macro_rules! newer {
+            ($($field:ident),*) => {$(
+                if self.$field.is_some() {
+                    merged.$field = self.$field;
+                }
+            )*};
+        }
+        newer!(
+            instructions,
+            declare,
+            fallback,
+            compaction_instructions,
+            compaction_model
+        );
+        merged
+    }
+}
+
 fn present<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1324,6 +1427,9 @@ struct Service {
     storage_backoff: Duration,
     /// When the ready turn a refused store left waiting is tried again.
     ready_retry_at: Option<tokio::time::Instant>,
+    /// Bots with a `configure` kept for their running turn's end, as the
+    /// store has them: read at start, kept current by `configure`.
+    kept: std::collections::HashSet<String>,
     /// Events of answered admissions not yet in their session's queue: the
     /// publisher has not passed them, or a follow is still replaying toward
     /// them. Each keeps its room in its session's queue.
@@ -1982,11 +2088,23 @@ pub async fn run(config: Configuration) -> Result<()> {
         reserved: 0,
         storage_backoff: Duration::ZERO,
         ready_retry_at: None,
+        kept: std::collections::HashSet::new(),
         unpublished: std::collections::VecDeque::new(),
         expiry: None,
         lapses: None,
         holds: None,
     };
+    // A `configure` kept for a turn that ended while no daemon ran is
+    // taken now; one whose turn still waits stays kept for its end.
+    service.kept = service
+        .store
+        .read("configures_kept", |db| db.configures_kept())
+        .await?
+        .into_iter()
+        .collect();
+    for bot in service.kept.clone() {
+        kept_for_start(service.take_configure(&bot).await)?;
+    }
     // Forks whose time ran out while no daemon ran are deleted at once.
     service.plan_expiry(Duration::ZERO).await?;
     // So are attached messages that waited out a stop delivered.
@@ -3337,6 +3455,10 @@ impl Service {
             self.ready_hint = false;
             return Ok(());
         };
+        // One its last turn kept and no end took (a store that refused it
+        // then, say) is taken before this one starts; a store refusing it
+        // still leaves the turn ready, as a refused start does.
+        self.take_configure(&bot).await?;
         let providers = self.providers.clone();
         match self
             .store
@@ -3544,6 +3666,10 @@ impl Service {
                 // Finishing still promotes queued work in that case.
                 self.ready_hint = true;
                 self.steer_wakes.remove(&turn);
+                // Before the bot's next turn can start: it starts on what
+                // a `configure` during this one kept. A store refusing it
+                // now leaves it for that start, which waits on it.
+                kept_for_start(self.take_configure(&bot).await)?;
                 return Ok(());
             }
             // A wake-up may already have claimed the turn again.
@@ -3566,6 +3692,392 @@ impl Service {
             self.wake_for_steer(bot, turn, steer);
         }
         Ok(())
+    }
+
+    /// Change what a bot's client chose for it (`configure`). While a turn
+    /// of it runs, the change, merged over one kept before, is checked as
+    /// the store would take it and kept for the turn's end, when
+    /// [`Service::take_configure`] takes it; a change of `rules` alone
+    /// reaches the running turn at once.
+    async fn configure(
+        &mut self,
+        bot: String,
+        bot_id: Option<i64>,
+        change: Configure,
+    ) -> Result<Value> {
+        // Said of this change alone, before one kept goes under it.
+        if change.effort.is_some() && change.model.is_none() {
+            return fail_with("invalid_effort", "effort goes with model");
+        }
+        let rules_only = change.rules_only();
+        // One kept before is older: this one goes over it, and both are
+        // checked as one.
+        let change = match !rules_only && self.kept.contains(&bot) {
+            true => {
+                let name = bot.clone();
+                let kept = self
+                    .store
+                    .read("kept_configure", move |db| {
+                        let id = db.identity(&name, bot_id)?;
+                        db.kept_configure(id)
+                    })
+                    .await?;
+                match kept {
+                    Some(kept) => change.over(serde_json::from_value(kept)?),
+                    None => change,
+                }
+            }
+            false => change,
+        };
+        let raw = serde_json::to_value(&change)?;
+        let Configure {
+            instructions,
+            model,
+            effort,
+            approve,
+            approver,
+            approve_expire_ms,
+            declare,
+            settings,
+            fallback,
+            compaction_instructions,
+            compaction_model,
+        } = change;
+        if effort.is_some() && model.is_none() {
+            return fail_with("invalid_effort", "effort goes with model");
+        }
+        let gate = match (&approve, &approver, approve_expire_ms) {
+            (None, None, None) => None,
+            (Some(tools), None, None) if tools.is_empty() => Some(None),
+            _ => Some(gate(
+                approve,
+                approver,
+                approve_expire_ms,
+                self.registry.tool_count() + MAX_DECLARED,
+            )?),
+        };
+        for (text, what) in [
+            (instructions.as_ref(), "instructions"),
+            (
+                compaction_instructions.as_ref().and_then(Option::as_ref),
+                "compaction_instructions",
+            ),
+        ] {
+            if text.is_some_and(|text| text.len() > 64 * 1024) {
+                return Err(Error::with(
+                    "instructions_limit",
+                    format!("{what} may be up to 65536 bytes"),
+                ));
+            }
+        }
+        if let Some(declare) = &declare {
+            validate_declared(declare)?;
+        }
+        // The command rules alone may change while a turn runs: its
+        // next round takes them, and a round already announced keeps
+        // the rules it was announced under.
+        // The settings named, `sandbox` taking the rest of the
+        // sandbox with it, over the bot's own.
+        let mut named = Vec::new();
+        let mut changes = settings.unwrap_or_default();
+        // Named before a null drops one, so a reset of a setting
+        // that isn't one is refused like any other.
+        if let Some(unknown) =
+            (changes.keys()).find(|key| !agent_runtime::store::SETTINGS.contains(&key.as_str()))
+        {
+            return fail_with("invalid_setting", format!("unknown setting `{unknown}`"));
+        }
+        if changes.contains_key("sandbox") {
+            for key in agent_runtime::store::SANDBOX {
+                changes.entry(key).or_insert(Value::Null);
+            }
+        }
+        named.extend(changes.keys().cloned());
+        let others = [compaction_model.as_ref(), fallback.as_ref()];
+        let record = match model.is_some()
+            || !named.is_empty()
+            || others.iter().any(|other| matches!(other, Some(Some(_))))
+        {
+            true => Some(
+                self.store
+                    .op("inspect", {
+                        let bot = bot.clone();
+                        move |db| db.inspect(&bot)
+                    })
+                    .await?,
+            ),
+            false => None,
+        };
+        // What its settings will be, checked as `create` checks them,
+        // on the provider it will be on.
+        let given = match &record {
+            Some(record) if !named.is_empty() => {
+                let Value::Object(mut merged) = serde_json::to_value(&record.settings)? else {
+                    unreachable!("settings are an object");
+                };
+                for (key, value) in changes {
+                    match value {
+                        Value::Null => merged.remove(&key),
+                        value => merged.insert(key, value),
+                    };
+                }
+                let mut merged: Settings = serde_json::from_value(Value::Object(merged))
+                    .map_err(|error| Error::with("invalid_setting", error.to_string()))?;
+                merged.validate()?;
+                // Checking for a sandbox and resolving folders touch
+                // the filesystem: off the runtime thread, and only
+                // when the sandbox changes, so a folder gone since
+                // fails no other setting.
+                let sandboxed = (agent_runtime::store::SANDBOX.iter())
+                    .any(|key| named.iter().any(|name| name == key));
+                if sandboxed {
+                    merged =
+                        tokio::task::spawn_blocking(move || confine(&mut merged).map(|()| merged))
+                            .await
+                            .map_err(|_| Error::new("sandbox_unavailable"))??;
+                }
+                Some(merged)
+            }
+            _ => None,
+        };
+        // Another model of the bot's family: its history is kept in
+        // that family's encoding. So must a summarizer or a fallback
+        // be, which are sent its items as they are.
+        let model = match &record {
+            Some(record) => {
+                let family = record.family()?;
+                let reference = model.as_deref();
+                let (provider, name) = match reference {
+                    Some(reference) => split_model(reference)?,
+                    None => (record.provider.as_str(), record.model.as_str()),
+                };
+                let served = self
+                    .providers
+                    .get(provider)
+                    .ok_or(Error::with("provider_unavailable", provider.to_owned()))?;
+                if served.family() != family {
+                    return fail_with(
+                        "provider_family_mismatch",
+                        reference.unwrap_or(provider).to_owned(),
+                    );
+                }
+                turn::shaped(served, given.as_ref().unwrap_or(&record.settings))?;
+                if let Some(level) = &effort {
+                    family.check_effort(level)?;
+                }
+                for reference in others.into_iter().flatten().flatten() {
+                    let (other, _) = split_model(reference)?;
+                    let known = self
+                        .providers
+                        .get(other)
+                        .ok_or(Error::with("provider_unavailable", other.to_owned()))?;
+                    if known.family() != family {
+                        return fail_with("provider_family_mismatch", reference.clone());
+                    }
+                }
+                reference.map(|_| (provider.to_owned(), name.to_owned()))
+            }
+            None => None,
+        };
+        // Rules given reach turns running now, its own (which only
+        // a change of rules alone may meet) and its kin's.
+        let given_rules = (named.iter().any(|key| key == "rules"))
+            .then_some(given.as_ref())
+            .flatten()
+            .map(|given| given.rules.clone().unwrap_or_default());
+        // Rules given with more while a turn runs reach it at once, as rules
+        // alone do, once the whole change is checked; the rest is kept.
+        let live = given_rules.as_ref().and(given.clone());
+        let mut rest = raw.clone();
+        if let Some(settings) = rest.get_mut("settings").and_then(Value::as_object_mut) {
+            settings.remove("rules");
+            if settings.is_empty()
+                && let Some(fields) = rest.as_object_mut()
+            {
+                fields.remove("settings");
+            }
+        }
+        let bot_name = bot.clone();
+        let answer = self
+            .store
+            // All of it or none: a write refused partway leaves the bot
+            // as it was, and what was kept still kept.
+            .op("configure", move |db| {
+                db.atomic(move |db| {
+                    let id = db.identity(&bot, bot_id)?;
+                    // While a turn runs, a parked one too, which reads the bot
+                    // again when it resumes, the change is kept for its end:
+                    // checked as the store would take it, then undone.
+                    let running = match rules_only {
+                        true => None,
+                        false => db.inspect(&bot)?.running_turn,
+                    };
+                    let write = move |db: &mut agent_runtime::store::Database| {
+                        let mut changed: Vec<String> = Vec::new();
+                        // First: the changes that may be refused here.
+                        if let Some(gate) = gate
+                            && db.set_gate(&bot_name, Some(id), gate, declare.as_deref())?
+                        {
+                            changed.push("gates".into());
+                        }
+                        let mut kin = Vec::new();
+                        if let Some(given) = &given {
+                            let (set, of_kin) =
+                                db.set_settings_of_kin(&bot_name, Some(id), &named, given)?;
+                            changed.extend(set);
+                            kin = of_kin;
+                        }
+                        if let Some((provider, name)) = &model
+                            && db.set_model(
+                                &bot_name,
+                                Some(id),
+                                provider,
+                                name,
+                                effort.as_deref(),
+                            )?
+                        {
+                            changed.push("model".into());
+                        }
+                        if let Some(instructions) = instructions
+                            && db.set_instructions(&bot_name, Some(id), &instructions)?
+                        {
+                            changed.push("instructions".into());
+                        }
+                        if let Some(declare) = &declare
+                            && db.set_declared(&bot_name, Some(id), declare)?
+                        {
+                            changed.push("declared".into());
+                        }
+                        if let Some(fallback) = &fallback
+                            && db.set_fallback(&bot_name, Some(id), fallback.as_deref())?
+                        {
+                            changed.push("fallback".into());
+                        }
+                        changed.extend(
+                            db.set_compaction(
+                                &bot_name,
+                                Some(id),
+                                compaction_instructions.as_ref().map(Option::as_deref),
+                                compaction_model.as_ref().map(Option::as_deref),
+                            )?
+                            .into_iter()
+                            .map(String::from),
+                        );
+                        Ok((changed, kin))
+                    };
+                    if let Some(turn) = running {
+                        db.trial(write)?;
+                        let (changed, kin) = match &live {
+                            Some(given) => db.set_settings_of_kin(
+                                &bot,
+                                Some(id),
+                                &["rules".to_owned()],
+                                given,
+                            )?,
+                            None => (Vec::new(), Vec::new()),
+                        };
+                        let mut kept = db.keep_configure(&bot, id, turn, &rest)?;
+                        kept["changed"] = json!(changed);
+                        return Ok((kept, kin));
+                    }
+                    let (changed, kin) = write(db)?;
+                    // What was kept is taken with it; a change of rules alone
+                    // lets go only of the older rules kept.
+                    db.taken_configure(id, rules_only)?;
+                    Ok((json!({"bot":bot,"bot_id":id,"changed":changed}), kin))
+                })
+            })
+            .await?;
+        let (answer, kin) = answer;
+        let name = answer["bot"].as_str().unwrap_or_default().to_owned();
+        match answer.get("configure_pending") {
+            Some(_) => self.kept.insert(name),
+            None if !rules_only => self.kept.remove(&name),
+            None => false,
+        };
+        // Followers read the bot again; nothing durable to replay.
+        if answer["changed"].as_array().is_some_and(|c| !c.is_empty()) {
+            let name = answer["bot"].as_str().unwrap_or_default();
+            // Its running turn and those of the bots it made, and
+            // theirs, which go by its rules, each at its next round:
+            // the walk the store made for them names them, so a
+            // change costs one look per such bot and no round pays.
+            if let Some(policy) = given_rules {
+                let rules = Arc::new(agent_runtime::rules::Rules::new(policy));
+                for running in std::iter::once(name)
+                    .chain(kin.iter().map(String::as_str))
+                    .filter_map(|bot| self.active.get(bot))
+                {
+                    *running
+                        .given_rules
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(rules.clone());
+                }
+            }
+            let mut event = answer.clone();
+            event["event"] = json!("configured");
+            event["durable"] = json!(false);
+            let bot = answer["bot"].as_str().unwrap_or_default().to_owned();
+            self.hub.live(&bot, event).await?;
+        }
+        Ok(answer)
+    }
+
+    /// Take the `configure` kept for `bot` once no turn of it runs, as
+    /// `configure` takes one; one still running keeps it. One that can no
+    /// longer be taken (its model gone from the config, say) is let go,
+    /// with a durable `configure_failed` saying why. A store that refuses
+    /// writes leaves it kept and answers `storage_error`: no turn of the
+    /// bot starts until it is taken.
+    async fn take_configure(&mut self, bot: &str) -> Result<()> {
+        if !self.kept.contains(bot) {
+            return Ok(());
+        }
+        // A turn still running keeps it, unchecked: what it would be
+        // checked against may yet change before the turn ends.
+        let name = bot.to_owned();
+        match (self.store)
+            .op("configure_running", move |db| {
+                Ok(db.inspect(&name)?.running_turn.is_some())
+            })
+            .await
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) if error.code == "bot_not_found" => {
+                self.kept.remove(bot);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+        match self
+            .configure(bot.to_owned(), None, Configure::default())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.code == "storage_error" => Err(error),
+            Err(error) if error.code == "bot_not_found" => {
+                self.kept.remove(bot);
+                Ok(())
+            }
+            Err(error) => {
+                self.kept.remove(bot);
+                let name = bot.to_owned();
+                match self
+                    .store
+                    .op("configure_failed", move |db| {
+                        db.configure_failed(&name, &error)
+                    })
+                    .await
+                {
+                    Err(error) if error.code == "storage_error" => {
+                        self.kept.insert(bot.to_owned());
+                        Err(error)
+                    }
+                    failed => failed,
+                }
+            }
+        }
     }
 
     /// Answer `read` from the observation lane, beside the run loop; the
@@ -3880,252 +4392,20 @@ impl Service {
                 compaction_instructions,
                 compaction_model,
             } => {
-                if effort.is_some() && model.is_none() {
-                    return fail_with("invalid_effort", "effort goes with model");
-                }
-                let gate = match (&approve, &approver, approve_expire_ms) {
-                    (None, None, None) => None,
-                    (Some(tools), None, None) if tools.is_empty() => Some(None),
-                    _ => Some(gate(
-                        approve,
-                        approver,
-                        approve_expire_ms,
-                        self.registry.tool_count() + MAX_DECLARED,
-                    )?),
+                let change = Configure {
+                    instructions,
+                    model,
+                    effort,
+                    approve,
+                    approver,
+                    approve_expire_ms,
+                    declare,
+                    settings,
+                    fallback,
+                    compaction_instructions,
+                    compaction_model,
                 };
-                for (text, what) in [
-                    (instructions.as_ref(), "instructions"),
-                    (
-                        compaction_instructions.as_ref().and_then(Option::as_ref),
-                        "compaction_instructions",
-                    ),
-                ] {
-                    if text.is_some_and(|text| text.len() > 64 * 1024) {
-                        return Err(Error::with(
-                            "instructions_limit",
-                            format!("{what} may be up to 65536 bytes"),
-                        ));
-                    }
-                }
-                if let Some(declare) = &declare {
-                    validate_declared(declare)?;
-                }
-                // The command rules alone may change while a turn runs: its
-                // next round takes them, and a round already announced keeps
-                // the rules it was announced under.
-                let rules_only = settings
-                    .as_ref()
-                    .is_some_and(|changes| changes.len() == 1 && changes.contains_key("rules"))
-                    && instructions.is_none()
-                    && model.is_none()
-                    && gate.is_none()
-                    && declare.is_none()
-                    && fallback.is_none()
-                    && compaction_instructions.is_none()
-                    && compaction_model.is_none();
-                if !rules_only && let Some(turn) = self.active.get(&bot).and_then(Active::running) {
-                    return Err(Error::with(
-                        "bot_busy",
-                        format!("turn {turn} of {bot} is running"),
-                    )
-                    .facts(json!({"running_turn":turn})));
-                }
-                // The settings named, `sandbox` taking the rest of the
-                // sandbox with it, over the bot's own.
-                let mut named = Vec::new();
-                let mut changes = settings.unwrap_or_default();
-                // Named before a null drops one, so a reset of a setting
-                // that isn't one is refused like any other.
-                if let Some(unknown) = (changes.keys())
-                    .find(|key| !agent_runtime::store::SETTINGS.contains(&key.as_str()))
-                {
-                    return fail_with("invalid_setting", format!("unknown setting `{unknown}`"));
-                }
-                if changes.contains_key("sandbox") {
-                    for key in agent_runtime::store::SANDBOX {
-                        changes.entry(key).or_insert(Value::Null);
-                    }
-                }
-                named.extend(changes.keys().cloned());
-                let others = [compaction_model.as_ref(), fallback.as_ref()];
-                let record = match model.is_some()
-                    || !named.is_empty()
-                    || others.iter().any(|other| matches!(other, Some(Some(_))))
-                {
-                    true => Some(
-                        store
-                            .op("inspect", {
-                                let bot = bot.clone();
-                                move |db| db.inspect(&bot)
-                            })
-                            .await?,
-                    ),
-                    false => None,
-                };
-                // What its settings will be, checked as `create` checks them,
-                // on the provider it will be on.
-                let given = match &record {
-                    Some(record) if !named.is_empty() => {
-                        let Value::Object(mut merged) = serde_json::to_value(&record.settings)?
-                        else {
-                            unreachable!("settings are an object");
-                        };
-                        for (key, value) in changes {
-                            match value {
-                                Value::Null => merged.remove(&key),
-                                value => merged.insert(key, value),
-                            };
-                        }
-                        let mut merged: Settings = serde_json::from_value(Value::Object(merged))
-                            .map_err(|error| Error::with("invalid_setting", error.to_string()))?;
-                        merged.validate()?;
-                        // Checking for a sandbox and resolving folders touch
-                        // the filesystem: off the runtime thread, and only
-                        // when the sandbox changes, so a folder gone since
-                        // fails no other setting.
-                        let sandboxed = (agent_runtime::store::SANDBOX.iter())
-                            .any(|key| named.iter().any(|name| name == key));
-                        if sandboxed {
-                            merged = tokio::task::spawn_blocking(move || {
-                                confine(&mut merged).map(|()| merged)
-                            })
-                            .await
-                            .map_err(|_| Error::new("sandbox_unavailable"))??;
-                        }
-                        Some(merged)
-                    }
-                    _ => None,
-                };
-                // Another model of the bot's family: its history is kept in
-                // that family's encoding. So must a summarizer or a fallback
-                // be, which are sent its items as they are.
-                let model = match &record {
-                    Some(record) => {
-                        let family = record.family()?;
-                        let reference = model.as_deref();
-                        let (provider, name) = match reference {
-                            Some(reference) => split_model(reference)?,
-                            None => (record.provider.as_str(), record.model.as_str()),
-                        };
-                        let served = self
-                            .providers
-                            .get(provider)
-                            .ok_or(Error::with("provider_unavailable", provider.to_owned()))?;
-                        if served.family() != family {
-                            return fail_with(
-                                "provider_family_mismatch",
-                                reference.unwrap_or(provider).to_owned(),
-                            );
-                        }
-                        turn::shaped(served, given.as_ref().unwrap_or(&record.settings))?;
-                        if let Some(level) = &effort {
-                            family.check_effort(level)?;
-                        }
-                        for reference in others.into_iter().flatten().flatten() {
-                            let (other, _) = split_model(reference)?;
-                            let known = self
-                                .providers
-                                .get(other)
-                                .ok_or(Error::with("provider_unavailable", other.to_owned()))?;
-                            if known.family() != family {
-                                return fail_with("provider_family_mismatch", reference.clone());
-                            }
-                        }
-                        reference.map(|_| (provider.to_owned(), name.to_owned()))
-                    }
-                    None => None,
-                };
-                // Rules given reach turns running now, its own (which only
-                // a change of rules alone may meet) and its kin's.
-                let given_rules = (named.iter().any(|key| key == "rules"))
-                    .then_some(given.as_ref())
-                    .flatten()
-                    .map(|given| given.rules.clone().unwrap_or_default());
-                let answer = store
-                    .op("configure", move |db| {
-                        let id = db.identity(&bot, bot_id)?;
-                        // A parked turn reads the bot again when it resumes.
-                        if !rules_only && let Some(turn) = db.inspect(&bot)?.running_turn {
-                            return Err(Error::with(
-                                "bot_busy",
-                                format!("turn {turn} of {bot} is running"),
-                            )
-                            .facts(json!({"running_turn":turn})));
-                        }
-                        let mut changed: Vec<String> = Vec::new();
-                        // First: the changes that may be refused here.
-                        if let Some(gate) = gate
-                            && db.set_gate(&bot, Some(id), gate, declare.as_deref())?
-                        {
-                            changed.push("gates".into());
-                        }
-                        let mut kin = Vec::new();
-                        if let Some(given) = &given {
-                            let (set, of_kin) =
-                                db.set_settings_of_kin(&bot, Some(id), &named, given)?;
-                            changed.extend(set);
-                            kin = of_kin;
-                        }
-                        if let Some((provider, name)) = &model
-                            && db.set_model(&bot, Some(id), provider, name, effort.as_deref())?
-                        {
-                            changed.push("model".into());
-                        }
-                        if let Some(instructions) = instructions
-                            && db.set_instructions(&bot, Some(id), &instructions)?
-                        {
-                            changed.push("instructions".into());
-                        }
-                        if let Some(declare) = &declare
-                            && db.set_declared(&bot, Some(id), declare)?
-                        {
-                            changed.push("declared".into());
-                        }
-                        if let Some(fallback) = &fallback
-                            && db.set_fallback(&bot, Some(id), fallback.as_deref())?
-                        {
-                            changed.push("fallback".into());
-                        }
-                        changed.extend(
-                            db.set_compaction(
-                                &bot,
-                                Some(id),
-                                compaction_instructions.as_ref().map(Option::as_deref),
-                                compaction_model.as_ref().map(Option::as_deref),
-                            )?
-                            .into_iter()
-                            .map(String::from),
-                        );
-                        Ok((json!({"bot":bot,"bot_id":id,"changed":changed}), kin))
-                    })
-                    .await?;
-                let (answer, kin) = answer;
-                // Followers read the bot again; nothing durable to replay.
-                if answer["changed"].as_array().is_some_and(|c| !c.is_empty()) {
-                    let name = answer["bot"].as_str().unwrap_or_default();
-                    // Its running turn and those of the bots it made, and
-                    // theirs, which go by its rules, each at its next round:
-                    // the walk the store made for them names them, so a
-                    // change costs one look per such bot and no round pays.
-                    if let Some(policy) = given_rules {
-                        let rules = Arc::new(agent_runtime::rules::Rules::new(policy));
-                        for running in std::iter::once(name)
-                            .chain(kin.iter().map(String::as_str))
-                            .filter_map(|bot| self.active.get(bot))
-                        {
-                            *running
-                                .given_rules
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner()) = Some(rules.clone());
-                        }
-                    }
-                    let mut event = answer.clone();
-                    event["event"] = json!("configured");
-                    event["durable"] = json!(false);
-                    let bot = answer["bot"].as_str().unwrap_or_default().to_owned();
-                    self.hub.live(&bot, event).await?;
-                }
-                Ok(answer)
+                self.configure(bot, bot_id, change).await
             }
             Command::Compact { bot, bot_id } => {
                 let name = bot.clone();
@@ -5283,6 +5563,10 @@ impl Service {
                 // A slot is promised before the commit that may take it, so
                 // admissions queued together cannot start more turns than
                 // the limit allows.
+                // A `configure` kept for a turn that has ended, its task not
+                // yet reaped, is taken before this turn can start; one still
+                // running keeps it.
+                self.take_configure(&bot).await?;
                 let capacity = self.has_capacity();
                 let reserved = capacity && self.limit_active != 0;
                 self.reserved += usize::from(reserved);
@@ -5296,7 +5580,8 @@ impl Service {
                     .map(|active| active.steers.clone());
                 let (b, r) = (bot.clone(), request_id.clone());
                 let providers = self.providers.clone();
-                let queued = store
+                let queued = self
+                    .store
                     .queue("begin", move |db| {
                         let identity = db.identity(&b, bot_id)?;
                         let started =
@@ -5423,6 +5708,9 @@ impl Service {
                 self.wakes.cancel(turn);
                 self.steer_wakes.remove(&turn);
                 self.ready_hint = true;
+                // It ended here, with no task to finish: what a `configure`
+                // kept for its end is taken now.
+                kept_for_start(self.take_configure(&bot).await)?;
                 view(&reader, bot, true).await
             }
             Command::Shutdown { grace_ms } => {
@@ -5432,6 +5720,15 @@ impl Service {
                 Ok(json!({"shutting_down":true}))
             }
         }
+    }
+}
+
+/// A kept `configure` the store refused to take stays kept: the bot's next
+/// turn start takes it first, and waits while the store refuses.
+fn kept_for_start(taken: Result<()>) -> Result<()> {
+    match taken {
+        Err(error) if error.code == "storage_error" => Ok(()),
+        taken => taken,
     }
 }
 
@@ -5807,6 +6104,35 @@ fn agent_bin() -> std::io::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_configure_kept_goes_under_a_later_one_as_one_after_the_other_would() {
+        let change = |value: Value| -> Configure { serde_json::from_value(value).unwrap() };
+        let older = change(json!({
+            "instructions": "old", "model": "openai/a", "effort": "high",
+            "approve": ["shell"], "approver": "manual", "approve_expire_ms": 5,
+            "settings": {"cache_ttl": "1h", "writable": ["/w"], "speed": "fast"},
+            "fallback": "openai/f",
+        }));
+        let newer = change(json!({
+            "model": "openai/b", "approve": [],
+            "settings": {"sandbox": "read-only", "speed": null},
+            "compaction_model": null,
+        }));
+        assert!(!newer.rules_only());
+        assert_eq!(
+            serde_json::to_value(newer.over(older)).unwrap(),
+            json!({
+                // A model takes its effort, absent here, and a gate its
+                // approver and expiry; the sandbox the rest of it.
+                "instructions": "old", "model": "openai/b", "approve": [],
+                "settings": {"cache_ttl": "1h", "sandbox": "read-only", "speed": null},
+                "fallback": "openai/f", "compaction_model": null,
+            })
+        );
+        assert!(change(json!({"settings": {"rules": {}}})).rules_only());
+        assert!(!change(json!({"settings": {"rules": {}, "speed": null}})).rules_only());
+    }
+
     #[test]
     fn provider_listings_always_fit_one_reply() {
         let model = json!({"id": "m".repeat(100)});
@@ -6184,6 +6510,7 @@ mod tests {
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,
+            kept: std::collections::HashSet::new(),
         };
         let output = Output::writer(tokio::io::sink());
         let delete = || Command::Delete {
@@ -6399,6 +6726,7 @@ mod tests {
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,
+            kept: std::collections::HashSet::new(),
         };
         service.jobs.spawn(async move {
             drop(cancelled);
@@ -6420,6 +6748,19 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(stale.code, "turn_not_found");
+        // A change while it waits parked is kept for its end.
+        let kept = service
+            .configure(
+                "Bob".into(),
+                None,
+                Configure {
+                    instructions: Some("new".into()),
+                    ..Configure::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(kept["configure_pending"], json!({"instructions": "new"}));
         let reply = service
             .dispatch(
                 Command::Interrupt {
@@ -6445,6 +6786,11 @@ mod tests {
                 let state = db.inspect("Bob")?;
                 assert_eq!(state.status, "interrupted");
                 assert_eq!(state.running_turn, None);
+                // Its end, here and with no task to finish, took the change.
+                assert_eq!(
+                    (state.instructions.as_str(), &state.configure_pending),
+                    ("new", &None)
+                );
                 let events = db.events("Bob", 0, 256)?;
                 let events = events["events"].as_array().unwrap();
                 assert_eq!(
@@ -6691,6 +7037,7 @@ mod tests {
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,
+            kept: std::collections::HashSet::new(),
         };
         let duplicate = request(&mut service, submit("Bob", "same"), &output)
             .await
@@ -6934,6 +7281,7 @@ mod tests {
             reserved: 0,
             storage_backoff: Duration::ZERO,
             ready_retry_at: None,
+            kept: std::collections::HashSet::new(),
         }
     }
     /// Refuse Bob's completion the way a full disk refuses a commit: the
@@ -6964,6 +7312,197 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_kept_configure_the_store_refuses_holds_the_next_turn_until_taken() {
+        let dir = std::env::temp_dir().join(format!("agent-kept-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let first = running(&store, &["Bob".into()]).await[0].1;
+        let mut service = bare_service(&store);
+        let kept = service
+            .configure(
+                "Bob".into(),
+                None,
+                Configure {
+                    instructions: Some("new".into()),
+                    ..Configure::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(kept["configure_pending"], json!({"instructions": "new"}));
+        // Its turn ends, and the next is in line, while the store refuses
+        // to take what was kept.
+        let next = store
+            .op("finish", move |db| {
+                turn::Finished::record(db, "Bob", first, None)?;
+                Ok(db
+                    .begin(
+                        "Bob",
+                        "second",
+                        "more",
+                        false,
+                        &TurnOptions {
+                            delivery: agent_runtime::store::Delivery::Queue,
+                            ..TurnOptions::default()
+                        },
+                        |_, _| Ok(()),
+                    )?
+                    .turn)
+            })
+            .await
+            .unwrap();
+        let status = |store: Store| async move {
+            store
+                .op("status", move |db| {
+                    let bob = db.inspect("Bob")?;
+                    Ok((
+                        db.turn_status("Bob", next)?,
+                        bob.instructions,
+                        bob.configure_pending,
+                    ))
+                })
+                .await
+        };
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_take BEFORE UPDATE OF configure_pending ON bots
+                 BEGIN SELECT RAISE(ABORT,'refused'); END;",
+            )
+            .unwrap();
+        let refused = service.start_ready().await.unwrap_err();
+        assert_eq!(refused.code, "storage_error");
+        // The next turn did not start on the old instructions: it waits.
+        let (waits, instructions, pending) = status(store.clone()).await.unwrap();
+        assert_eq!(waits, "ready");
+        assert_eq!((instructions.as_str(), pending.is_some()), ("", true));
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_take;")
+            .unwrap();
+        let _ = service.start_ready().await;
+        let (_, instructions, pending) = status(store.clone()).await.unwrap();
+        assert_eq!((instructions.as_str(), pending), ("new", None));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_start_admitted_before_a_kept_configure_is_taken_waits_for_it() {
+        let dir = std::env::temp_dir().join(format!("agent-kept-raced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let first = running(&store, &["Bob".into()]).await[0].1;
+        let mut service = admitting(&store, 4);
+        let change = Configure {
+            instructions: Some("new".into()),
+            ..Configure::default()
+        };
+        service.configure("Bob".into(), None, change).await.unwrap();
+        // The submission's look found the turn running; its end commits
+        // before the submission's own commit, which has room to start it.
+        let (next, admitted, instructions) = store
+            .op("finish", move |db| {
+                turn::Finished::record(db, "Bob", first, None)?;
+                let started = db.begin(
+                    "Bob",
+                    "second",
+                    "more",
+                    true,
+                    &TurnOptions::default(),
+                    |_, _| Ok(()),
+                )?;
+                Ok((
+                    started.turn,
+                    started.status,
+                    db.inspect("Bob")?.instructions,
+                ))
+            })
+            .await
+            .unwrap();
+        // It does not start on the old instructions: it waits for the
+        // start that takes the change first.
+        assert_eq!((admitted, instructions.as_str()), ("ready", ""));
+        service.start_ready().await.unwrap();
+        let (status, bob) = store
+            .op("status", move |db| {
+                Ok((db.turn_status("Bob", next)?, db.inspect("Bob")?))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                status.as_str(),
+                bob.instructions.as_str(),
+                bob.configure_pending
+            ),
+            ("running", "new", None)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_change_kept_while_its_turn_runs_is_not_checked_until_it_ends() {
+        let dir = std::env::temp_dir().join(format!("agent-kept-unchecked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        running(&store, &["Bob".into()]).await;
+        let mut service = admitting(&store, 4);
+        let change = Configure {
+            model: Some("openai/other".into()),
+            instructions: Some("new".into()),
+            ..Configure::default()
+        };
+        service.configure("Bob".into(), None, change).await.unwrap();
+        // What it was checked against goes while the turn runs (its
+        // provider, here), and a message comes meanwhile: the change stays
+        // kept for the turn's end, which checks it again.
+        service.providers = Arc::new(HashMap::new());
+        service.take_configure("Bob").await.unwrap();
+        let bob = store.op("inspect", |db| db.inspect("Bob")).await.unwrap();
+        assert_eq!(
+            bob.configure_pending,
+            Some(json!({"model": "openai/other", "instructions": "new"}))
+        );
+        assert!(service.kept.contains("Bob"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_turn_admitted_before_the_last_end_is_reaped_starts_on_what_was_kept() {
+        let dir = std::env::temp_dir().join(format!("agent-kept-admitted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let first = running(&store, &["Bob".into()]).await[0].1;
+        let mut service = admitting(&store, 4);
+        let change = Configure {
+            instructions: Some("new".into()),
+            ..Configure::default()
+        };
+        service.configure("Bob".into(), None, change).await.unwrap();
+        // Its end commits; the loop has not reaped its task yet when the
+        // next message comes, with room to start it at once.
+        store
+            .op("finish", move |db| {
+                turn::Finished::record(db, "Bob", first, None)
+            })
+            .await
+            .unwrap();
+        let output = Output::writer(tokio::io::sink());
+        let admitted = request(&mut service, submit("Bob", "second"), &output)
+            .await
+            .unwrap();
+        assert_eq!(admitted["status"], "running", "{admitted}");
+        // It started on the change, taken first.
+        let bob = store.op("inspect", |db| db.inspect("Bob")).await.unwrap();
+        assert_eq!(
+            (bob.instructions.as_str(), bob.configure_pending),
+            ("new", None)
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

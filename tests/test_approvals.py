@@ -458,13 +458,18 @@ class ApprovalTests(ModelFixture):
             {'pattern': ['mkdir'], 'decision': 'forbidden', 'source': 'default.rules:2'}]}
         self.assertEqual(client.request('configure', bot='Bob', settings={'rules': given})['result']['changed'],
                          ['rules'])
-        # Nothing else about the bot changes while it works.
-        busy = client.request('configure', bot='Bob', settings={'rules': rules, 'approval_hold_ms': 5000})
-        self.assertEqual(busy['error'], 'bot_busy', busy)
+        # Anything else about the bot is kept for the turn's end; rules given
+        # with it reach the turn at once, as rules alone do.
+        kept = client.request('configure', bot='Bob', settings={'rules': given, 'approval_hold_ms': 5000})
+        self.assertEqual((kept['result']['configure_pending'], kept['result']['changed']),
+                         ({'settings': {'approval_hold_ms': 5000}}, []), kept)
         self.answer(client, turn, 'script-0')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'script-1')[1]['error'], 'command_forbidden')
         self.assertFalse((self.path / 'made').exists())
+        bob = client.request('inspect', bot='Bob')['result']
+        self.assertEqual((bob['settings']['rules'], bob['settings']['approval_hold_ms']), (given, 5000))
+        self.assertNotIn('configure_pending', bob)
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
     def test_rules_given_reach_the_running_turns_of_the_bots_it_made_and_theirs(self):

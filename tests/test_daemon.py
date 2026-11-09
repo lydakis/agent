@@ -308,6 +308,62 @@ class DaemonTests(ModelFixture):
         self.assertEqual(client.request('configure', bot='Bob', approve=[])['result']['changed'], ['gates'])
         self.assertEqual(client.request('inspect', bot='Bob')['result']['gates'], [])
 
+    def test_configure_while_a_turn_runs_is_kept_and_taken_when_it_ends(self):
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = self.model.release_headers
+        self.addCleanup(self.model.release_headers.set)
+        client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
+        self.addCleanup(client.close)
+        client.request('create', bot='Ann', workspace=str(self.path), tools=['echo'])
+        ann_id = client.request('inspect', bot='Ann')['result']['bot_id']
+        watcher = Connection(client.socket_path)
+        self.addCleanup(watcher.close)
+        watcher.request('follow', bot='Ann', after=0)
+        watcher.receive(lambda e: e.get('event') == 'follow_live')
+        first = client.request('submit', bot='Ann', request_id='one', prompt='gate')['result']['turn']
+        self.model.requests.get(timeout=3)
+        # Accepted while the turn runs: kept, said, and nothing changes yet.
+        kept = client.request('configure', bot='Ann', instructions='new', model='openai/other',
+                              settings={'cache_ttl': '1h'})
+        self.assertEqual(kept['result'], {
+            'bot': 'Ann', 'bot_id': ann_id, 'running_turn': first, 'changed': [],
+            'configure_pending': {'instructions': 'new', 'model': 'openai/other',
+                                  'settings': {'cache_ttl': '1h'}}}, kept)
+        # A later one merges over it: newer fields win, settings by name,
+        # and a model without an effort drops the effort an older one gave.
+        later = client.request('configure', bot='Ann', model='openai/synthetic-model', effort='high',
+                               settings={'speed': None})['result']
+        self.assertEqual(later['configure_pending'], {
+            'instructions': 'new', 'model': 'openai/synthetic-model', 'effort': 'high',
+            'settings': {'cache_ttl': '1h', 'speed': None}})
+        told = watcher.receive(lambda e: e.get('event') == 'configure_pending')
+        # Kept, it is said durably, so a client that attaches later reads it.
+        self.assertIn('cursor', told)
+        self.assertEqual(told['data'], {'bot_id': ann_id, 'running_turn': first,
+                                        'configure_pending': kept['result']['configure_pending']})
+        ann = client.request('inspect', bot='Ann')['result']
+        self.assertEqual((ann['instructions'], ann['configure_pending']), ('Test agent.', later['configure_pending']))
+        # Invalid input is refused at once, not kept.
+        self.assertEqual(client.request('configure', bot='Ann', effort='low')['error'], 'invalid_effort')
+        # Rules that would reach the turn at once go with the rest: refused
+        # with it, they reach nothing.
+        rules = {'prefix_rules': [{'pattern': ['mkdir'], 'decision': 'forbidden', 'source': 'test.rules:1'}]}
+        refused = client.request('configure', bot='Ann', model='nowhere/model', settings={'rules': rules})
+        self.assertEqual(refused['error'], 'provider_unavailable', refused)
+        ann = client.request('inspect', bot='Ann')['result']
+        self.assertEqual((ann['settings'].get('rules'), ann['configure_pending']), (None, later['configure_pending']))
+        queued = client.request('submit', bot='Ann', request_id='two', prompt='again',
+                                delivery='queue')['result']['turn']
+        self.model.release_headers.set()
+        client.finished(first)
+        # The turn queued behind it starts on what was kept.
+        client.finished(queued)
+        ann = client.request('inspect', bot='Ann')['result']
+        self.assertEqual((ann['instructions'], ann['effort'], ann['settings']['cache_ttl']), ('new', 'high', '1h'))
+        self.assertNotIn('configure_pending', ann)
+        sent = [self.model.requests.get(timeout=3) for _ in range(self.model.requests.qsize())]
+        self.assertEqual(sent[-1]['instructions'], 'new')
+
     def test_admissions_sent_together_answer_in_order_and_start_once(self):
         client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
         self.addCleanup(client.close)
