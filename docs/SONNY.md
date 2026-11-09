@@ -1108,7 +1108,8 @@ The host's agents see each linked machine by name:
   keychain, so the sign-ins copied can be read and a company's device check
   finds its certificates; agent-browser starts a profile folder with a
   stand-in keychain. It runs headless unless agent-browser's settings say
-  `headed`, and closes 30 minutes after the link's agents last used it. Paths there don't belong to the agent: a screenshot with no
+  `headed`, through the proxy agent-browser would give it (one that signs
+  in with a password is refused), and closes 30 minutes after the link's agents last used it. Paths there don't belong to the agent: a screenshot with no
   path comes back as a picture, and other files are refused.
 - `desktop` takes `machine` while that machine's agents could use its
   desktop (agent-desktop is installed there and it shows a desktop). The

@@ -1459,7 +1459,7 @@ async fn find_link_browser(key: &str, profile: &str) -> Result<String, String> {
         Kept::Ready(dir) => dir,
         // Copied again only with its Chrome closed.
         Kept::Stale(dir) => {
-            stop_chrome(&dir).await;
+            stop_chrome(&dir).await?;
             let (key_, profile_) = (key.to_owned(), profile.to_owned());
             let copied = tokio::task::spawn_blocking(move || {
                 kept_profile(&key_, &profile_, chrome_data().as_deref())
@@ -1474,7 +1474,8 @@ async fn find_link_browser(key: &str, profile: &str) -> Result<String, String> {
     };
     // A profile it no longer names: its Chrome closed.
     if let Some(old) = chrome.dir.take().filter(|old| *old != dir) {
-        stop_chrome(&old).await;
+        // Left as it is if it will not close: its folder is not touched.
+        let _ = stop_chrome(&old).await;
     }
     let url = match chrome_at(&dir).await {
         Some(url) => url,
@@ -1498,7 +1499,7 @@ async fn close_when_idle(held: Arc<tokio::sync::Mutex<LinkChrome>>) {
         let left = LINK_IDLE.saturating_sub(idle);
         if left.is_zero() {
             if let Some(dir) = chrome.dir.take() {
-                stop_chrome(&dir).await;
+                let _ = stop_chrome(&dir).await;
             }
             chrome.watched = false;
             return;
@@ -1559,6 +1560,14 @@ async fn start_chrome(dir: &Path) -> Result<String, String> {
             "--no-first-run",
             "--no-default-browser-check",
         ]);
+    // The proxy agent-browser would start it with.
+    let (proxy, bypass) = proxy();
+    if let Some(proxy) = proxy {
+        command.arg(format!("--proxy-server={}", proxy_server(&proxy)?));
+    }
+    if let Some(bypass) = bypass {
+        command.arg(format!("--proxy-bypass-list={bypass}"));
+    }
     // Headless unless agent-browser's own settings say otherwise.
     if !headed() {
         command.arg("--headless=new");
@@ -1604,34 +1613,107 @@ async fn start_chrome(dir: &Path) -> Result<String, String> {
     }
 }
 
-/// Closes the Chrome running on the profile folder `dir`, if one answers
-/// there, by the process its `SingletonLock` names, and waits for the
-/// folder to be free.
-async fn stop_chrome(dir: &Path) {
-    if chrome_at(dir).await.is_none() {
-        return;
-    }
+/// Closes the Chrome running on the profile folder `dir`, if one runs,
+/// and waits until it has: the process its `SingletonLock` names, while it
+/// answers there as that profile's Chrome. One that holds the folder but
+/// does not answer is not closed, as its process may be another's by now,
+/// and the folder is said to be in use, so nothing replaces it under a
+/// Chrome still running.
+async fn stop_chrome(dir: &Path) -> Result<(), String> {
     let lock = dir.join("SingletonLock");
-    let Some(pid) = std::fs::read_link(&lock)
-        .ok()
-        .and_then(|to| lock_pid(&to.to_string_lossy()))
-    else {
-        return;
+    let held = || {
+        std::fs::read_link(&lock)
+            .ok()
+            .and_then(|to| lock_pid(&to.to_string_lossy()))
+            .filter(|pid| running(*pid))
     };
+    let Some(pid) = held() else {
+        return Ok(());
+    };
+    let in_use = || format!("a Chrome (process {pid}) still has {} open", dir.display());
+    if chrome_at(dir).await.is_none() {
+        return Err(in_use());
+    }
     // SAFETY: kill takes a number and a signal and touches no memory here.
     unsafe { libc::kill(pid, libc::SIGTERM) };
     for _ in 0..100 {
-        if std::fs::symlink_metadata(&lock).is_err() {
-            return;
+        if held().is_none() {
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    Err(in_use())
+}
+
+/// Whether the process `pid` runs.
+fn running(pid: i32) -> bool {
+    // SAFETY: signal 0 only asks whether the process exists.
+    let said = unsafe { libc::kill(pid, 0) };
+    said == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// The process a `SingletonLock` names: `HOST-PID`.
 fn lock_pid(to: &str) -> Option<i32> {
     let pid = to.rsplit_once('-')?.1.parse::<i32>().ok()?;
     (pid > 1).then_some(pid)
+}
+
+/// The proxy and the hosts that bypass it, as agent-browser takes them for
+/// the Chrome it starts: its own variable, its settings, then the usual
+/// variables.
+fn proxy() -> (Option<String>, Option<String>) {
+    let settings = settings_file()
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_default();
+    let first = |own: &str, key: &str, usual: &[&str]| {
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        var(own)
+            .or_else(|| settings[key].as_str().map(str::to_owned))
+            .or_else(|| usual.iter().find_map(|name| var(name)))
+    };
+    (
+        first(
+            "AGENT_BROWSER_PROXY",
+            "proxy",
+            &[
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ],
+        ),
+        first(
+            "AGENT_BROWSER_PROXY_BYPASS",
+            "proxyBypass",
+            &["NO_PROXY", "no_proxy"],
+        ),
+    )
+}
+
+/// `proxy` as Chrome's `--proxy-server` takes it, as agent-browser passes
+/// it; one with a user and password is refused, since agent-browser
+/// answers its sign-in only in a browser it starts itself.
+fn proxy_server(proxy: &str) -> Result<String, String> {
+    let host = proxy.split_once("://").map_or(proxy, |(_, rest)| rest);
+    if host
+        .split('/')
+        .next()
+        .is_some_and(|host| host.contains('@'))
+    {
+        return Err(
+            "the link's browser cannot use a proxy that signs in with a user and password; \
+             set one without, or `browser_profile = \"\"` for a fresh browser each"
+                .into(),
+        );
+    }
+    let trimmed = proxy.trim_end_matches('/');
+    Ok(match trimmed.is_empty() || proxy.ends_with("://") {
+        true => proxy.to_owned(),
+        false => trimmed.to_owned(),
+    })
 }
 
 /// Whether agent-browser's settings say to show the browser.
@@ -2194,6 +2276,16 @@ mod tests {
         assert_eq!(active_port("36099\n/devtools/browser/x?y\n"), None);
         assert_eq!(active_port("0\n/devtools/browser/x\n"), None);
         assert_eq!(active_port("not a port"), None);
+        // A proxy as agent-browser passes it; one that signs in, refused.
+        assert_eq!(
+            proxy_server("http://proxy:8080/").as_deref(),
+            Ok("http://proxy:8080")
+        );
+        assert!(proxy_server("http://me:secret@proxy:8080").is_err());
+        assert_eq!(
+            proxy_server("socks5://proxy:1080").as_deref(),
+            Ok("socks5://proxy:1080")
+        );
         // The process its lock names, and no other.
         assert_eq!(lock_pid("my-mac.local-4242"), Some(4242));
         assert_eq!(lock_pid("box-1"), None);
