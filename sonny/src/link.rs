@@ -116,6 +116,8 @@ fn replace(path: &Path, text: &str) -> std::io::Result<()> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Machine {
     pub name: String,
+    /// What it calls itself whatever its name, when it says.
+    pub id: Option<String>,
     /// Whether its browser runs commands sent here.
     pub browser: bool,
     /// Whether that browser starts signed in as the person is there.
@@ -149,6 +151,7 @@ impl Machine {
             .collect();
         Machine {
             name: name.to_owned(),
+            id: said["id"].as_str().map(str::to_owned),
             browser: said["browser"] == true,
             signed_in: said["signed_in"] == true,
             desktop: said["desktop"] == true,
@@ -161,9 +164,11 @@ impl Machine {
 /// The machines linked here, by name: each stays, with what it lends, while
 /// it is away, so its agents' tools stay as they are.
 pub fn machines() -> Vec<Machine> {
-    let Some(dir) = here() else {
-        return Vec::new();
-    };
+    here().map_or_else(Vec::new, |dir| machines_in(&dir))
+}
+
+/// [`machines`], kept in `dir`.
+fn machines_in(dir: &Path) -> Vec<Machine> {
     let mut machines: Vec<Machine> = (std::fs::read_dir(dir).into_iter().flatten().flatten())
         .filter_map(|entry| {
             let name = entry
@@ -510,6 +515,39 @@ fn nonce() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// This machine, to the hosts it links to, whatever name it goes by
+/// there: 32 hex digits made once and kept beside its links, so a host
+/// knows a new name for it is a rename, not another machine. Read each
+/// time, so every tool host of this home says what the file says.
+fn this_id() -> Option<String> {
+    let dir = mine()?;
+    private(&dir).ok()?;
+    id_in(&dir.join("id"))
+}
+
+/// The id kept in `file`, made there if there is none yet.
+fn id_in(file: &Path) -> Option<String> {
+    let read = || {
+        let text = std::fs::read_to_string(file).ok()?;
+        let id = text.trim();
+        (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_owned())
+    };
+    if let Some(id) = read() {
+        return Some(id);
+    }
+    // Made once: written aside and linked into place, which leaves one
+    // there alone, so of two tool hosts making one at once the first wins
+    // and both read it. One that is not an id, as a file cut short, is
+    // replaced whole; any host that made another then reads this one.
+    let partial = file.with_extension(format!("{}.partial", std::process::id()));
+    std::fs::write(&partial, nonce()).ok()?;
+    if std::fs::hard_link(&partial, file).is_err() && read().is_none() {
+        let _ = std::fs::rename(&partial, file);
+    }
+    let _ = std::fs::remove_file(&partial);
+    read()
+}
+
 /// A call's end as the link carries it.
 fn done(answer: Result<Value, Failed>) -> Value {
     match answer {
@@ -830,6 +868,9 @@ async fn serve(machine: String) -> Result<(), String> {
                         if std::fs::read_to_string(&file).ok().as_deref() != Some(lent.as_str()) {
                             let _ = replace(&file, &lent);
                         }
+                        if let Some(id) = hello["lends"]["id"].as_str() {
+                            renamed(&dir, &machine, id);
+                        }
                     }
                     *ready.lock().unwrap() = Some(matched);
                     continue;
@@ -872,6 +913,21 @@ async fn serve(machine: String) -> Result<(), String> {
         let _ = std::fs::remove_file(&path);
     }
     Ok(())
+}
+
+/// `machine`, whose id is `id`, known here by another name before: that
+/// name forgotten, and a session still serving it ended, so a machine
+/// renamed in its config is listed once, by its new name.
+fn renamed(dir: &Path, machine: &str, id: &str) {
+    for other in machines_in(dir) {
+        if other.name == machine || other.id.as_deref() != Some(id) {
+            continue;
+        }
+        // Its session sees its socket gone and ends.
+        for suffix in ["json", "seen", "sock"] {
+            let _ = std::fs::remove_file(dir.join(format!("{}.{suffix}", other.name)));
+        }
+    }
 }
 
 /// The session, as a connection to it sees it.
@@ -1431,6 +1487,7 @@ async fn lends(link: &agent_client::config::Link, hub: &crate::mcp::Hub, calls: 
         );
     }
     json!({
+        "id": this_id(),
         "browser": crate::setup::on_path("agent-browser"),
         "signed_in": !link.browser_profile.is_empty(),
         "calls": calls,
@@ -1759,10 +1816,18 @@ fn list() {
             (_, Some(error)) => format!("not connected: {error}"),
             _ => "not connected yet".to_owned(),
         };
+        // As the link in use names it, which a config just changed, or a
+        // tool host that has not read it, may not yet.
+        let named = machine_of(link);
+        let name = match said["machine"].as_str() {
+            Some(live) if live != named => {
+                format!("{live} (the config says {named}, not yet in use)")
+            }
+            _ => named,
+        };
         println!(
-            "{key}  this machine, linked to {} as {} · {how}",
-            link.host,
-            machine_of(link)
+            "{key}  this machine, linked to {} as {name} · {how}",
+            link.host
         );
     }
     for machine in machines() {
@@ -1806,6 +1871,51 @@ mod tests {
         assert_eq!(name_of("me@devbox.example.com"), "devbox");
         assert_eq!(name_of("me@10.0.0.2"), "10");
         assert_eq!(name_of("we_ird!"), "we_ird-");
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sonny-link-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_machine_s_id_is_made_once_and_kept() {
+        let dir = scratch("id");
+        let file = dir.join("id");
+        let id = id_in(&file).unwrap();
+        assert_eq!(id.len(), 32);
+        assert_eq!(id_in(&file).unwrap(), id);
+        // One cut short is made again.
+        std::fs::write(&file, "abc").unwrap();
+        let again = id_in(&file).unwrap();
+        assert_ne!(again, id);
+        assert_eq!(id_in(&file).unwrap(), again);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no partial left"
+        );
+    }
+
+    #[test]
+    fn a_machine_renamed_is_listed_once_by_its_new_name() {
+        let dir = scratch("renamed");
+        let lends = |id: &str| json!({"id": id, "browser": true}).to_string();
+        std::fs::write(dir.join("laptop.json"), lends("aa")).unwrap();
+        std::fs::write(dir.join("laptop.seen"), "1").unwrap();
+        std::fs::write(dir.join("laptop.sock"), "").unwrap();
+        std::fs::write(dir.join("other.json"), lends("bb")).unwrap();
+        std::fs::write(dir.join("old.json"), json!({"browser": true}).to_string()).unwrap();
+        std::fs::write(dir.join("mac.json"), lends("aa")).unwrap();
+        renamed(&dir, "mac", "aa");
+        let names: Vec<String> = machines_in(&dir).into_iter().map(|m| m.name).collect();
+        // Another machine, and one that never said its id, stay.
+        assert_eq!(names, ["mac", "old", "other"]);
+        assert!(!dir.join("laptop.seen").exists());
+        assert!(!dir.join("laptop.sock").exists());
+        assert_eq!(machines_in(&dir)[0].id.as_deref(), Some("aa"));
     }
 
     #[test]

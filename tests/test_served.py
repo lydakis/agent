@@ -1019,6 +1019,29 @@ there.wait()
             time.sleep(.2)
         self.assertEqual(sock.stat().st_ino, first)
 
+    def test_a_machine_renamed_in_its_config_is_listed_once_by_its_new_name(self):
+        laptop, _ = self.linked()
+        links = self.path / '.agent/links'
+        config = laptop / '.agent/config.toml'
+        config.write_text(config.read_text().replace('machine = "laptop"', 'machine = "mac"'))
+        deadline = time.monotonic() + 30
+        while (links / 'laptop.json').exists() or not (links / 'mac.json').exists():
+            self.assertLess(time.monotonic(), deadline, 'the box never took the new name')
+            time.sleep(.2)
+        self.assertFalse((links / 'laptop.sock').exists())
+        box = subprocess.run([str(self.sonny), 'link'], env={**clean_env(), 'HOME': str(self.path)},
+                             check=True, capture_output=True, text=True, timeout=30).stdout
+        self.assertIn('mac  linked here', box)
+        self.assertNotIn('laptop', box)
+        deadline = time.monotonic() + 30
+        while True:
+            said = subprocess.run([str(self.sonny), 'link'], env={**clean_env(), 'HOME': str(laptop)},
+                                  check=True, capture_output=True, text=True, timeout=30).stdout
+            if 'as mac · connected' in said:
+                break
+            self.assertLess(time.monotonic(), deadline, said)
+            time.sleep(.5)
+
     def test_a_config_that_stops_loading_keeps_the_link_and_says_why(self):
         laptop, _ = self.linked()
         sock = self.path / '.agent/links/laptop.sock'
