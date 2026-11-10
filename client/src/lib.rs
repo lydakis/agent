@@ -12,6 +12,10 @@ pub mod policy;
 pub mod project;
 pub mod rules;
 pub mod socket;
+pub mod test_home;
+
+#[cfg(test)]
+test_home!();
 
 use serde_json::{Value, json};
 use std::{collections::HashMap, os::fd::AsRawFd, path::Path, sync::Arc, time::Duration};

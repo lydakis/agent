@@ -28,6 +28,14 @@ Every pull request and push to main runs the format, Clippy and Rust test
 checks and, after a release build of the daemon and Sonny, the runtime suite
 with `tests.run` on Linux ([test.yml](../.github/workflows/test.yml)).
 
+The Rust tests of the daemon, the client and Sonny run in a home of their
+own: each test binary is given a fresh, empty folder as `HOME` before its
+first test and removes it as it exits, so no test reads the person's
+settings or writes among their things
+([test_home.rs](../client/src/test_home.rs)). A process started with
+`AGENT_TEST_HOME` set keeps the `HOME` it was given; set it by hand to run
+an ignored tool against the person's own home.
+
 The same checks run on Linux amd64 through Errand, with the build tree and
 the Python venv kept as named runner caches so a job pays for a build once
 (`.errand.toml`; the `live` profile also forwards the provider keys in

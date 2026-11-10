@@ -2969,6 +2969,12 @@ fn report_status(state: &str, bot: &str) {
     if SIDE.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    // A test says nothing to the terminal or multiplexer it is run in:
+    // what it keeps of the state, in its own home, is all it is asked.
+    if cfg!(test) {
+        used::reported(bot, state);
+        return;
+    }
     herdr::report(state);
     used::reported(bot, state);
     if state == "clear" {

@@ -5,6 +5,9 @@ use agent_runtime::tools::{Credentials, Prepared, Registry};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
+// The tests' own home: the sandbox keeps its lock files under `~/.agent`.
+agent_client::test_home!();
+
 #[tokio::test]
 async fn shell_preserves_exit_status_and_separate_outputs() {
     let tools = Registry::new("echo,shell").unwrap();
