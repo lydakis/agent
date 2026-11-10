@@ -8236,3 +8236,50 @@ Sonny rows the change does not touch: sky replay CPU (7.54 to 9.23 ms per
 1k lines) and RSS (84.5 to 97.9 MiB). Sky's replay reads no configure
 field; this change's Sonny paths are `/permissions` spreading, `regate`
 and the config watcher.
+
+## Speeds per model, spend by speed (protocol 62, schema 90)
+
+A bot's speed is sent only to a model that serves it, looked up per call
+in the provider's list of exact model ids, and each call's spend is kept by
+model and the speed that served it. What each call pays:
+
+- **A bot at standard** (most): nothing new. `speed_for` returns at once
+  when the bot has no speed, so the prompt prefix, the pool key and the
+  limits look up nothing.
+- **A bot at fast or ultrafast**: a scan of at most nine `&'static str`
+  ids for each of those three lookups, plus the person's `[speeds]`
+  patterns only when they set any (an empty set names no path, so formats
+  nothing).
+- **Recording a call**: the same one `turn_models` upsert in the same
+  transaction, keyed on one more short text column (`speed`, `standard`
+  for nearly every row). The `usage` read groups by one more column.
+- **Migration**: one rebuild of `turn_models` (copy, drop, rename) at the
+  schema 90 upgrade; earlier rows count as `standard`.
+
+The hot-path screen (`bench.perf_gate`'s benches, the Perf workflow's
+script) on the same 4-CPU Linux container. Main 022f47d against the head,
+two alternating rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 39.382 | 41.948 | +6.5% |
+| admission | burst submit p99, ms | 5.376 | 4.789 | -10.9% |
+| completion | release to terminal p99, ms | 10.486 | 11.351 | +8.2% |
+| footprint | idle RSS, MiB | 15.07 | 15.533 | +3.1% |
+| footprint | per idle bot, KiB | 1.88 | 1.864 | -0.9% |
+| footprint | RSS after a turn each, MiB | 26.584 | 26.736 | +0.6% |
+| footprint | CPU per turn, ms | 0.902 | 0.948 | +5.2% |
+| sonny | quiet window CPU, ms/s | 1.535 | 1.355 | -11.7% |
+| sonny | quiet window RSS, MiB | 22.8 | 22.95 | +0.7% |
+| sonny | sky replay CPU per 1k lines, ms | 12.48 | 12.945 | +3.7% |
+| sonny | sky replay RSS, MiB | 84.3 | 89.3 | +5.9% |
+| lifecycle | CPU, s | 0.635 | 0.575 | -9.4% |
+| lifecycle | p95 turn, ms | 588.297 | 585.896 | -0.4% |
+| lifecycle | peak RSS, MiB | 23.621 | 23.381 | -1.0% |
+
+Store work is the same on both sides (128 jobs for each admission submit
+phase, the same operation counts in the completion and footprint runs),
+and the gate warned on no row: every move is inside the runner's spread,
+in both directions (lone submit CPU read +12% on a change that added
+nothing to a submit in the screen before this one). The benches run at
+standard, which is what nearly every call is.
