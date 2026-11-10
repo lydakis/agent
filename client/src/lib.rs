@@ -114,7 +114,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 62;
+pub const PROTOCOL: u64 = 63;
 /// How long the daemon holds a turn on a cause a person can fix before it
 /// fails with it, for a bot that sets no `hold_ms`: five days, as mail is
 /// retried (RFC 5321 suggests four to five) before it is returned.
@@ -269,12 +269,22 @@ pub struct Client {
     identity: Option<String>,
     /// `ready.providers`: each binding's family and the efforts it takes.
     providers: Value,
+    /// `ready.speeds`: the tiers the person says models serve, by
+    /// `PROVIDER/MODEL` pattern, most specific first.
+    speeds: Vec<(String, Vec<String>)>,
     paused: Value,
     /// `ready.limits.depth`: the most generations below the bot that
     /// starts its line a bot may be made at; `None` for no bound.
     max_depth: Option<u64>,
     /// Requests this client keeps in flight at once, when bounded.
     in_flight: std::sync::OnceLock<Semaphore>,
+}
+
+/// A JSON list of names, as `ready` gives a model's tiers.
+fn names(list: &Value) -> Vec<String> {
+    (list.as_array().into_iter().flatten())
+        .filter_map(|name| name.as_str().map(str::to_owned))
+        .collect()
 }
 
 impl Client {
@@ -346,6 +356,11 @@ impl Client {
         let store = ready["store"]["lineage"].as_str().map(str::to_owned);
         let identity = ready["store"]["identity"].as_str().map(str::to_owned);
         let providers = ready["providers"].clone();
+        let speeds = config::ranked(
+            (ready["speeds"].as_object().into_iter().flatten())
+                .map(|(pattern, tiers)| (pattern.clone(), names(tiers)))
+                .collect(),
+        );
         let paused = ready["paused"].clone();
         let max_depth = ready["limits"]["depth"].as_u64();
         let pending: Pending = Arc::default();
@@ -416,6 +431,7 @@ impl Client {
                 store,
                 identity,
                 providers,
+                speeds,
                 paused,
                 max_depth,
                 in_flight: std::sync::OnceLock::new(),
@@ -445,6 +461,21 @@ impl Client {
     /// The daemon's provider bindings as `ready` announced them.
     pub fn providers(&self) -> &Value {
         &self.providers
+    }
+
+    /// The tiers faster than standard the model at `path`,
+    /// `PROVIDER/MODEL`, serves, as the daemon decides it: the person's
+    /// most specific `[speeds]` pattern that matches, else the list its
+    /// provider announced. A bot's speed reaches only these; on any other
+    /// model its calls run at standard.
+    pub fn speeds(&self, path: &str) -> Vec<String> {
+        if let Some((_, tiers)) =
+            (self.speeds.iter()).find(|(pattern, _)| config::matches(pattern, path))
+        {
+            return tiers.clone();
+        }
+        let (provider, model) = path.split_once('/').unwrap_or(("", path));
+        names(&self.providers[provider]["speeds"][model])
     }
 
     /// The most generations below the bot that starts its line the daemon
@@ -608,6 +639,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_model_s_speeds_are_the_person_s_then_its_provider_s() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let (_, write) = stream.into_split();
+        let client = Client {
+            writer: Mutex::new(write),
+            pending: Arc::default(),
+            next: std::sync::atomic::AtomicU64::new(0),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            store: None,
+            identity: None,
+            providers: json!({"work": {"speeds": {"us.openai.gpt-6.1-sol": ["ultrafast"]}}}),
+            speeds: config::ranked(vec![
+                ("work/*".into(), vec!["fast".into()]),
+                ("work/*grok*".into(), vec!["ultrafast".into()]),
+                ("work/us.openai.gpt-6.1-sol".into(), Vec::new()),
+            ]),
+            paused: Value::Null,
+            max_depth: None,
+            in_flight: std::sync::OnceLock::new(),
+        };
+        assert_eq!(client.speeds("work/us.xai.grok-4.7"), ["ultrafast"]);
+        assert!(client.speeds("work/us.openai.gpt-6.1-sol").is_empty());
+        assert_eq!(client.speeds("work/other"), ["fast"]);
+        // Without a pattern, the provider's own list; else none.
+        let client = Client {
+            speeds: Vec::new(),
+            ..client
+        };
+        assert_eq!(client.speeds("work/us.openai.gpt-6.1-sol"), ["ultrafast"]);
+        assert!(client.speeds("work/us.xai.grok-4.7").is_empty());
+        assert!(client.speeds("home/us.openai.gpt-6.1-sol").is_empty());
+    }
+
+    #[tokio::test]
     async fn canceled_waits_release_pending_requests_without_closing_the_session() {
         let (stream, peer) = UnixStream::pair().unwrap();
         let (_, write) = stream.into_split();
@@ -619,6 +684,7 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
+            speeds: Vec::new(),
             paused: Value::Null,
             max_depth: None,
             in_flight: std::sync::OnceLock::new(),
@@ -653,6 +719,7 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
+            speeds: Vec::new(),
             paused: Value::Null,
             max_depth: None,
             in_flight: std::sync::OnceLock::new(),
@@ -697,6 +764,7 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
+            speeds: Vec::new(),
             paused: Value::Null,
             max_depth: None,
             in_flight: std::sync::OnceLock::new(),
@@ -739,6 +807,7 @@ mod tests {
             store: None,
             identity: None,
             providers: Value::Null,
+            speeds: Vec::new(),
             paused: Value::Null,
             max_depth: None,
             in_flight: std::sync::OnceLock::new(),

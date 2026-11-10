@@ -28,6 +28,10 @@
 //! "bedrock/*openai.*" = 1000000 # every OpenAI model on Bedrock
 //! "anthropic/claude-opus-5-5" = 500000  # lower than the model's own on purpose
 //!
+//! [speeds]                      # the tiers past standard a model serves, over the daemon's own list; restart the daemon to apply
+//! "openrouter/openai/gpt-6.1-sol" = ["fast"]  # by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
+//! "anthropic/claude-opus-5" = []  # standard only: a bot's fast runs this model at standard
+//!
 //! [reviewer]
 //! model = "openai/gpt-6-luna"   # the model that reviews calls in auto, `sonny reviewer`
 //! effort = "low"                # the reviewer's effort
@@ -39,7 +43,7 @@
 //! [sonny]
 //! lead_effort = "medium"        # a new lead's effort
 //! task_effort = "high"          # each new task's
-//! task_speed = "fast"          # each new task's speed where its provider serves it; else its starter's on the same model
+//! task_speed = "fast"          # each new task's speed where its model serves it; else its starter's on the same model
 //! lead_profile = "my-lead"      # the role a new lead starts in, not lead
 //! task_profile = "worker"       # what every other agent is told, not task
 //! side_chat = "answer"          # calls no tool; "fork", the default, may do anything its agent may
@@ -149,6 +153,12 @@ pub struct Config {
     /// Unset, the provider's listing, else the daemon's own default. The
     /// agent CLI starts the daemon with them.
     pub context_windows: BTreeMap<String, u64>,
+    /// `[speeds]`: the tiers past standard (`fast`, `ultrafast`) each model
+    /// whose `PROVIDER/MODEL` path a pattern matches serves, `*` and `?`
+    /// wildcards, the most specific pattern winning, over the daemon's own
+    /// list; an empty list says standard only. The agent CLI starts the
+    /// daemon with them.
+    pub speeds: BTreeMap<String, Vec<String>>,
     /// `prices`: the price sheet's file, from `/` or `~/`; unset,
     /// `~/.agent/prices.toml`. See `prices`.
     pub prices: Option<String>,
@@ -179,6 +189,28 @@ pub struct Price {
     /// Input written to the cache for an hour.
     pub cache_write_1h: f64,
     pub output: f64,
+}
+
+/// A price sheet's entry: what a million tokens cost at standard speed,
+/// and at each faster tier that has a price of its own.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Prices {
+    pub standard: Price,
+    pub fast: Option<Price>,
+    pub ultrafast: Option<Price>,
+}
+
+impl Prices {
+    /// The price at `speed`, as the daemon names it: the tier's own, else
+    /// standard's.
+    pub fn at(&self, speed: &str) -> Price {
+        match speed {
+            "fast" => self.fast,
+            "ultrafast" => self.ultrafast,
+            _ => None,
+        }
+        .unwrap_or(self.standard)
+    }
 }
 
 impl Price {
@@ -1286,6 +1318,31 @@ fn parse(text: &str) -> Result<Config, String> {
             }
             continue;
         }
+        if name == "speeds" {
+            let models = value.as_table().ok_or("speeds must be a table")?;
+            for (pattern, tiers) in models {
+                let shape = || {
+                    format!(
+                        "speeds.{pattern} is a list of \"fast\" and \"ultrafast\", or [] for standard only"
+                    )
+                };
+                let tiers = (tiers.as_array().ok_or_else(shape)?.iter())
+                    .map(|tier| {
+                        tier.as_str()
+                            .filter(|tier| ["fast", "ultrafast"].contains(tier))
+                            .map(str::to_owned)
+                            .ok_or_else(shape)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if !pattern.contains('/') || pattern.contains(char::is_whitespace) {
+                    return Err(format!(
+                        "speeds keys are PROVIDER/MODEL, * and ? wildcards, as \"bedrock/*\", not {pattern:?}"
+                    ));
+                }
+                config.speeds.insert(pattern.clone(), tiers);
+            }
+            continue;
+        }
         if name == "prices" {
             let file = string(name, value)?;
             if !(file.starts_with('/') || file.starts_with("~/")) {
@@ -1863,15 +1920,17 @@ pub const SHEET_LIMIT: u64 = 1024 * 1024;
 /// million tokens cost on the models it matches:
 ///
 /// ```toml
-/// "anthropic/claude-opus-5*" = { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25 }
+/// "anthropic/claude-opus-5*" = { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25, fast = { input = 10, output = 50 } }
 /// "openai/*" = { input = 1.25, cached = 0.125, output = 10 }
 /// ```
 ///
 /// `input` and `output` are required; `cached` and `cache_write` are
-/// `input`'s when unset, and `cache_write_1h` is `cache_write`'s. The
-/// patterns come most specific first, as `price` looks them up. Nothing is
-/// priced unless the person says.
-pub fn prices(config: &Config) -> Result<Vec<(String, Price)>, String> {
+/// `input`'s when unset, and `cache_write_1h` is `cache_write`'s. `fast`
+/// and `ultrafast` price the tokens a faster tier served, each the same
+/// shape; a tier with none is priced at standard. The patterns come most
+/// specific first, as `price` looks them up. Nothing is priced unless the
+/// person says.
+pub fn prices(config: &Config) -> Result<Vec<(String, Prices)>, String> {
     let file = match &config.prices {
         Some(file) => match file.strip_prefix("~/") {
             Some(rest) => match std::env::var_os("HOME") {
@@ -1905,7 +1964,7 @@ pub fn prices(config: &Config) -> Result<Vec<(String, Price)>, String> {
 }
 
 /// A price sheet's text, its patterns most specific first.
-fn sheet(text: &str) -> Result<Vec<(String, Price)>, String> {
+fn sheet(text: &str) -> Result<Vec<(String, Prices)>, String> {
     let table: toml::Table = text
         .parse()
         .map_err(|e: toml::de::Error| e.message().to_owned())?;
@@ -1916,34 +1975,61 @@ fn sheet(text: &str) -> Result<Vec<(String, Price)>, String> {
                 "keys are PROVIDER/MODEL, * and ? wildcards, as \"anthropic/claude-opus-5*\", not {pattern:?}"
             ));
         }
-        prices.push((pattern.clone(), price_of(pattern, price)?));
+        prices.push((pattern.clone(), prices_of(pattern, price)?));
     }
-    // Literal paths first, then the patterns with the most literal
-    // characters, as the daemon ranks `[context_windows]`.
+    Ok(ranked(prices))
+}
+
+/// `set` by `PROVIDER/MODEL` pattern, most specific first, as the daemon
+/// ranks `[context_windows]` and `[speeds]`: literal paths first, then
+/// the patterns with the most literal characters, then by name.
+pub fn ranked<T>(mut set: Vec<(String, T)>) -> Vec<(String, T)> {
     let wild = |c: char| matches!(c, '*' | '?');
     let rank = |pattern: &str| {
         let literal = pattern.chars().filter(|c| !wild(*c)).count();
         (pattern.chars().any(wild), std::cmp::Reverse(literal))
     };
-    prices.sort_by(|(a, _), (b, _)| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
-    Ok(prices)
+    set.sort_by(|(a, _), (b, _)| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+    set
 }
 
-/// The price for `path`, `PROVIDER/MODEL`, in `prices` as `prices` reads
-/// them: the first, most specific, pattern that matches it.
-pub fn price(prices: &[(String, Price)], path: &str) -> Option<Price> {
+/// The price for `path`, `PROVIDER/MODEL`, at `speed`, in `prices` as
+/// `prices` reads them: the first, most specific, pattern that matches it.
+pub fn price(prices: &[(String, Prices)], path: &str, speed: &str) -> Option<Price> {
     (prices.iter())
         .find(|(pattern, _)| matches(pattern, path))
-        .map(|(_, price)| *price)
+        .map(|(_, prices)| prices.at(speed))
 }
 
-/// A price sheet's entry: input and output, and any of cached, cache_write
-/// and cache_write_1h, each a number of 0 or more; an unset one is the
-/// rate it would fall back to without a cache.
+/// A price sheet's entry: its standard price, with any of `fast` and
+/// `ultrafast`, each a price of the same shape.
+fn prices_of(pattern: &str, value: &toml::Value) -> Result<Prices, String> {
+    let mut fields = value.as_table().cloned().unwrap_or_default();
+    let mut tier = |name: &str| {
+        fields
+            .remove(name)
+            .map(|price| price_of(&format!("{pattern}.{name}"), &price))
+            .transpose()
+    };
+    let (fast, ultrafast) = (tier("fast")?, tier("ultrafast")?);
+    let standard = match value.is_table() {
+        true => price_of(pattern, &toml::Value::Table(fields))?,
+        false => price_of(pattern, value)?,
+    };
+    Ok(Prices {
+        standard,
+        fast,
+        ultrafast,
+    })
+}
+
+/// A price: input and output, and any of cached, cache_write and
+/// cache_write_1h, each a number of 0 or more; an unset one is the rate it
+/// would fall back to without a cache.
 fn price_of(pattern: &str, value: &toml::Value) -> Result<Price, String> {
     let shape = || {
         format!(
-            "{pattern:?} is {{ input = 5, output = 25 }} with any of cached, cache_write and cache_write_1h, each per million tokens"
+            "{pattern:?} is {{ input = 5, output = 25 }} with any of cached, cache_write and cache_write_1h, each per million tokens, and fast or ultrafast priced the same way"
         )
     };
     let fields = value.as_table().ok_or_else(shape)?;
@@ -2477,7 +2563,7 @@ mod tests {
              \"anthropic/claude-opus-5*\" = { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25 }\n",
         )
         .unwrap();
-        let opus = price(&prices, "anthropic/claude-opus-5-5").unwrap();
+        let opus = price(&prices, "anthropic/claude-opus-5-5", "standard").unwrap();
         assert_eq!((opus.input, opus.cached, opus.output), (5.0, 0.5, 25.0));
         // A million fresh, a million read, a million written of which half
         // for an hour, and a million out.
@@ -2486,14 +2572,33 @@ mod tests {
             (cost - (5.0 + 0.5 + 3.125 + 5.0 + 25.0)).abs() < 1e-9,
             "{cost}"
         );
-        let other = price(&prices, "anthropic/claude-haiku-4-5").unwrap();
+        let other = price(&prices, "anthropic/claude-haiku-4-5", "standard").unwrap();
         assert_eq!(
             (other.cached, other.cache_write, other.cache_write_1h),
             (3.0, 3.0, 3.0),
             "the cache's rates are input's when unset"
         );
-        assert_eq!(price(&prices, "openai/gpt-6"), None);
+        assert_eq!(price(&prices, "openai/gpt-6", "standard"), None);
+        // A faster tier is priced at its own rates where the sheet gives
+        // them, at standard's where it does not.
+        let prices = sheet(
+            "\"bedrock/*gpt-6.1-sol\" = { input = 2.2, cached = 0.11, output = 11, ultrafast = { input = 13.2, cached = 0.66, output = 66 } }\n",
+        )
+        .unwrap();
+        let sol = "bedrock/us.openai.gpt-6.1-sol";
+        let ultra = price(&prices, sol, "ultrafast").unwrap();
+        assert_eq!(
+            (ultra.input, ultra.cached, ultra.output),
+            (13.2, 0.66, 66.0)
+        );
+        assert_eq!(ultra.cache_write, 13.2, "a tier's own input, as standard's");
+        assert_eq!(price(&prices, sol, "fast").unwrap().input, 2.2);
+        assert_eq!(price(&prices, sol, "standard").unwrap().output, 11.0);
         for wrong in [
+            "\"a/b\" = { input = 1, output = 1, fast = { input = 2 } }\n",
+            "\"a/b\" = { input = 1, output = 1, fast = 2 }\n",
+            "\"a/b\" = { input = 1, output = 1, fast = { input = 2, output = 2, fast = { input = 3, output = 3 } } }\n",
+            "\"a/b\" = { fast = { input = 2, output = 2 } }\n",
             "\"anthropic\" = { input = 1, output = 1 }\n",
             "\"a/b\" = { input = 1 }\n",
             "\"a/b\" = { input = 1, output = -1 }\n",
@@ -2542,6 +2647,21 @@ mod tests {
             "[context_windows]\n\"a/b\" = 1000\n",
             "[context_windows]\n\"a/b\" = \"1M\"\n",
             "context_windows = 400000\n",
+        ] {
+            assert!(parse(wrong).is_err(), "{wrong}");
+        }
+        let speeds = parse(
+            "[speeds]\n\"work/*grok*\" = [\"ultrafast\"]\n\"anthropic/claude-opus-5\" = []\n",
+        )
+        .unwrap()
+        .speeds;
+        assert_eq!(speeds["work/*grok*"], ["ultrafast"]);
+        assert!(speeds["anthropic/claude-opus-5"].is_empty());
+        for wrong in [
+            "[speeds]\n\"a/b\" = [\"standard\"]\n",
+            "[speeds]\n\"a/b\" = \"fast\"\n",
+            "[speeds]\n\"ab\" = [\"fast\"]\n",
+            "speeds = [\"fast\"]\n",
         ] {
             assert!(parse(wrong).is_err(), "{wrong}");
         }

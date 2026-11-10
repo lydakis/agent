@@ -35,7 +35,7 @@ impl Lab {
             &agent,
             "#!/bin/sh\ncase \"$1\" in\n\
              run) [ ! -e \"$AGENT_LOG.refuse\" ] || { cat \"$AGENT_LOG.refuse\" >&2; exit 1; }; \
-             if [ -e \"$AGENT_LOG.slow\" ]; then for a in \"$@\"; do [ \"$a\" != --speed ] || { cat \"$AGENT_LOG.slow\" >&2; exit 1; }; done; fi; for a in \"$@\"; do if [ \"$a\" = - ]; then cat; echo; else printf '%s\\n' \"$a\"; fi; done > \"$AGENT_LOG\"; [ -z \"$AGENT_FAIL\" ] || exit 1; echo '{\"handle\":\"h\"}';;\n\
+             for a in \"$@\"; do if [ \"$a\" = - ]; then cat; echo; else printf '%s\\n' \"$a\"; fi; done > \"$AGENT_LOG\"; [ -z \"$AGENT_FAIL\" ] || exit 1; echo '{\"handle\":\"h\"}';;\n\
              ls) cat \"$AGENT_LOG.ls\" 2>/dev/null || echo '[]';;\n\
              inspect) cat \"$AGENT_LOG.inspect\" 2>/dev/null || exit 1;;\n\
              turns) cat \"$AGENT_LOG.turns\" 2>/dev/null || echo '[]';;\n\
@@ -353,7 +353,7 @@ fn a_brief_that_names_the_lead_s_folder_names_the_task_s_copy() {
 }
 
 #[test]
-fn a_task_runs_at_its_lead_s_speed_or_standard_where_refused() {
+fn a_task_runs_at_its_lead_s_speed() {
     let lab = Lab::new("speed");
     *lab.model.borrow_mut() = Some("a/lead".into());
     let log = lab.scratch.join("run.log");
@@ -369,19 +369,6 @@ fn a_task_runs_at_its_lead_s_speed_or_standard_where_refused() {
     let speed = ran.iter().position(|a| a == "--speed").expect("a speed");
     assert_eq!(ran[speed + 1], "fast");
     assert!(!said.contains("standard speed"), "{said}");
-    lab.remove(&lab.repo, true);
-    // A provider that does not serve it: the task starts at standard, and
-    // the start says why.
-    std::fs::write(
-        at("slow"),
-        r#"{"error":"invalid_speed","detail":"this provider serves anthropic at standard speed only","speeds":[]}"#,
-    )
-    .unwrap();
-    let (ok, said) = lab.task(false, false);
-    assert!(ok, "{said}");
-    assert!(!lab.ran().iter().any(|a| a == "--speed"));
-    assert!(said.contains("It runs at standard speed"), "{said}");
-    assert!(said.contains("standard speed only"), "{said}");
 }
 
 #[test]

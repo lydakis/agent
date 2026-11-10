@@ -2,7 +2,8 @@
 //! content-block events and stored as one native item, including thinking
 //! signatures so tool-using turns can continue.
 use super::{
-    Completion, Delta, Frame, ModelTokens, ToolCall, Usage, detail_of, unparsed, valid_call_id,
+    Completion, Delta, Frame, ModelTokens, Speed, ToolCall, Usage, detail_of, unparsed,
+    valid_call_id,
 };
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
@@ -51,6 +52,7 @@ pub(crate) fn usage(usage: &Value, hour: bool) -> Usage {
         cached_input_tokens: read,
         cache_write_tokens: created,
         cache_write_1h_tokens: hourly,
+        speed: usage["speed"].as_str().and_then(Speed::named),
         ..Usage::default()
     }
 }
@@ -236,6 +238,9 @@ impl State {
                 if let Some(output) = event["usage"]["output_tokens"].as_u64() {
                     self.usage.output_tokens = output;
                 }
+                if let Some(speed) = event["usage"]["speed"].as_str().and_then(Speed::named) {
+                    self.usage.speed = Some(speed);
+                }
                 if let Some(iterations) = event["usage"]["iterations"].as_array() {
                     self.iterations(iterations);
                 }
@@ -334,6 +339,7 @@ impl State {
             cache_write_1h_tokens: models.iter().map(|m| m.cache_write_1h_tokens).sum(),
             models,
             served_model,
+            speed: self.usage.speed,
             ..Usage::default()
         };
         self.saw_usage = true;
@@ -539,7 +545,7 @@ mod tests {
                 r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t1","name":"shell","input":{}}}"#,
                 r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"comm"}}"#,
                 r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"and\":\"ls\"}"}}"#,
-                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7,"speed":"fast"}}"#,
                 r#"{"type":"message_stop"}"#,
             ],
         );
@@ -562,6 +568,7 @@ mod tests {
                 models: Vec::new(),
                 served_model: "claude-test-20260926".to_owned(),
                 context_window: 0,
+                speed: Some(super::Speed::Fast),
             })
         );
     }

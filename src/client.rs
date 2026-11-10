@@ -1123,6 +1123,11 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
             .arg("--context-window")
             .arg(format!("{pattern}={tokens}"));
     }
+    for (pattern, tiers) in &file.speeds {
+        command
+            .arg("--speeds")
+            .arg(format!("{pattern}={}", tiers.join(",")));
+    }
     // Where the providers came from, so an edit there applies live.
     if let Some(file) = agent_client::config::path().filter(|_| options.providers_from_config) {
         command.arg("--provider-config").arg(file);

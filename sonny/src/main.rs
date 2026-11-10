@@ -3501,7 +3501,7 @@ enum Choice {
     Speed,
 }
 
-/// The speeds `/fast` lists, each where the provider serves it.
+/// The speeds `/fast` lists, each where the model serves it.
 const SPEEDS: [(&str, &str); 3] = [
     ("standard", "the model's own speed and price"),
     ("fast", "faster, at a higher price per token"),
@@ -6510,7 +6510,7 @@ impl App {
     }
 
     /// The rows `/fast` lists: standard, and each tier faster than it
-    /// the bot's provider serves.
+    /// the bot's model serves.
     fn speed_rows(&self) -> Vec<(&'static str, &'static str)> {
         let serves = self.speeds();
         (SPEEDS.into_iter())
@@ -6539,17 +6539,15 @@ impl App {
         });
     }
 
-    /// The tiers faster than standard the bot's provider serves.
+    /// The tiers faster than standard the bot's model serves.
     fn speeds(&self) -> Vec<String> {
-        let provider = self
-            .model
-            .split_once('/')
-            .map_or("", |(provider, _)| provider);
-        (self.client.providers()[provider]["speeds"].as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|speed| speed.as_str().map(str::to_owned))
-            .collect()
+        self.client.speeds(&self.model)
+    }
+
+    /// The speed the bot's calls run at: its own where its model serves
+    /// it; standard, shown as none, where it does not.
+    fn speed_shown(&self) -> Option<&str> {
+        (self.speed.as_deref()).filter(|speed| self.speeds().iter().any(|s| s == speed))
     }
 
     /// What the footer and pickers show of the bot, from its record.
@@ -12975,14 +12973,14 @@ impl App {
             self.input.clear();
             let rows = self.speed_rows();
             if rows.len() < 2 {
-                let provider = self.model.split_once('/').map_or("", |(p, _)| p);
                 self.notice = Some(format!(
-                    "{provider} serves its models at standard speed only"
+                    "{} runs at standard speed only",
+                    models::label(&self.model)
                 ));
                 return;
             }
             // On the pick still waiting for the turn to end, if there is one.
-            let now = (self.pace).unwrap_or(self.speed.as_deref().unwrap_or("standard"));
+            let now = (self.pace).unwrap_or(self.speed_shown().unwrap_or("standard"));
             let at = rows.iter().position(|(speed, _)| *speed == now);
             let rows = (self.speed_rows().into_iter())
                 .map(|(speed, about)| (speed.to_owned(), about.to_owned()))
@@ -15280,7 +15278,7 @@ impl App {
                 return;
             }
             if let Some((Choice::Speed, list)) = &self.choosing {
-                let now = self.speed.as_deref().unwrap_or("standard");
+                let now = self.speed_shown().unwrap_or("standard");
                 let rows = self.speed_rows();
                 let items: Vec<list::Item> = (list.shown().iter())
                     .filter_map(|&(at, ref found)| {
@@ -15953,7 +15951,7 @@ impl App {
         if let Some(boost) = &self.boost {
             long.push(Span::raw(format!(" ↑{boost}")));
         }
-        if let Some(speed) = &self.speed {
+        if let Some(speed) = self.speed_shown() {
             long.push(Span::raw(format!(" {speed}")).dim());
         }
         items.push(Item::new(Slot::Model, vec![long, vec![model]]));
@@ -21481,11 +21479,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_lists_the_speeds_its_provider_serves_and_picks_one() {
+    async fn fast_lists_the_speeds_its_model_serves_and_picks_one() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
-        let providers = json!({"anthropic": {"speeds": ["fast"]}, "bedrock": {"speeds": []},
-            "openai": {"speeds": ["fast", "ultrafast"]}});
+        let providers = json!({"anthropic": {"speeds": {"claude-opus-5-5": ["fast"]}},
+            "bedrock": {"speeds": {"us.openai.gpt-6.1-sol": ["ultrafast"]}},
+            "openai": {"speeds": {"gpt-6.1-sol": ["fast", "ultrafast"]}}});
         let client = daemon_serving(providers, move |request| {
             seen.lock().unwrap().push(request.clone());
             json!({"bot": "b", "changed": ["speed"]})
@@ -21535,15 +21534,14 @@ mod tests {
             .map(|sent| sent["settings"]["speed"].clone())
             .collect();
         assert_eq!(speeds, [json!("fast"), json!("standard")]);
-        // Nothing to pick where the provider serves standard alone.
-        app.model = "bedrock/anthropic.claude-opus-5-5".into();
+        // Nothing to pick where the model runs at standard alone, though
+        // another on its provider serves a faster tier.
+        app.model = "bedrock/us.xai.grok-4.7".into();
         app.input.set("/fast");
         app.submit().await;
         assert!(app.choosing.is_none());
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("bedrock serves its models at standard speed only")
-        );
+        let notice = app.notice.clone().unwrap();
+        assert!(notice.ends_with("runs at standard speed only"), "{notice}");
         app.model = "openai/gpt-6.1-sol".into();
         app.input.set("/fast");
         app.submit().await;
@@ -21551,7 +21549,15 @@ mod tests {
         app.key(key(KeyCode::Up)).await;
         app.key(key(KeyCode::Enter)).await;
         assert_eq!(app.speed.as_deref(), Some("ultrafast"));
-        // Moved meanwhile to a provider serving fewer tiers, the list
+        // On a model that does not serve it, the footer shows none: its
+        // calls run at standard.
+        app.model = "openai/gpt-6.1-terra".into();
+        let footer = app.footer_line(200).to_string();
+        assert!(!footer.contains("ultrafast"), "{footer}");
+        app.model = "openai/gpt-6.1-sol".into();
+        let footer = app.footer_line(200).to_string();
+        assert!(footer.contains("ultrafast"), "{footer}");
+        // Moved meanwhile to a model serving fewer tiers, the list
         // takes its last row rather than one that is gone.
         app.input.set("/fast");
         app.submit().await;

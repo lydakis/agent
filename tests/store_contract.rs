@@ -6724,6 +6724,7 @@ fn usage(input: u64, output: u64, model: &str) -> Usage {
         models: Vec::new(),
         served_model: model.into(),
         context_window: 0,
+        speed: None,
     }
 }
 /// A model round whose request sent `added` input tokens new.
@@ -10340,6 +10341,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         models: Vec::new(),
         served_model: String::new(),
         context_window: 0,
+        speed: None,
     };
     let warm = Usage {
         input_tokens: 300,
@@ -10351,6 +10353,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         models: Vec::new(),
         served_model: String::new(),
         context_window: 0,
+        speed: None,
     };
     db.append(turn, vec![assistant("one")], &[], Some(&cold))
         .unwrap();
@@ -10416,6 +10419,7 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                         models: Vec::new(),
                         served_model: String::new(),
                         context_window: 0,
+                        speed: None,
                     }),
                 )
                 .unwrap();
@@ -10453,6 +10457,7 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                     models: Vec::new(),
                     served_model: String::new(),
                     context_window: 0,
+                    speed: None,
                 },
                 100,
                 None,
@@ -10641,6 +10646,7 @@ fn schema_47_turns_take_their_own_token_cap() {
         models: Vec::new(),
         served_model: String::new(),
         context_window: 0,
+        speed: None,
     };
     {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
@@ -16309,6 +16315,7 @@ fn usage_sums_turns_by_bot_model_and_bucket_from_where_each_started() {
         models: Vec::new(),
         served_model: String::new(),
         context_window: 0,
+        speed: None,
     };
     let hour = 3_600_000;
     let now = std::time::SystemTime::now()
@@ -16584,11 +16591,147 @@ fn schema_85_files_each_earlier_turn_whole_under_its_own_model() {
     assert_eq!(usage["turns"], 2);
     assert_eq!(
         usage["models"],
-        json!([{"model":"openai/synthetic-model","turns":1,"input_tokens":500,
+        json!([{"model":"openai/synthetic-model","speed":"standard","turns":1,"input_tokens":500,
             "cached_input_tokens":100,"output_tokens":50,
             "cache_write_tokens":0,"cache_write_1h_tokens":0}]),
         "a turn that spent nothing has no row"
     );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn spend_is_kept_by_model_and_the_speed_that_served_it() {
+    use agent_runtime::provider::Speed;
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let at = |speed, input| Usage {
+        input_tokens: input,
+        output_tokens: 10,
+        speed,
+        ..Usage::default()
+    };
+    // Two calls served ultrafast, one the provider served at standard
+    // though a faster tier was asked, and one with no tier said.
+    for usage in [
+        at(Some(Speed::Ultrafast), 300),
+        at(Some(Speed::Ultrafast), 300),
+        at(Some(Speed::Standard), 100),
+        at(None, 50),
+    ] {
+        db.append(turn, vec![assistant("a")], &[], Some(&usage))
+            .unwrap();
+    }
+    db.finish(turn, None).unwrap();
+    let usage = db.usage(None, 0, None, 64).unwrap();
+    let rows: Vec<_> = (usage["models"].as_array().unwrap().iter())
+        .map(|m| {
+            (
+                m["model"].as_str().unwrap(),
+                m["speed"].as_str().unwrap(),
+                m["input_tokens"].as_i64().unwrap(),
+                m["turns"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("openai/synthetic-model", "ultrafast", 600, 1),
+            ("openai/synthetic-model", "standard", 150, 1),
+        ]
+    );
+    assert_eq!(usage["turns"], 1, "the turn counts once in the total");
+}
+
+#[test]
+fn schema_90_files_earlier_spend_at_standard() {
+    use agent_runtime::provider::Speed;
+    let path = std::env::temp_dir().join(format!("agent-spend-90-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let turn = db
+            .begin(
+                "Bob",
+                "1",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let usage = Usage {
+            input_tokens: 500,
+            cached_input_tokens: 100,
+            cache_write_tokens: 40,
+            output_tokens: 50,
+            ..Usage::default()
+        };
+        db.append(turn, vec![assistant("done")], &[], Some(&usage))
+            .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    let conn = Connection::open(&path).unwrap();
+    // The table as schema 89 kept it: no speed, keyed by turn and model.
+    conn.execute_batch(
+        "CREATE TABLE old_models AS SELECT turn,model,input_tokens,cached_input_tokens,
+                cache_write_tokens,cache_write_1h_tokens,output_tokens FROM turn_models;
+         DROP TABLE turn_models;
+         CREATE TABLE turn_models(turn INTEGER NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+            model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(turn,model)) WITHOUT ROWID;
+         INSERT INTO turn_models SELECT * FROM old_models;
+         DROP TABLE old_models;
+         PRAGMA user_version=89;",
+    )
+    .unwrap();
+    let mut db = Database::initialize(conn).unwrap();
+    let usage = db.usage(None, 0, None, 64).unwrap();
+    assert_eq!(
+        usage["models"],
+        json!([{"model":"openai/synthetic-model","speed":"standard","turns":1,"input_tokens":500,
+            "cached_input_tokens":100,"output_tokens":50,
+            "cache_write_tokens":40,"cache_write_1h_tokens":0}])
+    );
+    // The migrated table takes a faster tier's row beside the old one.
+    let turn = db
+        .begin(
+            "Bob",
+            "2",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let fast = Usage {
+        input_tokens: 10,
+        output_tokens: 1,
+        speed: Some(Speed::Fast),
+        ..Usage::default()
+    };
+    db.append(turn, vec![assistant("fast")], &[], Some(&fast))
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    let usage = db.usage(None, 0, None, 64).unwrap();
+    assert_eq!(usage["models"][1]["speed"], "fast");
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
