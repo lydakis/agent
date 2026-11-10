@@ -5037,6 +5037,7 @@ impl Fleet {
             };
             // Read again next time when a listing fails.
             let Some(bots) = bots_named(&self.client, &format!("{project}.*")).await else {
+                self.refollow = true;
                 return Vec::new();
             };
             let theirs = lead_and_lineage(&bots, lead);
@@ -22927,6 +22928,48 @@ mod tests {
         let unread = fleet.follow_leads(false).await;
         assert!(fleet.raised.contains("shop.loose"));
         assert!(unread.iter().any(|(bot, _)| bot == "shop.loose"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A followed lead's bots that a reconnect could not list are listed on
+    /// the next read, though no follows file changed.
+    #[tokio::test]
+    async fn a_followed_leads_bots_are_listed_again_when_a_reconnect_cannot() {
+        let dir = std::env::temp_dir().join(format!("refollow-{}", std::process::id()));
+        let store = dir.join("store");
+        let mut sub = lookout::subs::Sub::lead("home.lead", "home");
+        sub.tasks_of = vec!["shop.lead".into()];
+        std::fs::create_dir_all(lookout::subs::dir(&store)).unwrap();
+        std::fs::write(
+            lookout::subs::dir(&store).join("home.lead.json"),
+            json!({"subscriptions": [sub.to_json()]}).to_string(),
+        )
+        .unwrap();
+        let listings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (client, events) = daemon_with_events(json!({}), move |asked| {
+            if asked["op"] != "bots" {
+                return json!({});
+            }
+            let mut bots = vec![json!({"name": "shop.lead", "bot_id": 1, "head": 1})];
+            match listings.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => {}
+                1 => return json!({"error": "internal", "detail": "try again"}),
+                // A task made while away.
+                _ => bots.push(json!({"name": "shop.fix", "bot_id": 2, "head": 2,
+                    "created_by": "shop.lead"})),
+            }
+            json!({"bots": bots})
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client, events, "home", "home.lead");
+        fleet.store = store;
+        fleet.follow_leads(true).await;
+        assert!(fleet.raised.contains("shop.lead"));
+        // The reconnect's listing fails.
+        fleet.follow_leads(true).await;
+        fleet.followed_at = None;
+        fleet.follow_leads(false).await;
+        assert!(fleet.raised.contains("shop.fix"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
