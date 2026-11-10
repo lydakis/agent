@@ -9800,30 +9800,33 @@ impl Database {
             first["reply"] = Self::reply(&said, &mut left);
         }
         let mut prompts_more = false;
+        // The newest steers first, as Codex's reviewer keeps a person's
+        // newest words: what is left out is older than all that is read.
+        // Each row names the steer before it, whose event its reply is
+        // read after; read a row at a time, and only while there is room.
         let mut steers = self.conn.prepare_cached(
-            "SELECT json_extract(data,'$.steer'),id FROM events WHERE turn=? AND kind='steered' ORDER BY id",
+            "SELECT json_extract(e.data,'$.steer'),e.id,
+                COALESCE((SELECT MAX(b.id) FROM events b
+                          WHERE b.turn=e.turn AND b.kind='steered' AND b.id<e.id),0)
+             FROM events e WHERE e.turn=? AND e.kind='steered' ORDER BY e.id DESC",
         )?;
-        let steered: Vec<(i64, i64)> = steers
-            .query_map([turn], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
         let mut steer = self.conn.prepare_cached(
             "SELECT CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
                 t.from_bot,t.from_turn,t.origin,t.person,t.quotes
              FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node WHERE t.id=?",
         )?;
-        // The newest steers first, as Codex's reviewer keeps a person's
-        // newest words: what is left out is older than all that is read.
-        let mut kept = Vec::with_capacity(steered.len());
-        for (at, &(id, event)) in steered.iter().enumerate().rev() {
+        let mut kept = Vec::new();
+        let mut rows = steers.query([turn])?;
+        while let Some(r) = rows.next()? {
             if left < Self::PROMPTS_ENTRY {
                 prompts_more = true;
                 break;
             }
             left -= Self::PROMPTS_ENTRY;
+            let (id, event, since): (i64, i64, i64) = (r.get(0)?, r.get(1)?, r.get(2)?);
             let words = steer.query_row([id], |r| Words::read(r, 0))?;
             let mut entry = self.prompt_entry(id, words, &mut left)?;
             entry["steer"] = json!(true);
-            let since = at.checked_sub(1).map_or(0, |before| steered[before].1);
             if let Some(said) = self.said(turn, since, event)? {
                 entry["reply"] = Self::reply(&said, &mut left);
             }

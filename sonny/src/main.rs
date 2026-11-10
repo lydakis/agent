@@ -10732,26 +10732,35 @@ impl App {
             .filter(|read| !self.raised_read.contains(*read))
             .map(|(bot, ..)| bot.as_str())
             .collect();
-        for bot in unread {
-            let Ok(page) = (self.client)
-                .request("approvals", json!({"bot": bot, "limit": 64}))
-                .await
-            else {
-                continue;
-            };
-            for call in page["approvals"].as_array().into_iter().flatten() {
-                let read = key(call);
-                if !needs::person_call(call)
-                    || !wanted.contains(&read)
-                    || self.raised_read.contains(&read)
-                {
-                    continue;
+        'bots: for bot in unread {
+            // Every page, so a call past the first is not taken as answered.
+            let mut after = Value::Null;
+            loop {
+                let mut asked = json!({"bot": bot, "limit": 64});
+                if !after.is_null() {
+                    asked["after"] = after;
                 }
-                let mut call = call.clone();
-                whole_arguments(&self.client, bot, &mut call).await;
-                self.names.get_mut().learn(bot.to_owned(), true);
-                self.raised.push(call);
-                self.raised_read.insert(read);
+                let Ok(page) = self.client.request("approvals", asked).await else {
+                    continue 'bots;
+                };
+                for call in page["approvals"].as_array().into_iter().flatten() {
+                    let read = key(call);
+                    if !needs::person_call(call)
+                        || !wanted.contains(&read)
+                        || self.raised_read.contains(&read)
+                    {
+                        continue;
+                    }
+                    let mut call = call.clone();
+                    whole_arguments(&self.client, bot, &mut call).await;
+                    self.names.get_mut().learn(bot.to_owned(), true);
+                    self.raised.push(call);
+                    self.raised_read.insert(read);
+                }
+                after = page["next_after"].clone();
+                if after.is_null() {
+                    break;
+                }
             }
             // Looked up, held or not: one no longer listed was answered.
             for read in wanted.iter().filter(|(of, ..)| of == bot) {
@@ -10813,6 +10822,12 @@ impl App {
             )
             .await;
         match answered {
+            // A call below that could not be answered waits here still.
+            Err(error) if !own => {
+                self.notice = Some(error.to_string());
+                self.raised.insert(at, call);
+                return;
+            }
             Err(error) => self.notice = Some(error.to_string()),
             Ok(_) if decision == "allow" => {
                 let name = call["name"].as_str().unwrap_or("tool");
@@ -22775,6 +22790,7 @@ mod tests {
     async fn a_followed_tasks_approval_waits_and_is_answered_in_the_window_youre_in() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
+        let seen_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (client, events) = daemon_with_events(json!({}), move |asked| {
             match (asked["op"].as_str().unwrap_or(""), asked["bot"].as_str()) {
                 ("approvals", Some("shop.fix")) => json!({"approvals": [
@@ -22787,6 +22803,10 @@ mod tests {
                     {"bot": "shop.fix", "turn": 4, "call_id": "c2", "gates": ["auto"],
                         "name": "shell", "arguments": {"command": "ls"}},
                 ]}),
+                // The first answer does not reach the daemon.
+                ("answer", _) if !seen_once.swap(true, std::sync::atomic::Ordering::SeqCst) => {
+                    json!({"error": "internal", "detail": "try again"})
+                }
                 ("answer", _) => {
                     seen.lock().unwrap().push(asked.clone());
                     json!({})
@@ -22846,6 +22866,11 @@ mod tests {
         app.show_asked();
         let again = app.pending.len() - 6;
         assert_eq!(text(&app.pending[again..]), text(&app.pending[..6]));
+        // An answer that failed leaves it waiting here, to answer again.
+        app.key(key(KeyCode::Char('n'))).await;
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(app.notice.as_deref(), Some("internal (try again)"));
+        assert!(app.waiting().is_some());
         // Answered on the task's own call, and let go here.
         app.key(key(KeyCode::Char('n'))).await;
         let sent = sent.lock().unwrap().clone();
