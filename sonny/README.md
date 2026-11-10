@@ -538,7 +538,9 @@ as theirs. The lead is told only of one added.
 
 Enter sends (and steers a running turn), Tab while a turn runs queues what
 you wrote to run after it, as Codex does, Esc interrupts, `y`/`n` answer a
-pending approval, Ctrl-C clears the composer or quits. Shift-Enter or
+pending approval (Esc sets it aside first, so the keys type again, and
+Enter on an empty composer brings it back), Ctrl-C clears the composer or
+quits. Shift-Enter or
 Alt-Enter (or Ctrl-J) starts a new line. The composer takes a shell's editing
 keys, as Codex's does: Ctrl-A/E and Ctrl-B/F move, Alt-B/F (or Alt- or
 Ctrl-arrows) move a word, Up and Down (or Ctrl-P/N) move a row, Ctrl-H and Ctrl-D delete a
@@ -878,6 +880,17 @@ has something on it, or is off the screen, no time shows.
   can't tell sockets apart, so a row that names any reaches them all. No
   agent reaches the daemon's own socket, only its own, through which the
   `agent` and `sonny` commands work as that agent.
+
+  A call that waits on you is written out as Codex's approval shows it:
+  `⏸ Allow shell?`, the agent's own reason for it as `Reason:`, the
+  command, and what the reviewer doubted, whole. The calls of your lead's
+  tasks wait in its window too, and so do those of the leads it follows by
+  name (`follows`) and their tasks, at any depth, each under `↳ From AGENT`:
+  you answer where you are, on that agent's own call, and it is gone from
+  every window once answered in any. The questions they ask pin there the
+  same way.
+
+  ![An approval from a followed lead's task, with its reason and the reviewer's note](../docs/sonny/approval-raised.png)
 
   ![An approval prompt offering to always allow cargo test](../docs/sonny/permissions-always.png)
 
