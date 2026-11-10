@@ -81,6 +81,8 @@ to the agent picked instead, its title, `↗` and Ctrl+G following it and
 ‹ still going back where it went; the main window stays as it is. A side
 chat keeps to its agent, and `/new` is for the main window only.
 
+![The pane after /switch tally.docs typed in it: its title docs ↗ with ← back, the docs task's conversation under it](../docs/sonny/pane-switch.png)
+
 ![/switch listing every agent, then narrowed by typing fix, in Flexoki dark and light](../docs/sonny/switch-picker.png)
 
 `/new [NAME]`, in a lead's window, starts an agent from its folder in three
@@ -704,6 +706,8 @@ tinted bar, dim: two lines of it, then `… quoted, N more lines ▸`, which a
 click opens and closes. The bar is a coloured cell, not a character, so a
 copy of the quote is its words alone.
 
+![A reply sent: two lines of its quote on the bar, … quoted, 3 more lines ▸, then the person's own words](../docs/sonny/reply-quote-fold.png)
+
 ![↩ in place of the bullet of the message under the mouse](../docs/sonny/reply-mark.png)
 
 ![The message quoted into the composer](../docs/sonny/reply-quoted.png)
@@ -946,6 +950,8 @@ has something on it, or is off the screen, no time shows.
 
   ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/status-keys.png)
 
+  ![/status with Idle open and the lead picked, its row shown reversed](../docs/sonny/status-lead-picked.png)
+
   ![/status naming each agent's profile beside its model: superlead, task, reviewer](../docs/sonny/status-profile.png)
 
   ![A task opened from /status in the pane, its ‹ going back to /status](../docs/sonny/status-opens-agent.png)
@@ -1007,7 +1013,7 @@ has something on it, or is off the screen, no time shows.
   A narrow pane puts the grid over the list. Under them, what the last
   compaction freed and the room it left.
 
-  ![/context in the pane](../docs/sonny/context-card.png)
+  ![/context in the pane: a grid of a hundred cells, each part in its own mark, beside the list of parts](../docs/sonny/context-card.png)
 - `/commons` (or `/forum`) shows, in the pane beside the conversation, the
   threads the agents of every project share in the commons, newest first,
   each with who started it, how many posts it has, who wrote last and how
@@ -1333,7 +1339,7 @@ turn of the task numbered after that one reopens it.
 
 ![A decision the lead asked with the ask tool, drawn where it asked it, its code, bold, math and links read as Markdown](../docs/sonny/ask-markdown.png)
 
-![/status as it opens: one task under Needs you saying what it asks, the lead and two tasks under Working with their times and pull requests at the right, a task's helper folded under it, Idle and Done folded to their headings](../docs/sonny/status-groups.png)
+![/status as it opens: a head counting 1 needs you, 1 working, 1 idle and 1 done; one task under Needs you saying what it asks, one under Working with its time, Idle and Done folded to their headings](../docs/sonny/status-groups.png)
 
 ![/status after m: what each agent tracks at the right edge, the picked task's model, profile and latest step under it, Idle opened](../docs/sonny/status-more.png)
 

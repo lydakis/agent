@@ -1296,8 +1296,13 @@ fn quote_rows_of(
         None => Markdown::default(),
     };
     let count = quote.lines().count();
-    let shown = match count > QUOTE_LINES + 2 {
-        true => QUOTE_LINES,
+    // Its first lines with words in them: a blank line shows nothing.
+    let head = (quote.lines().enumerate())
+        .filter(|(_, line)| !quote_line(line).unwrap_or(line).trim().is_empty())
+        .nth(QUOTE_LINES - 1)
+        .map_or(count, |(at, _)| at + 1);
+    let shown = match count > head + 2 {
+        true => head,
         false => count,
     };
     let leads = (Line::from("  "), Line::from("  "));
@@ -3689,6 +3694,17 @@ mod tests {
         assert_eq!(shown[folds.more.unwrap()], "  … +6 lines ▸");
         let more = text(&prompt_more(&format!("{quote}\n{words}"), 80, true, None));
         assert_eq!(more[0], "  - item 7");
+        // A blank line in it shows nothing: the two lines shown have words.
+        let (rows, _) = prompt("> Fixed\n>\n> it rounds\n> a\n> b\n> c\n\nok", 80, None);
+        assert_eq!(
+            text(&rows)[1..5],
+            [
+                "  ▌ Fixed",
+                "  ▌ ",
+                "  ▌ it rounds",
+                "  ▌ … quoted, 3 more lines ▸"
+            ]
+        );
         // A short quote shows whole; a message that is all quote, or that
         // quotes after words of its own, reads as before.
         let (rows, folds) = prompt("> one\n> two\n\nok", 80, None);
