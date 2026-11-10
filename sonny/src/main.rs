@@ -3788,6 +3788,8 @@ struct App {
     /// The last `compacted` event's data, its summary and room (#718),
     /// for `/context`.
     compacted: Option<Value>,
+    /// What `/context` read, and the width its card was last laid at.
+    context_read: Option<(context::Parts, Option<usize>)>,
     input: prompt::Prompt,
     /// The prompts sent before, which Up and Down bring back.
     recall: recall::Recall<Vec<Option<attach::Picture>>>,
@@ -5421,6 +5423,7 @@ impl App {
             context: None,
             window: None,
             compacted: None,
+            context_read: None,
             input: prompt::Prompt::default(),
             recall: recall::Recall::default(),
             pending: Vec::new(),
@@ -10069,10 +10072,14 @@ impl App {
             }
             Some(version) => compaction_named(&self.options.socket, version).await,
         };
-        let lines = context::card(&self.bot, &parts);
-        self.watch = None;
+        // Laid now as the pane lays a card, and again by a frame that
+        // finds the pane another width.
+        let wide = pane::width(self.full_width, kept(self.full_width));
+        let width = card_width(wide);
         let mut pane = pane::Pane::card("context", "esc close");
-        pane.set_card(lines, "esc close");
+        pane.set_card(context::card(&self.bot, &parts, width), "esc close");
+        self.context_read = Some((parts, Some(width)));
+        self.watch = None;
         self.open_pane(pane);
     }
 
@@ -14659,6 +14666,22 @@ impl App {
                 }
             }
         }
+        // `/context`'s card, laid again only when the pane's width moved,
+        // so its grid and the list beside it never wrap into pieces.
+        if let (Some((parts, laid)), Some(pane)) = (&mut self.context_read, &mut self.pane)
+            && pane.is_card()
+            && pane.title() == "context"
+        {
+            let wide = match chat.width {
+                0 => size.width,
+                _ => pane::width(size.width, kept(size.width)),
+            };
+            let width = card_width(wide);
+            if *laid != Some(width) {
+                *laid = Some(width);
+                pane.set_card(context::card(&self.bot, parts, width), "esc close");
+            }
+        }
         // The links drawn, to be written again as hyperlinks.
         let mut linked = Vec::new();
         // Where the pane's program has its cursor.
@@ -15661,6 +15684,14 @@ impl App {
         }
         footer::lay(items, width)
     }
+}
+
+/// The width a card is laid at in a pane `wide` columns: each row is
+/// drawn a column in from the line between, at the conversation's measure.
+fn card_width(wide: u16) -> usize {
+    (wide.saturating_sub(2) as usize)
+        .min(measure())
+        .saturating_sub(1)
 }
 
 /// `rows` drawn over what is right above `below`, cleared first.
