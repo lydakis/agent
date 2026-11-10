@@ -171,8 +171,9 @@ Send more instructions into the turn that's already running:
 agent run --bot scout --delivery steer -- "Skip the integration tests"
 ```
 
-Or stop it: `agent interrupt --bot scout`. A busy bot rejects new work unless
-you choose `--delivery queue` or `steer`. A queued message it has not started
+Or stop it: `agent interrupt --bot scout`. A message to a busy bot steers its
+running turn unless you say otherwise: `--delivery queue` lines it up behind,
+and `--delivery reject` refuses it. A queued message it has not started
 can be taken back with `agent interrupt --bot scout --turn N`.
 
 ## Let bots delegate
@@ -214,7 +215,8 @@ Output is JSON by default: `run` and `follow` stream one event per line (text,
 thinking, tool calls and results, usage, state changes), and the other commands
 print one JSON value or nothing. Exit codes are stable: 0 success, 1 failed or
 incomplete, 2 invalid usage, and 75 when `agent serve` finds another daemon
-already owns the store. The [CLI contract](docs/CLI.md) has the details.
+already owns the store (`agent sandbox` exits with its command's own status,
+or 125 when it fails itself). The [CLI contract](docs/CLI.md) has the details.
 
 Programs that want a persistent connection can speak the daemon's JSONL socket
 protocol directly; [`client/`](client) is a Rust client for it. See the

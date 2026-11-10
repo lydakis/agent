@@ -199,7 +199,7 @@ tries its held turns at once.
   plus margin).
   Without the flag, `AGENT_APPROVAL` applies, then `full`. `--approve LIST`
   picks the gated tools and must name at least one; the default is every
-  tool but `history`, `wait`, `note`, and `echo`, and in `auto` `read` too. A fork keeps its source's gates and a created bot its
+  tool but `history`, `wait`, `note`, `echo` and `web_search`, and in `auto` `read` too. A fork keeps its source's gates and a created bot its
   creator's ([APPROVALS.md](APPROVALS.md)); `fork` takes no approval flags, and a
   program that wants a fork gated further passes `approve` on the protocol's `fork`.
 - `approvals [--bot NAME] [--tag TAG] [--full]` lists the calls waiting on a gate.
@@ -381,6 +381,7 @@ a daemon that exits without one is `daemon_start_failed`, naming the log.
 | 1 | Operation failed, requested result is incomplete, or wait timed out |
 | 2 | Invalid command-line usage |
 | 75 | `serve` could not acquire store/socket ownership |
+| 125 | `agent sandbox` itself failed (a usage error included); otherwise it exits with its command's own status |
 
 `wait --bot NAME` waits on that bot's running turn, else its newest, so a
 caller can wait on work it did not submit; the result is keyed by the handle
@@ -429,8 +430,7 @@ provider/limit flags shown in help and `--no-spawn` to require an
 already running daemon. Startup flags configure a newly started daemon. A
 running daemon is never reconfigured: a stated startup flag it does not match
 fails the command with `daemon_configuration_mismatch` naming the difference.
-Comparison uses effective limits: `--idle-exit 0` means disabled, and positive
-context limits are clamped to at least 1,024 bytes and two items.
+Comparison uses effective limits: `--idle-exit 0` means disabled.
 With no `--provider`, a started daemon takes `AGENT_PROVIDER` (the same specs,
 separated by whitespace), else `provider` in `~/.agent/config.toml` (the
 same), else the providers whose key variable is set; a

@@ -131,7 +131,7 @@ published JavaScript):
   `openNodeSqliteDatabase()` is exported, so a caller can open the database,
   change the pragma, and pass it to the exported `SqliteStorage.open()`; the
   benchmark adapter does that for FULL. Agent opens WAL with
-  `synchronous=FULL` (`src/store/db.rs`, line 1041).
+  `synchronous=FULL` (`src/store/db.rs`, where the store is opened).
 - Each transaction is `BEGIN IMMEDIATE` … `COMMIT` on one connection
   (`node.js` line 113), and `SqliteStorage.commit()` runs one transaction per
   Session commit (`storage/sqlite/storage.js` line 102). The Session has one

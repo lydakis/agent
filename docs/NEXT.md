@@ -1090,8 +1090,8 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     rewrites only discovery's catalog, so a model added to `~/.agent/models`
     by hand stays (done 2026-11-07).
 
-Kept out of the queue: process sandboxing, which is the host's job as the
-tools section says.
+Kept out of the queue: process isolation beyond the built
+[sandbox](RUST_PROTOTYPE.md#sandbox), a container or VM, which is the host's job.
 
 ## Stop conditions
 

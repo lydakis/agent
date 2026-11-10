@@ -103,8 +103,7 @@ at attach, and a difference fails with `daemon_configuration_mismatch` naming
 each one, before anything is submitted. Defaults and providers implied by
 environment keys never conflict; a stated provider must be registered with the
 same family and URL. Limit comparisons
-use effective values: `--idle-exit 0` disables idle exit, and positive context
-limits below 1,024 bytes or two items are raised to those minimums.
+use effective values: `--idle-exit 0` disables idle exit.
 Providers are selected explicitly with `--provider`; otherwise by
 `AGENT_PROVIDER`, which holds the same specs separated by whitespace (a spec
 contains commas), such as `AGENT_PROVIDER="chatgpt bedrock"`; otherwise by which
@@ -169,8 +168,9 @@ resume, fork, inspect, and interrupt operations apply to all agents.
 
 `agent run --detach` commits a submission and prints its bot, turn, request ID,
 status, and durable cursor, then exits. Completion is independent of the
-submitting client. `--delivery queue` or `steer` hands a busy bot the work
-instead of getting `bot_busy` ([delivery modes](#delivery-modes)). A controller can inspect metadata through `ls` or observe events through
+submitting client. A busy bot is handed the work by `--delivery steer` (the
+CLI's default) or `queue`; `--delivery reject` gets `bot_busy` instead
+([delivery modes](#delivery-modes)). A controller can inspect metadata through `ls` or observe events through
 `follow` from outside a shell tool. Full records remain available via the protocol.
 
 Shell tool processes receive `AGENT_BIN` (the daemon's own program, or the
@@ -542,7 +542,7 @@ Parked agents cost a store row and a registry entry. An agent in a model call
 costs its request body read-ahead (64 items at a time), the parser buffers, and
 a connection; no transcript is held in memory. Resolved waits queue until `--max-active` has capacity, including after restart.
 Interrupting a queued turn cancels that turn without starting its continuation.
-The 200-provider-round budget belongs to the durable turn, so parking or
+A bot's `max_rounds`, when set, belongs to the durable turn, so parking or
 restarting the daemon does not replenish it. The counter commits with each
 model response, without an additional disk commit.
 
@@ -926,20 +926,21 @@ timeout and a 120 second idle read timeout, and no total deadline. The read
 timeout restarts on any byte, so a provider that sends only keepalives (Anthropic
 `ping` events or SSE comments) would hold a turn indefinitely. An established
 stream therefore also fails with `provider_stream_stalled` when no content frame
-arrives within `--stall-timeout` (120 seconds by default); keepalives never renew
+arrives within `--stall-timeout` (10 minutes by default); keepalives never renew
 that bound, and time spent publishing deltas to followers does not count against it. Provider error
 bodies are reduced to a bounded `detail` string; codes never contain URLs or keys.
-Live provider behavior has been exercised only through synthetic endpoints in
-tests; see [NEXT.md](NEXT.md).
+Tests exercise provider behavior through synthetic endpoints; the live runs
+are listed in [EVIDENCE.md](EVIDENCE.md).
 
 ## Core ownership and resource bounds
 
 One process uses a Tokio I/O runtime with one scheduler thread, one shared reqwest
 client, and asynchronous agent tasks. Each client session drains its output
 independently (a thread for stdio, a task per socket). Durable mode adds one
-storage worker for all bots, one storage reader, and one reader per session.
-These are threads and tasks, not one process per bot. The storage reader is a
-second SQLite connection in query-only mode on its own thread; it serves
+storage worker for all bots, a pool of storage readers (one open when
+quiet, at most `--max-readers`), and one reader per session.
+These are threads and tasks, not one process per bot. A storage reader is a
+SQLite connection of its own in query-only mode on its own thread; it serves
 reads whose result is bytes for a caller, today the batches of context items
 that stream into a model request, so a long history's 8 MiB window is not
 read on the thread every other bot's commit waits for. It sees a job's
@@ -1006,8 +1007,8 @@ allocates the new item; an in-memory fork shares its prefix. Requests stream
 references to these items with an explicit Content-Length. They do not rebuild
 or stringify the full conversation on each turn. Provider HTTP/TLS comes from
 [reqwest](https://docs.rs/reqwest/0.13.4/reqwest/struct.Body.html), scheduling from
-[Tokio](https://docs.rs/tokio/1.53.1/tokio/runtime/struct.Builder.html), and disk
-transactions from [rusqlite](https://docs.rs/rusqlite/0.40.2/rusqlite/).
+[Tokio](https://docs.rs/tokio/1.54.1/tokio/runtime/struct.Builder.html), and disk
+transactions from [rusqlite](https://docs.rs/rusqlite/0.41.1/rusqlite/).
 
 Current limits: 8 MiB / 4,096 items of model context per request (stored
 history is unbounded), 256 KiB input prompt, 64 KiB instructions, no bound of
@@ -1018,17 +1019,16 @@ NUL, or one an earlier call of the response or turn used fails the response
 with `invalid_tool_call_id`, so every gated call can be listed and answered
 by a command naming it alone), a 16 MiB response stream, over HTTP or a
 socket, which also bounds one SSE frame (an endpoint that never stops; no
-model writes that much), 200 provider rounds per turn, and the configurable
+model writes that much), and the configurable
 active-turn, process, and connection-startup bounds below. Provider startup
 admission, when bounded, has a 60-second timeout and releases its permit when
 response headers arrive. Both live providers hold headers until the first
 token, so the permit covers the whole time to first token; the bound is off by
 default and the derived connection count is what keeps a fleet streaming in
-parallel. There is no automatic compaction: exceeding a bound is an
-explicit error. Opaque reasoning items count toward the same byte and item
+parallel. Exceeding a bound is an explicit error; what keeps a long
+conversation within its context bounds is [compaction](#compaction). Opaque reasoning items count toward the same byte and item
 limits as text and tool history; reasoning-heavy conversations can reach the
-limits sooner. They are not discarded to make history appear smaller. Indexed
-history and bounded context selection remain the next storage work.
+limits sooner. They are not discarded to make history appear smaller.
 
 Each session's output channel is bounded by bytes, as NATS and Redis bound a
 slow consumer: at most 2 MiB queued or being written, each packet counting
@@ -1065,7 +1065,7 @@ operations.
 
 Reads that decide nothing run beside the service loop, not in it:
 `history_nodes`, `history_items`, `history_search`, `turns`, `bots`,
-`events`, `usage` and `prompts`. Each runs on one of the store's reader
+`events`, `usage`, `prompts` and `audit`. Each runs on one of the store's reader
 connections (at most `--max-readers`, one per logical CPU by default; WAL
 readers do not block each other or the writer). One reader opens with the
 store; another opens when a read is queued with no reader free to take
@@ -1094,8 +1094,8 @@ event without subscribing (the benchmark and lifecycle tools use it). With
 `--socket PATH` it is a daemon: it prints `ready` once on stdout, accepts any
 number of Unix-socket sessions, and runs until `shutdown`, SIGTERM, or SIGINT.
 Each socket session begins with a `ready` line and must `follow` the bots it
-wants to observe. `ready` carries the protocol version, and the CLI, the app
-and `agent_client` refuse a daemon of any other with
+wants to observe. `ready` carries the protocol version, and the CLI and
+`agent_client` refuse a daemon of any other with
 `daemon_protocol_mismatch`: the daemon and its clients ship together, and
 none keeps an earlier protocol working. `agent start` and `agent run` never
 start a second daemon for the same socket: they refuse a newer one, and
@@ -1243,7 +1243,7 @@ own path from the turn. Example requests:
 
 ```json
 {"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-5","effort":"low","instructions":"...","tools":["shell","read","write","edit","wait","history"],"compaction_instructions":"...","created_by":"Alice","created_by_id":42}
-{"id":2,"op":"submit","bot":"Bob","request_id":"work-1","prompt":"Hello","workspace":"/workspaces/project-copy","model":"anthropic/claude-opus-5-5"}
+{"id":2,"op":"submit","bot":"Bob","request_id":"work-1","prompt":"Hello","delivery":"reject","workspace":"/workspaces/project-copy","model":"anthropic/claude-opus-5-5"}
 {"id":19,"op":"submit","bot":"Bob","request_id":"work-2","prompt":"Also check the docs","delivery":"steer"}
 {"id":3,"op":"follow","bot":"Bob","after":0}
 {"id":4,"op":"inspect","bot":"Bob"}
@@ -1274,7 +1274,7 @@ own path from the turn. Example requests:
 {"id":24,"op":"serve_approvals","tag":"auto","lease_ms":5000,"limit":64}
 {"id":25,"op":"renew_approvals","tag":"auto","lease":1790460421345}
 {"id":26,"op":"answer","bot":"Carol","turn":7,"call_id":"call_2","request":1,"tag":"auto","decision":"allow","by":"approver","lease":1790460421345}
-{"id":27,"op":"submit","bot":"Dave","request_id":"child-1","prompt":"Summarize the build log","from":{"bot":"Carol","turn":7}}
+{"id":27,"op":"submit","bot":"Dave","request_id":"child-1","prompt":"Summarize the build log","delivery":"queue","from":{"bot":"Carol","turn":7}}
 {"id":28,"op":"prompts","bot":"Carol","turn":7,"bytes":65536}
 {"id":12,"op":"shutdown"}
 {"id":21,"op":"shutdown","grace_ms":30000}
@@ -2405,18 +2405,17 @@ passes bounded blob slices into Rust rather than loading whole messages there.
 SQLite may parse and copy a whole item to filter it; items are transformed
 one at a time, outside the query that orders the turn.
 A number past the lineage returns `turn_not_in_history`; an offset past the end or inside a UTF-8
-character returns `invalid_history_page`. No summaries are made and nothing is
-deleted; compaction with summaries remains future work in [LONG_HISTORY.md](LONG_HISTORY.md).
+character returns `invalid_history_page`. A read makes no summary and deletes nothing;
+[compaction](#compaction) summarizes what a request carries and leaves the
+stored history whole.
 
 The window always contains the whole current turn. If that turn alone exceeds
 a budget even with its answered tool results [elided](#tool-result-elision),
-the turn fails with `context_limit` rather than sending a truncated request. Both limits are daemon flags forwarded by the client, reported in
-`ready` as `limits.context_bytes` and `limits.context_items`, and advertised as
-the `context_window` capability. Version 20 repairs previously blocked
+the turn fails with `context_limit` rather than sending a truncated request. Both limits are
+bot settings (`context_bytes`, `context_items`). Version 20 repairs previously blocked
 `uncertain` bots once, appending missing tool results without rewriting original
 history. If operational tool records were pruned, repair reconstructs unanswered
-calls from the interrupted turn's durable transcript. Stores are schema version
-32; supported migrations run at open. Store initialization and migration run in one
+calls from the interrupted turn's durable transcript. Supported migrations run at open. Store initialization and migration run in one
 transaction. [Project policy](../AGENTS.md#no-compatibility-branches) allows
 one-way migrations but no legacy runtime behavior for earlier Agent versions.
 
@@ -2587,8 +2586,9 @@ and idempotency rows remain intact.
 Freed pages are reused by later writes rather than returned to the
 filesystem, so a bounded fleet's store stops growing instead of shrinking.
 For a long-lived bot the transcript itself still grows with every turn (about
-850 bytes per turn on the sustained workload); bounding that is compaction,
-which is future work, or deleting the bot.
+850 bytes per turn on the sustained workload): compaction bounds what a
+request carries, not what is stored, so bounding that is `prune` or
+deleting the bot.
 
 ## Tools and validation scope
 
@@ -2600,7 +2600,6 @@ registry validates tool names and arguments before execution; a tool that fails
 overflow) returns an error result to the model and the turn continues. Only a
 closed tool scheduler fails the turn. Allowed tools run without approval
 prompts unless the bot was created with a gate (see [tool approval](#tool-approval)).
-A store remains bound to its tool set; changing it requires a new store.
 
 `shell` runs a noninteractive command with `/bin/bash -c` (`/bin/sh` where
 bash is not installed) in the bot workspace with
@@ -2778,7 +2777,7 @@ command reaches another bot's. A request on it:
 
 | Request | On a bot's own socket |
 |---|---|
-| `configure`, `answer`, `tool_result`, `approve_step`, `step_result`, `serve_approvals`, `renew_approvals`, `shutdown` | `not_permitted`: any of them would let a confined command undo its confinement |
+| `configure`, `answer`, `tool_result`, `take_call`, `approve_step`, `step_result`, `serve_approvals`, `renew_approvals`, `lend`, `resume`, `retry_held`, `companions`, `shutdown` | `not_permitted`: any of them would let a confined command undo its confinement |
 | `audit_trim` | `not_permitted`: the audit trail is the person's record of what agents did |
 | `create`, `fork` | Made by the caller, whatever `created_by` names (another is `not_permitted`), so the bot inherits its sandbox; its workspace and `writable` folders, and a fork's source's, must be ones the caller may write. A fork with `allow: []`, which only answers, may be of any bot |
 | `submit` | Reads as the caller's: `from` its turn when the request names it (the CLI does, from `AGENT_TURN`), else with its name as `origin`; `from` naming another bot is `not_permitted`. A workspace for a sandboxed bot must be one the caller may write |
@@ -3034,7 +3033,7 @@ schema 75 drops the setting from its bots; Sonny moves its own
 ### Declared tools
 
 Protocol version 19 lets a client declare tools of its own on a bot:
-`create` and `configure` take `declare`, a list of up to 16
+`create` and `configure` take `declare`, a list of up to 32
 `{name, description, parameters, result?}` taking at most 64 KiB, which
 `configure` replaces whole (`[]` removes them). The model is shown them after
 the daemon's tools, and the daemon never runs one: a call is checked against
@@ -3364,7 +3363,7 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
 
 The CLI turns a mode into a gate. `run --new --approval manual`, or
 `AGENT_APPROVAL=manual`, gates every tool of the new bot but `history`,
-`wait`, `note`, and `echo`, tagged `manual`; `--approve LIST` picks the
+`wait`, `note`, `echo` and `web_search`, tagged `manual`; `--approve LIST` picks the
 tools instead, and `fork` takes both. `full`, the default, gates nothing.
 `auto` gates the same tools but `read`, tagged `auto`, with a 105 s
 expiry (the approver's 90 s review budget plus margin), and refuses with

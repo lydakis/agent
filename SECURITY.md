@@ -175,8 +175,8 @@ vulnerability, whether or not the code's own documentation agrees.
   interrupts the turn. The reviewer reads `AGENTS.md` files as the person's
   standing instructions, so a checkout's `AGENTS.md` is as trusted as the
   checkout.
-- Any agent can pull the andon cord (`pause`), which cancels running turns
-  and ends background processes and is attributed to the agent that pulled
+- Any agent can pull the andon cord (`pause`), which parks running turns
+  until `resume` and ends background processes and is attributed to the agent that pulled
   it; only a client on the daemon's own socket can `resume`.
 
 ### Credentials and secrets
