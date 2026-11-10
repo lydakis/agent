@@ -10847,10 +10847,18 @@ impl App {
             )
             .await;
         match answered {
-            // A call below that could not be answered waits here still.
+            // A call below that could not be answered is read again: it
+            // waits here still, asked again under a new request when an
+            // earlier call of its round was refused.
             Err(error) if !own => {
                 self.notice = Some(error.to_string());
-                self.raised.insert(at, call);
+                let read = (
+                    bot,
+                    call["turn"].as_i64().unwrap_or(-1),
+                    call["call_id"].as_str().unwrap_or_default().to_owned(),
+                );
+                self.raised_read.remove(&read);
+                self.raise_approvals().await;
                 return;
             }
             Err(error) => self.notice = Some(error.to_string()),
@@ -22868,10 +22876,13 @@ mod tests {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = sent.clone();
         let seen_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Each listing asks anew, as a round re-announced after a refusal.
+        let request = Arc::new(std::sync::atomic::AtomicU64::new(9));
         let (client, events) = daemon_with_events(json!({}), move |asked| {
             match (asked["op"].as_str().unwrap_or(""), asked["bot"].as_str()) {
                 ("approvals", Some("shop.fix")) => json!({"approvals": [
-                    {"bot": "shop.fix", "turn": 4, "call_id": "c1", "request": 9,
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c1",
+                        "request": request.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
                         "name": "shell", "gates": ["auto"],
                         "asked": [{"tag": "auto", "reason": "It publishes the crate.\nNothing the person said asks for it."}],
                         "arguments": {"command": "cargo publish",
@@ -22966,6 +22977,8 @@ mod tests {
                 &json!("auto")
             )
         );
+        // Under the request it was read again with, not the one that failed.
+        assert_eq!(sent[0]["request"], 10);
         assert!(app.raised.is_empty() && app.waiting().is_none());
         // Answered anywhere, it waits here no more.
         let fleet = app.fleet.as_mut().unwrap();

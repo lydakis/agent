@@ -4084,8 +4084,9 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     assert!(listed["approvals"].as_array().unwrap().is_empty());
     // Text past the budget is cut and marked; steers and calls past it are
     // left out.
+    // With steers to read, the prompt takes at most half.
     let cut = db.prompts("Carol", turn, 5).unwrap();
-    assert_eq!(cut["prompts"][0]["text"], "deleg");
+    assert_eq!(cut["prompts"][0]["text"], "del");
     assert_eq!(cut["prompts"][0]["truncated"], true);
     assert_eq!(cut["prompts"].as_array().unwrap().len(), 1);
     assert_eq!(cut["prompts_more"], true);
@@ -4208,6 +4209,36 @@ fn a_prompts_read_keeps_the_prompt_and_the_newest_steers() {
     assert_eq!(texts(&cut), ["start", "no, wait", "hold off"]);
     assert_eq!(cut["prompts"][1]["turn"], steers[1]);
     assert_eq!(cut["prompts_more"], true);
+    // A prompt longer than the whole budget still leaves the newest
+    // steer room: it takes half, and is cut.
+    db.create("Dave", Some("/synthetic"), binding()).unwrap();
+    let long = db
+        .begin(
+            "Dave",
+            "q",
+            &"x".repeat(300),
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.begin("Dave", "q1", "stop", true, &steer, allow_provider)
+        .unwrap();
+    db.absorb(
+        long,
+        None,
+        8 << 20,
+        4096,
+        ContextUsage::default(),
+        false,
+        true,
+    )
+    .unwrap();
+    let cut = db.prompts("Dave", long, 2 * entry + 20).unwrap();
+    assert_eq!(cut["prompts"][0]["text"], "x".repeat(entry + 10));
+    assert_eq!(cut["prompts"][0]["truncated"], true);
+    assert_eq!(cut["prompts"][1]["text"], "stop");
 }
 
 /// The calls left out of a read are older than all it lists; the files

@@ -9780,7 +9780,16 @@ impl Database {
             self.inspect(name)?;
             return fail("turn_not_found");
         };
-        let mut left = bytes;
+        // With steers, the prompt and what it answers take at most half:
+        // the rest is kept for the newest steers, so a long prompt never
+        // leaves out the person's newest words; what it leaves unused
+        // goes to them too.
+        let steered: bool = self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM events WHERE turn=? AND kind='steered')")?
+            .query_row([turn], |r| r.get(0))?;
+        let kept_for_steers = if steered { bytes / 2 } else { 0 };
+        let mut left = bytes - kept_for_steers;
         let mut first = self.prompt_entry(turn, words, &mut left)?;
         // What the bot last said before the words: what a person's short
         // answer, such as "yes", answers.
@@ -9802,6 +9811,7 @@ impl Database {
         if let Some(said) = said {
             first["reply"] = Self::reply(&said, &mut left);
         }
+        left += kept_for_steers;
         let mut prompts_more = false;
         // The newest steers first, as Codex's reviewer keeps a person's
         // newest words: what is left out is older than all that is read.

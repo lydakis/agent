@@ -884,8 +884,10 @@ has something on it, or is off the screen, no time shows.
   A call that waits on you is written out as Codex's approval shows it:
   `⏸ Allow shell?`, the agent's own reason for it as `Reason:`, the
   command, and what the reviewer doubted, whole. The calls of your lead's
-  tasks wait in its window too, and so do those of the leads it follows by
-  name (`follows`) and their tasks, at any depth, each under `↳ From AGENT`:
+  tasks wait in its window too, and, where the lead runs in a multiplexer
+  (which is how its window follows other agents), so do those of the leads
+  it follows by name (`follows`) and their tasks, at any depth, each under
+  `↳ From AGENT`:
   you answer where you are, on that agent's own call, and it is gone from
   every window once answered in any. The questions they ask pin there the
   same way.
