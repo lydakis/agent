@@ -1718,8 +1718,9 @@ newest first, as Codex's reviewer keeps the newest, so what is left out is
 older than all that is listed (protocol 62); with steers, the prompt and
 its `reply` take at most half of `bytes`, so the newest steer always has
 room; the files the calls left
-out wrote, by name alone, as `written` (within 8 KiB of names, with
-`written_more` when some could not be named), so a later call that runs
+out wrote, by name alone, as `written` (within 8 KiB of names, looking
+through at most 256 left-out calls, with `written_more` when some could
+not be named), so a later call that runs
 one is still judged with it; and the bot's earlier prompts, newest first, with `more`
 when some were left out. A prompt or steer, this turn's or an earlier
 one's, carries the calls its turn was refused after it and before the

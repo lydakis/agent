@@ -9591,6 +9591,9 @@ impl Database {
     /// The most bytes of file names a `prompts` read lists as `written` by
     /// the calls it leaves out.
     pub const PROMPTS_WRITTEN: usize = 8 * 1024;
+    /// The most calls a `prompts` read looks through, past its `bytes`, for
+    /// the files they wrote; more leave `written_more`.
+    pub const PROMPTS_SCANNED: usize = 256;
     /// The most bytes a prompt's words and the words it quotes may have
     /// together, as many as its words alone may.
     pub const QUOTED_BYTES: usize = 256 * 1024;
@@ -9921,8 +9924,15 @@ impl Database {
                 calls_more = true;
                 // Past the budget, only what writes files is read, and of
                 // it only the names, while they fit.
-                let mut row = Some(r);
+                // And of those, a bounded number: a long turn's history
+                // is not read whole for a small reply.
+                let (mut row, mut scanned) = (Some(r), 0);
                 while let Some(r) = row {
+                    if scanned == Self::PROMPTS_SCANNED {
+                        written_more = true;
+                        break;
+                    }
+                    scanned += 1;
                     let name: Option<String> = r.get(1)?;
                     if matches!(name.as_deref(), Some("write" | "edit" | "apply_patch"))
                         && !wrote(&r.get::<_, String>(0)?)?

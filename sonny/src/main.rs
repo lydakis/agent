@@ -4610,7 +4610,14 @@ fn lead_and_lineage(bots: &[Value], lead: &str) -> std::collections::HashSet<Str
     let names = bots.iter().filter_map(|bot| bot["name"].as_str());
     let inner = inner_projects(names, project);
     let mut theirs = lineage_of(bots, lead, lead == format!("{project}.lead"));
-    theirs.retain(|bot| !inner.iter().any(|p| bot.starts_with(&format!("{p}."))));
+    // A side chat expires and is the person's own, as `reconcile` keeps it.
+    let expiring: std::collections::HashSet<&str> = (bots.iter())
+        .filter(|bot| !bot["expire_ms"].is_null())
+        .filter_map(|bot| bot["name"].as_str())
+        .collect();
+    theirs.retain(|bot| {
+        !expiring.contains(bot.as_str()) && !inner.iter().any(|p| bot.starts_with(&format!("{p}.")))
+    });
     theirs.insert(lead.to_owned());
     theirs
 }
@@ -22794,6 +22801,8 @@ mod tests {
             bot("shop.web.lead", ""),
             bot("shop.web.page", "shop.web.lead"),
             bot("shop.web.loose", ""),
+            // A side chat of a task is the person's own.
+            json!({"name": "shop.fix.side", "created_by": "shop.fix", "expire_ms": 60000}),
         ];
         let mut theirs: Vec<String> = lead_and_lineage(&bots, "shop.lead").into_iter().collect();
         theirs.sort();

@@ -4300,6 +4300,19 @@ fn a_prompts_read_names_the_files_its_left_out_calls_wrote() {
         (&whole["written"], &whole["written_more"]),
         (&json!([]), &json!(false))
     );
+    // Only so many left-out calls are looked through: a write older than
+    // them is not named, and the read says some are not.
+    for n in 0..Database::PROMPTS_SCANNED {
+        let (item, call) = call(&format!("x{n}"), "shell", json!({"command": "ls"}));
+        db.append(turn, vec![item], std::slice::from_ref(&call), None)
+            .unwrap();
+        db.tool_start(turn, &call, false, false).unwrap();
+    }
+    let read = db.prompts("Carol", turn, entry + 40).unwrap();
+    assert_eq!(
+        (&read["written"], &read["written_more"]),
+        (&json!([]), &json!(true))
+    );
 }
 
 #[test]
