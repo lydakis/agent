@@ -616,8 +616,14 @@ pub const NESTED_GONE: &str = "nested-repositories-gone";
 /// write until 0.9.2, and the agent kept those until its permissions were
 /// picked again, so a gone or emptied one gave a placeholder inside a
 /// placeholder, or failed every command. Run by the lookout, from a whole
-/// listing. One that can't be read or changed now is tried again next time.
-pub async fn nested_gone(client: &agent_client::Client, bots: &[Value], store: &std::path::Path) {
+/// listing, beside its start rather than before it: once done, it costs a
+/// read of the record. One that can't be read or changed now is tried
+/// again next time.
+pub fn nested_gone(
+    client: std::sync::Arc<agent_client::Client>,
+    bots: &[Value],
+    store: &std::path::Path,
+) {
     let mut record = store.as_os_str().to_owned();
     record.push(".migrated");
     let record = std::path::PathBuf::from(record);
@@ -627,60 +633,86 @@ pub async fn nested_gone(client: &agent_client::Client, bots: &[Value], store: &
     {
         return;
     }
-    let mut all = true;
-    for bot in bots {
-        let (name, id) = (&bot["name"], &bot["bot_id"]);
-        let Ok(inspected) = client
-            .request("inspect", json!({"bot": name, "bot_id": id}))
-            .await
-        else {
-            all = false;
-            continue;
-        };
-        let kept = tokio::task::spawn_blocking(move || without_nested(&inspected)).await;
-        let Ok(Some(kept)) = kept else {
-            all &= kept.is_ok();
-            continue;
-        };
-        let asked = json!({"bot": name, "bot_id": id, "settings": {"writable": kept}});
-        match client.request("configure", asked).await {
-            Ok(_) => {}
-            Err(error) if error.code == "bot_not_found" => {}
-            Err(error) => {
-                eprintln!("sonny: {NESTED_GONE} waits on {name}: {error}");
+    // Only an agent with a folder has repositories inside it.
+    let bots: Vec<(Value, Value)> = (bots.iter())
+        .filter(|bot| bot["workspace"].is_string())
+        .map(|bot| (bot["name"].clone(), bot["bot_id"].clone()))
+        .collect();
+    tokio::spawn(async move {
+        let mut all = true;
+        for (name, id) in bots {
+            let Ok(inspected) = client
+                .request("inspect", json!({"bot": name, "bot_id": id}))
+                .await
+            else {
                 all = false;
+                continue;
+            };
+            let kept = tokio::task::spawn_blocking(move || without_nested(&inspected)).await;
+            let Ok(Some(mut asked)) = kept else {
+                all &= kept.is_ok();
+                continue;
+            };
+            asked.insert("bot".into(), name.clone());
+            asked.insert("bot_id".into(), id);
+            match client.request("configure", Value::Object(asked)).await {
+                Ok(_) => {}
+                Err(error) if error.code == "bot_not_found" => {}
+                Err(error) => {
+                    eprintln!("sonny: {NESTED_GONE} waits on {name}: {error}");
+                    all = false;
+                }
             }
         }
-    }
-    if all {
-        crate::upgrade::once(&record, NESTED_GONE, || true);
-    }
+        if all {
+            crate::upgrade::once(&record, NESTED_GONE, || true);
+        }
+    });
 }
 
-/// The writable folders of the bot `record` describes without the
-/// repositories inside its folder, which are its folder's: each `.git`
-/// below the folder but its own; `None` when it writes none of them.
-fn without_nested(record: &Value) -> Option<Vec<String>> {
-    if record["settings"]["sandbox"] != "workspace-write" {
-        return None;
-    }
+/// The change that takes the repositories inside its folder, which are its
+/// folder's, out of the writable folders of the bot `record` describes:
+/// each `.git` below the folder but its own, in its settings or in a change
+/// the daemon keeps for its turn's end, which would give them back when
+/// taken. A kept change goes again whole, as the daemon keeps the last one
+/// sent; `None` when the bot writes none of them once it is taken.
+fn without_nested(record: &Value) -> Option<Map<String, Value>> {
     let workspace = std::fs::canonicalize(record["workspace"].as_str()?).ok()?;
-    let writable = list(&record["settings"], "writable");
     let nested = |folder: &String| {
         let folder = std::path::Path::new(folder);
         folder.file_name().is_some_and(|name| name == ".git")
             && (folder.parent())
                 .is_some_and(|above| above != workspace && above.starts_with(&workspace))
     };
-    if !writable.iter().any(nested) {
+    let kept = record["configure_pending"].as_object();
+    let later = kept
+        .and_then(|kept| kept.get("settings"))
+        .unwrap_or(&Value::Null);
+    // The sandbox and the folders the bot has once the kept change is taken.
+    let mode = match &later["sandbox"] {
+        Value::Null => &record["settings"]["sandbox"],
+        mode => mode,
+    };
+    let writable = match &later["writable"] {
+        Value::Null => list(&record["settings"], "writable"),
+        _ => list(later, "writable"),
+    };
+    if mode != "workspace-write" || !writable.iter().any(nested) {
         return None;
     }
     let own = repository(&workspace);
-    Some(
-        (writable.into_iter())
-            .filter(|folder| !nested(folder) || Some(folder) == own.as_ref())
-            .collect(),
-    )
+    let mut fields = kept.cloned().unwrap_or_default();
+    let mut settings = later.as_object().cloned().unwrap_or_default();
+    settings.insert(
+        "writable".into(),
+        json!(
+            (writable.into_iter())
+                .filter(|folder| !nested(folder) || Some(folder) == own.as_ref())
+                .collect::<Vec<_>>()
+        ),
+    );
+    fields.insert("settings".into(), Value::Object(settings));
+    Some(fields)
 }
 
 /// The git folder of the repository `dir` is in, which its linked
@@ -1103,12 +1135,42 @@ mod tests {
         // Its folder's own repository and Sonny's own folders stay; each
         // `.git` below its folder goes, there still or not.
         let record = |writable: Value| json!({"workspace": dir, "settings": {"sandbox": "workspace-write", "writable": writable}});
+        let kept = |writable: Vec<String>| {
+            let mut settings = Map::new();
+            settings.insert("writable".into(), json!(writable));
+            let mut fields = Map::new();
+            fields.insert("settings".into(), Value::Object(settings));
+            Some(fields)
+        };
         let walked = record(json!([git(""), "/zen", git("src/api"), git("src/gone")]));
         assert_eq!(
             without_nested(&walked),
-            Some(vec![git(""), "/zen".to_owned()])
+            kept(vec![git(""), "/zen".to_owned()])
         );
         assert_eq!(without_nested(&record(json!([git(""), "/zen"]))), None);
+        // A change kept for the turn's end that would give them back goes
+        // again whole, without them; one that takes them away needs none.
+        let mut waiting = record(json!([git("")]));
+        waiting["configure_pending"] = json!({"instructions": "new", "settings": {"writable": [git(""), git("src/api")], "network": true}});
+        assert_eq!(
+            without_nested(&waiting).map(Value::Object),
+            Some(
+                json!({"instructions": "new", "settings": {"writable": [git("")], "network": true}})
+            )
+        );
+        let mut leaving = walked.clone();
+        leaving["configure_pending"] = json!({"settings": {"writable": [git("")]}});
+        assert_eq!(without_nested(&leaving), None);
+        let mut reading = walked.clone();
+        reading["configure_pending"] = json!({"settings": {"sandbox": "read-only"}});
+        assert_eq!(without_nested(&reading), None);
+        // A kept change of something else goes again with the folders.
+        let mut renamed = walked.clone();
+        renamed["configure_pending"] = json!({"instructions": "new"});
+        assert_eq!(
+            without_nested(&renamed).map(Value::Object),
+            Some(json!({"instructions": "new", "settings": {"writable": [git(""), "/zen"]}}))
+        );
         // A folder of its own outside the agent's is left as it was given.
         assert_eq!(without_nested(&record(json!(["/elsewhere/.git"]))), None);
         let reading = json!({"workspace": dir, "settings": {"sandbox": "read-only"}});

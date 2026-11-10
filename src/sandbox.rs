@@ -1233,7 +1233,7 @@ fn copied(place: &Path, copy: &Path) -> bool {
     if fresh {
         return true;
     }
-    if copy_files(place, copy, &now).is_err() {
+    if locked(copy, || copy_files(place, copy, &now)).is_err() {
         return false;
     }
     match kept {
@@ -1241,6 +1241,31 @@ fn copied(place: &Path, copy: &Path) -> bool {
         None => stamps.push((place.to_owned(), now)),
     }
     true
+}
+
+/// `write` run while this process alone writes `copy`: another daemon or
+/// an `agent sandbox` of the person's copies into the same folder, and
+/// would take a file half written for its own, or remove it. The lock is
+/// a file beside the folder, which no sandbox sees, held until `write`
+/// returns.
+fn locked(copy: &Path, write: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let above = copy.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(above)?;
+    let mut name = copy.as_os_str().to_owned();
+    name.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(name)?;
+    lock.lock()?;
+    write()
 }
 
 /// `files` of `place` into `copy`, owner-only, and nothing else in it.
@@ -1908,6 +1933,25 @@ mod tests {
         assert_eq!(names(&copy), ["a.conf", "c.conf"]);
         // A folder that isn't there has no copy.
         assert!(!copied(&base.join("gone"), &base.join("copies/gone")));
+        // Another process copying holds the lock beside the folder, out of
+        // what a sandbox sees: this one waits for it.
+        let held = std::fs::File::open(base.join("copies/etc/ssh/ssh_config.d.lock")).unwrap();
+        held.lock().unwrap();
+        let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting = {
+            let (copy, wrote) = (copy.clone(), wrote.clone());
+            std::thread::spawn(move || {
+                locked(&copy, || {
+                    wrote.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!wrote.load(std::sync::atomic::Ordering::SeqCst));
+        drop(held);
+        waiting.join().unwrap().unwrap();
+        assert!(wrote.load(std::sync::atomic::Ordering::SeqCst));
         #[cfg(target_os = "linux")]
         {
             let policy = Policy {

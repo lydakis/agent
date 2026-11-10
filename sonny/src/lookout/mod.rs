@@ -1064,7 +1064,7 @@ impl Service {
         // What Sonny's walk of the repositories inside agents' folders gave
         // them leaves their sandboxes, once, from a whole listing.
         if complete {
-            crate::approvals::nested_gone(&client, &bots, &self.store).await;
+            crate::approvals::nested_gone(client.clone(), &bots, &self.store);
         }
         subs::steer_files(&self.store);
         subs::goals_gone(&self.store);

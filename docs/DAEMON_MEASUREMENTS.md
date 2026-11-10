@@ -8236,3 +8236,60 @@ Sonny rows the change does not touch: sky replay CPU (7.54 to 9.23 ms per
 1k lines) and RSS (84.5 to 97.9 MiB). Sky's replay reads no configure
 field; this change's Sonny paths are `/permissions` spreading, `regate`
 and the config watcher.
+
+## ssh's system config from the person's copy, a shell's `workdir`, nested repositories gone (#862)
+
+What a turn pays, on each path:
+
+- **A sandboxed command, from a daemon started with `--own-copy`** (the
+  CLI's, on Linux, not as root): `Policy::new`, which already runs off the
+  runtime thread, stamps each folder named (one listing plus a `stat` per
+  file) and compares it with the stamp kept in memory. It copies again
+  only when the stamp changed or the copy is gone, under a lock file
+  beside the copy, so two processes never write it at once. A daemon
+  started without `--own-copy` (macOS, root, every bench here) does none
+  of it.
+- **A shell call**: one `PathBuf::join` when it names a `workdir`. The
+  check that names a missing folder runs only after a failed start.
+- No store jobs, protocol or schema change, or state per bot.
+
+Mean cost of the copy check and of a policy build, measured as a non-root user
+on a 4-CPU Linux cloud container, release build. Three runs: 20,000 checks
+and 2,000 policies, alternating, against a `/etc/ssh/ssh_config.d` with one
+file:
+
+| Measure | Run 1 | Run 2 | Run 3 |
+| --- | ---: | ---: | ---: |
+| Copy check, folder unchanged, µs | 2.9 | 4.4 | 3.2 |
+| `Policy::new`, workspace-write, no `--own-copy`, µs | 1.9 | 3.0 | 1.9 |
+| `Policy::new`, workspace-write, with it, µs | 5.5 | 8.2 | 5.3 |
+
+So a sandboxed command pays about 3.5 µs more before its sandbox
+starts. The bubblewrap launch that follows takes about 12 ms.
+
+The Perf workflow's matched screen (GitHub runner, base main 1922ab4
+against head b6d6a02) shows no daemon change past noise. Lone submit CPU
+went 29.9 → 29.7 ms, burst submit p99 4.13 → 4.04 ms, release to terminal
+p99 9.37 → 9.55 ms, idle RSS 15.57 → 15.60 MiB, CPU per turn 0.886 → 0.880
+ms, lifecycle CPU 0.46 → 0.44 s, and p95 turn 577 → 576 ms. It warned on
+one Sonny row: lookout seated at 100x10 went from 0.1 to 0.3 s. In that
+head, the upgrade migration that takes nested repositories out of every
+agent's sandbox inspected each bot (1,000 at 100x10) before the lookout
+seated its leads. The bench starts each run on a new store, so it pays the
+migration every time. A store pays it once. The migration now runs beside
+the lookout's start. The same 100x10 screen on this container, main
+against the fixed head:
+
+| Measure | Base | Head |
+| --- | ---: | ---: |
+| Seated, s | 0.1 | 0.1 |
+| Busy until, s | 0.6 | 1.1 |
+| Start CPU, s | 0.11 | 0.28 |
+| CPU per 1k deltas, ms | 6.25 | 6.62 |
+| Note p95, ms | 2,483 | 2,636 |
+| Untold turns | 0 | 0 |
+
+Leads are seated as fast as on main. The once-per-store migration's
+1,000 inspects show up as 0.17 s more lookout CPU at start, spread over
+its first second. Once its record is written, a start pays one read of
+the record.
