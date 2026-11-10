@@ -171,6 +171,14 @@ pub const PROTECTED: [&str; 3] = [".git", ".agents", ".codex"];
 /// profiles, which can name a program to run for credentials.
 pub const PROTECTED_EXISTING: [&str; 1] = [".aws"];
 
+/// System folders a Linux sandbox shows from a copy the person owns
+/// (`--own-copy`): its user namespace maps the person alone, so root's
+/// files show as nobody's, and ssh refuses each file an `Include` names
+/// that way ("Bad owner or permissions"). Debian's ssh_config includes
+/// these, so no sandboxed command could ssh; Codex has the same bug open
+/// (openai/codex#9286).
+pub const OWN_COPIES: [&str; 1] = ["/etc/ssh/ssh_config.d"];
+
 /// Start `command` in a session of its own, for a service that outlives the
 /// terminal it was started from: closing a Herdr pane, or stopping Herdr,
 /// ends every process in the pane's session, not only its foreground job.

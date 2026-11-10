@@ -942,6 +942,8 @@ pub struct Configuration {
     /// Folders whose Unix sockets no sandboxed command reaches, made if
     /// missing, private to the daemon's user.
     pub walled: Vec<PathBuf>,
+    /// System folders every Linux sandbox shows from the person's copy.
+    pub own_copies: Vec<PathBuf>,
     /// The context windows the person set, by model path.
     pub context_windows: Arc<agent_runtime::provider::Windows>,
     /// The tiers faster than standard the person says models serve, by
@@ -1886,6 +1888,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         // missing one by the real path of the folder it would be made in.
         protected_paths,
         walled,
+        owned: config.own_copies.clone(),
     };
     daemon.capabilities = daemon
         .socket

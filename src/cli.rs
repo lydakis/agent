@@ -236,7 +236,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --context-window --speeds --models --provider-config",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --own-copy --context-window --speeds --models --provider-config",
         settings: "",
         startup: true,
     },
@@ -462,6 +462,10 @@ fn print_flags(flags: &str) {
             "--wall" => (
                 "FOLDER",
                 "Keep every sandboxed command, the network on or not, from the Unix sockets in FOLDER, made private if missing; repeatable",
+            ),
+            "--own-copy" => (
+                "FOLDER",
+                "On Linux, show the system folder FOLDER in every sandbox from a read-only copy the person owns, kept in step with it, for files a program takes only from root or the person; repeatable",
             ),
             "--protect" => (
                 "NAME",
@@ -750,6 +754,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--protect-existing"
                     | "--protect-path"
                     | "--wall"
+                    | "--own-copy"
                     | "--context-window"
                     | "--speeds"
             )

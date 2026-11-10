@@ -80,8 +80,10 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 impl From<std::io::Error> for Error {
-    fn from(_: std::io::Error) -> Self {
-        Self::new("io_error")
+    /// With the system's own words, which say what failed ("No such file
+    /// or directory"); a bare code leaves a person nothing to go on.
+    fn from(error: std::io::Error) -> Self {
+        Self::with("io_error", error.to_string())
     }
 }
 impl From<serde_json::Error> for Error {

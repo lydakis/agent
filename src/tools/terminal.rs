@@ -434,7 +434,7 @@ impl Registry {
                     Ok(())
                 });
             }
-            let child = process.spawn()?;
+            let child = (process.spawn()).map_err(|e| super::not_started(e, &workspace))?;
             // The parent's copies of the terminal's far end close here, so
             // the master reads its end once the command's do.
             drop(process);

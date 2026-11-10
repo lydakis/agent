@@ -1097,6 +1097,9 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     for name in agent_client::PROTECTED_EXISTING {
         command.arg("--protect-existing").arg(name);
     }
+    for folder in agent_client::OWN_COPIES {
+        command.arg("--own-copy").arg(folder);
+    }
     // Sonny reads its bots' command rules from here.
     if let Some(rules) = agent_client::config::rules() {
         command.arg("--protect-path").arg(rules);

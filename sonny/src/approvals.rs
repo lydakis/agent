@@ -385,11 +385,14 @@ pub fn create_gate(name: &str, tools: &[String]) -> Map<String, Value> {
 /// The sandbox fields, as `configure` takes them and `create`'s settings
 /// hold them, for an agent in the row `name` working in `workspace`, with
 /// `state`, the state folder of the lead it works for ([`crate::state`]).
-/// The commands let out of it are the daemon's command rules'. A row's repositories are the folder's own and each
-/// inside it, given as folders of their own so the daemon keeps their
-/// hooks and config read-only; a row's other folders are those that are
-/// there, by their real paths. A row no longer in the config is the
-/// default's.
+/// The commands let out of it are the daemon's command rules'. A row's
+/// repository is the folder's own, given as a folder of its own so the
+/// daemon keeps its hooks and config read-only; a repository inside the
+/// folder is the folder's, written as the rest of it is, as Codex gives an
+/// agent its whole workspace and keeps only the `.git` at its top
+/// read-only: a task takes the whole workspace. A row's other
+/// folders are those that are there, by their real paths. A row no longer
+/// in the config is the default's.
 pub fn sandbox(name: &str, workspace: &std::path::Path, state: Option<&str>) -> Map<String, Value> {
     owned(sandbox_with(name, workspace), state)
 }
@@ -448,7 +451,6 @@ fn fields(mode: &Mode, workspace: &std::path::Path) -> Map<String, Value> {
             let mut writable: Vec<String> = Vec::new();
             if *git {
                 writable.extend(repository(workspace));
-                writable.extend(repositories(workspace));
             }
             writable.extend(real(own));
             // As many as the daemon takes, the shallowest kept.
@@ -604,6 +606,115 @@ fn move_unsandboxed(path: &std::path::Path, folder: &std::path::Path) -> bool {
     agent_client::config::write(path, &[("sonny.unsandboxed", None)]).is_ok()
 }
 
+/// The upgrade migration that takes the repositories inside an agent's
+/// folder out of its writable folders.
+pub const NESTED_GONE: &str = "nested-repositories-gone";
+
+/// Each of `bots`, as `bots` lists them, writes no repository inside its
+/// folder but its folder's own, once for the store at `store`: Sonny gave
+/// each `.git` it found below an agent's folder as a folder of its own to
+/// write until 0.9.2, and the agent kept those until its permissions were
+/// picked again, so a gone or emptied one gave a placeholder inside a
+/// placeholder, or failed every command. Run by the lookout, from a whole
+/// listing, beside its start rather than before it: once done, it costs a
+/// read of the record. One that can't be read or changed now is tried
+/// again next time.
+pub fn nested_gone(
+    client: std::sync::Arc<agent_client::Client>,
+    bots: &[Value],
+    store: &std::path::Path,
+) {
+    let mut record = store.as_os_str().to_owned();
+    record.push(".migrated");
+    let record = std::path::PathBuf::from(record);
+    if crate::upgrade::lines(&record)
+        .iter()
+        .any(|line| line == NESTED_GONE)
+    {
+        return;
+    }
+    // Only an agent with a folder has repositories inside it.
+    let bots: Vec<(Value, Value)> = (bots.iter())
+        .filter(|bot| bot["workspace"].is_string())
+        .map(|bot| (bot["name"].clone(), bot["bot_id"].clone()))
+        .collect();
+    tokio::spawn(async move {
+        let mut all = true;
+        for (name, id) in bots {
+            let Ok(inspected) = client
+                .request("inspect", json!({"bot": name, "bot_id": id}))
+                .await
+            else {
+                all = false;
+                continue;
+            };
+            let kept = tokio::task::spawn_blocking(move || without_nested(&inspected)).await;
+            let Ok(Some(mut asked)) = kept else {
+                all &= kept.is_ok();
+                continue;
+            };
+            asked.insert("bot".into(), name.clone());
+            asked.insert("bot_id".into(), id);
+            match client.request("configure", Value::Object(asked)).await {
+                Ok(_) => {}
+                Err(error) if error.code == "bot_not_found" => {}
+                Err(error) => {
+                    eprintln!("sonny: {NESTED_GONE} waits on {name}: {error}");
+                    all = false;
+                }
+            }
+        }
+        if all {
+            crate::upgrade::once(&record, NESTED_GONE, || true);
+        }
+    });
+}
+
+/// The change that takes the repositories inside its folder, which are its
+/// folder's, out of the writable folders of the bot `record` describes:
+/// each `.git` below the folder but its own, in its settings or in a change
+/// the daemon keeps for its turn's end, which would give them back when
+/// taken. A kept change goes again whole, as the daemon keeps the last one
+/// sent; `None` when the bot writes none of them once it is taken.
+fn without_nested(record: &Value) -> Option<Map<String, Value>> {
+    let workspace = std::fs::canonicalize(record["workspace"].as_str()?).ok()?;
+    let nested = |folder: &String| {
+        let folder = std::path::Path::new(folder);
+        folder.file_name().is_some_and(|name| name == ".git")
+            && (folder.parent())
+                .is_some_and(|above| above != workspace && above.starts_with(&workspace))
+    };
+    let kept = record["configure_pending"].as_object();
+    let later = kept
+        .and_then(|kept| kept.get("settings"))
+        .unwrap_or(&Value::Null);
+    // The sandbox and the folders the bot has once the kept change is taken.
+    let mode = match &later["sandbox"] {
+        Value::Null => &record["settings"]["sandbox"],
+        mode => mode,
+    };
+    let writable = match &later["writable"] {
+        Value::Null => list(&record["settings"], "writable"),
+        _ => list(later, "writable"),
+    };
+    if mode != "workspace-write" || !writable.iter().any(nested) {
+        return None;
+    }
+    let own = repository(&workspace);
+    let mut fields = kept.cloned().unwrap_or_default();
+    let mut settings = later.as_object().cloned().unwrap_or_default();
+    settings.insert(
+        "writable".into(),
+        json!(
+            (writable.into_iter())
+                .filter(|folder| !nested(folder) || Some(folder) == own.as_ref())
+                .collect::<Vec<_>>()
+        ),
+    );
+    fields.insert("settings".into(), Value::Object(settings));
+    Some(fields)
+}
+
 /// The git folder of the repository `dir` is in, which its linked
 /// worktrees share, by its real path as the daemon keeps it. Only one
 /// named as the daemon knows a git folder, `.git` or `NAME.git`: in one
@@ -625,59 +736,6 @@ pub fn repository(dir: &std::path::Path) -> Option<String> {
 /// The most writable folders a bot takes, as the daemon bounds them.
 const MAX_WRITABLE: usize = 64;
 const MAX_WRITABLE_JSON: usize = 32 << 10;
-/// How many folders deep below an agent's folder repositories are looked
-/// for, and how many folders are looked in at most, so a start never walks
-/// a whole tree: a workspace's repositories sit a few folders down, not
-/// past its build folders.
-const NESTED_DEPTH: usize = 6;
-const NESTED_FOLDERS: usize = 10_000;
-
-/// The git folders of the repositories inside `dir`, below its own,
-/// shallowest first, by their real paths: each `.git` folder found, not
-/// looked inside, nor below it, nor in hidden folders, which hold caches
-/// and tools' state rather than the person's repositories, nor through
-/// links. A `.git` file, a linked checkout's, names a folder elsewhere,
-/// whose repository is not this folder's to keep.
-fn repositories(dir: &std::path::Path) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut folders = std::collections::VecDeque::from([(dir.to_owned(), 0)]);
-    let mut looked = 0;
-    while let Some((folder, depth)) = folders.pop_front() {
-        looked += 1;
-        if looked > NESTED_FOLDERS {
-            break;
-        }
-        let Ok(entries) = std::fs::read_dir(&folder) else {
-            continue;
-        };
-        let mut below = Vec::new();
-        for entry in entries.flatten() {
-            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                continue;
-            }
-            let name = entry.file_name();
-            // A repository's, which holds HEAD; not an empty one a
-            // sandbox left in its place.
-            if name == ".git" && entry.path().join("HEAD").exists() {
-                if depth > 0 {
-                    found.extend(std::fs::canonicalize(entry.path()).ok());
-                }
-                below.clear();
-                break;
-            }
-            if depth + 1 < NESTED_DEPTH && !name.to_string_lossy().starts_with('.') {
-                below.push(entry.path());
-            }
-        }
-        below.sort();
-        folders.extend(below.into_iter().map(|path| (path, depth + 1)));
-    }
-    found
-        .into_iter()
-        .filter_map(|path| path.to_str().map(str::to_owned))
-        .collect()
-}
-
 /// Whether `record`'s sandbox is the one `fields` give it: its mode, its
 /// writable folders, which a moved folder leaves stale, and its network.
 /// The folders as sets: the daemon keeps them sorted and each once, and
@@ -701,7 +759,7 @@ fn set(value: &Value, key: &str) -> Vec<String> {
 }
 
 /// [`sandbox`]'s fields for each row and folder asked, looked up once:
-/// one pick given to many agents walks each folder for its repositories
+/// one pick given to many agents asks git for each folder's repository
 /// once, not once per agent and again on each try. Kept for one pick,
 /// so the next pick, or the next agent made, looks again.
 #[derive(Default)]
@@ -1066,51 +1124,57 @@ mod tests {
     }
 
     #[test]
-    fn the_repositories_inside_an_agent_s_folder_are_given_as_folders_of_their_own() {
-        let dir = std::env::temp_dir().join(format!("sonny-nested-{}", std::process::id()));
+    fn the_repositories_the_walk_gave_an_agent_leave_its_sandbox() {
+        let dir = std::env::temp_dir().join(format!("sonny-nested-gone-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("src/api")).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
-        // A workspace that isn't git, holding repositories a few folders
-        // down; one inside another's tree, one in a hidden folder, one too
-        // deep, and a linked checkout's `.git` file are left to their own.
-        let repos = [
-            "src/api",
-            "src/web/ui",
-            "a/b/c/d/e/f",
-            ".cache/x",
-            "src/api/vendor/y",
-        ];
-        for repo in repos {
-            std::fs::create_dir_all(dir.join(repo)).unwrap();
-            crate::task::git(&dir.join(repo), &["init", "-q"]).unwrap();
-        }
-        std::fs::create_dir_all(dir.join("src/linked")).unwrap();
-        std::fs::write(dir.join("src/linked/.git"), "gitdir: /elsewhere\n").unwrap();
-        // An empty `.git` a sandbox left in place is no repository: its
-        // folder is looked in like any other.
-        std::fs::create_dir_all(dir.join("src/stray/.git")).unwrap();
-        std::fs::create_dir_all(dir.join("src/stray/inner")).unwrap();
-        crate::task::git(&dir.join("src/stray/inner"), &["init", "-q"]).unwrap();
-        let git = |repo: &str| dir.join(repo).join(".git").display().to_string();
-        let fields = sandbox_with("auto", &dir);
+        crate::task::git(&dir, &["init", "-q"]).unwrap();
+        crate::task::git(&dir.join("src/api"), &["init", "-q"]).unwrap();
+        let git = |under: &str| dir.join(under).join(".git").display().to_string();
+        // Its folder's own repository and Sonny's own folders stay; each
+        // `.git` below its folder goes, there still or not.
+        let record = |writable: Value| json!({"workspace": dir, "settings": {"sandbox": "workspace-write", "writable": writable}});
+        let kept = |writable: Vec<String>| {
+            let mut settings = Map::new();
+            settings.insert("writable".into(), json!(writable));
+            let mut fields = Map::new();
+            fields.insert("settings".into(), Value::Object(settings));
+            Some(fields)
+        };
+        let walked = record(json!([git(""), "/zen", git("src/api"), git("src/gone")]));
         assert_eq!(
-            fields["writable"],
-            json!([git("src/api"), git("src/stray/inner"), git("src/web/ui")])
+            without_nested(&walked),
+            kept(vec![git(""), "/zen".to_owned()])
         );
-        // A repository's own folder comes first, and what is inside its
-        // tree is its own.
-        let fields = sandbox_with("auto", &dir.join("src/api"));
-        assert_eq!(fields["writable"], json!([git("src/api")]));
-        // A repository cloned since makes an agent's sandbox stale, so it
-        // is given its folder too.
-        let before = sandbox_with("auto", &dir);
-        std::fs::create_dir_all(dir.join("src/new")).unwrap();
-        crate::task::git(&dir.join("src/new"), &["init", "-q"]).unwrap();
-        assert!(!sandboxed_as(
-            &json!({"settings": before}),
-            &sandbox_with("auto", &dir)
-        ));
+        assert_eq!(without_nested(&record(json!([git(""), "/zen"]))), None);
+        // A change kept for the turn's end that would give them back goes
+        // again whole, without them; one that takes them away needs none.
+        let mut waiting = record(json!([git("")]));
+        waiting["configure_pending"] = json!({"instructions": "new", "settings": {"writable": [git(""), git("src/api")], "network": true}});
+        assert_eq!(
+            without_nested(&waiting).map(Value::Object),
+            Some(
+                json!({"instructions": "new", "settings": {"writable": [git("")], "network": true}})
+            )
+        );
+        let mut leaving = walked.clone();
+        leaving["configure_pending"] = json!({"settings": {"writable": [git("")]}});
+        assert_eq!(without_nested(&leaving), None);
+        let mut reading = walked.clone();
+        reading["configure_pending"] = json!({"settings": {"sandbox": "read-only"}});
+        assert_eq!(without_nested(&reading), None);
+        // A kept change of something else goes again with the folders.
+        let mut renamed = walked.clone();
+        renamed["configure_pending"] = json!({"instructions": "new"});
+        assert_eq!(
+            without_nested(&renamed).map(Value::Object),
+            Some(json!({"instructions": "new", "settings": {"writable": [git(""), "/zen"]}}))
+        );
+        // A folder of its own outside the agent's is left as it was given.
+        assert_eq!(without_nested(&record(json!(["/elsewhere/.git"]))), None);
+        let reading = json!({"workspace": dir, "settings": {"sandbox": "read-only"}});
+        assert_eq!(without_nested(&reading), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1519,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sandbox_in_another_order_is_the_same_and_a_folder_is_walked_once() {
+    fn a_sandbox_in_another_order_is_the_same_and_a_folder_is_looked_up_once() {
         // The daemon keeps writable folders sorted; Sonny appends its own
         // last. The same folders in another order need no configure.
         let fields = confined(json!({"sandbox": "workspace-write",
@@ -1530,18 +1594,17 @@ mod tests {
         let fewer = json!({"settings": {"sandbox": "workspace-write",
             "writable": ["/a/.git", "/zen"], "network": true}});
         assert!(!sandboxed_as(&fewer, &fields));
-        // One pick walks a folder once, however many agents work there.
+        // One pick looks a folder up once, however many agents work there.
         let dir = std::env::temp_dir().join(format!("sonny-walked-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("one")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
-        crate::task::git(&dir.join("one"), &["init", "-q"]).unwrap();
         let workspace = dir.to_str().unwrap();
         let mut sandboxes = Sandboxes::default();
         let first = sandboxes.of("auto", workspace, None);
-        std::fs::create_dir_all(dir.join("two")).unwrap();
-        crate::task::git(&dir.join("two"), &["init", "-q"]).unwrap();
+        crate::task::git(&dir, &["init", "-q"]).unwrap();
         assert_eq!(sandboxes.of("auto", workspace, None), first);
-        // Each agent with its own lead's state folder, from the same walk.
+        // Each agent with its own lead's state folder, from the same lookup.
         let state = crate::state::folder("walked.lead").unwrap();
         let theirs = sandboxes.of("auto", workspace, Some(&state));
         assert_eq!(theirs["writable"][0], json!(state));
