@@ -3252,6 +3252,12 @@ fn more_button(node: i64) -> screen::Mark {
     screen::Mark::Link(format!("{}more/{node}", screen::BUTTON))
 }
 
+/// The button that opens or shuts the quote the person's reply at `node`
+/// opens with.
+fn quoted_button(node: i64) -> screen::Mark {
+    screen::Mark::Link(format!("{}quoted/{node}", screen::BUTTON))
+}
+
 /// The button that opens or shuts the message between agents at `node`.
 fn said_button(node: i64) -> screen::Mark {
     screen::Mark::Link(format!("{}said/{node}", screen::BUTTON))
@@ -7411,6 +7417,12 @@ impl App {
         {
             self.toggle_more(node).await;
         }
+        if let Some(node) = button
+            .strip_prefix("quoted/")
+            .and_then(|node| node.parse::<i64>().ok())
+        {
+            self.toggle_fold(node, true).await;
+        }
         if let Some(key) = button.strip_prefix("card/") {
             self.card_clicked(key);
         }
@@ -7454,21 +7466,30 @@ impl App {
     /// or shut again: its fold row and what it hid drawn anew from the
     /// message as stored, so nothing of it is kept but its rows drawn.
     async fn toggle_more(&mut self, node: i64) {
+        self.toggle_fold(node, false).await;
+    }
+
+    /// The person's message at `node` opened or shut where it folds: the
+    /// quote its reply opens with (`quote`), or its own long words.
+    async fn toggle_fold(&mut self, node: i64, quote: bool) {
         let Some(item) = self.items(&[node]).await.first().cloned() else {
             self.notice = Some("could not read that message".into());
             return;
         };
+        let (tag, button) = match quote {
+            true => (screen::Tag::Quoted(node), quoted_button(node)),
+            false => (screen::Tag::More(node), more_button(node)),
+        };
         // Shut, it is its fold row alone.
-        let open = self.screen.count_tagged(screen::Tag::More(node)) == 1;
+        let open = self.screen.count_tagged(tag) == 1;
         let folder = std::path::PathBuf::from(&self.workspace);
-        let rows = transcript::prompt_more(&text(&item), self.prose(), open, Some(&folder));
+        let rows = match quote {
+            true => transcript::prompt_quoted(&text(&item), self.prose(), open, Some(&folder)),
+            false => transcript::prompt_more(&text(&item), self.prose(), open, Some(&folder)),
+        };
         let last = rows.len().saturating_sub(1);
         self.flush();
-        self.screen.replace_tagged(
-            screen::Tag::More(node),
-            rows,
-            vec![(last, more_button(node))],
-        );
+        self.screen.replace_tagged(tag, rows, vec![(last, button)]);
     }
 
     /// A `margin` call where it was made: the note's first post as a
@@ -7736,8 +7757,9 @@ impl App {
         } else {
             let prose = self.prose();
             let folder = std::path::PathBuf::from(&self.workspace);
-            // A long message's fold row opens the rest of it.
-            let (lines, fold) = match older {
+            // A long message's fold row opens the rest of it, and a
+            // reply's the rest of what it quotes.
+            let (lines, folds) = match older {
                 true => landed(said, &mut Vec::new(), prose, &folder),
                 false => landed(said, &mut self.ran_here, prose, &folder),
             };
@@ -7748,11 +7770,15 @@ impl App {
                 };
                 let count = lines.len();
                 self.commit(lines);
-                if let Some(fold) = fold {
-                    let at = self.pending.len() - count + fold;
-                    self.marks
-                        .push((at, screen::Mark::Tag(screen::Tag::More(node))));
-                    self.marks.push((at, more_button(node)));
+                for (fold, tag, button) in [
+                    (folds.quoted, screen::Tag::Quoted(node), quoted_button(node)),
+                    (folds.more, screen::Tag::More(node), more_button(node)),
+                ] {
+                    if let Some(fold) = fold {
+                        let at = self.pending.len() - count + fold;
+                        self.marks.push((at, screen::Mark::Tag(tag)));
+                        self.marks.push((at, button));
+                    }
                 }
                 self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
                 // What another agent reacted with before it was drawn.
@@ -9091,10 +9117,10 @@ impl App {
                 true => "• ",
                 false => "  ",
             };
-            rows.extend(transcript::wrap(
+            rows.extend(transcript::wrap_lines(
                 line,
                 width,
-                Span::raw(lead),
+                Line::from(lead),
                 markdown.rest(),
             ));
         }
@@ -15999,7 +16025,7 @@ fn landed(
     shown: &mut Vec<user_shell::Ran>,
     width: usize,
     folder: &std::path::Path,
-) -> (Vec<Line<'static>>, Option<usize>) {
+) -> (Vec<Line<'static>>, transcript::Folds) {
     let Some(ran) = user_shell::read(text) else {
         return transcript::prompt(text, width, Some(folder));
     };
@@ -16010,7 +16036,7 @@ fn landed(
         }
         None => user_shell::lines(&ran, width),
     };
-    (rows, None)
+    (rows, transcript::Folds::default())
 }
 
 fn first_line(text: &str) -> String {
@@ -20297,6 +20323,49 @@ mod tests {
         );
         app.press_row("more/5").await;
         assert_eq!(texts(&mut app), shut);
+    }
+
+    #[tokio::test]
+    async fn a_reply_s_quote_folds_and_its_own_words_always_show() {
+        let quote: String = (1..=6).map(|n| format!("> line {n}\n")).collect();
+        let said = format!("{quote}\nShip it");
+        let stored = said.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_items") => json!({"items": [{"node": 5, "item": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": stored}]}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.land(5, (&said, ""), (None, false), false);
+        let texts = |app: &mut App| -> Vec<String> {
+            (drawn(app).into_iter())
+                .map(|row| row.trim_end().to_owned())
+                .filter(|row| !row.is_empty())
+                .collect()
+        };
+        assert_eq!(
+            texts(&mut app),
+            [
+                "  ▌ line 1",
+                "  ▌ line 2",
+                "  ▌ … quoted, 4 more lines ▸",
+                "› Ship it"
+            ]
+        );
+        let links = app.screen.links();
+        assert_eq!(
+            links.iter().flatten().collect::<Vec<_>>(),
+            [&format!("{}quoted/5", screen::BUTTON)]
+        );
+        // A click opens the rest of the quote over the words, and shuts it.
+        app.press_row("quoted/5").await;
+        let open = texts(&mut app);
+        assert_eq!(open[2], "  ▌ line 3");
+        assert_eq!(open[6..], ["  ▌ quoted, 4 more lines ▾", "› Ship it"]);
+        app.press_row("quoted/5").await;
+        assert_eq!(texts(&mut app).len(), 4);
     }
 
     #[tokio::test]

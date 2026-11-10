@@ -60,6 +60,18 @@ impl Look {
         if cell.bg == BAND {
             cell.bg = band();
         }
+        // A quote's bar is a tinted blank, so a copy takes no mark; with
+        // no color to tint it, the bar's mark is drawn in its place.
+        if cell.bg == QUOTE {
+            match self {
+                Look::Plain => {
+                    cell.set_symbol("▌");
+                    cell.bg = Color::Reset;
+                    cell.modifier.insert(Modifier::DIM);
+                }
+                _ => cell.bg = quote(),
+            }
+        }
         // A hue on a muted row (the footer's branch, an agent's name) is a
         // short mark meant to read: dim over it falls under 3:1 in many
         // themes, so the hue is drawn as it is and the words round it
@@ -178,6 +190,22 @@ pub fn band() -> Color {
         }
         _ if light => Color::Rgb(238, 238, 238),
         _ => Color::Rgb(40, 40, 40),
+    }
+}
+
+/// A quote's bar as a cell holds it, a role as [`BAND`] is: a blank
+/// tinted [`quote`] as each frame is finished, so a copy of the quote,
+/// Sonny's own or the terminal's, takes its words and no bar.
+pub const QUOTE: Color = Color::Rgb(3, 1, 2);
+
+/// The tint of a quote's bar: faint, as structure that isn't text is;
+/// a fixed gray with no hue of its own when the terminal did not say its
+/// colors.
+pub fn quote() -> Color {
+    match faint() {
+        Some(color) => color,
+        None if crate::term::light() => Color::Rgb(200, 200, 200),
+        None => Color::Rgb(90, 90, 90),
     }
 }
 

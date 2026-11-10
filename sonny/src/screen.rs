@@ -88,6 +88,9 @@ pub enum Tag {
     /// The rows of the person's long message at this node past its first
     /// lines: its fold row, and the rest of its lines while open.
     More(i64),
+    /// The rows of the quote the person's reply at this node opens with,
+    /// past its first lines: its fold row, and the rest while open.
+    Quoted(i64),
 }
 
 /// Buttons on a row: the columns each takes, and what it does.
@@ -708,7 +711,9 @@ impl Screen {
     /// Each row's text, as written: what a test reads of the conversation.
     #[cfg(test)]
     pub fn texts(&self) -> Vec<String> {
-        self.rows.iter().map(|row| row.line.to_string()).collect()
+        (self.rows.iter())
+            .map(|row| crate::transcript::seen(&row.line))
+            .collect()
     }
 
     /// Where each row's link goes, if it has one.
@@ -2950,6 +2955,30 @@ mod tests {
                 "Raise the timeout in tests/cart.rs:41 or make the stub answer at once.".into()
             ))
         );
+    }
+
+    #[test]
+    fn a_quote_copies_as_its_words_with_no_bar() {
+        let mut quoted = vec![Span::raw("  ")];
+        quoted.extend(crate::transcript::bars(1));
+        quoted.push(Span::raw("Floats stay floats."));
+        let lines = vec![Line::from("  Fixed."), Line::from(quoted)];
+        let (mut screen, buf) = screen(lines, 40, 3);
+        // Drawn as a tinted cell, the bar a frame's look colors.
+        assert_eq!(buf[(2, 1)].symbol(), " ");
+        assert_eq!(buf[(2, 1)].bg, crate::look::QUOTE);
+        screen.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 0));
+        screen.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 30, 1));
+        assert_eq!(
+            screen.selected().as_deref(),
+            Some("Fixed.\nFloats stay floats.")
+        );
+        let mut cell = buf[(2, 1)].clone();
+        crate::look::Look::Plain.cell(&mut cell);
+        assert_eq!(cell.symbol(), "▌", "with no color, its mark");
+        let mut cell = buf[(2, 1)].clone();
+        crate::look::Look::Muted((200, 200, 200)).cell(&mut cell);
+        assert_eq!((cell.symbol(), cell.bg), (" ", crate::look::quote()));
     }
 
     #[test]
