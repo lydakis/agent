@@ -786,8 +786,8 @@ fn told(
 /// `brief` with each path in the folder `from` turned into the same path
 /// in its copy `to`, and how many were. A folder has more names than its
 /// own: the one the lead's shell was given (`$PWD`, through a link), a
-/// link in the home to it or a folder holding it (`~/workplace` for
-/// `/Volumes/workplace`), each also from `~`, and macOS's `/tmp` for
+/// link in the home to it or a folder holding it (`~/projects` for
+/// `/Volumes/projects`), each also from `~`, and macOS's `/tmp` for
 /// `/private/tmp`.
 fn in_copy(brief: &[String], from: &Path, to: &Path) -> (Vec<String>, usize) {
     let names = names(from);
@@ -880,8 +880,8 @@ fn names(from: &Path) -> Vec<String> {
 /// `text` with each of `names` that stands as a whole path, or as the
 /// start of one, turned into `to`; and how many were.
 fn replace_paths(text: &str, names: &[String], to: &str) -> (String, usize) {
-    // A name inside a longer one (`/work` in `/workplace`, `/work+old` or
-    // `/x/work`) is another path. Names end at spaces and at what sets a path
+    // A name inside a longer one (`/proj` in `/projects`, `/proj+old` or
+    // `/x/proj`) is another path. Names end at spaces and at what sets a path
     // apart in prose and commands: quotes, brackets, `=`, `:` and the like.
     let part_of_name = |c: char| {
         !c.is_whitespace()
@@ -2047,40 +2047,40 @@ mod tests {
 
     #[test]
     fn a_brief_names_the_copy_where_it_named_the_folder() {
-        let names = ["/Volumes/workplace".to_owned(), "~/workplace".to_owned()];
+        let names = ["/Volumes/projects".to_owned(), "~/projects".to_owned()];
         let to = "/Users/g/.agent/tasks/t";
-        let said = "Write /Volumes/workplace/notes.md and ~/workplace/a, not /Volumes/workplace2, \
-                    /x/Volumes/workplace or ~/workplaces. Look in /Volumes/workplace.";
+        let said = "Write /Volumes/projects/notes.md and ~/projects/a, not /Volumes/projects2, \
+                    /x/Volumes/projects or ~/projects2. Look in /Volumes/projects.";
         let (brief, count) = replace_paths(said, &names, to);
         assert_eq!(
             brief,
-            "Write /Users/g/.agent/tasks/t/notes.md and /Users/g/.agent/tasks/t/a, not /Volumes/workplace2, \
-             /x/Volumes/workplace or ~/workplaces. Look in /Users/g/.agent/tasks/t."
+            "Write /Users/g/.agent/tasks/t/notes.md and /Users/g/.agent/tasks/t/a, not /Volumes/projects2, \
+             /x/Volumes/projects or ~/projects2. Look in /Users/g/.agent/tasks/t."
         );
         assert_eq!(count, 3);
-        assert_eq!(replace_paths("`/Volumes/workplace`", &names, to).1, 1);
+        assert_eq!(replace_paths("`/Volumes/projects`", &names, to).1, 1);
         // Paths that climb out of the folder name what is beside it.
         for beside in [
-            "/Volumes/workplace/../notes.md",
-            "/Volumes/workplace/a/../../b",
+            "/Volumes/projects/../notes.md",
+            "/Volumes/projects/a/../../b",
         ] {
             assert_eq!(replace_paths(beside, &names, to), (beside.to_owned(), 0));
         }
         assert_eq!(
-            replace_paths("/Volumes/workplace/a/../b", &names, to).0,
+            replace_paths("/Volumes/projects/a/../b", &names, to).0,
             "/Users/g/.agent/tasks/t/a/../b"
         );
         // Sibling folders whose names only start the same stay as they are.
         for sibling in [
-            "/Volumes/workplace+backup",
-            "/Volumes/workplace@old",
-            "/Volumes/workplace#2",
+            "/Volumes/projects+backup",
+            "/Volumes/projects@old",
+            "/Volumes/projects#2",
         ] {
             assert_eq!(replace_paths(sibling, &names, to), (sibling.to_owned(), 0));
         }
         assert_eq!(
             replace_paths(
-                "--dir=/Volumes/workplace:/Volumes/workplace/b (see ~/workplace)",
+                "--dir=/Volumes/projects:/Volumes/projects/b (see ~/projects)",
                 &names,
                 to
             )
