@@ -7182,6 +7182,18 @@ impl App {
         with_error(&self.client, turn).await
     }
 
+    /// An agent picked or clicked where its name is listed: opened as
+    /// [`Self::open_agent`] opens it; this window's own is here already,
+    /// so `/status` listing it closes, as Esc does.
+    fn open_picked(&mut self, bot: &str) {
+        if bot != self.bot {
+            return self.open_agent(bot, false);
+        }
+        if self.pane.as_ref().is_some_and(pane::Pane::is_card) {
+            self.close_pane(false);
+        }
+    }
+
     /// An agent named or picked: to its own tab, when the lead's layout
     /// has one for it, or a look at it in the pane, as `[sonny]
     /// agent_opens` says; `other`, a right click, the one it doesn't. With
@@ -7363,7 +7375,7 @@ impl App {
             }
         }
         if let Some(bot) = (button.strip_prefix("task/")).or(button.strip_prefix("agent/")) {
-            self.open_agent(bot, false);
+            self.open_picked(bot);
         }
         if let Some(bot) = button.strip_prefix("other/") {
             self.open_agent(bot, true);
@@ -9985,7 +9997,7 @@ impl App {
         if let Some(named) = self.screen.last_agent()
             && let Some(watch) = &mut self.watch
         {
-            watch.pick = card_bots(watch, self.width.max(40), &self.bot)
+            watch.pick = card_bots(watch, self.width.max(40))
                 .iter()
                 .position(|bot| *bot == named);
         }
@@ -10893,7 +10905,7 @@ impl App {
             && watch.audit.is_none()
             && watch.commons.is_none()
         {
-            let bots = card_bots(watch, self.width.max(40), &self.bot);
+            let bots = card_bots(watch, self.width.max(40));
             if !bots.is_empty() {
                 let last = bots.len() - 1;
                 // A pick the list no longer has (resolved agents hidden) is
@@ -10909,7 +10921,7 @@ impl App {
                 if key.code == KeyCode::Enter {
                     if let Some(at) = pick {
                         let bot = bots[at].clone();
-                        self.open_agent(&bot, false);
+                        self.open_picked(&bot);
                     }
                 } else if let Some(watch) = &mut self.watch {
                     watch.pick = pick;
@@ -14351,10 +14363,11 @@ impl App {
             && watch.audit.is_none()
             && watch.commons.is_none()
             && watch.sky.is_none();
-        let bots = card_bots(watch, self.width.max(40), &self.bot);
+        let bots = card_bots(watch, self.width.max(40));
         (open && listing)
             .then(|| watch.pick.and_then(|at| bots.get(at).cloned()))
             .flatten()
+            .filter(|bot| *bot != self.bot)
     }
 
     /// The pane gone once the side chat in it has ended.
@@ -14623,7 +14636,7 @@ impl App {
                 pane.set_card(lines, &view.keys());
                 pane.foot = None;
             } else {
-                let (mut lines, fold_keys, marks) = watch_card(watch, width, &self.bot);
+                let (mut lines, fold_keys, marks) = watch_card(watch, width);
                 let mut picked = None;
                 // The agent picked from the keys is drawn as the picker
                 // draws its pick, reversed.
@@ -15670,8 +15683,8 @@ const SKY_REPLAY_KEYS: &str = sky::REPLAY_KEYS;
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
 
 /// The agents `/status` lists, in its order: what its keys pick from.
-fn card_bots(watch: &Watch, width: usize, me: &str) -> Vec<String> {
-    (watch_card(watch, width, me).2)
+fn card_bots(watch: &Watch, width: usize) -> Vec<String> {
+    (watch_card(watch, width).2)
         .into_iter()
         .filter_map(|(_, mark)| match mark {
             screen::Mark::Link(link) => link
@@ -15684,13 +15697,12 @@ fn card_bots(watch: &Watch, width: usize, me: &str) -> Vec<String> {
 
 /// `/status`'s card at `width`, each line after a space, its times
 /// running turns counted on from when its rows were read; the keys of the
-/// groups in it that fold; and the line each agent but `me` starts on,
-/// which a click opens in the pane, then each folding group's heading,
-/// which a click opens or folds.
+/// groups in it that fold; and the line each agent starts on, which a
+/// click opens in the pane (this window's own closes `/status`), then
+/// each folding group's heading, which a click opens or folds.
 fn watch_card(
     watch: &Watch,
     width: usize,
-    me: &str,
 ) -> (
     Vec<Line<'static>>,
     Vec<&'static str>,
@@ -15718,12 +15730,9 @@ fn watch_card(
         status::Details::Quiet,
         &watch.helpers,
     );
-    let mut agents = listed
-        .named
-        .iter()
-        .map(|(_, bot)| bot)
-        .filter(|bot| *bot != me);
-    let picked = watch.pick.and_then(|at| agents.nth(at)).cloned();
+    let picked = (watch.pick)
+        .and_then(|at| listed.named.get(at))
+        .map(|(_, bot)| bot.clone());
     let status::Card {
         lines: mut card,
         named,
@@ -15752,7 +15761,6 @@ fn watch_card(
     // headings that open and fold their groups.
     let mut marks: Vec<(usize, screen::Mark)> = (named.into_iter())
         .map(|(at, bot)| (below(at), bot))
-        .filter(|(_, bot)| bot != me)
         .map(|(at, bot)| {
             (
                 at,
@@ -23250,7 +23258,7 @@ mod tests {
     }
 
     #[test]
-    fn status_links_each_agent_but_this_one_to_open_it() {
+    fn status_links_each_agent_to_open_it_this_one_too() {
         let row = |name: &str, bot: &str, group| status::Row {
             name: name.into(),
             bot: bot.into(),
@@ -23278,9 +23286,8 @@ mod tests {
             helpers: Vec::new(),
             more: false,
         };
-        // A named lead's window: its own row opens nothing, and the
-        // folder's other lead opens by its own name, not its label.
-        let (lines, _, marks) = watch_card(&watch, 80, "calc.lead.review");
+        // The folder's other lead opens by its own name, not its label.
+        let (lines, _, marks) = watch_card(&watch, 80);
         let link = |at: usize| {
             (marks.iter())
                 .find(|(on, _)| *on == at)
@@ -23306,8 +23313,18 @@ mod tests {
                 screen::BUTTON
             )))
         );
-        // This window's own agent opens nothing.
-        assert_eq!(marks.len(), 2);
+        // This window's own agent is listed and picked as any other.
+        let own = (lines.iter())
+            .position(|line| line.to_string().contains(" lead working"))
+            .unwrap();
+        assert_eq!(
+            link(own),
+            Some(screen::Mark::Link(format!(
+                "{}task/calc.lead.review",
+                screen::BUTTON
+            )))
+        );
+        assert_eq!(marks.len(), 3);
     }
 
     #[tokio::test]
@@ -23777,6 +23794,20 @@ mod tests {
         assert_eq!(pick(&app), Some(1), "the last stays picked");
         app.key(key(KeyCode::Up)).await;
         assert_eq!(pick(&app), Some(0));
+        // This window's own agent, the lead, is picked as any other row,
+        // first in its group; m then says its model, and Enter on it
+        // closes `/status`, since it is open here already.
+        app.bot = "calc.lead".into();
+        if let Some(watch) = &mut app.watch {
+            watch.rows.insert(0, row("lead"));
+            watch.pick = None;
+        }
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(pick(&app), Some(0));
+        assert_eq!(card_bots(app.watch.as_ref().unwrap(), 80)[0], "calc.lead");
+        assert!(app.beside().is_none(), "never this window's own agent");
+        app.key(key(KeyCode::Enter)).await;
+        assert!(app.pane.is_none(), "closed, as Esc closes it");
     }
 
     #[tokio::test]
