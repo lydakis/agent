@@ -412,6 +412,13 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         }
         _ => {}
     }
+    // An `--if` its next fire could not run, said before that fire finds
+    // it: a failure until it can, the same one whatever each check said.
+    if let Some(why) = row["if_cannot_run"].as_str() {
+        facts.push("its --if cannot run".into());
+        failed = Some(first_line(why));
+        episode = Some("its --if cannot run".into());
+    }
     if row["missed"] == true {
         facts.push("missed its time".into());
     }
@@ -1162,6 +1169,22 @@ mod tests {
         let ungated = trigger_item(&ungated, vec!["p.triage".into()]);
         assert_eq!(ungated.failed, None);
         assert_eq!(ungated.facts, ["sent 3", "last sent 1h ago"]);
+        // An `--if` its next fire could not run is a failure before that
+        // fire finds it, one however often its row is read.
+        let mut stranded = row(json!({"gate": "no", "checked_ms": at}), Value::Null);
+        stranded["if_cannot_run"] = json!("--if: Agent's binary was not found at /gone/agent");
+        let stranded = trigger_item(&stranded, vec!["p.triage".into()]);
+        assert_eq!(
+            stranded.failed.as_deref(),
+            Some("--if: Agent's binary was not found at /gone/agent")
+        );
+        assert!(
+            stranded
+                .facts
+                .iter()
+                .any(|fact| fact == "its --if cannot run")
+        );
+        assert_eq!(failures(std::slice::from_ref(&stranded)).len(), 1);
     }
 
     #[test]

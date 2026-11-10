@@ -292,7 +292,7 @@ pub fn sonny_path() -> Option<PathBuf> {
 
 /// `PREFIX/Cellar/NAME/VERSION/REST` as `PREFIX/opt/NAME/REST` when that
 /// leads to a file; any other path as it is.
-fn opt_path(exe: &Path) -> PathBuf {
+pub(crate) fn opt_path(exe: &Path) -> PathBuf {
     let parts: Vec<_> = exe.components().collect();
     let found = parts
         .iter()

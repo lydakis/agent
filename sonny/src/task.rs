@@ -97,7 +97,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     }
     // The daemon's binary in an agent's shell; in a terminal, the one
     // Sonny would start.
-    let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+    let agent = crate::agent_bin_or_missing()?;
     // A task cleaned up keeps its agent, and so its name; one that can't
     // be read is left to the start, which says what it found.
     if bot_record(&agent, &start.env, name).is_some_and(|bot| bot["name"] == name) {
@@ -1661,7 +1661,7 @@ pub fn remove(
     discard: bool,
     (store, call): (&Path, &str),
 ) -> Result<String, String> {
-    let agent = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+    let agent = crate::agent_bin_or_missing()?;
     let branch = format!("agent/{name}");
     let path = home_dir()?.join(".agent/worktrees").join(name);
     let (worktree, folder) = match (path.exists(), recorded(name)) {
