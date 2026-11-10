@@ -237,6 +237,23 @@ impl Cmux {
         terminal: Option<&str>,
         kept: Option<&str>,
     ) -> Result<Self, String> {
+        Self::open_as(bin, label, terminal, kept, false)
+    }
+
+    /// The workspace titled with the project's name, made when there is
+    /// none, whatever workspace a window of the project was last in: the
+    /// project's own home, for another project's agent to open in.
+    pub fn own(bin: PathBuf, label: &str) -> Result<Self, String> {
+        Self::open_as(bin, label, None, None, true)
+    }
+
+    fn open_as(
+        bin: PathBuf,
+        label: &str,
+        terminal: Option<&str>,
+        kept: Option<&str>,
+        own: bool,
+    ) -> Result<Self, String> {
         let mut cmux = Self {
             bin,
             workspace: String::new(),
@@ -262,7 +279,11 @@ impl Cmux {
             cmux.here = true;
             cmux.me = terminal.map(str::to_owned);
         }
-        match current.or(kept).or_else(leads).or_else(found) {
+        let chosen = match own {
+            true => found(),
+            false => current.or(kept).or_else(leads).or_else(found),
+        };
+        match chosen {
             Some(workspace) => {
                 cmux.workspace = id(workspace).ok_or("cmux system.tree: no workspace id")?;
                 cmux.name = workspace["title"].as_str().unwrap_or(label).to_owned();
@@ -759,6 +780,35 @@ print(json.dumps(out))
         let sonny = ["sonny".to_owned()];
         assert!(layout.show("shop.lead", "lead", &sonny).unwrap());
         assert_eq!(titles(&dir), [vec![vec!["shop.lead"]]]);
+    }
+
+    #[test]
+    fn another_project_s_lead_opens_in_its_own_workspace_never_the_caller_s() {
+        let state = json!({
+            "n": 10,
+            "workspaces": [
+                {"id": "ws-1", "title": "desk", "panes": [pane("pn-1", &[("sf-1", "shop.lead")])]},
+            ],
+        });
+        let (bin, dir) = fake("own", state);
+        let cmux = Cmux::own(bin, "shop").unwrap();
+        assert!(cmux.made());
+        assert_eq!(cmux.home(), "cmux workspace shop");
+        assert_eq!(
+            last(&dir, "workspace.create"),
+            json!({"title": "shop", "focus": false})
+        );
+        let state = json!({
+            "n": 10,
+            "workspaces": [
+                {"id": "ws-1", "title": "desk", "panes": [pane("pn-1", &[("sf-1", "shop.lead")])]},
+                {"id": "ws-2", "title": "shop", "panes": [pane("pn-2", &[("sf-2", "zsh")])]},
+            ],
+        });
+        let (bin, _) = fake("own-found", state);
+        let cmux = Cmux::own(bin, "shop").unwrap();
+        assert!(!cmux.made());
+        assert_eq!(cmux.workspace, "ws-2");
     }
 
     #[test]

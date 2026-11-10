@@ -1211,7 +1211,7 @@ async fn open_new_lead(client: &Client, socket: &Path, caller: &str, made: &mut 
             crate::open_lead(socket, store.as_deref(), project, &bot, &like, &me)
         });
     match opened {
-        Ok((home, _)) => made["opened_in"] = json!(home),
+        Ok((home, _, _)) => made["opened_in"] = json!(home),
         Err(error) => made["not_opened"] = json!(error),
     }
 }
