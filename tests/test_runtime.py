@@ -1057,7 +1057,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
                                     'cache_write_tokens': 1, 'served_model': 'synthetic-fallback', 'models': [
             {'model': 'synthetic-claude', 'input_tokens': 7, 'output_tokens': 4, 'cached_input_tokens': 2},
             {'model': 'synthetic-fallback', 'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 0,
-             'cache_write_tokens': 1}], 'work_tokens': 18})
+             'cache_write_tokens': 1}], 'speed': 'standard', 'work_tokens': 18})
         model.requests.get(timeout=1)
         second = model.requests.get(timeout=1)
         # The declined attempt's text continues the answer; its thinking and
@@ -1326,7 +1326,8 @@ class AnthropicRuntimeTests(unittest.TestCase):
         # and the model's context window, for a client to say how full it is.
         self.assertEqual(usage[0]['data'], {'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 2,
                                             'served_model': 'synthetic-claude-20260926',
-                                            'context_window': 200000, 'work_tokens': 14})
+                                            'context_window': 200000, 'speed': 'standard',
+                                            'work_tokens': 14})
         first, second = model.requests.get(timeout=1), model.requests.get(timeout=1)
         self.assertEqual(first['thinking'], {'type': 'adaptive', 'display': 'summarized',
                                              'block_binding': {'prefix_mismatch_behavior': 'drop_block'}})
