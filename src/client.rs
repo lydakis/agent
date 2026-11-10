@@ -60,8 +60,6 @@ struct AuditFilters {
 }
 
 struct Options {
-    /// The command being run; `run` treats `--model` as the turn's model.
-    command: String,
     store: PathBuf,
     socket: PathBuf,
     providers: Vec<String>,
@@ -165,7 +163,6 @@ struct Options {
 
 fn parse(args: &[String]) -> Result<Options> {
     let mut options = Options {
-        command: String::new(),
         socket: PathBuf::new(),
         store: PathBuf::new(),
         providers: Vec::new(),
@@ -1348,8 +1345,8 @@ fn require_approver(connection: &mut Connection) -> Result<()> {
 
 /// The gate a new bot asks for, as `create` or `fork` fields. The mode
 /// comes from --approval or AGENT_APPROVAL, `full` by default: no gate.
-/// `manual` gates --approve, or every tool the bot has but the four that
-/// touch only its own records, for a person or a program to answer; `auto`
+/// `manual` gates --approve, or every tool the bot has but those never
+/// gated (`UNGATED`), for a person or a program to answer; `auto`
 /// leaves `read` ungated too.
 fn requested_gate(options: &Options, tools: &[String]) -> Result<Value> {
     // The tools gated: --approve, or every tool but the ungated ones.
@@ -1407,8 +1404,7 @@ fn unique(prefix: &str) -> String {
 
 pub fn main(args: Vec<String>) -> Result<i32> {
     let command = args[0].as_str();
-    let mut options = parse(&args[1..])?;
-    options.command = command.to_owned();
+    let options = parse(&args[1..])?;
     if std::env::var("AGENT_SHELL_CONTEXT").as_deref() == Ok("1")
         && (command == "follow"
             || command == "wait"
@@ -1622,10 +1618,6 @@ fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
     Ok(())
 }
 
-/// The models clients offer: the person's `~/.agent/models` over
-/// discovery's catalog beside it; reading them needs no daemon.
-/// `--discover` rewrites the catalog from the listings of the providers the
-/// daemon runs, as every daemon start does, and says on stderr what changed.
 /// The person's model list, when `store` is the home store beside it
 /// (`state.sqlite`): only that store's daemon writes discovery's catalog,
 /// so a test, a side daemon or another file in the same folder never
@@ -1643,6 +1635,10 @@ fn home_models(store: &Path) -> Option<PathBuf> {
     })
 }
 
+/// The models clients offer: the person's `~/.agent/models` over
+/// discovery's catalog beside it; reading them needs no daemon.
+/// `--discover` rewrites the catalog from the listings of the providers the
+/// daemon runs, as every daemon start does, and says on stderr what changed.
 fn models(options: &Options) -> Result<i32> {
     let path = agent_client::models::path().ok_or(Error::with("usage", "set HOME"))?;
     if options.discover {
@@ -1979,9 +1975,6 @@ fn follow_live(connection: &mut Connection, bot: &str) -> Result<Value> {
     }
 }
 
-/// A busy bot's refusal, with the ways past it as flags to copy: callers,
-/// models included, do not act on a description of them. The daemon names
-/// the same ways as request fields.
 /// `run --image PATH`: the file as the daemon takes a picture, its media
 /// type from its name.
 fn image(path: &str) -> Result<agent_runtime::codec::Image> {
@@ -2009,6 +2002,9 @@ fn image(path: &str) -> Result<agent_runtime::codec::Image> {
         data: base64::engine::general_purpose::STANDARD.encode(data),
     })
 }
+/// A busy bot's refusal, with the ways past it as flags to copy: callers,
+/// models included, do not act on a description of them. The daemon names
+/// the same ways as request fields.
 fn ways_past_busy(bot: &str, error: Error) -> Error {
     if error.code == "active_agent_limit" {
         let mut error = Error {
@@ -2281,9 +2277,6 @@ fn wait(options: &Options) -> Result<i32> {
     Ok(if clean { 0 } else { 1 })
 }
 
-/// Calls waiting for a verdict, paged through completely or up to
-/// `--limit`; JSON array or one line per call with the command that
-/// answers it.
 /// The audit trail, newest first, page by page up to `--limit`; or with
 /// `trim`, delete its rows older than a row or a time.
 fn audit(options: &Options) -> Result<i32> {
@@ -2413,6 +2406,9 @@ fn utc(ms: i64) -> String {
     )
 }
 
+/// Calls waiting for a verdict, paged through completely or up to
+/// `--limit`; JSON array or one line per call with the command that
+/// answers it.
 fn approvals(options: &Options) -> Result<i32> {
     let mut connection = ensure_existing_daemon(options)?;
     let mut after = json!(0);
@@ -2583,7 +2579,7 @@ fn answer(options: &Options) -> Result<i32> {
             "answer needs --bot, --turn, --call, and --request, as agent approvals lists them",
         );
     };
-    let decision = options.positional[0].as_str();
+    let decision = options.positional.first().map_or("", String::as_str);
     if !matches!(decision, "allow" | "deny") {
         return fail_with("usage", "answer needs a decision: allow or deny");
     }
@@ -2597,8 +2593,6 @@ fn answer(options: &Options) -> Result<i32> {
     Ok(0)
 }
 
-/// A bot's turns, paged through completely or up to `--limit`, oldest
-/// first or with `--newest` newest first; JSON array or a table.
 /// The handle of a bot's running turn, else of its newest one, so a
 /// caller can wait on work it did not submit. A turn queued behind the
 /// running one is not it.
@@ -2653,6 +2647,8 @@ fn usage(options: &Options) -> Result<i32> {
     Ok(0)
 }
 
+/// A bot's turns, paged through completely or up to `--limit`, oldest
+/// first or with `--newest` newest first; JSON array or a table.
 fn turns(options: &Options) -> Result<i32> {
     let bot = options
         .bot
@@ -3229,15 +3225,15 @@ fn summary_field(
         .ok_or_else(|| keys.join(" or "))
 }
 
-/// A started call's arguments as one short line: the command or path when
-/// the tool has one. Arguments may be a preview cut short, so the field is
-/// read from as much of the text as there is.
 /// A started call as `run --pretty` shows it. The name is the model's too:
 /// a call to a tool that does not exist still starts, and fails after.
 fn tool_line(name: &str, arguments: &str) -> String {
     format!("▸ {} {}", visible(name), summary(name, arguments))
 }
 
+/// A started call's arguments as one short line: the command or path when
+/// the tool has one. Arguments may be a preview cut short, so the field is
+/// read from as much of the text as there is.
 fn summary(name: &str, arguments: &str) -> String {
     let keys = summary_keys(name);
     let text = if keys.is_empty() {

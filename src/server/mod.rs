@@ -217,8 +217,6 @@ pub struct Request {
     #[serde(flatten)]
     command: Command,
 }
-/// A client's refusal of an answered call, which the model reads as the
-/// call's error.
 /// A declared call's answer: text, or parts in the order the model reads
 /// them, text and pictures, as a provider's own tool results take them.
 #[derive(Deserialize)]
@@ -227,6 +225,8 @@ enum ToolOutput {
     Text(String),
     Parts(Vec<agent_runtime::codec::Part>),
 }
+/// A client's refusal of an answered call, which the model reads as the
+/// call's error.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolError {
@@ -305,8 +305,9 @@ enum Command {
     /// Change what a bot's client chose for it when it was made: its
     /// instructions, recomposed with the skills, memory and folder rules
     /// added since, its model (another of its family) and effort level, and
-    /// every other setting `create` takes, by the same names. Refused while
-    /// a turn runs; the next turn uses them.
+    /// every other setting `create` takes, by the same names. One sent
+    /// while a turn runs is kept for the turn's end (`configure_pending`),
+    /// its rules reaching the running turn at once; the next turn uses them.
     Configure {
         bot: String,
         /// The identity `bot` must hold; another is `bot_not_found`.
@@ -445,7 +446,7 @@ enum Command {
         model: Option<String>,
         /// This turn's effort level; absent is the bot's own.
         effort: Option<String>,
-        /// `reject` (default), `queue`, or `steer`.
+        /// Required: `reject`, `queue`, `steer` or `attach`.
         delivery: Option<String>,
         /// With `steer`: the running turn this message is for, or `stale_turn`.
         expected_turn: Option<i64>,
@@ -918,7 +919,7 @@ pub struct Configuration {
     /// running, as make's `-l`; none by default.
     pub max_load: Option<f64>,
     /// Seconds an established provider stream may go without a content
-    /// frame before the attempt fails and is retried; default 120.
+    /// frame before the attempt fails and is retried; default 600.
     pub stall_timeout: Option<u64>,
     /// Exit a socket daemon after this many seconds with no sessions, no
     /// active turns, and no running background commands; none by default.
@@ -1194,8 +1195,6 @@ fn confine(settings: &mut Settings) -> Result<()> {
     settings.unix_sockets.dedup();
     Ok(())
 }
-/// A field given as `null` deserializes to `Some(None)`, apart from one
-/// left out, which `default` makes `None`.
 /// What a `configure` gives, by its names: what a change while a turn runs
 /// keeps for the turn's end, as `inspect` shows it.
 #[derive(Debug, Default, serde::Serialize, Deserialize)]
@@ -1299,6 +1298,8 @@ impl Configure {
     }
 }
 
+/// A field given as `null` deserializes to `Some(None)`, apart from one
+/// left out, which `default` makes `None`.
 fn present<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -3709,6 +3710,9 @@ impl Service {
         if change.effort.is_some() && change.model.is_none() {
             return fail_with("invalid_effort", "effort goes with model");
         }
+        // The command rules alone may change while a turn runs: its
+        // next round takes them, and a round already announced keeps
+        // the rules it was announced under.
         let rules_only = change.rules_only();
         // One kept before is older: this one goes over it, and both are
         // checked as one.
@@ -3773,9 +3777,6 @@ impl Service {
         if let Some(declare) = &declare {
             validate_declared(declare)?;
         }
-        // The command rules alone may change while a turn runs: its
-        // next round takes them, and a round already announced keeps
-        // the rules it was announced under.
         // The settings named, `sandbox` taking the rest of the
         // sandbox with it, over the bot's own.
         let mut named = Vec::new();
@@ -5946,8 +5947,6 @@ async fn delete_pieces(
     Ok(deleted)
 }
 
-/// Match ordinary replies: the stdio owner (session zero) gets bounded
-/// backpressure; socket clients cannot hold up a reply task when they lag.
 /// Answer a read from the observation lane, in its own task.
 fn deliver(
     session: u64,
@@ -5961,6 +5960,9 @@ fn deliver(
 /// Answer a request from a task of its own: the stdio owner waits a few
 /// seconds for room, and a socket client that cannot take it is closed.
 /// Whether it was sent.
+///
+/// Match ordinary replies: the stdio owner (session zero) gets bounded
+/// backpressure; socket clients cannot hold up a reply task when they lag.
 async fn retention_reply(session: u64, output: &Output, id: Value, result: Result<Value>) -> bool {
     let sent = if session == 0 {
         matches!(

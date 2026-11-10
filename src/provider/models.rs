@@ -1,7 +1,8 @@
 //! The models a provider lists for the credentials the daemon holds. Asked
 //! only when a client wants them, never on the turn path, and kept for five
-//! minutes, as Codex and OpenCode keep their catalogs. The daemon does not
-//! consult the list to run anything: a turn runs whatever model it names.
+//! minutes, as Codex and OpenCode keep their catalogs. The daemon consults
+//! the list only for a model's context window: a turn runs whatever model
+//! it names.
 use super::{Provider, aws, connection_error, error_body, sanitize_error};
 use crate::{Error, Result, codec::Family, fail};
 use futures_util::StreamExt;
@@ -210,11 +211,11 @@ impl Provider {
             };
             if next.is_none() {
                 let mut models = parse(&json!({"data": entries}))?;
-                // Mantle lists every family at one address; offer only those
-                // this binding's wire format runs.
                 if self.url.host_str() == Some("api.openai.com") {
                     models.retain(|model| model["id"].as_str().is_some_and(openai_text));
                 }
+                // Mantle lists every family at one address; offer only those
+                // this binding's wire format runs.
                 if aws::endpoint(&self.url).is_some() {
                     models.retain(|model| {
                         model["id"]

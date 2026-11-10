@@ -3571,16 +3571,6 @@ impl Turn {
         fail("tool_round_limit")
     }
 
-    /// The round boundary: queued steers become user items after everything
-    /// recorded so far, while they fit beside what the view must send
-    /// `ahead` of the turn; optional previews of omitted turns yield. The worker publishes each batch and answers the steers'
-    /// waiters. One atomic read when nothing is waiting; the flag clears
-    /// before the read, so a steer landing during it is seen next. A steer
-    /// that stayed queued for lack of room is tried again once less goes
-    /// ahead, a note cleared or shrunk, and once more against the `whole`
-    /// budget when it stayed against three quarters. Returns whether any
-    /// went in; `capped` holds how one stayed queued, and is left alone
-    /// when nothing was tried.
     /// Whether a summary could take the rounds behind a steer admitted
     /// against the whole budget: the bot has compaction instructions and
     /// its summarizer is served here in the bot's family.
@@ -3593,6 +3583,17 @@ impl Turn {
             })
     }
 
+    /// The round boundary: queued steers become user items after everything
+    /// recorded so far, while they fit beside what the view must send
+    /// `ahead` of the turn; optional previews of omitted turns yield. The
+    /// worker publishes each batch and answers the steers' waiters. One
+    /// atomic read when nothing is waiting; the flag clears before the
+    /// read, so a steer landing during it is seen next. A steer that stayed
+    /// queued for lack of room is tried again once less goes ahead, a note
+    /// cleared or shrunk, and once more against the `whole` budget when it
+    /// stayed against three quarters. Returns whether any went in; `capped`
+    /// holds how one stayed queued, and is left alone when nothing was
+    /// tried.
     /// `attached` takes attached messages along with steers; a reply that
     /// called no tool takes steers alone, which an attached message must not
     /// turn into another round.
@@ -4229,8 +4230,6 @@ impl Turn {
         })
     }
 
-    /// Run planned calls in order. Returns true when a wait parked the turn;
-    /// the calls after it are stored with the parked state.
     /// Run a round's calls in order. `announced` is set when this round
     /// announced gated calls, with the time its commit began: the first of
     /// them waits for a verdict before its first check, since none can be
@@ -5410,9 +5409,6 @@ impl Turn {
         }
     }
 
-    /// Matches of literal text in a bot's history, or with a GLOB pattern
-    /// every matching bot's, newest first; the caller's own turn is left
-    /// out of a search that holds it.
     /// A page of the audit trail for the bot to read, redacted as its
     /// other reads of history are.
     async fn history_audit(
@@ -5429,6 +5425,9 @@ impl Turn {
         Ok(Outcome::text(output))
     }
 
+    /// Matches of literal text in a bot's history, or with a GLOB pattern
+    /// every matching bot's, newest first; the caller's own turn is left
+    /// out of a search that holds it.
     async fn history_search(
         &self,
         call_id: &str,
@@ -5769,7 +5768,6 @@ fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
         .then(|| Strip::from(window.ids[window.ids.len() - 1] + 1))
 }
 
-/// Whether the turn may make another model call.
 /// Whether the bot may search the web: its provider declares the search
 /// when it offers one, and a fork's allowed list narrows it as any tool.
 fn searches(record: &agent_runtime::store::Bot) -> bool {
@@ -5825,6 +5823,7 @@ fn added_input(
     (agent_runtime::store::share(input, new, whole as u64), sent)
 }
 
+/// Whether the turn may make another model call.
 fn calls_left(record: &agent_runtime::store::Bot, model_rounds: usize) -> bool {
     model_rounds < record.settings.max_rounds() && record.exhausted().is_none()
 }
@@ -7537,7 +7536,7 @@ mod tests {
             by_count.iter().map(Vec::len).collect::<Vec<_>>(),
             [64, 64, 64, 8]
         );
-        // Three 100 KiB items fill a batch; a 1 MiB item travels alone.
+        // Two 100 KiB items fill a batch; a 1 MiB item travels alone.
         let sizes = [100 << 10, 100 << 10, 100 << 10, 1 << 20, 10, 10];
         let by_bytes = batches(&ids[..6], &sizes, &[]);
         assert_eq!(by_bytes, [vec![1, 2], vec![3], vec![4], vec![5, 6]]);

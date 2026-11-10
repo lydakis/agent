@@ -447,15 +447,15 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
     Ok(())
 }
 
-/// A declared tool's call checked against its parameters, as far as the
-/// daemon looks: an object, with every required field, no field the
-/// schema closes out, and each listed field of its listed basic type.
 /// The most JSON text an answered call's arguments may take: its client
 /// reads the call whole from a `tool_calls` page, one line of at most
 /// 1 MiB beside its id (`MAX_CALL_ID`) and the rest. A model's reply has no
 /// bound but its own, so a longer call is refused at once, the model told.
 pub const ANSWERED_ARGUMENTS: usize = 768 * 1024;
 
+/// A declared tool's call checked against its parameters, as far as the
+/// daemon looks: an object, with every required field, no field the
+/// schema closes out, and each listed field of its listed basic type.
 pub fn check_declared(tool: &Declared, arguments: &str) -> Result<()> {
     let invalid = |detail: String| Error::with("invalid_arguments", detail);
     if tool.answered_by.is_some() && arguments.len() > ANSWERED_ARGUMENTS {
@@ -2291,10 +2291,6 @@ impl Registry {
         }
     }
 
-    /// A foreground command, owning everything it uses so a running one
-    /// can be moved to a task of its own. Dropping it kills the command.
-    /// `started` fires once it holds a process slot: only then is it
-    /// running, and only then may it move.
     /// A process slot for a confined write, which runs as a process of
     /// its own and so waits its turn as a command does.
     async fn helper_slot(
@@ -2312,6 +2308,10 @@ impl Registry {
         }
     }
 
+    /// A foreground command, owning everything it uses so a running one
+    /// can be moved to a task of its own. Dropping it kills the command.
+    /// `started` fires once it holds a process slot: only then is it
+    /// running, and only then may it move.
     #[allow(clippy::too_many_arguments)]
     pub fn foreground(
         &self,

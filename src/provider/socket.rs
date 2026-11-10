@@ -308,7 +308,7 @@ impl Session {
 
     /// Send one `response.create` and read its events until the terminal one.
     /// The stall bound covers the write, since a peer that stops reading
-    /// blocks it, and only content renews it; pings do not. The startup
+    /// blocks it, and every text event renews it; pings do not. The startup
     /// permit is released when the first event arrives.
     pub(super) async fn exchange<F, Fut>(
         &mut self,

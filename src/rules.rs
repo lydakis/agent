@@ -1,7 +1,7 @@
 //! Command rules applied to a bot's shell calls. A bot's client gives
 //! them as its `rules` setting, Codex's execpolicy as data
 //! ([`agent_client::rules`]); reading rules files, and in which language,
-//! is the client's. A script is read as the sandbox reads one
+//! is the client's. A script's commands are read as bash reads them
 //! ([`crate::sandbox::commands`]): each plain command on its own, and
 //! anything else matches no rule.
 use crate::Error;
@@ -167,7 +167,7 @@ mod tests {
             Ok(Ruling::Forbidden("Use the trash.".into()))
         );
         assert_eq!(rules.rule("env PATH=/tmp touch a"), Ok(Ruling::None));
-        // What the sandbox can't read as plain commands matches none.
+        // What can't be read as plain commands matches none.
         assert_eq!(rules.rule("touch $(echo a)"), Ok(Ruling::None));
         assert_eq!(rules.rule(""), Ok(Ruling::None));
     }

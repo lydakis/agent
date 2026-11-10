@@ -274,7 +274,7 @@ pub fn help(name: Option<&str>) -> Result<()> {
         );
     }
     println!(
-        "\nValue flags accept --flag VALUE or --flag=VALUE; -- ends option parsing.\nJSON is the default; --pretty selects human output.\nExit status: 0 success, 1 failed/incomplete operation, 2 invalid usage.\nProvider: NAME[=FAMILY[,BASE_URL[,KEY_ENV]]]; families: responses, responses-ws (Responses over WebSocket), anthropic."
+        "\nValue flags accept --flag VALUE or --flag=VALUE; -- ends option parsing.\nJSON is the default; --pretty selects human output.\nExit status: 0 success, 1 failed/incomplete operation, 2 invalid usage; serve exits 75 when another daemon owns the store; sandbox exits with its command's status, or 125 for a failure of its own.\nProvider: NAME[=FAMILY[,BASE_URL[,KEY_ENV]]]; families: responses, responses-ws (Responses over WebSocket), anthropic."
     );
     Ok(())
 }
@@ -379,7 +379,7 @@ fn print_flags(flags: &str) {
             ),
             "--tools" => (
                 "LIST",
-                "A new bot's tools; default shell,read,write,wait,history and apply_patch for a Responses model, else edit",
+                "A new bot's tools; default shell,write_stdin,read,write,wait,history, apply_patch for a Responses model else edit, web_fetch, and web_search where the provider offers it",
             ),
             "--allow" => (
                 "LIST",
@@ -555,7 +555,7 @@ fn print_flags(flags: &str) {
             ),
             "--approve" => (
                 "LIST",
-                "Tools whose calls need a verdict; default every tool but history, wait, note, echo",
+                "Tools whose calls need a verdict; default every tool but history, wait, note, echo, web_search",
             ),
             "--call" => ("ID", "The tool call to answer"),
             "--full" => ("", "Every call's whole arguments, not their preview"),
@@ -684,13 +684,13 @@ pub fn duration_secs(flag: &str, value: &str) -> Result<u64> {
     Ok(ms / 1000)
 }
 
-/// Normalize value flags once for both parsers; reject unused flags instead of
-/// silently accepting them. None means help was printed successfully.
 /// Whether `prepare` accepted `--pretty` as a flag, so a failure, even one
 /// later in the same command line, is reported the way output was asked
 /// for; a `--pretty` taken as another flag's missing value is not a request.
 pub static PRETTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Normalize value flags once for both parsers; reject unused flags instead of
+/// silently accepting them. None means help was printed successfully.
 pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     let c = command(&args[0])?;
     let mut out = Vec::with_capacity(args.len());
@@ -932,13 +932,17 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--unix-socket",
             "--approval",
             "--approve",
+            "--no-compaction",
+            "--compaction-model",
+            "--compaction-instructions",
+            "--compaction-instructions-file",
         ]
         .iter()
         .any(|f| has(f))
     {
         return fail_with(
             "usage",
-            "instructions, budget, approval, sandbox and senders are creation options; use --new",
+            "instructions, budget, approval, sandbox, senders and compaction are creation options; use --new",
         );
     }
     Ok(Some(out))

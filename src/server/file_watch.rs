@@ -417,9 +417,11 @@ mod tests {
     use std::time::Duration;
 
     async fn told(receiver: &mut tokio::sync::mpsc::Receiver<()>) -> bool {
-        tokio::time::timeout(Duration::from_secs(5), receiver.recv())
-            .await
-            .is_ok()
+        // A watcher that ended closes the channel, which tells nothing.
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await,
+            Ok(Some(()))
+        )
     }
 
     #[tokio::test]
@@ -433,17 +435,17 @@ mod tests {
         std::fs::write(&path, "a = 2\n").unwrap();
         assert!(told(&mut receiver).await, "write in place");
         // Drain what one write may have told twice.
-        while tokio::time::timeout(Duration::from_millis(200), receiver.recv())
-            .await
-            .is_ok()
-        {}
+        while matches!(
+            tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await,
+            Ok(Some(()))
+        ) {}
         std::fs::write(dir.join(".config.toml.tmp"), "a = 3\n").unwrap();
         std::fs::rename(dir.join(".config.toml.tmp"), &path).unwrap();
         assert!(told(&mut receiver).await, "rename over");
-        while tokio::time::timeout(Duration::from_millis(200), receiver.recv())
-            .await
-            .is_ok()
-        {}
+        while matches!(
+            tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await,
+            Ok(Some(()))
+        ) {}
         // A rewrite after the rename is still told: the new file is watched.
         std::fs::write(&path, "a = 4\n").unwrap();
         assert!(told(&mut receiver).await, "write after rename");
@@ -463,20 +465,20 @@ mod tests {
         let mut receiver = super::watch(&path).await.unwrap();
         std::fs::write(&target, "a = 2\n").unwrap();
         assert!(told(&mut receiver).await, "write to the target");
-        while tokio::time::timeout(Duration::from_millis(200), receiver.recv())
-            .await
-            .is_ok()
-        {}
+        while matches!(
+            tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await,
+            Ok(Some(()))
+        ) {}
         // The link pointed elsewhere: edits there are told from then on.
         let other = dir.join("dotfiles/other.toml");
         std::fs::write(&other, "a = 3\n").unwrap();
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&other, &path).unwrap();
         assert!(told(&mut receiver).await, "link swapped");
-        while tokio::time::timeout(Duration::from_millis(200), receiver.recv())
-            .await
-            .is_ok()
-        {}
+        while matches!(
+            tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await,
+            Ok(Some(()))
+        ) {}
         std::fs::write(&other, "a = 4\n").unwrap();
         assert!(told(&mut receiver).await, "write to the new target");
         std::fs::remove_dir_all(&dir).unwrap();
