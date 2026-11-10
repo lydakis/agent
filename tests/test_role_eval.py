@@ -105,9 +105,6 @@ class BlindTests(unittest.TestCase):
                 self.assertNotIn('trim', text)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class ConfinedTests(unittest.TestCase):
     """What the eval allows has effects only in the run (#521)."""
@@ -465,3 +462,6 @@ class BurstLedgerTests(unittest.TestCase):
             self.assertTrue(self.ledger.checked(agent, repo, env, 'main', "open('here', 'w').write('x')"))
             keyless = "import os, sys; sys.exit('OPENAI_API_KEY' in os.environ)"
             self.assertTrue(self.ledger.checked(agent, repo, env, 'main', keyless))
+
+if __name__ == '__main__':
+    unittest.main()

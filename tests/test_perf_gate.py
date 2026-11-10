@@ -14,7 +14,9 @@ def footprint(cpu, jobs=3, next_ready=1):
 
 class PerfGateTests(unittest.TestCase):
     def screen(self, base, head):
-        root = Path(tempfile.mkdtemp())
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        root = Path(folder.name)
         for side, runs in (('base', base), ('head', head)):
             folder = root / f'footprint-{side}-0'
             folder.mkdir()
@@ -40,7 +42,9 @@ class PerfGateTests(unittest.TestCase):
         def sonny(untold, p95):
             return {'lookout': {'10x100': {'untold': untold, 'note_delay_ms_p95': p95,
                                            'cpu_ms_per_1k_deltas': 10.0}}}
-        root = Path(tempfile.mkdtemp())
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        root = Path(folder.name)
         for side, run in (('base', sonny(0, 3000)), ('head', sonny(4, 1000))):
             folder = root / f'sonny-{side}-0'
             folder.mkdir()

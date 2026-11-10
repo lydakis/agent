@@ -396,7 +396,6 @@ class Bench:
             while self.running_tasks() and time.monotonic() < deadline:
                 time.sleep(.2)
         ran = time.monotonic() - started
-        settle = time.monotonic()
         time.sleep(self.args.settle)
         result = {'submitted_turns': submitted, 'ran_s': round(ran, 1),
                   'daemon': daemon.done(),

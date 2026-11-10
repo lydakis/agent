@@ -8,7 +8,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -1056,7 +1055,9 @@ there.wait()
                                                     'AGENT_BROWSER_SOCKET_DIR': str(sockets)}))
 
         def browse(bot, commands):
-            payload = {'commands': commands, 'bot': bot, 'bot_id': hash(bot) % 1000, 'store': str(self.store)}
+            # A fixed id each: `hash` of a string differs from run to run, and two could meet.
+            bot_id = {'one.lead': 1, 'two.lead': 2}[bot]
+            payload = {'commands': commands, 'bot': bot, 'bot_id': bot_id, 'store': str(self.store)}
             conn, said = self.borrow('browser', payload)
             # Whatever it asks, or records, the box's gate allows.
             while 'done' not in (answer := json.loads(said.readline())):

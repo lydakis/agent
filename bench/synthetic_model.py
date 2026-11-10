@@ -7,8 +7,8 @@ return one wait tool call on the given handles and then a reply; `call:NAME`
 prompts call the tool NAME with no arguments and then reply; `delay:N`
 prompts reply after N milliseconds so many turns overlap (and a summary
 after the server's `summary_delay` seconds); `limited:` prompts
-are refused with 429 and a one-second Retry-After every time. A judge's
-round from `sonny approver` gets every question answered 0.05.
+are refused with 429 and a one-second Retry-After every time. A reviewer's
+round from `sonny reviewer` gets every call it asks about allowed, low risk.
 No history validation: the daemon's request bodies are counted, not checked.
 """
 import http.server
@@ -91,8 +91,11 @@ class Model(http.server.BaseHTTPRequestHandler):
             text, output = '', [{'type': 'function_call', 'name': 'wait', 'call_id': 'w-1',
                                  'arguments': json.dumps({'handles': user[5:].split(',')})}]
         elif user.startswith('{"state"'):
-            # A judge's round from `sonny approver`: every risk judged low.
-            text = json.dumps({id: 0.05 for id in json.loads(user)['answer']})
+            # A reviewer's round from `sonny reviewer`: one assessment per
+            # call asked, each low risk and allowed, in the verdict's schema.
+            text = json.dumps({'assessments': [
+                {'id': id, 'risk_level': 'low', 'user_authorization': 'unknown', 'outcome': 'allow',
+                 'rationale': ''} for id in json.loads(user)['assess']]})
             output = [{'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': text}]}]
         else:
             # `text:N` replies with N bytes, so histories grow from both sides.

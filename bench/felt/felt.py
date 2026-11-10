@@ -35,8 +35,6 @@ import threading
 import time
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-
 
 class Conn:
     def __init__(self, path):
@@ -263,7 +261,6 @@ def run(args, out, logs, home, ws, store, sock, env):
     # window, so nothing keeps running into the next measurement.
     try:
         for phase in args.phases.split(','):
-            started = time.time()
             stop.clear()
             worker = None
             if phase == 'busy':

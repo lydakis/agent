@@ -7,7 +7,7 @@ import json
 import os
 import time
 from unittest import skipUnless
-from bench.runtime_client import Client, node_item
+from bench.runtime_client import node_item
 from bench.socket_client import Connection, SocketClient
 from tests.test_elision import drain, encoded
 from tests.test_runtime import ModelFixture, is_summary
