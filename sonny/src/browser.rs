@@ -261,6 +261,10 @@ pub struct Reach {
     /// Whether it reads this machine's files, as its sandbox reads anywhere
     /// here: not over a link, whose agent has no file of this machine.
     reads: bool,
+    /// Whether what its commands save is carried back to its agent's own
+    /// machine, which wrote that it may: over a link whose other end
+    /// takes them. The browser saves each to a file of Sonny's own here.
+    carry: bool,
 }
 
 impl Reach {
@@ -289,19 +293,38 @@ impl Reach {
             writes: sandbox != Some("read-only"),
             network: !confined || sandbox == Some("workspace-write") && settings["network"] == true,
             reads: true,
+            carry: false,
         }
     }
 
     /// The reach of an agent of another machine, over a link: no file
-    /// here, and the network, which its own machine allowed already.
-    pub fn lent() -> Reach {
+    /// here, and the network, which its own machine allowed already. What
+    /// it saves is carried back when `carry`, as its machine checked it.
+    pub fn lent(carry: bool) -> Reach {
         Reach {
             cwd: std::env::temp_dir(),
             roots: Some(Vec::new()),
             writes: false,
             network: true,
             reads: false,
+            carry,
         }
+    }
+
+    /// `path` as a file the browser writes, as [`output`](Self::output)
+    /// says; over a link that carries files back, a file of Sonny's own
+    /// here instead, noted in `carried` beside `path`, the agent's own.
+    fn saved(&self, path: &str, carried: &mut Vec<(String, PathBuf)>) -> Result<String, String> {
+        if !self.carry {
+            return self.output(path);
+        }
+        // One already named here (`diff`'s `-o`, read as a flag first).
+        if carried.iter().any(|(_, file)| file.as_os_str() == path) {
+            return Ok(path.to_owned());
+        }
+        let file = carried_file(path)?;
+        carried.push((path.to_owned(), file.clone()));
+        Ok(file.to_string_lossy().into_owned())
     }
 
     /// The folders its sandbox writes, the temporary ones with them, as
@@ -458,6 +481,11 @@ struct Checked {
     /// What `find` does to what it finds, which agent-browser confirms
     /// by `find`'s own action only.
     subaction: Option<String>,
+    /// Over a link that carries them back: each file it saves, as its
+    /// agent named it, and the file of Sonny's that holds it here.
+    carried: Vec<(String, PathBuf)>,
+    /// A recording's `start` or `stop`, whose file is written at its stop.
+    record: Option<&'static str>,
 }
 
 /// How a session's browser starts: the actions it confirms, and the
@@ -497,6 +525,43 @@ fn pictures() -> Result<PathBuf, String> {
 /// Pictures the tool host named, so two at once differ.
 static PICTURES: AtomicU64 = AtomicU64::new(0);
 
+/// The file of Sonny's own that holds what the browser saves for `path`,
+/// a file of another machine's agent, until it is carried back there: in
+/// [`pictures`], by the name `path` ends in, whose extension says what
+/// the browser writes.
+fn carried_file(path: &str) -> Result<PathBuf, String> {
+    let name: String = (Path::new(path).file_name())
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| match c.is_ascii_alphanumeric() || "._-".contains(c) {
+            true => c,
+            false => '_',
+        })
+        .collect();
+    let name = name.trim_start_matches('.');
+    let name = match name.len() > 64 {
+        true => &name[name.len() - 64..],
+        false => name,
+    };
+    Ok(pictures()?.join(format!(
+        "sonny-carried-{}-{}-{name}",
+        std::process::id(),
+        PICTURES.fetch_add(1, Ordering::Relaxed),
+    )))
+}
+
+/// The most bytes of files one call over a link carries back: with its
+/// pictures, as base64, they fit in the longest line a link reads.
+const CARRIED_BYTES: usize = 30 << 20;
+
+/// Each session's recording over a link that carries files back: its
+/// file as the agent named it, and the file of Sonny's that holds it
+/// until its `stop`, which may come in another call.
+static RECORDINGS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (String, PathBuf)>>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// Whether `word` reads as a picture's file name.
 fn picture_file(word: &str) -> bool {
     let lower = word.to_ascii_lowercase();
@@ -517,6 +582,8 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
         return Err("an empty command".into());
     };
     let refused = |why: &str| Err(format!("`{command}` {why}"));
+    let mut carried = Vec::new();
+    let mut record = None;
     // Its flags, each checked, and its other words, in order.
     let mut args = vec![command.clone()];
     let mut words = words.into_iter().skip(1);
@@ -565,8 +632,12 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
                 ));
             }
             args.extend([flag, value]);
+        } else if flag == "--screenshot-dir" && reach.carry {
+            return Err(format!(
+                "{flag} is not taken over a link: give each screenshot a path"
+            ));
         } else if ["--screenshot-dir", "-o", "--output"].contains(&flag.as_str()) {
-            let file = reach.output(&value(&mut words)?)?;
+            let file = reach.saved(&value(&mut words)?, &mut carried)?;
             args.extend([flag, file]);
         } else if ["-b", "--baseline"].contains(&flag.as_str()) {
             let file = reach.file(&value(&mut words)?)?;
@@ -647,7 +718,7 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
             };
             match path {
                 Some(n) => {
-                    let file = reach.output(word!(n).unwrap_or_default())?;
+                    let file = reach.saved(word!(n).unwrap_or_default(), &mut carried)?;
                     set!(n, file);
                 }
                 None => {
@@ -677,7 +748,7 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
             let Some(path) = word!(n) else {
                 return refused("needs a file to save to");
             };
-            let file = reach.output(path)?;
+            let file = reach.saved(path, &mut carried)?;
             set!(n, file);
         }
         "upload" => {
@@ -693,15 +764,22 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
                 (_, Some("start" | "stop")) => None,
                 _ => return refused("is start or stop here"),
             };
+            if command == "record" {
+                record = match word!(0) {
+                    Some("stop") => Some("stop"),
+                    Some("restart") => Some("restart"),
+                    _ => Some("start"),
+                };
+            }
             if let Some(n) = path.filter(|&n| word!(n).is_some()) {
-                let file = reach.output(word!(n).unwrap_or_default())?;
+                let file = reach.saved(word!(n).unwrap_or_default(), &mut carried)?;
                 set!(n, file);
             }
         }
         "network" => match (word!(0), word!(1)) {
             (Some("har"), Some("stop")) => {
                 if let Some(path) = word!(2) {
-                    let file = reach.output(path)?;
+                    let file = reach.saved(path, &mut carried)?;
                     set!(2, file);
                 }
             }
@@ -714,7 +792,9 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
                 for n in 1..rest.len() {
                     let file = match word!(n) {
                         Some("-b" | "--baseline") => word!(n + 1).map(|path| reach.file(path)),
-                        Some("-o" | "--output") => word!(n + 1).map(|path| reach.output(path)),
+                        Some("-o" | "--output") => {
+                            word!(n + 1).map(|path| reach.saved(path, &mut carried))
+                        }
                         _ => None,
                     };
                     if let Some(file) = file {
@@ -731,7 +811,7 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
                     return refused("needs a file");
                 };
                 let file = match how {
-                    "save" => reach.output(path)?,
+                    "save" => reach.saved(path, &mut carried)?,
                     _ => reach.file(path)?,
                 };
                 set!(1, file);
@@ -781,6 +861,8 @@ fn checked(line: &str, reach: &Reach) -> Result<Checked, String> {
         picture,
         ask,
         subaction,
+        carried,
+        record,
     })
 }
 
@@ -1142,7 +1224,8 @@ pub fn tool() -> Option<Value> {
         properties["machine"] = json!({"type": "string", "enum": machines,
             "description": "Another machine of the person's to run it on, while it is connected."});
         description.push_str(&format!(
-            " `machine` runs it on {names}, another machine of the person's; there no path is yours, so screenshots come back as pictures."
+            " `machine` runs it on {names}, another machine of the person's; a path is still one in your folder, and what it saves there comes back over the link, up to {} MB a call.",
+            CARRIED_BYTES >> 20
         ));
         if !here {
             required.push("machine");
@@ -1284,17 +1367,25 @@ pub async fn answer(
     // this agent's gate for what they confirm; the network is this one's
     // to allow first, as here.
     if let Some(machine) = call["arguments"]["machine"].as_str() {
+        // What they save is this agent's, written here where it may write,
+        // as checked before any runs there.
+        for line in &lines {
+            checked(line, &reach).map_err(|e| ("browser_refused", e))?;
+        }
         let allowed = match offline(&reach, &lines, &steps).await {
             Ok(allowed) => allowed,
             Err(why) => return Ok(Value::String(why)),
         };
         let lent = json!({"commands": lines, "bot": call["bot"], "bot_id": record["bot_id"],
-            "store": client.store().unwrap_or_default()});
+            "store": client.store().unwrap_or_default(), "carry": true});
         let answer = crate::link::call(machine, NAME, lent, Some(&steps)).await;
         if let Some(step) = allowed {
             steps.ran(step, answer.is_err()).await;
         }
-        return answer;
+        return match answer {
+            Ok(answer) => Ok(landed(answer, &reach).await),
+            Err(failed) => Err(failed),
+        };
     }
     // What agent-browser reads its settings from, which can name the
     // program it starts, is the person's to write, not the agent's.
@@ -1368,7 +1459,8 @@ pub async fn lent(
     };
     // An agent of another machine: its share here is its session's, the
     // only place it takes here.
-    drive(&lines, &Reach::lent(), &session, &session, browser, steps).await
+    let reach = Reach::lent(payload["carry"] == true);
+    drive(&lines, &reach, &session, &session, browser, steps).await
 }
 
 /// The browser a session drives.
@@ -1480,7 +1572,20 @@ async fn find_link_browser(key: &str, profile: &str) -> Result<String, String> {
     }
     let url = match chrome_at(&dir).await {
         Some(url) => url,
-        None => start_chrome(&dir).await?,
+        None => {
+            // A copy of the person's profile, while no Chrome has it open,
+            // brought up to date with what their Chrome has since.
+            if !is_folder(profile) && holder(&dir).is_none() {
+                let (dir_, profile_) = (dir.clone(), profile.to_owned());
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Some(data) = chrome_data() {
+                        refresh_kept(&dir_, &profile_, &data);
+                    }
+                })
+                .await;
+            }
+            start_chrome(&dir).await?
+        }
     };
     chrome.dir = Some(dir);
     chrome.last = Some(std::time::Instant::now());
@@ -1621,13 +1726,7 @@ async fn start_chrome(dir: &Path) -> Result<String, String> {
 /// and the folder is said to be in use, so nothing replaces it under a
 /// Chrome still running.
 async fn stop_chrome(dir: &Path) -> Result<(), String> {
-    let lock = dir.join("SingletonLock");
-    let held = || {
-        std::fs::read_link(&lock)
-            .ok()
-            .and_then(|to| lock_pid(&to.to_string_lossy()))
-            .filter(|pid| running(*pid))
-    };
+    let held = || holder(dir);
     let Some(pid) = held() else {
         return Ok(());
     };
@@ -1644,6 +1743,15 @@ async fn stop_chrome(dir: &Path) -> Result<(), String> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(in_use())
+}
+
+/// The running process that holds the profile folder `dir`, as its
+/// `SingletonLock` names it.
+fn holder(dir: &Path) -> Option<i32> {
+    std::fs::read_link(dir.join("SingletonLock"))
+        .ok()
+        .and_then(|to| lock_pid(&to.to_string_lossy()))
+        .filter(|pid| running(*pid))
 }
 
 /// Whether the process `pid` runs.
@@ -1821,7 +1929,7 @@ fn kept_profile(key: &str, profile: &str, data: Option<&Path>) -> Kept {
     if !agent_client::config::named(key) {
         return Kept::Failed(format!("{key} is not a link's name"));
     }
-    if profile.contains(['/', '\\', '~']) {
+    if is_folder(profile) {
         let dir = match profile.strip_prefix("~/") {
             Some(rest) => match std::env::var_os("HOME") {
                 Some(home) => PathBuf::from(home).join(rest),
@@ -1840,6 +1948,162 @@ fn kept_profile(key: &str, profile: &str, data: Option<&Path>) -> Kept {
     let links = home.join(".agent/sonny/links");
     kept_in(&links.join(key), profile, data)
 }
+
+/// Whether a link's `browser_profile` is a folder, used as it is, not a
+/// profile's name.
+fn is_folder(profile: &str) -> bool {
+    profile.contains(['/', '\\', '~'])
+}
+
+/// The kept profile `dir`, a copy of the person's profile `profile` from
+/// their Chrome's user-data folder `data`, brought up to date as its
+/// Chrome starts, which nothing has open: the person's native messaging
+/// hosts linked in, as Chrome reads them from beside its profiles, so an
+/// extension that talks to a program of theirs (a company's device check)
+/// reaches it, and their sign-ins copied over the copy's when theirs are
+/// newer. The rest of the copy stays as its browser left it.
+fn refresh_kept(dir: &Path, profile: &str, data: &Path) {
+    let _ = link_hosts(
+        &data.join("NativeMessagingHosts"),
+        &dir.join("NativeMessagingHosts"),
+    );
+    let state = std::fs::read_to_string(data.join("Local State")).unwrap_or_default();
+    let Some(folder) = profile_folder(&state, profile) else {
+        return;
+    };
+    // Where Chrome keeps them, by its version and system.
+    for cookies in ["Cookies", "Network/Cookies"] {
+        let _ = newer_database(
+            &data.join(&folder).join(cookies),
+            &dir.join(&folder).join(cookies),
+        );
+    }
+}
+
+/// Each file in `from` linked, by its name, into `to`, so one the person's
+/// programs rewrite is read as it is now; links there to files no longer
+/// in `from` go. Other files in `to` stay.
+fn link_hosts(from: &Path, to: &Path) -> std::io::Result<()> {
+    let hosts: Vec<std::ffi::OsString> = (std::fs::read_dir(from).into_iter().flatten().flatten())
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.file_name())
+        .collect();
+    if hosts.is_empty() && !to.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(to)?.flatten() {
+        let gone = !hosts.contains(&entry.file_name());
+        if gone && entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    for name in hosts {
+        let (target, link) = (from.join(&name), to.join(&name));
+        if std::fs::read_link(&link).ok().as_ref() == Some(&target) {
+            continue;
+        }
+        if std::fs::symlink_metadata(&link).is_ok() {
+            std::fs::remove_file(&link)?;
+        }
+        std::os::unix::fs::symlink(&target, &link)?;
+    }
+    Ok(())
+}
+
+/// The SQLite database `from`, with its journal, copied over `to` when it
+/// was written after `to` was: whether it was. A journal of `to`'s that
+/// `from` has none of goes first, so it is never played back over the
+/// other's data.
+fn newer_database(from: &Path, to: &Path) -> std::io::Result<bool> {
+    // When each was last written: by its database or its journal, where a
+    // write-ahead log holds what was written since the last checkpoint.
+    let written = |path: &Path| -> std::io::Result<std::time::SystemTime> {
+        let mut latest = std::fs::metadata(path)?.modified()?;
+        for suffix in ["-journal", "-wal"] {
+            let mut side = path.as_os_str().to_owned();
+            side.push(suffix);
+            if let Ok(at) = std::fs::metadata(PathBuf::from(side)).and_then(|m| m.modified()) {
+                latest = latest.max(at);
+            }
+        }
+        Ok(latest)
+    };
+    let theirs = written(from)?;
+    if written(to).is_ok_and(|ours| ours >= theirs) {
+        return Ok(false);
+    }
+    let with = |suffix: &str| {
+        let mut path = to.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    let source = |suffix: &str| {
+        let mut path = from.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    // Each of the person's files as it stands: its size and when it was
+    // written, or none. A copy between two equal readings is of one state
+    // of the database, which their Chrome did not write meanwhile.
+    let reading = || -> Vec<Option<(u64, std::time::SystemTime)>> {
+        (SIDECARS.iter())
+            .map(|suffix| {
+                let meta = std::fs::metadata(source(suffix)).ok()?;
+                Some((meta.len(), meta.modified().ok()?))
+            })
+            .collect()
+    };
+    for _ in 0..SNAPSHOT_TRIES {
+        let mut copied = Vec::new();
+        let before = reading();
+        let done = (|| {
+            for suffix in SIDECARS {
+                let partial = with(&format!("{suffix}.{}.partial", std::process::id()));
+                match std::fs::copy(source(suffix), &partial) {
+                    Ok(_) => copied.push((partial, with(suffix))),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && !suffix.is_empty() => {}
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&partial);
+                        return Err(e);
+                    }
+                }
+            }
+            // Written meanwhile: copied again.
+            if reading() != before {
+                return Ok(false);
+            }
+            // The copy's own, and its wal-index, which SQLite makes again
+            // from the log.
+            for suffix in ["-journal", "-wal", "-shm"] {
+                match std::fs::remove_file(with(suffix)) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                    _ => {}
+                }
+            }
+            // The database first: its own journal after, never another's before.
+            while !copied.is_empty() {
+                let (partial, file) = copied.remove(0);
+                std::fs::rename(partial, file)?;
+            }
+            Ok(true)
+        })();
+        for (partial, _) in copied {
+            let _ = std::fs::remove_file(partial);
+        }
+        if !matches!(done, Ok(false)) {
+            return done;
+        }
+    }
+    // Written throughout: left for the next start.
+    Ok(false)
+}
+
+/// A SQLite database's own file and those beside it that hold its data.
+const SIDECARS: [&str; 3] = ["", "-journal", "-wal"];
+
+/// How many times a database being written is copied again.
+const SNAPSHOT_TRIES: usize = 3;
 
 /// [`kept_profile`] of a named profile, kept in `link`'s folder.
 fn kept_in(link: &Path, profile: &str, data: Option<&Path>) -> Kept {
@@ -2022,6 +2286,7 @@ async fn drive(
     let mut parts: Vec<Value> = Vec::new();
     let mut text = String::new();
     let mut shown = 0;
+    let mut carried_bytes = 0;
     for (n, (line, command)) in lines.iter().zip(&checked).enumerate() {
         if lines.len() > 1 {
             text.push_str(&format!("$ {line}\n"));
@@ -2065,6 +2330,45 @@ async fn drive(
             }
         }
         let (mut said, ok) = (ran.said, ran.ok);
+        if reach.carry {
+            for (path, file) in carried(&session, command, ok) {
+                // Never more read than the call may still carry, and one
+                // byte, whatever the file's size.
+                let room = CARRIED_BYTES - carried_bytes;
+                let read = tokio::task::spawn_blocking({
+                    let file = file.clone();
+                    move || {
+                        use std::io::Read;
+                        let mut bytes = Vec::new();
+                        let read = std::fs::File::open(&file).and_then(|opened| {
+                            opened.take(room as u64 + 1).read_to_end(&mut bytes)
+                        });
+                        let _ = std::fs::remove_file(&file);
+                        read.map(|_| bytes)
+                    }
+                });
+                said = said.replace(&*file.to_string_lossy(), &path);
+                match read
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r.map_err(|e| e.to_string()))
+                {
+                    Ok(bytes) if carried_bytes + bytes.len() > CARRIED_BYTES => {
+                        said.push_str(&format!(
+                            "\n{path}: not saved: a call carries back {} MB at most",
+                            CARRIED_BYTES >> 20
+                        ))
+                    }
+                    Ok(bytes) => {
+                        use base64::Engine;
+                        carried_bytes += bytes.len();
+                        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        parts.push(json!({"type": "file", "path": path, "data": data}));
+                    }
+                    Err(e) => said.push_str(&format!("\n{path}: not saved: {e}")),
+                }
+            }
+        }
         // The file the host named is gone once read: the picture is shown,
         // as many as one result holds.
         // Read and fitted off the tool host's one thread: a tall page's
@@ -2126,7 +2430,137 @@ async fn drive(
     if !text.is_empty() {
         parts.push(json!({"type": "text", "text": text}));
     }
+    // Over a link, the whole answer is one line of it: past the longest
+    // line, the other end would drop the link, not land the files.
+    if reach.carry && carried_bytes > 0 {
+        return Ok(fitted(parts, ANSWER_BYTES));
+    }
     Ok(Value::Array(parts))
+}
+
+/// The most bytes of an answer that goes back over a link, with room for
+/// what carries it.
+const ANSWER_BYTES: usize = crate::link::LINE_BYTES - (64 << 10);
+
+/// `parts`, an answer carrying files back over a link, within `most`
+/// bytes as JSON: the last files it carries left out until it fits, each
+/// said not saved.
+fn fitted(mut parts: Vec<Value>, most: usize) -> Value {
+    let size = |parts: &Vec<Value>| serde_json::to_vec(parts).map_or(usize::MAX, |json| json.len());
+    let mut left_out = Vec::new();
+    while size(&parts) > most {
+        let Some(at) = parts.iter().rposition(|part| part["type"] == "file") else {
+            break;
+        };
+        let part = parts.remove(at);
+        left_out.push(format!(
+            "{}: not saved: with the rest of the answer it is more than the link carries ({} MB)",
+            part["path"].as_str().unwrap_or_default(),
+            most >> 20
+        ));
+    }
+    if !left_out.is_empty() {
+        left_out.reverse();
+        parts.push(json!({"type": "text", "text": left_out.join("\n")}));
+    }
+    Value::Array(parts)
+}
+
+/// The files `command`, which ran in `session` over a link that carries
+/// files back, saved and are to go back now, each as its agent named it
+/// and the file of Sonny's that holds it: none when it failed, whose files
+/// go. A recording's file is kept until its `stop`, whenever that comes.
+fn carried(session: &str, command: &Checked, ok: bool) -> Vec<(String, PathBuf)> {
+    let mut now = command.carried.clone();
+    if !ok {
+        for (_, file) in now {
+            let _ = std::fs::remove_file(file);
+        }
+        return Vec::new();
+    }
+    let mut recordings = RECORDINGS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut back = Vec::new();
+    // Stopped, the one recording before is written.
+    if matches!(command.record, Some("stop" | "restart"))
+        && let Some(earlier) = recordings.remove(session)
+    {
+        back.push(earlier);
+    }
+    if matches!(command.record, Some("start" | "restart"))
+        && let Some(started) = now.pop()
+        && let Some((_, unstopped)) = recordings.insert(session.to_owned(), started)
+    {
+        let _ = std::fs::remove_file(unstopped);
+    }
+    back.append(&mut now);
+    back
+}
+
+/// `answer`, from another machine, with the files it carried back written
+/// where this agent named them, as far as its own reach lets it write
+/// them, and taken out of it: what it says, as a call here would.
+async fn landed(answer: Value, reach: &Reach) -> Value {
+    let Value::Array(parts) = answer else {
+        return answer;
+    };
+    if !parts.iter().any(|part| part["type"] == "file") {
+        return Value::Array(parts);
+    }
+    let reach = reach.clone();
+    let landed = tokio::task::spawn_blocking(move || {
+        let mut kept = Vec::new();
+        let mut unsaved = Vec::new();
+        for part in parts {
+            if part["type"] != "file" {
+                kept.push(part);
+                continue;
+            }
+            let path = part["path"].as_str().unwrap_or_default();
+            if let Err(e) = reach
+                .output(path)
+                .and_then(|file| land(&file, &part["data"]))
+            {
+                unsaved.push(format!("{path}: not saved: {e}"));
+            }
+        }
+        if !unsaved.is_empty() {
+            kept.push(json!({"type": "text", "text": unsaved.join("\n")}));
+        }
+        match kept.iter().all(|part| part["type"] == "text") {
+            true => Value::String(
+                (kept.iter())
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            false => Value::Array(kept),
+        }
+    });
+    landed
+        .await
+        .unwrap_or_else(|e| Value::String(format!("the files saved were not written: {e}")))
+}
+
+/// The base64 `data` written to `file`, its folder made if need be, never
+/// through a link put in its place.
+fn land(file: &str, data: &Value) -> Result<(), String> {
+    use base64::Engine;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let bytes = (base64::engine::general_purpose::STANDARD
+        .decode(data.as_str().unwrap_or_default()))
+    .map_err(|e| e.to_string())?;
+    if let Some(folder) = Path::new(file).parent() {
+        std::fs::create_dir_all(folder).map_err(|e| e.to_string())?;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(file)
+        .and_then(|mut opened| opened.write_all(&bytes))
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -2259,6 +2693,131 @@ mod tests {
             kept_profile("../x", "Work", None),
             Kept::Failed(_)
         ));
+    }
+
+    #[test]
+    fn a_kept_profile_gets_the_person_s_hosts_and_newer_sign_ins_as_its_chrome_starts() {
+        let root = scratch("refresh");
+        let data = root.join("chrome-data");
+        let state = json!({"profile": {"info_cache": {"Profile 1": {"name": "Work"}}}});
+        std::fs::create_dir_all(data.join("Profile 1")).unwrap();
+        std::fs::create_dir_all(data.join("NativeMessagingHosts")).unwrap();
+        std::fs::write(data.join("Local State"), state.to_string()).unwrap();
+        std::fs::write(data.join("NativeMessagingHosts/check.json"), "{}").unwrap();
+        std::fs::write(data.join("Profile 1/Cookies"), "theirs").unwrap();
+        let link = root.join("links/box");
+        let Kept::Ready(dir) = kept_in(&link, "Work", Some(&data)) else {
+            panic!("not copied");
+        };
+        let at = |secs: u64| std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let stamp = |path: &Path, secs: u64| {
+            (std::fs::File::options().write(true).open(path))
+                .and_then(|file| file.set_modified(at(secs)))
+                .unwrap()
+        };
+        let hosts = dir.join("NativeMessagingHosts");
+        // The copy's own sign-ins, newer than the person's: kept, with
+        // their journal. A host Chrome made empty, and one gone since.
+        std::fs::write(dir.join("Profile 1/Cookies"), "ours").unwrap();
+        std::fs::write(dir.join("Profile 1/Cookies-journal"), "ours too").unwrap();
+        stamp(&data.join("Profile 1/Cookies"), 1_000);
+        stamp(&dir.join("Profile 1/Cookies"), 2_000);
+        stamp(&dir.join("Profile 1/Cookies-journal"), 2_000);
+        std::fs::create_dir_all(&hosts).unwrap();
+        std::os::unix::fs::symlink(
+            data.join("NativeMessagingHosts/old.json"),
+            hosts.join("old.json"),
+        )
+        .unwrap();
+        std::fs::write(hosts.join("own.json"), "kept").unwrap();
+        refresh_kept(&dir, "Work", &data);
+        let read = |path: PathBuf| std::fs::read_to_string(path).unwrap();
+        assert_eq!(read(dir.join("Profile 1/Cookies")), "ours");
+        assert_eq!(read(dir.join("Profile 1/Cookies-journal")), "ours too");
+        // The person's hosts are linked, read as they are now.
+        assert_eq!(
+            std::fs::read_link(hosts.join("check.json")).unwrap(),
+            data.join("NativeMessagingHosts/check.json")
+        );
+        std::fs::write(data.join("NativeMessagingHosts/check.json"), "{\"v\": 2}").unwrap();
+        assert_eq!(read(hosts.join("check.json")), "{\"v\": 2}");
+        assert!(std::fs::symlink_metadata(hosts.join("old.json")).is_err());
+        assert_eq!(read(hosts.join("own.json")), "kept");
+        // The person signs in again: theirs, newer, replace the copy's,
+        // whose journal goes with it.
+        std::fs::write(data.join("Profile 1/Cookies"), "signed in").unwrap();
+        stamp(&data.join("Profile 1/Cookies"), 3_000);
+        refresh_kept(&dir, "Work", &data);
+        assert_eq!(read(dir.join("Profile 1/Cookies")), "signed in");
+        assert!(!dir.join("Profile 1/Cookies-journal").exists());
+        // Their journal comes with theirs.
+        std::fs::write(data.join("Profile 1/Cookies-journal"), "j").unwrap();
+        stamp(&data.join("Profile 1/Cookies"), 4_000_000_000);
+        assert!(
+            newer_database(
+                &data.join("Profile 1/Cookies"),
+                &dir.join("Profile 1/Cookies")
+            )
+            .unwrap()
+        );
+        assert_eq!(read(dir.join("Profile 1/Cookies-journal")), "j");
+        // What a write-ahead log holds since its last checkpoint counts,
+        // though the database itself is older than the copy.
+        std::fs::write(data.join("Profile 1/Cookies-wal"), "renewed").unwrap();
+        stamp(&data.join("Profile 1/Cookies"), 1_000);
+        stamp(&dir.join("Profile 1/Cookies"), 2_000_000);
+        stamp(&dir.join("Profile 1/Cookies-journal"), 2_000_000);
+        stamp(&data.join("Profile 1/Cookies-wal"), 3_000_000);
+        assert!(
+            newer_database(
+                &data.join("Profile 1/Cookies"),
+                &dir.join("Profile 1/Cookies")
+            )
+            .unwrap()
+        );
+        assert_eq!(read(dir.join("Profile 1/Cookies-wal")), "renewed");
+        assert!(
+            !newer_database(
+                &data.join("Profile 1/Cookies"),
+                &dir.join("Profile 1/Cookies")
+            )
+            .unwrap()
+        );
+        // Nothing half copied is left beside them.
+        let left: Vec<String> = (std::fs::read_dir(dir.join("Profile 1")).unwrap().flatten())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".partial"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        // A host the person removed goes from the copy too.
+        std::fs::remove_file(data.join("NativeMessagingHosts/check.json")).unwrap();
+        refresh_kept(&dir, "Work", &data);
+        assert!(std::fs::symlink_metadata(hosts.join("check.json")).is_err());
+    }
+
+    #[test]
+    fn an_answer_over_a_link_leaves_out_the_files_that_would_not_fit() {
+        let file = |path: &str, size: usize| json!({"type": "file", "path": path, "data": "x".repeat(size)});
+        let text = json!({"type": "text", "text": "✓ saved"});
+        let parts = vec![text.clone(), file("a.pdf", 600), file("b.pdf", 600)];
+        let fitted = fitted(parts.clone(), 1_000);
+        let fitted = fitted.as_array().unwrap();
+        assert_eq!(fitted[0], text);
+        assert_eq!(fitted[1]["path"], "a.pdf");
+        assert_eq!(fitted.len(), 3);
+        assert!(
+            fitted[2]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("b.pdf: not saved")
+        );
+        assert!(serde_json::to_vec(fitted).unwrap().len() <= 1_000);
+        // One that fits stays whole.
+        assert_eq!(fitted_all(parts.clone()), Value::Array(parts));
+    }
+
+    fn fitted_all(parts: Vec<Value>) -> Value {
+        fitted(parts, ANSWER_BYTES)
     }
 
     #[test]
@@ -2502,16 +3061,98 @@ mod tests {
         assert!(checked("pdf page.pdf", &lost).is_err());
         assert!(checked("open file:///etc/passwd", &lost).is_ok());
         // An agent over a link reads no file here, page or otherwise.
-        let lent = Reach::lent();
+        let lent = Reach::lent(false);
         assert!(checked("open file:///etc/passwd", &lent).is_err());
         assert!(checked("open --name x file:/etc/passwd", &lent).is_err());
         assert!(checked("open https://example.com", &lent).is_ok());
         assert!(checked("pdf page.pdf", &lent).is_err());
+        assert!(checked("open file:///etc/passwd", &Reach::lent(true)).is_err());
         // The browser is handed the real path, not the link.
         std::os::unix::fs::symlink(real.join("shots"), real.join("in")).unwrap();
         std::fs::create_dir_all(real.join("shots")).unwrap();
         let shot = args("screenshot in/page.png", &real).unwrap();
         assert_eq!(shot[1], real.join("shots/page.png").to_string_lossy());
+    }
+
+    #[test]
+    fn what_a_linked_browser_saves_is_written_on_the_agent_s_machine_as_it_may() {
+        let real = scratch("carried");
+        let lent = Reach::lent(true);
+        // There, each file it saves is one of Sonny's own, noted beside
+        // the agent's path, never the path itself.
+        let shot = checked("screenshot shots/page.png --full", &lent).unwrap();
+        let [(path, file)] = shot.carried.as_slice() else {
+            panic!("{:?}", shot.carried);
+        };
+        assert_eq!(path, "shots/page.png");
+        assert!(file.starts_with(pictures().unwrap()));
+        assert!(file.to_string_lossy().ends_with("-page.png"));
+        assert_eq!(shot.args[1], file.to_string_lossy());
+        for line in [
+            "pdf ../../etc/x.pdf",
+            "network har stop h.har",
+            "trace stop t.zip",
+            "state save s.json",
+            "download @e1 x.zip",
+        ] {
+            let saved = checked(line, &lent).unwrap();
+            assert_eq!(saved.carried.len(), 1, "{line}");
+        }
+        // `-o`, read as a flag first, is one file.
+        let diff = checked("diff snapshot -o d.txt", &lent).unwrap();
+        assert_eq!(diff.carried.len(), 1, "{:?}", diff.carried);
+        assert!(checked("screenshot --screenshot-dir shots", &lent).is_err());
+        // A recording's file goes back at its stop, which may be a later
+        // call's; a failed command's files go.
+        let start = checked("record start r.webm", &lent).unwrap();
+        assert_eq!(start.record, Some("start"));
+        std::fs::write(&start.carried[0].1, "video").unwrap();
+        assert!(carried("s1", &start, true).is_empty());
+        let stop = checked("record stop", &lent).unwrap();
+        assert_eq!(carried("s2", &stop, true), vec![]);
+        assert_eq!(
+            carried("s1", &stop, true),
+            vec![("r.webm".to_owned(), start.carried[0].1.clone())]
+        );
+        let failed = checked("pdf p.pdf", &lent).unwrap();
+        std::fs::write(&failed.carried[0].1, "x").unwrap();
+        assert!(carried("s1", &failed, false).is_empty());
+        assert!(!failed.carried[0].1.exists());
+        // Here, each is written where the agent may write, and only there.
+        let writer = reach(&real);
+        for line in ["screenshot shots/page.png", "pdf p.pdf"] {
+            assert!(checked(line, &writer).unwrap().carried.is_empty());
+        }
+        use base64::Engine;
+        let data = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+        let answer = json!([
+            {"type": "text", "text": "✓ Screenshot saved to shots/page.png"},
+            {"type": "file", "path": "shots/page.png", "data": data("png")},
+            {"type": "file", "path": "/etc/sonny-x", "data": data("no")},
+        ]);
+        let said = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(landed(answer, &writer));
+        assert_eq!(
+            std::fs::read_to_string(real.join("shots/page.png")).unwrap(),
+            "png"
+        );
+        assert!(!Path::new("/etc/sonny-x").exists());
+        let said = said.as_str().unwrap();
+        assert!(
+            said.starts_with("✓ Screenshot saved to shots/page.png\n"),
+            "{said}"
+        );
+        assert!(said.contains("/etc/sonny-x: not saved"), "{said}");
+        // Never through a link put in a file's place.
+        std::os::unix::fs::symlink("/etc/passwd", real.join("trap.png")).unwrap();
+        assert!(land(&real.join("trap.png").to_string_lossy(), &json!(data("x"))).is_err());
+        // A picture shown stays as it came.
+        let shown = json!([{"type": "image", "data": "x"}]);
+        let kept = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(landed(shown.clone(), &writer));
+        assert_eq!(kept, shown);
     }
 
     #[test]

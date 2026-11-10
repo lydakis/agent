@@ -296,10 +296,13 @@ pub(crate) fn let_go(scheduler: Scheduler, dir: &Path, label: &str) {
                 return;
             };
             let units = ["timer", "path", "service"].map(|kind| format!("{label}.{kind}"));
-            let _ = manager.run_allowing(
-                &["disable", "--now", &units[0], &units[1], &units[2]],
-                &[1, 5],
-            );
+            // One unit at a time: a systemctl that refuses to disable a unit
+            // with no file (older systemd) stops none of those it was given,
+            // and the scheduler has no timer or path unit, so an upgrade went
+            // on running the old Sonny.
+            for unit in &units {
+                let _ = manager.run_allowing(&["disable", "--now", unit], &[1, 5]);
+            }
             for file in [
                 dir.join(&units[0]),
                 dir.join(&units[1]),

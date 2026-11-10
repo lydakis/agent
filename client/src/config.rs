@@ -662,7 +662,8 @@ pub struct Link {
     /// The Chrome profile their agents' one shared browser runs on, as
     /// agent-browser's `--profile` takes it: a profile's name, `Default`
     /// by default, copied once into a profile kept for the link, signed in
-    /// as the person is here; a folder, used as it is; empty for a fresh
+    /// as the person is here, whose newer cookies and native messaging
+    /// hosts reach it at each start; a folder, used as it is; empty for a fresh
     /// browser of each agent's own.
     pub browser_profile: String,
     /// How many calls of that host's agents this machine runs at once;

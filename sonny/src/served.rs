@@ -503,7 +503,8 @@ fn show() -> Value {
         "description": "Put an agent's window where the person asks, or where they should watch it now: a tab \
             of its own, the default, a split beside yours or the agent beside names, or floating over that \
             window where the terminal can float it. Another project's lead (PROJECT.lead) opens in its \
-            project's own home, unless open there already.",
+            project's own home, the workspace or session named for that project (made if there is none, \
+            and the answer says so), never yours, unless open there already.",
         "parameters": {
             "type": "object",
             "properties": {

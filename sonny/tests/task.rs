@@ -335,8 +335,8 @@ fn a_start_lists_the_folders_the_lead_s_gone_tasks_left() {
 #[test]
 fn a_brief_that_names_the_lead_s_folder_names_the_task_s_copy() {
     let lab = Lab::new("brief");
-    // A link in the home to the repository, as `~/workplace` is to
-    // `/Volumes/workplace`.
+    // A link in the home to the repository, as `~/projects` is to
+    // `/Volumes/projects`.
     std::os::unix::fs::symlink(&lab.repo, lab.home.join("link")).unwrap();
     let repo = lab.repo.to_string_lossy();
     let brief = format!("edit {repo}/src/lib.rs and ~/link/src, keep {repo}2/x");

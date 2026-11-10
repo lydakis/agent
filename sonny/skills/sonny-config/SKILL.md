@@ -105,7 +105,11 @@ key `profile`:
   (below), which `sonny setup --json` lists under `links_differ` where it
   is not the profile a session here starts from. It is copied once into a
   profile kept for the link, which its agents share in one Chrome, a tab
-  each: a sign-in or an extension's sync there stays. Sonny starts that
+  each: a sign-in or an extension's sync there stays. Each time that
+  Chrome starts, the person's native messaging hosts are linked in and
+  their Cookies copied over the kept ones when theirs are newer, so a
+  sign-in in their own Chrome reaches it once it starts again (it closes
+  30 minutes after its agents' last call). Sonny starts that
   Chrome with the system's keychain (the person's Chrome, or
   `executablePath` in agent-browser's file), headless unless the file says
   `"headed": true`. To start it again
