@@ -3667,7 +3667,10 @@ mod tests {
         assert_eq!(folds.more, None);
         // The quote is quieter than the words, on the same band.
         assert!(rows[1].style.add_modifier.contains(Modifier::DIM));
-        assert!(rows.iter().all(|row| row.style.bg == Some(crate::look::BAND)));
+        assert!(
+            rows.iter()
+                .all(|row| row.style.bg == Some(crate::look::BAND))
+        );
         // Opened, the rest of the quote over its fold row.
         let open = text(&prompt_quoted(&said, 80, true, None));
         assert_eq!(open[0], "  ▌ line 3");
@@ -3691,7 +3694,10 @@ mod tests {
         let (rows, folds) = prompt("> one\n> two\n\nok", 80, None);
         assert_eq!(text(&rows)[1..4], ["  ▌ one", "  ▌ two", "› ok"]);
         assert_eq!(folds, Folds::default());
-        assert_eq!(text(&prompt("> only a quote", 80, None).0)[1], "› ▌ only a quote");
+        assert_eq!(
+            text(&prompt("> only a quote", 80, None).0)[1],
+            "› ▌ only a quote"
+        );
         assert_eq!(text(&prompt("ok\n> after", 80, None).0)[1], "› ok");
     }
 

@@ -383,10 +383,17 @@ mod tests {
         assert!(shown.iter().any(
             |row| row == " Last compaction freed 117.2 KB, and left 293.0 KB before the next."
         ));
-        assert!(shown.iter().any(|row| row == " A cell is a hundredth of the window, 2,000 tokens."));
+        assert!(
+            shown
+                .iter()
+                .any(|row| row == " A cell is a hundredth of the window, 2,000 tokens.")
+        );
         // A grid of ten by ten under the total: a quarter used.
         let grid: Vec<&String> = shown[3..13].iter().collect();
-        assert!(grid.iter().all(|row| row.chars().filter(|c| *c != ' ').count() == 10));
+        assert!(
+            grid.iter()
+                .all(|row| row.chars().filter(|c| *c != ' ').count() == 10)
+        );
         let filled: usize = (grid.iter())
             .map(|row| row.chars().filter(|c| !matches!(c, ' ' | '□')).count())
             .sum();

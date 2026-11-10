@@ -246,6 +246,15 @@ impl Pane {
         self
     }
 
+    /// Shown in place of `before`, which goes: where it could go back
+    /// and forward to stays this one's, as a browser's tab keeps its
+    /// history when a link opens in it.
+    pub fn instead_of(mut self, mut before: Pane) -> Self {
+        self.back = std::mem::take(&mut before.back);
+        self.forward = std::mem::take(&mut before.forward);
+        self
+    }
+
     /// Whether there is something to go back (`back`) or forward to.
     pub fn can_go(&self, back: bool) -> bool {
         match back {

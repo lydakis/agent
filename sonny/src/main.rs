@@ -5911,6 +5911,7 @@ impl App {
                     term::copy(&text);
                 }
             }
+            self.pane_switched();
             self.side_closed();
             self.suggested_now().await;
             self.shell_ran().await;
@@ -7305,6 +7306,10 @@ impl App {
         match self.pane.take() {
             Some(shown) if shown.is_card() && self.watch.is_some() => {
                 self.open_pane(pane.after(shown))
+            }
+            // In place of another agent's, its way back kept.
+            Some(shown) if shown.program.is_some() && shown.agent.is_some() => {
+                self.open_pane(pane.instead_of(shown))
             }
             shown => {
                 self.pane = shown;
@@ -14300,8 +14305,8 @@ impl App {
     /// conversation picked, and a name found in none lists those it
     /// narrows to.
     async fn switch_command(&mut self, name: &str) {
-        if self.options.side.is_some() || self.options.embedded {
-            self.notice = Some("/switch is for the main window; this one is beside it".into());
+        if self.options.side.is_some() {
+            self.notice = Some("a side chat keeps to its agent; /switch from its window".into());
             return;
         }
         if name.is_empty() {
@@ -14321,8 +14326,7 @@ impl App {
             }
             match self.client.request("inspect", json!({"bot": bot})).await {
                 Ok(_) => {
-                    self.switch_to = Some(bot);
-                    self.quit = true;
+                    self.switch_window(bot);
                     return;
                 }
                 Err(error) if error.code == "bot_not_found" => continue,
@@ -14379,6 +14383,17 @@ impl App {
             self.notice = Some(format!("this window is {bot}'s already"));
             return;
         }
+        self.switch_window(bot);
+    }
+
+    /// This window made `bot`'s Sonny: the main window goes on as it, as
+    /// if opened on it; one drawn in a pane asks the Sonny it is drawn
+    /// in to show `bot` there instead, leaving the main window as it is.
+    fn switch_window(&mut self, bot: String) {
+        if self.options.embedded {
+            embed::open_here(&bot);
+            return;
+        }
         self.switch_to = Some(bot);
         self.quit = true;
     }
@@ -14401,6 +14416,26 @@ impl App {
             .then(|| watch.pick.and_then(|at| bots.get(at).cloned()))
             .flatten()
             .filter(|bot| *bot != self.bot)
+    }
+
+    /// The agent an agent's Sonny in the pane was switched to (`/switch`
+    /// there) shown in the pane in its place, its title, Ctrl+G and the
+    /// way back following; the main window stays as it is.
+    fn pane_switched(&mut self) {
+        let Some(pane) = &self.pane else {
+            return;
+        };
+        let Some(bot) = (pane.program.as_ref())
+            .filter(|_| pane.agent.is_some())
+            .and_then(embed::Embedded::opened)
+        else {
+            return;
+        };
+        if bot == self.bot {
+            self.notice = Some(format!("this window is {bot}'s already"));
+            return;
+        }
+        self.open_task(&bot);
     }
 
     /// The pane gone once the side chat in it has ended.
@@ -17105,12 +17140,30 @@ mod tests {
         let ctrl_g = event::KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         app.key(Event::Key(ctrl_g)).await;
         assert_eq!(app.switch_to.as_deref(), Some("shop.fix"));
-        // A window drawn beside another keeps to its agent.
+        // A window drawn in another's pane asks that one to show the
+        // agent there instead; the main window is left as it is.
         (app.switch_to, app.quit) = (None, false);
         app.options.embedded = true;
         app.input.set("/switch shop.lead");
         app.submit().await;
-        assert!(app.switch_to.is_none());
+        assert!(app.switch_to.is_none() && !app.quit);
+        assert!(
+            embed::OPENED_HERE
+                .lock()
+                .unwrap()
+                .contains(&"shop.lead".to_owned())
+        );
+        // A side chat keeps to its agent.
+        app.options.side = Some(1);
+        app.input.set("/switch shop.fix");
+        app.submit().await;
+        assert!(app.switch_to.is_none() && !app.quit);
+        assert!(
+            !embed::OPENED_HERE
+                .lock()
+                .unwrap()
+                .contains(&"shop.fix".to_owned())
+        );
     }
 
     #[tokio::test]
