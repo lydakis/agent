@@ -4288,6 +4288,9 @@ struct Fleet {
     /// A bot no agent made appeared in a followed project: whose it is,
     /// the next read of the followed leads lists again.
     refollow: bool,
+    /// Bots that joined `raised` whose calls could not be listed yet: the
+    /// next read of the followed leads lists them again.
+    unheld: std::collections::HashSet<String>,
     /// Those leads and every bot of their lineage: what waits on the
     /// person in theirs waits in this window too, and is answered here.
     /// Never a window here, nor a tab.
@@ -4783,6 +4786,7 @@ impl Fleet {
             followed: Vec::new(),
             followed_at: None,
             refollow: false,
+            unheld: Default::default(),
             raised: Default::default(),
             command,
             note,
@@ -4833,6 +4837,7 @@ impl Fleet {
             followed: Vec::new(),
             followed_at: None,
             refollow: false,
+            unheld: Default::default(),
             raised: Default::default(),
             command: Vec::new(),
             note: None,
@@ -5004,17 +5009,19 @@ impl Fleet {
             self.needs.forget(gone);
             self.scanned.remove(gone);
         }
-        let new: std::collections::HashSet<String> =
-            raised.difference(&self.raised).cloned().collect();
+        let mut new = std::mem::take(&mut self.unheld);
+        new.extend(raised.difference(&self.raised).cloned());
+        new.retain(|bot| raised.contains(bot));
         self.raised = raised;
         self.followed = followed;
         self.refollow = false;
-        // A reconcile reads every call after; else the new ones' now.
-        if !now
-            && !new.is_empty()
-            && let Ok(held) = needs::listing(&self.client, None).await
-        {
-            self.needs.held(held, |bot| new.contains(bot));
+        // A reconcile reads every call after; else the new ones' now, and
+        // when that fails, next time.
+        if !now && !new.is_empty() {
+            match needs::listing(&self.client, None).await {
+                Ok(held) => self.needs.held(held, |bot| new.contains(bot)),
+                Err(_) => (self.unheld, self.refollow) = (new, true),
+            }
         }
         (heads.into_iter())
             .filter(|(bot, head)| self.raised.contains(bot) && self.scanned.get(bot) != Some(head))
@@ -22872,6 +22879,56 @@ mod tests {
         let unread = fleet.follow_leads(false).await;
         assert!(fleet.raised.contains("shop.loose"));
         assert!(unread.iter().any(|(bot, _)| bot == "shop.loose"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A newly followed lead's calls that could not be listed are listed
+    /// on the next read, though no follows file changed.
+    #[tokio::test]
+    async fn a_followed_leads_calls_are_listed_again_when_a_listing_fails() {
+        let dir = std::env::temp_dir().join(format!("unheld-{}", std::process::id()));
+        let store = dir.join("store");
+        let mut sub = lookout::subs::Sub::lead("home.lead", "home");
+        sub.tasks_of = vec!["shop.lead".into()];
+        std::fs::create_dir_all(lookout::subs::dir(&store)).unwrap();
+        std::fs::write(
+            lookout::subs::dir(&store).join("home.lead.json"),
+            json!({"subscriptions": [sub.to_json()]}).to_string(),
+        )
+        .unwrap();
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (client, events) = daemon_with_events(json!({}), move |asked| {
+            match asked["op"].as_str().unwrap_or("") {
+                "bots" => json!({"bots": [
+                    json!({"name": "shop.lead", "bot_id": 1, "head": 1}),
+                    json!({"name": "shop.fix", "bot_id": 2, "head": 2,
+                        "created_by": "shop.lead", "running_turn": 5}),
+                ]}),
+                "approvals" if !failed.swap(true, std::sync::atomic::Ordering::SeqCst) => {
+                    json!({"error": "internal", "detail": "try again"})
+                }
+                "approvals" => json!({"approvals": [
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c1", "request": 1,
+                        "name": "shell", "gates": ["auto"],
+                        "asked": [{"tag": "auto", "reason": "It publishes."}],
+                        "arguments": {"command": "cargo publish"}},
+                ]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client, events, "home", "home.lead");
+        fleet.store = store;
+        fleet.follow_leads(false).await;
+        assert!(fleet.raised.contains("shop.fix"));
+        assert_eq!(fleet.needs.calls().count(), 0);
+        fleet.followed_at = None;
+        fleet.follow_leads(false).await;
+        assert_eq!(
+            fleet.needs.calls().collect::<Vec<_>>(),
+            [("shop.fix", 4, "c1")]
+        );
+        assert!(fleet.unheld.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
