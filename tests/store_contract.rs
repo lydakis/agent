@@ -4210,6 +4210,67 @@ fn a_prompts_read_keeps_the_prompt_and_the_newest_steers() {
     assert_eq!(cut["prompts_more"], true);
 }
 
+/// The calls left out of a read are older than all it lists; the files
+/// those wrote are still named, so a later call that runs one is judged
+/// with it.
+#[test]
+fn a_prompts_read_names_the_files_its_left_out_calls_wrote() {
+    let mut db = db();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Carol",
+            "p",
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = |id: &str, name: &str, arguments: Value| {
+        let arguments = arguments.to_string();
+        let item = json!({"type":"function_call","id":format!("fc_{id}"),"call_id":id,
+            "name":name,"arguments":arguments});
+        let call = ToolCall {
+            custom: false,
+            name: name.into(),
+            call_id: id.into(),
+            arguments,
+        };
+        (Bytes::from(serde_json::to_vec(&item).unwrap()), call)
+    };
+    let round = [
+        call(
+            "w1",
+            "write",
+            json!({"path": "run.sh", "content": "echo hi"}),
+        ),
+        call("s1", "shell", json!({"command": "ls"})),
+        call("s2", "shell", json!({"command": "sh run.sh"})),
+    ];
+    for (item, call) in round {
+        db.append(turn, vec![item], std::slice::from_ref(&call), None)
+            .unwrap();
+        db.tool_start(turn, &call, false, false).unwrap();
+    }
+    let entry = Database::PROMPTS_ENTRY;
+    let read = db.prompts("Carol", turn, entry + 40).unwrap();
+    assert_eq!(read["calls"].as_array().unwrap().len(), 1);
+    assert_eq!(read["calls"][0]["call_id"], "s2");
+    assert_eq!(read["calls_more"], true);
+    assert_eq!(
+        (&read["written"], &read["written_more"]),
+        (&json!(["run.sh"]), &json!(false))
+    );
+    // With every call listed, none is named apart.
+    let whole = db.prompts("Carol", turn, 64 * 1024).unwrap();
+    assert_eq!(
+        (&whole["written"], &whole["written_more"]),
+        (&json!([]), &json!(false))
+    );
+}
+
 #[test]
 fn schema_38_reads_every_stored_prompt_as_a_persons() {
     let path = std::env::temp_dir().join(format!("agent-authors-{}.sqlite", std::process::id()));

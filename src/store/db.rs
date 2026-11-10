@@ -9588,6 +9588,9 @@ impl Database {
     /// What each listed call and earlier prompt counts against `bytes` for
     /// its fields, so many short entries cannot outgrow a reply.
     pub const PROMPTS_ENTRY: usize = 64;
+    /// The most bytes of file names a `prompts` read lists as `written` by
+    /// the calls it leaves out.
+    pub const PROMPTS_WRITTEN: usize = 8 * 1024;
     /// The most bytes a prompt's words and the words it quotes may have
     /// together, as many as its words alone may.
     pub const QUOTED_BYTES: usize = 256 * 1024;
@@ -9855,11 +9858,49 @@ impl Database {
             done.insert(call_id);
         }
         let mut started = self.conn.prepare_cached(
-            "SELECT data FROM events WHERE turn=? AND (kind='tool_started'
+            "SELECT data,json_extract(data,'$.name') FROM events WHERE turn=? AND (kind='tool_started'
                OR kind='step_decided' AND json_extract(data,'$.decision')='allow') ORDER BY id DESC",
         )?;
         let mut calls = Vec::new();
         let mut calls_more = false;
+        // The files the calls left out wrote, by name alone: a later call
+        // that runs one is judged with it, or known not to be.
+        let mut written: Vec<String> = Vec::new();
+        let mut written_more = false;
+        let mut written_left = Self::PROMPTS_WRITTEN;
+        let mut wrote = |data: &str| -> Result<bool> {
+            let data: Value = serde_json::from_str(data)?;
+            let paths = match data.get("paths") {
+                Some(paths) => {
+                    let named = (paths.as_array().into_iter().flatten())
+                        .filter_map(|path| path.as_str().map(str::to_owned));
+                    Some((named.collect(), data["paths_cut"] != true))
+                }
+                // A cut preview that names none: what it wrote is unknown.
+                None if data["arguments_truncated"] == true => None,
+                None => changed_paths(
+                    data["name"].as_str().unwrap_or_default(),
+                    data["arguments"].as_str().unwrap_or_default(),
+                ),
+            };
+            let Some((paths, whole)) = paths else {
+                written_more = true;
+                return Ok(true);
+            };
+            written_more |= !whole;
+            for path in paths {
+                if written.contains(&path) {
+                    continue;
+                }
+                if path.len() + 3 > written_left {
+                    written_more = true;
+                    return Ok(false);
+                }
+                written_left -= path.len() + 3;
+                written.push(path);
+            }
+            Ok(true)
+        };
         // The calls have their own `bytes`: words that fill theirs still
         // leave a reader the files the turn wrote. The newest are read
         // first, so those left out are older than all that are listed.
@@ -9868,6 +9909,18 @@ impl Database {
         while let Some(r) = rows.next()? {
             if calls_left < Self::PROMPTS_ENTRY {
                 calls_more = true;
+                // Past the budget, only what writes files is read, and of
+                // it only the names, while they fit.
+                let mut row = Some(r);
+                while let Some(r) = row {
+                    let name: Option<String> = r.get(1)?;
+                    if matches!(name.as_deref(), Some("write" | "edit" | "apply_patch"))
+                        && !wrote(&r.get::<_, String>(0)?)?
+                    {
+                        break;
+                    }
+                    row = rows.next()?;
+                }
                 break;
             }
             calls_left -= Self::PROMPTS_ENTRY;
@@ -9948,7 +10001,8 @@ impl Database {
         }
         Ok(
             json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
-            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more}),
+            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,
+            "written":written,"written_more":written_more,"earlier":earlier,"more":more}),
         )
     }
     /// One prompt of a `prompts` read, cut to the budget left: its words,

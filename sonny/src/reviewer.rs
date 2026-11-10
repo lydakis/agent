@@ -1185,6 +1185,17 @@ async fn intent(
             },
         });
     }
+    // The files older calls left out of the read wrote, by name: a call
+    // that runs one is judged with it still; with some unnamed, any may.
+    for path in read["written"].as_array().into_iter().flatten() {
+        if let Some(path) = path
+            .as_str()
+            .filter(|path| !written.iter().any(|w| w == path))
+        {
+            written.push(path.to_owned());
+        }
+    }
+    written_cut |= read["written_more"] == true;
     // A call that names a file this turn wrote is judged with that file
     // whole, as it is on disk now: what the call would run, or by its size. One that an
     // earlier call of this round writes or edits is not on disk yet as the
