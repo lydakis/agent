@@ -1475,20 +1475,10 @@ fn ours(here: &Path, path: &Path, branch: &str) -> bool {
         && git(path, &["branch", "--show-current"]).is_ok_and(|current| current == branch)
 }
 
+/// git in `dir` as Sonny runs it outside a sandbox: none of the
+/// repository's hooks, fsmonitor or transports runs ([`crate::git::plain`]).
 pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("running git: {e}"))?;
-    if !output.status.success() {
-        let said = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git {}: {}", args.join(" "), said.trim()));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    crate::git::plain(dir, args)
 }
 
 /// git in `dir`, a repository an agent may have written, run as an
@@ -1956,8 +1946,7 @@ mod tests {
         git(&repo, &["config", "core.fsmonitor", &command]).unwrap();
         let status = ["--no-optional-locks", "status", "--porcelain"];
         git(&repo, &status).unwrap();
-        assert!(marker.exists(), "git runs it as Sonny");
-        std::fs::remove_file(&marker).unwrap();
+        assert!(!marker.exists(), "Sonny's own git runs none of it");
         confined_in(Some(&agent), &repo, &status, &[]).unwrap();
         assert!(!marker.exists(), "the sandbox keeps it from writing");
         git(&repo, &["config", "--unset", "core.fsmonitor"]).unwrap();

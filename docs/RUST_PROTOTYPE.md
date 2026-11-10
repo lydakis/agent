@@ -2610,7 +2610,10 @@ closed tool scheduler fails the turn. Allowed tools run without approval
 prompts unless the bot was created with a gate (see [tool approval](#tool-approval)).
 
 `shell` runs a noninteractive command with `/bin/bash -c` (`/bin/sh` where
-bash is not installed) in the bot workspace with
+bash is not installed) in the bot workspace, or in `workdir` when the call
+names one, read against the workspace unless absolute, as Codex's
+`workdir` is (a `workdir` that is not there fails the call with
+`path_not_found`), with
 `timeout_ms` (default 120 s, maximum 600 s, or a day for a background command,
 which holds no turn while it runs), which bounds the command's
 running time, not any time spent in line for a process slot. Commands are at
@@ -2737,7 +2740,8 @@ worktree remove` of an existing worktree is refused. It is
 known by its name, `.git` or `NAME.git`, which the bot can't change, not by
 what is inside it. One whose config is missing, turns on per-worktree config
 or includes other files stays read-only as a whole, since git reads those
-files wherever they are made. Network is
+files wherever they are made, and nothing inside it is held in place, so no
+placeholder is made there. Network is
 off unless `network` is set. `danger-full-access`, or no `sandbox`, runs
 unconfined.
 
@@ -2865,6 +2869,21 @@ a protected name is taken as missing, as Codex takes it, mounted over afresh
 rather than bound from the disk. A writable folder that is gone is skipped,
 as Codex skips it, rather than refusing every command. A sandbox that needs
 a placeholder being removed waits until it is gone.
+
+bubblewrap's user namespace maps only the person, so a file root owns shows
+inside as the overflow user's, and a program that takes a file only from
+root or the person refuses it. Each system folder the daemon was started
+with as `serve --own-copy FOLDER` is shown from a copy the person owns,
+kept under `~/.agent/copies`, read-only to every sandbox, bound read-only in
+the folder's place. The CLI passes `agent_client::OWN_COPIES`
+(`/etc/ssh/ssh_config.d`): ssh refuses every file an `Include` names that
+is not root's or the person's ("Bad owner or permissions"), and Debian's
+`/etc/ssh/ssh_config` includes that folder, so no sandboxed command could
+ssh (Codex has the same bug open, openai/codex#9286). Building a policy
+looks at the folder's files (a listing and a `stat` each) and copies them
+again only when one changed, each written beside its name and renamed over
+it, so a running sandbox reads a whole file. A daemon running as root,
+which the namespace maps as itself, binds nothing.
 
 `agent sandbox [--writable PATH]... -- COMMAND [ARGS...]` runs one command
 in the same sandbox, with no daemon, as Codex's `codex sandbox` does:

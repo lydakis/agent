@@ -4365,15 +4365,13 @@ impl Turn {
             });
             let mut sandbox = None;
             let prepared = match prepared {
-                Ok(Prepared::Shell { .. } | Prepared::Detach(_) | Prepared::Terminal { .. })
-                    if confined && !record.confines(&call, workspace) =>
-                {
-                    Err(Error::with(
-                        "escalation_refused",
-                        "no approval lets this bot run a command outside its sandbox; \
+                Ok(
+                    Prepared::Shell { .. } | Prepared::Detach { .. } | Prepared::Terminal { .. },
+                ) if confined && !record.confines(&call, workspace) => Err(Error::with(
+                    "escalation_refused",
+                    "no approval lets this bot run a command outside its sandbox; \
                          run it without sandbox_permissions",
-                    ))
-                }
+                )),
                 Ok(prepared) if confined => self.sandbox(record, workspace).await.map(|policy| {
                     sandbox = policy;
                     prepared
@@ -4439,6 +4437,7 @@ impl Turn {
                     command,
                     timeout_ms,
                     background: true,
+                    workdir,
                 }) => {
                     // A full line behind the process bound is a tool result
                     // the model acts on, not a runtime failure.
@@ -4446,7 +4445,7 @@ impl Turn {
                         .background(
                             &call.call_id,
                             command,
-                            workspace.to_path_buf(),
+                            Prepared::folder(workspace, workdir.as_deref()),
                             timeout_ms,
                             environment.to_vec(),
                             sandbox,
@@ -4459,7 +4458,11 @@ impl Turn {
                         Err(error) => return Err(error),
                     }
                 }
-                Ok(Prepared::Terminal { command, yield_ms }) => {
+                Ok(Prepared::Terminal {
+                    command,
+                    yield_ms,
+                    workdir,
+                }) => {
                     let (turn, started) = (self.turn, call.call_id.clone());
                     let id = self
                         .store
@@ -4477,7 +4480,7 @@ impl Turn {
                         record.bot_id,
                         id,
                         command,
-                        workspace.to_path_buf(),
+                        Prepared::folder(workspace, workdir.as_deref()),
                         yield_ms,
                         environment.to_vec(),
                         sandbox,
@@ -4660,12 +4663,13 @@ impl Turn {
                     command,
                     timeout_ms,
                     background: false,
+                    workdir,
                 }) => {
                     let (started, running) = oneshot::channel();
                     let place = self.registry.place();
                     let run = self.registry.foreground(
                         command,
-                        workspace.to_path_buf(),
+                        Prepared::folder(workspace, workdir.as_deref()),
                         timeout_ms,
                         environment.to_vec(),
                         sandbox,
@@ -4892,12 +4896,13 @@ impl Turn {
                 command,
                 timeout_ms,
                 background: false,
+                workdir,
             } => {
                 let (started, running) = oneshot::channel();
                 let place = self.registry.place();
                 let mut run = Box::pin(self.registry.foreground(
                     command,
-                    workspace.to_path_buf(),
+                    Prepared::folder(workspace, workdir.as_deref()),
                     timeout_ms,
                     environment.to_vec(),
                     sandbox,
