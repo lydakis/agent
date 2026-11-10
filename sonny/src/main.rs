@@ -14431,9 +14431,10 @@ impl App {
         else {
             return;
         };
+        // The main window's own agent is already shown there: back to it,
+        // as picking it in `/status` goes, the pane put aside for Ctrl+].
         if bot == self.bot {
-            self.notice = Some(format!("this window is {bot}'s already"));
-            return;
+            return self.close_pane(false);
         }
         self.open_task(&bot);
     }
@@ -17073,6 +17074,26 @@ mod tests {
         app.key(Event::Key(ctrl_c)).await;
         assert!(app.making.is_none() && !app.quit);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_pane_switched_to_the_main_window_s_agent_goes_back_to_it() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let mut command = portable_pty::CommandBuilder::new("printf");
+        command.arg("\\033]7700;open=b\\033\\\\");
+        let program = embed::Embedded::spawn(command, 5, 20, false, || {}).unwrap();
+        let mut pane = pane::Pane::program("fix", program);
+        pane.as_agent("shop.fix", false);
+        app.open_pane(pane);
+        app.pane_keys = true;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.pane.is_some() && std::time::Instant::now() < deadline {
+            app.pane_switched();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Closed, the keys back in the conversation, the task put aside.
+        assert!(app.pane.is_none() && !app.pane_keys);
+        assert!(app.closed.is_some());
     }
 
     #[tokio::test]

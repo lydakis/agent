@@ -78,7 +78,9 @@ leave out the project), or lists what NAME narrows to. The `↗` beside the
 name of an agent open in the pane, or Ctrl+G, moves that agent into the
 window. `/switch` typed in a task's Sonny drawn in the pane swaps the pane
 to the agent picked instead, its title, `↗` and Ctrl+G following it and
-‹ still going back where it went; the main window stays as it is. A side
+‹ still going back where it went; the main window stays as it is, and
+picking the main window's own agent goes back to the conversation, the
+pane put aside for Ctrl+]. A side
 chat keeps to its agent, and `/new` is for the main window only.
 
 ![The pane after /switch tally.docs typed in it: its title docs ↗ with ← back, the docs task's conversation under it](../docs/sonny/pane-switch.png)
