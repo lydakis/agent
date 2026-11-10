@@ -1074,11 +1074,9 @@ fn drop_named(
 ) -> Result<bool, String> {
     let before = subs.len();
     subs.retain(|s| s.name != name);
-    if subs.len() == before {
-        return Ok(false);
-    }
+    // Written even when nothing went: the lookout takes the file again.
     write(store, subscriber, subs)?;
-    Ok(true)
+    Ok(subs.len() < before)
 }
 
 /// End the subscriptions the deleted bot of `id` held as `subscriber`:
