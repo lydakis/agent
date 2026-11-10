@@ -4102,6 +4102,8 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     let cut = db.prompts("Carol", turn, entry + 3).unwrap();
     assert_eq!(cut["prompts_more"], true);
     assert_eq!(cut["calls"].as_array().unwrap().len(), 1);
+    // The newest call is the one kept, as Codex's reviewer keeps the newest.
+    assert_eq!(cut["calls"][0]["call_id"], "c2");
     assert_eq!(cut["calls"][0]["arguments"], "{\"c");
     assert_eq!(cut["calls"][0]["arguments_truncated"], true);
     assert_eq!(cut["calls_more"], true);
@@ -4151,6 +4153,61 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
         .unwrap();
     assert_eq!(row(&db, steered), ran_in);
     assert_ne!(ran_in, json!("/synthetic/moved"));
+}
+
+#[test]
+fn a_prompts_read_keeps_the_prompt_and_the_newest_steers() {
+    let mut db = db();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Carol",
+            "p",
+            "start",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    let mut steers = Vec::new();
+    for (key, words) in [("s1", "send it"), ("s2", "no, wait"), ("s3", "hold off")] {
+        let id = db
+            .begin("Carol", key, words, true, &steer, allow_provider)
+            .unwrap()
+            .turn;
+        db.absorb(
+            turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap();
+        steers.push(id);
+    }
+    let texts = |read: &Value| -> Vec<String> {
+        (read["prompts"].as_array().unwrap().iter())
+            .map(|p| p["text"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let whole = db.prompts("Carol", turn, 1024).unwrap();
+    assert_eq!(texts(&whole), ["start", "send it", "no, wait", "hold off"]);
+    assert_eq!(whole["prompts_more"], false);
+    // Room for the prompt and two steers: the oldest steer is left out, so
+    // a later word withdrawing an earlier one is never the one missing.
+    let entry = Database::PROMPTS_ENTRY;
+    let room = "start".len() + 2 * entry + "no, wait".len() + "hold off".len();
+    let cut = db.prompts("Carol", turn, room).unwrap();
+    assert_eq!(texts(&cut), ["start", "no, wait", "hold off"]);
+    assert_eq!(cut["prompts"][1]["turn"], steers[1]);
+    assert_eq!(cut["prompts_more"], true);
 }
 
 #[test]
