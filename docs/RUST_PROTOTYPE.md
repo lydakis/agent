@@ -1561,7 +1561,7 @@ it. The answer has the totals (`turns`, `input_tokens`, `cached_input_tokens`,
 default 64) that spent most input plus output first and `other_bots` summing
 the rest with how many (`null` when none), and `models`, one row for each
 model at each `speed` that served it (`standard`, `fast` or `ultrafast`;
-protocol 62, schema 90),
+protocol 63, schema 90),
 with its cache writes: a summary's or a fallback's tokens under the model
 that spent them, kept per turn as each call is recorded. Turns from before
 schema 90 kept no speed and count as `standard`. And `origins`, by the `origin` a client gave

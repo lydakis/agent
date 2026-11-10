@@ -8237,7 +8237,7 @@ Sonny rows the change does not touch: sky replay CPU (7.54 to 9.23 ms per
 field; this change's Sonny paths are `/permissions` spreading, `regate`
 and the config watcher.
 
-## Speeds per model, spend by speed (protocol 62, schema 90)
+## Speeds per model, spend by speed (protocol 63, schema 90)
 
 A bot's speed is sent only to a model that serves it, looked up per call
 in the provider's list of exact model ids, and each call's spend is kept by
