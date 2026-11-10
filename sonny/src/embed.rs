@@ -24,6 +24,7 @@ pub struct Embedded {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     size: (u16, u16),
     copied: Arc<Mutex<Vec<String>>>,
+    opened: Arc<Mutex<Option<String>>>,
 }
 
 impl Embedded {
@@ -61,7 +62,9 @@ impl Embedded {
             0,
         )));
         let copied = Arc::new(Mutex::new(Vec::new()));
+        let opened = Arc::new(Mutex::new(None));
         let (screen, replies, copies) = (parser.clone(), writer.clone(), copied.clone());
+        let opens = opened.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             // The start of a question a read cut off, kept for the next.
@@ -88,6 +91,13 @@ impl Embedded {
                                 copies.push(text);
                             }
                         }
+                        Piece::Opens(bot) => {
+                            if let Some(bot) = agent_name(bot)
+                                && let Ok(mut opened) = opens.lock()
+                            {
+                                *opened = Some(bot);
+                            }
+                        }
                     }
                 }
                 drop(parser);
@@ -111,7 +121,14 @@ impl Embedded {
             child,
             size: (rows, cols),
             copied,
+            opened,
         })
+    }
+
+    /// The agent the program, an agent's Sonny, asked to show in its
+    /// place since last asked ([`open_here`]), if it asked.
+    pub fn opened(&self) -> Option<String> {
+        self.opened.lock().ok().and_then(|mut opened| opened.take())
     }
 
     /// What the program copied since last asked, oldest first.
@@ -313,12 +330,48 @@ enum Piece<'a> {
     Asked(Query),
     /// OSC 52's `c;BASE64`: text the program put on the clipboard.
     Copied(&'a [u8]),
+    /// [`OPEN`]'s agent: the one the program asks to show in its place.
+    Opens(&'a [u8]),
 }
 
 /// Where OSC 52, a copy to the clipboard, starts.
 const COPY: &[u8] = b"\x1b]52;";
 /// The longest copy waited for over reads; a longer one is let through.
 const MOST_COPIED: usize = 8 << 20;
+/// Where an agent's Sonny drawn in a pane asks the Sonny it is drawn in
+/// to show another agent there instead (`/switch` in the pane): an OSC of
+/// Sonny's own, `OPEN` `AGENT` and ST, which no terminal reads.
+const OPEN: &[u8] = b"\x1b]7700;open=";
+/// The longest agent name an [`OPEN`] carries.
+const MOST_OPENED: usize = 256;
+
+/// Asks the Sonny this one is drawn in to show `bot` in its place, as
+/// a click on an agent's name opens it there; a terminal ignores it.
+pub fn open_here(bot: &str) {
+    // A test says nothing to the terminal it is run in: what it asked is
+    // kept for it to read.
+    #[cfg(test)]
+    if let Ok(mut asked) = OPENED_HERE.lock() {
+        asked.push(bot.to_owned());
+        return;
+    }
+    let mut stdout = std::io::stdout();
+    let _ = write!(stdout, "\x1b]7700;open={bot}\x1b\\");
+    let _ = stdout.flush();
+}
+
+/// What a test's Sonny asked the one it is drawn in to show.
+#[cfg(test)]
+pub static OPENED_HERE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// An agent's name an [`OPEN`] carried, if it reads as one.
+fn agent_name(bytes: &[u8]) -> Option<String> {
+    let name = std::str::from_utf8(bytes).ok()?;
+    let fits = !name.is_empty()
+        && name.len() <= MOST_OPENED
+        && (name.chars()).all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    fits.then(|| name.to_owned())
+}
 
 const ASKS: [(&[u8], Query); 4] = [
     (b"\x1b]11;?\x1b\\", Query::Background),
@@ -331,7 +384,7 @@ const ASKS: [(&[u8], Query); 4] = [
 /// handled after the output before it, as a terminal would; and the end
 /// of it that may be the start of one the next read finishes, held back.
 fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
-    let starts = || ASKS.iter().map(|(seq, _)| *seq).chain([COPY]);
+    let starts = || ASKS.iter().map(|(seq, _)| *seq).chain([COPY, OPEN]);
     let longest = starts().map(<[u8]>::len).max().unwrap_or(0);
     let held = (bytes.len().saturating_sub(longest - 1)..bytes.len())
         .find(|&at| {
@@ -355,8 +408,11 @@ fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
             from = at;
             continue;
         }
-        if bytes[at..].starts_with(COPY) {
-            let body = &bytes[at + COPY.len()..];
+        let osc = [(COPY, MOST_COPIED), (OPEN, MOST_OPENED)]
+            .into_iter()
+            .find(|(start, _)| bytes[at..].starts_with(start));
+        if let Some((start, most)) = osc {
+            let body = &bytes[at + start.len()..];
             // Ended by BEL or ST; base64 has neither.
             let end = body.iter().position(|&b| b == 0x07 || b == 0x1b);
             let ended = end.and_then(|end| match body[end] {
@@ -368,13 +424,16 @@ fn pieces(bytes: &[u8]) -> (Vec<Piece<'_>>, &[u8]) {
                     if from < at {
                         out.push(Piece::Output(&bytes[from..at]));
                     }
-                    out.push(Piece::Copied(&body[..end]));
+                    out.push(match start == COPY {
+                        true => Piece::Copied(&body[..end]),
+                        false => Piece::Opens(&body[..end]),
+                    });
                     let (more, rest) = pieces(&body[end + closing..]);
                     out.extend(more);
                     return (out, rest);
                 }
                 // The rest of it is for a later read.
-                None if body.len() < MOST_COPIED => {
+                None if body.len() < most => {
                     if from < at {
                         out.push(Piece::Output(&bytes[from..at]));
                     }
@@ -543,6 +602,52 @@ mod tests {
         );
         let (cut, rest) = pieces(b"\x1b]52;c;aGk=\x1b");
         assert_eq!((cut, rest), (vec![], &b"\x1b]52;c;aGk=\x1b"[..]));
+    }
+
+    #[test]
+    fn an_agent_asked_for_is_kept_for_the_sonny_it_is_drawn_in() {
+        let (cut, rest) = pieces(b"a\x1b]7700;open=shop.fix\x1b\\b\x1b]7700;open=x\x07");
+        assert!(rest.is_empty());
+        assert_eq!(
+            cut,
+            [
+                Piece::Output(b"a"),
+                Piece::Opens(b"shop.fix"),
+                Piece::Output(b"b"),
+                Piece::Opens(b"x"),
+            ]
+        );
+        assert_eq!(agent_name(b"shop.fix-2_a"), Some("shop.fix-2_a".to_owned()));
+        // Only a name: nothing that could be read as more than one.
+        assert_eq!(agent_name(b""), None);
+        assert_eq!(agent_name(b"a b"), None);
+        assert_eq!(agent_name(b"a\x1b[2J"), None);
+        assert_eq!(agent_name(&[b'a'; MOST_OPENED + 1]), None);
+        // One a read cuts off waits for the rest.
+        let (cut, rest) = pieces(b"a\x1b]7700;open=sh");
+        assert_eq!(
+            (cut, rest),
+            (vec![Piece::Output(b"a")], &b"\x1b]7700;open=sh"[..])
+        );
+    }
+
+    #[test]
+    fn a_program_s_ask_to_show_an_agent_is_read_once() {
+        let mut command = CommandBuilder::new("printf");
+        command.arg("hi\\033]7700;open=shop.fix\\033\\\\");
+        let program = Embedded::spawn(command, 5, 20, false, || {}).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let opened = loop {
+            match program.opened() {
+                Some(bot) => break bot,
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                None => panic!("never asked"),
+            }
+        };
+        assert_eq!(opened, "shop.fix");
+        assert_eq!(program.opened(), None);
     }
 
     #[test]

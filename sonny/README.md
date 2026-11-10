@@ -76,7 +76,14 @@ one beside the conversation picked to start. Enter opens the pick in the
 window. `/switch NAME` opens that agent at once (a name in this project may
 leave out the project), or lists what NAME narrows to. The `↗` beside the
 name of an agent open in the pane, or Ctrl+G, moves that agent into the
-window.
+window. `/switch` typed in a task's Sonny drawn in the pane swaps the pane
+to the agent picked instead, its title, `↗` and Ctrl+G following it and
+‹ still going back where it went; the main window stays as it is, and
+picking the main window's own agent goes back to the conversation, the
+pane put aside for Ctrl+]. A side
+chat keeps to its agent, and `/new` is for the main window only.
+
+![The pane after /switch tally.docs typed in it: its title docs ↗ with ← back, the docs task's conversation under it](../docs/sonny/pane-switch.png)
 
 ![/switch listing every agent, then narrowed by typing fix, in Flexoki dark and light](../docs/sonny/switch-picker.png)
 
@@ -699,7 +706,13 @@ Sonny turns it on while it runs and back off when it leaves.
 To answer one message, point at it: its bullet turns into `↩`, and a
 click quotes it into the composer (`> ` before each line, six lines at
 most) ahead of whatever you had typed. `/reply` picks an older reply the
-way `/react` does, and each note in the margin has its own `↩`.
+way `/react` does, and each note in the margin has its own `↩`. Sent, a
+reply shows your own words whole, with what it quotes over them on a
+tinted bar, dim: two lines of it, then `… quoted, N more lines ▸`, which a
+click opens and closes. The bar is a coloured cell, not a character, so a
+copy of the quote is its words alone.
+
+![A reply sent: two lines of its quote on the bar, … quoted, 3 more lines ▸, then the person's own words](../docs/sonny/reply-quote-fold.png)
 
 ![↩ in place of the bullet of the message under the mouse](../docs/sonny/reply-mark.png)
 
@@ -907,7 +920,9 @@ has something on it, or is off the screen, no time shows.
   the agent may retry it once; the retry is still reviewed, and the
   reviewer reads your words as consent. Codex calls this `/approve`.
 - `/status` shows the project's agents in the pane beside the
-  conversation, grouped by where they stand, the lead first in its group: **Needs you** (waiting on your
+  conversation, grouped by where they stand, the lead first in its group,
+  under a head that counts each group that has any
+  (`calc · 1 needs you · 2 working · 1 idle · 3 done`, no total): **Needs you** (waiting on your
   approval, asking you a question, held on something only you can fix,
   such as a ChatGPT sign-in, or failed),
   **Working** (a turn running, queued, rate limited, waiting on other
@@ -947,12 +962,16 @@ has something on it, or is off the screen, no time shows.
   its project's default. An agent with
   automations or follows of its own shows `↻ 2 automations` there too. A click on an agent's name goes
   to it as a click on a task in a roster does (below), and so does
-  Enter on the agent ↑ and ↓ pick (`›`); ‹ in its title,
+  Enter on the agent ↑ and ↓ pick (`›`). This window's own agent is a
+  row like any other: picking it closes `/status`, back to the
+  conversation. ‹ in its title,
   or Ctrl+[ from the conversation, goes back to `/status`. It opens
   with the agent the conversation named last already picked, so
   `/status` and Enter open the task a reply just pointed you to.
 
   ![/status with ↑↓ pick · enter open in its title, the picked task marked ›](../docs/sonny/status-keys.png)
+
+  ![/status with Idle open and the lead picked, its row shown reversed](../docs/sonny/status-lead-picked.png)
 
   ![/status naming each agent's profile beside its model: superlead, task, reviewer](../docs/sonny/status-profile.png)
 
@@ -1007,9 +1026,15 @@ has something on it, or is off the screen, no time shows.
   but not sized), the summary its last compaction left and which turns it
   covers, the conversation since, and what is free. The total is the
   model's own count; each part is its bytes at about four a token, marked
-  `≈`. Under them, what the last compaction freed and the room it left.
+  `≈`. Beside them, as Claude Code draws it, a grid ten cells wide, each
+  cell a hundredth of the window: each part fills its share in a mark of
+  its own (`▣` instructions, `▦` tools, `▨` summary, `■` conversation,
+  `□` free), so it reads with no colour too, and each part's row in the
+  list starts with its mark; a part with any tokens has a cell at least.
+  A narrow pane puts the grid over the list. Under them, what the last
+  compaction freed and the room it left.
 
-  ![/context in the pane](../docs/sonny/context-card.png)
+  ![/context in the pane: a grid of a hundred cells, each part in its own mark, beside the list of parts](../docs/sonny/context-card.png)
 - `/commons` (or `/forum`) shows, in the pane beside the conversation, the
   threads the agents of every project share in the commons, newest first,
   each with who started it, how many posts it has, who wrote last and how
@@ -1335,7 +1360,7 @@ turn of the task numbered after that one reopens it.
 
 ![A decision the lead asked with the ask tool, drawn where it asked it, its code, bold, math and links read as Markdown](../docs/sonny/ask-markdown.png)
 
-![/status as it opens: one task under Needs you saying what it asks, the lead and two tasks under Working with their times and pull requests at the right, a task's helper folded under it, Idle and Done folded to their headings](../docs/sonny/status-groups.png)
+![/status as it opens: a head counting 1 needs you, 1 working, 1 idle and 1 done; one task under Needs you saying what it asks, one under Working with its time, Idle and Done folded to their headings](../docs/sonny/status-groups.png)
 
 ![/status after m: what each agent tracks at the right edge, the picked task's model, profile and latest step under it, Idle opened](../docs/sonny/status-more.png)
 

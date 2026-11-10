@@ -74,6 +74,18 @@ impl Group {
         }
     }
 
+    /// The group in a count of `n` of its agents: `1 needs you`,
+    /// `2 need you`, `3 working`.
+    fn counted(self, n: usize) -> &'static str {
+        match self {
+            Group::NeedsYou if n == 1 => "needs you",
+            Group::NeedsYou => "need you",
+            Group::Working => "working",
+            Group::Idle => "idle",
+            Group::Done => "done",
+        }
+    }
+
     fn heading(self) -> &'static str {
         match self {
             Group::NeedsYou => "Needs you",
@@ -243,18 +255,17 @@ pub fn card(
             None => listed.push(row),
         }
     }
-    let count = |group: Group| rows.iter().filter(|r| r.group == group).count();
-    let mut head = format!(
-        "{project} · {} task{}",
-        tasks.len(),
-        if tasks.len() == 1 { "" } else { "s" }
-    );
-    for (group, said) in [(Group::NeedsYou, "need you"), (Group::Working, "working")] {
-        if count(group) > 0 {
-            head.push_str(&format!(" · {} {said}", count(group)));
+    // The head counts what each group's heading does, in the page's
+    // order: the agents listed there, a task's helpers inside its own.
+    let mut head = vec![Span::raw(project.to_owned()).bold()];
+    for group in [Group::NeedsYou, Group::Working, Group::Idle, Group::Done] {
+        let n = listed.iter().filter(|r| r.group == group).count();
+        if n > 0 {
+            head.push(Span::raw(" · ").dim());
+            head.push(Span::raw(format!("{n} {}", group.counted(n))));
         }
     }
-    let mut out = vec![Line::from(head).bold()];
+    let mut out = vec![Line::from(head)];
     let shown = |row: &Row| match details {
         Details::All => true,
         Details::Picked(picked) => picked == Some(row.bot.as_str()),
@@ -297,10 +308,10 @@ pub fn card(
                 helped.len(),
                 if helped.len() == 1 { "" } else { "s" }
             );
-            for (state, word) in [(Group::NeedsYou, "need you"), (Group::Working, "working")] {
+            for state in [Group::NeedsYou, Group::Working] {
                 let k = helped.iter().filter(|h| h.group == state).count();
                 if k > 0 {
-                    said.push_str(&format!(", {k} {word}"));
+                    said.push_str(&format!(", {k} {}", state.counted(k)));
                 }
             }
             toggles.push((out.len(), row.bot.clone()));
@@ -757,7 +768,7 @@ mod tests {
         assert_eq!(
             text(&quiet),
             [
-                "calc · 3 tasks · 1 need you · 1 working",
+                "calc · 1 needs you · 1 working · 1 idle · 1 done",
                 "",
                 "Needs you · 1",
                 " ? zero needs you · took 42s",
@@ -864,7 +875,7 @@ mod tests {
         assert_eq!(lines[3], " ? ask needs you · took 42s");
         assert_eq!(lines[5], "Working · 1");
         assert_eq!(lines[6], " ● fix working · 42s");
-        assert_eq!(lines[7], "   ▸ 4 helpers, 1 need you, 1 working");
+        assert_eq!(lines[7], "   ▸ 4 helpers, 1 needs you, 1 working");
         assert_eq!(lines.len(), 8);
         assert_eq!(shut.helpers, [(7, "calc.fix".to_owned())]);
         let open = card(
@@ -876,7 +887,7 @@ mod tests {
             &["calc.fix".to_owned()],
         );
         let lines = text(&open);
-        assert_eq!(lines[7], "   ▾ 4 helpers, 1 need you, 1 working");
+        assert_eq!(lines[7], "   ▾ 4 helpers, 1 needs you, 1 working");
         assert_eq!(lines[8], "   ● review working · 42s");
         assert_eq!(lines[9], "   ✓ tests idle · took 42s");
         assert_eq!(lines[10], "   ✓ lint idle · took 42s");

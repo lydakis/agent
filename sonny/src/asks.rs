@@ -955,12 +955,21 @@ fn first_line(text: &str) -> String {
 /// then room past the `lead` columns to its text, a list's marker or a
 /// quote's bar being lead too, the quote's bar kept.
 fn hang(row: &Line<'static>, lead: usize) -> Line<'static> {
-    let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
-    let after: String = text.chars().skip(lead).collect();
-    let spaces = after.len() - after.trim_start_matches(' ').len();
-    let rest = &after[spaces..];
+    // The row's characters past its lead, each with whether it is a
+    // quote's bar, a tinted blank.
+    let after: Vec<(char, bool)> = (row.spans.iter())
+        .flat_map(|span| {
+            let bar = crate::transcript::is_bar(span);
+            span.content.chars().map(move |c| (c, bar))
+        })
+        .skip(lead)
+        .collect();
+    let spaces = (after.iter())
+        .take_while(|(c, bar)| *c == ' ' && !bar)
+        .count();
+    let rest: String = after[spaces..].iter().map(|(c, _)| c).collect();
     let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    let marker = match rest {
+    let marker = match rest.as_str() {
         _ if ["- ", "* ", "+ ", "• "].iter().any(|m| rest.starts_with(m)) => 2,
         _ if digits > 0 && [". ", ") "].iter().any(|m| rest[digits..].starts_with(m)) => digits + 2,
         _ => 0,
@@ -969,10 +978,16 @@ fn hang(row: &Line<'static>, lead: usize) -> Line<'static> {
         Span::raw(BAR).dim(),
         Span::raw(" ".repeat(lead - BAR.width())),
     ];
-    // Under a quote its bar goes on too.
-    match rest.strip_prefix("▌ ") {
-        Some(_) => spans.extend([Span::raw(" ".repeat(spaces)), Span::raw("▌ ").dim()]),
-        None => spans.push(Span::raw(" ".repeat(spaces + marker))),
+    // Under a quote its bars go on too, as deep as it is.
+    let depth = (after[spaces..].chunks(2))
+        .take_while(|pair| matches!(pair, [(_, true), (' ', false)]))
+        .count();
+    match depth {
+        0 => spans.push(Span::raw(" ".repeat(spaces + marker))),
+        _ => {
+            spans.push(Span::raw(" ".repeat(spaces)));
+            spans.extend(crate::transcript::bars(depth));
+        }
     }
     Line::from(spans)
 }
@@ -2019,7 +2034,13 @@ mod tests {
         screen.render(area, &mut buf, |_| None);
         (0..area.height)
             .map(|y| {
-                let row: String = (0..width).map(|x| buf[(x, y)].symbol()).collect();
+                // A quote's bar, a tinted blank, read as its mark.
+                let row: String = (0..width)
+                    .map(|x| match buf[(x, y)].bg == crate::look::QUOTE {
+                        true => "▌",
+                        false => buf[(x, y)].symbol(),
+                    })
+                    .collect();
                 row.trim_end().to_owned()
             })
             .filter(|row| !row.is_empty())

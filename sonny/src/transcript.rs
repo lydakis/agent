@@ -105,7 +105,7 @@ impl Markdown {
             } else {
                 "  "
             };
-            out.extend(wrap(styled, width, Span::raw(lead), self.rest()));
+            out.extend(wrap_lines(styled, width, Line::from(lead), self.rest()));
         }
         out.extend(self.picture(width));
         out
@@ -146,11 +146,13 @@ impl Markdown {
     }
 
     /// What the last line's wrapped rows start with, inside a reply.
-    pub fn rest(&self) -> Span<'static> {
+    pub fn rest(&self) -> Line<'static> {
         if self.quoted > 0 {
-            return Span::raw(format!("  {}", "▌ ".repeat(self.quoted))).dim();
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(bars(self.quoted));
+            return Line::from(spans);
         }
-        Span::raw(format!("  {}", " ".repeat(self.hang)))
+        Line::from(format!("  {}", " ".repeat(self.hang)))
     }
 
     /// The picture a fence that just closed drew, as rows of the
@@ -348,7 +350,7 @@ impl Markdown {
                 (rest, depth) = (inner, depth + 1);
             }
             self.quoted = depth;
-            let mut spans = vec![Span::raw("▌ ".repeat(depth)).dim()];
+            let mut spans = bars(depth);
             spans.extend(inline(rest, Style::new().italic()));
             return Some(Line::from(spans));
         }
@@ -1202,26 +1204,41 @@ fn words(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// Where a prompt's rows fold, each its fold row's place among its rows:
+/// the quote it opens with, past its first lines (`quoted`), and a long
+/// paste of its own words, past theirs (`more`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Folds {
+    pub quoted: Option<usize>,
+    pub more: Option<usize>,
+}
+
 /// A prompt, as the person sent it, its pictures read from `folder`
-/// (the agent's workspace), with where it folds: its fold row's place
-/// among its rows, none for one that shows whole.
+/// (the agent's workspace), with where it folds.
 pub fn prompt(
     text: &str,
     width: usize,
     folder: Option<&std::path::Path>,
-) -> (Vec<Line<'static>>, Option<usize>) {
+) -> (Vec<Line<'static>>, Folds) {
     let mut out = Vec::new();
+    let mut folds = Folds::default();
     // What Sonny told the lead of its tasks, or what the lookout woke it
     // for: news, not words of the person's, kept to one quiet row; the
     // lead's answer says the rest.
     if let Some(news) = news(text) {
-        return (vec![news_row(&news, width)], None);
+        return (vec![news_row(&news, width)], folds);
     }
     // An answer to the lead's question says which over the answer, on
     // its band, as a reply in a chat quotes what it replies to and as
     // the composer showed it while it was written.
     let (answering, text) = match crate::asks::split(text) {
         Some((question, answer)) => (Some(crate::asks::answering(question, width)), answer),
+        None => (None, text),
+    };
+    // A reply opens with what it quotes, which folds to its first lines
+    // so the person's own words always show.
+    let (quote, text) = match replying(text) {
+        Some((quote, words)) => (Some(quote), words),
         None => (None, text),
     };
     // A long paste shows its start, and a row a click opens to the rest.
@@ -1231,13 +1248,101 @@ pub fn prompt(
     let band = crate::look::BAND;
     out.push(Line::default().bg(band));
     out.extend(answering.map(|row| row.bg(band)));
+    if let Some(quote) = quote {
+        let (shown, hidden) = quote_rows_of(quote, width, folder);
+        out.extend(shown);
+        if !hidden.is_empty() {
+            folds.quoted = Some(out.len());
+            out.push(quote_fold(hidden.len(), false));
+        }
+    }
     out.extend(rows);
-    let fold = (!more.is_empty()).then(|| {
+    if !more.is_empty() {
+        folds.more = Some(out.len());
         out.push(fold_row(more.len(), false));
-        out.len() - 1
-    });
+    }
     out.push(Line::default().bg(band));
-    (out, fold)
+    (out, folds)
+}
+
+/// A message that opens with a quote and has words of its own after it,
+/// as `/reply` and `↩` write one: the quote and the words. None for one
+/// that is all quote, or quotes after words of its own.
+fn replying(text: &str) -> Option<(&str, &str)> {
+    let mut end = 0;
+    for line in text.split_inclusive('\n') {
+        if quote_line(line.trim_end_matches(['\n', '\r'])).is_none() {
+            break;
+        }
+        end += line.len();
+    }
+    let words = text[end..].trim_start_matches(['\n', '\r', ' ']);
+    (end > 0 && !words.trim().is_empty()).then(|| (text[..end].trim_end(), words))
+}
+
+/// The most lines of a reply's quote shown while it is folded.
+const QUOTE_LINES: usize = 2;
+
+/// A reply's quote on its band, drawn as Markdown draws a quote: the rows
+/// of the lines it shows folded, and those of the rest.
+fn quote_rows_of(
+    quote: &str,
+    width: usize,
+    folder: Option<&std::path::Path>,
+) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+    let band = crate::look::BAND;
+    let mut reader = match folder {
+        Some(folder) => Markdown::in_folder(folder),
+        None => Markdown::default(),
+    };
+    let count = quote.lines().count();
+    // Its first lines with words in them: a blank line shows nothing.
+    let head = (quote.lines().enumerate())
+        .filter(|(_, line)| !quote_line(line).unwrap_or(line).trim().is_empty())
+        .nth(QUOTE_LINES - 1)
+        .map_or(count, |(at, _)| at + 1);
+    let shown = match count > head + 2 {
+        true => head,
+        false => count,
+    };
+    let leads = (Line::from("  "), Line::from("  "));
+    let (rows, more) = markdown_at(&mut reader, quote, width, leads, shown);
+    let band = |rows: Vec<Line<'static>>| rows.into_iter().map(|row| row.dim().bg(band)).collect();
+    (band(rows), band(more))
+}
+
+/// A reply's quote's fold row, under its bar: `more` rows past its first
+/// lines, shut or open.
+fn quote_fold(more: usize, open: bool) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    spans.extend(bars(1));
+    spans.push(Span::raw(match open {
+        true => format!("quoted, {more} more lines ▾"),
+        false => format!("… quoted, {more} more lines ▸"),
+    }));
+    Line::from(spans).dim().bg(crate::look::BAND)
+}
+
+/// A reply's quote past its first lines, open or shut: what replaces its
+/// fold row (or those rows) when the row is clicked, as [`prompt_more`].
+pub fn prompt_quoted(
+    text: &str,
+    width: usize,
+    open: bool,
+    folder: Option<&std::path::Path>,
+) -> Vec<Line<'static>> {
+    let (_, body) = crate::asks::split(text).unwrap_or(("", text));
+    let (_, more) = match replying(body) {
+        Some((quote, _)) => quote_rows_of(quote, width, folder),
+        None => (Vec::new(), Vec::new()),
+    };
+    let count = more.len();
+    let mut out = match open {
+        true => more,
+        false => Vec::new(),
+    };
+    out.push(quote_fold(count, open));
+    out
 }
 
 /// How many of a prompt's `count` lines show while it is folded: all of
@@ -1289,6 +1394,7 @@ pub fn prompt_more(
     folder: Option<&std::path::Path>,
 ) -> Vec<Line<'static>> {
     let (_, body) = crate::asks::split(text).unwrap_or(("", text));
+    let body = replying(body).map_or(body, |(_, words)| words);
     let (_, more) = prompt_rows(body, width, folder);
     let count = more.len();
     let mut out = match open {
@@ -1399,17 +1505,21 @@ fn quote_rows(text: &str, width: usize, cap: Option<usize>) -> Vec<Line<'static>
             words.push_str(quoted);
             lines.next();
         }
-        let bar = || Line::from("  ▌ ");
+        let bar = || Line::from([vec![Span::raw("  ")], bars(1)].concat());
         let mut rows = markdown(&mut Markdown::default(), &words, width, (bar(), bar()));
         if let Some(cap) = cap.filter(|cap| rows.len() > cap + 1) {
             let more = rows.len() - cap;
             rows.truncate(cap);
-            rows.push(Line::from(format!("  ▌ … +{more} lines")));
+            let mut said = bar();
+            said.push_span(Span::raw(format!("… +{more} lines")));
+            rows.push(said);
         }
         for mut line in rows {
             (line.style.fg, line.style.bg) = (None, None);
             for span in &mut line.spans {
-                (span.style.fg, span.style.bg) = (None, None);
+                span.style.fg = None;
+                // Its bars keep their tint.
+                span.style.bg = span.style.bg.filter(|bg| *bg == crate::look::QUOTE);
             }
             out.push(line);
         }
@@ -1440,6 +1550,32 @@ pub fn with_quotes(
 /// The most bars a quote draws, as deep as it is nested; the rest of
 /// its marks are kept as written, as groups past eight deep are.
 const QUOTE_DEPTH: usize = 8;
+
+/// A quote's bars, `depth` deep, each a tinted blank and a space: drawn
+/// as a bar, copied as blanks ([`crate::look::QUOTE`]).
+pub fn bars(depth: usize) -> Vec<Span<'static>> {
+    let bar = Span::styled(" ", Style::new().bg(crate::look::QUOTE));
+    (0..depth)
+        .flat_map(|_| [bar.clone(), Span::raw(" ")])
+        .collect()
+}
+
+/// Whether `span` is a quote's bar.
+pub fn is_bar(span: &Span) -> bool {
+    span.style.bg == Some(crate::look::QUOTE)
+}
+
+/// A line's text as it reads on screen, each quote's bar as its mark:
+/// what a test reads.
+#[cfg(test)]
+pub fn seen(line: &Line) -> String {
+    (line.spans.iter())
+        .map(|span| match is_bar(span) {
+            true => "▌",
+            false => span.content.as_ref(),
+        })
+        .collect()
+}
 
 /// A line of quoted words, as CommonMark marks one: `>` before it and
 /// at most one space after, so `> words`, `>words`, and a lone `>` for a
@@ -3173,7 +3309,7 @@ mod tests {
     }
 
     fn text(lines: &[Line]) -> Vec<String> {
-        lines.iter().map(|l| l.to_string()).collect()
+        lines.iter().map(seen).collect()
     }
 
     #[test]
@@ -3262,18 +3398,20 @@ mod tests {
         // A wrapped row keeps every bar its line has.
         let mut quote = Markdown::default();
         quote.line("> > a long nested quote");
-        assert_eq!(quote.rest().content, "  ▌ ▌ ");
+        assert_eq!(seen(&quote.rest()), "  ▌ ▌ ");
         // As deep as it goes, at most eight bars: the rest stays text, so
         // a run of marks wraps as words do, its rows' leads no longer.
         let deep = ">".repeat(10_000);
         let rows = markdown(&mut Markdown::default(), &deep, 80, (lead(), lead()));
         let bars = format!("  {}", "▌ ".repeat(8));
-        assert_eq!(rows[0].to_string(), bars);
-        assert!(rows[1].to_string().starts_with(&format!("{bars}>")));
+        assert_eq!(seen(&rows[0]), bars);
+        assert!(seen(&rows[1]).starts_with(&format!("{bars}>")));
         assert!(rows.iter().all(|row| row.width() <= 80));
         assert_eq!(quote_line(">"), Some(""));
         quote.line(&deep);
-        assert_eq!(quote.rest().content.chars().count(), 2 + 2 * 8);
+        assert_eq!(quote.rest().width(), 2 + 2 * 8);
+        // Each bar a tinted blank: a copy takes no mark.
+        assert!(!quote.rest().to_string().contains('▌'));
     }
 
     #[test]
@@ -3437,7 +3575,7 @@ mod tests {
         let said =
             "Ship **it** with `cargo test`:\n\n- one\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |";
         let (rows, fold) = prompt(said, 80, None);
-        assert_eq!(fold, None);
+        assert_eq!(fold, Folds::default());
         // The marks read as what they mean, as in the agent's reply.
         let shown = text(&rows);
         assert_eq!(shown[1], "› Ship it with cargo test:", "{shown:?}");
@@ -3494,7 +3632,7 @@ mod tests {
     fn a_long_message_folds_by_the_rows_it_draws_and_opens_to_the_rest() {
         let said: String = (1..=12).map(|n| format!("- item {n}\n")).collect();
         let (rows, fold) = prompt(&said, 80, None);
-        let fold = fold.unwrap();
+        let fold = fold.more.unwrap();
         assert_eq!(fold, rows.len() - 2);
         assert_eq!(rows[fold].to_string(), "  … +6 lines ▸");
         let shown = text(&rows);
@@ -3508,7 +3646,75 @@ mod tests {
             ["  … +6 lines ▸"]
         );
         // A short one shows whole.
-        assert_eq!(prompt("- a\n- b", 80, None).1, None);
+        assert_eq!(prompt("- a\n- b", 80, None).1, Folds::default());
+    }
+
+    #[test]
+    fn a_reply_shows_the_persons_words_whole_and_folds_what_it_quotes() {
+        // As `/reply` writes one: the quote, a blank line, the words.
+        let quote: String = (1..=7).map(|n| format!("> line {n}\n")).collect();
+        let said = format!("{quote}\nYes, ship it\nand tag it");
+        let (rows, folds) = prompt(&said, 80, None);
+        let shown = text(&rows);
+        assert_eq!(
+            shown,
+            [
+                "",
+                "  ▌ line 1",
+                "  ▌ line 2",
+                "  ▌ … quoted, 5 more lines ▸",
+                "› Yes, ship it",
+                "  and tag it",
+                "",
+            ]
+        );
+        assert_eq!(folds.quoted, Some(3));
+        assert_eq!(folds.more, None);
+        // The quote is quieter than the words, on the same band.
+        assert!(rows[1].style.add_modifier.contains(Modifier::DIM));
+        assert!(
+            rows.iter()
+                .all(|row| row.style.bg == Some(crate::look::BAND))
+        );
+        // Opened, the rest of the quote over its fold row.
+        let open = text(&prompt_quoted(&said, 80, true, None));
+        assert_eq!(open[0], "  ▌ line 3");
+        assert_eq!(open.last().unwrap(), "  ▌ quoted, 5 more lines ▾");
+        assert_eq!(open.len(), 6);
+        assert_eq!(
+            text(&prompt_quoted(&said, 80, false, None)),
+            ["  ▌ … quoted, 5 more lines ▸"]
+        );
+        // A long quote never pushes the words into a fold: a long paste
+        // of its own still folds as one with no quote would.
+        let words: String = (1..=12).map(|n| format!("- item {n}\n")).collect();
+        let (rows, folds) = prompt(&format!("{quote}\n{words}"), 80, None);
+        let shown = text(&rows);
+        assert_eq!(shown[4], "› - item 1");
+        assert_eq!(shown[folds.more.unwrap()], "  … +6 lines ▸");
+        let more = text(&prompt_more(&format!("{quote}\n{words}"), 80, true, None));
+        assert_eq!(more[0], "  - item 7");
+        // A blank line in it shows nothing: the two lines shown have words.
+        let (rows, _) = prompt("> Fixed\n>\n> it rounds\n> a\n> b\n> c\n\nok", 80, None);
+        assert_eq!(
+            text(&rows)[1..5],
+            [
+                "  ▌ Fixed",
+                "  ▌ ",
+                "  ▌ it rounds",
+                "  ▌ … quoted, 3 more lines ▸"
+            ]
+        );
+        // A short quote shows whole; a message that is all quote, or that
+        // quotes after words of its own, reads as before.
+        let (rows, folds) = prompt("> one\n> two\n\nok", 80, None);
+        assert_eq!(text(&rows)[1..4], ["  ▌ one", "  ▌ two", "› ok"]);
+        assert_eq!(folds, Folds::default());
+        assert_eq!(
+            text(&prompt("> only a quote", 80, None).0)[1],
+            "› ▌ only a quote"
+        );
+        assert_eq!(text(&prompt("ok\n> after", 80, None).0)[1], "› ok");
     }
 
     #[test]

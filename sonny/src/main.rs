@@ -3260,6 +3260,12 @@ fn more_button(node: i64) -> screen::Mark {
     screen::Mark::Link(format!("{}more/{node}", screen::BUTTON))
 }
 
+/// The button that opens or shuts the quote the person's reply at `node`
+/// opens with.
+fn quoted_button(node: i64) -> screen::Mark {
+    screen::Mark::Link(format!("{}quoted/{node}", screen::BUTTON))
+}
+
 /// The button that opens or shuts the message between agents at `node`.
 fn said_button(node: i64) -> screen::Mark {
     screen::Mark::Link(format!("{}said/{node}", screen::BUTTON))
@@ -3796,6 +3802,8 @@ struct App {
     /// The last `compacted` event's data, its summary and room (#718),
     /// for `/context`.
     compacted: Option<Value>,
+    /// What `/context` read, and the width its card was last laid at.
+    context_read: Option<(context::Parts, Option<usize>)>,
     input: prompt::Prompt,
     /// The prompts sent before, which Up and Down bring back.
     recall: recall::Recall<Vec<Option<attach::Picture>>>,
@@ -5630,6 +5638,7 @@ impl App {
             context: None,
             window: None,
             compacted: None,
+            context_read: None,
             input: prompt::Prompt::default(),
             recall: recall::Recall::default(),
             pending: Vec::new(),
@@ -6114,6 +6123,7 @@ impl App {
                     term::copy(&text);
                 }
             }
+            self.pane_switched();
             self.side_closed();
             self.suggested_now().await;
             self.shell_ran().await;
@@ -7397,6 +7407,18 @@ impl App {
         with_error(&self.client, turn).await
     }
 
+    /// An agent picked or clicked where its name is listed: opened as
+    /// [`Self::open_agent`] opens it; this window's own is here already,
+    /// so `/status` listing it closes, as Esc does.
+    fn open_picked(&mut self, bot: &str) {
+        if bot != self.bot {
+            return self.open_agent(bot, false);
+        }
+        if self.pane.as_ref().is_some_and(pane::Pane::is_card) {
+            self.close_pane(false);
+        }
+    }
+
     /// An agent named or picked: to its own tab, when the lead's layout
     /// has one for it, or a look at it in the pane, as `[sonny]
     /// agent_opens` says; `other`, a right click, the one it doesn't. With
@@ -7500,6 +7522,10 @@ impl App {
             Some(shown) if shown.is_card() && self.watch.is_some() => {
                 self.open_pane(pane.after(shown))
             }
+            // In place of another agent's, its way back kept.
+            Some(shown) if shown.program.is_some() && shown.agent.is_some() => {
+                self.open_pane(pane.instead_of(shown))
+            }
             shown => {
                 self.pane = shown;
                 self.open_pane(pane);
@@ -7578,7 +7604,7 @@ impl App {
             }
         }
         if let Some(bot) = (button.strip_prefix("task/")).or(button.strip_prefix("agent/")) {
-            self.open_agent(bot, false);
+            self.open_picked(bot);
         }
         if let Some(bot) = button.strip_prefix("other/") {
             self.open_agent(bot, true);
@@ -7610,6 +7636,12 @@ impl App {
             .and_then(|node| node.parse::<i64>().ok())
         {
             self.toggle_more(node).await;
+        }
+        if let Some(node) = button
+            .strip_prefix("quoted/")
+            .and_then(|node| node.parse::<i64>().ok())
+        {
+            self.toggle_fold(node, true).await;
         }
         if let Some(key) = button.strip_prefix("card/") {
             self.card_clicked(key);
@@ -7654,21 +7686,30 @@ impl App {
     /// or shut again: its fold row and what it hid drawn anew from the
     /// message as stored, so nothing of it is kept but its rows drawn.
     async fn toggle_more(&mut self, node: i64) {
+        self.toggle_fold(node, false).await;
+    }
+
+    /// The person's message at `node` opened or shut where it folds: the
+    /// quote its reply opens with (`quote`), or its own long words.
+    async fn toggle_fold(&mut self, node: i64, quote: bool) {
         let Some(item) = self.items(&[node]).await.first().cloned() else {
             self.notice = Some("could not read that message".into());
             return;
         };
+        let (tag, button) = match quote {
+            true => (screen::Tag::Quoted(node), quoted_button(node)),
+            false => (screen::Tag::More(node), more_button(node)),
+        };
         // Shut, it is its fold row alone.
-        let open = self.screen.count_tagged(screen::Tag::More(node)) == 1;
+        let open = self.screen.count_tagged(tag) == 1;
         let folder = std::path::PathBuf::from(&self.workspace);
-        let rows = transcript::prompt_more(&text(&item), self.prose(), open, Some(&folder));
+        let rows = match quote {
+            true => transcript::prompt_quoted(&text(&item), self.prose(), open, Some(&folder)),
+            false => transcript::prompt_more(&text(&item), self.prose(), open, Some(&folder)),
+        };
         let last = rows.len().saturating_sub(1);
         self.flush();
-        self.screen.replace_tagged(
-            screen::Tag::More(node),
-            rows,
-            vec![(last, more_button(node))],
-        );
+        self.screen.replace_tagged(tag, rows, vec![(last, button)]);
     }
 
     /// A `margin` call where it was made: the note's first post as a
@@ -7936,8 +7977,9 @@ impl App {
         } else {
             let prose = self.prose();
             let folder = std::path::PathBuf::from(&self.workspace);
-            // A long message's fold row opens the rest of it.
-            let (lines, fold) = match older {
+            // A long message's fold row opens the rest of it, and a
+            // reply's the rest of what it quotes.
+            let (lines, folds) = match older {
                 true => landed(said, &mut Vec::new(), prose, &folder),
                 false => landed(said, &mut self.ran_here, prose, &folder),
             };
@@ -7948,11 +7990,15 @@ impl App {
                 };
                 let count = lines.len();
                 self.commit(lines);
-                if let Some(fold) = fold {
-                    let at = self.pending.len() - count + fold;
-                    self.marks
-                        .push((at, screen::Mark::Tag(screen::Tag::More(node))));
-                    self.marks.push((at, more_button(node)));
+                for (fold, tag, button) in [
+                    (folds.quoted, screen::Tag::Quoted(node), quoted_button(node)),
+                    (folds.more, screen::Tag::More(node), more_button(node)),
+                ] {
+                    if let Some(fold) = fold {
+                        let at = self.pending.len() - count + fold;
+                        self.marks.push((at, screen::Mark::Tag(tag)));
+                        self.marks.push((at, button));
+                    }
                 }
                 self.mark_last(screen::Mark::Tag(screen::Tag::End(node)));
                 // What another agent reacted with before it was drawn.
@@ -9291,10 +9337,10 @@ impl App {
                 true => "• ",
                 false => "  ",
             };
-            rows.extend(transcript::wrap(
+            rows.extend(transcript::wrap_lines(
                 line,
                 width,
-                Span::raw(lead),
+                Line::from(lead),
                 markdown.rest(),
             ));
         }
@@ -10200,7 +10246,7 @@ impl App {
         if let Some(named) = self.screen.last_agent()
             && let Some(watch) = &mut self.watch
         {
-            watch.pick = card_bots(watch, self.width.max(40), &self.bot)
+            watch.pick = card_bots(watch, self.width.max(40))
                 .iter()
                 .position(|bot| *bot == named);
         }
@@ -10272,10 +10318,14 @@ impl App {
             }
             Some(version) => compaction_named(&self.options.socket, version).await,
         };
-        let lines = context::card(&self.bot, &parts);
-        self.watch = None;
+        // Laid now as the pane lays a card, and again by a frame that
+        // finds the pane another width.
+        let wide = pane::width(self.full_width, kept(self.full_width));
+        let width = card_width(wide);
         let mut pane = pane::Pane::card("context", "esc close");
-        pane.set_card(lines, "esc close");
+        pane.set_card(context::card(&self.bot, &parts, width), "esc close");
+        self.context_read = Some((parts, Some(width)));
+        self.watch = None;
         self.open_pane(pane);
     }
 
@@ -11209,7 +11259,7 @@ impl App {
             && watch.audit.is_none()
             && watch.commons.is_none()
         {
-            let bots = card_bots(watch, self.width.max(40), &self.bot);
+            let bots = card_bots(watch, self.width.max(40));
             if !bots.is_empty() {
                 let last = bots.len() - 1;
                 // A pick the list no longer has (resolved agents hidden) is
@@ -11225,7 +11275,7 @@ impl App {
                 if key.code == KeyCode::Enter {
                     if let Some(at) = pick {
                         let bot = bots[at].clone();
-                        self.open_agent(&bot, false);
+                        self.open_picked(&bot);
                     }
                 } else if let Some(watch) = &mut self.watch {
                     watch.pick = pick;
@@ -14603,8 +14653,8 @@ impl App {
     /// conversation picked, and a name found in none lists those it
     /// narrows to.
     async fn switch_command(&mut self, name: &str) {
-        if self.options.side.is_some() || self.options.embedded {
-            self.notice = Some("/switch is for the main window; this one is beside it".into());
+        if self.options.side.is_some() {
+            self.notice = Some("a side chat keeps to its agent; /switch from its window".into());
             return;
         }
         if name.is_empty() {
@@ -14624,8 +14674,7 @@ impl App {
             }
             match self.client.request("inspect", json!({"bot": bot})).await {
                 Ok(_) => {
-                    self.switch_to = Some(bot);
-                    self.quit = true;
+                    self.switch_window(bot);
                     return;
                 }
                 Err(error) if error.code == "bot_not_found" => continue,
@@ -14682,6 +14731,17 @@ impl App {
             self.notice = Some(format!("this window is {bot}'s already"));
             return;
         }
+        self.switch_window(bot);
+    }
+
+    /// This window made `bot`'s Sonny: the main window goes on as it, as
+    /// if opened on it; one drawn in a pane asks the Sonny it is drawn
+    /// in to show `bot` there instead, leaving the main window as it is.
+    fn switch_window(&mut self, bot: String) {
+        if self.options.embedded {
+            embed::open_here(&bot);
+            return;
+        }
         self.switch_to = Some(bot);
         self.quit = true;
     }
@@ -14699,10 +14759,32 @@ impl App {
             && watch.audit.is_none()
             && watch.commons.is_none()
             && watch.sky.is_none();
-        let bots = card_bots(watch, self.width.max(40), &self.bot);
+        let bots = card_bots(watch, self.width.max(40));
         (open && listing)
             .then(|| watch.pick.and_then(|at| bots.get(at).cloned()))
             .flatten()
+            .filter(|bot| *bot != self.bot)
+    }
+
+    /// The agent an agent's Sonny in the pane was switched to (`/switch`
+    /// there) shown in the pane in its place, its title, Ctrl+G and the
+    /// way back following; the main window stays as it is.
+    fn pane_switched(&mut self) {
+        let Some(pane) = &self.pane else {
+            return;
+        };
+        let Some(bot) = (pane.program.as_ref())
+            .filter(|_| pane.agent.is_some())
+            .and_then(embed::Embedded::opened)
+        else {
+            return;
+        };
+        // The main window's own agent is already shown there: back to it,
+        // as picking it in `/status` goes, the pane put aside for Ctrl+].
+        if bot == self.bot {
+            return self.close_pane(false);
+        }
+        self.open_task(&bot);
     }
 
     /// The pane gone once the side chat in it has ended.
@@ -15002,7 +15084,7 @@ impl App {
                 pane.set_card(lines, &view.keys());
                 pane.foot = None;
             } else {
-                let (mut lines, fold_keys, marks) = watch_card(watch, width, &self.bot);
+                let (mut lines, fold_keys, marks) = watch_card(watch, width);
                 let mut picked = None;
                 // The agent picked from the keys is drawn as the picker
                 // draws its pick, reversed.
@@ -15023,6 +15105,22 @@ impl App {
                     watch.picked = Some(row);
                     pane.screen.keep_in_view(row, 2);
                 }
+            }
+        }
+        // `/context`'s card, laid again only when the pane's width moved,
+        // so its grid and the list beside it never wrap into pieces.
+        if let (Some((parts, laid)), Some(pane)) = (&mut self.context_read, &mut self.pane)
+            && pane.is_card()
+            && pane.title() == "context"
+        {
+            let wide = match chat.width {
+                0 => size.width,
+                _ => pane::width(size.width, kept(size.width)),
+            };
+            let width = card_width(wide);
+            if *laid != Some(width) {
+                *laid = Some(width);
+                pane.set_card(context::card(&self.bot, parts, width), "esc close");
             }
         }
         // The links drawn, to be written again as hyperlinks.
@@ -16053,6 +16151,14 @@ impl App {
     }
 }
 
+/// The width a card is laid at in a pane `wide` columns: each row is
+/// drawn a column in from the line between, at the conversation's measure.
+fn card_width(wide: u16) -> usize {
+    (wide.saturating_sub(2) as usize)
+        .min(measure())
+        .saturating_sub(1)
+}
+
 /// `rows` drawn over what is right above `below`, cleared first.
 fn over(frame: &mut ratatui::Frame, rows: Vec<Line<'static>>, below: ratatui::layout::Rect) {
     let area = ratatui::layout::Rect {
@@ -16073,8 +16179,8 @@ const SKY_REPLAY_KEYS: &str = sky::REPLAY_KEYS;
 const PICK_KEYS: &str = "↑↓ pick · enter open · esc close";
 
 /// The agents `/status` lists, in its order: what its keys pick from.
-fn card_bots(watch: &Watch, width: usize, me: &str) -> Vec<String> {
-    (watch_card(watch, width, me).2)
+fn card_bots(watch: &Watch, width: usize) -> Vec<String> {
+    (watch_card(watch, width).2)
         .into_iter()
         .filter_map(|(_, mark)| match mark {
             screen::Mark::Link(link) => link
@@ -16087,13 +16193,12 @@ fn card_bots(watch: &Watch, width: usize, me: &str) -> Vec<String> {
 
 /// `/status`'s card at `width`, each line after a space, its times
 /// running turns counted on from when its rows were read; the keys of the
-/// groups in it that fold; and the line each agent but `me` starts on,
-/// which a click opens in the pane, then each folding group's heading,
-/// which a click opens or folds.
+/// groups in it that fold; and the line each agent starts on, which a
+/// click opens in the pane (this window's own closes `/status`), then
+/// each folding group's heading, which a click opens or folds.
 fn watch_card(
     watch: &Watch,
     width: usize,
-    me: &str,
 ) -> (
     Vec<Line<'static>>,
     Vec<&'static str>,
@@ -16121,12 +16226,9 @@ fn watch_card(
         status::Details::Quiet,
         &watch.helpers,
     );
-    let mut agents = listed
-        .named
-        .iter()
-        .map(|(_, bot)| bot)
-        .filter(|bot| *bot != me);
-    let picked = watch.pick.and_then(|at| agents.nth(at)).cloned();
+    let picked = (watch.pick)
+        .and_then(|at| listed.named.get(at))
+        .map(|(_, bot)| bot.clone());
     let status::Card {
         lines: mut card,
         named,
@@ -16155,7 +16257,6 @@ fn watch_card(
     // headings that open and fold their groups.
     let mut marks: Vec<(usize, screen::Mark)> = (named.into_iter())
         .map(|(at, bot)| (below(at), bot))
-        .filter(|(_, bot)| bot != me)
         .map(|(at, bot)| {
             (
                 at,
@@ -16391,7 +16492,7 @@ fn landed(
     shown: &mut Vec<user_shell::Ran>,
     width: usize,
     folder: &std::path::Path,
-) -> (Vec<Line<'static>>, Option<usize>) {
+) -> (Vec<Line<'static>>, transcript::Folds) {
     let Some(ran) = user_shell::read(text) else {
         return transcript::prompt(text, width, Some(folder));
     };
@@ -16402,7 +16503,7 @@ fn landed(
         }
         None => user_shell::lines(&ran, width),
     };
-    (rows, None)
+    (rows, transcript::Folds::default())
 }
 
 fn first_line(text: &str) -> String {
@@ -17407,6 +17508,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pane_switched_to_the_main_window_s_agent_goes_back_to_it() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let mut command = portable_pty::CommandBuilder::new("printf");
+        command.arg("\\033]7700;open=b\\033\\\\");
+        let program = embed::Embedded::spawn(command, 5, 20, false, || {}).unwrap();
+        let mut pane = pane::Pane::program("fix", program);
+        pane.as_agent("shop.fix", false);
+        app.open_pane(pane);
+        app.pane_keys = true;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.pane.is_some() && std::time::Instant::now() < deadline {
+            app.pane_switched();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Closed, the keys back in the conversation, the task put aside.
+        assert!(app.pane.is_none() && !app.pane_keys);
+        assert!(app.closed.is_some());
+    }
+
+    #[tokio::test]
     async fn switch_opens_any_agent_here_or_the_one_beside() {
         let client =
             daemon_answering(
@@ -17471,12 +17592,30 @@ mod tests {
         let ctrl_g = event::KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         app.key(Event::Key(ctrl_g)).await;
         assert_eq!(app.switch_to.as_deref(), Some("shop.fix"));
-        // A window drawn beside another keeps to its agent.
+        // A window drawn in another's pane asks that one to show the
+        // agent there instead; the main window is left as it is.
         (app.switch_to, app.quit) = (None, false);
         app.options.embedded = true;
         app.input.set("/switch shop.lead");
         app.submit().await;
-        assert!(app.switch_to.is_none());
+        assert!(app.switch_to.is_none() && !app.quit);
+        assert!(
+            embed::OPENED_HERE
+                .lock()
+                .unwrap()
+                .contains(&"shop.lead".to_owned())
+        );
+        // A side chat keeps to its agent.
+        app.options.side = Some(1);
+        app.input.set("/switch shop.fix");
+        app.submit().await;
+        assert!(app.switch_to.is_none() && !app.quit);
+        assert!(
+            !embed::OPENED_HERE
+                .lock()
+                .unwrap()
+                .contains(&"shop.fix".to_owned())
+        );
     }
 
     #[tokio::test]
@@ -20689,6 +20828,49 @@ mod tests {
         );
         app.press_row("more/5").await;
         assert_eq!(texts(&mut app), shut);
+    }
+
+    #[tokio::test]
+    async fn a_reply_s_quote_folds_and_its_own_words_always_show() {
+        let quote: String = (1..=6).map(|n| format!("> line {n}\n")).collect();
+        let said = format!("{quote}\nShip it");
+        let stored = said.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str() {
+            Some("history_items") => json!({"items": [{"node": 5, "item": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": stored}]}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.land(5, (&said, ""), (None, false), false);
+        let texts = |app: &mut App| -> Vec<String> {
+            (drawn(app).into_iter())
+                .map(|row| row.trim_end().to_owned())
+                .filter(|row| !row.is_empty())
+                .collect()
+        };
+        assert_eq!(
+            texts(&mut app),
+            [
+                "  ▌ line 1",
+                "  ▌ line 2",
+                "  ▌ … quoted, 4 more lines ▸",
+                "› Ship it"
+            ]
+        );
+        let links = app.screen.links();
+        assert_eq!(
+            links.iter().flatten().collect::<Vec<_>>(),
+            [&format!("{}quoted/5", screen::BUTTON)]
+        );
+        // A click opens the rest of the quote over the words, and shuts it.
+        app.press_row("quoted/5").await;
+        let open = texts(&mut app);
+        assert_eq!(open[2], "  ▌ line 3");
+        assert_eq!(open[6..], ["  ▌ quoted, 4 more lines ▾", "› Ship it"]);
+        app.press_row("quoted/5").await;
+        assert_eq!(texts(&mut app).len(), 4);
     }
 
     #[tokio::test]
@@ -24037,7 +24219,7 @@ mod tests {
     }
 
     #[test]
-    fn status_links_each_agent_but_this_one_to_open_it() {
+    fn status_links_each_agent_to_open_it_this_one_too() {
         let row = |name: &str, bot: &str, group| status::Row {
             name: name.into(),
             bot: bot.into(),
@@ -24065,9 +24247,8 @@ mod tests {
             helpers: Vec::new(),
             more: false,
         };
-        // A named lead's window: its own row opens nothing, and the
-        // folder's other lead opens by its own name, not its label.
-        let (lines, _, marks) = watch_card(&watch, 80, "calc.lead.review");
+        // The folder's other lead opens by its own name, not its label.
+        let (lines, _, marks) = watch_card(&watch, 80);
         let link = |at: usize| {
             (marks.iter())
                 .find(|(on, _)| *on == at)
@@ -24093,8 +24274,18 @@ mod tests {
                 screen::BUTTON
             )))
         );
-        // This window's own agent opens nothing.
-        assert_eq!(marks.len(), 2);
+        // This window's own agent is listed and picked as any other.
+        let own = (lines.iter())
+            .position(|line| line.to_string().contains(" lead working"))
+            .unwrap();
+        assert_eq!(
+            link(own),
+            Some(screen::Mark::Link(format!(
+                "{}task/calc.lead.review",
+                screen::BUTTON
+            )))
+        );
+        assert_eq!(marks.len(), 3);
     }
 
     #[tokio::test]
@@ -24564,6 +24755,20 @@ mod tests {
         assert_eq!(pick(&app), Some(1), "the last stays picked");
         app.key(key(KeyCode::Up)).await;
         assert_eq!(pick(&app), Some(0));
+        // This window's own agent, the lead, is picked as any other row,
+        // first in its group; m then says its model, and Enter on it
+        // closes `/status`, since it is open here already.
+        app.bot = "calc.lead".into();
+        if let Some(watch) = &mut app.watch {
+            watch.rows.insert(0, row("lead"));
+            watch.pick = None;
+        }
+        app.key(key(KeyCode::Down)).await;
+        assert_eq!(pick(&app), Some(0));
+        assert_eq!(card_bots(app.watch.as_ref().unwrap(), 80)[0], "calc.lead");
+        assert!(app.beside().is_none(), "never this window's own agent");
+        app.key(key(KeyCode::Enter)).await;
+        assert!(app.pane.is_none(), "closed, as Esc closes it");
     }
 
     #[tokio::test]
