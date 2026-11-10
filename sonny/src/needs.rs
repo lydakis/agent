@@ -490,9 +490,12 @@ impl Needs {
 }
 
 /// Whether a turn's prompt, as `accepted` or `steered` tells it, is the
-/// person's: no agent sent it, nor a client from outside.
+/// person's: no agent sent it, nor a client from outside, nor another
+/// person.
 fn from_person(data: &Value) -> bool {
-    data["from"]["bot"].is_null() && data["origin"].as_str().is_none_or(str::is_empty)
+    data["from"]["bot"].is_null()
+        && data["origin"].as_str().is_none_or(str::is_empty)
+        && data["person"].is_null()
 }
 
 #[cfg(test)]
@@ -648,6 +651,7 @@ mod tests {
             json!({"from": {"bot": "p.lead"}}),
         ));
         needs.event(&event("p.fix", 3, "accepted", json!({"origin": "trigger"})));
+        needs.event(&event("p.fix", 3, "accepted", json!({"person": "dana"})));
         assert!(needs.waits("p.fix"), "only the person answers it");
         assert!(needs.event(&event("p.fix", 4, "accepted", json!({}))));
         assert!(!needs.waits("p.fix"));

@@ -88,8 +88,6 @@ impl Sub {
         }
     }
 
-    /// Whether the bot of `record` holds it: one made for another bot of
-    /// its name does not.
     /// Which subscription it is, for its counts: all it says, and the
     /// subscriber bot it is for.
     pub fn identity(&self, subscriber: Option<i64>) -> String {
@@ -97,6 +95,8 @@ impl Sub {
         format!("{bot}/{}", super::digest(&self.to_json().to_string()))
     }
 
+    /// Whether the bot of `record` holds it: one made for another bot of
+    /// its name does not.
     pub fn held_by(&self, record: &Value) -> bool {
         self.owner
             .is_none_or(|owner| record["bot_id"].as_i64().is_none_or(|id| id == owner))
@@ -1048,7 +1048,7 @@ fn write(store: &Path, subscriber: &str, subs: &[Sub]) -> Result<(), String> {
 /// Remove the subscriber's subscription by that name: whether it had one.
 pub fn remove(store: &Path, subscriber: &str, name: &str) -> Result<bool, String> {
     let _held = held(store)?;
-    let mut subs = read(store, subscriber);
+    let mut subs = read_whole(store, subscriber)?;
     drop_named(store, subscriber, &mut subs, name)
 }
 
@@ -1074,6 +1074,7 @@ fn drop_named(
 ) -> Result<bool, String> {
     let before = subs.len();
     subs.retain(|s| s.name != name);
+    // Written even when nothing went: the lookout takes the file again.
     write(store, subscriber, subs)?;
     Ok(subs.len() < before)
 }
@@ -1278,7 +1279,7 @@ fn checked(add: &Value, sources: &[String]) -> Result<Sub, String> {
 /// them, and adding nothing. How many events it would hear, how many
 /// would steer, about how many notes they would be, with its digest or
 /// its sources', and the newest few as examples. What `subscriber` said
-/// itself, or was told another way, it does not hear, as live.
+/// itself it does not hear, as live.
 pub fn tried(
     store: &Path,
     subscriber: &str,

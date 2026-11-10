@@ -24,7 +24,8 @@ No profiler is installed globally and no model credentials are needed.
 
 ## Run and compare
 
-Run from the repository root on macOS or Linux with Python 3.11 or later:
+Run from the repository root on macOS or Linux with Python 3.11 or later
+(`bench.query_plans` needs 3.12, for the SQLite setting it turns on):
 
 ```sh
 uv --cache-dir .local/uv-cache venv .local/venv --python python3
@@ -840,7 +841,7 @@ burst, not steady-state capacity; pair it with the streaming and lifecycle scree
 
 Each turn is one synthetic `shell` call and a reply, on a fresh store per run.
 Arms: ungated (on both binaries), `held` (the screen answers `allow` on the
-announcement, inside the hold), and `parked` (`--approval-hold-ms 0`, answered
+announcement, inside the hold), and `parked` (an `approval_hold_ms` of 0, answered
 after the park). The screen is the approver, so gated latency includes its own
 answering round trip. It records store jobs and commits per turn, storage worker
 time by job, daemon CPU, latency, event bytes, live store bytes after a clean

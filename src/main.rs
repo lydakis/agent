@@ -111,8 +111,16 @@ fn run() -> Result<i32> {
         None => return fail_with("usage", "a command is required; use agent --help"),
         _ => {}
     }
-    let Some(args) = cli::prepare(args)? else {
-        return Ok(0);
+    // `sandbox`'s own usage error is its failure too, and exits as one.
+    let sandbox = args.first().is_some_and(|command| command == "sandbox");
+    let args = match cli::prepare(args) {
+        Ok(Some(args)) => args,
+        Ok(None) => return Ok(0),
+        Err(error) if sandbox => {
+            report(&error);
+            return Ok(SANDBOX_FAILED);
+        }
+        Err(error) => return Err(error),
     };
     if args[0] == "login" {
         return sign_in::main(&args[1..]);

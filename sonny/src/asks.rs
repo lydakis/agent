@@ -551,12 +551,6 @@ pub fn open(items: &[Value]) -> Option<Ask> {
     open
 }
 
-/// The asks among a bot's history `items`, newest first, each with the
-/// `turn` it holds, as the approver's judge is shown them: each ask's ID,
-/// question and what a yes covers, and the person's pick with the turn it
-/// came in, or none while it is open. An answer names its ask whole
-/// ([`answer_of`]): another's words, or an old-form answer, answer none. A
-/// refused or failed ask was never put to the person.
 /// Whether a history item bears on the asks [`decisions`] reads: an ask
 /// call, a call's failed or refused result, or the person's answer.
 pub fn bears_on_asks(item: &Value) -> bool {
@@ -569,6 +563,12 @@ pub fn bears_on_asks(item: &Value) -> bool {
     }
 }
 
+/// The asks among a bot's history `items`, newest first, each with the
+/// `turn` it holds, as the approver's judge is shown them: each ask's ID,
+/// question and what a yes covers, and the person's pick with the turn it
+/// came in, or none while it is open. An answer names its ask whole
+/// ([`answer_of`]): another's words, or an old-form answer, answer none. A
+/// refused or failed ask was never put to the person.
 pub fn decisions(items: &[(i64, Value)]) -> Vec<agent_client::approver::Decision> {
     let mut answers: Vec<(String, i64, String)> = Vec::new();
     // By turn and call: a provider's call IDs repeat across turns.

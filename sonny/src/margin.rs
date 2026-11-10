@@ -386,7 +386,6 @@ impl Kept {
     }
 }
 
-/// `body` written into a kept note's `json`.
 /// A note's words as a reply quotes them: its text, a file's path, or
 /// what another bot's note showed when last read.
 fn said(body: &Body) -> String {
@@ -397,6 +396,7 @@ fn said(body: &Body) -> String {
     }
 }
 
+/// `body` written into a kept note's `json`.
 fn body_json(body: &Body, json: &mut Value) {
     match body {
         Body::Markdown(text) => json["markdown"] = json!(text),

@@ -17,13 +17,13 @@ mod context;
 mod db;
 pub use context::{ContextPrefix, ContextUsage, pinned_item, thinking_bytes, without_thinking};
 pub use db::{
-    Absorbed, AfterTurn, Answered, BACKGROUND_ORIGIN, Binding, Blocked, Bot, CacheTtl, CallAnswer,
-    CatchUp, Charge, CompactionPlan, CompactionView, CopiedCall, Counts, DENIAL_WINDOW, Database,
-    Decision, Delivery, ENV_JSON, EVENT_PAGE_KINDS, ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated,
-    Halt, Halted, LIMIT_ORIGIN, Lapsed, Limit, MAX_GATES, ParkedFallback, Planning, Publication,
-    QuoteRef, RULES_JSON, Room, SANDBOX, SETTINGS, Served, Settings, Spend, Started, Step, Stepped,
-    Strip, TURN_VIEW_ACCOUNTING, TurnBudget, TurnContext, TurnOptions, Waiting, Wake, Window, Work,
-    cache_hit, merge_gates, share, unserved,
+    Absorbed, AfterTurn, Answered, Binding, Blocked, Bot, CacheTtl, CallAnswer, CatchUp, Charge,
+    CompactionPlan, CompactionView, CopiedCall, Counts, DENIAL_WINDOW, Database, Decision,
+    Delivery, ENV_JSON, EVENT_PAGE_KINDS, ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, Halt,
+    Halted, Lapsed, Limit, MAX_GATES, ParkedFallback, Planning, Publication, QuoteRef, RULES_JSON,
+    Room, SANDBOX, SETTINGS, Served, Settings, Spend, Started, Step, Stepped, Strip,
+    TURN_VIEW_ACCOUNTING, TurnBudget, TurnOptions, Waiting, Wake, Window, Work, cache_hit, share,
+    unserved,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
@@ -936,7 +936,7 @@ impl Store {
             .map(|permit| Slot(permit, queued))
             .map_err(|_| Error::new("storage_worker_failed"))
     }
-    /// Run a read on the reader connection, counted like any job. Only for
+    /// Run a read on a reader connection, counted like any job. Only for
     /// reads whose result is bytes for a caller, never for decisions that
     /// must see the write the caller is about to make.
     pub async fn read<T: Send + 'static>(
@@ -946,7 +946,7 @@ impl Store {
     ) -> Result<T> {
         self.reader().read(label, operation).await
     }
-    /// The reader connection alone, for a holder that must not keep the
+    /// The reader pool alone, for a holder that must not keep the
     /// writer, and so the publication stream, open: a waiter in the
     /// registry outlives the service at shutdown.
     pub fn reader(&self) -> Reader {
@@ -964,14 +964,14 @@ impl Store {
     }
 }
 
-/// Reads on the reader connection; see `Store::reader`.
+/// Reads on the reader pool; see `Store::reader`.
 #[derive(Clone)]
 pub struct Reader {
     reader: std::sync::Arc<ReadQueue>,
     counters: std::sync::Arc<Counters>,
 }
 impl Reader {
-    /// Run a read on the reader connection, counted like any job. Only for
+    /// Run a read on a reader connection, counted like any job. Only for
     /// reads whose result is bytes for a caller, never for decisions that
     /// must see the write the caller is about to make.
     pub async fn read<T: Send + 'static>(

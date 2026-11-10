@@ -284,6 +284,13 @@ fn append(file: &Path, prompt: &str, at: i64) -> std::io::Result<()> {
         let half = text.len() - (MOST_BYTES / 2) as usize;
         let keep =
             (text[half..].iter().position(|&b| b == b'\n')).map_or(text.len(), |at| half + at + 1);
+        // A last line longer than what is kept would leave nothing: it is
+        // kept itself, the prompt just sent.
+        let last = text[..text.len().saturating_sub(1)]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |at| at + 1);
+        let keep = keep.min(last);
         handle.set_len(0)?;
         handle.write_all(&text[keep..])?;
     }

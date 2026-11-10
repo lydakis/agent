@@ -10,7 +10,7 @@ use std::time::Duration;
 
 /// The fields a bot's events may have, as the `follows` tool lists
 /// them for an agent to filter on.
-pub const FIELDS: [(&str, &str); 13] = [
+pub const FIELDS: [(&str, &str); 14] = [
     (
         "type",
         "string: message.written, turn.ended, approval.waiting, ask.posted, turn.silent or note.changed",
@@ -42,6 +42,7 @@ pub const FIELDS: [(&str, &str); 13] = [
         "string, the line a task asked the person to run, for a step only they can take",
     ),
     ("id", "string, a margin note's id"),
+    ("removed", "boolean, the margin note was taken away"),
 ];
 
 /// What one subscription that watches a bot says of its events.
@@ -69,8 +70,8 @@ impl Rule {
 /// goes as news always went.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Hold {
-    /// Something in it goes as soon as the subscriber rests: heard by a
-    /// subscription with no digest, or the person's own.
+    /// Something in it waits for no digest: heard by a subscription with
+    /// none, or the person's own.
     pub now: bool,
     /// Subscriptions with a digest that heard it, each with its digest:
     /// no sooner than one allows, this long after a note last told what
@@ -87,7 +88,7 @@ pub struct Hold {
 }
 
 impl Hold {
-    /// As soon as the subscriber rests.
+    /// Waiting for no digest.
     #[cfg(test)]
     pub fn now() -> Hold {
         Hold {

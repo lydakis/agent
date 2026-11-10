@@ -1299,6 +1299,7 @@ pub async fn answer(
     // What agent-browser reads its settings from, which can name the
     // program it starts, is the person's to write, not the agent's.
     let settings = std::env::var_os("AGENT_BROWSER_CONFIG")
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent-browser"))

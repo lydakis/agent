@@ -1452,9 +1452,10 @@ impl Provider {
             Some(Chain { bot, window, tail }) => (Some(bot), window, Some(tail)),
             None => (None, None, None),
         };
-        let key = window.map_or(socket::key(&prefix, &[], 0), |(head, elided, _)| {
-            socket::key(&prefix, head, elided)
-        });
+        let key = window.map_or_else(
+            || socket::key(&prefix, &[], 0),
+            |(head, elided, _)| socket::key(&prefix, head, elided),
+        );
         let ids = window.map(|(_, _, ids)| ids);
         // A connection opened under an older login would present its token
         // until it closes; open a new one instead, as Codex does.
@@ -1678,10 +1679,15 @@ pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<f64>().ok())
     };
+    // A number no `Duration` holds (negative, not finite) names no delay,
+    // and the other header is read; one past the longest is the longest.
+    let delay = |seconds: f64| {
+        let delay = Duration::try_from_secs_f64(seconds).ok()?;
+        Some(delay.min(pace::LONGEST_DELAY))
+    };
     number("retry-after-ms")
-        .map(|ms| ms / 1000.0)
-        .or_else(|| number("retry-after"))
-        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+        .and_then(|ms| delay(ms / 1000.0))
+        .or_else(|| number("retry-after").and_then(delay))
 }
 
 /// Tell the model's pool of a refusal a socket reported: a 429 or 529
@@ -1700,8 +1706,6 @@ fn limit(pace: &pace::Pace, failure: &socket::Failure) {
     }
 }
 
-/// A `response.create` event: the request fields, the continuation if any,
-/// and the input. A socket message is whole, so the input is assembled here.
 /// A request body as it is sent: the prefix, the items and the close. Empty
 /// chunks (an empty context prefix, a batch of thinking-only items) are
 /// dropped: each would be an empty HTTP/2 DATA frame, which Bedrock answers
@@ -1716,6 +1720,8 @@ fn framed(
         .filter(|chunk| std::future::ready(!matches!(chunk, Ok(bytes) if bytes.is_empty())))
 }
 
+/// A `response.create` event: the request fields, the continuation if any,
+/// and the input. A socket message is whole, so the input is assembled here.
 async fn create(prefix: &[u8], previous: Option<&str>, items: Items) -> Result<String> {
     let mut text = Vec::with_capacity(prefix.len() + items.bytes + 96);
     text.extend_from_slice(br#"{"type":"response.create","#);
@@ -1902,8 +1908,8 @@ fn legacy_thinking(model: &str) -> bool {
         && !model.starts_with("claude-opus-4-6")
 }
 
-// Preserve only stage, timeout classification, and numeric OS code. Reqwest's
-// Display/debug strings can include URLs and must never become diagnostics.
+// The code says a timeout or the numeric OS code. Reqwest's Display strings,
+// which can include URLs, are kept as the detail only, never for a timeout.
 /// Classify a transport failure and keep its cause chain as the detail. The
 /// chain names the URL and the HTTP, TLS, or socket layer that failed, never a
 /// header, so it is safe once the caller's key redaction has run.
@@ -2123,6 +2129,17 @@ mod tests {
         );
         headers.insert("retry-after-ms", HeaderValue::from_static("soon"));
         assert_eq!(super::retry_after(&headers), Some(Duration::from_secs(2)));
+        // A number that names no delay leaves the other header to be read.
+        headers.insert("retry-after-ms", HeaderValue::from_static("-1"));
+        assert_eq!(super::retry_after(&headers), Some(Duration::from_secs(2)));
+        // One no clock could add is the longest a provider can name.
+        headers.insert("retry-after-ms", HeaderValue::from_static("1e21"));
+        assert_eq!(
+            super::retry_after(&headers),
+            Some(super::pace::LONGEST_DELAY)
+        );
+        let pace = super::pace::Pace::default();
+        pace.limited(super::retry_after(&headers));
     }
     #[tokio::test]
     async fn an_unlisted_window_is_the_one_anthropic_publishes_else_200k() {

@@ -600,11 +600,8 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             // The daemon bounds how deep a line goes and refuses the
             // agent past it; asked first, by its own facts, so a start it
             // would refuse makes no folder and runs no setup.
-            let itself = text("from")
-                .and_then(|from| crate::resolved::call(&json!({"task": from}), &line.project))
-                .is_some_and(|from| from == caller);
             // Without a daemon to ask, the start goes on to meet its answer.
-            let most = match (line.depth > 0 && !itself)
+            let most = match (line.depth > 0)
                 .then(|| crate::daemon_paths(None, None).ok())
                 .flatten()
             {
@@ -1676,7 +1673,6 @@ async fn unreviewed(
     }
 }
 
-/// The time a call has left before the daemon gives up on it.
 /// `call` with its time to answer moved `by` later.
 fn later(call: &Value, by: Duration) -> Value {
     let mut call = call.clone();
@@ -1686,6 +1682,7 @@ fn later(call: &Value, by: Duration) -> Value {
     call
 }
 
+/// The time a call has left before the daemon gives up on it.
 fn left(call: &Value) -> Duration {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1966,7 +1963,7 @@ pub fn stop() {
 
 /// The error codes `sonny tool` answers with, as static names.
 fn code(said: &str) -> &'static str {
-    const CODES: [&str; 19] = [
+    const CODES: [&str; 23] = [
         "not_in_folder",
         "no_caller",
         "invalid_arguments",
@@ -1984,6 +1981,10 @@ fn code(said: &str) -> &'static str {
         "margin_full",
         "margin_note_too_long",
         "margin_unread",
+        "not_marked",
+        "commons_refused",
+        "ask_refused",
+        "ask_close_refused",
         "unknown_tool",
         "tool_failed",
     ];
@@ -2687,6 +2688,8 @@ mod tests {
         assert_eq!(code("task_not_started"), "task_not_started");
         assert_eq!(code("tasks_exist"), "tasks_exist");
         assert_eq!(code("margin_full"), "margin_full");
+        assert_eq!(code("ask_refused"), "ask_refused");
+        assert_eq!(code("commons_refused"), "commons_refused");
         assert_eq!(code("Anything Else"), "tool_failed");
     }
 }

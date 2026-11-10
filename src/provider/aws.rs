@@ -1048,9 +1048,6 @@ mod tests {
         }
     }
 
-    /// Whole requests as botocore 1.43 signs them, with payload signing off
-    /// and on, with and without a session token. The digest is taken over
-    /// the body in chunks, as it streams.
     #[tokio::test]
     async fn a_login_missing_at_start_resolves_on_first_use() {
         let dir = std::env::temp_dir().join(format!("agent-aws-late-{}", std::process::id()));
@@ -1166,6 +1163,9 @@ exit 252
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Whole requests as botocore 1.43 signs them, with payload signing off
+    /// and on, with and without a session token. The digest is taken over
+    /// the body in chunks, as it streams.
     #[tokio::test]
     async fn requests_sign_as_botocore_signs_them() {
         let now = at(1_790_296_697);

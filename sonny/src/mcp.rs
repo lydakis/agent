@@ -338,7 +338,7 @@ pub fn kept(cache: &Path, server: &str, config: &McpServer) -> Option<Known> {
 /// The process groups of the stdio servers running, which `kill_all` ends.
 static GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
-/// Stop every stdio server at once, as a lookout that exits does.
+/// Stop every stdio server at once, as a tool host that exits does.
 pub fn kill_all() {
     for group in std::mem::take(&mut *GROUPS.lock().unwrap()) {
         kill(group);

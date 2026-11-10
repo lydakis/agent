@@ -390,8 +390,13 @@ fn depth_moved(text: &str) -> Result<Option<String>, ()> {
     let mut lines = Vec::new();
     for raw in text.lines() {
         let trimmed = raw.trim();
-        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
-            table = trimmed.trim_matches(['[', ']']).trim().to_owned();
+        // A heading, `[sonny]`, a comment after it or not.
+        if let Some(heading) = trimmed
+            .strip_prefix('[')
+            .filter(|rest| !rest.starts_with('['))
+            && let Some((name, _)) = heading.split_once(']')
+        {
+            table = name.trim().to_owned();
         }
         let key = trimmed.split_once('=').map(|(key, _)| key.trim());
         if table == "sonny" && key == Some("task_depth") && !removed {
@@ -849,6 +854,13 @@ mod tests {
         assert_eq!(
             depth_moved("[daemon]\ndepth = 4\n[sonny]\ntask_depth = 3\n"),
             Ok(Some("[daemon]\ndepth = 4\n[sonny]\n".into()))
+        );
+        // A heading with a comment after it is its table all the same.
+        assert_eq!(
+            depth_moved("[sonny] # mine\ntask_depth = 3\n[daemon] # its\nload = 0\n"),
+            Ok(Some(
+                "[sonny] # mine\n[daemon] # its\ndepth = 3\nload = 0\n".into()
+            ))
         );
         // Nothing to move.
         assert_eq!(depth_moved("[sonny]\nchime = true\n"), Ok(None));

@@ -648,10 +648,6 @@ impl Handles {
         }
     }
 
-    /// Release session outputs and stop deadlines before the stdout worker
-    /// is joined. Background completions may retain this registry afterward.
-    /// Drop every waiter, and hand back the answers still reading, for the
-    /// caller to let finish or end before closing their outputs.
     /// Answer every client's `wait` now, as its deadline would: what is
     /// still pending is reported as it stands, a turn the daemon parked as
     /// it stops included, which goes on only at the next start.
@@ -666,6 +662,10 @@ impl Handles {
         }
     }
 
+    /// Release session outputs and stop deadlines before the stdout worker
+    /// is joined. Background completions may retain this registry afterward.
+    /// Drop every waiter, and hand back the answers still reading, for the
+    /// caller to let finish or end before closing their outputs.
     pub fn shutdown(&self) -> tokio::task::JoinSet<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.waiters.clear();

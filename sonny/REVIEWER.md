@@ -256,7 +256,7 @@ so only one instance runs at a time, and answers in layers:
    high. TypeSafe publishes no calibration figures; a third-party benchmark
    (jev-bench, 12 tasks, 2026-09-20) found answers reliable at 0.9 and
    task-dependent below it. Our labeled run
-   ([Measure](#measure-before-building), item 2) found them too strict for
+   ([Measured](#measured), item 2) found them too strict for
    coding work, but it cannot yet set
    better ones: benign calls such as starting the server a task asks for
    score up to 0.64 on "changes a shared system", while a requested
@@ -368,7 +368,7 @@ A general model is slower than a decision API, so its round gets 30 s, and the C
 gives an `auto` call 45 s before its gate lapses. Which reviewer is better at
 what cost is measured, not assumed: the labeled calls of item 2 are replayed
 through the daemon and the reviewer with each reviewer
-([Measure](#measure-before-building), item 4).
+([Measured](#measured), item 4).
 
 **What the reviewer is shown.** (Since 2026-10-28 also the bot's history,
 tool outputs included, and the AGENTS.md files it was given: see the top
@@ -709,7 +709,7 @@ Where the reviewer differs from the design above:
   in the 2026-10-26 graft session, which sent the questions first and
   inline, none of the reviewer's 450k input tokens were cached.
 - A turn whose steers do not all fit the `prompts` read is reviewed
-  without consent, since the person's latest word may be the one left out. A model reviewer's tag is at most 67 bytes, so its forks' names fit.
+  without consent, since the person's latest word may be the one left out. A model reviewer's tag is at most 66 bytes, so its forks' names fit.
 
 Not built yet: the app's cards and the app's own approver, and a labeled
 set of calls that should not run, to measure false allows. Follow-ups

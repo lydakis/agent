@@ -20,16 +20,27 @@ fn main() {
     if let Some(commit) = git(&["rev-parse", "--short=9", "HEAD"]).filter(|_| ours) {
         println!("cargo:rustc-env=SONNY_COMMIT={commit}");
         // Built again once HEAD moves: the file HEAD names, its branch's.
-        for path in [
-            Some("HEAD".to_owned()),
-            git(&["symbolic-ref", "-q", "HEAD"]),
-        ]
-        .into_iter()
-        .flatten()
-        .chain(["packed-refs".to_owned()])
-        {
-            if let Some(file) = git(&["rev-parse", "--git-path", &path]) {
-                println!("cargo:rerun-if-changed={file}");
+        // Only what is there is watched, since cargo takes a path that is
+        // missing for one that changed and builds again every time: a
+        // branch's own file is missing once its ref is packed, and
+        // `packed-refs` until one is. The branch's file coming back, at the
+        // next commit, changes the folder watched in its place.
+        let path =
+            |name: &str| git(&["rev-parse", "--git-path", name]).map(std::path::PathBuf::from);
+        let watch = |file: &std::path::Path| println!("cargo:rerun-if-changed={}", file.display());
+        for file in ["HEAD", "packed-refs"].into_iter().filter_map(path) {
+            if file.exists() {
+                watch(&file);
+            }
+        }
+        if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]).and_then(|name| path(&name)) {
+            match branch.exists() {
+                true => watch(&branch),
+                false => {
+                    if let Some(heads) = path("refs/heads").filter(|heads| heads.exists()) {
+                        watch(&heads);
+                    }
+                }
             }
         }
     }

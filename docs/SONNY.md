@@ -824,7 +824,8 @@ from the notices every session hears, and a pause already holding from
 
 At each start Sonny writes the skills it ships into `~/.agents/skills`, where
 every agent finds them ([client policy](CLIENT.md)): `plan`, an agent's plan
-as a file; `memory`, what to save for later agents; `commons`, the threads
+as a file; `memory`, what to save for later agents; `zen`, one focus at
+a time; `coordination`, how a lead works with its tasks; `commons`, the threads
 agents share (see Commons); `memory-cleanup`, the
 nightly cleanup (see Memory); `automation`, for recurring jobs (see
 Automations); `sonny-setup`, how any agent sets Sonny up with `sonny setup`'s
@@ -868,8 +869,9 @@ new register is the heard one. No version is compared, so a skipped release
 is told with the next. The first register a person has is heard of without
 a word. The note also offers each setup step an upgrade brings that the
 person has neither done nor been offered (`setup::STEPS`: bringing in
-MCP servers with `sonny mcp import`, and a git backup with `sonny setup
-backup`): each is offered once, then noted in
+MCP servers with `sonny mcp import`, a git backup with `sonny setup
+backup`, and a signed-in browser with `sonny setup --browser-signed-in`):
+each is offered once, then noted in
 `~/.agent/sonny/offered`, as is one setup itself offers. The row reads
 `↳ Sonny upgraded · what's new · set up mcp-import`.
 
@@ -921,7 +923,7 @@ says which build runs). It follows the daemon's `tool_started` and
 `turn_finished` events from `STORE.tool-host.cursor`, the first time from
 the lookout's cursor rather than the whole log, and exits once the daemon
 has been gone 30 seconds. On starting, it brings every agent Sonny declared
-tools on up to this build's tools. `/status` says "tools not answered"
+tools on up to this build's tools. `/background` says "tools not answered"
 when no tool host runs.
 
 ## MCP servers

@@ -617,6 +617,9 @@ async fn everyone(client: &agent_client::Client, author: &str) -> Vec<String> {
             (page["bots"].as_array().into_iter().flatten())
                 .filter_map(|bot| bot["name"].as_str())
                 .filter(|name| *name != author)
+                // Sonny's own bots (the reviewer's base and its forks) are
+                // no one to invite.
+                .filter(|name| !crate::project::is_internal(name))
                 .map(str::to_owned),
         );
         match &page["next_after"] {

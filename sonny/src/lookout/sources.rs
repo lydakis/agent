@@ -1292,9 +1292,6 @@ fn sample(fields: &Value) -> Option<Value> {
     (sample.to_string().len() <= SAMPLE_BYTES).then_some(sample)
 }
 
-/// The one thread that writes shapes, off the lookout's runtime: what was
-/// handed over while it wrote waits, and the newest body for each file
-/// wins, so a source whose fields churn costs one write at a time.
 /// `lines` added to the end of `path`: how long it is now, none when it
 /// could not be written.
 fn add_lines(path: &Path, lines: &str) -> Option<u64> {
@@ -1341,6 +1338,9 @@ fn trim(path: &Path, now_ms: u128) {
     }
 }
 
+/// The one thread that writes shapes, off the lookout's runtime: what was
+/// handed over while it wrote waits, and the newest body for each file
+/// wins, so a source whose fields churn costs one write at a time.
 mod shapes {
     use std::collections::HashMap;
     use std::path::PathBuf;

@@ -13,7 +13,7 @@ import time
 import unittest
 from pathlib import Path
 
-from bench.runtime_client import Client, node_item
+from bench.runtime_client import node_item
 from bench.socket_client import Connection, SocketClient
 from bench.targets import clean_env
 from tests.test_elision import drain, encoded

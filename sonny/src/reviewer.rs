@@ -5,9 +5,9 @@
 //! `agent_client::judge`; this is the loop. Sonny keeps it as the daemon's
 //! companion, the daemon's approver for the tag; the daemon holds only the
 //! gates it serves.
-//! As in Codex, a denial goes back to the model at once, and a round the
-//! reviewer never assessed is denied as a review failure; only a call too
-//! long to show is handed to a person, where one can be asked.
+//! As in Codex, a denial goes back to the model at once. A round the
+//! reviewer never assessed is handed to a person, as a doubt is; where the
+//! gate lapses nobody can be asked, and both are denied.
 use agent_client::Error;
 use agent_client::{
     Client,
@@ -321,8 +321,8 @@ async fn serve(settings: Settings) -> Result<i32> {
         tripped: Mutex::default(),
         lost: Notify::new(),
     });
-    // The CLI that started this process waits for this line: the judge is
-    // ready, not just the lease held.
+    // Printed once the reviewer is ready, not just the lease held: tests
+    // wait for it.
     report(
         json!({"event":"serving","tag":tag,"lease":lease,"model":named,
         "pid":std::process::id()}),

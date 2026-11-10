@@ -106,7 +106,9 @@ jobs:
             echo "A command or flag Sonny's browser or desktop tool passes is no longer documented, or a line it passes no longer parses. Agents get an error for it until the tool's lists in \`sonny/src/\` follow the release."
             echo
             echo '```'
-            grep -A 20 "no longer\|panicked" .local/upstream/tools.log | head -60
+            # A log with neither phrase (a build that failed, say) still
+            # opens the issue: grep finding nothing must not end the step.
+            { grep -A 20 "no longer\|panicked" .local/upstream/tools.log || true; } | head -60
             echo '```'
             echo
             echo "Found by [this run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."

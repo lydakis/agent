@@ -1,6 +1,6 @@
 //! `~/.agent/env`: provider keys kept out of shell profiles, as `KEY=VALUE`
-//! lines readable only by their owner. The clients (the app, Sonny) add them
-//! over the environment they start a daemon with; neither the CLI nor the
+//! lines readable only by their owner. A client such as Sonny adds them
+//! over the environment it starts a daemon with; neither the CLI nor the
 //! daemon reads the file. Providers are not set here: Sonny passes over an
 //! `AGENT_PROVIDER` in it, since `~/.agent/config.toml` is where they live.
 use std::path::{Path, PathBuf};

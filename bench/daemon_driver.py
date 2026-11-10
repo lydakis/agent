@@ -26,7 +26,6 @@ class DaemonDriver:
         self.created = 0
         self.finished = 0
         self.failed = False
-        self.done = False
         self.outgoing = []
 
     def request(self, op, agent=None, **params):
@@ -106,7 +105,6 @@ class DaemonDriver:
         if data.get('status') != 'completed':
             code = data.get('error')
             self.failed = True
-            self.done = True
             self.request('shutdown')
             return [{'event': 'diagnostic', 'stage': 'benchmark',
                      'code': code if code in ALLOWED_DIAGNOSTICS else 'benchmark_failed'}]
@@ -119,6 +117,5 @@ class DaemonDriver:
         else:
             self.finished += 1
             if self.finished == self.config['concurrency']:
-                self.done = True
                 self.request('shutdown')
         return events

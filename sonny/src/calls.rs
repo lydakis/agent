@@ -644,7 +644,11 @@ pub fn waited(reply: &Value) -> Option<Vec<String>> {
 /// A Rex target as a person reads it: a label as is, an id by its end.
 fn target(target: &str) -> String {
     match target.split_once(':') {
-        Some((_, id)) if id.len() > 8 => format!("…{}", &id[id.len() - 6..]),
+        Some((_, id)) if id.chars().count() > 8 => {
+            // By characters: an id is whatever the command's text held.
+            let end: String = id.chars().skip(id.chars().count() - 6).collect();
+            format!("…{end}")
+        }
         _ => target.to_owned(),
     }
 }

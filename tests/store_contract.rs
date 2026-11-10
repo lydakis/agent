@@ -6976,12 +6976,18 @@ fn stores_carry_a_schema_version_and_migrate_older_ones_forward() {
         Database::initialize(conn).err().unwrap().code,
         "store_schema_newer"
     );
-    let conn = Connection::open_in_memory().unwrap();
-    let version: i32 = {
-        let _db = Database::initialize(conn).unwrap();
-        Database::SCHEMA
-    };
+    // A fresh store carries the version, read back from its file.
+    let fresh = std::env::temp_dir().join(format!("agent-fresh-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&fresh);
+    drop(Database::initialize(Connection::open(&fresh).unwrap()).unwrap());
+    let version: i32 = Connection::open(&fresh)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
     assert_eq!(version, Database::SCHEMA);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", fresh.display()));
+    }
     // A version-6 store (no turn ordinals) is migrated forward at open:
     // ordinals are rebuilt from the accepted events, so windows and history
     // reads work on the old data.
@@ -8874,8 +8880,7 @@ fn deleting_a_bot_frees_only_its_exclusive_history() {
     // Deleting the last bot on a lineage frees everything.
     let freed = db.delete_bot("branch").unwrap();
     assert_eq!(freed["nodes"], 8);
-    let nodes: i64 = db.events("branch", 0, 8).map(|_| 0).unwrap_or_else(|_| 0);
-    assert_eq!(nodes, 0);
+    assert_eq!(db.events("branch", 0, 8).unwrap_err().code, "bot_not_found");
     assert_eq!(db.delete_bot("branch").unwrap_err().code, "bot_not_found");
 }
 
@@ -16963,8 +16968,6 @@ fn a_background_command_no_wait_collected_is_told_once_its_bot_rests() {
     assert!(!db.tell_finished("Bob").unwrap());
 }
 
-/// A turn of `bot` that starts a background command and ends: the
-/// command's id.
 /// Tell the resting bot of its ended commands and run every note.
 fn hear_out(db: &mut Database, bot: &str) {
     db.tell_finished(bot).unwrap();
@@ -16974,6 +16977,8 @@ fn hear_out(db: &mut Database, bot: &str) {
     }
 }
 
+/// A turn of `bot` that starts a background command and ends: the
+/// command's id.
 fn started_in_background(db: &mut Database, bot: &str, id: &str) -> i64 {
     let turn = (db.begin(
         bot,

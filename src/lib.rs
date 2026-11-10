@@ -103,3 +103,7 @@ pub fn fail<T>(code: &str) -> Result<T> {
 pub fn fail_with<T>(code: &str, detail: impl Into<String>) -> Result<T> {
     Err(Error::with(code, detail))
 }
+
+// The tests' own home: the sandbox keeps its lock files under `~/.agent`.
+#[cfg(test)]
+agent_client::test_home!();

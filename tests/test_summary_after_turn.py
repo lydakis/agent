@@ -3,7 +3,6 @@ call's cache is warm, rather than before the bot's next call. The next turn
 starts at once, takes the summary in at a boundary once it lands, and waits
 for it only when its view cannot go on without one."""
 from contextlib import closing
-import json
 import os
 import queue
 import sqlite3

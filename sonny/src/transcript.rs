@@ -94,7 +94,7 @@ impl Markdown {
                 return out;
             }
         }
-        if !self.fence && table_row(text) {
+        if !self.fence && self.math.is_none() && table_row(text) {
             self.table.push(text.trim().to_owned());
             return Vec::new();
         }
@@ -1211,9 +1211,9 @@ pub fn prompt(
     folder: Option<&std::path::Path>,
 ) -> (Vec<Line<'static>>, Option<usize>) {
     let mut out = Vec::new();
-    // What Sonny (or the app) told the lead of its tasks, or what the
-    // lookout woke it for: news, not words of the person's, kept to one
-    // quiet row; the lead's answer says the rest.
+    // What Sonny told the lead of its tasks, or what the lookout woke it
+    // for: news, not words of the person's, kept to one quiet row; the
+    // lead's answer says the rest.
     if let Some(news) = news(text) {
         return (vec![news_row(&news, width)], None);
     }
@@ -1364,16 +1364,16 @@ pub fn relayed(text: &str, from: Option<&str>, open: bool, width: usize) -> Vec<
     out.into_iter().map(|line| line.dim()).collect()
 }
 
-/// Words with the words they quote: each `> ` run drawn as the reply it
-/// was, behind a bar, its shape without its colors, so it never
-/// outweighs the words that quote it; at most `cap` rows of each, the
-/// rest counted. Every row starts two columns in.
 /// A line that opens or closes a fenced code block.
 fn fence(line: &str) -> bool {
     let line = line.trim_start();
     line.starts_with("```") || line.starts_with("~~~")
 }
 
+/// Words with the words they quote: each `> ` run drawn as the reply it
+/// was, behind a bar, its shape without its colors, so it never
+/// outweighs the words that quote it; at most `cap` rows of each, the
+/// rest counted. Every row starts two columns in.
 fn quote_rows(text: &str, width: usize, cap: Option<usize>) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let mut lines = text.lines().peekable();
@@ -2653,7 +2653,6 @@ fn assignment(part: &str) -> bool {
     })
 }
 
-/// A call said as an action, with up to two rows of each line under it.
 /// The first line of a failed call's `{"error","detail"}` output: its
 /// detail, else its code.
 fn refusal(output: Option<&str>) -> Option<String> {
@@ -2672,6 +2671,7 @@ pub fn plan_lines(steps: &[String], full: bool, width: usize) -> Vec<Line<'stati
     said_lines(said, width)
 }
 
+/// A call said as an action, with up to four rows of each line under it.
 fn said_lines(said: crate::calls::Said, width: usize) -> Vec<Line<'static>> {
     // A call that failed did not do what its verb says: it is marked
     // failed and said as what it tried, as Codex and Claude Code lead a
@@ -2990,11 +2990,16 @@ fn find_lines(lines: &[&str], wanted: &[&str], from: usize, budget: &mut usize) 
     })?
 }
 
-/// The rule under a finished turn: how it ended, how long it took, what it cost.
 /// A path as the person would say it: inside the bot's folder, from
 /// there (macOS's /tmp is /private/tmp, either way round); else from ~.
 fn shown(path: &str, workspace: &str) -> String {
-    let bare = |p: &str| p.strip_prefix("/private").unwrap_or(p).to_owned();
+    // Only the folder /private itself, not a name that starts as it does.
+    let bare = |p: &str| {
+        let under = p
+            .strip_prefix("/private")
+            .filter(|rest| rest.starts_with('/'));
+        under.unwrap_or(p).to_owned()
+    };
     let (path, workspace) = (bare(path), bare(workspace.trim_end_matches('/')));
     if !workspace.is_empty()
         && let Some(inside) = path.strip_prefix(&format!("{workspace}/"))
@@ -3009,6 +3014,8 @@ fn shown(path: &str, workspace: &str) -> String {
     }
 }
 
+/// The row under a finished turn: how it ended, how long it took, and
+/// `detail` when it has one.
 pub fn finished(status: &str, detail: &str, seconds: Option<u64>) -> Line<'static> {
     let mut label = match status {
         "completed" => "Worked".to_owned(),

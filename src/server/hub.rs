@@ -681,13 +681,12 @@ impl Hub {
 }
 
 /// `limit` of `bot`'s durable events after `after`, or every bot's for `*`.
-/// A page of `bot`'s events, or every bot's. A follow of every bot that
-/// names `kinds`, up to as many as a page takes, gets only those from the
-/// store, so a few rare kinds cost the events they are, not every event
-/// written since. One bot's events, or every bot's of more kinds, are paged
-/// whole and filtered as they are sent: each page costs its limit, so its
-/// cursor passes what it skipped and going live looks at no more than one
-/// event.
+/// A follow of every bot that names `kinds`, up to as many as a page
+/// takes, gets only those from the store, so a few rare kinds cost the
+/// events they are, not every event written since. One bot's events, or
+/// every bot's of more kinds, are paged whole and filtered as they are
+/// sent: each page costs its limit, so its cursor passes what it skipped
+/// and going live looks at no more than one event.
 fn event_page(
     db: &Database,
     bot: &str,

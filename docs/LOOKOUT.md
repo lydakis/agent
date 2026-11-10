@@ -232,7 +232,8 @@ again; a poller keeps its own cursor in `$SONNY_SOURCE_DIR`, a folder of
 its own beside the store (`STORE.sources/NAME`), and `$SONNY_SOURCE` is
 its name. A line over 64 KiB is skipped, and an event's text is cut at
 4,000 characters. What it writes to stderr (its first 20 lines a run), a
-run that fails, and a source started or stopped go to `STORE.lookout.log`.
+run that fails, and a source started or stopped go to the lookout's own
+log, `STORE.companions/sonny-lookout.log`.
 The lookout reads the settings again every 15 seconds: a source added or
 changed starts, one removed stops, and a lookout that stops stops its
 sources' commands. So does a source when a file its `watch` list names
@@ -304,10 +305,9 @@ steer = { from = ["boss"] }    # an event pattern, as a filter is written
 ```
 
 A pattern that does not check keeps the source from starting, said in
-`STORE.lookout.log` as a bad `every` is. Naming a source the settings do not have is refused, with the
-ones they have. An event `from` the follower itself is not news to it,
-nor is one whose `told` lists it: a source that told some followers
-another way names them there. What waits to be told, and when each source
+the lookout's log as a bad `every` is. Naming a source the settings do not have is refused, with the
+ones they have. An event `from` the follower itself is not news to it.
+What waits to be told, and when each source
 last told a follower, is kept in `STORE.sources/.held/BOT.json` until it
 is, so a restart loses none.
 
@@ -505,7 +505,7 @@ is an event with a `type` and fields, as a source's are, and the
 | `message.written` | someone other than the follower writes in a watched bot | `by` (`person`, an agent's name, a program), `text` (the person's words) |
 | `turn.ended` | a turn that is news ends | `by` (who asked: `you`, `person`, an agent's name, `automation`), `status`, `done`, `theirs` |
 | `approval.waiting` | an approval only the person can give has waited | |
-| `ask.posted` | a task asked the person with `ask` | `question`, `options` |
+| `ask.posted` | a task asked the person with `ask` | `question`, `options`, `command` (a line it asked the person to run) |
 | `turn.silent` | a running turn printed nothing for 30 minutes | |
 | `note.changed` | a task changed or took away a margin note | `id`, `removed` |
 
@@ -577,7 +577,7 @@ the note until the next turn.
 
 ## The note
 
-One message, queued (or steered, for the person's words mid-turn), with
+One message, steered, with
 the origin `lookout.tasks`, so the reviewer reads its words as asking for
 nothing. The person's words in a task are not retyped: the note quotes
 their turns (`quotes`), and the daemon copies each in after the note with

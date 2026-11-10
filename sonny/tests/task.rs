@@ -89,6 +89,9 @@ impl Lab {
             .env("AGENT_BOT_ID", "1")
             .env("HOME", &self.home)
             .env_remove("XDG_STATE_HOME")
+            // What an agent's shell would add of its own daemon and turn.
+            .env_remove("AGENT_SOCKET")
+            .env_remove("AGENT_TURN")
             .env("AGENT_BIN", &self.agent)
             .env("AGENT_LOG", self.scratch.join("run.log"))
             .env("AGENT_STORE", self.store())
@@ -477,6 +480,10 @@ fn a_task_starts_with_the_agent_installed_beside_sonny() {
         .env("GIT_CEILING_DIRECTORIES", env!("CARGO_TARGET_TMPDIR"))
         .env("HOME", &lab.home)
         .env_remove("XDG_STATE_HOME")
+        // Run from an agent's shell, the store and socket would be its
+        // daemon's: the lab's are found from its home.
+        .env_remove("AGENT_STORE")
+        .env_remove("AGENT_SOCKET")
         .env("AGENT_BOT", "demo.lead")
         .env_remove("AGENT_BIN")
         .env("AGENT_LOG", lab.scratch.join("run.log"))

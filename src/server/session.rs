@@ -479,7 +479,15 @@ pub async fn accept(
     caller: Option<i64>,
     hub: Option<Hub>,
 ) {
-    while let Ok((stream, _)) = listener.accept().await {
+    loop {
+        // An accept that fails (the process out of descriptors, a
+        // connection gone before it was taken) leaves the listener as good
+        // as it was: the next is taken after a moment, where ending here
+        // would leave the socket unanswered for as long as the daemon runs.
+        let Ok((stream, _)) = listener.accept().await else {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            continue;
+        };
         let id = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let peer = stream
             .peer_cred()

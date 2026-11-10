@@ -3574,8 +3574,10 @@ impl View {
             "so far"
         };
         let minute = Duration::from_secs(60);
-        let calls = (self.calls.iter())
-            .filter(|at| now.duration_since(**at) <= minute)
+        // Newest last, as `minute` reads the messages: only the last
+        // minute's are walked, not the hour's.
+        let calls = (self.calls.iter().rev())
+            .take_while(|at| now.duration_since(**at) <= minute)
             .count();
         let busiest = (self.pairs.iter())
             .map(|(&pair, &n)| (pair, n))
@@ -4457,7 +4459,7 @@ impl Sky {
 
     /// How many dots the unit disc's radius takes across and down, two
     /// dots in from the canvas's edges: round, as in 0.7.0, stretched
-    /// toward the pane's longer side by at most a quarter, so a wide pane
+    /// toward the pane's longer side by at most [`STRETCH`], so a wide pane
     /// uses its width and the sky still reads as round.
     fn scale(&self) -> (f32, f32) {
         let (w, h) = (self.cols as f32 * 2.0, self.rows as f32 * 4.0);
@@ -4701,9 +4703,6 @@ impl Sky {
             .then(|| (row, start, start + words.chars().count()))
     }
 
-    /// Words put at a place in a row, a blank cell kept either side and
-    /// a blank row above and below, so names never run together or
-    /// stack into a column; false when they don't fit there.
     /// `line` from `start` on `row`, whatever is near: what the person
     /// reads over the sky, clear of the dots under it and either side.
     fn inscribe(&mut self, row: usize, start: usize, line: &Line) {
@@ -4728,6 +4727,9 @@ impl Sky {
         }
     }
 
+    /// Words put at a place in a row, a blank cell kept either side and
+    /// a blank row above and below, so names never run together or
+    /// stack into a column; false when they don't fit there.
     fn put(&mut self, row: usize, start: usize, words: &str, style: Style) -> bool {
         let count = words.chars().count();
         if start + count > self.cols {

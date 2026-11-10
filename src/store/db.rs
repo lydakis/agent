@@ -1189,8 +1189,6 @@ pub const BACKGROUND_ORIGIN: &str = "background";
 /// The origin of the message that tells a bot its last reply was dropped:
 /// the model's own output cap cut it short.
 pub const LIMIT_ORIGIN: &str = "limit";
-/// How a background command ended, as its bot is told: its result without
-/// the output, which a `wait` on its handle reads.
 /// The fields of a result that say how its command ended, in the order
 /// `UNTOLD` reads them.
 const ENDED: [&str; 7] = [
@@ -1202,6 +1200,8 @@ const ENDED: [&str; 7] = [
     "error",
     "detail",
 ];
+/// How a background command ended, as its bot is told: its result without
+/// the output, which a `wait` on its handle reads.
 fn ended_as(result: &Value) -> Value {
     let mut ended = serde_json::Map::new();
     for key in ENDED {
@@ -1442,8 +1442,6 @@ pub fn merge_gates<'a>(gates: impl IntoIterator<Item = &'a Gate>, tools: &[Strin
     merged.retain(|g| !g.tools.is_empty());
     merged
 }
-/// The tools a gate may hold back: the daemon's a bot has and those its
-/// client declared.
 /// An answered call's result when nobody answered it in time.
 pub fn unserved(detail: String) -> Outcome {
     Outcome {
@@ -1455,6 +1453,8 @@ pub fn unserved(detail: String) -> Outcome {
         failed: true,
     }
 }
+/// The tools a gate may hold back: the daemon's a bot has and those its
+/// client declared.
 fn gateable(tools: &[String], declared: &[Declared]) -> Vec<String> {
     tools
         .iter()
@@ -2258,7 +2258,6 @@ fn creation(request_id: Option<&str>, request: Option<Value>) -> Option<String> 
         .zip(request)
         .map(|(key, request)| json!({"request_id":key,"request":request}).to_string())
 }
-/// An offset must start a character: page from a returned `next_offset`.
 /// Matches one history search lists.
 const HISTORY_MATCHES: usize = 20;
 /// Item bytes one history search reads before it stops at a turn's start.
@@ -2281,6 +2280,7 @@ fn around(text: &str, at: usize, len: usize) -> String {
     text[start..end].to_owned()
 }
 
+/// An offset must start a character: page from a returned `next_offset`.
 fn inside_character(code: &str) -> Error {
     Error::with(
         code,
@@ -2345,9 +2345,6 @@ fn conflict(name: &str, field: &str) -> Error {
 fn entry(cursor: i64, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Value {
     json!({"cursor":cursor,"bot":bot,"turn":turn,"event":kind,"data":data})
 }
-/// A stored event as read back: its entry with `written_ms`, the Unix ms
-/// it joined the store, when it has one (events from before the column
-/// existed have none).
 /// The most kinds `events_of_kinds` takes, each read from its place in the
 /// index (SQLite allows 500 arms in a compound). A follow of more pages
 /// every event and filters them as they are sent, which costs each page its
@@ -2384,6 +2381,9 @@ fn re_spaced(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// A stored event as read back: its entry with `written_ms`, the Unix ms
+/// it joined the store, when it has one (events from before the column
+/// existed have none).
 fn stored_entry(
     cursor: i64,
     bot: &str,
@@ -2401,8 +2401,9 @@ fn stored_entry(
 
 impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
-    /// before versioning and stores from newer binaries are rejected; an older
-    /// versioned store is migrated forward, one version at a time, at open.
+    /// before versioning, stores at versions 1 to 5 and stores from newer
+    /// binaries are rejected; an older store from version 6 on is migrated
+    /// forward, one version at a time, at open.
     pub const SCHEMA: i32 = 89;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
@@ -2998,9 +2999,6 @@ impl Database {
             .query_row([name], |r| r.get(0))?)
     }
 
-    /// Whether the bot's running turn takes a steer at its next boundary:
-    /// the oldest one for it is queued and fits the turn, as `absorb` reads
-    /// them. Delivery steer only.
     /// Whether the model has called a tool in `turn`: it has replied there.
     pub fn turn_called(&self, turn: i64) -> Result<bool> {
         Ok(self.conn.query_row(
@@ -3009,6 +3007,9 @@ impl Database {
             |r| r.get(0),
         )?)
     }
+    /// Whether the bot's running turn takes a steer at its next boundary:
+    /// the oldest one for it is queued and fits the turn, as `absorb` reads
+    /// them. Delivery steer only.
     pub fn joining_steer(&self, name: &str) -> Result<bool> {
         Ok(self
             .conn
@@ -5583,8 +5584,6 @@ impl Database {
         }
         Ok(out)
     }
-    /// Durable lineage, drawn at creation and copied with the database. The
-    /// daemon also binds it to the physical file for its cache namespace.
     /// Every companion, by name, as `put_companion` kept it.
     pub fn companions(&self) -> Result<Vec<(String, String)>> {
         let mut statement = self
@@ -5693,6 +5692,8 @@ impl Database {
         }
         Ok(json!({"pauses": pauses, "more": more}))
     }
+    /// Durable lineage, drawn at creation and copied with the database. The
+    /// daemon also binds it to the physical file for its cache namespace.
     pub fn store_identity(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -5701,7 +5702,6 @@ impl Database {
             })?)
     }
 
-    /// Bytes each node loses without its thinking blocks.
     /// The node the bot's saved context window starts at, if one is saved.
     pub fn context_start(&self, name: &str) -> Result<Option<i64>> {
         Ok(self
@@ -5711,6 +5711,7 @@ impl Database {
             .optional()?
             .flatten())
     }
+    /// Bytes each node loses without its thinking blocks.
     pub fn thinking_of(&self, ids: &[i64]) -> Result<Vec<u32>> {
         let mut statement = self
             .conn
@@ -5894,11 +5895,6 @@ impl Database {
         ))
     }
 
-    /// Page a reading view of provider items as JSONL by byte offset in that
-    /// view. Only the opaque state a provider replays is omitted (see
-    /// `READING_ITEM`); stored items and provider replay remain unchanged.
-    /// Pages end at UTF-8 boundaries and may split a JSON record. Concatenate
-    /// their text before decoding; no content is replaced with previews.
     /// A bot's newest `limit` conversation turns, newest first, as its
     /// history numbers them: each one's number, handle, status and the
     /// start of its prompt. Its own turns and those it took from a source.
@@ -5960,6 +5956,11 @@ impl Database {
                 )
             })
     }
+    /// Page a reading view of provider items as JSONL by byte offset in that
+    /// view. Only the opaque state a provider replays is omitted (see
+    /// `READING_ITEM`); stored items and provider replay remain unchanged.
+    /// Pages end at UTF-8 boundaries and may split a JSON record. Concatenate
+    /// their text before decoding; no content is replaced with previews.
     pub fn history_read(
         &self,
         name: &str,
@@ -6355,8 +6356,6 @@ impl Database {
             "done":next_before.is_none(),"next_before":next_before}))
     }
 
-    /// Reconcile duplicates first, then validate the effective provider using
-    /// the bot already loaded for admission, before any durable mutation.
     /// Bounds for submissions waiting to start; zero is unbounded.
     pub fn set_pending_limits(&mut self, turns: usize, bytes: usize) {
         self.pending_limits = (turns, bytes);
@@ -6433,6 +6432,8 @@ impl Database {
         }
         fail_with("bot_not_found", format!("{name} is not identity {id}"))
     }
+    /// Reconcile duplicates first, then validate the effective provider using
+    /// the bot already loaded for admission, before any durable mutation.
     pub fn begin(
         &mut self,
         name: &str,
@@ -8081,9 +8082,6 @@ impl Database {
             self.live.remove(&turn);
         }
     }
-    /// Start a gated call once every gate allowed it, record its denial, or
-    /// say what it still waits for. Allows ride the call's `tool_start`
-    /// commit and a denial is its result, so a verdict adds no commit.
     /// What the command rules made of each of the turn's calls still to
     /// run, as their rounds were announced.
     fn rulings(&self, turn: i64) -> Result<BTreeMap<String, String>> {
@@ -8630,7 +8628,6 @@ impl Database {
     /// While a step waits, its call's time stops. Under no gate, a step is
     /// allowed at once. A step lives as long as the request waiting on it,
     /// so asking for one already waiting is refused.
-    #[allow(clippy::too_many_arguments)]
     ///
     /// Every step gets a row in the audit trail with the `facts` its client
     /// gives: at once when it is allowed at once, under no gate or when
@@ -9216,10 +9213,6 @@ impl Database {
         more |= scanned > limit;
         Ok(json!({"calls":listed,"next_after":more.then_some(last)}))
     }
-    /// Record one gate's verdict on the current request of a planned call.
-    /// A running turn's verdict is held by the worker and wakes its task;
-    /// a parked turn's is committed now, and resumes the turn only if it is
-    /// parked on this call and the call is now decided.
     /// The call a decision is for, checked: its turn's status, its current
     /// request, the gate named, and the time, once no verdict decided it
     /// and the gate has not lapsed.
@@ -9337,6 +9330,10 @@ impl Database {
             resume: false,
         })
     }
+    /// Record one gate's verdict on the current request of a planned call.
+    /// A running turn's verdict is held by the worker and wakes its task;
+    /// a parked turn's is committed now, and resumes the turn only if it is
+    /// parked on this call and the call is now decided.
     pub fn answer(&mut self, answer: Decision<'_>) -> Result<Answered> {
         let (status, mut request, tag, at_ms) = self.open_gate(&answer)?;
         let verdict = Verdict {
@@ -9986,9 +9983,6 @@ impl Database {
         }
         Ok(entry)
     }
-    /// The last message with text `turn` streamed between two of its events, as
-    /// `{text}` with its end kept: at most `PROMPTS_REPLY` bytes, or the
-    /// budget left, starting at a whole word when cut (`truncated`).
     /// The newest text a turn streamed between two events: calls and
     /// reasoning stream as messages too, and say nothing a person answers.
     fn said(&self, turn: i64, after: i64, before: i64) -> Result<Option<String>> {
@@ -10005,7 +9999,9 @@ impl Database {
         }
         Ok(None)
     }
-    /// What a `prompts` read shows of the text: its end, within the budget.
+    /// What a `prompts` read shows of the text, as `{text}` with its end
+    /// kept: at most `PROMPTS_REPLY` bytes, or the budget left, starting at
+    /// a whole word when cut (`truncated`).
     fn reply(text: &str, left: &mut usize) -> Value {
         // Redacted whole before its end is kept: a private key whose
         // opening line is cut away would no longer read as one.
@@ -11368,9 +11364,10 @@ impl Database {
     /// Branch a new bot from any message in the source's history. Without a
     /// node, an idle source's head is used, or a running turn's newest
     /// finished round. The point must leave no tool call unanswered; the
-    /// source itself is never changed. The fork copies the
-    /// source's binding, instructions, and tools as they are, so its first
-    /// call repeats the source's prefix and can read the source's cache.
+    /// source itself is never changed. The fork copies the source's
+    /// binding, instructions, and tools as they are, so its first call
+    /// repeats the source's prefix and can read the source's cache.
+    ///
     /// A new bot from `source`'s history, and its `forked` event; a resend
     /// of the request that made it gets the fork and no event, wherever its
     /// source has moved since.
@@ -11921,8 +11918,8 @@ impl Database {
     /// Remove an idle bot with everything only it owns: its turns, tool
     /// intents, processes, artifacts, events, checkpoints, and the history
     /// nodes no other bot's lineage reaches. Shared prefixes stay for forks.
-    /// Remove a bot and everything only it owns, running every piece to
-    /// completion on this thread. Services run the pieces as separate jobs.
+    /// Every piece runs to completion on this thread; services run the
+    /// pieces as separate jobs.
     pub fn delete_bot(&mut self, name: &str) -> Result<Value> {
         let (id, mut piece) = self.start_delete_bot(name, Self::RETENTION_PIECE)?;
         let mut totals = json!({"turns":0,"events":0,"nodes":0});
@@ -12536,10 +12533,6 @@ impl Database {
         snapshot.commit()?;
         Ok(json!({"items":items}))
     }
-    /// A bot's turns in id order, paged by `after`, with accounting a program
-    /// needs without replaying events.
-    /// Flush an execution segment's retry and pacing accounting once when it
-    /// finishes, is interrupted, or parks; zero counters need no write.
     /// Counts a controller reads instead of scanning: parked turns and
     /// running background commands, both from the active-status indexes.
     /// Waiting turns, running processes, turns queued or ready to start,
@@ -12558,6 +12551,8 @@ impl Database {
         let (queued, _) = self.pending()?;
         Ok((waiting, self.running_processes()?, queued, paced))
     }
+    /// Flush an execution segment's retry and pacing accounting once when it
+    /// finishes, is interrupted, or parks; zero counters need no write.
     pub fn note_pacing(
         &mut self,
         turn: i64,
@@ -12573,7 +12568,8 @@ impl Database {
     }
     /// A page of a bot's turns between `after` and `before`, oldest first
     /// with `next_after` to continue; with `newest`, newest first from the
-    /// end of the bot's index, with `next_before` to continue.
+    /// end of the bot's index, with `next_before` to continue. Each carries
+    /// the accounting a program needs without replaying events.
     pub fn turns(
         &self,
         name: &str,
@@ -13705,8 +13701,6 @@ fn announcements(calls: Vec<Value>) -> Result<Vec<Vec<Value>>> {
     }
     Ok(events)
 }
-/// Write the verdicts the worker holds for a turn into their requests, in
-/// the commit that parks the turn.
 /// Answer each call of `turn` that has no result yet, in the order they
 /// were made, with what `output` says of it (given whether it had started),
 /// on from `head`. `output` also says whether its outcome is unknown rather
@@ -13742,6 +13736,8 @@ fn close_unanswered(
     }
     Ok((head, entries))
 }
+/// Write the verdicts the worker holds for a turn into their requests, in
+/// the commit that parks the turn.
 fn flush(tx: &Connection, turn: i64, live: Option<&Live>) -> Result<()> {
     let Some(live) = live else {
         return Ok(());
@@ -13767,9 +13763,6 @@ fn flush(tx: &Connection, turn: i64, live: Option<&Live>) -> Result<()> {
     }
     Ok(())
 }
-/// Store an event, written now or, should the clock have gone back, when
-/// the event before it was: times rise with cursors, as a log's time index
-/// keeps them (Kafka's), so a follow from a time skips nothing.
 /// A bot's turn parked: the bot's status says how, and what it waits on is
 /// what the turn's event says, as the turn's own `waiting_on` does.
 fn parked(tx: &Connection, bot: &str, status: &str, on: &Value) -> Result<()> {
@@ -13825,6 +13818,9 @@ fn ended(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Option<Ended>> {
         error: r.get(at + 4)?,
     }))
 }
+/// Store an event, written now or, should the clock have gone back, when
+/// the event before it was: times rise with cursors, as a log's time index
+/// keeps them (Kafka's), so a follow from a time skips nothing.
 fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Result<i64> {
     conn.prepare_cached(
         "INSERT INTO events(bot,turn,kind,data,written_ms) VALUES (?1,?2,?3,?4,
@@ -13834,9 +13830,6 @@ fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Valu
     .execute(params![bot, turn, kind, data.to_string(), epoch_ms()])?;
     Ok(conn.last_insert_rowid())
 }
-/// Append an item. Stored history has no lifetime cap; the per-request
-/// context window is bounded separately. `turn` marks a turn's first item
-/// (its user prompt) and receives the next ordinal along the lineage.
 /// Keep who sent a turn's prompt with the prompt's node, where it outlives
 /// the turn's row: a fork keeps it after its source is deleted. The sending
 /// bot's id is its id while the turn it wrote from still exists, so a later
@@ -13872,10 +13865,6 @@ fn keep_sender(tx: &Connection, turn: i64, node: i64, data: &mut Value) -> Resul
     .optional()?;
     Ok(())
 }
-/// Who sent a prompt, as events and reads name it: another bot's turn,
-/// what the submitting client called itself, or the person the client
-/// says wrote it; and the turns it quotes, each with who wrote it and,
-/// once the prompt is an item, where in the item its words are.
 /// When the first turn held in line is next tried, after `after`.
 fn next_held(conn: &Connection, after: i64) -> Result<Option<i64>> {
     Ok(conn
@@ -13884,6 +13873,10 @@ fn next_held(conn: &Connection, after: i64) -> Result<Option<i64>> {
         )?
         .query_row([after], |r| r.get(0))?)
 }
+/// Who sent a prompt, as events and reads name it: another bot's turn,
+/// what the submitting client called itself, or the person the client
+/// says wrote it; and the turns it quotes, each with who wrote it and,
+/// once the prompt is an item, where in the item its words are.
 fn sender_fields(
     data: &mut Value,
     from: Option<(&str, i64)>,
@@ -14110,14 +14103,14 @@ fn images_from(json: Option<&str>) -> rusqlite::Result<Vec<crate::codec::Image>>
         })
     })
 }
-/// The `images` column for a turn's pictures: their JSON, or nothing for
-/// none.
 /// An answer's parts as the answers table keeps them: JSON, or null for none.
 fn stored_parts(parts: &[crate::codec::Part]) -> Result<Option<String>> {
     Ok((!parts.is_empty())
         .then(|| serde_json::to_string(parts))
         .transpose()?)
 }
+/// The `images` column for a turn's pictures: their JSON, or nothing for
+/// none.
 fn stored_images(images: &[crate::codec::Image]) -> Result<Option<String>> {
     Ok((!images.is_empty())
         .then(|| serde_json::to_string(images))
@@ -14154,10 +14147,6 @@ fn keep_quotes(tx: &Connection, turn: i64, quotes: Option<&str>, node: i64) -> R
     }
     Ok(())
 }
-/// SQL for `item`, a node's item, as history reads return it: the pictures
-/// of a user item or a tool's result without their bytes, each counted in
-/// `omitted_bytes` (a data URL keeps its media type). The model is sent
-/// them whole.
 /// An item as history reads show it: one line, without the opaque state
 /// a provider hands back only to be replayed (reasoning's encrypted
 /// content; a thinking block's signature, a redacted one's data, a web
@@ -14183,6 +14172,10 @@ const READING_ITEM: &str = "CASE
         FROM json_each(CAST(item AS TEXT),'$.content') AS b))) AS BLOB)
     WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
     ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
+/// SQL for `item`, a node's item, as history reads return it: the pictures
+/// of a user item or a tool's result without their bytes, each counted in
+/// `omitted_bytes` (a data URL keeps its media type). The model is sent
+/// them whole.
 /// Each subquery's array is passed through `json()`: a value's JSON subtype
 /// does not reliably survive a subquery (SQLite 3.54 drops it), and without
 /// it `json_set` stores the array as a string.
@@ -14244,6 +14237,8 @@ fn turn_status_name(status: &str) -> &'static str {
         _ => "finished",
     }
 }
+/// Append an item. Stored history has no lifetime cap; the per-request
+/// context window is bounded separately.
 fn node(conn: &Connection, parent: Option<i64>, item: &[u8]) -> Result<i64> {
     node_with_turn(conn, parent, item, None)
 }
@@ -15670,8 +15665,6 @@ fn bounded_prompt(prompt: &str, limit: usize) -> String {
     }
     format!("{}…", &prompt[..end])
 }
-/// The first line of a prompt, cut to `limit` bytes at a character boundary,
-/// with an ellipsis when anything was left out.
 /// Cut `text` to the budget left, at a character boundary; true if cut.
 fn cut(text: &mut String, left: &mut usize) -> bool {
     if text.len() <= *left {
@@ -15723,6 +15716,8 @@ impl Words {
         })
     }
 }
+/// The first line of a prompt, cut to `limit` bytes at a character boundary,
+/// with an ellipsis when anything was left out.
 fn first_line(prompt: &str, limit: usize) -> String {
     let line = prompt.lines().next().unwrap_or("").trim();
     if line.len() <= limit && prompt.lines().nth(1).is_none() {
@@ -15885,7 +15880,8 @@ fn previous_turn_seq(conn: &Connection, node: i64) -> Result<Option<i64>> {
         .optional()?)
 }
 
-/// `pictured`: what the item's pictures add beyond their weight.
+/// `turn` marks a turn's first item (its user prompt) and receives the
+/// next ordinal along the lineage.
 fn node_with_turn(
     conn: &Connection,
     parent: Option<i64>,

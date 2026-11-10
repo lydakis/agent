@@ -1028,23 +1028,28 @@ impl Layout {
         placement: &Placement,
     ) -> Result<(), String> {
         let listed = self.listed();
+        // What it stands beside is found before its own block closes, so a
+        // split with nothing to stand beside leaves the agent's window open.
+        let anchor = match placement {
+            Placement::Window => None,
+            Placement::Split { beside, .. } => Some(
+                listed
+                    .iter()
+                    .find(|b| &b.label == beside && b.label != bot)
+                    .map(|b| b.id.clone())
+                    .ok_or(format!("no block labelled {beside} in {}", self.home()))?,
+            ),
+        };
         for old in listed.iter().filter(|b| b.label == bot) {
             self.close_block(&old.id);
         }
         let cwd = Path::new("/");
-        let block = match placement {
-            Placement::Window => self.backend.window(bot, name, cwd, command, false)?,
-            Placement::Split { side, beside } => {
-                let anchor = listed
-                    .iter()
-                    .find(|b| &b.label == beside && b.label != bot)
-                    .map(|b| b.id.clone())
-                    .ok_or(format!("no block labelled {beside} in {}", self.home()))?;
-                match side.as_str() {
-                    FLOAT => (self.backend).float(&anchor, bot, cwd, command, false)?,
-                    side => (self.backend).split(&anchor, side, false, bot, cwd, command, false)?,
-                }
-            }
+        let block = match (placement, anchor) {
+            (Placement::Split { side, .. }, Some(anchor)) => match side.as_str() {
+                FLOAT => (self.backend).float(&anchor, bot, cwd, command, false)?,
+                side => (self.backend).split(&anchor, side, false, bot, cwd, command, false)?,
+            },
+            _ => self.backend.window(bot, name, cwd, command, false)?,
         };
         self.forget();
         self.blocks.insert(bot.to_owned(), block);
@@ -1820,8 +1825,6 @@ mod tests {
             open(&mut layout, "shop.e", &full, false),
             Shown::Opened(vec![])
         );
-        // A window that says its task failed, as its own Sonny reported,
-        // stays though the lead never heard so itself.
         // A limit of 0 is none.
         assert_eq!(
             open(&mut layout, "shop.f", &room(0, &[]), false),

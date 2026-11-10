@@ -19,6 +19,24 @@ const NAMES: [&str; 12] = [
     "Lookout",
 ];
 
+/// A file's code before its tests: up to the first `#[cfg(test)]` that
+/// opens a module with a body. One on a single item (a test-only helper,
+/// `mod doubling;`) has daemon code after it, which is read too.
+fn code(text: &str) -> &str {
+    const TESTS: &str = "#[cfg(test)]";
+    let mut from = 0;
+    while let Some(at) = text[from..].find(TESTS).map(|at| from + at) {
+        let next = text[at + TESTS.len()..].trim_start();
+        let line = next.lines().next().unwrap_or_default().trim_end();
+        let module = line.starts_with("mod ") || line.starts_with("pub(crate) mod ");
+        if module && line.ends_with('{') {
+            return &text[..at];
+        }
+        from = at + TESTS.len();
+    }
+    text
+}
+
 fn sources(folder: &Path, found: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(folder).unwrap() {
         let path = entry.unwrap().path();
@@ -47,7 +65,7 @@ fn the_daemon_names_no_client_terminal_or_tool() {
         }
         let text = std::fs::read_to_string(&file).unwrap();
         // A file's tests may name what they stand in for.
-        let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+        let code = code(&text);
         for (line, content) in code.lines().enumerate() {
             for name in NAMES.iter().filter(|name| content.contains(*name)) {
                 named.push(format!("{relative}:{}: {name}", line + 1));
@@ -59,4 +77,12 @@ fn the_daemon_names_no_client_terminal_or_tool() {
         "the daemon names what only a client knows; have the client pass it in:\n{}",
         named.join("\n")
     );
+}
+
+#[test]
+fn only_a_test_module_ends_a_files_code() {
+    let text = "#[cfg(test)]\nmod doubling;\nfn a() {}\n#[cfg(test)]\nfn only_tests() {}\nfn b() {}\n#[cfg(test)]\nmod tests {\n    fn c() {}\n}\n";
+    let read = code(text);
+    assert!(read.contains("fn a()") && read.contains("fn b()"), "{read}");
+    assert!(!read.contains("fn c()"), "{read}");
 }

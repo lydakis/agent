@@ -2,8 +2,8 @@ name: Perf
 
 # Screens a pull request's daemon and Sonny against its base's on one
 # runner: the AGENTS.md hot-path benches (admission and completion bursts,
-# lifecycle, footprint) and Sonny's own at fleet scale (the lookout at 10,
-# 100 and 1,000 subscribers, a quiet lead's window under unrelated traffic,
+# lifecycle, footprint) and Sonny's own at fleet scale (the lookout over 10
+# or 100 leads with 10 to 1,000 tasks, a quiet lead's window under unrelated traffic,
 # a sky replay of the hour), run alternately so both builds see the same
 # machine. Store
 # work per turn is counted and fails the check when it rises; CPU, latency

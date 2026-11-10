@@ -76,7 +76,6 @@ def run(agent, out, bots, minutes, model, context_items, window_seconds, keep_tu
             pass
 
     def handle(message):
-        nonlocal current
         if message.get('event') != 'turn_finished':
             return
         bot = message['bot']

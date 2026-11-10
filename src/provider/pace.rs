@@ -866,6 +866,11 @@ impl Pace {
     }
 }
 
+/// The longest delay a provider's words are read as naming. A number past
+/// it (a gateway's stray header or message) is read as this, so no clock
+/// it is added to overflows: it bounds what a number can mean, not a pool.
+pub const LONGEST_DELAY: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 /// A Go-style duration such as `6m0s`, `1.2s`, or `120ms`.
 pub fn go_duration(text: &str) -> Option<Duration> {
     let mut total = 0.0;
@@ -902,7 +907,12 @@ pub fn go_duration(text: &str) -> Option<Duration> {
         total += number.parse::<f64>().ok()?;
         any = true;
     }
-    any.then(|| Duration::from_secs_f64(total.max(0.0)))
+    // One too long for a `Duration` to hold is the longest, not a panic.
+    any.then(|| {
+        Duration::try_from_secs_f64(total.max(0.0))
+            .unwrap_or(LONGEST_DELAY)
+            .min(LONGEST_DELAY)
+    })
 }
 
 /// The delay a provider names inside a message, `... try again in 2.106s`.
@@ -1538,6 +1548,11 @@ mod tests {
             Some(Duration::from_millis(2106))
         );
         assert_eq!(named_delay("no delay here"), None);
+        // A delay no `Duration` holds is the longest, not a panic.
+        assert_eq!(
+            named_delay("try again in 99999999999999999999s"),
+            Some(LONGEST_DELAY)
+        );
     }
 
     #[tokio::test(start_paused = true)]

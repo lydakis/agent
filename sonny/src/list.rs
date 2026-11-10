@@ -65,7 +65,10 @@ pub fn lines(items: &[Item], pick: usize, width: usize, room: usize) -> Vec<Line
             true => "  • ",
             false => "    ",
         };
-        let name = format!("{:<wide$}", item.name);
+        // Padded by columns, as `wide` is measured: a wide character
+        // takes two.
+        let pad = " ".repeat(wide.saturating_sub(item.name.width()));
+        let name = format!("{}{pad}", item.name);
         let room = width.saturating_sub(mark.width() + wide + 4);
         let about = match item.about.is_empty() {
             true => String::new(),

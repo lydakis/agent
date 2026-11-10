@@ -503,8 +503,6 @@ impl Pane {
             .map(|(.., url)| url.clone())
     }
 
-    /// A card's lines, put in only when they changed, so a selection in
-    /// them lasts while they do not, and the view stays where it was.
     /// The card's rows as text.
     #[cfg(test)]
     pub fn card_text(&self) -> Vec<String> {
@@ -513,6 +511,8 @@ impl Pane {
             .collect()
     }
 
+    /// A card's lines, put in only when they changed, so a selection in
+    /// them lasts while they do not, and the view stays where it was.
     pub fn set_card(&mut self, lines: Vec<Line<'static>>, keys: &str) {
         self.set_card_marked(lines, Vec::new(), keys);
     }
@@ -774,8 +774,6 @@ impl Pane {
     }
 }
 
-/// Whether `path` is read as Markdown, whose tables and lists are laid
-/// out for the width they are drawn at.
 /// A picture, or a file Sonny draws: what [`BIGGER`] opens.
 fn is_drawing(path: &Path) -> bool {
     let extension = (path.extension().and_then(|e| e.to_str()))
@@ -784,6 +782,8 @@ fn is_drawing(path: &Path) -> bool {
     crate::image::bigger_kind(&extension).is_some()
 }
 
+/// Whether `path` is read as Markdown, whose tables and lists are laid
+/// out for the width they are drawn at.
 fn is_markdown(path: &Path) -> bool {
     let extension = (path.extension().and_then(|e| e.to_str()))
         .unwrap_or_default()
@@ -1286,28 +1286,6 @@ mod tests {
         let area = Rect::new(0, 0, 80, 4);
         let mut buf = Buffer::empty(area);
         pane.render(area, &mut buf, true, "tab", |_| None);
-        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-        let ev = |kind| MouseEvent {
-            kind,
-            column: 117,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        };
-        println!(
-            "down {:?}",
-            pane.screen
-                .mouse(ev(MouseEventKind::Down(MouseButton::Left)))
-                .is_some()
-        );
-        println!(
-            "up {:?}",
-            pane.screen
-                .mouse(ev(MouseEventKind::Up(MouseButton::Left)))
-                .map(|a| match a {
-                    crate::screen::Action::Open(u) => u,
-                    _ => "copy".into(),
-                })
-        );
         let cells = pane.screen.link_cells(&buf);
         let url = format!("file://{}/a%20b.rs", dir.display());
         // One link, over the whole name, spaces and all.
@@ -1386,28 +1364,6 @@ mod tests {
         let area = Rect::new(0, 0, 80, 4);
         let mut buf = Buffer::empty(area);
         pane.render(area, &mut buf, true, "tab", |_| None);
-        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-        let ev = |kind| MouseEvent {
-            kind,
-            column: 117,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        };
-        println!(
-            "down {:?}",
-            pane.screen
-                .mouse(ev(MouseEventKind::Down(MouseButton::Left)))
-                .is_some()
-        );
-        println!(
-            "up {:?}",
-            pane.screen
-                .mouse(ev(MouseEventKind::Up(MouseButton::Left)))
-                .map(|a| match a {
-                    crate::screen::Action::Open(u) => u,
-                    _ => "copy".into(),
-                })
-        );
         let cells = pane.screen.link_cells(&buf);
         // No cell a wide character goes on into is written over.
         for (x, y, _) in &cells {

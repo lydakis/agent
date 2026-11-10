@@ -1305,7 +1305,8 @@ fn headers(text: &str) -> Option<String> {
         .filter_map(|h| lower[from..].find(h).map(|at| (from + at, *h)))
         .min_by_key(|(at, _)| *at)
     {
-        // A header name starts a word: `x-authorization:` is not ours.
+        // A header name starts a word: `reauthorization:` is not ours, though
+        // `x-authorization:` is, a `-` ending a word.
         let starts = at == 0 || !text.as_bytes()[at - 1].is_ascii_alphanumeric();
         let value_start = at + header.len();
         let value_end = text[value_start..]
@@ -1398,7 +1399,10 @@ fn tokens_and_assignments(text: &str) -> Option<String> {
             changed = true;
             continue;
         }
-        if secret_name(run) {
+        // A placeholder already written, `[secret: NAME value]`, is no
+        // secret name with NAME as its value: a long name would go too.
+        let placeholder = run == "secret" && start > 0 && bytes[start - 1] == b'[';
+        if secret_name(run) && !placeholder {
             let mut value = at;
             while value < bytes.len() && matches!(bytes[value], b' ' | b':' | b'=' | b'"' | b'\'') {
                 value += 1;
@@ -1787,6 +1791,19 @@ mod tests {
     impl Transcript {
         fn offer_plain(&mut self, entry: Entry) -> bool {
             self.offer(entry, &Redactor::default())
+        }
+    }
+
+    #[test]
+    fn a_long_variable_s_name_stays_in_its_placeholder() {
+        // The placeholder's own words are not a secret name and its value.
+        let secret = "synthetic-key-value-0123456789abcdefghijklmnopqrstuvwxyz";
+        for name in ["ANTHROPIC_API_KEY", "GITHUB_PERSONAL_ACCESS_TOKEN"] {
+            let redactor = Redactor::from_env([(name.to_owned(), secret.to_owned())]);
+            assert_eq!(
+                redactor.redact(&format!("echo {secret}")),
+                format!("echo [secret: {name} value]")
+            );
         }
     }
 
