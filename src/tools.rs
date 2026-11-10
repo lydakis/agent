@@ -3074,6 +3074,12 @@ async fn detach(
     fail("shell_platform_unsupported")
 }
 
+/// How long a command's pipes are read on for their end once its group is
+/// killed. Everything the group wrote is read first; only a process that
+/// left the group can still hold a pipe open, and it is not waited for.
+#[cfg(unix)]
+const PIPES_END: Duration = Duration::from_millis(100);
+
 #[cfg(unix)]
 async fn shell(
     command: &str,
@@ -3122,42 +3128,48 @@ async fn shell(
         .take()
         .ok_or(Error::new("shell_pipe_failed"))?;
     let (mut out, mut err) = (Captured::default(), Captured::default());
-    let result = tokio::time::timeout(timeout, async {
-        tokio::try_join!(
-            capture(&mut stdout, &mut out),
-            capture(&mut stderr, &mut err),
-            async { owned.child.wait().await.map_err(Error::from) }
-        )
-    })
-    .await;
-    // Finish cleanup before returning a timeout. Drop also covers
-    // cancellation, with Tokio responsible for reaping its killed child.
-    // SAFETY: kill takes no pointers; the group is this command's own.
-    unsafe {
-        libc::kill(-group, libc::SIGKILL);
-    }
-    let _ = owned.child.wait().await;
-    owned.group = 0;
-    let elapsed = started.elapsed();
-    match result {
-        Ok(result) => result.map(|(_, _, status)| (out, err, Exit::Status(status), elapsed)),
-        Err(_) => {
-            // What the group wrote before it was killed is still in the pipes.
-            // A process that left the group may hold them open, so the drain
-            // is bounded too.
-            if let Ok(Err(error)) = tokio::time::timeout(Duration::from_millis(100), async {
-                tokio::try_join!(
-                    capture(&mut stdout, &mut out),
-                    capture(&mut stderr, &mut err)
-                )
-            })
-            .await
-            {
-                return Err(error);
+    let status = {
+        let reads = async {
+            tokio::try_join!(
+                capture(&mut stdout, &mut out),
+                capture(&mut stderr, &mut err)
+            )
+        };
+        tokio::pin!(reads);
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        // The command's own return ends it, not its pipes' end: a job it
+        // left running holds them open for as long as it runs, and goes
+        // with the group below.
+        let mut read = false;
+        let status = loop {
+            tokio::select! {
+                done = &mut reads, if !read => {
+                    done?;
+                    read = true;
+                }
+                status = owned.child.wait() => break Some(status?),
+                () = &mut deadline => break None,
             }
-            Ok((out, err, Exit::TimedOut, elapsed))
+        };
+        // Finish cleanup before returning. Drop also covers cancellation,
+        // with Tokio responsible for reaping its killed child.
+        // SAFETY: kill takes no pointers; the group is this command's own.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
         }
-    }
+        let _ = owned.child.wait().await;
+        owned.group = 0;
+        // What the group wrote before it ended is still in the pipes, and
+        // is read whatever the wait: the bound is on their end alone, which
+        // a process that left the group may hold off for as long as it runs.
+        if !read && let Ok(done) = tokio::time::timeout(PIPES_END, &mut reads).await {
+            done?;
+        }
+        status
+    };
+    let exit = status.map_or(Exit::TimedOut, Exit::Status);
+    Ok((out, err, exit, started.elapsed()))
 }
 
 #[cfg(not(unix))]

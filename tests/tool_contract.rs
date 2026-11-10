@@ -9,6 +9,52 @@ use std::collections::HashMap;
 agent_client::test_home!();
 
 #[tokio::test]
+async fn a_command_that_returns_ends_what_it_left_running() {
+    let tools = Registry::new("echo,shell").unwrap();
+    let dir = std::env::temp_dir().join(format!("agent-shell-left-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // The job it leaves holds the command's pipes open for as long as it
+    // runs: the command's own return ends the call, not the pipes' end.
+    let prepared = tools
+        .prepare(
+            "shell",
+            &json!({"command":"sleep 300 & echo $! > pid; echo started","timeout_ms":20000})
+                .to_string(),
+        )
+        .unwrap();
+    let output: Value = serde_json::from_str(
+        &tools
+            .execute(prepared, &dir, &[], None)
+            .await
+            .unwrap()
+            .output,
+    )
+    .unwrap();
+    assert_eq!(output["exit_code"], 0, "{output}");
+    assert_ne!(output["timed_out"], true, "{output}");
+    assert_eq!(output["stdout"], "started\n");
+    // The job went with the command's group.
+    let pid: i32 = std::fs::read_to_string(dir.join("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    for _ in 0..500 {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "the job outlived its command"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn shell_preserves_exit_status_and_separate_outputs() {
     let tools = Registry::new("echo,shell").unwrap();
     let cwd = std::env::temp_dir();
