@@ -1316,7 +1316,7 @@ turn of the task numbered after that one reopens it.
 
 ![A decision the lead asked with the ask tool, drawn where it asked it, its code, bold, math and links read as Markdown](../docs/sonny/ask-markdown.png)
 
-![/status as it opens: one task under Needs you saying what it asks, the lead and two tasks under Working with their times and code reviews at the right, a task's helper folded under it, Idle and Done folded to their headings](../docs/sonny/status-groups.png)
+![/status as it opens: one task under Needs you saying what it asks, the lead and two tasks under Working with their times and pull requests at the right, a task's helper folded under it, Idle and Done folded to their headings](../docs/sonny/status-groups.png)
 
 ![/status after m: what each agent tracks at the right edge, the picked task's model, profile and latest step under it, Idle opened](../docs/sonny/status-more.png)
 

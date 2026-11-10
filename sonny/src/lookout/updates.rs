@@ -9,8 +9,8 @@
 //! The note itself is the lookout's, not the person's. A turn the lead
 //! waits on is not news, nor its own forks.
 //!
-//! Only live turns count. The lookout sends the news as soon as the lead
-//! rests, or at once when the person wrote in a task mid-turn; one note
+//! Only live turns count. The lookout sends the news once it settles, as
+//! a steer, or at once when the person wrote in a task; one note
 //! names each task's latest turn of each kind, by the handle the wait tool
 //! reads it with. What changed in memory rides along, and never sends a
 //! note by itself.
@@ -439,8 +439,6 @@ struct Read {
     forwarding: Vec<(Key, Forward)>,
 }
 
-/// A reply cut to `REPLY_CHARS`, and further while it reads past
-/// `REPLY_BYTES`.
 /// A turn's end, a wait for approval or a silence, as the subscriptions
 /// that watch its bot read it.
 fn turn_event(t: &Turn, theirs: bool) -> Value {
@@ -468,6 +466,8 @@ fn by_field(by: &str) -> &str {
     }
 }
 
+/// A reply cut to `REPLY_CHARS`, and further while it reads past
+/// `REPLY_BYTES`.
 fn quotable(text: &str) -> String {
     let mut max = REPLY_CHARS;
     let mut reply = super::cut(text, max);
@@ -1166,7 +1166,6 @@ impl Updates {
         }
     }
 
-    /// Whether who asked for a turn that just ended is still to be read.
     /// A note still to go of `name`'s turn `turn` waiting for approval or
     /// gone silent, answered by its end: no news any more.
     fn answered(&mut self, name: &str, turn: i64) {
@@ -1190,6 +1189,7 @@ impl Updates {
         (self.wrote_back.as_ref()).is_some_and(|(bot, t)| bot == name && *t == turn)
     }
 
+    /// Whether who asked for a turn that just ended is still to be read.
     pub fn asker_unknown(&self, name: &str, turn: i64) -> bool {
         self.unknown.contains(&(name.to_owned(), turn))
     }
@@ -1353,7 +1353,10 @@ impl Updates {
             return;
         }
         let handle = format!("turn:{name}/{turn}");
-        if self.bots[&self.lead].waiting_on.contains(&handle) {
+        // The lead may be gone from the listing: its news then waits for no one.
+        let waited =
+            (self.bots.get(&self.lead)).is_some_and(|lead| lead.waiting_on.contains(&handle));
+        if waited {
             return;
         }
         let by = self.by(status, from, origin);
@@ -1872,13 +1875,13 @@ impl Updates {
         }
     }
 
-    /// The lead's ID, to send it the note and no later bot of its name.
     /// Every bot seated, by name.
     #[cfg(test)]
     pub fn listed(&self) -> Vec<String> {
         self.bots.keys().cloned().collect()
     }
 
+    /// The lead's ID, to send it the note and no later bot of its name.
     pub fn lead_id(&self) -> Option<i64> {
         self.bots.get(&self.lead)?.id
     }

@@ -266,7 +266,7 @@ fn marks(top: &Path, status: &[u8]) -> HashMap<PathBuf, Mark> {
             _ => Mark::Modified,
         };
         // A rename names where it came from after it.
-        if matches!(x, b'R' | b'C') {
+        if matches!(x, b'R' | b'C') || matches!(y, b'R' | b'C') {
             fields.next();
         }
         let path = String::from_utf8_lossy(path);

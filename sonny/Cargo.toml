@@ -6,8 +6,8 @@ rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 publish = false
 
-# Sonny: a terminal client for the daemon, beside the app, that lays its
-# work out in Rex. Prototype.
+# Sonny: a terminal client for the daemon that lays its work out in Rex,
+# Herdr or cmux. Prototype.
 
 [dependencies]
 agent-client = { path = "../client" }
@@ -18,15 +18,16 @@ shell-words = "1"
 # Reads the browser tool's URLs as the browser does (WHATWG), already
 # built for reqwest.
 url = "2"
-# Scroll regions write history rows without padding them to the width, so
-# a pane that narrows later does not re-wrap them.
-# Asks the terminal for its background (theme.rs).
+# Asks the terminal for its background (term.rs).
 libc = "0.2"
 # Opens links, files and pages with the desktop's opener, whichever is
 # installed (xdg-open, gio, wslview, ...).
 open = "5"
-# The lookout asks its decision model over HTTPS (lookout.rs).
+# Calls T3 Code's MCP endpoint (t3.rs) and asks a Chrome already running
+# for its address (browser.rs).
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "http2"] }
+# Scroll regions write history rows without padding them to the width, so
+# a pane that narrows later does not re-wrap them.
 ratatui = { version = "0.30", features = ["scrolling-regions"] }
 # Syntax colors for code, as bat draws them: syntect with bat's own
 # syntaxes and themes, read with Oniguruma as bat reads them: about three

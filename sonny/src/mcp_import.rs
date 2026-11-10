@@ -385,6 +385,9 @@ fn secret(name: &str) -> bool {
         "PASSWORD",
         "PASS",
         "AUTH",
+        // The header, and `Proxy-Authorization`: a Basic or other scheme's
+        // value is as much a secret as a bearer token.
+        "AUTHORIZATION",
         "CREDENTIAL",
         "PAT",
         "COOKIE",
@@ -590,7 +593,10 @@ pub fn bring(mut chosen: Vec<Found>) -> Result<Vec<Found>, String> {
     let env = agent_client::env_file::path().ok_or("set HOME")?;
     // What children see: the shell's environment, with the file over it.
     // A name the file unsets stays taken: the person meant it unset.
-    let mut kept: BTreeMap<String, String> = std::env::vars().collect();
+    // One that is not text names no secret a server here could take.
+    let mut kept: BTreeMap<String, String> = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
     kept.extend(agent_client::env_file::read(&env)?);
     settle(&mut chosen, &kept.into_iter().collect::<Vec<_>>());
     let secrets: Vec<(&str, &str)> = (chosen.iter())
@@ -999,6 +1005,8 @@ mod tests {
             secret("GITHUB_PERSONAL_ACCESS_TOKEN")
                 && secret("OPENAI_API_KEY")
                 && secret("x-api-key")
+                && secret("Authorization")
+                && secret("Proxy-Authorization")
         );
         assert!(!secret("LOG_LEVEL") && !secret("X-Team"));
         assert_eq!(

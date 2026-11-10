@@ -29,8 +29,9 @@ impl T3 {
         })
     }
 
-    /// The variables `from_env` reads: the credential is this thread's, and
-    /// no program Sonny starts (the daemon, the lookout) takes it.
+    /// The variables `sonny acp` takes out of its environment: the
+    /// credential is this thread's, and no program Sonny starts (the
+    /// daemon, the lookout) takes it.
     pub const VARS: [&str; 4] = [
         "T3_ACP_MCP_ENDPOINT",
         "T3_ACP_MCP_AUTHORIZATION",

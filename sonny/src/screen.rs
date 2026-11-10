@@ -389,7 +389,6 @@ impl Screen {
         }
     }
 
-    /// `mark` on the last row pushed; whether there was one.
     /// When the message at `node` was written, `ms` in Unix milliseconds.
     pub fn date(&mut self, node: i64, ms: i64) {
         self.dates.insert(node, ms);
@@ -400,6 +399,7 @@ impl Screen {
         self.dates.get(&node).copied()
     }
 
+    /// `mark` on the last row pushed; whether there was one.
     pub fn mark_last(&mut self, mark: Mark) -> bool {
         let laid = self.wrapped == self.rows.len();
         let Some(row) = self.rows.last_mut() else {
@@ -442,7 +442,6 @@ impl Screen {
         row.rest.get_or_insert(rest);
     }
 
-    /// The row tagged `tag`, the newest if more are.
     /// The question cards whose rows the screen still keeps, by number.
     pub fn ask_tags(&self) -> std::collections::HashSet<u64> {
         (self.rows.iter())
@@ -453,6 +452,7 @@ impl Screen {
             .collect()
     }
 
+    /// The row tagged `tag`, the newest if more are.
     fn tagged(&self, tag: Tag) -> Option<usize> {
         self.rows.iter().rposition(|row| row.tag == Some(tag))
     }
@@ -2309,8 +2309,6 @@ impl Screen {
     }
 }
 
-/// A row's characters, one per column: a wide character, then empty
-/// strings for the columns it covers.
 /// A row a line was wrapped onto, as its lead of `columns` and the text
 /// after it.
 fn split(line: Line<'static>, columns: usize) -> (Line<'static>, Vec<Span<'static>>) {
@@ -2344,6 +2342,8 @@ fn split(line: Line<'static>, columns: usize) -> (Line<'static>, Vec<Span<'stati
     (Line::from(lead), text)
 }
 
+/// A row's characters, one per column: a wide character, then empty
+/// strings for the columns it covers.
 fn cells(line: &Line) -> Vec<String> {
     let mut out = Vec::new();
     for span in &line.spans {

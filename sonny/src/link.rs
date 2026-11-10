@@ -606,7 +606,7 @@ async fn call_in(
     steps: Option<&Steps>,
 ) -> Result<Value, Failed> {
     if !agent_client::config::named(machine) || !dir.join(format!("{machine}.json")).exists() {
-        let linked: Vec<String> = machines().into_iter().map(|m| m.name).collect();
+        let linked: Vec<String> = machines_in(dir).into_iter().map(|m| m.name).collect();
         return Err((
             "no_machine",
             match linked.is_empty() {
@@ -1607,6 +1607,7 @@ fn opened(payload: &Value) -> Result<String, String> {
 const USAGE: &str = "usage:
   sonny link HOST [--machine NAME] [--name NAME]   link this machine to HOST, for its agents to use
   sonny link off NAME                              take the link away
+  sonny link forget MACHINE                        on a host: forget a machine linked to it
   sonny link                                       the links, and the machines linked here";
 
 /// `sonny link ...`.
@@ -1625,7 +1626,11 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         [serve, machine] if serve == "serve" => runtime()?.block_on(serve_machine(machine.clone())),
         [forget, machine] if forget == "forget" => forget_machine(machine),
         [off, name] if off == "off" => off_link(name),
-        [first, rest @ ..] if !first.starts_with('-') && first != "off" => setup(first, rest),
+        [first, rest @ ..]
+            if !first.starts_with('-') && !matches!(first.as_str(), "off" | "serve" | "forget") =>
+        {
+            setup(first, rest)
+        }
         _ => Err(USAGE.into()),
     }
 }
@@ -1723,7 +1728,17 @@ fn setup(host: &str, rest: &[String]) -> Result<(), String> {
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
         .unwrap_or_default();
     let path = agent_client::config::path().ok_or("HOME is not set")?;
-    let mut table = toml::Table::new();
+    // What the person set on this link besides stays when it is linked
+    // again: its browser profile above all, which would otherwise fall
+    // back to their signed-in one.
+    let mut table = (std::fs::read_to_string(&path).ok())
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|whole| {
+            let kept = whole.get("sonny")?.get("links")?.get(name.as_str())?;
+            kept.as_table().cloned()
+        })
+        .filter(|kept| kept.get("host").and_then(toml::Value::as_str) == Some(host))
+        .unwrap_or_default();
     table.insert("host".into(), toml::Value::String(host.to_owned()));
     table.insert("machine".into(), toml::Value::String(machine.clone()));
     table.insert("command".into(), toml::Value::String(command.clone()));

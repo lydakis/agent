@@ -4,9 +4,9 @@
 //! subscriber hears every message someone else writes in the bots it
 //! watches and how each of their turns ends, unjudged (see `updates`): it
 //! decides itself what matters. The lookout decides only when it hears:
-//! the person's own words in a task cut into the subscriber's running turn,
-//! as the person's words to it would; everything else waits until it
-//! rests. One lookout watches a daemon, for every subscriber on it, started
+//! every note goes as a steer, the person's own words in a task at once,
+//! as the person's words to it would, and everything else once it settles.
+//! One lookout watches a daemon, for every subscriber on it, started
 //! by the first Sonny to open; the daemon is unchanged: this follows every
 //! bot and submits to the subscribers like any client. The tools Sonny
 //! answers are another companion's (`tool_host`), which signals it to read
@@ -302,7 +302,7 @@ enum Steer {
     News,
 }
 
-/// FNV-1a, 64-bit, as the app keys its wakes: the same note twice is one submit.
+/// FNV-1a, 64-bit: the same note twice is one submit.
 fn digest(text: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.bytes() {
@@ -830,7 +830,6 @@ impl Readers {
     }
 }
 
-/// Every subscriber's lookout on one daemon.
 /// A failed fire's note under way.
 struct Telling {
     note: tokio::task::AbortHandle,
@@ -840,6 +839,7 @@ struct Telling {
     ended: Option<i64>,
 }
 
+/// Every subscriber's lookout on one daemon.
 struct Service {
     store: PathBuf,
     /// How many events from sources wait for one subscriber
@@ -1161,7 +1161,6 @@ impl Service {
         // files less often.
         let mut tick = tokio::time::interval(SETTLE / 2);
         let mut reread: Option<Instant> = None;
-        // Past the replay: a turn that ends now left its folder as it is.
         loop {
             // The lookouts whose news may have changed: those an event
             // reached, or all of them.
@@ -2135,7 +2134,7 @@ struct Lookout {
     /// For each other bot a subscription names the makers of: it, and every
     /// bot it or one of those made.
     others: HashMap<String, HashSet<String>>,
-    /// Bots a subscription's `--bot` glob names, as listed and made since.
+    /// Bots a subscription's `bots` glob names, as listed and made since.
     globbed: HashSet<String>,
     /// The other leads of the lead's folder and every bot they or theirs
     /// made: theirs, which the lead's tasks subscription never names.
@@ -2666,7 +2665,7 @@ impl Lookout {
         }
         made.grow(&mut theirs);
         self.theirs = theirs;
-        // Only a `--bot` glob names bots beyond the lineages.
+        // Only a `bots` glob names bots beyond the lineages.
         self.globbed = match self.subs.iter().any(|sub| !sub.bots.is_empty()) {
             true => (records.iter())
                 .filter(|(name, record)| self.globs(name) && record["expire_ms"].is_null())
@@ -2692,7 +2691,7 @@ impl Lookout {
             && crate::project::lead_project(bot) == crate::project::lead_project(&self.lead)
     }
 
-    /// Whether a subscription's `--bot` glob names this bot. The tasks
+    /// Whether a subscription's `bots` glob names this bot. The tasks
     /// subscription Sonny gives a lead never names another lead's: one the
     /// lead asked for may.
     fn globs(&self, bot: &str) -> bool {
@@ -3172,7 +3171,6 @@ impl Lookout {
         (urgent || settled).then_some(self.updates.busy())
     }
 
-    /// The last note was refused lately: even a steer waits the gap after.
     /// The subscriptions that hear an event now: those naming its source,
     /// or its source and topic, whose filter, if any, matches it. What the
     /// subscriber itself said is no news to it.
@@ -3527,6 +3525,7 @@ impl Lookout {
         self.send(client, woken, asked, Answer::Sourced);
     }
 
+    /// The last note was refused lately: even a steer waits the gap after.
     fn refused(&self, now: Instant) -> bool {
         self.refused
             .is_some_and(|at| now.duration_since(at) < WAKE_GAP)

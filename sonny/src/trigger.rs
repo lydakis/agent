@@ -5417,9 +5417,6 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
     outcome
 }
 
-/// What a turn's `wait` result says: its text, else its error. A turn that
-/// ended saying nothing passes on nothing, not "null".
-/// The turn the last fire of `row` sent, by handle, when it sent one.
 /// How the turn `row`'s fire sent ended: as its outcome kept it, for a
 /// shadow fire, whose copy is gone; else as `ended` read it.
 fn ended_for<'a>(row: &'a Value, ended: &'a HashMap<String, Value>) -> Option<&'a Value> {
@@ -5429,6 +5426,7 @@ fn ended_for<'a>(row: &'a Value, ended: &'a HashMap<String, Value>) -> Option<&'
     }
 }
 
+/// The turn the last fire of `row` sent, by handle, when it sent one.
 pub fn sent(row: &Value) -> Option<String> {
     let last = &row["last"];
     (last["outcome"] == "sent")
@@ -5548,6 +5546,8 @@ pub fn with_turn(row: &mut Value, ended: &HashMap<String, Value>) {
     row["last"]["turn_status"] = status;
 }
 
+/// What a turn's `wait` result says: its text, else its error. A turn that
+/// ended saying nothing passes on nothing, not "null".
 fn answer(result: &Value) -> String {
     match (result["text"].as_str(), &result["error"]) {
         (Some(text), _) if !text.is_empty() => text.to_owned(),
@@ -5905,8 +5905,6 @@ fn looked(places: &Places, trigger: &Trigger, seen: &Seen) {
     }
 }
 
-/// `f` with the trigger's daemon; why not, as a failed outcome, when it
-/// cannot be reached or serves another store.
 /// How often a fire waiting out a pause looks again.
 const PAUSE_LOOK: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -5948,6 +5946,8 @@ fn until_resumed(trigger: &Trigger) {
     }
 }
 
+/// `f` with the trigger's daemon; why not, as a failed outcome, when it
+/// cannot be reached or serves another store.
 fn with_daemon<T>(trigger: &Trigger, f: impl AsyncFnOnce(&Client) -> T) -> Result<T, Value> {
     let failed = |detail: String| json!({"outcome": "failed", "detail": detail});
     let runtime = runtime().map_err(failed)?;

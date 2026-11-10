@@ -140,6 +140,9 @@ async fn serve(store: PathBuf, socket: PathBuf) -> Result<(), String> {
         }
         if gone.get_or_insert_with(Instant::now).elapsed() >= GONE_AFTER {
             println!("{}", json!({"event": "daemon_gone"}));
+            // As when asked to give way: no call or MCP server goes on
+            // behind a host that has left.
+            crate::served::stop();
             return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(2)).await;

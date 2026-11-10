@@ -56,8 +56,7 @@ pub fn apply(on: bool) -> Result<String, String> {
     })
 }
 
-/// At Sonny's start: the job of its own an earlier Sonny kept let go of,
-/// and the scheduler running while the setting is on.
+/// At Sonny's start: the scheduler running while the setting is on.
 pub fn at_start() {
     std::thread::spawn(|| {
         if on()

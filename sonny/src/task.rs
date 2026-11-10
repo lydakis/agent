@@ -959,8 +959,6 @@ fn bot_record(agent: &Path, env: &[(String, String)], name: &str) -> Option<Valu
     serde_json::from_slice(&output.stdout).ok()
 }
 
-/// Whether the daemon has a task `name`: one whose start failed after it
-/// was made keeps its folder, since a retry continues it there.
 /// The tasks `starter` started in `project` that are still there, by
 /// name and status, as the daemon lists the bots of the project: none when
 /// it cannot say.
@@ -1102,7 +1100,8 @@ fn own(bots: &[Value], lead: &str) -> Vec<(String, String)> {
 }
 
 /// Whether the daemon `env` names, or this shell's, lists `name`: so when
-/// it can't be read, to keep a task's folder.
+/// it can't be read, to keep a task's folder. One whose start failed after
+/// it was made keeps its folder, since a retry continues it there.
 fn listed_on(agent: &Path, env: &[(String, String)], name: &str) -> bool {
     let Ok(output) = Command::new(agent)
         .envs(env.iter().map(|(key, value)| (key, value)))
@@ -1131,7 +1130,6 @@ fn undo(undo: &Undo) {
     }
 }
 
-/// Every task works in the lead's folder.
 /// The lead's folder itself for the task `name`: as every task of the
 /// project works, or `all` false, as the person asked for this one.
 fn in_place(here: &Path, name: &str, all: bool) -> Place {
@@ -1344,7 +1342,13 @@ fn worktree(here: &Path, name: &str, base: &str, confine: bool) -> Result<Place,
                 }
             }
             false => {
-                git(here, &args)?;
+                // git takes back a worktree it could not finish, not the
+                // branch it made for it.
+                if let Err(e) = git(here, &args) {
+                    self::undo(&undo);
+                    let _ = std::fs::remove_dir_all(&path);
+                    return Err(e);
+                }
             }
         }
         undo

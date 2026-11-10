@@ -672,8 +672,8 @@ static ANSWERINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// call that asks first is put to the agent's gate.
 pub struct Steps {
     via: Via,
-    /// This answering of the call, so its steps' ids are its own: a
-    /// lookout that restarts and answers the same call again never repeats
+    /// This answering of the call, so its steps' ids are its own: a tool
+    /// host that restarts and answers the same call again never repeats
     /// one, which the agent's judge would take as reviewed already.
     run: String,
     next: std::sync::atomic::AtomicU64,
@@ -1281,7 +1281,6 @@ fn budgeted(body: String, tokens: usize, whole: &Whole<'_>) -> String {
     )
 }
 
-/// A name no other file of this lookout's takes.
 /// How long the outputs scripts save are kept.
 const KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
 
@@ -1300,6 +1299,7 @@ fn fresh(dir: &Path) -> Result<&Path, String> {
     Ok(dir)
 }
 
+/// A name no other file of this lookout's takes.
 fn stamp() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = std::time::SystemTime::now()

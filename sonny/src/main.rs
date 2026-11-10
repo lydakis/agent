@@ -240,7 +240,7 @@ fn kept(window: u16) -> u16 {
 /// [`kept`] at `measure`.
 fn kept_at(window: u16, measure: usize) -> u16 {
     match measure {
-        WHOLE => window - window.saturating_sub(2 * GUTTER) / 2 - 1,
+        WHOLE => (window - window.saturating_sub(2 * GUTTER) / 2).saturating_sub(1),
         measure => measure as u16 + 2 * GUTTER,
     }
 }
@@ -259,9 +259,9 @@ fn measure_of(text_width: u64) -> usize {
 /// from the left edge as from the line or the right edge, as the margin's
 /// text does (#742).
 const GUTTER: u16 = 2;
-/// How long a side chat's copy stays once idle.
 /// What follows a guess at the next message in the composer.
 const TAB: &str = "  tab";
+/// How long a side chat's copy stays once idle.
 const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
 /// This window is a side chat (`--side`).
 static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -367,8 +367,8 @@ fn usage() -> String {
      --replay [WHEN] plays the past back from WHEN: 2h, 30m or 1d ago, or 02:10 (an hour ago).\n\
      sonny where [AGENT] prints the multiplexer and its workspace or session that AGENT's\n\
      run_in_pane and show_agent calls act in now (AGENT is $AGENT_BOT in an agent's shell).\n\
-     sonny lookout watches every lead on the daemon, tells it what happens in its tasks\n\
-     and answers its agents' calls of Sonny's tools; Sonny starts one.\n\
+     sonny lookout watches every lead on the daemon and tells it what happens in its\n\
+     tasks; sonny tool-host answers its agents' calls of Sonny's tools. Sonny starts both.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
      sonny setup asks again for the provider and the default model, as the first run does.\n\
      sonny acp [--store PATH] [--socket PATH] speaks the Agent Client Protocol on stdio\n\
@@ -1069,9 +1069,6 @@ impl Spread {
     }
 }
 
-/// `bot`'s turn `turn`, as `turns` lists it, read by its number: no
-/// number of messages steered or attached since can hide it. `None` when
-/// it has no such turn or it could not be read.
 /// An answer sent to a task's question from its lead's window: the
 /// question, as [`asks::Ask::key`] names it; the task; and the turn it
 /// went as, while it may still be taken back unread, with when that was
@@ -1124,6 +1121,9 @@ pub(crate) async fn answer_once(
     }
 }
 
+/// `bot`'s turn `turn`, as `turns` lists it, read by its number: no
+/// number of messages steered or attached since can hide it. `None` when
+/// it has no such turn or it could not be read.
 async fn turn_row(client: &Client, bot: &str, turn: i64) -> Option<Value> {
     let page = (client)
         .request("turns", json!({"bot": bot, "after": turn - 1, "limit": 1}))
@@ -1779,7 +1779,6 @@ fn start_daemon(
     Ok(())
 }
 
-/// The store and socket given, else the environment's, else Agent's own.
 /// The store this Sonny reaches, once [`daemon_paths`] chose it.
 static STORE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
@@ -1792,6 +1791,7 @@ pub(crate) fn outputs() -> Option<String> {
     }
 }
 
+/// The store and socket given, else the environment's, else Agent's own.
 fn daemon_paths(
     store: Option<PathBuf>,
     socket: Option<PathBuf>,
@@ -2001,7 +2001,7 @@ fn main() -> std::process::ExitCode {
             match &rest[1..] {
                 [] => home::Places::home().and_then(|places| home::set_up(&places, None)),
                 [help] if help == "-h" || help == "--help" => {
-                    println!("usage: {}", home::USAGE);
+                    println!("{}", home::USAGE);
                     Ok(())
                 }
                 // A flag is never a repository's URL.
@@ -2622,7 +2622,7 @@ fn used(event: &Event) -> bool {
     }
 }
 
-/// A new bot in the folder, with the instructions the app would give it.
+/// A new bot in the folder, with the instructions its folder gives it.
 async fn create(client: &Client, options: &Options, bot: &str) -> Result<(), String> {
     let model = options
         .model
@@ -2840,14 +2840,18 @@ fn heading(thought: &str) -> Option<&str> {
         .rfind(|title| !title.is_empty() && !title.contains('\n'))
 }
 
-/// A folder as the person reads it: under their home, from `~`.
 /// How often the footer reads the workspace's branch again.
 const PLACE_EVERY: Duration = Duration::from_secs(3);
 
+/// A folder as the person reads it: under their home, from `~`.
 fn tilde(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     match path.strip_prefix(&home) {
-        Some(rest) if !home.is_empty() => format!("~{rest}"),
+        // The home itself or what is under it, never a folder whose name
+        // only starts as the home's does.
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
+            format!("~{rest}")
+        }
         _ => path.to_owned(),
     }
 }
@@ -3005,8 +3009,6 @@ fn report_status(state: &str, bot: &str) {
 
 /// Read past a follow's replay as it arrives, so a long one cannot fill
 /// the client's queue and cut the stream before it goes live.
-/// Skip the replay of a follow up to its live events; returns how big the
-/// context was after the last model round it held, when it held one.
 async fn caught_up(events: &mut Events) -> Caught {
     let mut caught = Caught::default();
     let replay = async {
@@ -3198,13 +3200,13 @@ struct Fold {
     open: bool,
 }
 
-/// The button that opens or shuts the message between agents at `node`.
 /// What a click on the fold row of the person's long message at `node`
 /// does: opens the rest of it, or shuts it again.
 fn more_button(node: i64) -> screen::Mark {
     screen::Mark::Link(format!("{}more/{node}", screen::BUTTON))
 }
 
+/// The button that opens or shuts the message between agents at `node`.
 fn said_button(node: i64) -> screen::Mark {
     screen::Mark::Link(format!("{}said/{node}", screen::BUTTON))
 }
@@ -3480,7 +3482,8 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 
 /// The slash commands, as the menu lists them: name and what it does.
 /// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
-/// open `/background`, and `/settings` opens `/config`, unlisted.
+/// open `/background`, `/forum` opens `/commons`, and `/settings` opens
+/// `/config`, unlisted.
 const COMMANDS: [(&str, &str); 29] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
@@ -3896,9 +3899,8 @@ struct App {
     steering: Vec<i64>,
     /// Pictures given with the message being written, each behind its
     /// placeholder in the composer: [`attach::placeholder`] of its place
-    /// here, from 1.
-    /// Pictures attached to the draft, by their placeholders' numbers; one
-    /// neither the draft nor Ctrl-Y can bring back is let go.
+    /// here, from 1; one neither the draft nor Ctrl-Y can bring back is let
+    /// go.
     pictures: Vec<Option<attach::Picture>>,
     /// The person's reactions to this bot's replies.
     reactions: reactions::Reactions,
@@ -4255,7 +4257,6 @@ struct Fleet {
     socket: PathBuf,
     /// The connection dropped; it is made again with the lead's.
     down: bool,
-    live: bool,
     project: String,
     lead: String,
     /// The lead and every bot it, or one of them, made.
@@ -4618,7 +4619,7 @@ impl Naming {
 }
 
 /// The kinds of event a lead's layout acts on (`Fleet::event`, `taken`,
-/// `Resolving::event`).
+/// `resolved::Own::event`).
 const FLEET_KINDS: [&str; 12] = [
     "created",
     "forked",
@@ -4684,7 +4685,6 @@ impl Fleet {
             events,
             socket: options.socket.clone(),
             down: false,
-            live: true,
             project: project.to_owned(),
             lead: lead.to_owned(),
             lineage: [lead.to_owned()].into(),
@@ -4731,7 +4731,6 @@ impl Fleet {
             events,
             socket: PathBuf::new(),
             down: false,
-            live: true,
             project: project.to_owned(),
             lead: lead.to_owned(),
             lineage: [lead.to_owned()].into(),
@@ -5271,10 +5270,6 @@ impl Fleet {
     /// What the event did to the layout, as a line for the lead's view.
     fn event(&mut self, event: &Value) -> Option<String> {
         let kind = event["event"].as_str().unwrap_or("");
-        if !self.live {
-            self.live = kind == "follow_live";
-            return None;
-        }
         let bot = event["bot"].as_str()?;
         let data = &event["data"];
         if self.lineage.contains(bot) {
@@ -5873,8 +5868,8 @@ impl App {
             self.done_elsewhere();
             if let Some(fleet) = &mut self.fleet {
                 fleet.rescan().await;
-                // A check's mark lands after its turn's events: what it
-                // sets off sounds now, not with the next event.
+                // What the rescan set off sounds now, not with the next
+                // event.
                 for (alert, what) in std::mem::take(&mut fleet.alerts) {
                     self.sounds.alert(alert, &what);
                 }
@@ -6065,6 +6060,7 @@ impl App {
 
     /// The lead's instructions as composed on attach, sent once no turn
     /// runs; the next turn reads them.
+    ///
     /// Whether what was picked is now the bot's: false while it waits
     /// for the turn to end, or when the daemon refused it (the notice says
     /// why).
@@ -6143,8 +6139,8 @@ impl App {
                     project::wrote(&self.lead, text);
                 }
                 if let Some((model, effort)) = switch {
-                    // A lead's project file says what it runs, for the app
-                    // and the next lead made there.
+                    // A lead's project file says what it runs, for the next
+                    // lead made there.
                     if self.project.is_some()
                         && let Err(error) = project::keep_model(
                             std::path::Path::new(&self.workspace),
@@ -6658,9 +6654,11 @@ impl App {
                 && now != Some(turn)
             {
                 let row = (turn_row(&self.client, &self.bot, turn).await).unwrap_or_default();
+                // A turn's row has no error; its handle's answer does.
+                let row = self.with_error(row).await;
                 let status = row["status"].as_str().unwrap_or("unknown");
                 let ended = json!({"event": "turn_finished", "bot": self.bot,
-                    "turn": turn, "data": {"status": status}});
+                    "turn": turn, "data": {"status": status, "error": row["error"]}});
                 self.daemon(ended).await;
             }
             if self.running.is_none()
@@ -8206,7 +8204,6 @@ impl App {
             .push_marked(std::mem::take(&mut self.pending), marks);
     }
 
-    /// `mark` on the last row written so far, waiting or drawn.
     /// The first of the last `count` lines waiting marked as a message's
     /// first row.
     fn mark_first(&mut self, count: usize) {
@@ -8215,6 +8212,7 @@ impl App {
         }
     }
 
+    /// `mark` on the last row written so far, waiting or drawn.
     fn mark_last(&mut self, mark: screen::Mark) {
         match self.pending.len() {
             0 => {
@@ -9308,7 +9306,7 @@ impl App {
             // An attached note whose wait ran out goes as a steer: the
             // sender's, nothing the person put in line.
             "queued" if data["lapsed"] == true => {}
-            "queued" => self.notice = Some(format!("queued behind turn {}", data["behind"])),
+            "queued" => self.notice = Some("queued".to_owned()),
             // Nothing until a call takes it in: it asks nothing of the
             // person, so nothing says it waits.
             "attached" => {}
@@ -9407,7 +9405,12 @@ impl App {
                     return;
                 }
                 if let Some(item) = &item {
-                    self.last_reply = text(item);
+                    // A message of calls alone has no words to copy: the
+                    // last reply stays, as when history is read.
+                    let reply = text(item);
+                    if !reply.is_empty() {
+                        self.last_reply = reply;
+                    }
                     if let Some(node) = data["node"].as_i64() {
                         self.saw_reply(node, &text(item));
                         self.dated(node, item);
@@ -11033,7 +11036,6 @@ impl App {
                             && watch.background.is_none()
                             && watch.usage.is_none()
                             && watch.audit.is_none()
-                            && watch.audit.is_none()
                             && watch.commons.is_none()
                             && watch.sky.is_none() =>
                     {
@@ -11187,8 +11189,6 @@ impl App {
         true
     }
 
-    /// `pane` beside the conversation, with the keys; what was selected
-    /// or being found in the conversation let go.
     /// Every key Sonny takes, beside the conversation.
     fn shortcuts(&mut self) {
         let rows = SHORTCUTS;
@@ -11208,6 +11208,8 @@ impl App {
         self.open_pane(pane);
     }
 
+    /// `pane` beside the conversation, with the keys; what was selected
+    /// or being found in the conversation let go.
     fn open_pane(&mut self, mut pane: pane::Pane) {
         self.closed = None;
         // Over the margin, kept under it to go back to; what else was
@@ -11684,7 +11686,6 @@ impl App {
         self.width.min(measure())
     }
 
-    /// `text` put on the clipboard, and said so.
     /// The mouse over the composer's text, as Codex's composer takes it:
     /// a press puts the cursor there, a drag selects, which is copied,
     /// two clicks select a word and three its line. Whether it took
@@ -11756,6 +11757,7 @@ impl App {
         true
     }
 
+    /// `text` put on the clipboard, and said so.
     fn copied(&mut self, text: &str) {
         term::copy(text);
         let count = text.chars().count();
@@ -13597,9 +13599,6 @@ impl App {
         self.focus = self.asks.get(to).map(asks::Ask::key);
     }
 
-    /// The bot's reactions so far to the person's message, right under
-    /// it, wherever it is: never a row of their own. A message no longer
-    /// in the conversation, or not drawn yet, shows them once it is.
     /// Whether something on the screen moves with time alone, so each
     /// tick draws it: the running turn's shimmer and clock, a shell's
     /// clock and output, a card beside (the sky, or one read again every
@@ -13612,18 +13611,21 @@ impl App {
             || self.needs_pulse.get().moving(Instant::now())
     }
 
-    /// Whether zen keeps what the running turn says out of view: the
-    /// person did not start it.
     /// Whether only words are drawn: the person's, the agent's, its
     /// questions and what failed, as in zen, every turn's words still.
     fn words(&self) -> bool {
         self.zen.is_some() || (self.words_only && !self.verbose)
     }
 
+    /// Whether zen keeps what the running turn says out of view: the
+    /// person did not start it.
     fn zen_hides(&self) -> bool {
         self.zen.is_some() && self.elsewhere
     }
 
+    /// The bot's reactions so far to the person's message, right under
+    /// it, wherever it is: never a row of their own. A message no longer
+    /// in the conversation, or not drawn yet, shows them once it is.
     fn draw_bot_reactions(&mut self) {
         self.place_bot_reactions();
     }
@@ -13991,6 +13993,7 @@ impl App {
         self.input.clear();
         if let Err(error) = zen::set(self.reactions_key.as_deref(), focus.as_deref()) {
             self.notice = Some(error);
+            return;
         }
         let changed = self.zen.is_some() != focus.is_some();
         self.notice = Some(zen_notice(focus.is_some()));
@@ -15797,7 +15800,6 @@ fn shimmer(text: &str, since: Duration) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// A bot's name in its project: `lead`, or what follows the project's dot.
 /// The gate a person answers a call on: the first that handed it over,
 /// else `manual`.
 fn person_gate(call: &Value) -> &str {
@@ -15815,6 +15817,7 @@ fn clicked(link: &str, right: bool) -> Option<String> {
     }
 }
 
+/// A bot's name in its project: `lead`, or what follows the project's dot.
 fn short(bot: &str, project: &str, lead: &str) -> String {
     if bot == lead {
         return "lead".into();
