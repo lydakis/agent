@@ -43,7 +43,7 @@ const BACKOFF: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const HEALTHY: Duration = Duration::from_secs(60);
 /// The largest line either end reads: a file opened there, as base64.
-const LINE_BYTES: usize = 48 << 20;
+pub(crate) const LINE_BYTES: usize = 48 << 20;
 /// The most bytes of payloads either end holds queued to send: the
 /// longest line. Lines up to `SMALL` go ahead of them, whatever waits.
 const QUEUED_BYTES: usize = LINE_BYTES;

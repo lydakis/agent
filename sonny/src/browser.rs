@@ -2038,39 +2038,72 @@ fn newer_database(from: &Path, to: &Path) -> std::io::Result<bool> {
         path.push(suffix);
         PathBuf::from(path)
     };
-    let mut copied = Vec::new();
-    let done = (|| {
-        for suffix in ["", "-journal", "-wal", "-shm"] {
-            let mut source = from.as_os_str().to_owned();
-            source.push(suffix);
-            let partial = with(&format!("{suffix}.{}.partial", std::process::id()));
-            match std::fs::copy(PathBuf::from(source), &partial) {
-                Ok(_) => copied.push((partial, with(suffix))),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !suffix.is_empty() => {}
-                Err(e) => {
-                    let _ = std::fs::remove_file(&partial);
-                    return Err(e);
+    let source = |suffix: &str| {
+        let mut path = from.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    // Each of the person's files as it stands: its size and when it was
+    // written, or none. A copy between two equal readings is of one state
+    // of the database, which their Chrome did not write meanwhile.
+    let reading = || -> Vec<Option<(u64, std::time::SystemTime)>> {
+        (SIDECARS.iter())
+            .map(|suffix| {
+                let meta = std::fs::metadata(source(suffix)).ok()?;
+                Some((meta.len(), meta.modified().ok()?))
+            })
+            .collect()
+    };
+    for _ in 0..SNAPSHOT_TRIES {
+        let mut copied = Vec::new();
+        let before = reading();
+        let done = (|| {
+            for suffix in SIDECARS {
+                let partial = with(&format!("{suffix}.{}.partial", std::process::id()));
+                match std::fs::copy(source(suffix), &partial) {
+                    Ok(_) => copied.push((partial, with(suffix))),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && !suffix.is_empty() => {}
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&partial);
+                        return Err(e);
+                    }
                 }
             }
-        }
-        for suffix in ["-journal", "-wal", "-shm"] {
-            match std::fs::remove_file(with(suffix)) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-                _ => {}
+            // Written meanwhile: copied again.
+            if reading() != before {
+                return Ok(false);
             }
+            // The copy's own, and its wal-index, which SQLite makes again
+            // from the log.
+            for suffix in ["-journal", "-wal", "-shm"] {
+                match std::fs::remove_file(with(suffix)) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                    _ => {}
+                }
+            }
+            // The database first: its own journal after, never another's before.
+            while !copied.is_empty() {
+                let (partial, file) = copied.remove(0);
+                std::fs::rename(partial, file)?;
+            }
+            Ok(true)
+        })();
+        for (partial, _) in copied {
+            let _ = std::fs::remove_file(partial);
         }
-        // The database first: its own journal after, never another's before.
-        while !copied.is_empty() {
-            let (partial, file) = copied.remove(0);
-            std::fs::rename(partial, file)?;
+        if !matches!(done, Ok(false)) {
+            return done;
         }
-        Ok(true)
-    })();
-    for (partial, _) in copied {
-        let _ = std::fs::remove_file(partial);
     }
-    done
+    // Written throughout: left for the next start.
+    Ok(false)
 }
+
+/// A SQLite database's own file and those beside it that hold its data.
+const SIDECARS: [&str; 3] = ["", "-journal", "-wal"];
+
+/// How many times a database being written is copied again.
+const SNAPSHOT_TRIES: usize = 3;
 
 /// [`kept_profile`] of a named profile, kept in `link`'s folder.
 fn kept_in(link: &Path, profile: &str, data: Option<&Path>) -> Kept {
@@ -2397,7 +2430,40 @@ async fn drive(
     if !text.is_empty() {
         parts.push(json!({"type": "text", "text": text}));
     }
+    // Over a link, the whole answer is one line of it: past the longest
+    // line, the other end would drop the link, not land the files.
+    if reach.carry && carried_bytes > 0 {
+        return Ok(fitted(parts, ANSWER_BYTES));
+    }
     Ok(Value::Array(parts))
+}
+
+/// The most bytes of an answer that goes back over a link, with room for
+/// what carries it.
+const ANSWER_BYTES: usize = crate::link::LINE_BYTES - (64 << 10);
+
+/// `parts`, an answer carrying files back over a link, within `most`
+/// bytes as JSON: the last files it carries left out until it fits, each
+/// said not saved.
+fn fitted(mut parts: Vec<Value>, most: usize) -> Value {
+    let size = |parts: &Vec<Value>| serde_json::to_vec(parts).map_or(usize::MAX, |json| json.len());
+    let mut left_out = Vec::new();
+    while size(&parts) > most {
+        let Some(at) = parts.iter().rposition(|part| part["type"] == "file") else {
+            break;
+        };
+        let part = parts.remove(at);
+        left_out.push(format!(
+            "{}: not saved: with the rest of the answer it is more than the link carries ({} MB)",
+            part["path"].as_str().unwrap_or_default(),
+            most >> 20
+        ));
+    }
+    if !left_out.is_empty() {
+        left_out.reverse();
+        parts.push(json!({"type": "text", "text": left_out.join("\n")}));
+    }
+    Value::Array(parts)
 }
 
 /// The files `command`, which ran in `session` over a link that carries
@@ -2727,6 +2793,31 @@ mod tests {
         std::fs::remove_file(data.join("NativeMessagingHosts/check.json")).unwrap();
         refresh_kept(&dir, "Work", &data);
         assert!(std::fs::symlink_metadata(hosts.join("check.json")).is_err());
+    }
+
+    #[test]
+    fn an_answer_over_a_link_leaves_out_the_files_that_would_not_fit() {
+        let file = |path: &str, size: usize| json!({"type": "file", "path": path, "data": "x".repeat(size)});
+        let text = json!({"type": "text", "text": "✓ saved"});
+        let parts = vec![text.clone(), file("a.pdf", 600), file("b.pdf", 600)];
+        let fitted = fitted(parts.clone(), 1_000);
+        let fitted = fitted.as_array().unwrap();
+        assert_eq!(fitted[0], text);
+        assert_eq!(fitted[1]["path"], "a.pdf");
+        assert_eq!(fitted.len(), 3);
+        assert!(
+            fitted[2]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("b.pdf: not saved")
+        );
+        assert!(serde_json::to_vec(fitted).unwrap().len() <= 1_000);
+        // One that fits stays whole.
+        assert_eq!(fitted_all(parts.clone()), Value::Array(parts));
+    }
+
+    fn fitted_all(parts: Vec<Value>) -> Value {
+        fitted(parts, ANSWER_BYTES)
     }
 
     #[test]
