@@ -3826,6 +3826,16 @@ struct App {
     calls: HashMap<String, (String, Value)>,
     /// Calls waiting on the person, as `approvals` lists them.
     approvals: Vec<Value>,
+    /// Calls of the bots below this window waiting on the person, as
+    /// `approvals` lists them, each with its `bot`: its tasks', and those
+    /// of the leads it follows and theirs. Answered here after its own.
+    raised: Vec<Value>,
+    /// The calls below that were looked up, by bot, turn and call: one
+    /// the listing no longer held is not looked up again.
+    raised_read: std::collections::BTreeSet<(String, i64, String)>,
+    /// Calls Esc set aside, by bot and call: the keys type again, and
+    /// Enter on an empty composer brings them back.
+    calls_aside: std::collections::HashSet<(String, String)>,
     /// The lead's open questions for the person, oldest first: its `ask`
     /// calls not yet answered, nor set aside, and its tasks' open ones,
     /// pinned here as they come ([`App::pin_task_asks`]).
@@ -4318,6 +4328,21 @@ struct Fleet {
     /// Other projects whose leads were seen: their bots are theirs, never
     /// tasks here, and their Sonny opens only when asked for.
     leads: std::collections::HashSet<String>,
+    /// The leads of other projects this lead follows by name, and those
+    /// they follow in turn ([`followed_leads`]), as last read.
+    followed: Vec<String>,
+    /// When the followed leads were last read.
+    followed_at: Option<Instant>,
+    /// A bot no agent made appeared in a followed project: whose it is,
+    /// the next read of the followed leads lists again.
+    refollow: bool,
+    /// Bots that joined `raised` whose calls could not be listed yet: the
+    /// next read of the followed leads lists them again.
+    unheld: std::collections::HashSet<String>,
+    /// Those leads and every bot of their lineage: what waits on the
+    /// person in theirs waits in this window too, and is answered here.
+    /// Never a window here, nor a tab.
+    raised: std::collections::HashSet<String>,
     /// How a task's window runs Sonny on it, without the bot's name.
     command: Vec<String>,
     /// Said once in the status row when tasks open where this pane is not.
@@ -4604,6 +4629,66 @@ fn lineage(bots: &[Value], lead: &str, first: bool) -> (std::collections::HashSe
     (mine, looked)
 }
 
+/// The leads `lead` follows by name, as its `follows` subscriptions name
+/// them (`read`), and those they follow in turn, at any depth, each once
+/// and never `lead`: what waits on the person in theirs is raised to the
+/// window the person is in. A pattern names no lead.
+fn followed_leads(lead: &str, read: impl Fn(&str) -> Vec<lookout::subs::Sub>) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = [lead.to_owned()].into();
+    let mut at = vec![lead.to_owned()];
+    while let Some(follower) = at.pop() {
+        for sub in read(&follower) {
+            for name in sub.tasks_of.iter().chain(&sub.bots) {
+                if !name.contains('*') && project::is_lead(name) && seen.insert(name.clone()) {
+                    at.push(name.clone());
+                }
+            }
+        }
+    }
+    seen.remove(lead);
+    let mut followed: Vec<String> = seen.into_iter().collect();
+    followed.sort();
+    followed
+}
+
+/// The bots of `lead`, a lead of its project's folder, among `bots` (its
+/// project's, as `bots` lists them): the lead and its [`lineage_of`], but
+/// none of a project inside, which has a lead of its own.
+fn lead_and_lineage(bots: &[Value], lead: &str) -> std::collections::HashSet<String> {
+    let Some(project) = project::lead_project(lead) else {
+        return Default::default();
+    };
+    let names = bots.iter().filter_map(|bot| bot["name"].as_str());
+    let inner = inner_projects(names, project);
+    let mut theirs = lineage_of(bots, lead, lead == format!("{project}.lead"));
+    // A side chat expires and is the person's own, as `reconcile` keeps it.
+    let expiring: std::collections::HashSet<&str> = (bots.iter())
+        .filter(|bot| !bot["expire_ms"].is_null())
+        .filter_map(|bot| bot["name"].as_str())
+        .collect();
+    theirs.retain(|bot| {
+        !expiring.contains(bot.as_str()) && !inner.iter().any(|p| bot.starts_with(&format!("{p}.")))
+    });
+    theirs.insert(lead.to_owned());
+    theirs
+}
+
+/// Every bot named `pattern`, every page of them; none when a page could
+/// not be read.
+async fn bots_named(client: &Client, pattern: &str) -> Option<Vec<Value>> {
+    let mut bots = Vec::new();
+    let mut after = Value::Null;
+    loop {
+        let asked = json!({"name": pattern, "limit": 256, "after": after});
+        let page = client.request("bots", asked).await.ok()?;
+        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+        after = page["next_after"].clone();
+        if after.is_null() {
+            return Some(bots);
+        }
+    }
+}
+
 /// What a lead's windows are named from: its project, the lead, what
 /// each of its bots is doing, and every bot of its lineage.
 struct Naming {
@@ -4690,6 +4775,9 @@ const FLEET_KINDS: [&str; 12] = [
     "turn_finished",
 ];
 
+/// How often a lead's window reads again which leads it follows.
+const FOLLOWED_EVERY: Duration = Duration::from_secs(5);
+
 /// A lead's layout follows every agent from now, for the kinds it acts on:
 /// where they are now comes from the listing (`reconcile`), so the past is
 /// not replayed only to be passed over, and other projects' token traffic
@@ -4743,6 +4831,11 @@ impl Fleet {
             lead: lead.to_owned(),
             lineage: [lead.to_owned()].into(),
             leads: Default::default(),
+            followed: Vec::new(),
+            followed_at: None,
+            refollow: false,
+            unheld: Default::default(),
+            raised: Default::default(),
             command,
             note,
             place,
@@ -4789,6 +4882,11 @@ impl Fleet {
             lead: lead.to_owned(),
             lineage: [lead.to_owned()].into(),
             leads: Default::default(),
+            followed: Vec::new(),
+            followed_at: None,
+            refollow: false,
+            unheld: Default::default(),
+            raised: Default::default(),
             command: Vec::new(),
             note: None,
             doing: HashMap::new(),
@@ -4814,20 +4912,11 @@ impl Fleet {
     async fn reconcile(&mut self) {
         // Every page of them: a project past one page still finds a task
         // running that sorts after it.
-        let mut bots = Vec::new();
-        let mut after = Value::Null;
-        loop {
-            let asked =
-                json!({"name": format!("{}.*", self.project), "limit": 256, "after": after});
-            let Ok(page) = self.client.request("bots", asked).await else {
-                return;
-            };
-            bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-            after = page["next_after"].clone();
-            if after.is_null() {
-                break;
-            }
-        }
+        let Some(bots) = bots_named(&self.client, &format!("{}.*", self.project)).await else {
+            return;
+        };
+        // Whose bots, in other projects, raise what waits on the person here.
+        let raised_unread = self.follow_leads(true).await;
         // A project inside this one has a lead, and a home, of its own: its
         // lead opens there and its tasks are its own.
         let names = bots.iter().filter_map(|bot| bot["name"].as_str());
@@ -4883,9 +4972,12 @@ impl Fleet {
                 self.needs.sure(name);
             }
         }
-        // The calls of other projects' agents are theirs to show.
-        let lineage = self.lineage.clone();
-        self.needs.held(Vec::new(), |bot| !lineage.contains(bot));
+        // The calls of other projects' agents are theirs to show, but for
+        // those of the leads followed.
+        let (lineage, raised) = (self.lineage.clone(), self.raised.clone());
+        self.needs.held(Vec::new(), |bot| {
+            !lineage.contains(bot) && !raised.contains(bot)
+        });
         // Each agent's questions, read again once its history moved: one
         // at a time from the loop, so a project of many tasks opens at once.
         self.unread = (bots.iter())
@@ -4897,10 +4989,92 @@ impl Fleet {
                 (self.scanned.get(name) != Some(&head)).then(|| (name.to_owned(), head))
             })
             .collect();
+        self.unread.extend(raised_unread);
         for bot in self.lineage.clone() {
             self.settle(&bot, false);
         }
         self.name_windows();
+    }
+
+    /// Whether what waits on the person in `bot` waits in this window: one
+    /// of the lineage, or of a lead followed.
+    fn below(&self, bot: &str) -> bool {
+        self.lineage.contains(bot) || self.raised.contains(bot)
+    }
+
+    /// `bot` as this window names it: a task by its short name, another
+    /// project's lead by its project, any other bot by its own name.
+    fn who(&self, bot: &str) -> String {
+        match self.lineage.contains(bot) {
+            true => self.short(bot).to_owned(),
+            false => spoken(bot),
+        }
+    }
+
+    /// Read again which leads this one follows, at most every few seconds
+    /// unless `now`; when they changed, which bots are theirs, and what of
+    /// theirs waits on the person. Returns those whose questions are to be
+    /// read, with the head each is at, as the lineage's are.
+    async fn follow_leads(&mut self, now: bool) -> Vec<(String, Value)> {
+        if !now
+            && self
+                .followed_at
+                .is_some_and(|at| at.elapsed() < FOLLOWED_EVERY)
+        {
+            return Vec::new();
+        }
+        self.followed_at = Some(Instant::now());
+        let store = self.store.clone();
+        let followed = followed_leads(&self.lead, |bot| lookout::subs::read(&store, bot));
+        if !now && !self.refollow && followed == self.followed {
+            return Vec::new();
+        }
+        let mut raised = std::collections::HashSet::new();
+        let mut heads = Vec::new();
+        for lead in &followed {
+            let Some(project) = project::lead_project(lead) else {
+                continue;
+            };
+            // Read again next time when a listing fails.
+            let Some(bots) = bots_named(&self.client, &format!("{project}.*")).await else {
+                self.refollow = true;
+                return Vec::new();
+            };
+            let theirs = lead_and_lineage(&bots, lead);
+            for bot in &bots {
+                if let Some(name) = bot["name"].as_str().filter(|name| theirs.contains(*name)) {
+                    // A turn that ended while away ends what its events
+                    // left unsure: its history, read next, says.
+                    if bot["running_turn"].is_null() {
+                        self.needs.sure(name);
+                    }
+                    heads.push((name.to_owned(), json!([bot["bot_id"], bot["head"]])));
+                }
+            }
+            raised.extend(theirs);
+        }
+        raised.retain(|bot| !self.lineage.contains(bot));
+        for gone in self.raised.difference(&raised) {
+            self.needs.forget(gone);
+            self.scanned.remove(gone);
+        }
+        let mut new = std::mem::take(&mut self.unheld);
+        new.extend(raised.difference(&self.raised).cloned());
+        new.retain(|bot| raised.contains(bot));
+        self.raised = raised;
+        self.followed = followed;
+        self.refollow = false;
+        // A reconcile reads every call after; else the new ones' now, and
+        // when that fails, next time.
+        if !now && !new.is_empty() {
+            match needs::listing(&self.client, None).await {
+                Ok(held) => self.needs.held(held, |bot| new.contains(bot)),
+                Err(_) => (self.unheld, self.refollow) = (new, true),
+            }
+        }
+        (heads.into_iter())
+            .filter(|(bot, head)| self.raised.contains(bot) && self.scanned.get(bot) != Some(head))
+            .collect()
     }
 
     /// The question `bot`'s history has open, unless the task is resolved:
@@ -4917,7 +5091,7 @@ impl Fleet {
     fn adopt(&mut self, read: &needs::Needs, calls: Option<&[String]>, asks: &[String]) {
         let mine = |bots: &[String], sure: bool| -> Vec<String> {
             (bots.iter())
-                .filter(|bot| self.lineage.contains(*bot) && (!sure || !self.needs.unsure(bot)))
+                .filter(|bot| self.below(bot) && (!sure || !self.needs.unsure(bot)))
                 .cloned()
                 .collect()
         };
@@ -4932,6 +5106,8 @@ impl Fleet {
     /// them, and show what they wait on; then those of one agent not read
     /// since the last reconcile.
     async fn rescan(&mut self) {
+        let raised = self.follow_leads(false).await;
+        self.unread.extend(raised);
         for (bot, turn) in self.needs.due() {
             let Some(seen) = needs::scan(&self.client, &bot, turn).await else {
                 continue;
@@ -4943,7 +5119,7 @@ impl Fleet {
             self.settle(&bot, waits);
         }
         if let Some((bot, head)) = self.unread.pop()
-            && self.lineage.contains(&bot)
+            && self.below(&bot)
         {
             // One that failed is read at the next reconcile. While a turn
             // the events left unsure of runs, its end reads it.
@@ -5362,6 +5538,12 @@ impl Fleet {
                 }
                 _ => {}
             }
+        } else if self.raised.contains(bot) && self.needs.event(event) && self.needs.waits(bot) {
+            // A followed lead's bot coming to wait rings here too.
+            if !self.zen {
+                let what = format!("{} needs you", self.who(bot));
+                self.alerts.push((sound::Alert::NeedsYou, what));
+            }
         }
         match kind {
             // A copy that goes once idle is a side chat, not a task.
@@ -5381,6 +5563,24 @@ impl Fleet {
                     Kin::Lead(project) => {
                         self.leads.insert(project);
                     }
+                    // A followed lead's new task is followed with it.
+                    Kin::None if self.raised.contains(by) && !project::is_lead(bot) => {
+                        self.raised.insert(bot.to_owned());
+                    }
+                    // One no agent made may be a followed first lead's:
+                    // the listing says, as it does at the start.
+                    Kin::None
+                        if by.is_empty()
+                            && (self.followed.iter()).any(|lead| {
+                                project::lead_project(lead).is_some_and(|project| {
+                                    *lead == format!("{project}.lead")
+                                        && bot.starts_with(&format!("{project}."))
+                                })
+                            }) =>
+                    {
+                        self.refollow = true;
+                        self.followed_at = None;
+                    }
                     Kin::None => {}
                 }
                 None
@@ -5394,6 +5594,7 @@ impl Fleet {
                 let gone = bot.to_owned();
                 self.layout.send(move |_| used::forget(&gone));
                 self.lineage.remove(bot);
+                self.raised.remove(bot);
                 self.doing.remove(bot);
                 self.activity.remove(bot);
                 self.needs.forget(bot);
@@ -5450,6 +5651,9 @@ impl App {
             }),
             calls: HashMap::new(),
             approvals: Vec::new(),
+            raised: Vec::new(),
+            raised_read: Default::default(),
+            calls_aside: Default::default(),
             asks: Vec::new(),
             focus: None,
             aside: Vec::new(),
@@ -5929,6 +6133,7 @@ impl App {
                 }
             }
             self.pin_task_asks();
+            self.raise_approvals().await;
             self.recheck_task_answers().await;
             self.settle_task_asks().await;
             self.read_running_tasks().await;
@@ -7151,8 +7356,10 @@ impl App {
         if let Some(fleet) = &mut self.fleet {
             fleet.adopt(&needs, held.is_ok().then_some(&read[..]), &ended);
         }
-        // A running task not read again this pass keeps what it asked.
-        self.task_needs.adopt(&needs, &[], &asked);
+        // A running task not read again this pass keeps what it asked; the
+        // calls waiting are as listed, when they could be.
+        let listed: &[String] = if held.is_ok() { &read } else { &[] };
+        self.task_needs.adopt(&needs, listed, &asked);
         for at in self.tasks.keys().copied().collect::<Vec<_>>() {
             let mut changed = false;
             for task in self.tasks.get_mut(&at).into_iter().flatten() {
@@ -10561,39 +10768,15 @@ impl App {
             })
             .cloned()
             .collect();
-        // A long command is listed cut: the person answers the whole of it,
-        // read from the node that planned it, or is told it could not be.
         for call in &mut self.approvals {
-            let whole = call["arguments"].is_object()
-                && call["arguments_cut"].as_array().is_none_or(Vec::is_empty)
-                && call["arguments_omitted"].as_u64().unwrap_or(0) == 0;
-            if whole {
-                continue;
-            }
-            let whole = match self
-                .client
-                .request(
-                    "history_items",
-                    json!({"bot": self.bot, "nodes": [call["node"]]}),
-                )
-                .await
-            {
-                Ok(read) => agent_client::approver::call_arguments(
-                    &read["items"][0]["item"],
-                    call["call_id"].as_str().unwrap_or_default(),
-                ),
-                Err(_) => None,
-            };
-            match whole {
-                Some(arguments) => call["arguments"] = arguments,
-                None => call["incomplete"] = json!(true),
-            }
+            whole_arguments(&self.client, &self.bot, call).await;
         }
-        if let Some(running) = &mut self.running
-            && self.approvals.is_empty()
-            && !self.reviewing.is_empty()
-        {
-            running.phase = reviewing(self.reviewing.len());
+        if let Some(running) = &mut self.running {
+            if !self.approvals.is_empty() {
+                running.phase = "Waiting for your approval".into();
+            } else if !self.reviewing.is_empty() {
+                running.phase = reviewing(self.reviewing.len());
+            }
         }
         if !self.approvals.is_empty() {
             status_report("blocked", &self.bot);
@@ -10605,20 +10788,142 @@ impl App {
         }
     }
 
+    /// The calls of the bots below this window that wait on the person,
+    /// read as the fleet, or with none the tasks this window tracks, say
+    /// they wait: each looked up once, as its own window lists it, and let
+    /// go once it waits no more, answered here or anywhere else.
+    async fn raise_approvals(&mut self) {
+        let tracked: std::collections::HashSet<&str> = (self.tasks.values().flatten())
+            .map(|task| task.bot.as_str())
+            .collect();
+        let me = self.bot.as_str();
+        let wanted: std::collections::BTreeSet<(String, i64, String)> = match &self.fleet {
+            Some(fleet) => (fleet.needs.calls())
+                .filter(|(bot, ..)| *bot != me && fleet.below(bot))
+                .map(|(bot, turn, call)| (bot.to_owned(), turn, call.to_owned()))
+                .collect(),
+            None => (self.task_needs.calls())
+                .filter(|(bot, ..)| *bot != me && tracked.contains(bot))
+                .map(|(bot, turn, call)| (bot.to_owned(), turn, call.to_owned()))
+                .collect(),
+        };
+        let key = |call: &Value| {
+            (
+                call["bot"].as_str().unwrap_or_default().to_owned(),
+                call["turn"].as_i64().unwrap_or(-1),
+                call["call_id"].as_str().unwrap_or_default().to_owned(),
+            )
+        };
+        self.raised.retain(|call| wanted.contains(&key(call)));
+        self.raised_read.retain(|read| wanted.contains(read));
+        let unread: std::collections::BTreeSet<&str> = (wanted.iter())
+            .filter(|read| !self.raised_read.contains(*read))
+            .map(|(bot, ..)| bot.as_str())
+            .collect();
+        'bots: for bot in unread {
+            // Every page, so a call past the first is not taken as answered.
+            let mut after = Value::Null;
+            loop {
+                let mut asked = json!({"bot": bot, "limit": 64});
+                if !after.is_null() {
+                    asked["after"] = after;
+                }
+                let Ok(page) = self.client.request("approvals", asked).await else {
+                    continue 'bots;
+                };
+                for call in page["approvals"].as_array().into_iter().flatten() {
+                    let read = key(call);
+                    if !needs::person_call(call)
+                        || !wanted.contains(&read)
+                        || self.raised_read.contains(&read)
+                    {
+                        continue;
+                    }
+                    let mut call = call.clone();
+                    whole_arguments(&self.client, bot, &mut call).await;
+                    self.names.get_mut().learn(bot.to_owned(), true);
+                    self.raised.push(call);
+                    self.raised_read.insert(read);
+                }
+                after = page["next_after"].clone();
+                if after.is_null() {
+                    break;
+                }
+            }
+            // Looked up, held or not: one no longer listed was answered.
+            for read in wanted.iter().filter(|(of, ..)| of == bot) {
+                self.raised_read.insert(read.clone());
+            }
+        }
+        let waiting: std::collections::HashSet<(String, String)> =
+            (self.approvals.iter().chain(&self.raised))
+                .map(|call| {
+                    let (bot, _, call) = key(call);
+                    (bot, call)
+                })
+                .collect();
+        self.calls_aside.retain(|call| waiting.contains(call));
+    }
+
+    /// The call the keys answer: this window's own first, then those
+    /// raised from below, none of those Esc set aside.
+    fn waiting(&self) -> Option<&Value> {
+        (self.approvals.iter().chain(&self.raised)).find(|call| !self.set_aside(call))
+    }
+
+    /// Whether Esc set `call` aside.
+    fn set_aside(&self, call: &Value) -> bool {
+        let bot = call["bot"].as_str().unwrap_or(&self.bot);
+        let id = call["call_id"].as_str().unwrap_or_default();
+        (self.calls_aside.iter()).any(|(of, aside)| of == bot && aside == id)
+    }
+
+    /// How many calls wait on the person here, and of those how many Esc
+    /// set aside.
+    fn calls_waiting(&self) -> (usize, usize) {
+        let all = self.approvals.iter().chain(&self.raised);
+        let aside = all.clone().filter(|call| self.set_aside(call)).count();
+        (all.count(), aside)
+    }
+
     /// Answers the call waiting first; one allowed is recorded under it,
     /// with the command `kept` from now on when it is always allowed.
     async fn answer(&mut self, decision: &str, kept: Option<&str>) {
-        let call = self.approvals.remove(0);
+        let first = |calls: &[Value]| calls.iter().position(|call| !self.set_aside(call));
+        let Some((own, at)) = (first(&self.approvals).map(|at| (true, at)))
+            .or_else(|| first(&self.raised).map(|at| (false, at)))
+        else {
+            return;
+        };
+        let call = match own {
+            true => self.approvals.remove(at),
+            false => self.raised.remove(at),
+        };
+        let bot = call["bot"].as_str().unwrap_or(&self.bot).to_owned();
         let answered = self
             .client
             .request(
                 "answer",
-                json!({"bot": self.bot, "turn": call["turn"], "call_id": call["call_id"],
+                json!({"bot": bot, "turn": call["turn"], "call_id": call["call_id"],
                     "request": call["request"], "tag": person_gate(&call), "decision": decision,
                     "by": "tui"}),
             )
             .await;
         match answered {
+            // A call below that could not be answered is read again: it
+            // waits here still, asked again under a new request when an
+            // earlier call of its round was refused.
+            Err(error) if !own => {
+                self.notice = Some(error.to_string());
+                let read = (
+                    bot,
+                    call["turn"].as_i64().unwrap_or(-1),
+                    call["call_id"].as_str().unwrap_or_default().to_owned(),
+                );
+                self.raised_read.remove(&read);
+                self.raise_approvals().await;
+                return;
+            }
             Err(error) => self.notice = Some(error.to_string()),
             Ok(_) if decision == "allow" => {
                 let name = call["name"].as_str().unwrap_or("tool");
@@ -10632,6 +10937,9 @@ impl App {
                 self.commit(lines);
             }
             Ok(_) => {}
+        }
+        if !own {
+            return;
         }
         // A round with more calls waiting than one listing holds shows
         // the rest once these are answered.
@@ -11378,8 +11686,9 @@ impl App {
     }
 
     /// The other agents at work, and how many agents wait on the person:
-    /// this one, with a question or a call of its open here, and the others
-    /// as their windows' names say ([`Fleet::settle`]). Without windows for
+    /// this one, with a question or a call of its open here, the others
+    /// as their windows' names say ([`Fleet::settle`]), and those of the
+    /// leads followed ([`Fleet::raised`]). Without windows for
     /// the project's agents, the tasks this one started: those running as
     /// the daemon says, drawn or not, and those that need the person as
     /// their rosters read them.
@@ -11411,7 +11720,16 @@ impl App {
         let here = self.asks.iter().any(|ask| ask.task.is_none())
             || !self.approvals.is_empty()
             || (self.fleet.as_ref()).is_some_and(|fleet| fleet.needs.waits(&self.bot));
-        (count("working"), usize::from(here) + count("needs you"))
+        // Those of the leads followed wait here too, though no tab is theirs.
+        let raised = (self.fleet.as_ref()).map_or(0, |fleet| {
+            (fleet.raised.iter())
+                .filter(|bot| fleet.needs.waits(bot))
+                .count()
+        });
+        (
+            count("working"),
+            usize::from(here) + count("needs you") + raised,
+        )
     }
 
     /// A button clicked: what Sonny does for it now, or once the loop
@@ -12191,14 +12509,14 @@ impl App {
                     KeyCode::Char(c @ ('y' | 'n'))
                         if !ctrl
                             && !alt
-                            && !self.approvals.is_empty()
+                            && let Some(call) = self.waiting()
                             && self.paused.is_none()
                             && self.input.is_empty()
                             && !self.new_brief() =>
                     {
                         // A call whose whole arguments could not be read
                         // can only be denied.
-                        if c == 'y' && self.approvals[0]["incomplete"] == true {
+                        if c == 'y' && call["incomplete"] == true {
                             self.notice =
                                 Some("only part of this call could be read; n denies it".into());
                         } else {
@@ -12212,8 +12530,7 @@ impl App {
                             && self.paused.is_none()
                             && self.input.is_empty()
                             && !self.new_brief()
-                            && let Some(prefix) =
-                                self.approvals.first().and_then(approvals::always) =>
+                            && let Some(prefix) = self.waiting().and_then(approvals::always) =>
                     {
                         self.always(&prefix).await;
                     }
@@ -12252,7 +12569,7 @@ impl App {
                         if !alt
                             && self.input.is_empty()
                             && self.asks.is_empty()
-                            && self.approvals.is_empty()
+                            && self.waiting().is_none()
                             && self.react_to.is_none() =>
                     {
                         self.shortcuts()
@@ -12303,6 +12620,15 @@ impl App {
                     KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => {
                         self.input.insert("\n")
                     }
+                    // Calls set aside come back to be answered.
+                    KeyCode::Enter
+                        if self.input.is_empty()
+                            && self.waiting().is_none()
+                            && self.calls_waiting().1 > 0 =>
+                    {
+                        self.calls_aside.clear();
+                        self.asked = None;
+                    }
                     KeyCode::Enter => self.submit().await,
                     // Tab sends it to run once the running turn ends, as
                     // Codex queues; Enter steers.
@@ -12316,8 +12642,21 @@ impl App {
                         }
                     }
                     // As Codex's bottom pane does, Esc closes what is open
-                    // over the composer before it stops anything: an open
-                    // question is set aside first, as its hint says.
+                    // over the composer before it stops anything: the calls
+                    // waiting on the person are set aside first, the keys
+                    // typing again, then an open question, as their hints
+                    // say.
+                    KeyCode::Esc if self.waiting().is_some() => {
+                        let aside: Vec<(String, String)> = (self.approvals.iter())
+                            .chain(&self.raised)
+                            .map(|call| {
+                                let bot = call["bot"].as_str().unwrap_or(&self.bot);
+                                let id = call["call_id"].as_str().unwrap_or_default();
+                                (bot.to_owned(), id.to_owned())
+                            })
+                            .collect();
+                        self.calls_aside.extend(aside);
+                    }
                     KeyCode::Esc if !self.asks.is_empty() && !self.chatting => {
                         self.chatting = true;
                     }
@@ -13409,8 +13748,9 @@ impl App {
         }
     }
 
-    /// The open questions of this lead's tasks, as the fleet reads them,
-    /// pinned beside the lead's own, each card drawn as it comes: the
+    /// The open questions of this lead's tasks, and of the leads it follows
+    /// and their tasks at any depth ([`Fleet::raised`]), as the fleet reads
+    /// them, pinned beside the lead's own, each card drawn as it comes: the
     /// person answers a task from here as from its own window, the same
     /// answer to the same ask, which its task takes once. One that closed
     /// elsewhere, answered in the task's window or by words past it, is
@@ -13419,7 +13759,7 @@ impl App {
         let read = (
             self.fleet.as_ref().map_or(0, |fleet| fleet.needs.version()),
             self.task_needs.version(),
-            self.fleet.as_ref().map_or(0, |fleet| fleet.lineage.len()),
+            (self.fleet.as_ref()).map_or(0, |fleet| fleet.lineage.len() + fleet.raised.len()),
             self.tasks.values().map(Vec::len).sum(),
         );
         if self.task_asks_read.replace(read) == Some(read) {
@@ -13441,8 +13781,8 @@ impl App {
         let mut open: Vec<asks::Ask> = match &self.fleet {
             Some(fleet) => (fleet.needs.asks())
                 .filter(|(bot, _)| *bot != self.bot && *bot != fleet.lead)
-                .filter(|(bot, _)| fleet.lineage.contains(*bot))
-                .map(|(bot, ask)| pinned(bot, ask, fleet.short(bot).to_owned()))
+                .filter(|(bot, _)| fleet.below(bot))
+                .map(|(bot, ask)| pinned(bot, ask, fleet.who(bot)))
                 .collect(),
             None => (self.task_needs.asks())
                 .filter(|(bot, _)| *bot != self.bot && tracked.contains(bot))
@@ -13907,7 +14247,7 @@ impl App {
         let shows = self.input.is_empty()
             && self.running.is_none()
             && self.asks.is_empty()
-            && self.approvals.is_empty()
+            && self.calls_waiting().0 == 0
             && !open;
         self.suggestion.as_ref().filter(|_| shows)
     }
@@ -14377,15 +14717,19 @@ impl App {
 
     /// The call waiting on the person, written out whole above the
     /// status row before `y` can allow it: the row shows only the keys.
+    /// As Codex's approval shows it: whose it is when not this window's
+    /// own, as Codex names the thread a subagent's call comes from; the
+    /// agent's reason, then the command; then what the reviewer doubted,
+    /// whole.
     fn show_asked(&mut self) {
-        let Some(call) = self.approvals.first() else {
+        let Some(call) = self.waiting() else {
             self.asked = None;
             return;
         };
-        if self.asked.as_ref() == Some(&call["call_id"]) {
+        let id = json!([call["bot"], call["call_id"]]);
+        if self.asked.as_ref() == Some(&id) {
             return;
         }
-        self.asked = Some(call["call_id"].clone());
         let name = call["name"].as_str().unwrap_or("tool").to_owned();
         let arguments = &call["arguments"];
         let what = arguments["command"]
@@ -14393,10 +14737,28 @@ impl App {
             .or_else(|| arguments["path"].as_str())
             .map(str::to_owned)
             .unwrap_or_else(|| arguments.to_string());
-        let mut lines = vec![Line::from(vec![
+        let mut lines = Vec::new();
+        // By the agent's whole name, as a task's question is, which opens
+        // it as any agent's name drawn does.
+        if let Some(bot) = call["bot"].as_str().filter(|bot| *bot != self.bot) {
+            lines.push(Line::from(format!("↳ From {bot}")).dim());
+        }
+        lines.push(Line::from(vec![
             Span::raw("⏸ ").fg(Color::Yellow),
             Span::raw(format!("Allow {name}?")).bold(),
-        ])];
+        ]));
+        // The agent's own words for why it asks, as Codex's `Reason:`.
+        if let Some(reason) = (arguments["justification"].as_str())
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+        {
+            let mut reason = reason.lines();
+            lines.push(Line::from(vec![
+                Span::raw("  Reason: "),
+                Span::raw(reason.next().unwrap_or_default().to_owned()).italic(),
+            ]));
+            lines.extend(reason.map(|line| Line::from(Span::raw(format!("  {line}")).italic())));
+        }
         lines.extend(what.lines().map(|line| Line::from(format!("  {line}"))));
         // A call an exec script makes, which waits while it is asked.
         if call["step_of"].is_string() {
@@ -14407,11 +14769,16 @@ impl App {
                 Line::from("  … cut; the rest could not be read, so y is off: n denies it").dim(),
             );
         }
-        // What the judge doubted, when it handed the call over.
+        // What the reviewer doubted, whole, when it handed the call over.
         if let Some(reason) = call["asked"][0]["reason"].as_str() {
-            let why = reason.split(". ").next().unwrap_or(reason);
-            lines.push(Line::from(format!("  {why}")).dim());
+            lines.extend(
+                reason
+                    .trim()
+                    .lines()
+                    .map(|line| Line::from(format!("  {line}")).dim()),
+            );
         }
+        self.asked = Some(id);
         // What the agent said before the call reads before it, a step as
         // the call's start would make it.
         self.end_live(Words::Step);
@@ -15201,6 +15568,9 @@ impl App {
                 ),
                 _ if self.new_brief() => said("What should it do?", "enter start · esc back"),
                 _ if self.react_to.is_some() => said("An emoji for that reply", "esc cancel"),
+                // Answered with its keys, until Esc sets it aside.
+                _ if self.waiting().is_some() => said("An approval waits", "esc type a message"),
+                _ if self.calls_waiting().1 > 0 => said("A message of your own", "enter approval"),
                 _ if !self.asks.is_empty() => said("A message of your own", "esc answer"),
                 Some(_) => vec![Span::raw(format!("Steer {name}")).dim()],
                 None => vec![Span::raw(format!("Message {name}")).dim()],
@@ -15216,7 +15586,7 @@ impl App {
                 && self.asks.is_empty()
                 && self.react_to.is_none()
                 && !self.new_brief()
-                && self.approvals.is_empty()
+                && self.calls_waiting().0 == 0
             {
                 spans.push(Span::raw(" · ").dim());
                 spans.extend(hint::spans("? shortcuts"));
@@ -15321,12 +15691,12 @@ impl App {
                 }
             }
             line.push(Span::raw(" · /resume").dim());
-            if !self.approvals.is_empty() {
+            if self.calls_waiting().0 > 0 {
                 line.push(Span::raw(" · an approval waits").dim());
             }
             return Line::from(line);
         }
-        if let Some(call) = self.approvals.first() {
+        if let Some(call) = self.waiting() {
             // Only the keys: the call is written out whole right above,
             // under the same ⏸, so the row does not say it again.
             let mut line = vec![
@@ -15338,9 +15708,23 @@ impl App {
                 line.push(Span::raw("a"));
                 line.push(Span::raw(format!(" always allow {prefix} · ")).dim());
             }
-            line.extend([Span::raw("n"), Span::raw(" deny").dim()]);
+            line.extend([Span::raw("n"), Span::raw(" deny · ").dim()]);
+            line.extend([Span::raw("esc"), Span::raw(" set aside").dim()]);
             return Line::from(line);
         }
+        // Set aside, a call still waits: said until it is answered, after
+        // what runs.
+        let aside = match self.calls_waiting().1 {
+            0 => Vec::new(),
+            1 => vec![
+                Span::raw("⏸ ").fg(Color::Yellow),
+                Span::raw("1 approval set aside"),
+            ],
+            n => vec![
+                Span::raw("⏸ ").fg(Color::Yellow),
+                Span::raw(format!("{n} approvals set aside")),
+            ],
+        };
         if let Some(running) = self.running.as_ref().filter(|_| !self.zen_hides()) {
             let mut spans = vec![Span::raw("• ").dim()];
             // In zen, what it runs or calls stays out of view, as its calls do.
@@ -15361,7 +15745,14 @@ impl App {
                 ))
                 .dim(),
             );
+            if !aside.is_empty() {
+                spans.push(Span::raw(" · ").dim());
+                spans.extend(aside);
+            }
             return Line::from(spans);
+        }
+        if !aside.is_empty() {
+            return Line::from(aside);
         }
         match &self.notice {
             Some(notice) => Line::from(Span::raw(notice.clone())),
@@ -15852,6 +16243,34 @@ fn shimmer(text: &str, since: Duration) -> Vec<Span<'static>> {
             Span::styled(c.to_string(), style)
         })
         .collect()
+}
+
+/// A call listed cut made whole: the person answers the whole of it, read
+/// from the node of `bot`'s that planned it, or is told it could not be.
+async fn whole_arguments(client: &Client, bot: &str, call: &mut Value) {
+    let whole = call["arguments"].is_object()
+        && call["arguments_cut"].as_array().is_none_or(Vec::is_empty)
+        && call["arguments_omitted"].as_u64().unwrap_or(0) == 0;
+    if whole {
+        return;
+    }
+    let read = client
+        .request(
+            "history_items",
+            json!({"bot": bot, "nodes": [call["node"]]}),
+        )
+        .await;
+    let whole = match read {
+        Ok(read) => agent_client::approver::call_arguments(
+            &read["items"][0]["item"],
+            call["call_id"].as_str().unwrap_or_default(),
+        ),
+        Err(_) => None,
+    };
+    match whole {
+        Some(arguments) => call["arguments"] = arguments,
+        None => call["incomplete"] = json!(true),
+    }
 }
 
 /// The gate a person answers a call on: the first that handed it over,
@@ -17135,7 +17554,7 @@ mod tests {
         app.daemon(json!({"event": "resumed", "pause": pause, "durable": false}))
             .await;
         assert!(app.paused.is_none());
-        assert_eq!(shown(&app), "⏸ y allow once · n deny");
+        assert_eq!(shown(&app), "⏸ y allow once · n deny · esc set aside");
     }
 
     #[tokio::test]
@@ -22401,6 +22820,362 @@ mod tests {
         ));
         assert_eq!(fleet.doing["calc.fix"], "working");
         assert_eq!(app.agents(), (1, 2));
+    }
+
+    /// The leads a lead follows by name, and theirs in turn, each once:
+    /// a pattern names none, nor does a task, nor the lead itself.
+    #[test]
+    fn the_leads_followed_are_read_at_every_level_by_name() {
+        let sub = |names: &[&str]| {
+            let mut sub = lookout::subs::Sub::lead("home.lead", "home");
+            sub.tasks_of = names.iter().map(|name| name.to_string()).collect();
+            sub
+        };
+        let read = |bot: &str| match bot {
+            "home.lead" => vec![sub(&["home.lead", "shop.lead", "shop.fix"])],
+            "shop.lead" => vec![sub(&["pay.lead.cards", "home.lead"])],
+            "pay.lead.cards" => vec![sub(&["shop.lead", "web.*"])],
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            followed_leads("home.lead", read),
+            ["pay.lead.cards", "shop.lead"]
+        );
+        assert!(followed_leads("calc.lead", read).is_empty());
+    }
+
+    /// A followed lead's bots are the lead and its lineage: never a
+    /// project's inside it, which has a lead of its own.
+    #[test]
+    fn a_followed_leads_bots_are_its_own_and_not_an_inner_projects() {
+        let bot = |name: &str, by: &str| json!({"name": name, "created_by": by});
+        let bots = [
+            bot("shop.lead", ""),
+            bot("shop.fix", "shop.lead"),
+            bot("shop.fix.check", "shop.fix"),
+            bot("shop.loose", ""),
+            bot("shop.web.lead", ""),
+            bot("shop.web.page", "shop.web.lead"),
+            bot("shop.web.loose", ""),
+            // A side chat of a task is the person's own.
+            json!({"name": "shop.fix.side", "created_by": "shop.fix", "expire_ms": 60000}),
+        ];
+        let mut theirs: Vec<String> = lead_and_lineage(&bots, "shop.lead").into_iter().collect();
+        theirs.sort();
+        assert_eq!(
+            theirs,
+            ["shop.fix", "shop.fix.check", "shop.lead", "shop.loose"]
+        );
+        // Another lead of the folder has only what it made.
+        let bots = [
+            bot("shop.lead.web", ""),
+            bot("shop.page", "shop.lead.web"),
+            bot("shop.fix", "shop.lead"),
+        ];
+        let mut theirs: Vec<String> = lead_and_lineage(&bots, "shop.lead.web")
+            .into_iter()
+            .collect();
+        theirs.sort();
+        assert_eq!(theirs, ["shop.lead.web", "shop.page"]);
+    }
+
+    /// The bots of the leads a window follows are listed when the follows
+    /// file names them, and again when a bot no agent made appears in a
+    /// followed first lead's project; idle ones are read afresh.
+    #[tokio::test]
+    async fn a_followed_leads_bots_are_listed_and_a_loose_one_joins_them() {
+        let dir = std::env::temp_dir().join(format!("followed-{}", std::process::id()));
+        let store = dir.join("store");
+        let mut sub = lookout::subs::Sub::lead("home.lead", "home");
+        sub.tasks_of = vec!["shop.lead".into()];
+        std::fs::create_dir_all(lookout::subs::dir(&store)).unwrap();
+        std::fs::write(
+            lookout::subs::dir(&store).join("home.lead.json"),
+            json!({"subscriptions": [sub.to_json()]}).to_string(),
+        )
+        .unwrap();
+        let loose = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listed = loose.clone();
+        let (client, events) = daemon_with_events(json!({}), move |asked| {
+            match (asked["op"].as_str().unwrap_or(""), asked["name"].as_str()) {
+                ("bots", Some("shop.*")) => {
+                    let mut bots = vec![
+                        json!({"name": "shop.lead", "bot_id": 1, "head": 1}),
+                        json!({"name": "shop.fix", "bot_id": 2, "head": 2,
+                            "created_by": "shop.lead", "running_turn": 5}),
+                    ];
+                    if listed.load(std::sync::atomic::Ordering::SeqCst) {
+                        bots.push(json!({"name": "shop.loose", "bot_id": 3, "head": 3}));
+                    }
+                    json!({"bots": bots})
+                }
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client, events, "home", "home.lead");
+        fleet.store = store;
+        let unread = fleet.follow_leads(true).await;
+        let mut raised: Vec<&String> = fleet.raised.iter().collect();
+        raised.sort();
+        assert_eq!(raised, ["shop.fix", "shop.lead"]);
+        assert_eq!(unread.len(), 2);
+        // Unchanged, the file is not listed again.
+        assert!(fleet.follow_leads(false).await.is_empty());
+        // A bot no agent made, in a followed first lead's project.
+        loose.store(true, std::sync::atomic::Ordering::SeqCst);
+        fleet.event(&json!({"event": "created", "bot": "shop.loose", "data": {}}));
+        let unread = fleet.follow_leads(false).await;
+        assert!(fleet.raised.contains("shop.loose"));
+        assert!(unread.iter().any(|(bot, _)| bot == "shop.loose"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A followed lead's bots that a reconnect could not list are listed on
+    /// the next read, though no follows file changed.
+    #[tokio::test]
+    async fn a_followed_leads_bots_are_listed_again_when_a_reconnect_cannot() {
+        let dir = std::env::temp_dir().join(format!("refollow-{}", std::process::id()));
+        let store = dir.join("store");
+        let mut sub = lookout::subs::Sub::lead("home.lead", "home");
+        sub.tasks_of = vec!["shop.lead".into()];
+        std::fs::create_dir_all(lookout::subs::dir(&store)).unwrap();
+        std::fs::write(
+            lookout::subs::dir(&store).join("home.lead.json"),
+            json!({"subscriptions": [sub.to_json()]}).to_string(),
+        )
+        .unwrap();
+        let listings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (client, events) = daemon_with_events(json!({}), move |asked| {
+            if asked["op"] != "bots" {
+                return json!({});
+            }
+            let mut bots = vec![json!({"name": "shop.lead", "bot_id": 1, "head": 1})];
+            match listings.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => {}
+                1 => return json!({"error": "internal", "detail": "try again"}),
+                // A task made while away.
+                _ => bots.push(json!({"name": "shop.fix", "bot_id": 2, "head": 2,
+                    "created_by": "shop.lead"})),
+            }
+            json!({"bots": bots})
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client, events, "home", "home.lead");
+        fleet.store = store;
+        fleet.follow_leads(true).await;
+        assert!(fleet.raised.contains("shop.lead"));
+        // The reconnect's listing fails.
+        fleet.follow_leads(true).await;
+        fleet.followed_at = None;
+        fleet.follow_leads(false).await;
+        assert!(fleet.raised.contains("shop.fix"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A newly followed lead's calls that could not be listed are listed
+    /// on the next read, though no follows file changed.
+    #[tokio::test]
+    async fn a_followed_leads_calls_are_listed_again_when_a_listing_fails() {
+        let dir = std::env::temp_dir().join(format!("unheld-{}", std::process::id()));
+        let store = dir.join("store");
+        let mut sub = lookout::subs::Sub::lead("home.lead", "home");
+        sub.tasks_of = vec!["shop.lead".into()];
+        std::fs::create_dir_all(lookout::subs::dir(&store)).unwrap();
+        std::fs::write(
+            lookout::subs::dir(&store).join("home.lead.json"),
+            json!({"subscriptions": [sub.to_json()]}).to_string(),
+        )
+        .unwrap();
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (client, events) = daemon_with_events(json!({}), move |asked| {
+            match asked["op"].as_str().unwrap_or("") {
+                "bots" => json!({"bots": [
+                    json!({"name": "shop.lead", "bot_id": 1, "head": 1}),
+                    json!({"name": "shop.fix", "bot_id": 2, "head": 2,
+                        "created_by": "shop.lead", "running_turn": 5}),
+                ]}),
+                "approvals" if !failed.swap(true, std::sync::atomic::Ordering::SeqCst) => {
+                    json!({"error": "internal", "detail": "try again"})
+                }
+                "approvals" => json!({"approvals": [
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c1", "request": 1,
+                        "name": "shell", "gates": ["auto"],
+                        "asked": [{"tag": "auto", "reason": "It publishes."}],
+                        "arguments": {"command": "cargo publish"}},
+                ]}),
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client, events, "home", "home.lead");
+        fleet.store = store;
+        fleet.follow_leads(false).await;
+        assert!(fleet.raised.contains("shop.fix"));
+        assert_eq!(fleet.needs.calls().count(), 0);
+        fleet.followed_at = None;
+        fleet.follow_leads(false).await;
+        assert_eq!(
+            fleet.needs.calls().collect::<Vec<_>>(),
+            [("shop.fix", 4, "c1")]
+        );
+        assert!(fleet.unheld.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A call of a followed lead's task waits in the window the person is
+    /// in: written out whole as its own window writes it, by whose it is,
+    /// with the agent's reason; answered from there on the task's own
+    /// call; set aside with Esc, the keys typing again, and brought back
+    /// with Enter.
+    #[tokio::test]
+    async fn a_followed_tasks_approval_waits_and_is_answered_in_the_window_youre_in() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let seen_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Each listing asks anew, as a round re-announced after a refusal.
+        let request = Arc::new(std::sync::atomic::AtomicU64::new(9));
+        let (client, events) = daemon_with_events(json!({}), move |asked| {
+            match (asked["op"].as_str().unwrap_or(""), asked["bot"].as_str()) {
+                ("approvals", Some("shop.fix")) => json!({"approvals": [
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c1",
+                        "request": request.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                        "name": "shell", "gates": ["auto"],
+                        "asked": [{"tag": "auto", "reason": "It publishes the crate.\nNothing the person said asks for it."}],
+                        "arguments": {"command": "cargo publish",
+                            "justification": "Releasing needs the registry."}},
+                    // One a reviewer still weighs is not the person's.
+                    {"bot": "shop.fix", "turn": 4, "call_id": "c2", "gates": ["auto"],
+                        "name": "shell", "arguments": {"command": "ls"}},
+                ]}),
+                // The first answer does not reach the daemon.
+                ("answer", _) if !seen_once.swap(true, std::sync::atomic::Ordering::SeqCst) => {
+                    json!({"error": "internal", "detail": "try again"})
+                }
+                ("answer", _) => {
+                    seen.lock().unwrap().push(asked.clone());
+                    json!({})
+                }
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "home", "home.lead");
+        fleet.raised.insert("shop.fix".into());
+        let held = vec![("shop.fix".to_owned(), 4, "c1".to_owned())];
+        fleet.needs.held(held, |_| true);
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.fleet = Some(fleet);
+        app.raise_approvals().await;
+        assert_eq!(app.raised.len(), 1);
+        // The footer counts it among what needs the person.
+        assert_eq!(app.agents(), (0, 1));
+        app.show_asked();
+        let text = |lines: &[Line]| -> Vec<String> {
+            (lines.iter())
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect()
+                })
+                .collect()
+        };
+        assert_eq!(
+            text(&app.pending),
+            [
+                "↳ From shop.fix",
+                "⏸ Allow shell?",
+                "  Reason: Releasing needs the registry.",
+                "  cargo publish",
+                "  It publishes the crate.",
+                "  Nothing the person said asks for it.",
+            ]
+        );
+        // Read once, however often the loop asks.
+        app.raise_approvals().await;
+        app.show_asked();
+        assert_eq!((app.raised.len(), app.pending.len()), (1, 6));
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        // Esc sets it aside: y types, and the row says it still waits.
+        app.key(key(KeyCode::Esc)).await;
+        app.key(key(KeyCode::Char('y'))).await;
+        assert_eq!(app.input.trim(), "y");
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(text(&[app.status_line()]), ["⏸ 1 approval set aside"]);
+        // With nothing typed, Enter brings it back, written out again.
+        app.input.set("");
+        app.key(key(KeyCode::Enter)).await;
+        assert!(app.waiting().is_some());
+        app.show_asked();
+        let again = app.pending.len() - 6;
+        assert_eq!(text(&app.pending[again..]), text(&app.pending[..6]));
+        // An answer that failed leaves it waiting here, to answer again.
+        app.key(key(KeyCode::Char('n'))).await;
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(app.notice.as_deref(), Some("internal (try again)"));
+        assert!(app.waiting().is_some());
+        // Answered on the task's own call, and let go here.
+        app.key(key(KeyCode::Char('n'))).await;
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            (
+                &sent[0]["bot"],
+                &sent[0]["call_id"],
+                &sent[0]["decision"],
+                &sent[0]["tag"]
+            ),
+            (
+                &json!("shop.fix"),
+                &json!("c1"),
+                &json!("deny"),
+                &json!("auto")
+            )
+        );
+        // Under the request it was read again with, not the one that failed.
+        assert_eq!(sent[0]["request"], 10);
+        assert!(app.raised.is_empty() && app.waiting().is_none());
+        // Answered anywhere, it waits here no more.
+        let fleet = app.fleet.as_mut().unwrap();
+        fleet
+            .needs
+            .held(vec![("shop.fix".to_owned(), 4, "c3".to_owned())], |_| true);
+        fleet.event(
+            &json!({"event": "step_decided", "bot": "shop.fix", "turn": 4,
+            "data": {"call_id": "c3"}}),
+        );
+        app.raise_approvals().await;
+        assert!(app.raised.is_empty());
+    }
+
+    /// A followed lead's task asking a question pins it here, by whose it
+    /// is, as one of this lead's own tasks would.
+    #[tokio::test]
+    async fn a_followed_tasks_question_pins_in_the_window_youre_in() {
+        let (client, events) = daemon_with_events(json!({}), |_| json!({})).await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "home", "home.lead");
+        fleet.raised.insert("shop.ask".into());
+        let ask = asks::call("q1", &json!({"question": "Ship it?", "why": "w",
+            "options": [{"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]}))
+            .unwrap();
+        fleet.needs.asked("shop.ask", Some(ask));
+        // Another project's, not followed, stays its own.
+        let other = asks::call("q2", &json!({"question": "Other?", "why": "w",
+            "options": [{"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]}))
+            .unwrap();
+        fleet.needs.asked("calc.ask", Some(other));
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.fleet = Some(fleet);
+        app.pin_task_asks();
+        assert_eq!(app.asks.len(), 1);
+        let task = app.asks[0].task.clone().unwrap();
+        assert_eq!(
+            (task.bot.as_str(), task.name.as_str()),
+            ("shop.ask", "shop.ask")
+        );
     }
 
     /// A task's question shows in its lead's window too, by whose it is,

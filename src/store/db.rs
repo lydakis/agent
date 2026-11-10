@@ -9588,6 +9588,12 @@ impl Database {
     /// What each listed call and earlier prompt counts against `bytes` for
     /// its fields, so many short entries cannot outgrow a reply.
     pub const PROMPTS_ENTRY: usize = 64;
+    /// The most bytes of file names a `prompts` read lists as `written` by
+    /// the calls it leaves out.
+    pub const PROMPTS_WRITTEN: usize = 8 * 1024;
+    /// The most calls a `prompts` read looks through, past its `bytes`, for
+    /// the files they wrote; more leave `written_more`.
+    pub const PROMPTS_SCANNED: usize = 256;
     /// The most bytes a prompt's words and the words it quotes may have
     /// together, as many as its words alone may.
     pub const QUOTED_BYTES: usize = 256 * 1024;
@@ -9742,12 +9748,13 @@ impl Database {
     /// the calls refused after it (`refused`), and this turn's carry the
     /// end of the bot's last message before them (`reply`): its last of
     /// the turn before for the prompt, one since the previous words for a
-    /// steer. The words' text counts against
-    /// `bytes` in that order and the calls' against their own `bytes`, and
-    /// each steer, call, and earlier prompt also counts `PROMPTS_ENTRY`;
-    /// text that does not fit is cut and marked
-    /// `truncated`, and `prompts_more`, `calls_more`, and `more` say steers,
-    /// calls, and earlier prompts were left out.
+    /// steer. The words' text counts against `bytes`, the prompt first and
+    /// then the steers newest first, and the calls' against their own
+    /// `bytes`, newest first, as Codex's reviewer keeps the newest; each
+    /// steer, call, and earlier prompt also counts `PROMPTS_ENTRY`; text
+    /// that does not fit is cut and marked `truncated`, and `prompts_more`,
+    /// `calls_more`, and `more` say older steers, calls, and earlier prompts
+    /// were left out.
     pub fn prompts(&self, name: &str, turn: i64, bytes: usize) -> Result<Value> {
         if !(1..=Self::PROMPTS_BYTES).contains(&bytes) {
             return fail_with(
@@ -9776,7 +9783,16 @@ impl Database {
             self.inspect(name)?;
             return fail("turn_not_found");
         };
-        let mut left = bytes;
+        // With steers, the prompt and what it answers take at most half:
+        // the rest is kept for the newest steers, so a long prompt never
+        // leaves out the person's newest words; what it leaves unused
+        // goes to them too.
+        let steered: bool = self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM events WHERE turn=? AND kind='steered')")?
+            .query_row([turn], |r| r.get(0))?;
+        let kept_for_steers = if steered { bytes / 2 } else { 0 };
+        let mut left = bytes - kept_for_steers;
         let mut first = self.prompt_entry(turn, words, &mut left)?;
         // What the bot last said before the words: what a person's short
         // answer, such as "yes", answers.
@@ -9798,33 +9814,43 @@ impl Database {
         if let Some(said) = said {
             first["reply"] = Self::reply(&said, &mut left);
         }
-        let mut prompts = vec![first];
+        left += kept_for_steers;
         let mut prompts_more = false;
+        // The newest steers first, as Codex's reviewer keeps a person's
+        // newest words: what is left out is older than all that is read.
+        // Each row names the steer before it, whose event its reply is
+        // read after; read a row at a time, and only while there is room.
         let mut steers = self.conn.prepare_cached(
-            "SELECT json_extract(data,'$.steer'),id FROM events WHERE turn=? AND kind='steered' ORDER BY id",
+            "SELECT json_extract(e.data,'$.steer'),e.id,
+                COALESCE((SELECT MAX(b.id) FROM events b
+                          WHERE b.turn=e.turn AND b.kind='steered' AND b.id<e.id),0)
+             FROM events e WHERE e.turn=? AND e.kind='steered' ORDER BY e.id DESC",
         )?;
-        let mut since = 0;
         let mut steer = self.conn.prepare_cached(
             "SELECT CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
                 t.from_bot,t.from_turn,t.origin,t.person,t.quotes
              FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node WHERE t.id=?",
         )?;
-        for row in steers.query_map([turn], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
-            let (id, steered) = row?;
-            let words = steer.query_row([id], |r| Words::read(r, 0))?;
+        let mut kept = Vec::new();
+        let mut rows = steers.query([turn])?;
+        while let Some(r) = rows.next()? {
             if left < Self::PROMPTS_ENTRY {
                 prompts_more = true;
                 break;
             }
             left -= Self::PROMPTS_ENTRY;
+            let (id, event, since): (i64, i64, i64) = (r.get(0)?, r.get(1)?, r.get(2)?);
+            let words = steer.query_row([id], |r| Words::read(r, 0))?;
             let mut entry = self.prompt_entry(id, words, &mut left)?;
             entry["steer"] = json!(true);
-            if let Some(said) = self.said(turn, since, steered)? {
+            if let Some(said) = self.said(turn, since, event)? {
                 entry["reply"] = Self::reply(&said, &mut left);
             }
-            since = steered;
-            prompts.push(entry);
+            kept.push(entry);
         }
+        let mut prompts = Vec::with_capacity(kept.len() + 1);
+        prompts.push(first);
+        prompts.extend(kept.into_iter().rev());
         let mut failed = std::collections::HashSet::new();
         let mut done = std::collections::HashSet::new();
         for (after, call) in self.refused(turn, &mut left)? {
@@ -9845,18 +9871,76 @@ impl Database {
             done.insert(call_id);
         }
         let mut started = self.conn.prepare_cached(
-            "SELECT data FROM events WHERE turn=? AND (kind='tool_started'
-               OR kind='step_decided' AND json_extract(data,'$.decision')='allow') ORDER BY id",
+            "SELECT data,json_extract(data,'$.name') FROM events WHERE turn=? AND (kind='tool_started'
+               OR kind='step_decided' AND json_extract(data,'$.decision')='allow') ORDER BY id DESC",
         )?;
         let mut calls = Vec::new();
         let mut calls_more = false;
+        // The files the calls left out wrote, by name alone: a later call
+        // that runs one is judged with it, or known not to be.
+        let mut written: Vec<String> = Vec::new();
+        let mut written_more = false;
+        let mut written_left = Self::PROMPTS_WRITTEN;
+        let mut wrote = |data: &str| -> Result<bool> {
+            let data: Value = serde_json::from_str(data)?;
+            let paths = match data.get("paths") {
+                Some(paths) => {
+                    let named = (paths.as_array().into_iter().flatten())
+                        .filter_map(|path| path.as_str().map(str::to_owned));
+                    Some((named.collect(), data["paths_cut"] != true))
+                }
+                // A cut preview that names none: what it wrote is unknown.
+                None if data["arguments_truncated"] == true => None,
+                None => changed_paths(
+                    data["name"].as_str().unwrap_or_default(),
+                    data["arguments"].as_str().unwrap_or_default(),
+                ),
+            };
+            let Some((paths, whole)) = paths else {
+                written_more = true;
+                return Ok(true);
+            };
+            written_more |= !whole;
+            for path in paths {
+                if written.contains(&path) {
+                    continue;
+                }
+                if path.len() + 3 > written_left {
+                    written_more = true;
+                    return Ok(false);
+                }
+                written_left -= path.len() + 3;
+                written.push(path);
+            }
+            Ok(true)
+        };
         // The calls have their own `bytes`: words that fill theirs still
-        // leave a reader the files the turn wrote.
+        // leave a reader the files the turn wrote. The newest are read
+        // first, so those left out are older than all that are listed.
         let mut calls_left = bytes;
         let mut rows = started.query([turn])?;
         while let Some(r) = rows.next()? {
             if calls_left < Self::PROMPTS_ENTRY {
                 calls_more = true;
+                // Past the budget, only what writes files is read, and of
+                // it only the names, while they fit.
+                // And of those, a bounded number: a long turn's history
+                // is not read whole for a small reply.
+                let (mut row, mut scanned) = (Some(r), 0);
+                while let Some(r) = row {
+                    if scanned == Self::PROMPTS_SCANNED {
+                        written_more = true;
+                        break;
+                    }
+                    scanned += 1;
+                    let name: Option<String> = r.get(1)?;
+                    if matches!(name.as_deref(), Some("write" | "edit" | "apply_patch"))
+                        && !wrote(&r.get::<_, String>(0)?)?
+                    {
+                        break;
+                    }
+                    row = rows.next()?;
+                }
                 break;
             }
             calls_left -= Self::PROMPTS_ENTRY;
@@ -9904,6 +9988,7 @@ impl Database {
             }
             calls.push(call);
         }
+        calls.reverse();
         let mut earlier = Vec::new();
         let mut more = false;
         let mut statement = self.conn.prepare_cached(
@@ -9936,7 +10021,8 @@ impl Database {
         }
         Ok(
             json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
-            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more}),
+            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,
+            "written":written,"written_more":written_more,"earlier":earlier,"more":more}),
         )
     }
     /// One prompt of a `prompts` read, cut to the budget left: its words,
@@ -15679,15 +15765,11 @@ fn cut(text: &mut String, left: &mut usize) -> bool {
     *left = 0;
     true
 }
-/// Add a refused call to the listed prompt or steer it came after, or to
-/// the entry listed last when that one was left out: this turn's newest
-/// listed word, or an earlier turn's own prompt, just listed.
+/// Add a refused call to the listed prompt or steer it came after; one
+/// refused after words left out is left out with them, as under other
+/// words it would read as refused after those.
 fn attach(entries: &mut [Value], after: i64, call: Value) {
-    let at = entries
-        .iter()
-        .rposition(|entry| entry["turn"] == after)
-        .or(entries.len().checked_sub(1));
-    if let Some(entry) = at.and_then(|at| entries.get_mut(at)) {
+    if let Some(entry) = entries.iter_mut().rfind(|entry| entry["turn"] == after) {
         match entry["refused"].as_array_mut() {
             Some(calls) => calls.push(call),
             None => entry["refused"] = json!([call]),
