@@ -890,7 +890,9 @@ has something on it, or is off the screen, no time shows.
   every window once answered in any. The questions they ask pin there the
   same way.
 
-  ![An approval from a followed lead's task, with its reason and the reviewer's note](../docs/sonny/approval-raised.png)
+  ![An approval from a task, with its reason and the reviewer's note, waiting in its lead's window](../docs/sonny/approval-raised.png)
+
+  ![The same approval set aside with Esc: the composer types again and the row says it still waits](../docs/sonny/approval-aside.png)
 
   ![An approval prompt offering to always allow cargo test](../docs/sonny/permissions-always.png)
 

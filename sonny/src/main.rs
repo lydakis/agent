@@ -10683,11 +10683,12 @@ impl App {
         for call in &mut self.approvals {
             whole_arguments(&self.client, &self.bot, call).await;
         }
-        if let Some(running) = &mut self.running
-            && self.approvals.is_empty()
-            && !self.reviewing.is_empty()
-        {
-            running.phase = reviewing(self.reviewing.len());
+        if let Some(running) = &mut self.running {
+            if !self.approvals.is_empty() {
+                running.phase = "Waiting for your approval".into();
+            } else if !self.reviewing.is_empty() {
+                running.phase = reviewing(self.reviewing.len());
+            }
         }
         if !self.approvals.is_empty() {
             status_report("blocked", &self.bot);
