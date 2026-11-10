@@ -14760,6 +14760,10 @@ impl App {
             lines.extend(reason.map(|line| Line::from(Span::raw(format!("  {line}")).italic())));
         }
         lines.extend(what.lines().map(|line| Line::from(format!("  {line}"))));
+        // A command run in another folder than the agent's says which.
+        if let Some(workdir) = arguments["workdir"].as_str().filter(|w| !w.is_empty()) {
+            lines.push(Line::from(format!("  in {}", tilde(workdir))).dim());
+        }
         // A call an exec script makes, which waits while it is asked.
         if call["step_of"].is_string() {
             lines.push(Line::from("  a call in a running script").dim());

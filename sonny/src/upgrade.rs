@@ -219,6 +219,12 @@ pub const MIGRATIONS: &[Migration] = &[
         id: crate::trigger::CLEANUP_FRESH,
         retire: "0.11.0",
     },
+    // The repositories inside an agent's folder leave its writable folders:
+    // the folder is the agent's whole, as Codex's is (0.9.2).
+    Migration {
+        id: crate::approvals::NESTED_GONE,
+        retire: "0.11.0",
+    },
 ];
 
 /// `run` once for each `record`: a file of the ids done, a line each,

@@ -89,6 +89,10 @@ pub struct Policy {
     /// Folders whose Unix sockets its commands never reach, the network on
     /// or off, named or not ([`Daemon::walled`]).
     pub walled: Vec<PathBuf>,
+    /// On Linux, each of [`Daemon::owned`] that is here, and the person's
+    /// copy of it, bound read-only in its place: `(copy, place)`.
+    #[serde(default)]
+    pub owned: Vec<(PathBuf, PathBuf)>,
 }
 
 impl Policy {
@@ -143,6 +147,7 @@ impl Policy {
             helper: daemon.helper.clone(),
             sockets: Vec::new(),
             walled: daemon.walled.clone(),
+            owned: owned(&daemon.owned),
         }))
     }
 
@@ -448,6 +453,12 @@ pub struct Daemon {
     /// as the person, as Codex hides its own app-server's. Each exists, by
     /// its real path.
     pub walled: Vec<PathBuf>,
+    /// System folders whose files a program takes only from root or the
+    /// person, which a Linux sandbox would show as nobody's: its user
+    /// namespace maps the person alone, so what root owns shows as the
+    /// overflow user's. Each is shown from a read-only copy the person
+    /// owns (`--own-copy`). The client starting the daemon names them.
+    pub owned: Vec<PathBuf>,
 }
 
 /// A share in a bot's own socket, which listens while any share lives,
@@ -533,6 +544,23 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             ),
         );
     }
+    let git = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".git"));
+    // A git folder kept read-only whole is written nowhere, so nothing in
+    // it needs holding: no placeholder is made inside it, where one would
+    // be left in the repository's own folder, or inside another sandbox's
+    // placeholder.
+    if git && !git_folder_writable(path) {
+        return Ok(Root {
+            path: path.to_owned(),
+            read_only: vec![path.to_owned()],
+            missing: Vec::new(),
+            left: Vec::new(),
+            locks: Vec::new(),
+        });
+    }
     let mut read_only = Vec::new();
     let mut missing = Vec::new();
     let mut left = Vec::new();
@@ -562,13 +590,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             Err(_) => {}
         }
     }
-    let git = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".git"));
-    if git && !git_folder_writable(path) {
-        read_only.push(path.to_owned());
-    } else if git {
+    if git {
         for name in GIT_PROTECTED {
             let kept = path.join(name);
             if matches!(name, "hooks" | "modules") && placeholder(&kept) {
@@ -617,6 +639,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
     for kept in (daemon.protected_paths.iter())
         .chain(&daemon.walled)
         .chain(locks())
+        .chain(copies())
         .filter(|kept| kept.starts_with(path))
     {
         match std::fs::symlink_metadata(kept) {
@@ -893,6 +916,11 @@ mod linux {
                 path(folder),
             ]);
         }
+        // The person's copies of the system's folders whose files a
+        // program checks the owner of, over the folders themselves.
+        for (copy, place) in &policy.owned {
+            args.extend(["--ro-bind".into(), path(copy), path(place)]);
+        }
         args.extend(["--unshare-user", "--unshare-pid", "--unshare-ipc"].map(String::from));
         if !policy.network {
             args.push("--unshare-net".into());
@@ -1114,6 +1142,175 @@ mod linux {
         });
         Ok(Some(theirs))
     }
+}
+
+/// The folders of `places` ([`Daemon::owned`]) that are here, each with
+/// the person's copy, made again when a file in the folder changes; none
+/// on another system than Linux, or for root, whom the namespace maps as
+/// itself. Off the runtime thread, as a policy is built: a folder
+/// unchanged since costs a listing and a look at each file. One that can't
+/// be copied is left as it shows.
+fn owned(places: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
+    // SAFETY: geteuid takes nothing and can't fail.
+    if places.is_empty() || !cfg!(target_os = "linux") || unsafe { libc::geteuid() } == 0 {
+        return Vec::new();
+    }
+    let Some(copies) = copies() else {
+        return Vec::new();
+    };
+    (places.iter())
+        .filter_map(|place| {
+            let copy = copies.join(place.strip_prefix("/").ok()?);
+            copied(place, &copy).then(|| (copy, place.clone()))
+        })
+        .collect()
+}
+
+/// Where the copies of [`Daemon::owned`]'s folders are kept, `~/.agent/copies`,
+/// each under its own path, read-only to every sandbox; `None` when it
+/// can't be made, and on another system than Linux, which needs none.
+fn copies() -> Option<&'static PathBuf> {
+    static COPIES: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    COPIES
+        .get_or_init(|| {
+            use std::os::unix::fs::DirBuilderExt;
+            if !cfg!(target_os = "linux") {
+                return None;
+            }
+            let folder = agent_client::config::home()?.join("copies");
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&folder)
+                .ok()?;
+            std::fs::canonicalize(&folder).ok()
+        })
+        .as_ref()
+}
+
+/// What a folder's files are, to tell when one changed: each regular file's
+/// name, size, change time and inode, as the folder lists them, following
+/// links; `None` when the folder isn't there.
+type Stamp = Vec<(std::ffi::OsString, u64, i64, i64, u64)>;
+
+fn stamp(place: &Path) -> Option<Stamp> {
+    use std::os::unix::fs::MetadataExt;
+    let mut files: Stamp = (std::fs::read_dir(place).ok()?.flatten())
+        .filter_map(|entry| {
+            let found = std::fs::metadata(entry.path()).ok()?;
+            found.is_file().then(|| {
+                let name = entry.file_name();
+                (
+                    name,
+                    found.len(),
+                    found.ctime(),
+                    found.ctime_nsec(),
+                    found.ino(),
+                )
+            })
+        })
+        .collect();
+    files.sort();
+    Some(files)
+}
+
+/// Whether `copy` holds `place`'s files now, as the person's own, copying
+/// them when they changed since this daemon last did. Each file is written
+/// beside its name and renamed over it, so a sandbox running reads the old
+/// file or the new one, never part of either; the folder stays, as
+/// bubblewrap binds it by name.
+fn copied(place: &Path, copy: &Path) -> bool {
+    static STAMPS: std::sync::Mutex<Vec<(PathBuf, Stamp)>> = std::sync::Mutex::new(Vec::new());
+    let Some(now) = stamp(place) else {
+        return false;
+    };
+    let mut stamps = STAMPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let kept = stamps.iter().position(|(kept, _)| kept == place);
+    let fresh = kept.is_some_and(|at| stamps[at].1 == now)
+        && std::fs::symlink_metadata(copy).is_ok_and(|found| found.is_dir());
+    if fresh {
+        return true;
+    }
+    if locked(copy, || copy_files(place, copy, &now)).is_err() {
+        return false;
+    }
+    match kept {
+        Some(at) => stamps[at].1 = now,
+        None => stamps.push((place.to_owned(), now)),
+    }
+    true
+}
+
+/// `write` run while this process alone writes `copy`: another daemon or
+/// an `agent sandbox` of the person's copies into the same folder, and
+/// would take a file half written for its own, or remove it. The lock is
+/// a file beside the folder, which no sandbox sees, held until `write`
+/// returns.
+fn locked(copy: &Path, write: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let above = copy.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(above)?;
+    let mut name = copy.as_os_str().to_owned();
+    name.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(name)?;
+    lock.lock()?;
+    write()
+}
+
+/// `files` of `place` into `copy`, owner-only, and nothing else in it.
+fn copy_files(place: &Path, copy: &Path, files: &Stamp) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(copy)?;
+    // Never through a link: bubblewrap would bind wherever it points.
+    if !std::fs::symlink_metadata(copy)?.is_dir() {
+        return Err(std::io::ErrorKind::AlreadyExists.into());
+    }
+    for (name, ..) in files {
+        // One it can't read, it couldn't read outside a sandbox either.
+        let Ok(content) = std::fs::read(place.join(name)) else {
+            continue;
+        };
+        let mut part = std::ffi::OsString::from(".");
+        part.push(name);
+        part.push(".part");
+        let part = copy.join(part);
+        let _ = std::fs::remove_file(&part);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&part)?;
+        file.write_all(&content)?;
+        std::fs::rename(&part, copy.join(name))?;
+    }
+    for entry in std::fs::read_dir(copy)?.flatten() {
+        let name = entry.file_name();
+        let wanted = files.iter().any(|(file, ..)| *file == name)
+            && entry.file_type().is_ok_and(|kind| kind.is_file());
+        if !wanted {
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(entry.path())?,
+                _ => std::fs::remove_file(entry.path())?,
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether `path`, a name kept from being made, holds only a placeholder:
@@ -1693,6 +1890,84 @@ mod tests {
         ));
     }
 
+    /// A system folder whose files a sandbox would show as nobody's is
+    /// copied as the person's, kept in step with it, and bound in its place.
+    #[test]
+    fn a_system_folder_is_bound_from_the_person_s_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("agent-sandbox-owned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let place = base.join("etc/ssh/ssh_config.d");
+        let copy = base.join("copies/etc/ssh/ssh_config.d");
+        std::fs::create_dir_all(place.join("folder")).unwrap();
+        std::fs::write(place.join("a.conf"), "Host a\n").unwrap();
+        std::fs::write(place.join("b.conf"), "Host b\n").unwrap();
+        assert!(copied(&place, &copy));
+        let read = |name: &str| std::fs::read_to_string(copy.join(name)).ok();
+        assert_eq!(read("a.conf").as_deref(), Some("Host a\n"));
+        assert_eq!(read("b.conf").as_deref(), Some("Host b\n"));
+        let mode = std::fs::metadata(copy.join("a.conf"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // Only files are copied, and only what is there.
+        let names = |dir: &Path| {
+            let mut names: Vec<String> = (std::fs::read_dir(dir).unwrap().flatten())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(&copy), ["a.conf", "b.conf"]);
+        // A file changed, one gone, one new: copied again.
+        std::fs::write(place.join("a.conf"), "Host changed\n").unwrap();
+        std::fs::remove_file(place.join("b.conf")).unwrap();
+        std::fs::write(place.join("c.conf"), "Host c\n").unwrap();
+        assert!(copied(&place, &copy));
+        assert_eq!(read("a.conf").as_deref(), Some("Host changed\n"));
+        assert_eq!(names(&copy), ["a.conf", "c.conf"]);
+        // A copy taken away is made again, though nothing changed.
+        std::fs::remove_dir_all(&copy).unwrap();
+        assert!(copied(&place, &copy));
+        assert_eq!(names(&copy), ["a.conf", "c.conf"]);
+        // A folder that isn't there has no copy.
+        assert!(!copied(&base.join("gone"), &base.join("copies/gone")));
+        // Another process copying holds the lock beside the folder, out of
+        // what a sandbox sees: this one waits for it.
+        let held = std::fs::File::open(base.join("copies/etc/ssh/ssh_config.d.lock")).unwrap();
+        held.lock().unwrap();
+        let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting = {
+            let (copy, wrote) = (copy.clone(), wrote.clone());
+            std::thread::spawn(move || {
+                locked(&copy, || {
+                    wrote.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!wrote.load(std::sync::atomic::Ordering::SeqCst));
+        drop(held);
+        waiting.join().unwrap().unwrap();
+        assert!(wrote.load(std::sync::atomic::Ordering::SeqCst));
+        #[cfg(target_os = "linux")]
+        {
+            let policy = Policy {
+                owned: vec![(copy.clone(), place.clone())],
+                ..Policy::new(Some(Mode::ReadOnly), None, &[], false, &Daemon::default())
+                    .unwrap()
+                    .unwrap()
+            };
+            let args = linux::args(&policy, false);
+            assert!(args.windows(3).any(|w| w[0] == "--ro-bind"
+                && w[1] == copy.to_string_lossy()
+                && w[2] == place.to_string_lossy()));
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     #[test]
     fn a_git_folder_given_as_a_root_keeps_what_git_runs() {
         let base = std::env::temp_dir().join(format!("agent-sandbox-git-{}", std::process::id()));
@@ -1754,6 +2029,10 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(!policy.can_write(&git.join("extra.conf")));
+        // Nothing in it is held either: no placeholder is made inside it.
+        let kept = policy.roots.iter().find(|root| root.path == git).unwrap();
+        assert_eq!(kept.read_only, std::slice::from_ref(&git));
+        assert!(kept.missing.is_empty() && kept.locks.is_empty());
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -2093,6 +2372,7 @@ mod tests {
             helper: None,
             sockets: Vec::new(),
             walled: Vec::new(),
+            owned: Vec::new(),
         };
         let (profile, params) = seatbelt(&policy);
         let size = profile.len()

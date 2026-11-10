@@ -125,8 +125,9 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s, or a day with background=true; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s, or a day with background=true; a command that times out returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
+                "workdir":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_BACKGROUND_TIMEOUT_MS},
                 "background":{"type":"boolean"},"detach":{"type":"boolean"},"tty":{"type":"boolean"},
                 "yield_time_ms":{"type":"integer","minimum":0,"maximum":MAX_YIELD_MS}},
@@ -1044,18 +1045,25 @@ fn redact_blocks(mut text: String, blocks: &[String]) -> String {
 
 pub enum Prepared {
     Echo(String),
+    /// Each command runs in `workdir` when its call names one, read
+    /// against the turn's folder ([`Prepared::folder`]), as Codex's do.
     Shell {
         command: String,
         timeout_ms: u64,
         background: bool,
+        workdir: Option<String>,
     },
     /// A command in its own session, neither tracked nor killed.
-    Detach(String),
+    Detach {
+        command: String,
+        workdir: Option<String>,
+    },
     /// A command in a terminal its bot types into, on a proc handle.
     /// Resolved by the runtime, never by the registry.
     Terminal {
         command: String,
         yield_ms: u64,
+        workdir: Option<String>,
     },
     /// Input for a bot's terminal, or its end. Resolved by the runtime,
     /// never by the registry.
@@ -1122,6 +1130,14 @@ pub enum Prepared {
         new: String,
         replace_all: bool,
     },
+}
+
+impl Prepared {
+    /// The folder a command runs in: `workdir` read against the turn's
+    /// `folder`, or that folder.
+    pub fn folder(folder: &Path, workdir: Option<&str>) -> PathBuf {
+        workdir.map_or_else(|| folder.to_path_buf(), |workdir| folder.join(workdir))
+    }
 }
 
 /// What a `read` call reads: a workspace file, or a retained tool output
@@ -1655,6 +1671,7 @@ impl Registry {
         #[serde(deny_unknown_fields)]
         struct Shell {
             command: String,
+            workdir: Option<String>,
             timeout_ms: Option<u64>,
             #[serde(default)]
             background: bool,
@@ -1762,6 +1779,10 @@ impl Registry {
                     Some("command is over 16 KiB".to_owned())
                 } else if args.command.contains('\0') {
                     Some("command contains a NUL byte".to_owned())
+                } else if (args.workdir.as_deref())
+                    .is_some_and(|workdir| workdir.len() > 4096 || workdir.contains('\0'))
+                {
+                    Some("workdir is a path of up to 4096 bytes, with no NUL byte".to_owned())
                 } else if let Some(timeout_ms) = args.timeout_ms.filter(|t| {
                     let most = match args.background {
                         true => MAX_BACKGROUND_TIMEOUT_MS,
@@ -1815,19 +1836,26 @@ impl Registry {
                 if let Some(detail) = invalid {
                     return fail_with("invalid_shell_arguments", detail);
                 }
+                // An empty one is the turn's folder, as Codex takes it.
+                let workdir = args.workdir.filter(|workdir| !workdir.is_empty());
                 if args.detach {
-                    return Ok(Prepared::Detach(args.command));
+                    return Ok(Prepared::Detach {
+                        command: args.command,
+                        workdir,
+                    });
                 }
                 if args.tty {
                     return Ok(Prepared::Terminal {
                         command: args.command,
                         yield_ms: args.yield_time_ms.unwrap_or(START_YIELD_MS),
+                        workdir,
                     });
                 }
                 Prepared::Shell {
                     command: args.command,
                     timeout_ms: args.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS),
                     background: args.background,
+                    workdir,
                 }
             }
             Tool::History => {
@@ -2061,8 +2089,9 @@ impl Registry {
             Prepared::Shell {
                 background: true, ..
             } => fail("background_requires_runtime"),
-            Prepared::Detach(command) => {
-                detach(&command, workspace, self, environment, sandbox).await
+            Prepared::Detach { command, workdir } => {
+                let folder = Prepared::folder(workspace, workdir.as_deref());
+                detach(&command, &folder, self, environment, sandbox).await
             }
             Prepared::Wait { .. } => fail("wait_requires_runtime"),
             Prepared::Terminal { .. } | Prepared::WriteStdin { .. } => {
@@ -2083,10 +2112,11 @@ impl Registry {
                 command,
                 timeout_ms,
                 background: false,
+                workdir,
             } => {
                 self.foreground(
                     command,
-                    workspace.to_path_buf(),
+                    Prepared::folder(workspace, workdir.as_deref()),
                     timeout_ms,
                     environment.to_vec(),
                     sandbox,
@@ -2821,6 +2851,20 @@ pub fn shell_environment_whole(
     whole
 }
 
+/// What a command that could not start in `folder` says: that the folder
+/// is not there, when it is not, as a missing `workdir` leaves it, or the
+/// system's own words. Looked at only once a start failed.
+#[cfg(unix)]
+pub(crate) fn not_started(error: std::io::Error, folder: &Path) -> Error {
+    if error.kind() == std::io::ErrorKind::NotFound && !folder.is_dir() {
+        return Error::with(
+            "path_not_found",
+            format!("{} is not a folder to run the command in", folder.display()),
+        );
+    }
+    error.into()
+}
+
 /// `shell_path() -c command` in the workspace, with the registry's
 /// environment and none of the credentials the daemon holds.
 #[cfg(unix)]
@@ -2900,7 +2944,7 @@ async fn detach(
     // The bot's socket listens while anything the command left in its
     // group runs, not only while the command itself does.
     let listening = sandbox.as_ref().and_then(|policy| policy.listening.clone());
-    let mut child = process.spawn()?;
+    let mut child = process.spawn().map_err(|e| not_started(e, workspace))?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
     // It outlives turns and the daemon, but not the pull cord: a pull ends
     // the process group it leads, and a sandbox's namespace, as it ends
@@ -3113,7 +3157,8 @@ async fn shell(
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true)
-        .spawn()?;
+        .spawn()
+        .map_err(|e| not_started(e, workspace))?;
     let started = tokio::time::Instant::now();
     let group = child.id().ok_or(Error::new("shell_spawn_failed"))? as i32;
     let mut owned = ProcessGroup { child, group };
@@ -3516,5 +3561,36 @@ mod tests {
             detail(r#"{"command":"true","detach":true,"background":true}"#),
             "detach and background cannot both be set"
         );
+        assert_eq!(
+            detail(r#"{"command":"true","workdir":"a\u0000b"}"#),
+            "workdir is a path of up to 4096 bytes, with no NUL byte"
+        );
+    }
+    /// A command runs in its workdir, read against the turn's folder unless
+    /// absolute, as Codex's; an empty one is the folder itself, and one
+    /// that is not there is named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_runs_in_its_workdir() {
+        let dir = std::env::temp_dir().join(format!("agent-workdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let registry = Registry::new("shell").unwrap();
+        let run = |workdir: &str| {
+            let arguments = json!({"command": "realpath .", "workdir": workdir}).to_string();
+            let prepared = registry.prepare("shell", &arguments).unwrap();
+            registry.execute(prepared, &dir, &[], None)
+        };
+        let here = |outcome: Outcome| outcome.output.lines().next().unwrap_or_default().to_owned();
+        let sub = dir.join("sub").display().to_string();
+        assert!(here(run("sub").await.unwrap()).contains(&sub));
+        assert!(here(run(&sub).await.unwrap()).contains(&sub));
+        let whole = here(run("").await.unwrap());
+        assert!(whole.contains(&dir.display().to_string()) && !whole.contains(&sub));
+        let error = run("gone").await.unwrap_err();
+        assert_eq!(error.code, "path_not_found");
+        assert!(error.detail.unwrap().contains("gone"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

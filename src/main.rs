@@ -251,6 +251,10 @@ fn sandboxed(args: &[String]) -> Result<i32> {
             .and_then(|run| std::fs::canonicalize(run).ok())
             .into_iter()
             .collect(),
+        // And shows the folders a daemon this CLI starts shows from copies.
+        owned: agent_client::OWN_COPIES
+            .map(std::path::PathBuf::from)
+            .to_vec(),
         ..Daemon::default()
     };
     agent_runtime::sandbox::available()?;
@@ -344,6 +348,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let (mut protected, mut protected_existing) = (Vec::new(), Vec::new());
     let mut protected_paths = Vec::new();
     let mut walled = Vec::new();
+    let mut own_copies = Vec::new();
     let mut windows = Vec::new();
     let mut models = None;
     let mut provider_config = None;
@@ -373,6 +378,10 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--protect" => protected.push(value.clone()),
             "--protect-path" => protected_paths.push(value.into()),
             "--wall" => walled.push(value.into()),
+            "--own-copy" if !std::path::Path::new(value).is_absolute() => {
+                return fail_with("usage", "--own-copy needs an absolute folder");
+            }
+            "--own-copy" => own_copies.push(value.into()),
             "--context-window" => windows.push(value.as_str()),
             "--models" => models = Some(value.into()),
             // Made whole here, so the file watched and reread on each edit is
@@ -450,6 +459,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         protected_existing,
         protected_paths,
         walled,
+        own_copies,
         context_windows: std::sync::Arc::new(agent_runtime::provider::Windows::parse(windows)?),
         models,
         provider_config,

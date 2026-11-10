@@ -10,9 +10,9 @@ use std::{io::ErrorKind, path::Path, process::Stdio, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn open_regular(path: &Path, write: bool) -> Result<tokio::fs::File> {
-    let open_error = |_| {
+    let open_error = |error: std::io::Error| {
         if write {
-            Error::new("io_error")
+            Error::with("io_error", format!("{}: {error}", path.display()))
         } else {
             Error::with("file_unreadable", path.display().to_string())
         }
