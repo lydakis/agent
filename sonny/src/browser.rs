@@ -2016,7 +2016,19 @@ fn link_hosts(from: &Path, to: &Path) -> std::io::Result<()> {
 /// `from` has none of goes first, so it is never played back over the
 /// other's data.
 fn newer_database(from: &Path, to: &Path) -> std::io::Result<bool> {
-    let written = |path: &Path| std::fs::metadata(path).and_then(|meta| meta.modified());
+    // When each was last written: by its database or its journal, where a
+    // write-ahead log holds what was written since the last checkpoint.
+    let written = |path: &Path| -> std::io::Result<std::time::SystemTime> {
+        let mut latest = std::fs::metadata(path)?.modified()?;
+        for suffix in ["-journal", "-wal"] {
+            let mut side = path.as_os_str().to_owned();
+            side.push(suffix);
+            if let Ok(at) = std::fs::metadata(PathBuf::from(side)).and_then(|m| m.modified()) {
+                latest = latest.max(at);
+            }
+        }
+        Ok(latest)
+    };
     let theirs = written(from)?;
     if written(to).is_ok_and(|ours| ours >= theirs) {
         return Ok(false);
@@ -2287,12 +2299,19 @@ async fn drive(
         let (mut said, ok) = (ran.said, ran.ok);
         if reach.carry {
             for (path, file) in carried(&session, command, ok) {
+                // Never more read than the call may still carry, and one
+                // byte, whatever the file's size.
+                let room = CARRIED_BYTES - carried_bytes;
                 let read = tokio::task::spawn_blocking({
                     let file = file.clone();
                     move || {
-                        let bytes = std::fs::read(&file);
+                        use std::io::Read;
+                        let mut bytes = Vec::new();
+                        let read = std::fs::File::open(&file).and_then(|opened| {
+                            opened.take(room as u64 + 1).read_to_end(&mut bytes)
+                        });
                         let _ = std::fs::remove_file(&file);
-                        bytes
+                        read.map(|_| bytes)
                     }
                 });
                 said = said.replace(&*file.to_string_lossy(), &path);
@@ -2637,6 +2656,7 @@ mod tests {
         std::fs::write(dir.join("Profile 1/Cookies-journal"), "ours too").unwrap();
         stamp(&data.join("Profile 1/Cookies"), 1_000);
         stamp(&dir.join("Profile 1/Cookies"), 2_000);
+        stamp(&dir.join("Profile 1/Cookies-journal"), 2_000);
         std::fs::create_dir_all(&hosts).unwrap();
         std::os::unix::fs::symlink(
             data.join("NativeMessagingHosts/old.json"),
@@ -2675,6 +2695,28 @@ mod tests {
             .unwrap()
         );
         assert_eq!(read(dir.join("Profile 1/Cookies-journal")), "j");
+        // What a write-ahead log holds since its last checkpoint counts,
+        // though the database itself is older than the copy.
+        std::fs::write(data.join("Profile 1/Cookies-wal"), "renewed").unwrap();
+        stamp(&data.join("Profile 1/Cookies"), 1_000);
+        stamp(&dir.join("Profile 1/Cookies"), 2_000_000);
+        stamp(&dir.join("Profile 1/Cookies-journal"), 2_000_000);
+        stamp(&data.join("Profile 1/Cookies-wal"), 3_000_000);
+        assert!(
+            newer_database(
+                &data.join("Profile 1/Cookies"),
+                &dir.join("Profile 1/Cookies")
+            )
+            .unwrap()
+        );
+        assert_eq!(read(dir.join("Profile 1/Cookies-wal")), "renewed");
+        assert!(
+            !newer_database(
+                &data.join("Profile 1/Cookies"),
+                &dir.join("Profile 1/Cookies")
+            )
+            .unwrap()
+        );
         // Nothing half copied is left beside them.
         let left: Vec<String> = (std::fs::read_dir(dir.join("Profile 1")).unwrap().flatten())
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
