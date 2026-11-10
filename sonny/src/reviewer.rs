@@ -682,7 +682,7 @@ async fn judge(
     };
     let state = match policy::build(&intent, &shared.redactor) {
         State::TooLong => return Err(long("the calls are too long to show")),
-        State::Built { state, .. } => state,
+        State::Built(state) => state,
     };
     let ids: Vec<&str> = intent.planned.iter().map(|call| call.id.as_str()).collect();
     match shared
@@ -1028,18 +1028,16 @@ async fn intent(
             json!({"bot":bot,"turn":turn,"bytes":PROMPT_BYTES}),
         )
         .await?;
-    // The read keeps the earliest words of the turn, so steers it left out
-    // or cut may hold the person's latest word: authorization is unreadable then.
-    let mut left_out = Left {
-        newest: read["prompts_more"] == true,
-        ..Left::default()
-    };
+    // The read keeps the turn's prompt and its newest steers, as Codex's
+    // reviewer keeps the newest: what it left out or cut is older, and the
+    // judge is told some was.
+    let mut left_out = read["prompts_more"] == true;
     let mut request = Vec::new();
     let mut visited = HashSet::from([(bot.to_owned(), turn)]);
     let prompts = with_replies(read["prompts"].as_array().cloned().unwrap_or_default());
     let mut budget = PROMPT_BYTES.saturating_sub(prompt_bytes(&prompts));
     for prompt in &prompts {
-        left_out.cut(prompt);
+        left_out |= prompt["truncated"] == true;
         let text = prompt_text(prompt);
         match prompt.get("from") {
             None => request.push(Words {
@@ -1187,6 +1185,17 @@ async fn intent(
             },
         });
     }
+    // The files older calls left out of the read wrote, by name: a call
+    // that runs one is judged with it still; with some unnamed, any may.
+    for path in read["written"].as_array().into_iter().flatten() {
+        if let Some(path) = path
+            .as_str()
+            .filter(|path| !written.iter().any(|w| w == path))
+        {
+            written.push(path.to_owned());
+        }
+    }
+    written_cut |= read["written_more"] == true;
     // A call that names a file this turn wrote is judged with that file
     // whole, as it is on disk now: what the call would run, or by its size. One that an
     // earlier call of this round writes or edits is not on disk yet as the
@@ -1336,8 +1345,7 @@ async fn intent(
         planned,
         allowed,
         allowed_cut,
-        request_cut: left_out.any || left_out.newest,
-        newest_cut: left_out.newest,
+        request_cut: left_out,
         earlier,
         transcript,
         instructions,
@@ -1532,7 +1540,7 @@ fn by_origin(prompt: &Value) -> By {
 /// wrote it, and so on up to `CHAIN` delegations, in the order they were
 /// written, so a later word from the person still reads as the later one.
 /// A turn that can no longer be read (its bot was deleted) has no person
-/// above it, so nothing there consents. Words left out go in `left_out`:
+/// above it, so nothing there consents. Words left out set `left_out`:
 /// a delegating turn past the chain's limits, or a prompt or steer a read
 /// cut or left out.
 async fn persons_above(
@@ -1541,7 +1549,7 @@ async fn persons_above(
     visited: &mut HashSet<(String, i64)>,
     budget: &mut usize,
     request: &mut Vec<Words>,
-    left_out: &mut Left,
+    left_out: &mut bool,
 ) -> std::result::Result<(), Unjudged> {
     // Each delegating turn's prompts in order; a model-written one is
     // replaced by the prompts above it, depth first.
@@ -1549,17 +1557,16 @@ async fn persons_above(
     let mut next = Some(from.clone());
     loop {
         if let Some(from) = next.take() {
-            // A turn not read at all may hold a later word too.
             if levels.len() >= CHAIN {
-                left_out.newest = true;
+                *left_out = true;
             } else {
                 match delegated(client, &from, visited, budget).await? {
                     Above::Prompts { prompts, more } => {
-                        left_out.newest |= more;
+                        *left_out |= more;
                         levels.push(prompts.into_iter());
                     }
                     Above::None => {}
-                    Above::Cut => left_out.newest = true,
+                    Above::Cut => *left_out = true,
                 }
             }
         }
@@ -1570,7 +1577,7 @@ async fn persons_above(
             levels.pop();
             continue;
         };
-        left_out.cut(&prompt);
+        *left_out |= prompt["truncated"] == true;
         match prompt.get("from") {
             Some(above) => next = Some(above.clone()),
             None => request.push(Words {
@@ -1578,27 +1585,6 @@ async fn persons_above(
                 text: prompt_text(&prompt),
                 refused: refused(&prompt["refused"]),
             }),
-        }
-    }
-}
-
-/// What a round's `prompts` reads left out of the words.
-#[derive(Default)]
-struct Left {
-    /// Some text was cut.
-    any: bool,
-    /// A steer was cut or left out, or a turn was not read: a later word,
-    /// which may withdraw what an earlier one asked.
-    newest: bool,
-}
-
-impl Left {
-    /// Note a prompt or steer as a read returned it. A turn's prompt cut
-    /// at its end loses only its own tail; a steer cut came later than it.
-    fn cut(&mut self, prompt: &Value) {
-        if prompt["truncated"] == true {
-            self.any = true;
-            self.newest |= prompt["steer"] == true;
         }
     }
 }
@@ -1638,7 +1624,7 @@ async fn delegated(
             Value::Array(prompts) => {
                 let prompts = with_replies(prompts);
                 *budget = budget.saturating_sub(prompt_bytes(&prompts));
-                // Steers left out may hold that person's latest word.
+                // Older steers left out: the newest are kept.
                 Above::Prompts {
                     prompts,
                     more: read["prompts_more"] == true,
@@ -1798,18 +1784,6 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_steer_is_a_later_word_left_out_and_a_cut_prompt_is_not() {
-        let mut left = Left::default();
-        left.cut(&json!({"text":"deploy","truncated":true}));
-        assert!(left.any && !left.newest);
-        left.cut(&json!({"text":"","truncated":true,"steer":true}));
-        assert!(left.newest);
-        let mut whole = Left::default();
-        whole.cut(&json!({"text":"don't","steer":true}));
-        assert!(!whole.any && !whole.newest);
-    }
-
-    #[test]
     fn quoted_words_are_the_persons_only_when_the_person_wrote_and_quoted_them() {
         let quotes = json!([
             {"bot":"lead","turn":2,"text":"yes, deploy it"},
@@ -1825,12 +1799,10 @@ mod tests {
         assert_eq!(words.len(), 12);
         assert!(words.iter().all(|w| w.get("quotes").is_none()));
         assert_eq!(words[2]["truncated"], true);
-        // A steer's quote cut short may hold a later word.
+        // A steer's quote cut short reads as words left out.
         let steered = with_replies(vec![json!({"turn":7,"text":"ok","steer":true,
             "quotes":[{"bot":"lead","turn":2,"text":"no","truncated":true}]})]);
-        let mut left = Left::default();
-        steered.iter().for_each(|w| left.cut(w));
-        assert!(left.newest);
+        assert!(steered.iter().any(|w| w["truncated"] == true));
         let by: Vec<(By, &str)> = (words.iter())
             .filter(|w| w.get("from").is_none())
             .map(|w| (by_origin(w), w["text"].as_str().unwrap()))

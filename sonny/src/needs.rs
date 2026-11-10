@@ -324,6 +324,13 @@ impl Needs {
         self.calls.retain(|_, calls| !calls.is_empty());
     }
 
+    /// Every call waiting on the person's approval: its agent, turn and id.
+    pub fn calls(&self) -> impl Iterator<Item = (&str, i64, &str)> {
+        (self.calls.iter()).flat_map(|(bot, calls)| {
+            (calls.iter()).map(move |(turn, call)| (bot.as_str(), *turn, call.as_str()))
+        })
+    }
+
     /// The question each agent has open, whole, where it was read.
     pub fn asks(&self) -> impl Iterator<Item = (&str, &crate::asks::Ask)> {
         (self.asks.iter()).filter_map(|(bot, open)| Some((bot.as_str(), open.ask.as_ref()?)))

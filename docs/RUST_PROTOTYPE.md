@@ -1718,11 +1718,19 @@ as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with
 `from` or `origin`, and `prompts_more` when steers were left out; the calls it started, each with its argument preview,
 `done`, `failed` when it failed, and `node`, with `calls_more` when some
-were left out; and the bot's earlier prompts, newest first, with `more`
+were left out. The prompt is read first, then the steers and the calls
+newest first, as Codex's reviewer keeps the newest, so what is left out is
+older than all that is listed (protocol 62); with steers, the prompt and
+its `reply` take at most half of `bytes`, so the newest steer always has
+room; the files the calls left
+out wrote, by name alone, as `written` (within 8 KiB of names, looking
+through at most 256 left-out calls, with `written_more` when some could
+not be named), so a later call that runs
+one is still judged with it; and the bot's earlier prompts, newest first, with `more`
 when some were left out. A prompt or steer, this turn's or an earlier
 one's, carries the calls its turn was refused after it and before the
 next steer (`refused`, each `{name, arguments}`, `arguments_truncated`
-when cut), so a reader can tell a go-ahead that followed a refusal from
+when cut; one refused after words left out is left out with them), so a reader can tell a go-ahead that followed a refusal from
 one that came before it. This turn's prompt and steers carry `reply`,
 the end of the bot's last message before them within 2 KiB
 (`{text, truncated?}`), with secrets redacted before the end is kept: its

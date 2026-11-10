@@ -4084,8 +4084,9 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     assert!(listed["approvals"].as_array().unwrap().is_empty());
     // Text past the budget is cut and marked; steers and calls past it are
     // left out.
+    // With steers to read, the prompt takes at most half.
     let cut = db.prompts("Carol", turn, 5).unwrap();
-    assert_eq!(cut["prompts"][0]["text"], "deleg");
+    assert_eq!(cut["prompts"][0]["text"], "del");
     assert_eq!(cut["prompts"][0]["truncated"], true);
     assert_eq!(cut["prompts"].as_array().unwrap().len(), 1);
     assert_eq!(cut["prompts_more"], true);
@@ -4102,6 +4103,8 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     let cut = db.prompts("Carol", turn, entry + 3).unwrap();
     assert_eq!(cut["prompts_more"], true);
     assert_eq!(cut["calls"].as_array().unwrap().len(), 1);
+    // The newest call is the one kept, as Codex's reviewer keeps the newest.
+    assert_eq!(cut["calls"][0]["call_id"], "c2");
     assert_eq!(cut["calls"][0]["arguments"], "{\"c");
     assert_eq!(cut["calls"][0]["arguments_truncated"], true);
     assert_eq!(cut["calls_more"], true);
@@ -4151,6 +4154,165 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
         .unwrap();
     assert_eq!(row(&db, steered), ran_in);
     assert_ne!(ran_in, json!("/synthetic/moved"));
+}
+
+#[test]
+fn a_prompts_read_keeps_the_prompt_and_the_newest_steers() {
+    let mut db = db();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Carol",
+            "p",
+            "start",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    let mut steers = Vec::new();
+    for (key, words) in [("s1", "send it"), ("s2", "no, wait"), ("s3", "hold off")] {
+        let id = db
+            .begin("Carol", key, words, true, &steer, allow_provider)
+            .unwrap()
+            .turn;
+        db.absorb(
+            turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap();
+        steers.push(id);
+    }
+    let texts = |read: &Value| -> Vec<String> {
+        (read["prompts"].as_array().unwrap().iter())
+            .map(|p| p["text"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let whole = db.prompts("Carol", turn, 1024).unwrap();
+    assert_eq!(texts(&whole), ["start", "send it", "no, wait", "hold off"]);
+    assert_eq!(whole["prompts_more"], false);
+    // Room for the prompt and two steers: the oldest steer is left out, so
+    // a later word withdrawing an earlier one is never the one missing.
+    let entry = Database::PROMPTS_ENTRY;
+    let room = "start".len() + 2 * entry + "no, wait".len() + "hold off".len();
+    let cut = db.prompts("Carol", turn, room).unwrap();
+    assert_eq!(texts(&cut), ["start", "no, wait", "hold off"]);
+    assert_eq!(cut["prompts"][1]["turn"], steers[1]);
+    assert_eq!(cut["prompts_more"], true);
+    // A prompt longer than the whole budget still leaves the newest
+    // steer room: it takes half, and is cut.
+    db.create("Dave", Some("/synthetic"), binding()).unwrap();
+    let long = db
+        .begin(
+            "Dave",
+            "q",
+            &"x".repeat(300),
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.begin("Dave", "q1", "stop", true, &steer, allow_provider)
+        .unwrap();
+    db.absorb(
+        long,
+        None,
+        8 << 20,
+        4096,
+        ContextUsage::default(),
+        false,
+        true,
+    )
+    .unwrap();
+    let cut = db.prompts("Dave", long, 2 * entry + 20).unwrap();
+    assert_eq!(cut["prompts"][0]["text"], "x".repeat(entry + 10));
+    assert_eq!(cut["prompts"][0]["truncated"], true);
+    assert_eq!(cut["prompts"][1]["text"], "stop");
+}
+
+/// The calls left out of a read are older than all it lists; the files
+/// those wrote are still named, so a later call that runs one is judged
+/// with it.
+#[test]
+fn a_prompts_read_names_the_files_its_left_out_calls_wrote() {
+    let mut db = db();
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Carol",
+            "p",
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = |id: &str, name: &str, arguments: Value| {
+        let arguments = arguments.to_string();
+        let item = json!({"type":"function_call","id":format!("fc_{id}"),"call_id":id,
+            "name":name,"arguments":arguments});
+        let call = ToolCall {
+            custom: false,
+            name: name.into(),
+            call_id: id.into(),
+            arguments,
+        };
+        (Bytes::from(serde_json::to_vec(&item).unwrap()), call)
+    };
+    let round = [
+        call(
+            "w1",
+            "write",
+            json!({"path": "run.sh", "content": "echo hi"}),
+        ),
+        call("s1", "shell", json!({"command": "ls"})),
+        call("s2", "shell", json!({"command": "sh run.sh"})),
+    ];
+    for (item, call) in round {
+        db.append(turn, vec![item], std::slice::from_ref(&call), None)
+            .unwrap();
+        db.tool_start(turn, &call, false, false).unwrap();
+    }
+    let entry = Database::PROMPTS_ENTRY;
+    let read = db.prompts("Carol", turn, entry + 40).unwrap();
+    assert_eq!(read["calls"].as_array().unwrap().len(), 1);
+    assert_eq!(read["calls"][0]["call_id"], "s2");
+    assert_eq!(read["calls_more"], true);
+    assert_eq!(
+        (&read["written"], &read["written_more"]),
+        (&json!(["run.sh"]), &json!(false))
+    );
+    // With every call listed, none is named apart.
+    let whole = db.prompts("Carol", turn, 64 * 1024).unwrap();
+    assert_eq!(
+        (&whole["written"], &whole["written_more"]),
+        (&json!([]), &json!(false))
+    );
+    // Only so many left-out calls are looked through: a write older than
+    // them is not named, and the read says some are not.
+    for n in 0..Database::PROMPTS_SCANNED {
+        let (item, call) = call(&format!("x{n}"), "shell", json!({"command": "ls"}));
+        db.append(turn, vec![item], std::slice::from_ref(&call), None)
+            .unwrap();
+        db.tool_start(turn, &call, false, false).unwrap();
+    }
+    let read = db.prompts("Carol", turn, entry + 40).unwrap();
+    assert_eq!(
+        (&read["written"], &read["written_more"]),
+        (&json!([]), &json!(true))
+    );
 }
 
 #[test]

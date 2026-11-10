@@ -50,9 +50,17 @@ this replaced:
   assesses every call asked exactly once and no other, else the check
   failed and says which. Low and medium risk are allowed; high only
   with at least medium authorization on a narrow action; critical never.
-  When the person's latest words or
-  the calls already run do not fit the state, it carries
-  `authorization_unreadable` and the reviewer scores authorization unknown.
+  When words, calls already run, history or asks do not fit the state,
+  the newest are kept and the rest left out with a note (`request_cut`,
+  `already_allowed_cut`, `transcript_cut`, `decisions_cut`), as Codex's
+  reviewer does (openai/codex main 551fc71, `codex-rs/guardian-context`):
+  the reviewer does not treat what remains as complete authorization, but
+  an answered ask still approves the exact action it covers. Each ask is
+  shown whole or left out whole (900 tokens at most, Codex's verified
+  answer limit), never cut. Until 2026-11-10 a turn whose newest steers
+  or calls did not fit carried `authorization_unreadable`, which scored
+  every call's authorization unknown, overriding even an answered ask
+  for that exact send.
 - **A denial goes back to the model at once.** Its reason is Codex's:
   "This action was rejected due to unacceptable risk (risk, authorization).
   Reason: RATIONALE", then that the agent must not work around it and
@@ -455,11 +463,11 @@ consent is about. If the words do not all fit, the newest are sent and the older
 (the newest cut to its start and end if it alone does not fit), with
 `request_cut: true`, and consent is still counted on what is shown (until
 2026-10-26 it was not, since a word left out may be the one that withdrew
-it; the newest are the ones kept). The daemon's `prompts` read keeps a
-turn's earliest words instead, so when it left steers out or cut one,
-of this turn or of a turn that delegated it, or a delegating turn was not
-read at all, the newest may be missing and consent is not counted; a
-prompt cut at its end loses only its own tail. Text the daemon cut at the read's budget ends
+it; the newest are the ones kept). Since protocol 62 the daemon's
+`prompts` read keeps a turn's prompt and then its newest steers and calls,
+as Codex keeps the newest (it kept the earliest, so a long turn's latest
+steers were the ones left out, and consent was not counted); what it left
+out is marked the same way. Text the daemon cut at the read's budget ends
 at its last whole word, so the redactor never sees a secret without what
 marks it (a URL's password cut before its `@host`). `prompts` gives the calls their own budget, so
 words that fill the read still leave the calls that name the files the
@@ -468,7 +476,7 @@ refusing every call in them, which the reviewer did until 2026-10-26,
 stopped ordinary work such as `cargo fmt --check`. Only if the calls being reviewed do not fit on their
 own does it not call Jev; the call is unclear (step 4), with the reason
 "not reviewed: the calls are too long to show". If the already allowed
-calls do not fit, consent is not counted either.
+calls do not fit, the newest are shown and the rest marked left out.
 
 In the stored Harbor trials the first limit never fires: across the
 1,398 rounds that would reach Jev, the prompt plus every planned and
@@ -666,7 +674,7 @@ Built on 2026-09-27, the reviewer:
   `inspect` (the bot's instructions), follows delegations up to
   8 turns to the person's words (past a deeper chain, more than 64
   delegating turns, or more prompt text across them than one 128 KiB read
-  holds, the words are cut and consent is not counted), redacts, and asks one reviewer request per
+  holds, the words are cut and the reviewer is told), redacts, and asks one reviewer request per
   round to a model through the daemon ([Which model
   reviews](#which-model-reviews)). Rounds are not capped (a round
   waiting on its reviewer holds nothing); the reviewer keeps at most 64
