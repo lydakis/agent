@@ -1118,7 +1118,7 @@ pub async fn again(store: &Path, socket: &Path) -> Result<(), String> {
         return Err("sonny setup asks its questions in a terminal".into());
     }
     let before = reached()?;
-    let bin = crate::agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+    let bin = crate::agent_bin_or_missing()?;
     provider(&bin, true)?;
     let after = reached()?;
     if after != before && Client::connect(socket).await.is_ok() {

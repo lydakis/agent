@@ -863,6 +863,11 @@ impl Layout {
         self.backend.here()
     }
 
+    /// Whether its home was made just now.
+    pub fn made(&self) -> bool {
+        self.backend.made()
+    }
+
     /// A block already labelled with the bot's name.
     fn adopt(&mut self, bot: &str, listed: &[Block]) -> bool {
         let Some(found) = listed.iter().find(|b| b.label == bot) else {
@@ -1551,6 +1556,26 @@ pub fn for_agent(
             false,
             session.as_deref(),
         )?),
+    };
+    Ok(Layout::new(backend))
+}
+
+/// The project's own home, for another project's agent to open its lead
+/// in: in the multiplexer [`aim`] says, the workspace or session labelled
+/// with the project's name, made when there is none, never the one a
+/// window of the project was last in, which may be the caller's.
+pub fn own_home(
+    socket: &Path,
+    project: &str,
+    chain: &[String],
+    like: Option<&str>,
+) -> Result<Layout, String> {
+    let backend: Box<dyn Backend> = match aim(socket, project, chain, like)? {
+        Aim::Herdr { bin, .. } => Box::new(crate::herdr::Herdr::own(bin, project)?),
+        Aim::Cmux { bin, .. } => Box::new(crate::cmux::Cmux::own(bin, project)?),
+        Aim::Rex { bin, host, .. } => {
+            Box::new(crate::rex::Rex::own(bin, host.as_deref(), project)?)
+        }
     };
     Ok(Layout::new(backend))
 }

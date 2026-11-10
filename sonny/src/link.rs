@@ -43,7 +43,7 @@ const BACKOFF: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const HEALTHY: Duration = Duration::from_secs(60);
 /// The largest line either end reads: a file opened there, as base64.
-const LINE_BYTES: usize = 48 << 20;
+pub(crate) const LINE_BYTES: usize = 48 << 20;
 /// The most bytes of payloads either end holds queued to send: the
 /// longest line. Lines up to `SMALL` go ahead of them, whatever waits.
 const QUEUED_BYTES: usize = LINE_BYTES;
@@ -1765,9 +1765,20 @@ fn setup(host: &str, rest: &[String]) -> Result<(), String> {
 fn off_link(name: &str) -> Result<(), String> {
     let path = agent_client::config::path().ok_or("HOME is not set")?;
     let config = agent_client::config::read(&path)?;
-    let (key, link) = (config.sonny.links.iter())
-        .find(|(key, link)| *key == name || link.host == name)
-        .ok_or(format!("no link {name}"))?;
+    let Some((key, link)) =
+        (config.sonny.links.iter()).find(|(key, link)| *key == name || link.host == name)
+    else {
+        // A machine linked to this one is forgotten here, not taken off.
+        return Err(
+            match machines().iter().any(|machine| machine.name == name) {
+                true => format!(
+                    "{name} is a machine linked here, not a link of this machine's: \
+                 `sonny link forget {name}` forgets it"
+                ),
+                false => format!("no link {name}"),
+            },
+        );
+    };
     agent_client::config::set_table(&path, &format!("sonny.links.{key}"), None)?;
     let sonny = link.command.as_deref().unwrap_or("sonny");
     let machine = machine_of(link);
@@ -1801,16 +1812,31 @@ fn off_link(name: &str) -> Result<(), String> {
 }
 
 /// `sonny link forget MACHINE`: a machine linked here taken out of its
-/// agents' tools.
+/// agents' tools. One not linked here is gone already, which `sonny link
+/// off` on that machine counts on.
 fn forget_machine(machine: &str) -> Result<(), String> {
-    if !agent_client::config::named(machine) {
-        return Err(format!("no machine {machine}"));
-    }
     let dir = here().ok_or("HOME is not set")?;
+    println!("{}", forget_in(&dir, machine));
+    Ok(())
+}
+
+/// [`forget_machine`], with the machines linked here kept in `dir`: what
+/// it did.
+fn forget_in(dir: &Path, machine: &str) -> String {
+    if !agent_client::config::named(machine) || !dir.join(format!("{machine}.json")).exists() {
+        let linked: Vec<String> = machines_in(dir).into_iter().map(|m| m.name).collect();
+        return match linked.is_empty() {
+            true => format!("No machine {machine} is linked here."),
+            false => format!(
+                "No machine {machine} is linked here, only {}.",
+                linked.join(", ")
+            ),
+        };
+    }
     for suffix in ["json", "seen"] {
         let _ = std::fs::remove_file(dir.join(format!("{machine}.{suffix}")));
     }
-    Ok(())
+    format!("{machine} is forgotten here, until it connects again.")
 }
 
 /// `sonny link`: this machine's links, and the machines linked here.
@@ -1932,6 +1958,21 @@ mod tests {
         assert!(!dir.join("laptop.seen").exists());
         assert!(!dir.join("laptop.sock").exists());
         assert_eq!(machines_in(&dir)[0].id.as_deref(), Some("aa"));
+        // A name an id never replaced (one listed before ids, 0.9.0) is
+        // forgotten by hand, and only one linked here.
+        assert_eq!(
+            forget_in(&dir, "old"),
+            "old is forgotten here, until it connects again."
+        );
+        assert!(!dir.join("old.json").exists());
+        assert_eq!(
+            forget_in(&dir, "old"),
+            "No machine old is linked here, only mac, other."
+        );
+        assert_eq!(
+            forget_in(&dir, "../x"),
+            "No machine ../x is linked here, only mac, other."
+        );
     }
 
     #[test]

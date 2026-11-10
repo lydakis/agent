@@ -411,8 +411,10 @@ to show the person something now, such as a server's or a tool's output, or
 an agent to watch beside them. Sessions are for leads, tabs and splits for
 their tasks: `show_agent` on `PROJECT.lead`, from another project's lead (one
 that leads the projects in its folder), opens that lead's Sonny in its own
-project's session or workspace, made when needed in the same multiplexer,
-and leaves one already open alone. Sonny never lays another project's lead,
+project's session or workspace (the one named for that project, made when
+needed in the same multiplexer, which the answer says), never the
+caller's even when the lead was last shown there, and leaves one already
+open there alone. Sonny never lays another project's lead,
 or its tasks, out in this one's home. `sonny --agent PROJECT.lead` anywhere is
 that lead's Sonny too, laying out its tasks where it runs. Opened in a
 session that already holds other work, Sonny takes that session as the
