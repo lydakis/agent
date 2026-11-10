@@ -944,6 +944,9 @@ pub struct Configuration {
     pub walled: Vec<PathBuf>,
     /// The context windows the person set, by model path.
     pub context_windows: Arc<agent_runtime::provider::Windows>,
+    /// The tiers faster than standard the person says models serve, by
+    /// model path, over the built-in catalog.
+    pub speeds: Arc<agent_runtime::provider::Speeds>,
     /// Discovery's model catalog (`~/.agent/models.discovered`),
     /// rewritten from the providers' listings each time the daemon starts;
     /// none leaves it be.
@@ -1676,6 +1679,7 @@ struct Binder {
     credentials: agent_runtime::tools::Credentials,
     stall_timeout: Duration,
     windows: Arc<agent_runtime::provider::Windows>,
+    speeds: Arc<agent_runtime::provider::Speeds>,
 }
 
 impl Binder {
@@ -1756,7 +1760,7 @@ impl Binder {
         }
         let provider = provider
             .with_stall_timeout(self.stall_timeout)?
-            .with_windows(&spec.name, self.windows.clone());
+            .with_models(&spec.name, self.windows.clone(), self.speeds.clone());
         let (searches, speeds) = (provider.searches(), provider.speeds());
         let mut binding = json!({"family":spec.family.name(),"url":spec.url,
             "transport":spec.transport(),"efforts":spec.family.efforts(),
@@ -1795,6 +1799,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         credentials: credentials.clone(),
         stall_timeout,
         windows: config.context_windows.clone(),
+        speeds: config.speeds.clone(),
     };
     let mut bindings = serde_json::Map::new();
     for spec in &config.providers {
@@ -1939,6 +1944,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
         "context_windows":config.context_windows.json(),
+        "speeds":config.speeds.json(),
         "durability":"sqlite_full","partial_text_durable":false});
     let mut sessions: HashMap<u64, Output> = HashMap::new();
     // The sandboxed bot each session on a bot's own socket answers as.

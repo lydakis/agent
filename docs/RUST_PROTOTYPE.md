@@ -318,7 +318,10 @@ it; `served_model`, the model the provider named in its response, which can
 differ from the one requested (a dated snapshot, a reroute, and after a
 fallback the last attempt's); `context_window`, the model's context window
 in tokens on a model round's event, so a client can say how full the
-conversation is), and the store keeps running
+conversation is; `speed`, the tier that served the call, the provider's
+word where it gives one (Claude's `usage.speed`, OpenAI's `service_tier`,
+which can be the standard tier though a faster one was asked), else the
+tier the call asked for), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
 `input_tokens`, `cached_input_tokens`). Both report `cache_hit`, the share of
@@ -527,7 +530,7 @@ when it sets either.
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)), and a terminal read waits live for its output before its turn parks. 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
 | `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on every cache marker of a request: the instructions', the request's own, and the pinned compaction summary's and note's, since the API refuses a longer lifetime after a shorter one. `1h` bills each write at twice the input rate instead of 1.25 times. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. A bot whose summarizer or fallback is such a model keeps five minutes on every call, since those calls carry the same pinned blocks. `inspect` reports a lifetime never set as `null`, so a client's own default can tell it from `5m` someone chose. | unset (`5m`) |
-| `speed` (`--speed`) | The tier the bot's own model's calls are served at: `standard`, `fast` or `ultrafast`, each faster one at a higher price per token. The Claude API serves `fast`, its fast mode (sent as `speed` with the `fast-mode-2026-02-01` beta; Opus 4.8 and later, twice the price, its own rate limit, so its own pool, which learns `anthropic-fast-input-tokens-*` and `anthropic-fast-output-tokens-*`); Bedrock serves Claude at standard only. OpenAI's API and the ChatGPT plan serve `fast` (sent as `service_tier: priority`) and `ultrafast`; Bedrock serves GPT models `ultrafast` alone (OpenAI's fast-mode guide and Bedrock's GPT-6.1 Sol and GPT-6 Astra cards, read 2026-10-30). A tier the binding does not serve is refused `invalid_speed` with its `speeds`; which models take one is the provider's to say, and a call on one that does not fails there. Switching it misses the prompt cache once. Calls on another model (a `compaction_model`, a fallback) go at standard. `inspect` reports `standard` when unset. | `standard` |
+| `speed` (`--speed`) | The tier the bot's own model's calls are served at: `standard`, `fast` or `ultrafast`, each faster one at a higher price per token. A call sends it only to a model that serves it, and runs at standard on any other, as Codex sends a service tier only where its model catalog lists it; the setting is kept as asked, so a bot moved to a model that serves it gets it back. Which model serves which tier is the daemon's list of exact model ids (never read from a name), or the person's `serve --speeds`, announced in `ready` (see [providers](#providers)). The Claude API serves `fast`, its fast mode (sent as `speed` with the `fast-mode-2026-02-01` beta) on Fable 5.2, Mythos 5.2 and Opus 5.5, and on Opus 5 and Opus 4.8 in research preview: twice the price or more, its own rate limit, so its own pool, which learns `anthropic-fast-input-tokens-*` and `anthropic-fast-output-tokens-*`; Bedrock serves Claude at standard only (Claude's fast-mode guide, read 2026-11-10). OpenAI's API and the ChatGPT plan serve `fast` (sent as `service_tier: priority`) on the models Codex's bundled catalog gives priority, and `ultrafast` on GPT-6.1 Sol and GPT-6 Astra; Bedrock serves those two `ultrafast` alone, on Mantle and their `us.` and `global.` runtime profiles (Codex's Bedrock catalog at 551fc71, and Bedrock's model cards). Each call's `usage` event says the tier that served it. Switching it misses the prompt cache once. Calls on another model (a `compaction_model`, a fallback) go at standard. `inspect` reports the setting, `standard` when unset. | `standard` |
 | `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
@@ -608,8 +611,9 @@ its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
 binding and waited on at most three seconds. Keys the CLI cannot resolve
 by then (no login yet, an expired SSO session, a stalled CLI) do not stop
 the daemon: the binding's `ready.providers` entry (its `family`, `url`,
-`transport`, the `efforts` its family takes, the `speeds` it serves
-faster than standard and whether it offers `web_search`) carries `unresolved` with
+`transport`, the `efforts` its family takes, `speeds`, the models its
+built-in list names with the tiers each serves faster than standard, and
+whether it offers `web_search`) carries `unresolved` with
 the reason (its detail clipped to 200 bytes), and its next call resolves
 again, so `aws sso login` fixes it without a restart.
 A call with no usable keys fails before it is paced, admitted or its body
@@ -1229,8 +1233,7 @@ Requests include a string or nonnegative integer `id`. Responses carry the same
 `id` and either `result` or an explicit `error` code with optional `detail`.
 A refusal a program acts on also carries its facts as fields beside them:
 `bot_busy` from `submit` reports `running_turn` and `fork_point`, and
-`invalid_effort` lists the model's `efforts`, and `invalid_speed` the
-provider's `speeds`. A line that is not JSON
+and `invalid_effort` lists the model's `efforts`. A line that is not JSON
 is `invalid_json` with a null `id`; JSON of the wrong shape is
 `invalid_request`, answered with its `id` when that parses, and its detail
 names the unknown or ill-typed field.
@@ -1482,9 +1485,9 @@ given too; a bot another bot made keeps no weaker a sandbox than its
 creator's, as when it was made, and a bot's own socket may not configure
 at all. `rules` may not be configured on a bot another made, which goes by
 its creator's, and a change to them reaches every bot made under it
-([command rules](#command-rules)). `cache_ttl` takes effect from the bot's next model call, and
-`speed` is refused `invalid_speed` where the provider it is on, or moves
-to with `model`, does not serve it. `fallback`, `compaction_instructions`
+([command rules](#command-rules)). `cache_ttl` and `speed` take effect from the bot's next model
+call; a `speed` its model does not serve is kept and its calls run at
+standard. `fallback`, `compaction_instructions`
 and `compaction_model` are taken as `create` takes them, the models of the
 bot's family, and `null` removes the bot's: with no compaction
 instructions it no longer compacts, and a summary it has stays. Since
@@ -1556,10 +1559,12 @@ it started, compaction calls included, since they are recorded on
 it. The answer has the totals (`turns`, `input_tokens`, `cached_input_tokens`,
 `output_tokens`; cached is part of input), `bots` with the `limit` (1 to 256,
 default 64) that spent most input plus output first and `other_bots` summing
-the rest with how many (`null` when none), and `models`, the turn's model as
-`turns` reports it: a different compaction model's or an Anthropic fallback's
-tokens count under the turn's model, since only the usage events keep that
-split and events are pruned, and `origins`, by the `origin` a client gave
+the rest with how many (`null` when none), and `models`, one row for each
+model at each `speed` that served it (`standard`, `fast` or `ultrafast`;
+protocol 62, schema 90),
+with its cache writes: a summary's or a fallback's tokens under the model
+that spent them, kept per turn as each call is recorded. Turns from before
+schema 90 kept no speed and count as `standard`. And `origins`, by the `origin` a client gave
 the turn at `submit` (`null` for none), so a client can tell what its own
 features cost. With `bucket_ms` it adds `series`, one row for each bucket
 of that width from `since_ms` that has turns, at its `at_ms`; it needs a

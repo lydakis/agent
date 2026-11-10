@@ -430,24 +430,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
             .spawn()
             .and_then(|child| given(child, brief.clone()))
     };
-    let mut output = run(command, &flags);
-    // A speed the task's provider does not serve is refused before the
-    // task is made: it starts at standard instead, and says so.
-    let mut slowed = None;
-    if let Ok(refused) = &output
-        && !refused.status.success()
-        && refused_speed(&refused.stderr)
-        && let Some(standard) = without_speed(&flags)
-    {
-        slowed = Some(String::from_utf8_lossy(&refused.stderr).trim().to_owned());
-        let mut again = match crate::agent_command(&agent) {
-            Ok(command) => command,
-            Err(error) => return failed(&place, false, error),
-        };
-        again.envs(start.env.iter().map(|(key, value)| (key, value)));
-        output = run(again, &standard);
-    }
-    let output = match output {
+    let output = match run(command, &flags) {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
             let said = String::from_utf8_lossy(&output.stderr);
@@ -479,11 +462,6 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         String::from_utf8_lossy(&output.stdout).trim()
     )];
     said.extend(place.note.clone());
-    if let Some(refusal) = slowed {
-        said.push(format!(
-            "It runs at standard speed: its provider refused the speed it was to have ({refusal})."
-        ));
-    }
     if let (Some((from, to)), 1..) = (&place.copy, moved) {
         said.push(format!(
             "The brief named {} {moved} time{}; it names the task's copy {} instead.",
@@ -614,20 +592,6 @@ struct Picks {
     model: Option<String>,
     effort: Option<String>,
     speed: Option<String>,
-}
-
-/// Whether `run` refused the task for a speed its provider does not serve:
-/// its stderr is the CLI's one JSON object.
-fn refused_speed(stderr: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(stderr).is_ok_and(|error| error["error"] == "invalid_speed")
-}
-
-/// The run flags without `--speed`, or None when they name none.
-fn without_speed(flags: &[String]) -> Option<Vec<String>> {
-    let at = flags.iter().position(|flag| flag == "--speed")?;
-    let mut flags = flags.to_vec();
-    flags.drain(at..(at + 2).min(flags.len()));
-    Some(flags)
 }
 
 /// The run flags with the task's model, effort and speed, unless they
@@ -2196,22 +2160,6 @@ mod tests {
             run(file, &[], None, Some("fast")),
             ["--model", "a/lead", "--speed", "ultrafast"]
         );
-    }
-
-    #[test]
-    fn a_refused_speed_is_dropped_for_standard() {
-        let refusal = br#"{"error":"invalid_speed","detail":"this provider serves anthropic at standard speed only","speeds":[]}"#;
-        assert!(refused_speed(refusal));
-        assert!(!refused_speed(br#"{"error":"model_required"}"#));
-        assert!(!refused_speed(b"not json"));
-        let flags: Vec<String> = ["--model", "a/b", "--speed", "fast", "--effort", "high"]
-            .map(str::to_owned)
-            .into();
-        assert_eq!(
-            without_speed(&flags).unwrap(),
-            ["--model", "a/b", "--effort", "high"]
-        );
-        assert!(without_speed(&flags[..2]).is_none());
     }
 
     #[test]

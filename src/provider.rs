@@ -158,12 +158,12 @@ const ANTHROPIC_BETAS: &str = "thinking-binding-controls-2026-08-01,fallback-cre
 const BEDROCK_BETAS: &str = "thinking-binding-controls-2026-08-01";
 
 /// How fast a bot's calls are served, each faster tier at a higher price.
-/// The Claude API serves `fast` (fast mode, Opus 4.8 and later at twice the
-/// price) and Bedrock serves Claude at standard speed only; OpenAI serves
-/// `fast` (its priority tier) and `ultrafast`, and Bedrock serves GPT
-/// models `ultrafast` alone (OpenAI's fast-mode guide and Bedrock's GPT-6.1
-/// Sol and GPT-6 Astra cards, read 2026-10-30). Which models take a tier is
-/// the provider's to say: a call on one that does not is refused there.
+/// The Claude API serves `fast` (fast mode) and OpenAI `fast` (its
+/// priority tier) and `ultrafast`, each on some models only; Bedrock serves
+/// Claude at standard speed only and two GPT models `ultrafast`. Which
+/// models serve which tier is the catalog's below, or the person's `--speeds`:
+/// a call sends a tier only to a model that serves it, as Codex sends one
+/// only where its model catalog lists it, and runs at standard otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Speed {
@@ -179,7 +179,84 @@ impl Speed {
             Speed::Ultrafast => "ultrafast",
         }
     }
+    pub fn named(name: &str) -> Option<Self> {
+        [Speed::Standard, Speed::Fast, Speed::Ultrafast]
+            .into_iter()
+            .find(|speed| speed.name() == name)
+    }
+    fn bit(self) -> u8 {
+        match self {
+            Speed::Standard => 0,
+            Speed::Fast => 1,
+            Speed::Ultrafast => 2,
+        }
+    }
 }
+
+/// The tiers faster than standard a model serves; every model serves
+/// standard.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tiers(u8);
+impl Tiers {
+    pub const NONE: Tiers = Tiers(0);
+    const FAST: Tiers = Tiers(1);
+    const ULTRAFAST: Tiers = Tiers(2);
+    const BOTH: Tiers = Tiers(3);
+    pub fn of(speeds: impl IntoIterator<Item = Speed>) -> Self {
+        Tiers(speeds.into_iter().fold(0, |bits, speed| bits | speed.bit()))
+    }
+    pub fn serves(self, speed: Speed) -> bool {
+        speed == Speed::Standard || self.0 & speed.bit() != 0
+    }
+    /// The faster tiers by name, fastest last.
+    pub fn names(self) -> Vec<&'static str> {
+        [Speed::Fast, Speed::Ultrafast]
+            .into_iter()
+            .filter(|speed| self.serves(*speed))
+            .map(Speed::name)
+            .collect()
+    }
+}
+
+/// The models each kind of endpoint serves faster than standard, by exact
+/// model id: never read from a model's name, so a model not here serves
+/// standard only until the person names it in `--speeds`.
+/// - The Claude API's fast mode: Fable 5.2, Mythos 5.2 and Opus 5.5, and
+///   Opus 5 and Opus 4.8 in research preview, under the beta every Claude
+///   API request names (platform.claude.com fast-mode guide, read
+///   2026-11-10). Bedrock serves Claude at standard speed only.
+/// - OpenAI, on a key or the ChatGPT plan: priority on every model Codex's
+///   bundled catalog gives it (openai/codex 551fc71, models.json),
+///   ultrafast on GPT-6.1 Sol and GPT-6 Astra (OpenAI's pricing page).
+/// - Bedrock: ultrafast on GPT-6.1 Sol and GPT-6 Astra on Mantle and their
+///   `us.` and `global.` runtime profiles, no priority, as Codex's Bedrock
+///   catalog lists them (model-provider/src/amazon_bedrock/catalog.rs).
+const CLAUDE_API: [(&str, Tiers); 5] = [
+    ("claude-fable-5-2", Tiers::FAST),
+    ("claude-mythos-5-2", Tiers::FAST),
+    ("claude-opus-5-5", Tiers::FAST),
+    ("claude-opus-5", Tiers::FAST),
+    ("claude-opus-4-8", Tiers::FAST),
+];
+const OPENAI: [(&str, Tiers); 9] = [
+    ("gpt-6.1-sol", Tiers::BOTH),
+    ("gpt-6-astra", Tiers::BOTH),
+    ("gpt-6.1-terra", Tiers::FAST),
+    ("gpt-6-sol", Tiers::FAST),
+    ("gpt-6-luna", Tiers::FAST),
+    ("gpt-5.6-sol", Tiers::FAST),
+    ("gpt-5.6-terra", Tiers::FAST),
+    ("gpt-5.6-luna", Tiers::FAST),
+    ("gpt-5.5", Tiers::FAST),
+];
+const BEDROCK_OPENAI: [(&str, Tiers); 6] = [
+    ("openai.gpt-6.1-sol", Tiers::ULTRAFAST),
+    ("us.openai.gpt-6.1-sol", Tiers::ULTRAFAST),
+    ("global.openai.gpt-6.1-sol", Tiers::ULTRAFAST),
+    ("openai.gpt-6-astra", Tiers::ULTRAFAST),
+    ("us.openai.gpt-6-astra", Tiers::ULTRAFAST),
+    ("global.openai.gpt-6-astra", Tiers::ULTRAFAST),
+];
 
 /// The TLS client setup every connection the daemon makes shares: TLS 1.2
 /// and 1.3, the platform's verifier and its root certificates, loaded once,
@@ -295,7 +372,7 @@ pub struct Provider {
     stall_timeout: Duration,
     /// Ask Anthropic to cache for an hour instead of five minutes.
     cache_hour: bool,
-    /// A faster tier than standard, one this provider serves.
+    /// A faster tier than standard, sent to the models that serve it.
     speed: Option<Speed>,
     /// Responses over WebSocket, one connection per bot, instead of HTTP.
     sockets: Option<Arc<Sockets>>,
@@ -308,9 +385,9 @@ pub struct Provider {
     mantle: bool,
     /// The models this provider last listed, shared by every clone.
     listing: Arc<models::Listing>,
-    /// The windows the person set, with the name this provider is bound
-    /// to, which their model paths start with.
-    windows: Option<(Arc<str>, Arc<Windows>)>,
+    /// The windows and speeds the person set, with the name this provider
+    /// is bound to, which their model paths start with.
+    set: Option<(Arc<str>, Arc<Windows>, Arc<Speeds>)>,
 }
 
 /// Streamed text or thinking, with the index of the response's output item
@@ -366,6 +443,11 @@ pub struct Usage {
     /// the conversation is. Set by the turn that knows it; zero when unknown.
     #[serde(skip_serializing_if = "is_zero")]
     pub context_window: u64,
+    /// The tier that served the call: the one the provider says (Claude's
+    /// `usage.speed`, OpenAI's `service_tier`), which can be standard
+    /// though a faster one was asked, else the one the call asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<Speed>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelTokens {
@@ -580,13 +662,13 @@ impl Provider {
             bedrock,
             mantle,
             listing: Arc::default(),
-            windows: None,
+            set: None,
         })
     }
-    /// The context windows the person set, read for models of this
-    /// provider by `name/model`.
-    pub fn with_windows(mut self, name: &str, windows: Arc<Windows>) -> Self {
-        self.windows = Some((name.into(), windows));
+    /// The context windows and speeds the person set, read for models of
+    /// this provider by `name/model`.
+    pub fn with_models(mut self, name: &str, windows: Arc<Windows>, speeds: Arc<Speeds>) -> Self {
+        self.set = Some((name.into(), windows, speeds));
         self
     }
     /// Model pool levels behind this provider, for `stats`.
@@ -665,53 +747,65 @@ impl Provider {
     /// limit of its own, and OpenAI counts every tier against the model's.
     fn pool_key(&self, model: &str) -> String {
         let key = self.family.pool_key(model);
-        match (self.family, self.speed) {
+        match (self.family, self.speed_for(model)) {
             (Family::Anthropic, Some(speed)) => format!("{key} {}", speed.name()),
             _ => key,
         }
     }
 
-    /// The rate-limit headers its calls' pool learns from.
-    fn limits(&self) -> pace::Limits {
-        match (self.family, self.speed) {
+    /// The rate-limit headers calls to `model` teach its pool.
+    fn limits(&self, model: &str) -> pace::Limits {
+        match (self.family, self.speed_for(model)) {
             (Family::Anthropic, Some(_)) => pace::Limits::AnthropicFast,
             (family, _) => family.into(),
         }
     }
 
-    /// The tiers faster than standard this provider serves, by name.
-    pub fn speeds(&self) -> &'static [&'static str] {
+    /// The models this kind of endpoint serves faster than standard.
+    fn catalog(&self) -> &'static [(&'static str, Tiers)] {
         match (self.family, self.bedrock) {
-            (Family::Anthropic, false) => &["fast"],
+            (Family::Anthropic, false) => &CLAUDE_API,
             (Family::Anthropic, true) => &[],
-            (Family::Responses, false) => &["fast", "ultrafast"],
-            (Family::Responses, true) => &["ultrafast"],
+            (Family::Responses, false) => &OPENAI,
+            (Family::Responses, true) => &BEDROCK_OPENAI,
         }
     }
 
-    /// Serve every call at `speed`, refused where this provider has no such
-    /// tier; standard sends none.
-    pub fn with_speed(mut self, speed: Option<Speed>) -> Result<Self> {
-        let speed = speed.filter(|speed| *speed != Speed::Standard);
-        if let Some(speed) = speed
-            && !self.speeds().contains(&speed.name())
+    /// The tiers `model` serves here: the person's `--speeds` for its path
+    /// when one matches, else the catalog's, else none.
+    pub fn tiers(&self, model: &str) -> Tiers {
+        if let Some((name, _, speeds)) = &self.set
+            && !speeds.is_empty()
+            && let Some(tiers) = speeds.get(&format!("{name}/{model}"))
         {
-            let speeds = self.speeds();
-            let detail = match speeds {
-                [] => format!(
-                    "this provider serves {} at standard speed only",
-                    self.family.name()
-                ),
-                _ => format!(
-                    "{} is not one of standard, {}",
-                    speed.name(),
-                    speeds.join(", ")
-                ),
-            };
-            return Err(Error::with("invalid_speed", detail).facts(json!({"speeds":speeds})));
+            return tiers;
         }
-        self.speed = speed;
-        Ok(self)
+        (self.catalog().iter())
+            .find(|(id, _)| *id == model)
+            .map_or(Tiers::NONE, |(_, tiers)| *tiers)
+    }
+
+    /// The catalog's models with their faster tiers, as the daemon
+    /// announces them; the person's `--speeds` are announced beside.
+    pub fn speeds(&self) -> Value {
+        Value::Object(
+            (self.catalog().iter())
+                .map(|(model, tiers)| ((*model).to_owned(), json!(tiers.names())))
+                .collect(),
+        )
+    }
+
+    /// The tier a call to `model` is sent at: the bot's speed where the
+    /// model serves it; standard, which sends none, otherwise.
+    pub fn speed_for(&self, model: &str) -> Option<Speed> {
+        self.speed.filter(|speed| self.tiers(model).serves(*speed))
+    }
+
+    /// Ask for `speed` on every call to a model that serves it; standard
+    /// sends none.
+    pub fn with_speed(mut self, speed: Option<Speed>) -> Self {
+        self.speed = speed.filter(|speed| *speed != Speed::Standard);
+        self
     }
 
     /// Bound generated tokens, reasoning included. Anthropic calls send it
@@ -812,7 +906,7 @@ impl Provider {
         {
             return Ok(std::borrow::Cow::Borrowed(self));
         }
-        let mut shaped = self.clone().with_cache_hour(cache_hour).with_speed(speed)?;
+        let mut shaped = self.clone().with_cache_hour(cache_hour).with_speed(speed);
         shaped.max_output_tokens = None;
         if let Some(limit) = max_output_tokens {
             shaped = shaped.with_max_output_tokens(limit)?;
@@ -935,7 +1029,7 @@ impl Provider {
                     prompt_cache_key: request.cache_key,
                     // Fast is OpenAI's priority tier, by the name every
                     // model that has one takes.
-                    service_tier: self.speed.map(|speed| match speed {
+                    service_tier: self.speed_for(request.model).map(|speed| match speed {
                         Speed::Ultrafast => "ultrafast",
                         _ => "priority",
                     }),
@@ -992,7 +1086,7 @@ impl Provider {
                         (!config.is_empty()).then_some(Value::Object(config))
                     },
                     fallback_credit_token: request.fallback_credit.filter(|_| !self.bedrock),
-                    speed: self.speed.map(Speed::name),
+                    speed: self.speed_for(request.model).map(Speed::name),
                 })?,
                 &b",\"messages\":["[..],
             ),
@@ -1068,9 +1162,19 @@ impl Provider {
     {
         *report = Report::default();
         let mut session = None;
+        let asked = self.speed_for(request.model).unwrap_or(Speed::Standard);
         let result = self
             .complete_inner(request, delta, report, &mut session)
-            .await;
+            .await
+            .map(|mut completion| {
+                if let Some(usage) = &mut completion.usage {
+                    usage.speed.get_or_insert(asked);
+                }
+                completion
+            });
+        if let Some(usage) = &mut report.usage {
+            usage.speed.get_or_insert(asked);
+        }
         let key = session
             .as_ref()
             .map(|s| s.token.as_str())
@@ -1100,6 +1204,7 @@ impl Provider {
             aws.current().await?;
         }
         let pace = self.pools.get(&self.pool_key(request.model));
+        let limits = self.limits(request.model);
         let prefix = Bytes::from(self.prefix(&request)?);
         // Anthropic counts output as it is written, not the cap a request
         // asks for: reserve what this model's calls have been writing.
@@ -1238,7 +1343,7 @@ impl Provider {
             }
             let quota = status == 429 && body.quota;
             if !quota {
-                reservation.learn(&headers, self.limits());
+                reservation.learn(&headers, limits);
             }
             if matches!(status, 429 | 529) && !quota {
                 refused(&pace, status == 529, retry_after(&headers));
@@ -1258,7 +1363,7 @@ impl Provider {
                 &headers,
             ));
         }
-        reservation.learn(response.headers(), self.limits());
+        reservation.learn(response.headers(), limits);
         if self.family == Family::Responses
             && let Some(route) = route
             && let Some(state) = response.headers().get(TURN_STATE)
@@ -1441,6 +1546,7 @@ impl Provider {
         F: FnMut(Delta) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        let limits = self.limits(request.model);
         let Request {
             items,
             chain,
@@ -1483,7 +1589,7 @@ impl Provider {
                     // The upgrade's headers predate this call, so they
                     // teach the pool without settling its reservation.
                     Ok((mut session, response)) => {
-                        pace.seed(&response, self.limits());
+                        pace.seed(&response, limits);
                         session.auth = auth;
                         session
                     }
@@ -1499,7 +1605,7 @@ impl Provider {
                                 sent.mark();
                             }
                             if let Some(headers) = &failure.headers {
-                                reservation.learn(headers, self.limits());
+                                reservation.learn(headers, limits);
                             }
                             limit(pace, &failure);
                             reservation.settle(0);
@@ -1581,7 +1687,7 @@ impl Provider {
             }
             Err(failure) => {
                 if let Some(headers) = failure.headers.as_deref() {
-                    reservation.learn(headers, self.limits());
+                    reservation.learn(headers, limits);
                 }
                 limit(pace, &failure);
                 session.failed(&failure);
@@ -1755,45 +1861,57 @@ fn claude_model(model: &str) -> &str {
         .unwrap_or(model)
 }
 
-/// Context windows a person set by model path, `PROVIDER/MODEL` with `*`
-/// and `?` wildcards, as OpenCode sets a model's `limit.context` and
-/// Codex its `model_context_window`: for a model a provider does not list,
-/// or lists wrong, or to hold a bot under its model's full window. The
-/// most specific pattern a path matches wins: an exact path over every
-/// wildcard (a `*` can match nothing, so `a/*b` counts as many literal
-/// characters as `a/b`), then the one with the most characters that are
-/// not wildcards, then the first by name.
-#[derive(Debug, Default)]
-pub struct Windows(Vec<(String, u64)>);
+/// Values a person set by model path, `PROVIDER/MODEL` with `*` and `?`
+/// wildcards: the most specific pattern a path matches wins. An exact path
+/// beats every wildcard (a `*` can match nothing, so `a/*b` counts as many
+/// literal characters as `a/b`), then the one with the most characters
+/// that are not wildcards, then the first by name.
+#[derive(Debug)]
+pub struct ByModel<T>(Vec<(String, T)>);
+
+impl<T> Default for ByModel<T> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+/// Context windows a person set by model path, as OpenCode sets a model's
+/// `limit.context` and Codex its `model_context_window`: for a model a
+/// provider does not list, or lists wrong, or to hold a bot under its
+/// model's full window.
+pub type Windows = ByModel<u64>;
+
+/// The tiers faster than standard a person says a model serves, as a
+/// custom Codex catalog lists a model's service tiers: for a model the
+/// built-in catalog does not name, or to take a tier from one that does.
+pub type Speeds = ByModel<Tiers>;
 
 /// The least window a pattern may set: the least compaction threshold.
 pub const MIN_WINDOW: u64 = 1024;
 
-impl Windows {
-    /// `PATTERN=TOKENS`, each pattern once.
-    pub fn parse<'a>(specs: impl IntoIterator<Item = &'a str>) -> Result<Self> {
-        let mut set: Vec<(String, u64)> = Vec::new();
+impl<T> ByModel<T> {
+    /// `PATTERN=VALUE` specs for `flag`, each pattern once, `value`
+    /// reading each value; `shape` says what the flag takes.
+    fn parse_with<'a>(
+        specs: impl IntoIterator<Item = &'a str>,
+        flag: &str,
+        shape: &str,
+        value: impl Fn(&str) -> Option<T>,
+    ) -> Result<Self> {
+        let mut set: Vec<(String, T)> = Vec::new();
         for spec in specs {
-            let parsed = spec.rsplit_once('=').and_then(|(pattern, tokens)| {
-                let tokens = tokens.parse::<u64>().ok().filter(|t| *t >= MIN_WINDOW)?;
+            let parsed = spec.rsplit_once('=').and_then(|(pattern, given)| {
+                let given = value(given)?;
                 (pattern.contains('/') && !pattern.chars().any(char::is_whitespace))
-                    .then(|| (pattern.to_owned(), tokens))
+                    .then(|| (pattern.to_owned(), given))
             });
-            let Some((pattern, tokens)) = parsed else {
-                return fail_with(
-                    "usage",
-                    format!(
-                        "--context-window takes PROVIDER/MODEL=TOKENS, * and ? wildcards, at least {MIN_WINDOW} tokens, not {spec}"
-                    ),
-                );
+            let Some((pattern, given)) = parsed else {
+                return fail_with("usage", format!("{flag} takes {shape}, not {spec}"));
             };
-            if set.iter().any(|(given, _)| *given == pattern) {
-                return fail_with(
-                    "usage",
-                    format!("--context-window {pattern} is given twice"),
-                );
+            if set.iter().any(|(named, _)| *named == pattern) {
+                return fail_with("usage", format!("{flag} {pattern} is given twice"));
             }
-            set.push((pattern, tokens));
+            set.push((pattern, given));
         }
         let wild = |c: char| matches!(c, '*' | '?');
         let rank = |pattern: &str| {
@@ -1803,11 +1921,31 @@ impl Windows {
         set.sort_by(|(a, _), (b, _)| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
         Ok(Self(set))
     }
-    /// The window set for `path`, `PROVIDER/MODEL`.
-    pub fn get(&self, path: &str) -> Option<u64> {
+    /// Whether the person set none, so a lookup can skip naming the path.
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    /// The value set for `path`, `PROVIDER/MODEL`.
+    fn find(&self, path: &str) -> Option<&T> {
         (self.0.iter())
             .find(|(pattern, _)| crate::tools::name_matches(pattern, path))
-            .map(|(_, tokens)| *tokens)
+            .map(|(_, value)| value)
+    }
+}
+
+impl Windows {
+    /// `PATTERN=TOKENS`, each pattern once.
+    pub fn parse<'a>(specs: impl IntoIterator<Item = &'a str>) -> Result<Self> {
+        Self::parse_with(
+            specs,
+            "--context-window",
+            &format!("PROVIDER/MODEL=TOKENS, * and ? wildcards, at least {MIN_WINDOW} tokens"),
+            |tokens| tokens.parse::<u64>().ok().filter(|t| *t >= MIN_WINDOW),
+        )
+    }
+    /// The window set for `path`, `PROVIDER/MODEL`.
+    pub fn get(&self, path: &str) -> Option<u64> {
+        self.find(path).copied()
     }
     /// Each pattern and its window, as the daemon announces them.
     pub fn json(&self) -> Value {
@@ -1819,13 +1957,44 @@ impl Windows {
     }
 }
 
+impl Speeds {
+    /// `PATTERN=TIERS`, the faster tiers comma-separated (`fast`,
+    /// `ultrafast`), none for standard only; each pattern once.
+    pub fn parse<'a>(specs: impl IntoIterator<Item = &'a str>) -> Result<Self> {
+        Self::parse_with(
+            specs,
+            "--speeds",
+            "PROVIDER/MODEL=TIERS, * and ? wildcards, TIERS fast and ultrafast comma-separated or none",
+            |tiers| {
+                let mut speeds = Vec::new();
+                for name in tiers.split(',').filter(|name| !name.is_empty()) {
+                    speeds.push(Speed::named(name).filter(|s| *s != Speed::Standard)?);
+                }
+                Some(Tiers::of(speeds))
+            },
+        )
+    }
+    /// The tiers set for `path`, `PROVIDER/MODEL`.
+    pub fn get(&self, path: &str) -> Option<Tiers> {
+        self.find(path).copied()
+    }
+    /// Each pattern and its faster tiers, as the daemon announces them.
+    pub fn json(&self) -> Value {
+        Value::Object(
+            (self.0.iter())
+                .map(|(pattern, tiers)| (pattern.clone(), json!(tiers.names())))
+                .collect(),
+        )
+    }
+}
+
 /// The model's context window in tokens: the window the person set for
 /// it, else what the provider's listing says, else the window Anthropic
 /// publishes for a Claude model (1M from Claude 5 on, 200K before), else
 /// 200K, the smallest a current model has.
 pub fn context_window(provider: &Provider, model: &str) -> u64 {
-    if let Some(tokens) = (provider.windows.as_ref())
-        .and_then(|(name, windows)| windows.get(&format!("{name}/{model}")))
+    if let Some(tokens) = (provider.set.as_ref())
+        .and_then(|(name, windows, _)| windows.get(&format!("{name}/{model}")))
     {
         return tokens;
     }
@@ -2175,7 +2344,7 @@ mod tests {
             None,
         )
         .unwrap()
-        .with_windows("bedrock", windows.clone());
+        .with_models("bedrock", windows.clone(), Arc::default());
         for (model, window) in [
             ("openai.gpt-6-sol", 1_000_000),
             ("us.anthropic.claude-opus-5-5-v1:0", 150_000),
@@ -2193,12 +2362,12 @@ mod tests {
             None,
         )
         .unwrap()
-        .with_windows("anthropic", windows.clone());
+        .with_models("anthropic", windows.clone(), Arc::default());
         assert_eq!(context_window(&anthropic, "claude-opus-5-5"), 300_000);
         // A provider no pattern names keeps its own windows.
         let other = Provider::new(transport, Family::Anthropic, "http://127.0.0.1:1/v1", None)
             .unwrap()
-            .with_windows("work", windows);
+            .with_models("work", windows, Arc::default());
         assert_eq!(context_window(&other, "claude-opus-5-5"), 1_000_000);
         assert_eq!(context_window(&other, "gpt-6-luna"), 200_000);
         for wrong in [
@@ -3909,16 +4078,19 @@ mod tests {
         assert_eq!(chunks, [Bytes::from_static(b"]}")]);
     }
 
-    /// A bot's speed is sent in its family's field, at the tiers its
-    /// provider serves; Bedrock serves Claude at standard speed only, and
-    /// GPT models ultrafast alone. Claude's fast mode draws on its own pool.
+    /// A bot's speed is sent in its family's field to the models that
+    /// serve it, and to no other: a model the catalog does not name runs
+    /// at standard, as Codex sends a tier only where its catalog lists it.
+    /// Bedrock serves Claude at standard speed only and two GPT models
+    /// ultrafast alone. Claude's fast mode draws on its own pool. The
+    /// person's `--speeds` beat the catalog, most specific first.
     #[test]
-    fn speed_is_sent_where_the_provider_serves_it() {
+    fn speed_is_sent_to_the_models_that_serve_it() {
         let transport = Transport::new(64, 1).unwrap();
-        let encoded = |provider: &Provider| {
+        let encoded = |provider: &Provider, model: &str| {
             let mut prefix = provider
                 .prefix(&Request {
-                    model: "m",
+                    model,
                     instructions: "i",
                     reasoning: None,
                     tools: &none(),
@@ -3940,48 +4112,134 @@ mod tests {
             Provider::new(transport.clone(), family, url, None)
                 .unwrap()
                 .shaped(None, false, speed)
-                .map(std::borrow::Cow::into_owned)
+                .unwrap()
+                .into_owned()
         };
         let claude = "https://api.example.test";
-        let fast = at(Family::Anthropic, claude, Some(Speed::Fast)).unwrap();
-        assert_eq!(encoded(&fast)["speed"], "fast");
+        let opus = "claude-opus-5-5";
+        let fast = at(Family::Anthropic, claude, Some(Speed::Fast));
+        assert_eq!(encoded(&fast, opus)["speed"], "fast");
         assert!(
             ANTHROPIC_BETAS
                 .split(',')
                 .any(|beta| beta == "fast-mode-2026-02-01")
         );
-        assert_ne!(fast.pool_key("m"), Family::Anthropic.pool_key("m"));
-        assert_eq!(fast.limits(), pace::Limits::AnthropicFast);
-        let standard = at(Family::Anthropic, claude, Some(Speed::Standard)).unwrap();
-        assert!(encoded(&standard).get("speed").is_none());
-        assert_eq!(standard.pool_key("m"), Family::Anthropic.pool_key("m"));
-        let refused = at(Family::Anthropic, claude, Some(Speed::Ultrafast))
-            .err()
-            .unwrap();
-        assert_eq!(refused.code, "invalid_speed");
-        assert_eq!(refused.facts.unwrap()["speeds"], json!(["fast"]));
+        assert_ne!(fast.pool_key(opus), Family::Anthropic.pool_key(opus));
+        assert_eq!(fast.limits(opus), pace::Limits::AnthropicFast);
+        // A model fast mode does not serve runs at standard, in the
+        // standard pool.
+        let haiku = "claude-haiku-4-5";
+        assert!(encoded(&fast, haiku).get("speed").is_none());
+        assert_eq!(fast.pool_key(haiku), Family::Anthropic.pool_key(haiku));
+        assert_eq!(fast.speed_for(haiku), None);
+        let standard = at(Family::Anthropic, claude, Some(Speed::Standard));
+        assert!(encoded(&standard, opus).get("speed").is_none());
+        assert_eq!(standard.pool_key(opus), Family::Anthropic.pool_key(opus));
+        let ultra = at(Family::Anthropic, claude, Some(Speed::Ultrafast));
+        assert!(encoded(&ultra, opus).get("speed").is_none());
         let bedrock = "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1";
-        let refused = at(Family::Anthropic, bedrock, Some(Speed::Fast))
-            .err()
-            .unwrap();
-        assert_eq!(refused.code, "invalid_speed");
-        assert!(at(Family::Anthropic, bedrock, None).is_ok());
+        let fast = at(Family::Anthropic, bedrock, Some(Speed::Fast));
+        assert!(
+            encoded(&fast, "anthropic.claude-opus-5-5")
+                .get("speed")
+                .is_none()
+        );
 
         let openai = "https://api.openai.example.test/v1";
-        let fast = at(Family::Responses, openai, Some(Speed::Fast)).unwrap();
-        assert_eq!(encoded(&fast)["service_tier"], "priority");
+        let sol = "gpt-6.1-sol";
+        let fast = at(Family::Responses, openai, Some(Speed::Fast));
+        assert_eq!(encoded(&fast, sol)["service_tier"], "priority");
+        assert_eq!(encoded(&fast, "gpt-6.1-terra")["service_tier"], "priority");
         // Every tier counts against the model's own limit.
-        assert_eq!(fast.pool_key("m"), Family::Responses.pool_key("m"));
-        let ultra = at(Family::Responses, openai, Some(Speed::Ultrafast)).unwrap();
-        assert_eq!(encoded(&ultra)["service_tier"], "ultrafast");
-        let standard = at(Family::Responses, openai, None).unwrap();
-        assert!(encoded(&standard).get("service_tier").is_none());
-        let bedrock = "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
-        let refused = at(Family::Responses, bedrock, Some(Speed::Fast))
-            .err()
-            .unwrap();
-        assert_eq!(refused.facts.unwrap()["speeds"], json!(["ultrafast"]));
-        let ultra = at(Family::Responses, bedrock, Some(Speed::Ultrafast)).unwrap();
-        assert_eq!(encoded(&ultra)["service_tier"], "ultrafast");
+        assert_eq!(fast.pool_key(sol), Family::Responses.pool_key(sol));
+        let ultra = at(Family::Responses, openai, Some(Speed::Ultrafast));
+        assert_eq!(encoded(&ultra, sol)["service_tier"], "ultrafast");
+        assert!(
+            encoded(&ultra, "gpt-6.1-terra")
+                .get("service_tier")
+                .is_none()
+        );
+        assert!(
+            encoded(&ultra, "gpt-6.1-sol-mini")
+                .get("service_tier")
+                .is_none()
+        );
+        let standard = at(Family::Responses, openai, None);
+        assert!(encoded(&standard, sol).get("service_tier").is_none());
+
+        // Bedrock: ultrafast on GPT-6.1 Sol and GPT-6 Astra alone, never
+        // priority; Grok on the same binding runs at standard.
+        let runtime = "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1";
+        let ultra = at(Family::Responses, runtime, Some(Speed::Ultrafast));
+        assert_eq!(
+            encoded(&ultra, "us.openai.gpt-6.1-sol")["service_tier"],
+            "ultrafast"
+        );
+        assert_eq!(
+            encoded(&ultra, "global.openai.gpt-6-astra")["service_tier"],
+            "ultrafast"
+        );
+        assert!(
+            encoded(&ultra, "us.xai.grok-4.7")
+                .get("service_tier")
+                .is_none()
+        );
+        let fast = at(Family::Responses, runtime, Some(Speed::Fast));
+        assert!(
+            encoded(&fast, "us.openai.gpt-6.1-sol")
+                .get("service_tier")
+                .is_none()
+        );
+        assert_eq!(
+            ultra.speeds()["us.openai.gpt-6.1-sol"],
+            json!(["ultrafast"])
+        );
+        assert!(ultra.speeds().get("us.xai.grok-4.7").is_none());
+
+        // The person's speeds beat the catalog: one adds a model, another
+        // takes a tier from one the catalog names.
+        let speeds = Arc::new(
+            Speeds::parse([
+                "work/*grok*=ultrafast",
+                "work/us.openai.gpt-6.1-sol=",
+                "work/*=fast",
+            ])
+            .unwrap(),
+        );
+        let set = ultra
+            .clone()
+            .with_models("work", Arc::default(), speeds.clone());
+        assert_eq!(
+            encoded(&set, "us.xai.grok-4.7")["service_tier"],
+            "ultrafast"
+        );
+        assert!(
+            encoded(&set, "us.openai.gpt-6.1-sol")
+                .get("service_tier")
+                .is_none()
+        );
+        assert_eq!(set.tiers("other"), Tiers::FAST);
+        // A pattern under another provider's name leaves this one's catalog.
+        let other = ultra.with_models("home", Arc::default(), speeds);
+        assert_eq!(
+            encoded(&other, "us.openai.gpt-6.1-sol")["service_tier"],
+            "ultrafast"
+        );
+    }
+
+    #[test]
+    fn speeds_take_known_tiers_by_model_path() {
+        let speeds = Speeds::parse(["a/*=fast,ultrafast", "a/b=", "a/c=ultrafast"]).unwrap();
+        assert_eq!(speeds.get("a/b"), Some(Tiers::NONE));
+        assert_eq!(speeds.get("a/c").map(Tiers::names), Some(vec!["ultrafast"]));
+        assert_eq!(
+            speeds.get("a/d").map(Tiers::names),
+            Some(vec!["fast", "ultrafast"])
+        );
+        assert_eq!(speeds.json()["a/b"], json!([]));
+        for wrong in ["a/b=standard", "a/b=slow", "ab=fast", "a/b"] {
+            assert_eq!(Speeds::parse([wrong]).unwrap_err().code, "usage", "{wrong}");
+        }
+        assert!(Speeds::parse(["a/b=fast", "a/b=ultrafast"]).is_err());
     }
 }

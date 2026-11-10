@@ -236,7 +236,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --context-window --models --provider-config",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --context-window --speeds --models --provider-config",
         settings: "",
         startup: true,
     },
@@ -424,7 +424,7 @@ fn print_flags(flags: &str) {
             ),
             "--speed" => (
                 "standard|fast|ultrafast",
-                "A new bot's speed tier, where its provider serves it, at a higher price per token; default standard",
+                "A new bot's speed tier, sent to each model that serves it, at a higher price per token; standard on the rest; default standard",
             ),
             "--idle-exit" => ("DURATION", "Exit after this long idle; 0 disables"),
             "--shell-exclude" => (
@@ -446,6 +446,10 @@ fn print_flags(flags: &str) {
             "--context-window" => (
                 "PATTERN=TOKENS",
                 "The context window of each model whose PROVIDER/MODEL path matches PATTERN (* and ? wildcards), over its provider's listing; the most specific pattern wins; repeatable; clients pass [context_windows] from ~/.agent/config.toml",
+            ),
+            "--speeds" => (
+                "PATTERN=TIERS",
+                "The tiers faster than standard (fast, ultrafast, comma-separated, or none) each model whose PROVIDER/MODEL path matches PATTERN (* and ? wildcards) serves, over the built-in list; a bot's speed reaches only models that serve it, others run at standard; the most specific pattern wins; repeatable; clients pass [speeds] from ~/.agent/config.toml",
             ),
             "--provider-config" => (
                 "PATH",
@@ -747,6 +751,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--protect-path"
                     | "--wall"
                     | "--context-window"
+                    | "--speeds"
             )
         {
             return fail_with("usage", format!("{flag} may only be specified once"));

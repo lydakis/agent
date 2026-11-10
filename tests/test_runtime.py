@@ -1003,25 +1003,32 @@ class AnthropicRuntimeTests(unittest.TestCase):
         turn = client.request('submit', bot='Bob', request_id='c1', prompt='hello')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
-    def test_configure_serves_a_bot_in_fast_mode_and_back(self):
-        client, model, path = self.start()
+    def test_a_bots_speed_reaches_only_the_models_that_serve_it(self):
+        # The built-in list names exact Claude models; the person adds one.
+        client, model, path = self.start(extra=('--speeds', 'anthropic/synthetic-claude=fast'))
         client.request('create', bot='Bob', workspace=str(path), effort='low')
         self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['speed'], 'standard')
-        # The Claude API serves fast alone; the refusal names what it serves.
-        refused = client.request('configure', bot='Bob', settings={'speed': 'ultrafast'})
-        self.assertEqual(refused['error'], 'invalid_speed')
-        self.assertEqual(refused['speeds'], ['fast'])
+        def served(request_id):
+            turn = client.request('submit', bot='Bob', request_id=request_id, prompt='hello')['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            usage = [m['data'] for m in client.saved if m.get('event') == 'usage' and m.get('turn') == turn]
+            return model.requests.get(timeout=5).get('speed'), usage[-1]['speed']
+        # A tier the model does not serve is kept, and its calls run at
+        # standard, as the usage says.
+        self.assertEqual(client.request('configure', bot='Bob', settings={'speed': 'ultrafast'})['result']['changed'], ['speed'])
+        self.assertEqual(served('u1'), (None, 'standard'))
         self.assertEqual(client.request('configure', bot='Bob', settings={'speed': 'fast'})['result']['changed'], ['speed'])
         self.assertEqual(client.request('configure', bot='Bob', settings={'speed': 'fast'})['result']['changed'], [])
-        turn = client.request('submit', bot='Bob', request_id='f1', prompt='hello')['result']['turn']
-        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        self.assertEqual(model.requests.get(timeout=5)['speed'], 'fast')
+        self.assertEqual(served('f1'), ('fast', 'fast'))
         # Back to standard, its calls name no speed.
         self.assertEqual(client.request('configure', bot='Bob', settings={'speed': 'standard'})['result']['changed'], ['speed'])
-        turn = client.request('submit', bot='Bob', request_id='f2', prompt='hello')['result']['turn']
-        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        self.assertNotIn('speed', model.requests.get(timeout=5))
-        self.assertEqual(client.ready['providers']['anthropic']['speeds'], ['fast'])
+        self.assertEqual(served('f2'), (None, 'standard'))
+        self.assertEqual(client.ready['providers']['anthropic']['speeds']['claude-opus-5-5'], ['fast'])
+        self.assertEqual(client.ready['speeds'], {'anthropic/synthetic-claude': ['fast']})
+        # Usage keeps each speed's spend apart.
+        spent = client.request('usage', since_ms=0)['result']['models']
+        self.assertEqual(sorted((m['model'], m['speed'], m['turns']) for m in spent),
+                         [('anthropic/synthetic-claude', 'fast', 1), ('anthropic/synthetic-claude', 'standard', 2)])
 
     def test_a_short_tool_call_sends_no_refresh(self):
         client, model, path = self.start()

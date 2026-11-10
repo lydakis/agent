@@ -4,7 +4,7 @@
 //! completion; the terminal output stands in only when none streamed. The
 //! ChatGPT Codex endpoint streams items and leaves the terminal output empty.
 use super::{
-    Completion, Delta, Frame, ToolCall, Usage, detail_of, unparsed, valid_call_id, writing,
+    Completion, Delta, Frame, Speed, ToolCall, Usage, detail_of, unparsed, valid_call_id, writing,
 };
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
@@ -126,6 +126,7 @@ impl State {
                     .as_str()
                     .unwrap_or_default()
                     .to_owned(),
+                speed: value["response"]["service_tier"].as_str().map(served_tier),
                 ..parse_usage(usage)
             });
         let detail = detail_of(&value)
@@ -224,6 +225,10 @@ fn parse_completion_with_usage(
         /// can make differ from the one requested.
         #[serde(default, borrow)]
         model: Option<Cow<'a, str>>,
+        /// The tier that served the response, which can be the default
+        /// one though a faster one was asked.
+        #[serde(default, borrow)]
+        service_tier: Option<Cow<'a, str>>,
         status: &'a str,
         #[serde(borrow)]
         output: Vec<&'a RawValue>,
@@ -233,6 +238,7 @@ fn parse_completion_with_usage(
         serde_json::from_str(raw.get()).map_err(|e| unparsed(e, raw.get().as_bytes()))?;
     *reported = response.usage.as_ref().map(|usage| Usage {
         served_model: response.model.map(Cow::into_owned).unwrap_or_default(),
+        speed: response.service_tier.as_deref().map(served_tier),
         ..parse_usage(usage)
     });
     *id = response.id.map(Cow::into_owned);
@@ -320,6 +326,16 @@ fn parse_completion_with_usage(
         usage,
         paused: false,
     })
+}
+
+/// The speed a response's `service_tier` names: `priority` is fast, as
+/// the request names it; any other tier, `default` among them, standard.
+fn served_tier(tier: &str) -> Speed {
+    match tier {
+        "priority" => Speed::Fast,
+        "ultrafast" => Speed::Ultrafast,
+        _ => Speed::Standard,
+    }
 }
 
 fn parse_usage(usage: &Value) -> Usage {
@@ -491,7 +507,7 @@ mod tests {
         state
             .frame(br#"{"type":"response.output_text.delta","delta":"ok"}"#)
             .unwrap();
-        state.frame(br#"{"type":"response.completed","response":{"model":"gpt-test-2026-09-26","status":"completed","output":[{"type":"reasoning","summary":[]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":4}}}}"#).unwrap();
+        state.frame(br#"{"type":"response.completed","response":{"model":"gpt-test-2026-09-26","service_tier":"default","status":"completed","output":[{"type":"reasoning","summary":[]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":4}}}}"#).unwrap();
         let completion = state.finish().unwrap();
         assert_eq!(completion.items.len(), 2);
         assert_eq!(
@@ -506,6 +522,7 @@ mod tests {
                 models: Vec::new(),
                 served_model: "gpt-test-2026-09-26".to_owned(),
                 context_window: 0,
+                speed: Some(Speed::Standard),
             })
         );
         // A response that failed after billing still names what ran.

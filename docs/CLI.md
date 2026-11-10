@@ -45,6 +45,15 @@ are not wildcards, then the first by name), and it wins over the provider's list
 on purpose. A client that starts a daemon passes `[context_windows]` from
 `~/.agent/config.toml`; the daemon announces them in `ready` as
 `context_windows`, and a running daemon keeps the ones it started with.
+A bot's `--speed` reaches only the models that serve that tier; its calls
+on any other run at standard. The daemon's own list names exact model ids
+(each provider's in `ready.providers.NAME.speeds`), and `serve --speeds
+PROVIDER/MODEL=TIERS`, repeatable, sets the tiers past standard (`fast`,
+`ultrafast`, comma-separated, or none) for every model whose path matches,
+ranked as `--context-window` patterns are and over the daemon's list: for
+a model the list does not name, or to take a tier from one it does. A
+client passes `[speeds]` from `~/.agent/config.toml`, and `ready.speeds`
+announces them.
 `serve --redact-field NAME` has the value printed after a field named like
 NAME (its end, any case, `_` and `-` ignored) redacted from tool output, and
 `serve --redact-block LABEL` the body of each PEM block whose header names

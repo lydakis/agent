@@ -8,7 +8,7 @@
 //! each model's cost and their sum, priced here from the sheet as it
 //! stands at each read; the daemon counts tokens only.
 use crate::background::Scope;
-use agent_client::config::Price;
+use agent_client::config::Prices;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     style::{Color, Style, Stylize},
@@ -100,11 +100,13 @@ impl Spent {
         self.cost += other.cost;
         self.unpriced += other.unpriced;
     }
-    /// A model's `row`, priced from `prices` by its `PROVIDER/MODEL`.
-    fn priced(row: &Value, prices: &[(String, Price)]) -> Self {
+    /// A model's `row`, priced from `prices` by its `PROVIDER/MODEL` at
+    /// the speed that served it.
+    fn priced(row: &Value, prices: &[(String, Prices)]) -> Self {
         let mut spent = Self::of(row);
         let id = row["model"].as_str().unwrap_or("");
-        match agent_client::config::price(prices, id) {
+        let speed = row["speed"].as_str().unwrap_or("standard");
+        match agent_client::config::price(prices, id, speed) {
             Some(price) => {
                 let count = |key: &str| row[key].as_u64().unwrap_or(0);
                 spent.cost = price.cost(
@@ -153,7 +155,7 @@ pub struct View {
     /// When it was read last; none until it is, or once it must be again.
     at: Option<Instant>,
     /// The price sheet as it was at the last read; none, no costs.
-    prices: Vec<(String, Price)>,
+    prices: Vec<(String, Prices)>,
     /// Rows scrolled past on its own screen, inline; the pane scrolls
     /// itself.
     pub scroll: usize,
@@ -205,7 +207,7 @@ impl View {
         &mut self,
         window: (i64, i64, usize),
         usage: Result<Value, String>,
-        prices: Vec<(String, Price)>,
+        prices: Vec<(String, Prices)>,
     ) {
         self.at = Some(Instant::now());
         self.prices = prices;
@@ -342,14 +344,20 @@ impl View {
         if let Some(share) = (total.cached * 100).checked_div(input) {
             head.push(Span::raw(format!(" · {share}% of input from cache")));
         }
-        // Each model priced by its own id, before ids of one model share
-        // a row.
+        // Each model priced by its own id and speed, before ids of one
+        // model share a row.
         let mut models: Vec<Row> = Vec::new();
         let mut spent = Spent::default();
         for row in usage["models"].as_array().into_iter().flatten() {
             let id = row["model"].as_str().unwrap_or("?");
             let provider = crate::models::provider(id).unwrap_or_default();
-            let name = crate::models::label(id);
+            // A faster tier's spend is a row of its own, priced at its rates.
+            let name = match row["speed"].as_str() {
+                Some(speed) if speed != "standard" => {
+                    format!("{} · {speed}", crate::models::label(id))
+                }
+                _ => crate::models::label(id),
+            };
             let priced = Spent::priced(row, &self.prices);
             spent.add(priced);
             add(&mut models, name, provider.to_owned(), priced);
@@ -995,7 +1003,7 @@ mod tests {
         assert_eq!(view.key(KeyEvent::from(KeyCode::Esc)), Key::Close);
     }
 
-    fn prices(sheet: &str) -> Vec<(String, Price)> {
+    fn prices(sheet: &str) -> Vec<(String, Prices)> {
         let dir = std::env::temp_dir().join(format!("sonny-prices-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{:x}.toml", sheet.len()));
@@ -1070,6 +1078,47 @@ mod tests {
         // Agents are not priced: a turn may span models.
         let lead = card.lines().find(|line| line.starts_with("lead ")).unwrap();
         assert!(lead.ends_with('%'), "{card}");
+    }
+
+    #[test]
+    fn each_speed_is_a_row_of_its_own_priced_at_its_rates() {
+        let mut view = View::new(scope());
+        let (_, window) = view.query(1_800_000_000_000);
+        let usage = json!({
+            "turns": 2, "input_tokens": 2_000_000, "cached_input_tokens": 0, "output_tokens": 200_000,
+            "bots": [{"bot": "p.lead", "turns": 2, "input_tokens": 2_000_000, "cached_input_tokens": 0, "output_tokens": 200_000}],
+            "other_bots": null,
+            "models": [
+                {"model": "bedrock/us.openai.gpt-6.1-sol", "speed": "ultrafast", "turns": 1,
+                 "input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 100_000},
+                {"model": "bedrock/us.openai.gpt-6.1-sol", "speed": "standard", "turns": 1,
+                 "input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 100_000},
+            ],
+            "origins": [],
+            "series": [],
+        });
+        view.loaded(
+            window,
+            Ok(usage),
+            prices(
+                "\"bedrock/*gpt-6.1-sol\" = { input = 2, output = 10, \
+                 ultrafast = { input = 12, output = 60 } }\n",
+            ),
+        );
+        let card = text(&view.card(80));
+        let models: Vec<&str> = (card.lines())
+            .skip_while(|line| *line != "By model")
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+            .collect();
+        assert_eq!(models.len(), 2, "{card}");
+        // 1M in and 0.1M out at each tier's own rates; equal spend, so by
+        // name.
+        assert!(models[0].starts_with("GPT 6.1 Sol  "), "{card}");
+        assert!(models[0].ends_with("  $3.00"), "{card}");
+        assert!(models[1].starts_with("GPT 6.1 Sol · ultrafast"), "{card}");
+        assert!(models[1].ends_with("  $18.00"), "{card}");
+        assert!(card.contains("$21.00"), "{card}");
     }
 
     #[test]

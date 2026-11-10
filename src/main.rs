@@ -345,6 +345,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut protected_paths = Vec::new();
     let mut walled = Vec::new();
     let mut windows = Vec::new();
+    let mut speeds = Vec::new();
     let mut models = None;
     let mut provider_config = None;
     let mut iter = args.iter();
@@ -374,6 +375,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--protect-path" => protected_paths.push(value.into()),
             "--wall" => walled.push(value.into()),
             "--context-window" => windows.push(value.as_str()),
+            "--speeds" => speeds.push(value.as_str()),
             "--models" => models = Some(value.into()),
             // Made whole here, so the file watched and reread on each edit is
             // the one named, with or without a folder in front of it.
@@ -451,6 +453,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         protected_paths,
         walled,
         context_windows: std::sync::Arc::new(agent_runtime::provider::Windows::parse(windows)?),
+        speeds: std::sync::Arc::new(agent_runtime::provider::Speeds::parse(speeds)?),
         models,
         provider_config,
         max_depth,

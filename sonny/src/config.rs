@@ -107,7 +107,7 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "sonny.task_speed",
-        about: "each new task's speed, where its provider serves it",
+        about: "each new task's speed, where its model serves it",
         values: &agent_client::config::SPEEDS,
         default: "its starter's on the same model",
     },
