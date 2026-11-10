@@ -718,6 +718,38 @@ class TriggerFireTests(ModelFixture):
         self.assertIn('added again', old['checked']['detail'])
         self.assertFalse((self.path / 'escaped').exists())
 
+    def test_a_definition_says_where_agent_is_and_its_row_when_it_is_gone(self):
+        # The scheduler's own environment may name no AGENT_BIN (a box whose Sonny came from a shell that
+        # set it): each definition names the Agent its fires run an agent's `--if` with.
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        env = {**clean_env(), 'HOME': str(self.home), 'AGENT_STORE': str(self.store), 'AGENT_BIN': str(self.binary)}
+        self.scheduler(env)
+
+        def automation(*args):
+            result = subprocess.run([str(SONNY), 'automation', *args], env=env, capture_output=True, text=True,
+                                    timeout=120, cwd=self.path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        doorbell = self.home / '.agent/automations/.ring'
+        self.assertTrue(self.until(doorbell.exists, 30), 'the scheduler did not open its doorbell')
+        automation('add', '--bot', 'p.task', '--name', 'gated', '--every', '30m', '--if', 'true', '--', 'look')
+        written = json.loads(job(self.home, 'gated').read_text())
+        self.assertEqual(written['environment']['AGENT_BIN'], str(self.binary))
+        (row,) = automation('ls')['automations']
+        self.assertNotIn('if_cannot_run', row)
+        # Made an agent's, its Agent gone: its row says so before any fire finds it.
+        args = program(job(self.home, 'gated').read_text())
+        at = args.index('--if-by-person')
+        args[at:at + 2] = ['--if-by', 'p.task', '--if-by-id', str(self.bot_id('p.task'))]
+        gone = self.path / 'gone/agent'
+        written.update(program=args, environment={**written['environment'], 'AGENT_BIN': str(gone)})
+        job(self.home, 'gated').write_text(json.dumps(written))
+        (row,) = automation('ls')['automations']
+        # Each place it looked: the definition's, then beside the Sonny it runs.
+        self.assertTrue(row['if_cannot_run'].startswith(f"--if: Agent's binary was not found at {gone}, "), row)
+        automation('rm', 'gated')
+
     def test_a_gate_that_says_no_costs_no_turn(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
         # Its row says when it looked and why it said no, with no result yet.

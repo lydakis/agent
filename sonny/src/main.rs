@@ -1430,12 +1430,50 @@ async fn project_of(client: &Client, bot: &str) -> String {
 /// out), else Homebrew's `agent` formula when Sonny is its `sonny`. Not
 /// `agent` on PATH, which may be another program.
 fn agent_bin() -> Option<PathBuf> {
-    let me = named::me().and_then(std::fs::canonicalize).ok();
-    std::env::var_os("AGENT_BIN")
-        .map(PathBuf::from)
+    agent_at(&agent_places_here()).ok()
+}
+
+/// [`agent_bin`], or why not: each place it looked, and to set AGENT_BIN.
+fn agent_bin_or_missing() -> Result<PathBuf, String> {
+    agent_at(&agent_places_here()).map_err(|missing| format!("{missing}; set AGENT_BIN"))
+}
+
+/// Where [`agent_bin`] looks, in order.
+fn agent_places_here() -> Vec<PathBuf> {
+    let given = std::env::var_os("AGENT_BIN").map(PathBuf::from);
+    agent_places(given, named::me().ok().as_deref())
+}
+
+/// Where Agent's binary is looked for by the Sonny at `me` given
+/// `AGENT_BIN` `given`: that, then where it is installed beside `me`. A
+/// trigger's fire looks as its definition says, which an automation's row
+/// reads to say ahead when its `--if` could not run.
+pub(crate) fn agent_places(given: Option<PathBuf>, me: Option<&std::path::Path>) -> Vec<PathBuf> {
+    let me = me.and_then(|me| std::fs::canonicalize(me).ok());
+    given
         .into_iter()
         .chain(me.iter().flat_map(|me| installed_agent(me)))
-        .find(|bin| bin.is_file())
+        .collect()
+}
+
+/// The first of `places` that is a file, else an error naming each.
+pub(crate) fn agent_at(places: &[PathBuf]) -> Result<PathBuf, String> {
+    if let Some(bin) = places.iter().find(|bin| bin.is_file()) {
+        return Ok(bin.clone());
+    }
+    Err(match places {
+        [] => {
+            "Agent's binary was not found: no AGENT_BIN, and no path to this Sonny to look beside"
+                .to_owned()
+        }
+        places => format!(
+            "Agent's binary was not found at {}",
+            (places.iter())
+                .map(|place| place.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    })
 }
 
 /// Where Agent's binary is installed with Sonny at `me`: beside it, and,
@@ -1461,7 +1499,7 @@ fn installed_agent(me: &std::path::Path) -> Vec<PathBuf> {
 /// ARGS and the same keys, in place of this process, so the person reaches
 /// it whatever else is called `agent` on their PATH.
 fn pass_to_agent(args: &[String]) -> Result<(), String> {
-    let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+    let bin = agent_bin_or_missing()?;
     let mut command = agent_command(&bin)?;
     let error = std::os::unix::process::CommandExt::exec(command.args(args));
     Err(format!("{}: {error}", bin.display()))
@@ -1674,7 +1712,7 @@ async fn connect_starting(
             if !setup::interactive() {
                 return Err(format!("{failed}; run sonny in a terminal to choose one"));
             }
-            let bin = agent_bin().ok_or("Agent's binary was not found; set AGENT_BIN")?;
+            let bin = agent_bin_or_missing()?;
             setup::provider(&bin, false)?;
             start().map_err(|e| e.to_string())?;
         }
@@ -1726,9 +1764,11 @@ fn start_daemon(
     socket: &std::path::Path,
     login: bool,
 ) -> Result<(), NotStarted> {
-    let bin = agent_bin().ok_or(
-        "the daemon is not running and Agent's binary was not found; install Sonny with Homebrew or its release tarball, or set AGENT_BIN".to_owned(),
-    )?;
+    let bin = agent_at(&agent_places_here()).map_err(|missing| {
+        format!(
+            "the daemon is not running and {missing}; install Sonny with Homebrew or its release tarball, or set AGENT_BIN"
+        )
+    })?;
     // A trigger's fire runs as a systemd service, which takes every process
     // left in it when it ends: the daemon is started in a scope of its own,
     // as a desktop starts an app, so it outlives the fire.

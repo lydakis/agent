@@ -1465,8 +1465,9 @@ fn words(line: &str) -> Option<Vec<String>> {
     }
 }
 
-/// A plist's trigger and app, or why it could not be read.
-type Read = Result<(Trigger, PathBuf), String>;
+/// A definition's trigger and how the scheduler runs it, or why it could
+/// not be read.
+type Read = Result<(Trigger, Job), String>;
 
 const PAGE_SIZE: usize = 64;
 // Shared by plist writes and record reads; oversized definitions never replace a job.
@@ -1495,7 +1496,9 @@ fn read_bounded(path: &Path, max: u64) -> Result<String, String> {
 
 fn read_trigger(path: &Path) -> Read {
     read_record(path).and_then(|text| {
-        read_job(&text).ok_or_else(|| "unreadable: not an automation's definition".into())
+        Job::read(&text)
+            .and_then(|job| Some((trigger_of(&job.program)?.0, job)))
+            .ok_or_else(|| "unreadable: not an automation's definition".into())
     })
 }
 
@@ -1552,6 +1555,32 @@ impl Trigger {
         }
     }
 
+    /// Whether its `--if` can run as the scheduler runs its definition
+    /// `job`: one an agent wrote runs in that agent's sandbox, which takes
+    /// Agent's binary, looked for as the fire looks ([`crate::agent_bin`])
+    /// with the definition's `AGENT_BIN` and Sonny. Its row says why not,
+    /// ahead of the fire that would find it (`if_cannot_run`).
+    fn say_gate_cannot_run(&self, job: &Job, row: &mut Value) {
+        if self.gate.is_none() {
+            return;
+        }
+        let cannot = match self.gate_runs_as() {
+            Err(why) => why,
+            Ok(None) => return,
+            Ok(Some(_)) => {
+                let given = (job.environment.iter())
+                    .find(|(key, _)| key == AGENT_BIN)
+                    .map(|(_, path)| PathBuf::from(path));
+                let me = job.program.first().map(PathBuf::from);
+                match crate::agent_at(&crate::agent_places(given, me.as_deref())) {
+                    Ok(_) => return,
+                    Err(missing) => no_agent(&missing),
+                }
+            }
+        };
+        row["if_cannot_run"] = json!(cannot);
+    }
+
     /// Whether `gate` is one Sonny writes, word for word.
     fn sonnys_gate(&self, gate: &str) -> bool {
         let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"));
@@ -1583,7 +1612,7 @@ impl Trigger {
     }
 }
 
-fn triggers(places: &Places) -> Vec<(Trigger, PathBuf)> {
+fn triggers(places: &Places) -> Vec<(Trigger, Job)> {
     read_all(places).filter_map(|(_, r)| r.ok()).collect()
 }
 
@@ -1935,8 +1964,9 @@ pub fn on_store_until(places: &Places, store_id: &str) -> (Vec<(Value, Vec<Strin
     let mut found: Vec<(Value, Vec<String>)> = triggers(places)
         .into_iter()
         .filter(|(t, _)| t.store_id == store_id)
-        .map(|(t, _)| {
+        .map(|(t, job)| {
             let mut row = t.json(&state(places, &t));
+            t.say_gate_cannot_run(&job, &mut row);
             match t.at.map(|at| at + SLACK) {
                 Some(missed) if now > missed => row["missed"] = json!(true),
                 Some(missed) => until = Some(until.map_or(missed + 1, |u| u.min(missed + 1))),
@@ -2009,7 +2039,11 @@ fn row(places: &Places, name: &str) -> Value {
         return row;
     }
     match read_trigger(&path) {
-        Ok((t, _)) => live_row(&t, &state(places, &t)),
+        Ok((t, job)) => {
+            let mut row = live_row(&t, &state(places, &t));
+            t.say_gate_cannot_run(&job, &mut row);
+            row
+        }
         Err(problem) => json!({"name": name, "ended": false, "problem": problem}),
     }
 }
@@ -2783,13 +2817,37 @@ fn synced(path: &Path) -> Result<(), String> {
 }
 
 /// The app moves when it is updated, so it writes its path into every
-/// trigger again when it starts from somewhere else. One that fails keeps
-/// the old path, so the next start tries it again.
+/// trigger again when it starts from somewhere else, and Agent's
+/// ([`AGENT_BIN`]) when it is another. One that fails keeps the old paths,
+/// so the next start tries it again. Agent not found here leaves each
+/// definition's as it is.
 pub fn refresh(places: &Places, app: &Path) {
+    refresh_with(places, app, agent_path().as_deref());
+}
+
+fn refresh_with(places: &Places, app: &Path, agent: Option<&str>) {
     rewrite(places, |_, text| {
         let was = PathBuf::from(program(text)?.into_iter().next()?);
-        (was != app).then(|| with_app(text, &was, app))
+        let moved = (was != app).then(|| with_app(text, &was, app));
+        let text = moved.as_deref().unwrap_or(text);
+        agent.and_then(|agent| with_agent(text, agent)).or(moved)
     });
+}
+
+/// The definition with its fires finding Agent at `agent`; none when it
+/// does already, or is not a definition.
+fn with_agent(text: &str, agent: &str) -> Option<String> {
+    let mut value: Value = serde_json::from_str(text).ok()?;
+    if value["environment"][AGENT_BIN] == agent {
+        return None;
+    }
+    if value["environment"].is_null() {
+        value["environment"] = json!({});
+    }
+    value["environment"]
+        .as_object_mut()?
+        .insert(AGENT_BIN.into(), json!(agent));
+    Some(value.to_string() + "\n")
 }
 
 /// A trigger made before triggers named their store by its lineage names
@@ -3035,6 +3093,31 @@ pub(crate) fn environment() -> Vec<(&'static str, String)> {
     keys.into_iter()
         .filter_map(|key| std::env::var(key).ok().map(|v| (key, v)))
         .collect()
+}
+
+/// Where a fire finds Agent's binary, which its definition names beside
+/// the Sonny it runs: the scheduler's own environment may name none (it
+/// ran Sonny from a shell that set `AGENT_BIN`), or name one an upgrade
+/// removed. [`refresh`] writes it again at each Sonny start.
+const AGENT_BIN: &str = "AGENT_BIN";
+
+/// The Agent this Sonny runs, by a path that outlasts upgrades: Homebrew's
+/// `opt` path for one in its Cellar.
+fn agent_path() -> Option<String> {
+    let agent = crate::agent_bin()?;
+    Some(
+        crate::skills::opt_path(&agent)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// What a trigger's fire starts with besides the scheduler's own:
+/// [`environment`], and where Agent's binary is ([`AGENT_BIN`]).
+fn fire_environment() -> Vec<(&'static str, String)> {
+    let mut environment = environment();
+    environment.extend(agent_path().map(|agent| (AGENT_BIN, agent)));
+    environment
 }
 
 pub(crate) fn runtime() -> Result<tokio::runtime::Runtime, String> {
@@ -3960,12 +4043,20 @@ fn add_as(places: &Places, args: &[String], agents_gate: bool) -> Result<Value, 
         .commit
         .as_deref()
         .map(|repo| moved(repo, &Seen::default()).1);
-    let watching = std::fs::read_to_string(places.job(&trigger.name))
+    let there = std::fs::read_to_string(places.job(&trigger.name))
         .ok()
-        .and_then(|text| watched(&text));
+        .and_then(|text| Job::read(&text));
+    let watching = there.as_ref().and_then(|job| job.watch.clone());
     let keeps_seen = asked.replace && keeps_seen(places, &trigger);
     let app = crate::skills::sonny_path().ok_or("no path to this Sonny")?;
-    let environment = environment();
+    let mut environment = fire_environment();
+    // Added again where Agent is not found, it keeps where it finds it.
+    if !environment.iter().any(|(key, _)| *key == AGENT_BIN) {
+        let kept = (there.iter().flat_map(|job| &job.environment))
+            .find(|(key, _)| key == AGENT_BIN)
+            .map(|(_, agent)| (AGENT_BIN, agent.clone()));
+        environment.extend(kept);
+    }
     match install(
         places,
         &app,
@@ -4093,6 +4184,12 @@ fn stamp(epoch: i64) -> String {
     )
 }
 
+/// An agent's `--if` that cannot run for want of Agent's binary, which
+/// runs its sandbox.
+fn no_agent(missing: &str) -> String {
+    format!("--if: {missing}")
+}
+
 /// How much of what a gate wrote to stderr its failure keeps: the end,
 /// where a shell says what it could not find.
 const GATE_SAID: usize = 300;
@@ -4115,8 +4212,8 @@ fn gate(
     let mut sh = match by {
         None => std::process::Command::new("/bin/sh"),
         Some((bot, id)) => {
-            let agent = crate::agent_bin()
-                .ok_or("--if: no agent command to run its agent's sandbox with")?;
+            let agent = crate::agent_at(&crate::agent_places_here())
+                .map_err(|missing| no_agent(&missing))?;
             let mut sh = std::process::Command::new(agent);
             sh.args(["sandbox", "--bot", bot, "--bot-id", &id.to_string()]);
             for (flag, value) in [("--store", &daemon.store), ("--socket", &daemon.socket)] {
@@ -7366,6 +7463,69 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_row_says_ahead_when_an_agents_if_cannot_run() {
+        let dir = std::env::temp_dir().join(format!("if-agent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent = dir.join("agent");
+        std::fs::write(&agent, "").unwrap();
+        let gone = dir.join("gone");
+        // A Sonny with no path to it: only the definition's AGENT_BIN is looked at.
+        let job = |agent: Option<&Path>| Job {
+            program: vec!["/nowhere/sonny".into()],
+            environment: (agent.into_iter())
+                .map(|agent| ("AGENT_BIN".to_owned(), agent.display().to_string()))
+                .collect(),
+            calendar: Vec::new(),
+            watch: None,
+        };
+        let said = |t: &Trigger, job: &Job| {
+            let mut row = json!({});
+            t.say_gate_cannot_run(job, &mut row);
+            row["if_cannot_run"].clone()
+        };
+        let gated = Trigger {
+            gate: Some("test -f ready".into()),
+            gate_by: Some(Writer::Agent("p.fix".into(), 7)),
+            ..trigger()
+        };
+        assert_eq!(said(&gated, &job(Some(&agent))), Value::Null);
+        assert_eq!(
+            said(&gated, &job(Some(&gone))),
+            json!(format!(
+                "--if: Agent's binary was not found at {}",
+                gone.display()
+            ))
+        );
+        assert_eq!(
+            said(&gated, &job(None)),
+            json!(
+                "--if: Agent's binary was not found: no AGENT_BIN, and no path to this Sonny to look beside"
+            )
+        );
+        // The person's runs as them, and none at all runs nothing.
+        let persons = Trigger {
+            gate_by: Some(Writer::Person),
+            ..gated.clone()
+        };
+        assert_eq!(said(&persons, &job(None)), Value::Null);
+        assert_eq!(said(&trigger(), &job(None)), Value::Null);
+        // One added before Sonny recorded whose it is does not run at all.
+        let unowned = Trigger {
+            gate_by: None,
+            ..gated.clone()
+        };
+        let cannot = said(&unowned, &job(Some(&agent)));
+        assert!(
+            cannot
+                .as_str()
+                .unwrap()
+                .starts_with("--if: added before Sonny 0.9.0"),
+            "{cannot}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn add_again_is_the_same_trigger_and_rm_removes_it() {
         let w = World::new("add");
         let s = trigger();
@@ -7464,12 +7624,29 @@ pub(crate) mod tests {
                 .starts_with("automation_not_found")
         );
         // A move of Sonny is written into every trigger.
-        refresh(&w.places, Path::new("/B/agent-app"));
-        assert_eq!(triggers(&w.places)[0].1, Path::new("/B/agent-app"));
+        refresh_with(&w.places, Path::new("/B/agent-app"), None);
+        assert_eq!(triggers(&w.places)[0].1.program[0], "/B/agent-app");
         assert_eq!(triggers(&w.places)[0].0, s);
         let text = w.plist(&s.name);
-        refresh(&w.places, Path::new("/B/agent-app"));
+        refresh_with(&w.places, Path::new("/B/agent-app"), None);
         assert_eq!(w.plist(&s.name), text, "an unmoved app changes nothing");
+        // Where Agent is goes into every trigger's environment, for its
+        // fires to find it, written again only when it moved; Agent not
+        // found leaves the one there.
+        let agent = |w: &World| {
+            let job = triggers(&w.places).remove(0).1;
+            (job.program[0].clone(), job.environment)
+        };
+        let at = |path: &str| vec![("AGENT_BIN".to_owned(), path.to_owned())];
+        refresh_with(&w.places, Path::new("/B/agent-app"), Some("/B/agent"));
+        assert_eq!(agent(&w), ("/B/agent-app".into(), at("/B/agent")));
+        let text = w.plist(&s.name);
+        refresh_with(&w.places, Path::new("/B/agent-app"), Some("/B/agent"));
+        assert_eq!(w.plist(&s.name), text, "an unmoved agent changes nothing");
+        refresh_with(&w.places, Path::new("/C/agent-app"), Some("/C/agent"));
+        assert_eq!(agent(&w), ("/C/agent-app".into(), at("/C/agent")));
+        refresh_with(&w.places, Path::new("/C/agent-app"), None);
+        assert_eq!(agent(&w), ("/C/agent-app".into(), at("/C/agent")));
         w.remove(&s.name).unwrap();
         assert_eq!(w.rows(), Vec::<Value>::new());
         assert_eq!(w.state(&s.name), (false, false));
