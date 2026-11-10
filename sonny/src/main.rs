@@ -4285,6 +4285,9 @@ struct Fleet {
     followed: Vec<String>,
     /// When the followed leads were last read.
     followed_at: Option<Instant>,
+    /// A bot no agent made appeared in a followed project: whose it is,
+    /// the next read of the followed leads lists again.
+    refollow: bool,
     /// Those leads and every bot of their lineage: what waits on the
     /// person in theirs waits in this window too, and is answered here.
     /// Never a window here, nor a tab.
@@ -4772,6 +4775,7 @@ impl Fleet {
             leads: Default::default(),
             followed: Vec::new(),
             followed_at: None,
+            refollow: false,
             raised: Default::default(),
             command,
             note,
@@ -4821,6 +4825,7 @@ impl Fleet {
             leads: Default::default(),
             followed: Vec::new(),
             followed_at: None,
+            refollow: false,
             raised: Default::default(),
             command: Vec::new(),
             note: None,
@@ -4961,7 +4966,7 @@ impl Fleet {
         self.followed_at = Some(Instant::now());
         let store = self.store.clone();
         let followed = followed_leads(&self.lead, |bot| lookout::subs::read(&store, bot));
-        if !now && followed == self.followed {
+        if !now && !self.refollow && followed == self.followed {
             return Vec::new();
         }
         let mut raised = std::collections::HashSet::new();
@@ -4977,6 +4982,11 @@ impl Fleet {
             let theirs = lead_and_lineage(&bots, lead);
             for bot in &bots {
                 if let Some(name) = bot["name"].as_str().filter(|name| theirs.contains(*name)) {
+                    // A turn that ended while away ends what its events
+                    // left unsure: its history, read next, says.
+                    if bot["running_turn"].is_null() {
+                        self.needs.sure(name);
+                    }
                     heads.push((name.to_owned(), json!([bot["bot_id"], bot["head"]])));
                 }
             }
@@ -4991,6 +5001,7 @@ impl Fleet {
             raised.difference(&self.raised).cloned().collect();
         self.raised = raised;
         self.followed = followed;
+        self.refollow = false;
         // A reconcile reads every call after; else the new ones' now.
         if !now
             && !new.is_empty()
@@ -5492,6 +5503,20 @@ impl Fleet {
                     // A followed lead's new task is followed with it.
                     Kin::None if self.raised.contains(by) && !project::is_lead(bot) => {
                         self.raised.insert(bot.to_owned());
+                    }
+                    // One no agent made may be a followed first lead's:
+                    // the listing says, as it does at the start.
+                    Kin::None
+                        if by.is_empty()
+                            && (self.followed.iter()).any(|lead| {
+                                project::lead_project(lead).is_some_and(|project| {
+                                    *lead == format!("{project}.lead")
+                                        && bot.starts_with(&format!("{project}."))
+                                })
+                            }) =>
+                    {
+                        self.refollow = true;
+                        self.followed_at = None;
                     }
                     Kin::None => {}
                 }
@@ -22779,6 +22804,58 @@ mod tests {
             .collect();
         theirs.sort();
         assert_eq!(theirs, ["shop.lead.web", "shop.page"]);
+    }
+
+    /// The bots of the leads a window follows are listed when the follows
+    /// file names them, and again when a bot no agent made appears in a
+    /// followed first lead's project; idle ones are read afresh.
+    #[tokio::test]
+    async fn a_followed_leads_bots_are_listed_and_a_loose_one_joins_them() {
+        let dir = std::env::temp_dir().join(format!("followed-{}", std::process::id()));
+        let store = dir.join("store");
+        let mut sub = lookout::subs::Sub::lead("home.lead", "home");
+        sub.tasks_of = vec!["shop.lead".into()];
+        std::fs::create_dir_all(lookout::subs::dir(&store)).unwrap();
+        std::fs::write(
+            lookout::subs::dir(&store).join("home.lead.json"),
+            json!({"subscriptions": [sub.to_json()]}).to_string(),
+        )
+        .unwrap();
+        let loose = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listed = loose.clone();
+        let (client, events) = daemon_with_events(json!({}), move |asked| {
+            match (asked["op"].as_str().unwrap_or(""), asked["name"].as_str()) {
+                ("bots", Some("shop.*")) => {
+                    let mut bots = vec![
+                        json!({"name": "shop.lead", "bot_id": 1, "head": 1}),
+                        json!({"name": "shop.fix", "bot_id": 2, "head": 2,
+                            "created_by": "shop.lead", "running_turn": 5}),
+                    ];
+                    if listed.load(std::sync::atomic::Ordering::SeqCst) {
+                        bots.push(json!({"name": "shop.loose", "bot_id": 3, "head": 3}));
+                    }
+                    json!({"bots": bots})
+                }
+                _ => json!({}),
+            }
+        })
+        .await;
+        let mut fleet = Fleet::in_memory(client, events, "home", "home.lead");
+        fleet.store = store;
+        let unread = fleet.follow_leads(true).await;
+        let mut raised: Vec<&String> = fleet.raised.iter().collect();
+        raised.sort();
+        assert_eq!(raised, ["shop.fix", "shop.lead"]);
+        assert_eq!(unread.len(), 2);
+        // Unchanged, the file is not listed again.
+        assert!(fleet.follow_leads(false).await.is_empty());
+        // A bot no agent made, in a followed first lead's project.
+        loose.store(true, std::sync::atomic::Ordering::SeqCst);
+        fleet.event(&json!({"event": "created", "bot": "shop.loose", "data": {}}));
+        let unread = fleet.follow_leads(false).await;
+        assert!(fleet.raised.contains("shop.loose"));
+        assert!(unread.iter().any(|(bot, _)| bot == "shop.loose"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A call of a followed lead's task waits in the window the person is
