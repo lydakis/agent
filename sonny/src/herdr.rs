@@ -1170,12 +1170,12 @@ if out is not None:
 
     #[test]
     fn another_project_s_lead_opens_in_its_own_workspace_never_the_caller_s() {
-        // Its lead last shown in the caller's workspace, `workplace`.
+        // Its lead last shown in the caller's workspace, `desk`.
         let (bin, dir) = fake(
             "own",
             json!({
                 "n": 10,
-                "workspaces": [{"workspace_id": "w1", "label": "workplace"}],
+                "workspaces": [{"workspace_id": "w1", "label": "desk"}],
                 "panes": [
                     {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "shop.lead"},
                 ],

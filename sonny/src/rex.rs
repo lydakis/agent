@@ -550,7 +550,7 @@ if out is not None:
         // Its lead was shown in the caller's session.
         let (bin, dir) = fake(
             "own",
-            serde_json::json!({"01ws": {"label": "workplace", "blocks": [block("block:web", "web.lead")]}}),
+            serde_json::json!({"01ws": {"label": "desk", "blocks": [block("block:web", "web.lead")]}}),
         );
         let rex = super::Rex::own(bin, None, "web").unwrap();
         assert!(crate::mux::Backend::made(&rex));

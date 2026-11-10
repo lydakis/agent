@@ -787,7 +787,7 @@ print(json.dumps(out))
         let state = json!({
             "n": 10,
             "workspaces": [
-                {"id": "ws-1", "title": "workplace", "panes": [pane("pn-1", &[("sf-1", "shop.lead")])]},
+                {"id": "ws-1", "title": "desk", "panes": [pane("pn-1", &[("sf-1", "shop.lead")])]},
             ],
         });
         let (bin, dir) = fake("own", state);
@@ -801,7 +801,7 @@ print(json.dumps(out))
         let state = json!({
             "n": 10,
             "workspaces": [
-                {"id": "ws-1", "title": "workplace", "panes": [pane("pn-1", &[("sf-1", "shop.lead")])]},
+                {"id": "ws-1", "title": "desk", "panes": [pane("pn-1", &[("sf-1", "shop.lead")])]},
                 {"id": "ws-2", "title": "shop", "panes": [pane("pn-2", &[("sf-2", "zsh")])]},
             ],
         });
