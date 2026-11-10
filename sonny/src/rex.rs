@@ -107,6 +107,24 @@ impl Rex {
         terminal: bool,
         kept: Option<&str>,
     ) -> Result<Self, String> {
+        Self::open_as(bin, host, label, terminal, kept, false)
+    }
+
+    /// The session labelled with the project's name, made when there is
+    /// none, whatever session a window of the project was last in: the
+    /// project's own home, for another project's agent to open in.
+    pub fn own(bin: PathBuf, host: Option<&str>, label: &str) -> Result<Self, String> {
+        Self::open_as(bin, host, label, false, None, true)
+    }
+
+    fn open_as(
+        bin: PathBuf,
+        host: Option<&str>,
+        label: &str,
+        terminal: bool,
+        kept: Option<&str>,
+        own: bool,
+    ) -> Result<Self, String> {
         let mut rex = Self {
             bin,
             host: host
@@ -148,7 +166,11 @@ impl Rex {
                 rex.here = true;
                 (id.clone(), now.clone())
             }
-            None => match kept.or_else(leads).or(found) {
+            None => match if own {
+                found
+            } else {
+                kept.or_else(leads).or(found)
+            } {
                 Some((id, now)) => (id.clone(), now.clone()),
                 None => {
                     let made = rex.call(&["new", label, "--json"])?;
@@ -520,6 +542,19 @@ if out is not None:
         let rex = super::Rex::open(dir.join("rex"), None, "web", false, None).unwrap();
         let mut layout = crate::mux::Layout::new(Box::new(rex));
         assert!(!layout.show("web.lead", "lead", &sonny).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn another_project_s_lead_gets_its_own_session_never_the_one_it_was_shown_in() {
+        // Its lead was shown in the caller's session.
+        let (bin, dir) = fake(
+            "own",
+            serde_json::json!({"01ws": {"label": "workplace", "blocks": [block("block:web", "web.lead")]}}),
+        );
+        let rex = super::Rex::own(bin, None, "web").unwrap();
+        assert!(crate::mux::Backend::made(&rex));
+        assert_eq!(rex.session, "01made");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

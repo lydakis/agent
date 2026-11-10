@@ -368,6 +368,23 @@ impl Herdr {
         terminal: Option<&str>,
         kept: Option<&str>,
     ) -> Result<Self, String> {
+        Self::open_as(bin, label, terminal, kept, false)
+    }
+
+    /// The workspace labelled with the project's name, made when there is
+    /// none, whatever workspace a window of the project was last in: the
+    /// project's own home, for another project's agent to open in.
+    pub fn own(bin: PathBuf, label: &str) -> Result<Self, String> {
+        Self::open_as(bin, label, None, None, true)
+    }
+
+    fn open_as(
+        bin: PathBuf,
+        label: &str,
+        terminal: Option<&str>,
+        kept: Option<&str>,
+        own: bool,
+    ) -> Result<Self, String> {
         let mut herdr = Self {
             bin,
             workspace: String::new(),
@@ -414,7 +431,11 @@ impl Herdr {
                     .and_then(|me| me["pane"]["pane_id"].as_str().map(str::to_owned));
                 (id.clone(), now.clone())
             }
-            None => match kept.or_else(leads).or_else(found) {
+            None => match if own {
+                found()
+            } else {
+                kept.or_else(leads).or_else(found)
+            } {
                 Some((id, now)) => (id.clone(), now.clone()),
                 None => {
                     let made =
@@ -1145,6 +1166,34 @@ if out is not None:
         // A kept workspace closed since: the lead's, as before.
         let herdr = Herdr::open(bin, "shop", None, Some("w9")).unwrap();
         assert_eq!(herdr.workspace, "w1");
+    }
+
+    #[test]
+    fn another_project_s_lead_opens_in_its_own_workspace_never_the_caller_s() {
+        // Its lead last shown in the caller's workspace, `workplace`.
+        let (bin, dir) = fake(
+            "own",
+            json!({
+                "n": 10,
+                "workspaces": [{"workspace_id": "w1", "label": "workplace"}],
+                "panes": [
+                    {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "shop.lead"},
+                ],
+            }),
+        );
+        let herdr = Herdr::own(bin.clone(), "shop").unwrap();
+        assert!(herdr.made());
+        assert_eq!(herdr.home(), "Herdr workspace shop");
+        assert!(
+            calls(&dir)
+                .iter()
+                .any(|call| call[..2] == ["workspace", "create"])
+        );
+        // One labelled with the project is its own, found again.
+        let found = Herdr::own(bin, "shop").unwrap();
+        assert!(!found.made());
+        assert_ne!(found.workspace, "w1");
+        assert_eq!(found.workspace, herdr.workspace);
     }
 
     #[test]

@@ -1066,6 +1066,7 @@ run macOS or Linux. On the machine to link:
 sonny link devbox          # or me@devbox.example.com; --machine NAME, --name NAME
 sonny link                 # the links, and the machines linked here
 sonny link off devbox
+sonny link forget laptop   # on the host: forget a machine linked to it
 ```
 
 `sonny link HOST` finds Sonny on the host (installing this version with
@@ -1103,7 +1104,12 @@ The host's agents see each linked machine by name:
   once from the person's Chrome profile `browser_profile` names, and again
   only when that name changes, so the person's own Chrome is left alone and
   what the shared browser picks up (a sign-in, an extension's sync, a
-  device check) stays across restarts. A `browser_profile` that is a
+  device check) stays across restarts. Each time that Chrome starts, the
+  person's native messaging hosts (`NativeMessagingHosts` beside their
+  profiles, which an extension such as a company's device check talks to)
+  are linked into the kept profile, and their `Cookies` are copied over
+  the kept profile's when theirs were written later, so signing in again
+  in their own Chrome reaches the shared browser at its next start. A `browser_profile` that is a
   folder is used as it is; `""` gives each agent a fresh browser of its
   own instead. Sonny starts that Chrome itself, the person's own Chrome
   program (or agent-browser's `executablePath`), with the system's
@@ -1111,8 +1117,12 @@ The host's agents see each linked machine by name:
   finds its certificates; agent-browser starts a profile folder with a
   stand-in keychain. It runs headless unless agent-browser's settings say
   `headed`, through the proxy agent-browser would give it (one that signs
-  in with a password is refused), and closes 30 minutes after the link's agents last used it. Paths there don't belong to the agent: a screenshot with no
-  path comes back as a picture, and other files are refused.
+  in with a password is refused), and closes 30 minutes after the link's agents last used it. A screenshot with no
+  path comes back as a picture. A path is the agent's own, on the host:
+  checked against what the agent may write before anything runs, the file
+  (a screenshot, a PDF, a HAR, `diff -o`, a recording at its `stop`, up to
+  30 MB a call) comes back over the link and is written there. The linked
+  machine keeps none of it, and reads no file of its own for the agent.
 - `desktop` takes `machine` while that machine's agents could use its
   desktop (agent-desktop is installed there and it shows a desktop). The
   commands run on its desktop, checked there as its own agents' are, and

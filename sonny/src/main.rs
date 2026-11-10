@@ -380,7 +380,9 @@ fn usage() -> String {
 /// asked. A task gets a window of its own unless told otherwise; `split`
 /// puts it beside the caller's block, or `beside` another bot's. Another
 /// project's lead gets its project's own home instead (a Rex session, a
-/// Herdr or cmux workspace), running that lead's Sonny, unless it is there already.
+/// Herdr or cmux workspace, labelled with the project and made when there
+/// is none, never the caller's), running that lead's Sonny, unless it is
+/// there already; the answer says when the home was made.
 async fn show(
     caller: &str,
     bot: &str,
@@ -398,8 +400,12 @@ async fn show(
         && let Some(other) = project::lead_project(bot).filter(|p| *p != project)
     {
         let store = std::env::var_os("AGENT_STORE").map(PathBuf::from);
-        let (home, opened) = open_lead(&socket, store.as_deref(), other, bot, &project, &me)?;
-        return Ok(json!({"bot": bot, "in": home, "opened": opened}));
+        let (home, opened, made) = open_lead(&socket, store.as_deref(), other, bot, &project, &me)?;
+        let mut answer = json!({"bot": bot, "in": home, "opened": opened});
+        if made {
+            answer["made"] = json!(format!("{home} was made for {other}, as it had none"));
+        }
+        return Ok(answer);
     }
     let mut layout = mux::for_agent(&socket, &project, &chain, None)?;
     // Opened in this home, the agent's window knows it is there.
@@ -976,11 +982,13 @@ async fn read_latest(client: &Client, bot: &str) -> Option<Latest> {
     })
 }
 
-/// Open `bot`, a lead of `project`, in that project's own home, made when needed in
-/// the multiplexer `like`'s home is in, running Sonny on it: a session for
-/// each lead, and in it a window for each of its tasks. A lead whose Sonny
-/// is there already is left as it is. Returns the home, and whether it
-/// was opened now.
+/// Open `bot`, a lead of `project`, in that project's own home, the
+/// workspace or session labelled with it, made when needed in the
+/// multiplexer `like`'s home is in, running Sonny on it: a session for
+/// each lead, and in it a window for each of its tasks. Never in another
+/// project's home, though the lead's window was last there. A lead whose
+/// Sonny is there already is left as it is. Returns the home, whether the
+/// lead was opened now, and whether its home was made now.
 fn open_lead(
     socket: &std::path::Path,
     store: Option<&std::path::Path>,
@@ -988,8 +996,8 @@ fn open_lead(
     bot: &str,
     like: &str,
     me: &std::path::Path,
-) -> Result<(String, bool), String> {
-    let mut layout = mux::for_agent(socket, project, &[bot.to_owned()], Some(like))?;
+) -> Result<(String, bool, bool), String> {
+    let mut layout = mux::own_home(socket, project, &[bot.to_owned()], Some(like))?;
     let bot = bot.to_owned();
     let mut command = vec![me.to_string_lossy().into_owned()];
     if let Some(store) = store {
@@ -1006,7 +1014,7 @@ fn open_lead(
         false => format!("lead {}", project::lead_short(&bot)),
     };
     let opened = layout.show(&bot, &label, &command)?;
-    Ok((layout.home(), opened))
+    Ok((layout.home(), opened, layout.made()))
 }
 
 /// The daemon's socket, the project `bot` belongs to, and `bot` with the
