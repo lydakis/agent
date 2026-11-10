@@ -939,7 +939,6 @@ fn link(name: &str, value: &toml::Value) -> Result<Link, String> {
             "host" => link.host = string(&key_at, value)?,
             "machine" => link.machine = string(&key_at, value)?,
             "command" => link.command = Some(string(&key_at, value)?),
-            // "" is a fresh browser, with no profile to start from.
             "calls" => {
                 link.calls = Some(
                     (value.as_integer())
@@ -948,6 +947,7 @@ fn link(name: &str, value: &toml::Value) -> Result<Link, String> {
                         as usize,
                 );
             }
+            // "" is a fresh browser, with no profile to start from.
             "browser_profile" => {
                 link.browser_profile = (value.as_str())
                     .ok_or_else(|| format!("{key_at} must be a string"))?
@@ -2114,10 +2114,11 @@ pub fn set_table(path: &Path, name: &str, keys: Option<&toml::Table>) -> Result<
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         read => read.map_err(|e| format!("config_unreadable: {}: {e}", path.display()))?,
     };
+    // The name is what the brackets hold: a comment may follow them.
     let header = |line: &str| {
         let line = line.trim();
-        (line.starts_with('[') && !line.starts_with("[["))
-            .then(|| line.trim_matches(['[', ']']).trim().to_owned())
+        let rest = line.strip_prefix('[').filter(|_| !line.starts_with("[["))?;
+        Some(rest.split(']').next().unwrap_or(rest).trim().to_owned())
     };
     let ours = |table: &str| table == name || table.starts_with(&format!("{name}."));
     let mut lines = Vec::new();
@@ -3030,6 +3031,16 @@ mod tests {
             (Some("npx"), &["-y".to_owned(), "x".to_owned()][..])
         );
         assert_eq!(files.env["K"], "v");
+        assert_eq!(config.reviewer.effort.as_deref(), Some("low"));
+        // A heading with a comment after it is the table all the same.
+        std::fs::write(
+            &file,
+            "[sonny.mcp_servers.docs]  # the docs\nurl = \"https://a\"\n\n[reviewer] # mine\neffort = \"low\"\n",
+        )
+        .unwrap();
+        set_table(&file, "sonny.mcp_servers.docs", None).unwrap();
+        let config = read(&file).unwrap();
+        assert!(!config.sonny.mcp_servers.contains_key("docs"));
         assert_eq!(config.reviewer.effort.as_deref(), Some("low"));
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -1,6 +1,6 @@
 //! What a human-facing client tells a new bot. The daemon stores whatever
 //! text it is given and never composes any; this is where clients agree on
-//! the composition, so a bot created from the app or the CLI with `--agents`
+//! the composition, so a bot created from Sonny or the CLI with `--agents`
 //! reads the same way.
 //!
 //! Layers, in this order: the harness preamble (how to delegate and collect
@@ -254,8 +254,7 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Option<String>, Failure> {
 /// The head of a skill or profile file: at most this much is read to index it.
 const SKILL_HEAD: usize = 4096;
 /// Directory entries one index visits, indexed or not, so a folder full of
-/// other files cannot make every composition slow. A row costs more than 15
-/// bytes, so the byte budget ends a full index well before this.
+/// other files cannot make every composition slow.
 const MAX_ENTRIES: usize = 4096;
 
 /// AGENTS.md files that apply to `workspace`: the global one first, then
@@ -317,8 +316,9 @@ pub struct Front {
     pub description: Option<String>,
     pub model: Option<String>,
     pub tools: Option<Vec<String>>,
-    /// A profile this one builds on: its body comes first, and its model,
-    /// tools and skills stand where this one names none.
+    /// A profile this one builds on: its body comes first, its model and
+    /// tools stand where this one names none, and its skills are carried
+    /// with this one's.
     pub extends: Option<String>,
     /// Skills whose whole text a profile carries, as a Claude Code
     /// subagent's `skills` preloads them.
@@ -583,8 +583,8 @@ fn not_dangling(path: &Path) -> Result<(), Failure> {
 
 /// The memory indexes a new bot in `workspace` starts with: the person's
 /// `~/.agents/memory/MEMORY.md`, then, when the workspace is in a project,
-/// `~/.agents/memory/projects/NAME/MEMORY.md`. The app's memory script
-/// keeps both.
+/// `~/.agents/memory/projects/NAME/MEMORY.md`. The memory script keeps
+/// both.
 pub fn memory_indexes(workspace: &Path) -> Result<Vec<PathBuf>, Failure> {
     memory_indexes_from(workspace, home().as_deref())
 }
@@ -1142,8 +1142,6 @@ pub fn lineage(
     .collect())
 }
 
-/// The files `name` is built from, itself first, each with its front
-/// matter; `None` when there is no profile `name`.
 /// Where profiles are looked for from `workspace`: the folder's, the
 /// person's, then (`None`) the client's own roles, the layer below.
 fn layers(workspace: &Path) -> Vec<Option<PathBuf>> {
@@ -1155,6 +1153,8 @@ fn layers(workspace: &Path) -> Vec<Option<PathBuf>> {
     layers
 }
 
+/// The files `name` is built from, itself first, each with its front
+/// matter; `None` when there is no profile `name`.
 fn chain(
     layers: &[Option<PathBuf>],
     name: &str,
@@ -1940,7 +1940,7 @@ mod tests {
         let root = temp("bare");
         let composed = instructions(&root, None, &[]).unwrap();
         assert_eq!(composed.sources, Vec::new());
-        assert!(composed.skills.is_empty() || composed.text.contains("# Skills"));
+        assert!(composed.skills.is_empty() && !composed.text.contains("# Skills"));
         assert!(composed.text.starts_with(PREAMBLE));
         let _ = std::fs::remove_dir_all(&root);
     }

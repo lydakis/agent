@@ -53,8 +53,8 @@ const READS: &str = ".reads";
 const UNREAD_DAYS: i64 = 30;
 const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory search WORDS... [SCOPE]\n       memory save NAME --type user|feedback|project|reference|work --description TEXT --source TEXT [--external] [--confirmed N] [--pushed-back N] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory said [SINCE_MS]   (Sonny: what the person wrote to any agent since then)\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         each run starts an agent on --model; without it, the model scheduled before\n         SCOPE: --user | --project NAME; none: the project of this folder";
 
-/// `memory show|save|rm|index|check|changed|cleanup|schedule`, as
-/// `~/.agent/memory` runs it.
+/// `memory show|read|search|save|rm|index|check|changed|cleanup|schedule`,
+/// as `~/.agent/memory` runs it.
 pub fn cli(args: &[String]) -> i32 {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let cwd = std::env::current_dir().ok();
@@ -79,9 +79,10 @@ pub fn cli(args: &[String]) -> i32 {
 
 /// A `memory` call of an agent working in `cwd`, as a client's tool takes
 /// it: the script's commands but `schedule`, which is the person's, with
-/// the fact's text in the call. `read` NAME, `save {name, type,
-/// description, source, text, external}`, `remove` NAME, `index`, `check`, `changed`
-/// or `cleanup` (`start` or `finish`); with none, `show`. `user` or `project` picks the scope.
+/// the fact's text in the call. `read` NAME, `search` WORDS, `save {name,
+/// type, description, source, text, external}`, `remove` NAME, `index`,
+/// `check`, `changed` or `cleanup` (`start` or `finish`); with none,
+/// `show`. `user` or `project` picks the scope.
 pub fn call(home: &Path, cwd: &Path, arguments: &Value) -> Result<Value, String> {
     let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
     let mut scope = Vec::new();
@@ -619,8 +620,6 @@ fn write(path: &Path, text: &str) -> Result<(), String> {
         .map_err(|e| format!("memory_failed: {e}"))
 }
 
-/// Every fact in the folder, sorted by name, or the first file that is not
-/// one: a fact the index would leave out is refused, not skipped.
 /// How many entries `dir` holds, facts or not, as [`facts`] counts them.
 fn entries(dir: &Path) -> Result<usize, String> {
     match std::fs::read_dir(dir) {
@@ -630,6 +629,8 @@ fn entries(dir: &Path) -> Result<usize, String> {
     }
 }
 
+/// Every fact in the folder, sorted by name, or the first file that is not
+/// one: a fact the index would leave out is refused, not skipped.
 fn facts(dir: &Path) -> Result<Vec<Fact>, String> {
     let failed = |e: std::io::Error| format!("memory_failed: {}: {e}", dir.display());
     let entries = match std::fs::read_dir(dir) {
@@ -775,12 +776,12 @@ fn search(dirs: &[(Option<String>, PathBuf)], words: &str) -> Result<Value, Stri
     Ok(json!({"found": found, "more": more}))
 }
 
-/// Save `fact`; a count left out (`None` in `counts`) keeps the one the
-/// fact had, so an agent rewording a fact does not reset its weight.
 /// What a save or removal tells the cleanup journal ([`noted`]): the fact
 /// as the change left it, while the folder is still locked.
 type Note<'a> = &'a dyn Fn(Option<&str>) -> Result<(), String>;
 
+/// Save `fact`; a count left out (`None` in `counts`) keeps the one the
+/// fact had, so an agent rewording a fact does not reset its weight.
 fn save(
     dir: &Path,
     mut fact: Fact,
@@ -1630,14 +1631,13 @@ fn automation(script: &Path, args: &[String]) -> Result<Value, String> {
     })
 }
 
-/// Project folders the Memory sheet at Home lists at most; the rest are
-/// counted.
+/// Project folders [`view`] lists at most; the rest are counted.
 const MAX_PROJECTS: usize = 100;
 
-/// What the app shows of memory, and what it tells a coordinator changed:
-/// the person's facts, and `project`'s, or with no project every project's,
-/// each fact with its file and when it was last written. A folder that is not
-/// all facts says so in place of its facts.
+/// What Sonny's `/background` reads of memory: the person's facts, and
+/// `project`'s, or with no project every project's, each fact with its file
+/// and when it was last written. A folder that is not all facts says so in
+/// place of its facts.
 pub fn view(root: &Path, project: Option<&str>) -> Value {
     let scope = |dir: PathBuf, name: Option<&str>| {
         let listed = facts(&dir).map(|all| {
@@ -2004,7 +2004,7 @@ mod tests {
         std::fs::create_dir_all(repo.join("web/.agents")).unwrap();
         std::fs::write(repo.join("web/.agents/project.toml"), "name = \"demo\"\n").unwrap();
         std::fs::write(repo.join("web/index.html"), "x").unwrap();
-        // The project's file is not committed, as when the app made it.
+        // The project's file is not committed, as when Sonny made it.
         git(&repo, &["add", "web/index.html"]);
         git(
             &repo,

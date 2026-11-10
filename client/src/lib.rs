@@ -1,7 +1,6 @@
 //! The daemon's socket protocol for human-facing clients: one session,
 //! JSONL requests correlated by `id`, notifications forwarded on a channel.
-//! Shared by the terminal client and the desktop app; nothing here depends
-//! on the runtime crate.
+//! Shared by Sonny and the CLI; nothing here depends on the runtime crate.
 pub mod approver;
 pub mod config;
 pub mod env_file;
@@ -501,7 +500,11 @@ impl Client {
             .await
             .map_err(|_| Error::new("daemon_disconnected"))?;
         let Some(code) = message.get("error").and_then(Value::as_str) else {
-            return Ok(message["result"].clone());
+            // Taken, not copied: a page of history runs to megabytes.
+            return Ok(match message {
+                Value::Object(mut reply) => reply.remove("result").unwrap_or(Value::Null),
+                _ => Value::Null,
+            });
         };
         let mut error = Error::new(code);
         error.detail = message["detail"].as_str().map(str::to_owned);

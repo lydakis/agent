@@ -1,6 +1,6 @@
 //! Where a daemon for a store is reached: the socket adjacent to the store,
 //! or, when that path exceeds the Unix socket address limit, a stable short
-//! rendezvous under /tmp. The CLI, the daemon and the app all resolve it
+//! rendezvous under /tmp. The CLI, the daemon and Sonny all resolve it
 //! here, so a client never looks for a daemon where none could listen.
 use crate::{Error, Result};
 use std::{

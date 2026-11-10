@@ -322,7 +322,7 @@ pub struct ThreadPicks {
     pub in_project: bool,
 }
 
-/// A daemon that answers requests: the app's client, or a test's.
+/// A daemon that answers requests: this crate's `Client`, or a test's.
 pub trait Requests {
     fn request(
         &self,
