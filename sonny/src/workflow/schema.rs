@@ -58,6 +58,9 @@ fn untaken(schema: &Value, depth: usize) -> Option<&'static str> {
     if let Some(key) = UNTAKEN.iter().find(|key| fields.contains_key(**key)) {
         return Some(key);
     }
+    if fields.contains_key("anyOf") && fields.contains_key("oneOf") {
+        return Some("oneOf beside an anyOf");
+    }
     let within = |key: &str| -> Vec<&Value> {
         match fields.get(key) {
             Some(Value::Array(each)) => each.iter().collect(),
@@ -103,7 +106,14 @@ pub fn strict(schema: &Value) -> Value {
             },
             _ => value.clone(),
         };
-        out.insert(key.clone(), value);
+        // Strict output takes a choice as anyOf, and its branches, all
+        // properties required, may no longer exclude each other: the reply
+        // is held to the oneOf itself when it is checked.
+        let key = match key.as_str() {
+            "oneOf" => "anyOf".to_owned(),
+            _ => key.clone(),
+        };
+        out.insert(key, value);
     }
     if let Some(Value::Object(properties)) = fields.get("properties") {
         let required: Vec<&str> = (fields.get("required").and_then(Value::as_array))
@@ -372,6 +382,28 @@ mod tests {
         // A property may still be called what a keyword is.
         let schema = json!({"type": "object", "properties": {"not": {"type": "string"}}});
         assert!(check(&schema).is_ok());
+    }
+
+    #[test]
+    fn a_one_of_goes_as_any_of_and_is_held_to_one_of() {
+        let branch = |required: &str| {
+            json!({"type": "object", "properties": {"x": {"type": ["string", "null"]},
+                "y": {"type": ["string", "null"]}}, "required": [required]})
+        };
+        let schema = json!({"type": "object", "properties": {"v": {"oneOf": [
+            branch("x"), branch("y")]}}, "required": ["v"]});
+        let sent = strict(&schema);
+        assert!(sent["properties"]["v"].get("oneOf").is_none());
+        assert_eq!(
+            sent["properties"]["v"]["anyOf"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            parse(r#"{"v": {"x": null, "y": null}}"#, &schema).unwrap(),
+            json!({"v": {"x": null}})
+        );
+        let both = json!({"type": "object", "properties": {"v": {"anyOf": [{}], "oneOf": [{}]}}});
+        assert!(check(&both).is_err());
     }
 
     #[test]
