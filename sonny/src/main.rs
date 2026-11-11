@@ -628,7 +628,7 @@ async fn read_status(
             let ended = bot["last"]["finished_ms"].as_u64().unwrap_or(0);
             let held_here = held
                 .as_ref()
-                .is_ok_and(|held| held.iter().any(|(of, ..)| of == name));
+                .is_ok_and(|held| held.iter().any(|held| held.bot == name));
             if bot["running_turn"].is_i64() || held_here || now.saturating_sub(ended) < 600_000 {
                 read.push(name.to_owned());
             }
