@@ -2905,11 +2905,14 @@ impl Turn {
                             .await
                             .unwrap_or(false)
                     };
-                    let mut result = wait_result(for_model(results));
+                    let mut results = for_model(results);
+                    let parts = pictures_of(&mut results)?;
+                    let mut result = wait_result(results);
                     if steered {
                         result["steered"] = json!(true);
                     }
-                    let outcome = Outcome::text(result.to_string());
+                    let mut outcome = Outcome::text(result.to_string());
+                    outcome.parts = parts;
                     let id = waiting.call_id.clone();
                     self.store
                         .op("tool_finish", move |db| {
@@ -6464,6 +6467,28 @@ fn annotate(mut outcome: Outcome, turn: i64, call_id: &str) -> Outcome {
     outcome
 }
 
+/// The pictures a lifted call's client answered with, taken out of the
+/// results a wait hands over to follow its words as pictures.
+fn pictures_of(
+    results: &mut BTreeMap<String, Arc<Value>>,
+) -> Result<Vec<agent_runtime::codec::Part>> {
+    let mut parts = Vec::new();
+    for result in results.values_mut() {
+        if result.get("parts").is_none() {
+            continue;
+        }
+        if let Some(taken) = Arc::make_mut(result)
+            .as_object_mut()
+            .and_then(|r| r.remove("parts"))
+        {
+            parts.extend(serde_json::from_value::<Vec<agent_runtime::codec::Part>>(
+                taken,
+            )?);
+        }
+    }
+    Ok(parts)
+}
+
 /// A model reads a peer turn's outcome, not its accounting: the turn view's
 /// usage, timing and identity stay with clients and out of the context. A
 /// pending turn is its status; an ended one is everything its end recorded,
@@ -7245,6 +7270,26 @@ fn priced_at(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_wait_takes_an_answers_pictures_out_of_its_result() {
+        use agent_runtime::codec::Part;
+        use serde_json::json;
+        use std::{collections::BTreeMap, sync::Arc};
+        let shown = vec![Part::Text {
+            text: "seen".into(),
+        }];
+        let mut kept = BTreeMap::from([
+            (
+                "proc:1".to_string(),
+                Arc::new(json!({"answer": "ok", "parts": shown})),
+            ),
+            ("proc:2".to_string(), Arc::new(json!({"output": "plain"}))),
+        ]);
+        let parts = super::pictures_of(&mut kept).unwrap();
+        assert_eq!(parts, shown);
+        assert_eq!(*kept["proc:1"], json!({"answer": "ok"}));
+        assert_eq!(*kept["proc:2"], json!({"output": "plain"}));
+    }
     #[test]
     fn a_long_delta_goes_live_in_pieces_cut_between_characters() {
         fn pieces(text: &str, most: usize) -> Vec<&str> {

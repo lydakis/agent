@@ -3329,7 +3329,8 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   `withdrawn` or `stopped`, with `failed` and its `result` as its bot is
   told it. The end is told as a background command's is, with the first
   2,048 bytes of the call's `output` (or of an answered call's `answer`),
-  and a `wait` on the handle collects it whole. The agent may stop it: `write_stdin` with
+  and a `wait` on the handle collects it whole, an answer's pictures
+  among the wait's own. The agent may stop it: `write_stdin` with
   `kill: true` on the handle withdraws a request still waiting (`withdrawn`,
   never run) and kills a command it started, answering
   `{"handle","stopped":true,"ran":BOOL}`; the same kill ends any background

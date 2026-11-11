@@ -9382,10 +9382,25 @@ impl Database {
         let Some((_, status)) = owner.filter(|(owner, _)| owner == answer.bot) else {
             return fail("turn_not_found");
         };
-        // A call a message lifted waits on past its turn.
+        // A call a message lifted waits on past its turn, and so do the
+        // steps its client asks for.
         let request = self.request(answer.turn, answer.call_id)?;
+        let lifted = |request: &Request| -> Result<bool> {
+            if request.process.is_some() {
+                return Ok(true);
+            }
+            let Some(of) = &request.step_of else {
+                return Ok(false);
+            };
+            Ok(self
+                .conn
+                .prepare_cached(
+                    "SELECT 1 FROM answers WHERE turn=? AND call_id=? AND process IS NOT NULL",
+                )?
+                .exists(params![answer.turn, of])?)
+        };
         if !matches!(status.as_str(), "running" | "waiting" | "paced")
-            && !request.as_ref().is_some_and(|r| r.process.is_some())
+            && !request.as_ref().map(lifted).transpose()?.unwrap_or(false)
         {
             return Err(
                 Error::with("stale_turn", format!("turn {} is {status}", answer.turn))
@@ -11889,10 +11904,19 @@ impl Database {
             return self.lifted_verdict(process, turn, &call_id, now_ms, held);
         }
         #[allow(clippy::type_complexity)]
-        let answer: Option<(i64, String, String, i64, Option<String>, bool, bool)> = self
+        let answer: Option<(
+            i64,
+            String,
+            String,
+            i64,
+            Option<String>,
+            bool,
+            bool,
+            Option<String>,
+        )> = self
             .conn
             .prepare_cached(
-                "SELECT turn,call_id,tag,expires_ms,output,failed,paused_ms IS NOT NULL
+                "SELECT turn,call_id,tag,expires_ms,output,failed,paused_ms IS NOT NULL,parts
                  FROM answers INDEXED BY answers_lifted WHERE process=?",
             )?
             .query_row([process], |r| {
@@ -11904,14 +11928,23 @@ impl Database {
                     r.get(4)?,
                     r.get(5)?,
                     r.get(6)?,
+                    r.get(7)?,
                 ))
             })
             .optional()?;
-        let Some((turn, call_id, tag, expires_ms, output, failed, paused)) = answer else {
+        let Some((turn, call_id, tag, expires_ms, output, failed, paused, parts)) = answer else {
             return Ok(Lifted::Gone);
         };
         let (result, failed, outcome) = match output {
-            Some(output) => (lifted_answer(&output, failed), failed, "answered"),
+            Some(output) => {
+                // Its pictures go with its words, for a `wait` on its
+                // handle to hand the model.
+                let mut answer = lifted_answer(&output, failed);
+                if let Some(parts) = parts {
+                    answer["parts"] = serde_json::from_str(&parts)?;
+                }
+                (answer, failed, "answered")
+            }
             None if !paused && now_ms >= expires_ms.max(0) as u64 => (
                 json!({"error":"tool_unserved","detail":format!("no answer from {tag} in time")}),
                 true,

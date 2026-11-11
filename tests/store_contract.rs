@@ -19229,6 +19229,24 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         .filter_map(|call| call["call_id"].as_str())
         .collect();
     assert_eq!(steps, ["c1/1"], "{listed}");
+    // And it takes its verdict.
+    db.answer(Decision {
+        bot: "Lead",
+        turn,
+        call_id: "c1/1",
+        request: 1,
+        tag: None,
+        allow: true,
+        unreviewed: false,
+        reason: None,
+        by: Some("test"),
+        leased: false,
+    })
+    .unwrap();
+    assert_eq!(
+        db.approvals(Some("Lead"), None, 0, None, 64).unwrap()["approvals"],
+        json!([])
+    );
     // Later turns push it past what is kept; a prune keeps its call.
     for n in 0..2 {
         let later = db
@@ -19252,13 +19270,22 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         .collect();
     assert_eq!(listed, ["c1"]);
     db.take_call("Lead", turn, "c1", now).unwrap();
-    let answered = db
-        .answer_call("Lead", turn, "c1", result("{\"ran\":true}"), now)
-        .unwrap();
+    // Answered with a picture: the picture stays with the words, for a
+    // wait on the handle to hand over.
+    let photo = noise(64);
+    let answer = Outcome {
+        parts: vec![agent_runtime::codec::Part::Image(photo.clone())],
+        ..result("{\"ran\":true}")
+    };
+    let answered = db.answer_call("Lead", turn, "c1", answer, now).unwrap();
     assert_eq!(answered.lifted, Some(process));
-    let Lifted::Ended { .. } = db.lifted_check(process, now, false).unwrap() else {
+    let Lifted::Ended { result: ended, .. } = db.lifted_check(process, now, false).unwrap() else {
         panic!("an answered call did not end");
     };
+    assert_eq!(ended["answer"], "{\"ran\":true}");
+    let parts: Vec<agent_runtime::codec::Part> =
+        serde_json::from_value(ended["parts"].clone()).unwrap();
+    assert_eq!(parts, [agent_runtime::codec::Part::Image(photo)]);
     let trail = db
         .audit(&agent_runtime::store::audit::Query::default())
         .unwrap();
