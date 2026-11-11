@@ -1162,7 +1162,12 @@ impl Attempt {
             }
             false => plan.workspace.clone(),
         };
-        let told = match self.run.told(&dir, asked.agent_type.as_deref()).await {
+        // Told its source folder's rules, as a task in a worktree is, while
+        // it works in its own worktree.
+        let told = match (self.run)
+            .told(&plan.workspace, asked.agent_type.as_deref())
+            .await
+        {
             Ok(told) => Some(told),
             // A worker this call made before the host restarted needs
             // nothing its profile says now: recover it, as it is.
