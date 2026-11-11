@@ -211,18 +211,18 @@ pub struct Card {
     pub helpers: Vec<(usize, String)>,
 }
 
-/// See [`Card`].
-pub fn card(
-    project: &str,
-    rows: &[Row],
-    width: usize,
-    open: &[Group],
-    details: Details,
-    helpers: &[String],
-) -> Card {
-    let mut named = Vec::new();
-    let mut folds = Vec::new();
-    let mut toggles = Vec::new();
+/// The agents `/status` lists, in the rows' order: the lead, and each
+/// task whose line of makers leads to no other task; a task's helpers by
+/// the task the lead's line started, and listed too when one needs the
+/// person.
+struct Listing<'a> {
+    listed: Vec<&'a Row>,
+    under: HashMap<String, Vec<&'a Row>>,
+    /// The bots that are some task's helpers.
+    helping: std::collections::HashSet<&'a str>,
+}
+
+fn listing(rows: &[Row]) -> Listing<'_> {
     let tasks: Vec<&Row> = rows.iter().filter(|r| r.name != "lead").collect();
     // A task's own helpers fold under the task the lead's line started:
     // each row by the top of its line of makers among the tasks.
@@ -241,6 +241,7 @@ pub fn card(
         (at.bot != row.bot).then(|| at.bot.clone())
     };
     let mut under: HashMap<String, Vec<&Row>> = HashMap::new();
+    let mut helping = std::collections::HashSet::new();
     // The lead is listed first in its group, as one of the agents.
     let mut listed: Vec<&Row> = rows.iter().filter(|r| r.name == "lead").collect();
     for row in &tasks {
@@ -250,16 +251,78 @@ pub fn card(
                 if row.group == Group::NeedsYou {
                     listed.push(row);
                 }
+                helping.insert(row.bot.as_str());
                 under.entry(parent).or_default().push(row);
             }
             None => listed.push(row),
         }
     }
+    Listing {
+        listed,
+        under,
+        helping,
+    }
+}
+
+/// How many agents each of `/status`'s groups lists, as its head and its
+/// headings count them: the footer shows these same four.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub needs_you: usize,
+    pub working: usize,
+    pub idle: usize,
+    pub done: usize,
+}
+
+impl Counts {
+    pub fn of(self, group: Group) -> usize {
+        match group {
+            Group::NeedsYou => self.needs_you,
+            Group::Working => self.working,
+            Group::Idle => self.idle,
+            Group::Done => self.done,
+        }
+    }
+}
+
+/// See [`Counts`].
+pub fn counts(rows: &[Row]) -> Counts {
+    tally(&listing(rows).listed)
+}
+
+fn tally(listed: &[&Row]) -> Counts {
+    let n = |group| listed.iter().filter(|r| r.group == group).count();
+    Counts {
+        needs_you: n(Group::NeedsYou),
+        working: n(Group::Working),
+        idle: n(Group::Idle),
+        done: n(Group::Done),
+    }
+}
+
+/// See [`Card`].
+pub fn card(
+    project: &str,
+    rows: &[Row],
+    width: usize,
+    open: &[Group],
+    details: Details,
+    helpers: &[String],
+) -> Card {
+    let mut named = Vec::new();
+    let mut folds = Vec::new();
+    let mut toggles = Vec::new();
+    let Listing {
+        listed,
+        under,
+        helping,
+    } = listing(rows);
     // The head counts what each group's heading does, in the page's
     // order: the agents listed there, a task's helpers inside its own.
     let mut head = vec![Span::raw(project.to_owned()).bold()];
+    let counted = tally(&listed);
     for group in [Group::NeedsYou, Group::Working, Group::Idle, Group::Done] {
-        let n = listed.iter().filter(|r| r.group == group).count();
+        let n = counted.of(group);
         if n > 0 {
             head.push(Span::raw(" · ").dim());
             head.push(Span::raw(format!("{n} {}", group.counted(n))));
@@ -298,7 +361,9 @@ pub fn card(
             named.push((out.len(), row.bot.clone()));
             out.extend(row_lines(row, width, "", shown(row), trackers));
             // A helper listed with what needs the person shows alone.
-            let Some(helped) = under.get(&row.bot).filter(|_| top(row).is_none()) else {
+            let Some(helped) =
+                (under.get(&row.bot)).filter(|_| !helping.contains(row.bot.as_str()))
+            else {
                 continue;
             };
             let unfolded = helpers.contains(&row.bot);

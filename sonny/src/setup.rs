@@ -408,7 +408,7 @@ pub fn provider(bin: &Path, again: bool) -> Result<(), String> {
             (Some("chatgpt"), Vec::new())
         }
         Way::ChatGpt => {
-            let mut command = crate::agent_command(bin)?;
+            let mut command = std::process::Command::new(bin);
             let status = command
                 .args(["login", "chatgpt", "--pretty"])
                 .status()

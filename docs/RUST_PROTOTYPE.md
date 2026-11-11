@@ -446,8 +446,8 @@ config lacks). `submit` answers `{bot, bot_id, message, turn, request_id,
 duplicate, status, cursor, handle}`, with `turn` only when the message
 opened one. `messages` (protocol) lists a bot's messages as views,
 each with `message`, `turn` (null until taken), `delivery`, `node`,
-`sent_ms`, `taken_ms`, its sender, its effective effort and a prompt
-preview, paged as `turns` is; `turns` lists runs only, so steers and
+`sent_ms`, `taken_ms`, its sender, its effective effort and folder and a
+prompt preview, paged as `turns` is; `turns` lists runs only, so steers and
 attached messages never hide what a bot did. `wait` on a message's handle
 resolves when it is taken, withdrawn or failed, or for a turn's opener when
 the turn ends; `interrupt` names a message (`turn` keeps its field name)
@@ -568,7 +568,7 @@ when it sets either.
 | `approval_hold_ms` (`--approval-hold`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)), and a terminal read waits live for its output before its turn parks. 0 parks at once; at most 3,600,000. | 2,000 |
 | `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
 | `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on every cache marker of a request: the instructions', the request's own, and the pinned compaction summary's and note's, since the API refuses a longer lifetime after a shorter one. `1h` bills each write at twice the input rate instead of 1.25 times. Responses providers are unaffected. Bedrock takes `1h` for Claude 4.5 and later and may refuse it for older Claude (its prompt-caching guide, read 2026-10-28), so calls to older Claude there keep five minutes whatever this says, also after `configure` switches a bot to one. A bot whose summarizer or fallback is such a model keeps five minutes on every call, since those calls carry the same pinned blocks. `inspect` reports a lifetime never set as `null`, so a client's own default can tell it from `5m` someone chose. | unset (`5m`) |
-| `speed` (`--speed`) | The tier the bot's own model's calls are served at: `standard`, `fast` or `ultrafast`, each faster one at a higher price per token. A call sends it only to a model that serves it, and runs at standard on any other, as Codex sends a service tier only where its model catalog lists it; the setting is kept as asked, so a bot moved to a model that serves it gets it back. Which model serves which tier is the daemon's list of exact model ids (never read from a name), or the person's `serve --speeds`, announced in `ready` (see [providers](#providers)). The Claude API serves `fast`, its fast mode (sent as `speed` with the `fast-mode-2026-02-01` beta) on Fable 5.2, Mythos 5.2 and Opus 5.5, and on Opus 5 and Opus 4.8 in research preview: twice the price or more, its own rate limit, so its own pool, which learns `anthropic-fast-input-tokens-*` and `anthropic-fast-output-tokens-*`; Bedrock serves Claude at standard only (Claude's fast-mode guide, read 2026-11-10). OpenAI's API and the ChatGPT plan serve `fast` (sent as `service_tier: priority`) on the models Codex's bundled catalog gives priority, and `ultrafast` on GPT-6.1 Sol and GPT-6 Astra; Bedrock serves those two `ultrafast` alone, on Mantle and their `us.` and `global.` runtime profiles (Codex's Bedrock catalog at 551fc71, and Bedrock's model cards). Each call's `usage` event says the tier that served it. Switching it misses the prompt cache once. Calls on another model (a `compaction_model`, a fallback) go at standard. `inspect` reports the setting, `standard` when unset. | `standard` |
+| `speed` (`--speed`) | The tier the bot's own model's calls are served at: `standard`, `fast` or `ultrafast`, each faster one at a higher price per token. A call sends it only to a model that serves it, and runs at standard on any other, as Codex sends a service tier only where its model catalog lists it; the setting is kept as asked, so a bot moved to a model that serves it gets it back. Which model serves which tier is the daemon's list of exact model ids (never read from a name), or the person's `serve --speeds`, announced in `ready` (see [providers](#providers)). The Claude API serves `fast`, its fast mode (sent as `speed` with the `fast-mode-2026-02-01` beta) on Fable 5.2, Mythos 5.2 and Opus 5.5, and on Opus 5 and Opus 4.8 in research preview: twice the price or more, its own rate limit, so its own pool, which learns `anthropic-fast-input-tokens-*` and `anthropic-fast-output-tokens-*`; Bedrock serves Claude at standard only (Claude's fast-mode guide, read 2026-11-10). Each list claims only what its endpoint, region and sign-in are documented to serve. OpenAI's API on a key serves `fast` (sent as `service_tier: priority`) on the models Codex's bundled catalog gives priority, and `ultrafast` on GPT-6.1 Sol and GPT-6 Astra; the ChatGPT sign-in serves what Codex's bundled catalog lists for it, `fast` on those models and no `ultrafast`. Bedrock serves those two `ultrafast` alone, through their `us.` and `global.` profiles in any region, and under their bare `openai.` ids on Mantle in us-east-1 only (Codex's Bedrock catalogs, and Bedrock's model cards). Each call's `usage` event says the tier that served it. A call the provider refuses for its tier (a 400 that names the field or the value sent) fails as `provider_speed_refused`, its detail and facts naming the provider, model, region (Bedrock's, else null) and speed; it is never retried at standard nor run there in its place. Switching it misses the prompt cache once. Calls on another model (a `compaction_model`, a fallback) go at standard. `inspect` reports the setting, `standard` when unset. | `standard` |
 | `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
 | `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
@@ -940,7 +940,14 @@ continuing... Attempting to continue without resetting will result in
 continued refusals." Each item becomes a note naming the refusal's category,
 so the model knows something was declined: a tool result keeps its call with
 `[This tool result is left out: ...]`, and a message becomes `[A message here
-is left out: ...]`. A note is padded with spaces to the size of the item it
+is left out: ...]`. A message a person or another bot steered into the
+turn goes back in line as it was sent, a queued message of its own with its
+words, pictures, effort, quotes and sender, for the turns after this one;
+its place says `[A message here is left out and sent again after this turn:
+...]`. A strict steer (`expected_turn`) is for that turn alone and an
+attached note is a note, so both stay notes; a queued message has no turn
+to join, so one the classifier declines again as its turn's first request
+is noted, not sent a third time. A note is padded with spaces to the size of the item it
 replaces, so the context's byte accounting does not change; a shorter wording
 is used where the full one does not fit, and an item too small for any keeps
 its own. Everything before it is unchanged, so no thinking binding or prompt
@@ -2928,11 +2935,16 @@ inside as the overflow user's, and a program that takes a file only from
 root or the person refuses it. Each system folder the daemon was started
 with as `serve --own-copy FOLDER` is shown from a copy the person owns,
 kept under `~/.agent/copies`, read-only to every sandbox, bound read-only in
-the folder's place. The CLI passes `agent_client::OWN_COPIES`
-(`/etc/ssh/ssh_config.d`): ssh refuses every file an `Include` names that
+the folder's place. The CLI passes `agent_client::OWN_COPIES`:
+`/etc/ssh/ssh_config.d`, as ssh refuses every file an `Include` names that
 is not root's or the person's ("Bad owner or permissions"), and Debian's
 `/etc/ssh/ssh_config` includes that folder, so no sandboxed command could
-ssh (Codex has the same bug open, openai/codex#9286). Building a policy
+ssh (Codex has the same bug open, openai/codex#9286); and
+`/etc/crypto-policies/back-ends`, whose `openssh.config` Fedora's, RHEL's
+and Amazon Linux's `ssh_config.d/50-redhat.conf` includes: each file there
+is a link into `/usr/share/crypto-policies`, and the copy holds the file it
+points at, copied again when a policy switch points it elsewhere. A folder
+that isn't there, as on Debian, costs one failed listing. Building a policy
 looks at the folder's files (a listing and a `stat` each) and copies them
 again only when one changed, each written beside its name and renamed over
 it, so a running sandbox reads a whole file. A daemon running as root,

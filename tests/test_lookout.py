@@ -255,6 +255,47 @@ class LookoutTests(ModelFixture):
                  if str(row.get('request_id', '')).startswith('lookout-')]
         self.assertEqual([(row['status'], row['turn']) for row in notes], [('taken', held)], notes)
 
+    def test_a_lookout_restarted_mid_a_long_task_turn_tells_nothing_twice(self):
+        # The stream starts again before the oldest turn still under way:
+        # a task's long turn is read again from its start after a restart,
+        # and what was told of it already is not told again.
+        self.make('calc.lead', 'calc.fix')
+        self.subscribe('calc.lead', 'calc')
+        service = self.start()
+        time.sleep(1)
+        long = self.daemon.request('submit', bot='calc.fix', request_id='long', prompt='hold on',
+                                   origin='tasks')['result']['message']
+        deadline = time.monotonic() + 10
+        while self.daemon.request('turns', bot='calc.fix', newest=True, limit=1)['result']['turns'][0]['status'] != 'running':
+            self.assertLess(time.monotonic(), deadline, 'the task never started its turn')
+            time.sleep(.05)
+        # The person's words wait for the busy task: news at once.
+        queued = self.daemon.request('submit', bot='calc.fix', request_id='p', prompt='use the other branch',
+                                     delivery='queue')
+        self.assertIn('result', queued, queued)
+        self.assertIsNotNone(self.note_for('calc.lead', having='the person wrote'),
+                             "the person's words in the task never reached the lead")
+        # Gone and back past a cursor save, the task still at work.
+        time.sleep(3)
+        service.kill()
+        service.wait(timeout=5)
+        self.start()
+        time.sleep(3)
+        self.gate.set()
+        self.assertEqual(self.daemon.finished(long)['data']['status'], 'completed')
+        self.assertIsNotNone(self.note_for('calc.lead', having=f'calc.fix/{long} completed'),
+                             "the task's end never reached the lead")
+        self.assertEqual(self.daemon.finished(queued['result']['message'])['data']['status'], 'completed')
+        time.sleep(3)
+        notes = []
+        for message in self.daemon.request('messages', bot='calc.lead', after=0)['result']['messages']:
+            text = self.daemon.request('prompts', bot='calc.lead', turn=message['message'])['result']['prompts'][0]['text']
+            if text.startswith('Task updates: '):
+                notes.append(text)
+        told = lambda having: sum(having in note for note in notes)
+        self.assertEqual(told('the person wrote'), 1, notes)
+        self.assertEqual(told(f'calc.fix/{long} completed'), 1, notes)
+
     def test_a_bot_that_is_no_lead_hears_what_it_subscribed_to(self):
         # It subscribes with the tool Sonny gives it, which the tool host
         # answers, to its own file only.

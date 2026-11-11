@@ -1084,6 +1084,11 @@ pub struct TurnOptions {
     /// Turns whose words the store copies after this prompt's, each with
     /// who wrote them.
     pub quotes: Vec<QuoteRef>,
+    /// What a message going back in line was admitted with: who sent it
+    /// and the words it quoted, kept as they were, whatever became of that
+    /// sender and those turns since. None checks `from` and copies
+    /// `quotes` now.
+    pub kept: Option<Kept>,
     /// The most tokens, of what `budget_counts` names, this turn may
     /// spend; none is bounded only by the bot's own budget.
     pub budget_counts: Counts,
@@ -1101,6 +1106,13 @@ pub struct TurnOptions {
     /// such as a dropped reply: no budget refuses it, since that turn's
     /// calls are what the budget bounds, and its last call should read it.
     pub fact: bool,
+}
+/// A message's provenance as its first admission checked it: its
+/// sender's bot id, and the words it quoted as JSON.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct Kept {
+    pub from_id: Option<i64>,
+    pub quotes: Option<String>,
 }
 /// An attached message whose wait ran out, delivered now as a steer.
 #[derive(Debug)]
@@ -6576,6 +6588,8 @@ impl Database {
                                     })?,
                                 None => Vec::new(),
                             },
+                            // What they copied: a retry names the turns.
+                            kept: None,
                             budget_tokens: r.get::<_, Option<i64>>(12)?.map(|n| n as u64),
                             budget_counts: Counts::from_stored(
                                 r.get::<_, Option<String>>(17)?.as_deref(),
@@ -6622,6 +6636,8 @@ impl Database {
                 origin,
                 person,
                 quotes,
+                // As `from` and `quotes` were admitted.
+                kept: _,
                 budget_tokens,
                 budget_counts,
                 images: _,
@@ -6696,8 +6712,12 @@ impl Database {
             .facts(json!({"running_turn":bot.running_turn})));
         }
         // Declared, not verified: the named turn exists and is that bot's.
-        let mut from_id = None;
-        if let Some((from, turn)) = &options.from {
+        // A message going back in line keeps the sender it was admitted
+        // with.
+        let mut from_id = options.kept.as_ref().and_then(|kept| kept.from_id);
+        if let Some((from, turn)) = &options.from
+            && options.kept.is_none()
+        {
             from_id = self
                 .conn
                 .prepare_cached(
@@ -6712,7 +6732,10 @@ impl Database {
         if let Some(level) = &options.effort {
             bot.family()?.check_effort(level)?;
         }
-        let quotes = self.quote(&options.quotes, prompt.len())?;
+        let quotes = match &options.kept {
+            Some(kept) => kept.quotes.clone(),
+            None => self.quote(&options.quotes, prompt.len())?,
+        };
         let attach = options.delivery == Delivery::Attach;
         // An attached message runs on no model of its own: it joins
         // whichever call the bot makes next.
@@ -10395,6 +10418,13 @@ impl Database {
     pub fn finish(&mut self, turn: i64, error: Option<&Error>) -> Result<Vec<Value>> {
         let bot = self.active(turn)?;
         let waiting = self.waiting(turn)?;
+        let code = error.map(|e| e.code.as_str());
+        // Messages that joined a request a safety classifier declined go
+        // back in line, before the turn ends, so the next one takes them.
+        let requeued = match code == Some("provider_refusal") {
+            true => self.requeue_declined(&bot, turn, error)?,
+            false => Vec::new(),
+        };
         let tx = self.conn.savepoint()?;
         let mut head = bot.head;
         let mut entries = Vec::new();
@@ -10449,7 +10479,6 @@ impl Database {
         if bot.declared.iter().any(|tool| tool.answered_by.is_some()) {
             tx.execute("DELETE FROM answers WHERE turn=?", [turn])?;
         }
-        let code = error.map(|e| e.code.as_str());
         // Interrupted, by cause: a client's interrupt, the daemon shutting
         // down or paused around the turn, a daemon that died with it
         // running, or a gate that lapsed without a verdict.
@@ -10490,50 +10519,26 @@ impl Database {
         // A request a safety classifier declined, and the bot's fallback
         // too: what it added since the model last answered goes to later
         // requests as notes in its place, since Anthropic says to remove it
-        // before going on. Each note is the size of what it replaces, so
-        // nothing counted for the context changes, and the originals are
-        // kept beside them.
+        // before going on; a message that went back in line says so. Each
+        // note is the size of what it replaces, so nothing counted for the
+        // context changes, and the originals are kept beside them.
         let mut left_out = 0;
         if code == Some("provider_refusal") {
             let category = (error.and_then(|e| e.facts.as_ref()))
                 .and_then(|facts| facts.get("category"))
                 .and_then(Value::as_str);
             let family = bot.family()?;
-            let mut added = Vec::new();
-            let (mut node, mut child) = (head, None::<i64>);
-            while let Some(id) = node {
-                let (parent, item, first): (Option<i64>, Vec<u8>, Option<i64>) = tx
-                    .prepare_cached("SELECT parent,item,turn FROM nodes WHERE id=?")?
-                    .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-                if super::context::model_output(&item) {
-                    break;
-                }
-                // A node another bot reaches, as a fork taken while the
-                // request was out does, is its history too: it and what
-                // came before it stay as they are.
-                let shared: bool = tx
-                    .prepare_cached(
-                        "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1
-                                OR note=?1 OR compaction=?1 OR elision=?1))
-                            OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1 AND id IS NOT ?3)",
-                    )?
-                    .query_row(params![id, bot.name, child], |r| r.get(0))?;
-                if shared {
-                    break;
-                }
-                added.push((id, item));
-                if first == Some(turn) {
-                    break;
-                }
-                (node, child) = (parent, Some(id));
-            }
+            let added = declined_span(&tx, &bot.name, turn, head)?;
             let mut noted = false;
             for (id, item) in added.iter().rev() {
                 let result = super::context::is_tool_result(item);
                 let first = !result && !noted;
-                let note = super::context::declined(family, item, category, first, item.len())?;
+                let note = match requeued.contains(id) {
+                    true => super::context::moved(family, category, item.len())?,
+                    false => super::context::declined(family, item, category, first, item.len())?,
+                };
                 let Some(note) = note else { continue };
-                noted |= !result;
+                noted |= !result && !requeued.contains(id);
                 left_out += 1;
                 tx.prepare_cached("INSERT OR IGNORE INTO declined(node,item) VALUES (?,?)")?
                     .execute(params![id, item])?;
@@ -10555,10 +10560,14 @@ impl Database {
                     .prepare_cached("SELECT length(item) FROM stubs WHERE node=?")?
                     .query_row([id], |r| r.get(0))
                     .optional()?;
-                if let Some(len) = stub
-                    && let Some(note) =
+                let stubbed = match (stub, requeued.contains(id)) {
+                    (Some(len), true) => super::context::moved(family, category, len as usize)?,
+                    (Some(len), false) => {
                         super::context::declined(family, item, category, first, len as usize)?
-                {
+                    }
+                    (None, _) => None,
+                };
+                if let Some(note) = stubbed {
                     tx.prepare_cached("UPDATE stubs SET item=? WHERE node=?")?
                         .execute(params![note, id])?;
                 }
@@ -10605,6 +10614,165 @@ impl Database {
         // What its background commands did while it ran, uncollected.
         self.tell_finished(&bot.name)?;
         Ok(entries)
+    }
+    /// Put back in line each message a person or another agent steered
+    /// into `turn`'s declined request, as it was sent: its words, pictures,
+    /// effort, quotes and who sent it, as a message of its own for the
+    /// turns after this one. A strict steer is for this turn or nobody, and
+    /// an attached note is a note: those stay as notes. Not held to the
+    /// bounds on submissions, which each met once. Each one's node, for
+    /// `finish` to note in its place; one that is refused, or too short for
+    /// the note, stays as it was.
+    fn requeue_declined(
+        &mut self,
+        bot: &Bot,
+        turn: i64,
+        error: Option<&Error>,
+    ) -> Result<Vec<i64>> {
+        // The daemon's own notes, a background command's end or a dropped
+        // reply, are notes: they are left out as tool output is.
+        let joined: HashMap<i64, i64> = self
+            .conn
+            .prepare_cached(
+                "SELECT node,id FROM messages
+                 WHERE turn=?1 AND id<>?1 AND delivery='steer' AND node IS NOT NULL
+                   AND wait_ms IS NULL AND expected_turn IS NULL
+                   AND origin IS NOT ?2 AND origin IS NOT ?3",
+            )?
+            .query_map(params![turn, BACKGROUND_ORIGIN, LIMIT_ORIGIN], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        if joined.is_empty() {
+            return Ok(Vec::new());
+        }
+        let category = (error.and_then(|e| e.facts.as_ref()))
+            .and_then(|facts| facts.get("category"))
+            .and_then(Value::as_str);
+        let family = bot.family()?;
+        // A bot with no folder of its own runs it in this turn's, which
+        // every message that joined it was for.
+        let folder: Option<String> = match bot.workspace {
+            Some(_) => None,
+            None => self
+                .conn
+                .prepare_cached("SELECT workspace FROM turns WHERE id=?")?
+                .query_row([turn], |r| r.get(0))?,
+        };
+        // What `finish` will note: the request's additions, oldest first.
+        let added = declined_span(&self.conn, &bot.name, turn, bot.head)?;
+        let mut requeued = Vec::new();
+        for (node, item) in added.into_iter().rev() {
+            let Some(&steer) = joined.get(&node) else {
+                continue;
+            };
+            if super::context::moved(family, category, item.len())?.is_none() {
+                continue;
+            }
+            let Some((prompt, mut options)) = self.sent_again(steer, family, &item)? else {
+                continue;
+            };
+            options.workspace = folder.clone();
+            let limits = std::mem::take(&mut self.pending_limits);
+            let begun = self.begin(
+                &bot.name,
+                // A key no client's request can hold: theirs are names.
+                &format!("again:{steer}"),
+                &prompt,
+                false,
+                &options,
+                |_, _| Ok(()),
+            );
+            self.pending_limits = limits;
+            match begun {
+                Ok(_) => requeued.push(node),
+                Err(error) if error.code == "storage_error" => return Err(error),
+                Err(_) => {}
+            }
+        }
+        Ok(requeued)
+    }
+    /// A steered message as it goes back in line: its words and pictures
+    /// from `item`, the node it became, and the rest from its row. It runs
+    /// where and on what the bot does next, as a queued message that names
+    /// neither does (a bot with no folder needs one named: its caller's).
+    /// None for an item with no words to send.
+    fn sent_again(
+        &self,
+        steer: i64,
+        family: Family,
+        item: &[u8],
+    ) -> Result<Option<(String, TurnOptions)>> {
+        let value: Value = serde_json::from_slice(item)?;
+        let content = value["content"].as_array();
+        let Some(prompt) = (content.and_then(|c| c.first()))
+            .and_then(|part| part["text"].as_str())
+            .map(str::to_owned)
+        else {
+            return Ok(None);
+        };
+        let images = content.map_or_else(Vec::new, |c| family.images_in(c));
+        type Row = (
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let (effort, from, from_turn, from_id, origin, person, quotes): Row = self
+            .conn
+            .prepare_cached(
+                "SELECT reasoning,from_bot,from_turn,from_id,origin,person,quotes FROM messages WHERE id=?",
+            )?
+            .query_row([steer], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })?;
+        // The messages it quoted, as a retry names them, with the words it
+        // copied, read from its own item: those messages, and its sender,
+        // may be gone by now.
+        let (quotes, copied) = match quotes {
+            Some(json) => {
+                let copied = quoted(&self.conn, Some(&json), Self::QUOTED_BYTES)?;
+                let named = (copied.iter())
+                    .filter(|quote| quote["nested"] != true)
+                    .map(|quote| {
+                        serde_json::from_value(
+                            json!({"bot":quote["bot"],"message":quote["message"],
+                            "reply":quote["reply"] == true}),
+                        )
+                    })
+                    .collect::<serde_json::Result<_>>()?;
+                (named, Some(serde_json::to_string(&copied)?))
+            }
+            None => (Vec::new(), None),
+        };
+        Ok(Some((
+            prompt,
+            TurnOptions {
+                effort,
+                delivery: Delivery::Queue,
+                from: from.zip(from_turn),
+                origin,
+                person,
+                quotes,
+                kept: Some(Kept {
+                    from_id,
+                    quotes: copied,
+                }),
+                images,
+                ..TurnOptions::default()
+            },
+        )))
     }
     fn waiting(&self, turn: i64) -> Result<Option<Waiting>> {
         let row: Option<(String, Option<String>)> = self
@@ -12911,7 +13079,8 @@ impl Database {
                     m.from_bot,m.from_turn,m.origin,m.person,
                     CASE WHEN r.id IS NULL THEN COALESCE(m.reasoning,b.reasoning)
                          ELSE COALESCE(r.reasoning,CASE WHEN r.bot_model IS NULL THEN b.reasoning
-                            ELSE r.bot_reasoning END) END
+                            ELSE r.bot_reasoning END) END,
+                    COALESCE(r.workspace,m.workspace)
              FROM {MESSAGE_FROM} LEFT JOIN turns r ON r.id=m.turn {PREVIEW_NODE}
              WHERE m.bot=?1 AND m.id>?2 AND m.id<?3 ORDER BY m.id {order} LIMIT ?4"
         ))?;
@@ -12936,6 +13105,8 @@ impl Database {
             authored(&mut message, from, r.get(at + 8)?, r.get(at + 9)?);
             // The level it ran at once taken in, else the one it asked.
             message["effort"] = json!(r.get::<_, Option<String>>(at + 10)?);
+            // The folder it runs in once taken in, else the one it named.
+            message["workspace"] = json!(r.get::<_, Option<String>>(at + 11)?);
             messages.push(message);
         }
         let next = more.then(|| {
@@ -16543,6 +16714,44 @@ struct Prompted {
     chars: i64,
 }
 /// A prompt on the lineage, with its stub, which saves what it weighs less.
+/// What a declined request added since the model last answered, newest
+/// first, from `head`: back to the model's last output, the turn's own
+/// prompt, or a node another bot reaches, as a fork taken while the request
+/// was out does, which is its history too and stays as it is with what
+/// came before it.
+fn declined_span(
+    conn: &Connection,
+    name: &str,
+    turn: i64,
+    head: Option<i64>,
+) -> Result<Vec<(i64, Vec<u8>)>> {
+    let mut added = Vec::new();
+    let (mut node, mut child) = (head, None::<i64>);
+    while let Some(id) = node {
+        let (parent, item, first): (Option<i64>, Vec<u8>, Option<i64>) = conn
+            .prepare_cached("SELECT parent,item,turn FROM nodes WHERE id=?")?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        if super::context::model_output(&item) {
+            break;
+        }
+        let shared: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1
+                        OR note=?1 OR compaction=?1 OR elision=?1))
+                    OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1 AND id IS NOT ?3)",
+            )?
+            .query_row(params![id, name, child], |r| r.get(0))?;
+        if shared {
+            break;
+        }
+        added.push((id, item));
+        if first == Some(turn) {
+            break;
+        }
+        (node, child) = (parent, Some(id));
+    }
+    Ok(added)
+}
 fn prompt_node(
     conn: &Connection,
     parent: Option<i64>,

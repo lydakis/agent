@@ -1336,10 +1336,14 @@ impl Service {
                     if !live {
                         for name in &hearing {
                             let Some(lookout) = self.lookouts.get_mut(name) else { continue };
-                            // Nothing in it was read, so a turn still
-                            // queued is read once it starts.
+                            // Nothing in it is read again. A first lookout
+                            // reads a turn still queued once it starts;
+                            // after another, what was queued up to where it
+                            // left off was told then, and is not again.
                             lookout.due.clear();
-                            lookout.queued.clear();
+                            if self.resume.is_none() {
+                                lookout.queued.clear();
+                            }
                         }
                         if event["event"] == "follow_live" {
                             live = true;

@@ -863,6 +863,13 @@ impl Reach {
     }
 }
 
+/// The line under what a `/permissions` pick reaches: that no folder is
+/// shared, past each lead's own, until the person adds one to a row of
+/// their own, as an agent's sandbox wall tells it to ask (Codex has no
+/// shared folder either).
+pub const SHARED: &str =
+    "No folder is shared by default; a row of your own in ~/.agent/config.toml adds one (writable)";
+
 /// The line under `/permissions`' rows saying what a pick reaches: the
 /// agent `name`, those it made (and those they made) and any new ones,
 /// since each takes its maker's row; and that one in a turn switches when

@@ -35,7 +35,7 @@ from main. Both channels build from source on macOS and Linux; stable
 With `cargo install`, build both (`--path .` for `agent` and
 `--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
 `agent` from `PATH`, which may be another program. `sonny agent ARGS` runs
-the one Sonny uses, with the keys in `~/.agent/env`, whatever else is called
+the one Sonny uses, whatever else is called
 `agent` on your `PATH`. It is also the one way in agents are told about:
 Sonny sets `AGENT_CLI` to its own `sonny agent`, so the instructions it
 composes, those the CLI composes for agents started through it, and the
@@ -123,9 +123,10 @@ folder's branch, since the leads share one checkout; the instructions,
 skills and memory of the folder are the same for all of them.
 
 `~/.agent/env` (`KEY=VALUE` lines, readable only by you) holds the provider
-keys, and `AWS_PROFILE` for Bedrock, which Sonny applies over your shell's to
-the daemon it starts; it does not set providers, so an `AGENT_PROVIDER` there
-is passed over and Sonny says to move it to `provider` in
+keys, and `AWS_PROFILE` for Bedrock, which `agent` applies over your shell's
+to every daemon it starts, whoever starts it; it does not set Agent's own
+names, so an `AGENT_` name there (`AGENT_PROVIDER` among them) is passed
+over and Sonny says so, and to move a provider to `provider` in
 `~/.agent/config.toml`; the reviewer and the lookout run as that daemon's
 companions, with its environment, so they live as long as it does whether
 or not a window is open. Settings go in
@@ -1747,16 +1748,19 @@ that isn't its seat's own (`lead` for a lead, `task` for a task). The left
 of the footer says what you talk to and where (the permissions mark, the
 model as pickers name it, its effort, the folder and its branch), and the
 right what wants you (needs you, failed, working, `↻`, `✎`, the
-context). The agent's name is left to the composer, which says it. When
-the window is too narrow for all of it, items give way in one order, as
-Powerline drops its lowest segments first: words before marks, marks
-before whole items, and what needs you never. `⏵⏵ full access` goes to `⏵⏵`, the folder to `~/D/agent` as fish
+context). Its counts of the agents are the ones `/status` heads its
+groups with, marks and numbers only: `? 2  ● 3  ✓ 13  ✓ 4` needs you,
+working, at rest, and done, dim. The agent's name is left to the
+composer, which says it. When the window is too narrow for all of it,
+items give way in one order, as Powerline drops its lowest segments
+first: done and at rest first, words before marks, marks before whole
+items, and what needs you never. `⏵⏵ full access` goes to `⏵⏵`, the folder to `~/D/agent` as fish
 shortens it and then to `agent`, until at 44 columns a busy lead reads
 `⏵⏵ GPT 6.1 Sol high   ? 1  ✗ 1  ● 2  37%`. The hues on it are only for
 what asks something of you: the `?`, the `✗`, the `●` and a context half
 used.
 
-![The footer at 100, 80, 60 and 44 columns: counts are marks and numbers, what needs you stays](../docs/sonny/footer-widths.png) Under the glance are the notes the agent keeps there with its `margin`
+![The footer at 100, 80, 60 and 44 columns: the /status counts as marks and numbers, done and at rest give way first, what needs you stays](../docs/sonny/footer-widths.png) Under the glance are the notes the agent keeps there with its `margin`
 tool: a diagram, a table of findings, a file it is discussing (kept fresh
 as the file changes), or a live view it updates while it works. Each
 note is pinned where the agent first put it: a quiet `✎ title · in the

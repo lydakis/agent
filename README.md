@@ -275,7 +275,7 @@ again; with flags (`--provider`, `--profile`, `--key-stdin`, `--model`,
 `--import-mcp`, `--json`) it asks nothing, for scripts and agents, and the
 `sonny-setup` skill tells any agent how to use them. As Codex does, it keeps the settings in
 `~/.agent/config.toml` and any key in `~/.agent/env`, readable only by you,
-which Sonny applies to the daemon and everything else it starts, so nothing
+which `agent` gives every daemon it starts, whoever asks it to, so nothing
 goes in your shell profile. Tool shells never get the keys the daemon's
 providers use; as in Codex, `[shell_environment_policy]` with
 `ignore_default_excludes = false` also leaves out every variable named like

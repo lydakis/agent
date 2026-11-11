@@ -266,8 +266,10 @@ const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
 /// This window is a side chat (`--side`).
 static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Into the alternate screen with the mouse, which Sonny owns while it
-/// runs, or out of it, the keys told apart on the screen it is on.
+/// runs, or out of it, the keys told apart on the screen it is on, and the
+/// terminal's colour-scheme reports heard while it is there.
 fn own_screen(own: bool) {
+    term::follow(own);
     keys_apart(false);
     let _ = match own {
         true => execute!(
@@ -520,6 +522,9 @@ struct StatusView<'a> {
     turn_model: Option<&'a str>,
     places: mux::Places,
     aside: &'a (dyn Fn(&str) -> bool + Sync),
+    /// Each row's details, its profile and what follows it; with none
+    /// only where each agent stands is read, as the footer counts it.
+    details: bool,
 }
 
 /// What `/status` read: its rows, what waits on the person, and which
@@ -534,6 +539,9 @@ struct StatusRead {
     idle: Vec<String>,
     /// Whether any agent's history was read, not taken from what was kept.
     fresh: bool,
+    /// Whether every history it read was read: one that failed counts as
+    /// nothing until a later read.
+    whole: bool,
 }
 
 /// The agents of `scope` as `/status` shows them, and footers and leads
@@ -555,9 +563,12 @@ async fn read_status(
         lead,
         glob: pattern,
     } = scope;
-    let behind = background::read(options_store, client.store(), turns, |bot| {
-        lookout::subs::matches(&pattern, bot)
-    });
+    let behind = match view.details {
+        true => background::read(options_store, client.store(), turns, |bot| {
+            lookout::subs::matches(&pattern, bot)
+        }),
+        false => Vec::new(),
+    };
     // Every page of the listing: past the first 256, agents are the
     // project's too.
     let mut listed = Vec::new();
@@ -591,7 +602,10 @@ async fn read_status(
     let store = agent_client::socket::canonical_store(options_store)
         .unwrap_or_else(|_| options_store.to_path_buf());
     // Each source's icon, as the settings give it now.
-    let icons = background::source_icons();
+    let icons = match view.details {
+        true => background::source_icons(),
+        false => HashMap::new(),
+    };
     let mut rows = Vec::new();
     // Each lead's project file read once a refresh; a task's profile
     // is the one noted when it started.
@@ -601,7 +615,7 @@ async fn read_status(
     let mine = owned(&listed, &project, &lead);
     // Side chats are not the project's agents.
     let mut kept = HashMap::new();
-    let mut fresh = false;
+    let (mut fresh, mut whole) = (false, true);
     for bot in &listed {
         let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
             continue;
@@ -621,7 +635,9 @@ async fn read_status(
             Some((seen, latest)) if seen == head && !bot["head"].is_null() => Some(latest),
             _ => {
                 fresh = true;
-                read_latest(client, name).await
+                let latest = read_latest(client, name).await;
+                whole &= latest.is_some();
+                latest
             }
         };
         if let Some(latest) = &latest {
@@ -708,7 +724,10 @@ async fn read_status(
                             asks_seen.insert(name.to_owned(), (last, seen.clone()));
                             seen
                         }
-                        None => Seen::default(),
+                        None => {
+                            whole = false;
+                            Seen::default()
+                        }
                     }
                 }
             },
@@ -778,6 +797,7 @@ async fn read_status(
         // A folder's own lead profile is read once; a lead made in a
         // role of its own by `/new` keeps that.
         let profile = match project::is_lead(name) {
+            _ if !view.details => None,
             true => project::chosen(&store, name).or_else(|| {
                 let folder = bot["workspace"].as_str().unwrap_or("").to_owned();
                 (profiles.entry(folder))
@@ -826,6 +846,7 @@ async fn read_status(
         read,
         idle,
         fresh,
+        whole,
     })
 }
 
@@ -1479,56 +1500,49 @@ fn installed_agent(me: &std::path::Path) -> Vec<PathBuf> {
 }
 
 /// `sonny agent ARGS...`: the `agent` Sonny itself starts, run with
-/// ARGS and the same keys, in place of this process, so the person reaches
-/// it whatever else is called `agent` on their PATH.
+/// ARGS in place of this process, so the person reaches it whatever else
+/// is called `agent` on their PATH. It gives a daemon it starts the keys
+/// in ~/.agent/env, as for every other starter.
 fn pass_to_agent(args: &[String]) -> Result<(), String> {
     let bin = agent_bin_or_missing()?;
-    let mut command = agent_command(&bin)?;
+    let mut command = std::process::Command::new(&bin);
     let error = std::os::unix::process::CommandExt::exec(command.args(args));
     Err(format!("{}: {error}", bin.display()))
 }
 
-/// Agent's binary to run, with the provider keys kept in ~/.agent/env
-/// over this shell's own; an empty value unsets one.
-fn agent_command(bin: &std::path::Path) -> Result<std::process::Command, String> {
-    let mut command = std::process::Command::new(bin);
-    apply_env_file(&mut command)?;
-    Ok(command)
+/// What to tell the person when `~/.agent/env` sets one of Agent's own
+/// names, which it never gives a daemon (`agent_client::env_file::refused`):
+/// providers are set by `provider` in `~/.agent/config.toml` (a shell's own
+/// `AGENT_PROVIDER` still wins, for scripts).
+fn env_file_refused() -> Option<String> {
+    env_file_refused_at(&agent_client::env_file::path()?)
 }
 
-/// `~/.agent/env` over `command`'s environment: an empty value unsets.
-/// Its keys only: the providers are set in `~/.agent/config.toml`, so an
-/// `AGENT_PROVIDER` there is passed over ([`env_file_provider`] says so).
-fn apply_env_file(command: &mut std::process::Command) -> Result<(), String> {
-    if let Some(file) = agent_client::env_file::path() {
-        for (key, value) in agent_client::env_file::read(&file)? {
-            if key == "AGENT_PROVIDER" {
-                continue;
-            }
-            match value.is_empty() {
-                true => command.env_remove(key),
-                false => command.env(key, value),
-            };
-        }
-    }
-    Ok(())
-}
-
-/// What to tell the person when `~/.agent/env` still sets `AGENT_PROVIDER`,
-/// which nothing reads now: `~/.agent/config.toml`'s `provider` is the one
-/// place providers are set (a shell's own `AGENT_PROVIDER` still wins, for
-/// scripts).
-fn env_file_provider() -> Option<String> {
-    env_file_provider_at(&agent_client::env_file::path()?)
-}
-
-fn env_file_provider_at(file: &std::path::Path) -> Option<String> {
+fn env_file_refused_at(file: &std::path::Path) -> Option<String> {
     let set = agent_client::env_file::read(file).ok()?;
-    set.iter().any(|(key, value)| key == "AGENT_PROVIDER" && !value.is_empty()).then(|| {
-        format!(
-            "{} sets AGENT_PROVIDER, which is no longer read; move it to provider in ~/.agent/config.toml (/config provider)",
+    let mut names: Vec<&str> = (set.iter())
+        .filter(|(key, value)| agent_client::env_file::refused(key) && !value.is_empty())
+        .map(|(key, _)| key.as_str())
+        .collect();
+    names.dedup();
+    let first = *names.first()?;
+    let move_it = match names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("AGENT_PROVIDER"))
+    {
+        true => "; move the provider to provider in ~/.agent/config.toml (/config provider)",
+        false => "",
+    };
+    Some(match names.len() {
+        1 => format!(
+            "{} sets {first}, which is not read: names starting AGENT_ are Agent's own{move_it}",
             file.display()
-        )
+        ),
+        _ => format!(
+            "{} sets {}, which are not read: names starting AGENT_ are Agent's own{move_it}",
+            file.display(),
+            names.join(", ")
+        ),
     })
 }
 
@@ -1684,8 +1698,11 @@ async fn connect_starting(
     asking: Asking,
     start: impl Fn() -> Result<(), NotStarted>,
 ) -> Result<(Arc<Client>, agent_client::Events), String> {
-    if let Ok(connected) = Client::connect(socket).await {
-        return Ok(connected);
+    match Client::connect(socket).await {
+        Ok(connected) => return Ok(connected),
+        // What this window would start is its own older build.
+        Err(error) if newer_daemon(&error) => return Err(UPGRADED.to_owned()),
+        Err(_) => {}
     }
     match start() {
         Err(failed) if failed.code.as_deref() == Some("provider_required") => {
@@ -1699,10 +1716,35 @@ async fn connect_starting(
             setup::provider(&bin, false)?;
             start().map_err(|e| e.to_string())?;
         }
-        started => started.map_err(|e| e.to_string())?,
+        Err(failed) => {
+            // Lost to the newer daemon that took the store meanwhile.
+            return Err(match Client::connect(socket).await {
+                Err(error) if newer_daemon(&error) => UPGRADED.to_owned(),
+                _ => failed.to_string(),
+            });
+        }
+        Ok(()) => {}
     }
     // The daemon rewrites the model catalog itself, from every start.
-    Client::connect(socket).await.map_err(|e| e.to_string())
+    Client::connect(socket)
+        .await
+        .map_err(|error| match newer_daemon(&error) {
+            true => UPGRADED.to_owned(),
+            false => error.to_string(),
+        })
+}
+
+/// Why a window starts nothing once the daemon speaks a newer protocol
+/// than it: Sonny was upgraded while it was open, and a daemon or
+/// companion it started would be its own older build.
+const UPGRADED: &str = "Sonny was upgraded; reopen this window";
+
+/// Whether `error` met a daemon on a newer protocol than this Sonny's.
+fn newer_daemon(error: &agent_client::Error) -> bool {
+    error.code == "daemon_protocol_mismatch"
+        && (error.facts.as_ref())
+            .and_then(|facts| facts.get("protocol")?.as_u64())
+            .is_some_and(|protocol| protocol > agent_client::PROTOCOL)
 }
 
 /// Why a daemon that stopped is not started again: it has no provider,
@@ -1776,7 +1818,7 @@ fn start_daemon(
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|_| scoped) {
         command.env("XDG_RUNTIME_DIR", runtime);
     }
-    apply_env_file(&mut command)?;
+    // The CLI gives the daemon the keys in ~/.agent/env itself.
     command.env("AGENT_BIN", &bin).env_remove(named::PROGRAM);
     let out = command
         .arg("start")
@@ -2206,6 +2248,7 @@ fn status_cli(args: &[String]) -> Result<(), String> {
             turn_model: None,
             places: Default::default(),
             aside: &|_| false,
+            details: true,
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
         let kept = agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
@@ -2455,7 +2498,7 @@ async fn run() -> Result<(), String> {
             "a new lead for this folder; {above} leads the folder above: sonny --agent {above}"
         ));
     }
-    if let Some(said) = env_file_provider()
+    if let Some(said) = env_file_refused()
         && app.notice.is_none()
     {
         app.notice = Some(said);
@@ -2570,7 +2613,7 @@ async fn run() -> Result<(), String> {
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     term::restore();
     let _ = disable_raw_mode();
-    status_report("clear", &name);
+    report_status("clear", &name);
     // `/switch NAME` or `/new`: this window becomes that agent's Sonny, as
     // if opened on it.
     if let (Ok(()), Some(other)) = (&result, app.switch_to.take()) {
@@ -2907,78 +2950,10 @@ pub fn side_copy(record: &Value) -> Option<&str> {
 /// How long `/status` waits, as it opens, for where the windows sit now.
 const PLACES_NOW: Duration = Duration::from_millis(500);
 
-/// What this window last said its agent is doing, and whether a question
-/// the agent put to the person is open here: the bot, the state, and the
-/// question.
-static REPORTED: std::sync::Mutex<Option<(String, String, bool)>> = std::sync::Mutex::new(None);
-
 /// Whether a lead's call of tool `name` marks the task it names done:
 /// `mark_done`, and `remove_task`, which marks it as it cleans up.
 fn resolves(name: &str) -> bool {
     name == resolved::TOOL || name == served::REMOVE
-}
-
-/// What the multiplexer is told: a question open says the agent needs the
-/// person (`asking`), as its tab, `/status` and the footer say
-/// ([`needs`]), whatever its turn does; a call waiting on their approval
-/// says so first (`blocked`), and a window closing says nothing more.
-fn shown_status(state: &str, asking: bool) -> &str {
-    match state {
-        "blocked" | "clear" => state,
-        _ if asking => "asking",
-        _ => state,
-    }
-}
-
-/// The agent's state, as its turns and calls go: said to the multiplexer
-/// with any question still open here.
-fn status_report(state: &str, bot: &str) {
-    let asking = match REPORTED.lock() {
-        Ok(mut reported) => {
-            let asking = (reported.as_ref()).is_some_and(|(of, _, asking)| of == bot && *asking);
-            *reported = Some((bot.to_owned(), state.to_owned(), asking));
-            asking
-        }
-        Err(_) => false,
-    };
-    report_status(shown_status(state, asking), bot);
-}
-
-/// Whether a question the agent put to the person is open in this window,
-/// as each frame finds: said to the multiplexer once it changes.
-fn status_asking(bot: &str, open: bool) {
-    let Some(state) = REPORTED
-        .lock()
-        .ok()
-        .and_then(|mut reported| asked_now(&mut reported, bot, open))
-    else {
-        return;
-    };
-    report_status(shown_status(&state, open), bot);
-}
-
-/// What to say again now that a question is `open` here or not: the
-/// agent's state last said, when that changes what the multiplexer is
-/// told. Nothing before the agent's state was first said, which says the
-/// question with it, nor once its window closed.
-fn asked_now(
-    reported: &mut Option<(String, String, bool)>,
-    bot: &str,
-    open: bool,
-) -> Option<String> {
-    match reported.as_mut() {
-        Some((of, state, asking)) if of == bot => {
-            if *asking == open {
-                return None;
-            }
-            *asking = open;
-            (!state.is_empty() && state != "clear").then(|| state.clone())
-        }
-        _ => {
-            *reported = Some((bot.to_owned(), String::new(), open));
-            None
-        }
-    }
 }
 
 /// Program status (OSC 7501), so a terminal or multiplexer that reads it
@@ -3622,6 +3597,63 @@ type Reads = (
     HashMap<String, (i64, Seen)>,
 );
 
+/// What the footer's count of the agents found: the mark of where they
+/// stood, and, when that had changed, the counts with the reads made.
+/// No mark when a history read failed, so the next count reads again.
+struct Counted {
+    mark: Option<u64>,
+    read: Option<(status::Counts, Reads)>,
+}
+
+/// A mark of where the agents `pattern` names stand, as the daemon lists
+/// them, and of what waits on the person: what decides each one's group,
+/// and a running one's history, whose newest items can hold a question.
+/// `here` is this window's own open question and calls. A task marked
+/// done beside `store` counts too: a lead elsewhere can mark it without
+/// it moving. None when the daemon could not be asked.
+async fn standing(
+    client: &Client,
+    store: &std::path::Path,
+    pattern: &str,
+    here: (usize, usize),
+) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut mark = std::collections::hash_map::DefaultHasher::new();
+    here.hash(&mut mark);
+    let mut after: Option<String> = None;
+    loop {
+        let mut ask = json!({"name": pattern, "limit": 256});
+        if let Some(after) = &after {
+            ask["after"] = json!(after);
+        }
+        let page = client.request("bots", ask).await.ok()?;
+        for bot in page["bots"].as_array().into_iter().flatten() {
+            for key in [
+                "name",
+                "running_turn",
+                "status",
+                "waiting_on",
+                "last",
+                "expire_ms",
+            ] {
+                bot[key].to_string().hash(&mut mark);
+            }
+            if !bot["running_turn"].is_null() {
+                bot["head"].to_string().hash(&mut mark);
+            }
+            if let Some(name) = bot["name"].as_str() {
+                resolved::read(store, name).hash(&mut mark);
+            }
+        }
+        match page["next_after"].as_str() {
+            Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
+            _ => break,
+        }
+    }
+    needs::listing(client, None).await.ok().hash(&mut mark);
+    Some(mark.finish())
+}
+
 enum Warming {
     Running(tokio::task::JoinHandle<Option<Reads>>),
     Done,
@@ -3809,6 +3841,11 @@ struct App {
     calls: HashMap<String, (String, Value)>,
     /// Calls waiting on the person, as `approvals` lists them.
     approvals: Vec<Value>,
+    /// How the agent's last turn ended, as it rests between turns: `idle`,
+    /// `done` or `error`; none until known.
+    rest: Option<&'static str>,
+    /// What the multiplexer was last told of the agent ([`App::tab_status`]).
+    told: Option<&'static str>,
     /// Calls of the bots below this window waiting on the person, as
     /// `approvals` lists them, each with its `bot`: its tasks', and those
     /// of the leads it follows and theirs. Answered here after its own.
@@ -3877,9 +3914,6 @@ struct App {
     /// Where the person's reactions to the bot are kept, once its id is
     /// known.
     reactions_key: Option<String>,
-    /// This agent's store-wide id, which the bots it made carry as
-    /// `created_by_id`.
-    bot_id: Option<i64>,
     /// Esc set the questions aside: what is typed is a message of its own.
     chatting: bool,
     /// The waiting call whose whole command was last written out.
@@ -4092,8 +4126,15 @@ struct App {
     /// The tasks this agent started that have a turn running, as the
     /// daemon says without windows for the project's agents; and when
     /// they were last read.
-    tasks_running: Option<std::collections::HashSet<String>>,
-    tasks_running_read: Option<Instant>,
+    /// How many of the project's agents each of `/status`'s groups lists,
+    /// as its last read found: what the footer shows.
+    counts: Option<status::Counts>,
+    /// The footer's own read of them, under way, and when the last began.
+    counting: Option<tokio::task::JoinHandle<Option<Counted>>>,
+    counted_at: Option<Instant>,
+    /// What the listing said where each agent stands, when last counted:
+    /// the agents are counted again only once it changes.
+    counted_mark: Option<u64>,
     folded: Option<(bool, u64)>,
     refold: bool,
     /// The `plan` calls drawn, by the number each is tagged with, and the
@@ -4145,6 +4186,9 @@ struct App {
     lead: String,
     /// When to connect again, while it or the fleet's is down.
     retry: Option<Instant>,
+    /// The daemon is newer than this window: it connects and starts
+    /// nothing again ([`UPGRADED`]).
+    upgraded: bool,
     /// `/model`, open over the composer.
     picker: Option<models::Picker>,
     /// `/switch`'s list of every agent, open over the composer.
@@ -5635,6 +5679,8 @@ impl App {
             }),
             calls: HashMap::new(),
             approvals: Vec::new(),
+            rest: None,
+            told: None,
             raised: Vec::new(),
             raised_read: Default::default(),
             calls_aside: Default::default(),
@@ -5655,7 +5701,6 @@ impl App {
             task_asks_read: None,
             done_read: None,
             task_needs: Default::default(),
-            bot_id: record["bot_id"].as_i64(),
             reactions_key: record["bot_id"].as_i64().map(|id| {
                 let store =
                     std::fs::canonicalize(&options.store).unwrap_or_else(|_| options.store.clone());
@@ -5753,8 +5798,10 @@ impl App {
             marked: HashMap::new(),
             references: HashMap::new(),
             references_read: None,
-            tasks_running: None,
-            tasks_running_read: None,
+            counts: None,
+            counting: None,
+            counted_at: None,
+            counted_mark: None,
             folded: None,
             refold: false,
             plans: HashMap::new(),
@@ -5777,6 +5824,7 @@ impl App {
             move_to: None,
             lead: String::new(),
             retry: None,
+            upgraded: false,
             picker: None,
             searching: None,
             config: None,
@@ -5846,7 +5894,6 @@ impl App {
         self.history().await;
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
-            status_report("working", &self.bot);
             if let Ok(page) = self
                 .client
                 .request(
@@ -5875,7 +5922,7 @@ impl App {
                 Ok(last) => last["status"] == "failed" && last["error"] != EMPTY,
                 Err(_) => false,
             };
-            status_report(if failed { "error" } else { "idle" }, &self.bot);
+            self.rest = Some(if failed { "error" } else { "idle" });
         }
         self.configure().await;
         self.tell_upgrades().await;
@@ -6121,7 +6168,7 @@ impl App {
             self.raise_approvals().await;
             self.recheck_task_answers().await;
             self.settle_task_asks().await;
-            self.read_running_tasks().await;
+            self.count_agents().await;
             self.read_references().await;
             self.read_names().await;
             self.warm_reads().await;
@@ -6855,6 +6902,10 @@ impl App {
     /// what happened meanwhile: the bot's new items, and a turn that ended
     /// or began. Tried again every two seconds until it works.
     async fn reattach(&mut self, events: &mut Events) {
+        if self.upgraded {
+            self.retry = None;
+            return;
+        }
         let lead = async {
             let (client, mut fresh) = connect(&self.options, Asking::Never).await?;
             client
@@ -6873,6 +6924,12 @@ impl App {
         if self.down {
             let (client, fresh, record, caught) = match lead.await {
                 Ok(back) => back,
+                Err(error) if error == UPGRADED => {
+                    self.notice = Some(UPGRADED.to_owned());
+                    self.upgraded = true;
+                    self.retry = None;
+                    return;
+                }
                 Err(error) => {
                     self.notice = Some(format!("reconnecting to the daemon: {error}"));
                     self.retry = Some(Instant::now() + Duration::from_secs(2));
@@ -6914,7 +6971,6 @@ impl App {
                     effort: None,
                 });
                 self.turn_began().await;
-                status_report("working", &self.bot);
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
                 .await;
@@ -8596,37 +8652,66 @@ impl App {
         }
     }
 
-    /// The tasks this agent started with a turn running, read every few
-    /// seconds where no windows for the project's agents say it.
-    async fn read_running_tasks(&mut self) {
-        if self.fleet.is_some()
-            || self.bot_id.is_none()
-            || (self.tasks_running_read).is_some_and(|at| at.elapsed() < Duration::from_secs(3))
+    /// The project's agents counted as `/status` counts them, for the
+    /// footer: off the screen's thread, at most every few seconds, and
+    /// read whole only once where any agent stands changed (its turn,
+    /// what it waits on, a running one's history) or what waits on the
+    /// person did. While `/status` is open, its own reads count them.
+    async fn count_agents(&mut self) {
+        if let Some(job) = self.counting.take_if(|job| job.is_finished())
+            && let Ok(Some(counted)) = job.await
+        {
+            self.counted_mark = counted.mark;
+            if let Some((counts, (latest, seen))) = counted.read {
+                self.counts = Some(counts);
+                self.status_read = latest;
+                self.asks_seen = seen;
+            }
+        }
+        if self.counting.is_some()
+            || (self.counted_at).is_some_and(|at| at.elapsed() < Duration::from_secs(3))
         {
             return;
         }
-        self.tasks_running_read = Some(Instant::now());
-        // Every page of them, or the count stays as it was.
-        let mut running = std::collections::HashSet::new();
-        let mut after = Value::Null;
-        loop {
-            let asked = json!({"active": true, "created_by_id": self.bot_id,
-                "limit": 256, "after": after});
-            let Ok(page) = self.client.request("bots", asked).await else {
-                return;
-            };
-            running.extend(
-                (page["bots"].as_array().into_iter().flatten())
-                    // Its side chats lapse, and are no tasks.
-                    .filter(|bot| bot["expire_ms"].is_null())
-                    .filter_map(|bot| bot["name"].as_str().map(str::to_owned)),
-            );
-            after = page["next_after"].clone();
-            if !after.is_string() {
-                break;
+        self.counted_at = Some(Instant::now());
+        let (client, woken) = (self.client.clone(), self.woken.clone());
+        let (store, scope, bot) = (self.options.store.clone(), self.scope(), self.bot.clone());
+        let (asks, approvals) = (self.asks.clone(), self.approvals.clone());
+        let (mut latest, mut seen) = (self.status_read.clone(), self.asks_seen.clone());
+        let (was, turns) = (self.counted_mark, self.turns.clone());
+        // This window's own question and calls count for its own row.
+        let here = (
+            asks.iter().filter(|ask| ask.task.is_none()).count(),
+            approvals.len(),
+        );
+        self.counting = Some(tokio::spawn(async move {
+            let marks =
+                agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
+            let mark = standing(&client, &marks, &scope.glob, here).await?;
+            if was == Some(mark) {
+                return Some(Counted {
+                    mark: Some(mark),
+                    read: None,
+                });
             }
-        }
-        self.tasks_running = Some(running);
+            let view = StatusView {
+                bot: &bot,
+                asks: &asks,
+                approvals: &approvals,
+                turn_model: None,
+                places: Default::default(),
+                aside: &|_| false,
+                details: false,
+            };
+            let read = read_status(&client, &store, scope, &turns, &mut latest, &mut seen, view)
+                .await
+                .ok()?;
+            woken.notify_one();
+            Some(Counted {
+                mark: read.whole.then_some(mark),
+                read: Some((status::counts(&read.rows), (latest, seen))),
+            })
+        }));
     }
 
     /// What `bot` did since `reference` was last read of its note `id`,
@@ -9534,7 +9619,6 @@ impl App {
                 if let Some(model) = data["model"].as_str() {
                     self.model = model.to_owned();
                 }
-                status_report("working", &self.bot);
                 // A turn the history drew still answers the message it
                 // drew, with what the bot reacted to it with so far.
                 if !drawn {
@@ -10090,15 +10174,12 @@ impl App {
                 if status == "completed" && !quiet && turn.is_some() && turn == self.yours {
                     self.suggest();
                 }
-                status_report(
-                    match status {
-                        _ if quiet => "idle",
-                        "completed" => "done",
-                        "interrupted" => "idle",
-                        _ => "error",
-                    },
-                    &self.bot,
-                );
+                self.rest = Some(match status {
+                    _ if quiet => "idle",
+                    "completed" => "done",
+                    "interrupted" => "idle",
+                    _ => "error",
+                });
                 self.configure().await;
                 // Only this view knows whether the turn said anything, so it
                 // rings for the end of every turn of its own; the project's
@@ -10587,6 +10668,7 @@ impl App {
             turn_model: self.turn_model.as_deref(),
             places: fleet.map(|fleet| fleet.layout.places()).unwrap_or_default(),
             aside: &|name| fleet.is_some_and(|fleet| fleet.layout.aside(name)),
+            details: true,
         };
         let read = read_status(
             &self.client,
@@ -10598,6 +10680,7 @@ impl App {
             view,
         )
         .await?;
+        self.counts = Some(status::counts(&read.rows));
         // The windows' names and the footer say what this read, as it is
         // newer than what they had. A running agent's question is read
         // from its last few items here, so its events keep theirs.
@@ -10634,6 +10717,7 @@ impl App {
                         turn_model: None,
                         places: Default::default(),
                         aside: &|_| false,
+                        details: true,
                     };
                     let turns = HashMap::new();
                     let read =
@@ -10808,7 +10892,6 @@ impl App {
             }
         }
         if !self.approvals.is_empty() {
-            status_report("blocked", &self.bot);
             // With a fleet, the lead's Sonny rings for every agent.
             if self.fleet.is_none() {
                 let what = format!("{} needs you", self.bot);
@@ -10974,9 +11057,6 @@ impl App {
         // the rest once these are answered.
         if self.approvals.is_empty() {
             self.approvals_for(call["turn"].as_i64()).await;
-        }
-        if self.approvals.is_empty() {
-            status_report("working", &self.bot);
         }
     }
 
@@ -11714,53 +11794,6 @@ impl App {
         }
     }
 
-    /// The other agents at work, and how many agents wait on the person:
-    /// this one, with a question or a call of its open here, the others
-    /// as their windows' names say ([`Fleet::settle`]), and those of the
-    /// leads followed ([`Fleet::raised`]). Without windows for
-    /// the project's agents, the tasks this one started: those running as
-    /// the daemon says, drawn or not, and those that need the person as
-    /// their rosters read them.
-    fn agents(&self) -> (usize, usize) {
-        let doing: HashMap<&str, &str> = match &self.fleet {
-            Some(fleet) => (fleet.doing.iter())
-                .map(|(bot, doing)| (bot.as_str(), *doing))
-                .collect(),
-            None => {
-                let rostered = (self.tasks.values().flatten())
-                    .map(|task| (task.bot.as_str(), task.state.as_str()));
-                match &self.tasks_running {
-                    Some(running) => (running.iter())
-                        .map(|bot| (bot.as_str(), "working"))
-                        .chain(rostered.filter(|(_, state)| *state == "needs you"))
-                        .collect(),
-                    None => rostered.collect(),
-                }
-            }
-        };
-        let count = |state: &str| {
-            (doing.iter())
-                .filter(|(bot, doing)| **bot != self.bot && **doing == state)
-                .count()
-        };
-        // Its transcript read only so far back, the fleet's read of its
-        // history may hold a question this window does not.
-        // Its tasks' questions pinned here count as theirs.
-        let here = self.asks.iter().any(|ask| ask.task.is_none())
-            || !self.approvals.is_empty()
-            || (self.fleet.as_ref()).is_some_and(|fleet| fleet.needs.waits(&self.bot));
-        // Those of the leads followed wait here too, though no tab is theirs.
-        let raised = (self.fleet.as_ref()).map_or(0, |fleet| {
-            (fleet.raised.iter())
-                .filter(|bot| fleet.needs.waits(bot))
-                .count()
-        });
-        (
-            count("working"),
-            usize::from(here) + count("needs you") + raised,
-        )
-    }
-
     /// A button clicked: what Sonny does for it now, or once the loop
     /// gets to it.
     fn act(&mut self, what: &str) {
@@ -12169,6 +12202,11 @@ impl App {
     }
 
     async fn key(&mut self, mut event: Event) {
+        // The terminal answering: its colors, or its light and dark.
+        if let Event::Reply(reply) = &event {
+            term::heard(reply);
+            return;
+        }
         // A key, a click, a paste or the window coming to the front: the
         // person is here, not in another terminal's Sonny.
         if let Some(marker) = &mut self.marker
@@ -12204,8 +12242,11 @@ impl App {
         }
         match &event {
             Event::Resize(..) => self.stale = true,
+            // A terminal that sends no colour-scheme reports may have
+            // switched while elsewhere: its colors are asked again.
             Event::FocusGained => {
                 self.stale = true;
+                term::ask();
                 return;
             }
             Event::Key(key)
@@ -14850,6 +14891,36 @@ impl App {
         self.commit(lines);
     }
 
+    /// What this window's tab says of its agent, from what the window
+    /// holds now, so the tab can never be left behind by a path that forgot
+    /// to say: a call waiting on the person's approval here (`blocked`),
+    /// else a question of the agent's own open here (`asking`; its tasks'
+    /// are theirs), else a turn running (`working`), else how its last
+    /// turn ended. An approval or a question answered in another window
+    /// clears here as the daemon says so, and the tab with it.
+    fn tab_status(&self) -> Option<&'static str> {
+        if !self.approvals.is_empty() {
+            Some("blocked")
+        } else if self.asks.iter().any(|ask| ask.task.is_none()) {
+            Some("asking")
+        } else if self.running.is_some() {
+            Some("working")
+        } else {
+            self.rest
+        }
+    }
+
+    /// The tab told the agent's state once it changes, as each frame finds.
+    fn tell_status(&mut self) {
+        let status = self.tab_status();
+        if status != self.told
+            && let Some(status) = status
+        {
+            self.told = Some(status);
+            report_status(status, &self.bot);
+        }
+    }
+
     /// A frame drawn, the whole screen written again when it is stale
     /// (cleared first); every frame shown whole, or not written at all
     /// when it changes nothing ([`frames`]).
@@ -14868,9 +14939,7 @@ impl App {
         // A question open here holds this window's place in its lead's
         // multiplexer, as the person still has it to answer.
         used::asking(&self.bot, !self.asks.is_empty());
-        // Its tasks' questions are theirs: the multiplexer says so of them.
-        let own = self.asks.iter().any(|ask| ask.task.is_none());
-        status_asking(&self.bot, own);
+        self.tell_status();
         self.show_asked();
         self.margin_back();
         // /status beside the conversation, gone once the pane is.
@@ -15310,16 +15379,16 @@ impl App {
                         )
                     })
                     .collect();
-                // The rows, then what a pick reaches, muted, in the
-                // column of their names.
-                let room = (composer.y as usize).saturating_sub(1);
+                // The rows, then what a pick reaches and how a folder is
+                // shared, muted, in the column of their names.
+                let room = (composer.y as usize).saturating_sub(2);
                 let mut rows = list::lines(&items, list.at(), width, room);
-                let reach = approvals::reach_line(
-                    &self.named(),
-                    self.reach,
-                    width.saturating_sub(list::INDENT),
-                );
-                rows.push(Line::from(format!("{}{reach}", " ".repeat(list::INDENT))).dim());
+                let room = width.saturating_sub(list::INDENT);
+                let indent = " ".repeat(list::INDENT);
+                let reach = approvals::reach_line(&self.named(), self.reach, room);
+                rows.push(Line::from(format!("{indent}{reach}")).dim());
+                let shared = transcript::cut(approvals::SHARED, room);
+                rows.push(Line::from(format!("{indent}{shared}")).dim());
                 over(frame, rows, composer);
                 let (line, cursor) = list.line("permissions");
                 frame.render_widget(Paragraph::new(line), composer);
@@ -16029,9 +16098,11 @@ impl App {
                 .opens("switch"),
             );
         }
-        let (working, waiting) = self.agents();
-        // Marks as the roster and /status draw them, each with its number,
-        // so the counts read without colour.
+        // The four counts `/status` heads its page with, as it counts
+        // them, each a mark as its rows draw it with its number: what
+        // needs the person, what works, what rests, what is done.
+        let counts = self.counts.unwrap_or_default();
+        let (working, waiting) = (counts.working, counts.needs_you);
         // Something new to answer beats the count a few times, reversed,
         // then it holds still (F12).
         let mut pulse = self.needs_pulse.get();
@@ -16085,6 +16156,15 @@ impl App {
         if working > 0 {
             let forms = footer::count("●", Color::Cyan, working, true);
             items.push(Item::new(Slot::Working, forms).opens("status"));
+        }
+        if counts.idle > 0 {
+            let forms = footer::count("✓", Color::Green, counts.idle, true);
+            items.push(Item::new(Slot::Idle, forms).opens("status"));
+        }
+        if counts.done > 0 {
+            let n = counts.done;
+            let forms = vec![vec![Span::raw(format!("✓ {n}")).dim()], Vec::new()];
+            items.push(Item::new(Slot::Done, forms).opens("status"));
         }
         // Something runs for it with no one typing: /background lists it.
         if self.behind.0 > 0 && !glancing {
@@ -16669,7 +16749,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_env_file_that_sets_providers_is_told_to_move_them() {
+    fn an_env_file_that_sets_agent_s_own_names_is_told_they_are_not_read() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("sonny-env-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -16679,14 +16759,18 @@ mod tests {
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         };
         write("OPENAI_API_KEY=k\nAGENT_PROVIDER=\"openai bedrock\"\n");
-        let said = env_file_provider_at(&file).unwrap();
+        let said = env_file_refused_at(&file).unwrap();
+        assert!(said.contains("AGENT_PROVIDER, which is not read"), "{said}");
+        assert!(said.contains("provider in ~/.agent/config.toml"), "{said}");
+        write("OPENAI_API_KEY=k\nAGENT_SOCKET=/x\nagent_bin=/y\n");
+        let said = env_file_refused_at(&file).unwrap();
         assert!(
-            said.contains("AGENT_PROVIDER, which is no longer read"),
+            said.contains("AGENT_SOCKET, agent_bin, which are not read"),
             "{said}"
         );
-        assert!(said.contains("provider in ~/.agent/config.toml"), "{said}");
+        assert!(!said.contains("config.toml"), "{said}");
         write("OPENAI_API_KEY=k\nAGENT_PROVIDER=\n");
-        assert_eq!(env_file_provider_at(&file), None);
+        assert_eq!(env_file_refused_at(&file), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -16773,38 +16857,6 @@ mod tests {
             .backend()
             .0
             .assert_buffer_lines(["drawn   ", "        "]);
-    }
-
-    #[test]
-    fn a_question_open_says_the_agent_needs_you_to_its_multiplexer() {
-        // As its tab, `/status` and the footer say: an approval waiting
-        // says so first, and a closing window says nothing more.
-        assert_eq!(shown_status("done", true), "asking");
-        assert_eq!(shown_status("idle", true), "asking");
-        assert_eq!(shown_status("working", true), "asking");
-        assert_eq!(shown_status("error", true), "asking");
-        assert_eq!(shown_status("blocked", true), "blocked");
-        assert_eq!(shown_status("clear", true), "clear");
-        assert_eq!(shown_status("done", false), "done");
-        // A question found open before anything was said waits for the
-        // state, which says it.
-        let mut reported = None;
-        assert_eq!(asked_now(&mut reported, "shop.a", true), None);
-        // The turn ended on the question: said again once it opens and
-        // once it closes, and not with every frame between.
-        reported = Some(("shop.a".into(), "done".into(), false));
-        assert_eq!(
-            asked_now(&mut reported, "shop.a", true).as_deref(),
-            Some("done")
-        );
-        assert_eq!(asked_now(&mut reported, "shop.a", true), None);
-        assert_eq!(
-            asked_now(&mut reported, "shop.a", false).as_deref(),
-            Some("done")
-        );
-        // A closed window says nothing more.
-        reported = Some(("shop.a".into(), "clear".into(), false));
-        assert_eq!(asked_now(&mut reported, "shop.a", true), None);
     }
 
     /// [`lineage_of`] as it was: each bot's line of makers walked afresh.
@@ -18216,7 +18268,110 @@ mod tests {
         let fleet = app.fleet.as_ref().unwrap();
         assert_eq!(fleet.doing["shop.fix"], "needs you");
         assert_eq!(fleet.doing["shop.web"], "working");
-        assert_eq!(app.agents(), (1, 1));
+        // The footer counts as /status's head does: the lead rests.
+        let counts = status::Counts {
+            needs_you: 1,
+            working: 1,
+            idle: 1,
+            done: 0,
+        };
+        assert_eq!(app.counts, Some(counts));
+    }
+
+    #[tokio::test]
+    async fn the_footer_counts_as_status_does_and_reads_again_only_on_a_change() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let listings = Arc::new(AtomicUsize::new(0));
+        let ended = Arc::new(AtomicBool::new(false));
+        let failing = Arc::new(AtomicBool::new(false));
+        let (listed, over, fails) = (listings.clone(), ended.clone(), failing.clone());
+        let client = daemon_answering(move |asked| match asked["op"].as_str().unwrap_or("") {
+            "history_nodes" | "history" if fails.load(Ordering::SeqCst) => {
+                json!({"error": "store_busy"})
+            }
+            "bots" => {
+                listed.fetch_add(1, Ordering::SeqCst);
+                let fix = match over.load(Ordering::SeqCst) {
+                    false => json!({"name": "shop.fix", "bot_id": 2, "head": 1,
+                        "running_turn": 4, "status": "running", "created_by": "shop.lead"}),
+                    true => json!({"name": "shop.fix", "bot_id": 2, "head": 2,
+                        "last": {"turn": 4, "status": "completed"}, "created_by": "shop.lead"}),
+                };
+                json!({"bots": [
+                    {"name": "shop.lead", "bot_id": 1, "head": 1},
+                    fix,
+                    // A helper of the task folds under it, as on /status.
+                    {"name": "shop.fix.help", "bot_id": 3, "head": 1, "running_turn": 2,
+                        "status": "running", "created_by": "shop.fix"},
+                ], "next_after": null})
+            }
+            "approvals" => json!({"approvals": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        let dir = std::env::temp_dir().join(unique("sonny-footer-counts"));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.options.store = dir.join("state.sqlite");
+        let counted = async |app: &mut App| {
+            app.counted_at = None;
+            app.count_agents().await;
+            while !app.counting.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+            app.counted_at = None;
+            app.count_agents().await;
+        };
+        counted(&mut app).await;
+        let counts = |needs_you, working, idle| status::Counts {
+            needs_you,
+            working,
+            idle,
+            done: 0,
+        };
+        assert_eq!(app.counts, Some(counts(0, 1, 1)));
+        // Its mark, then the read itself.
+        assert_eq!(listings.load(Ordering::SeqCst), 2);
+        // Nothing changed: only the mark is read.
+        counted(&mut app).await;
+        assert_eq!(listings.load(Ordering::SeqCst), 3);
+        // The task's turn ended: read again, and counted at rest.
+        ended.store(true, Ordering::SeqCst);
+        counted(&mut app).await;
+        assert_eq!(listings.load(Ordering::SeqCst), 5);
+        assert_eq!(app.counts, Some(counts(0, 0, 2)));
+        // Marked done by a lead elsewhere, the task itself unmoved: read
+        // again, and counted done.
+        resolved::keep(&dir.join("state.sqlite"), "shop.fix", 4, "call-1").unwrap();
+        counted(&mut app).await;
+        assert_eq!(listings.load(Ordering::SeqCst), 7);
+        assert_eq!(
+            app.counts,
+            Some(status::Counts {
+                idle: 1,
+                done: 1,
+                ..Default::default()
+            })
+        );
+        // A history read that failed keeps no mark: the next count reads
+        // again, and once it reads whole, only the mark again.
+        failing.store(true, Ordering::SeqCst);
+        let _ = app.counting.take().unwrap().await;
+        let listed = listings.load(Ordering::SeqCst);
+        app.status_read.clear();
+        app.asks_seen.clear();
+        app.counted_mark = None;
+        counted(&mut app).await;
+        assert_eq!(listings.load(Ordering::SeqCst), listed + 2);
+        assert_eq!(app.counted_mark, None);
+        failing.store(false, Ordering::SeqCst);
+        counted(&mut app).await;
+        assert_eq!(listings.load(Ordering::SeqCst), listed + 4);
+        assert!(app.counted_mark.is_some());
+        counted(&mut app).await;
+        assert_eq!(listings.load(Ordering::SeqCst), listed + 5);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -19316,6 +19471,10 @@ mod tests {
     async fn a_new_question_beats_the_footer_count_and_then_it_holds() {
         let mut app = app_in_zen(zen_daemon().await);
         app.history().await;
+        app.counts = Some(status::Counts {
+            needs_you: 1,
+            ..Default::default()
+        });
         let mark = |app: &App| {
             let (line, _) = app.footer(60);
             let span = (line.spans.into_iter()).find(|span| span.content == "?");
@@ -19335,6 +19494,12 @@ mod tests {
     async fn in_zen_the_footer_counts_only_what_needs_the_person() {
         let mut app = app_in_zen(zen_daemon().await);
         app.history().await;
+        app.counts = Some(status::Counts {
+            needs_you: 1,
+            working: 2,
+            idle: 3,
+            done: 4,
+        });
         let (footer, counter) = app.footer(60);
         let footer = footer.to_string();
         assert!(footer.starts_with("  zen · the rounding"), "{footer}");
@@ -22705,6 +22870,33 @@ mod tests {
         assert_eq!(starts.get(), 1, "tried once, never again after a setup");
     }
 
+    /// A window open across an upgrade that meets the new daemon starts
+    /// nothing: its daemon and companions would be its own older build.
+    #[tokio::test]
+    async fn a_window_that_meets_a_newer_daemon_says_reopen_and_starts_nothing() {
+        use tokio::io::AsyncWriteExt;
+        let dir = std::env::temp_dir().join(format!("sonny-newer-{}", unique("t")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL + 1,
+                    "pid": 4242});
+                let _ = stream.write_all(format!("{ready}\n").as_bytes()).await;
+            }
+        });
+        let starts = std::cell::Cell::new(0);
+        let start = || {
+            starts.set(starts.get() + 1);
+            Ok(())
+        };
+        let refused = connect_starting(&socket, Asking::Never, start).await;
+        assert_eq!(refused.err().as_deref(), Some(UPGRADED));
+        assert_eq!(starts.get(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn context_reads_the_agent_s_record_and_keeps_its_last_compaction() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -22936,13 +23128,7 @@ mod tests {
             fleet.rescan().await;
         }
         assert_eq!(fleet.doing["calc.ask"], "needs you");
-        // The footer counts what the tabs say, this agent's own aside.
-        let mut app = app(client);
-        app.bot = "calc.lead".into();
-        app.fleet = Some(fleet);
-        assert_eq!(app.agents(), (0, 3));
         // The call answered, the task works on.
-        let fleet = app.fleet.as_mut().unwrap();
         fleet.event(&event(
             "calc.fix",
             "step_decided",
@@ -22950,7 +23136,61 @@ mod tests {
             json!({"call_id": "c1"}),
         ));
         assert_eq!(fleet.doing["calc.fix"], "working");
-        assert_eq!(app.agents(), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn the_tab_says_working_again_once_an_approval_is_answered_elsewhere() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let decided = Arc::new(AtomicBool::new(false));
+        let answered = decided.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str().unwrap_or("") {
+            "approvals" if !answered.load(Ordering::SeqCst) => json!({"approvals": [
+                {"bot": "calc.fix", "turn": 4, "call_id": "c1", "gates": ["manual"]},
+            ]}),
+            "approvals" => json!({"approvals": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "calc.fix".into();
+        app.rest = Some("idle");
+        app.tell_status();
+        assert_eq!(app.told, Some("idle"));
+        app.running = Some(Running {
+            turn: 4,
+            started: Instant::now(),
+            phase: "Working".into(),
+            note: false,
+            effort: None,
+        });
+        app.tell_status();
+        assert_eq!(app.told, Some("working"));
+        let event = |kind: &str| json!({"event": kind, "bot": "calc.fix", "turn": 4, "data": {"call_id": "c1"}});
+        app.daemon(event("approval_requested")).await;
+        app.tell_status();
+        assert_eq!(app.told, Some("blocked"));
+        // Answered in the lead's window, not this one: the daemon says it
+        // was decided, and the tab says working again.
+        decided.store(true, Ordering::SeqCst);
+        app.daemon(event("step_decided")).await;
+        app.tell_status();
+        assert_eq!(app.told, Some("working"));
+        // A question of its own open here says it needs the person; its
+        // turn's end, once the question closes, says how it ended.
+        app.asks.push(
+            asks::call(
+                &asks::id(4, "q1"),
+                &json!({"question": "Ship it?", "options": [{"label": "Yes"}]}),
+            )
+            .unwrap(),
+        );
+        app.tell_status();
+        assert_eq!(app.told, Some("asking"));
+        app.asks.clear();
+        app.running = None;
+        app.rest = Some("done");
+        app.tell_status();
+        assert_eq!(app.told, Some("done"));
     }
 
     /// The leads a lead follows by name, and theirs in turn, each once:
@@ -23200,8 +23440,6 @@ mod tests {
         app.fleet = Some(fleet);
         app.raise_approvals().await;
         assert_eq!(app.raised.len(), 1);
-        // The footer counts it among what needs the person.
-        assert_eq!(app.agents(), (0, 1));
         app.show_asked();
         let text = |lines: &[Line]| -> Vec<String> {
             (lines.iter())
@@ -24063,30 +24301,16 @@ mod tests {
         use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = app(daemon_answering(|_| json!({})).await);
         app.model = "opus".into();
-        // Nothing counted while nothing runs or waits.
+        // Nothing counted before the agents were.
         let (line, opens) = app.footer(100);
         assert!(opens.is_empty() && !line.to_string().contains('●'));
-        let ask = |id: &str| {
-            asks::call(
-                id,
-                &json!({"question": "Merge?", "options": [
-                {"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]}),
-            )
-            .unwrap()
-        };
-        app.asks = vec![ask("c1"), ask("c2")];
-        // With no windows for them, the tasks started, as their roster reads them.
-        let task = |name: &str, state: &str| started::Task {
-            bot: format!("calc.{name}"),
-            name: name.into(),
-            brief: "b".into(),
-            state: state.into(),
-        };
-        // Agents are counted: this one once, however many it asked.
-        app.tasks
-            .insert(0, vec![task("add", "working"), task("neg", "needs you")]);
-        app.tasks
-            .insert(1, vec![task("add", "working"), task("div", "working")]);
+        // The four counts /status heads its page with, marks only.
+        app.counts = Some(status::Counts {
+            needs_you: 2,
+            working: 3,
+            idle: 13,
+            done: 4,
+        });
         let (line, opens) = app.footer(100);
         let text = line.to_string();
         let shown: Vec<(String, &str)> = (opens.iter())
@@ -24100,20 +24324,36 @@ mod tests {
             .collect();
         assert_eq!(
             shown,
-            [("? 2".to_owned(), "status"), ("● 2".to_owned(), "status")]
+            [
+                ("? 2".to_owned(), "status"),
+                ("● 3".to_owned(), "status"),
+                ("✓ 13".to_owned(), "status"),
+                ("✓ 4".to_owned(), "status"),
+            ]
         );
         // The agent's name is the composer's to say, not the footer's.
-        assert!(text.ends_with("  ? 2  ● 2  "), "{text}");
+        assert!(text.ends_with("  ? 2  ● 3  ✓ 13  ✓ 4  "), "{text}");
         assert!(!text.contains(&app.bot), "{text}");
         assert_eq!(text.width(), 100);
+        // Narrow, done goes first, then idle; what needs the person stays.
+        let narrow = app.footer(44).0.to_string();
+        assert!(
+            narrow.contains("? 2") && !narrow.contains("✓ 4"),
+            "{narrow}"
+        );
         let counter = opens[0].0.clone();
-        // Its marks and colors as a roster's: yellow ? for what needs the
-        // person, cyan ● at work.
+        // Its marks and colors as /status's rows: yellow ? for what needs
+        // the person, cyan ● at work, green ✓ at rest, and done dim.
         let marks: Vec<_> = (line.spans.iter())
-            .filter(|span| span.content == "●" || span.content == "?")
+            .filter(|span| ["?", "●", "✓"].contains(&&*span.content))
             .map(|span| span.style.fg)
             .collect();
-        assert_eq!(marks, [Some(Color::Yellow), Some(Color::Cyan)]);
+        assert_eq!(
+            marks,
+            [Some(Color::Yellow), Some(Color::Cyan), Some(Color::Green)]
+        );
+        let done = (line.spans.iter()).find(|span| span.content == "✓ 4");
+        assert!(done.is_some_and(|span| span.style.add_modifier.contains(Modifier::DIM)));
         app.opens_at = vec![(
             20,
             10 + counter.start..10 + counter.end,
@@ -24217,41 +24457,6 @@ mod tests {
             )))
         );
         assert_eq!(marks.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn the_footer_counts_tasks_at_work_whose_rosters_are_not_drawn() {
-        let client = daemon_answering(|asked| {
-            assert_eq!(asked["active"], true);
-            // The daemon keeps to this agent's own tasks.
-            assert_eq!(asked["created_by_id"], 7);
-            // Two pages of them.
-            match asked["after"].as_str() {
-                None => json!({"next_after": "calc.ask", "bots": [
-                    {"name": "calc.add", "created_by": "calc"},
-                    {"name": "calc.ask", "created_by": "calc"}]}),
-                // A side chat of its own is no task.
-                Some(_) => json!({"next_after": null, "bots": [
-                    {"name": "calc.mul", "created_by": "calc"},
-                    {"name": "calc.side", "created_by": "calc", "expire_ms": 60000}]}),
-            }
-        })
-        .await;
-        let mut app = app(client);
-        app.bot = "calc".into();
-        app.bot_id = Some(7);
-        // Only one roster still drawn: its task needs the person.
-        app.tasks.insert(
-            0,
-            vec![started::Task {
-                bot: "calc.ask".into(),
-                name: "ask".into(),
-                brief: "b".into(),
-                state: "needs you".into(),
-            }],
-        );
-        app.read_running_tasks().await;
-        assert_eq!(app.agents(), (2, 1));
     }
 
     #[tokio::test]

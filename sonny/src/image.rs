@@ -47,16 +47,61 @@ const DIACRITICS: [char; 128] = [
 
 pub const PLACEHOLDER: char = '\u{10EEEE}';
 
-/// System fonts, read once, for text inside an SVG.
+/// The font text inside an SVG falls back to where the system has none
+/// for it: Inter, cut to Latin, Greek, punctuation, arrows, math, box
+/// drawing and shapes (vendor/INTER-LICENSE), about 80 KB. A headless box
+/// can have no fonts at all, and an SVG's text then drew nothing.
+const FALLBACK: &[u8] = include_bytes!("../vendor/inter.otf");
+
+/// System fonts, read once, for text inside an SVG, with [`FALLBACK`]
+/// standing in for each generic family the system has no face for: a
+/// family an SVG names that is not here falls back to serif, as usvg
+/// does, which then still draws.
 fn fonts() -> Arc<usvg::fontdb::Database> {
     static FONTS: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
     FONTS
         .get_or_init(|| {
             let mut db = usvg::fontdb::Database::new();
             db.load_system_fonts();
+            with_fallback(&mut db);
             Arc::new(db)
         })
         .clone()
+}
+
+/// [`FALLBACK`] in `db`, for each generic family `db` has no face for.
+fn with_fallback(db: &mut usvg::fontdb::Database) {
+    use usvg::fontdb::{Family, Query};
+    let missing: Vec<Family> = [
+        Family::Serif,
+        Family::SansSerif,
+        Family::Monospace,
+        Family::Cursive,
+        Family::Fantasy,
+    ]
+    .into_iter()
+    .filter(|family| {
+        db.query(&Query {
+            families: &[*family],
+            ..Query::default()
+        })
+        .is_none()
+    })
+    .collect();
+    if missing.is_empty() {
+        return;
+    }
+    db.load_font_source(usvg::fontdb::Source::Binary(Arc::new(FALLBACK)));
+    let name = "Inter";
+    for family in missing {
+        match family {
+            Family::Serif => db.set_serif_family(name),
+            Family::SansSerif => db.set_sans_serif_family(name),
+            Family::Monospace => db.set_monospace_family(name),
+            Family::Cursive => db.set_cursive_family(name),
+            _ => db.set_fantasy_family(name),
+        }
+    }
 }
 
 /// The system fonts read now, off the thread that draws.
@@ -581,6 +626,34 @@ fn large(svg: &str, (r, g, b): (u8, u8, u8)) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_svgs_text_draws_on_a_system_with_no_fonts() {
+        // The family a diagram names, as mermaid's: on no system here.
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="40">
+            <text x="10" y="30" font-family="trebuchet ms" font-size="20">Hello</text></svg>"#;
+        let inked = |db: usvg::fontdb::Database| {
+            let options = usvg::Options {
+                fontdb: Arc::new(db),
+                font_family: "Helvetica".into(),
+                ..usvg::Options::default()
+            };
+            let tree = usvg::Tree::from_str(svg, &options).unwrap();
+            let mut pixmap = tiny_skia::Pixmap::new(200, 40).unwrap();
+            resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+            pixmap.pixels().iter().filter(|p| p.alpha() > 0).count()
+        };
+        assert_eq!(inked(usvg::fontdb::Database::new()), 0);
+        let mut db = usvg::fontdb::Database::new();
+        with_fallback(&mut db);
+        assert!(inked(db) > 100);
+        // A system with a face for every family keeps its own.
+        let mut db = usvg::fontdb::Database::new();
+        with_fallback(&mut db);
+        let faces = db.len();
+        with_fallback(&mut db);
+        assert_eq!(db.len(), faces);
+    }
 
     #[test]
     fn a_drawing_opens_bigger_as_a_large_png_and_a_picture_as_itself() {

@@ -4,13 +4,17 @@
 //! Sonny's own grays and tints start from; whether it draws Kitty
 //! graphics; its cell size in pixels, so an image fills whole cells; and
 //! whether it joins an emoji's parts into one character (mode 2027), as
-//! a skin tone onto the hand it colours. A terminal that follows the
-//! Mac's light and dark appearance (Rex does) is followed as it switches.
+//! a skin tone onto the hand it colours. The terminal's light and dark is
+//! followed as it switches: by the colour-scheme reports it sends once
+//! asked (mode 2031, as Ghostty, kitty, foot and Herdr do), each followed
+//! by asking its colours again, which are asked again too as the window
+//! comes to the front; and for a terminal on this Mac that sends none but
+//! follows the Mac's appearance (Rex does), by the Mac's.
 use std::{
     io::Write,
     sync::{
         Arc, LazyLock, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -22,22 +26,23 @@ struct Probe {
 }
 
 static PROBE: OnceLock<Probe> = OnceLock::new();
-static LIGHT: AtomicBool = AtomicBool::new(true);
-/// The background changed since [`switched`] was last asked.
-static SWITCHED: AtomicBool = AtomicBool::new(false);
-/// The theme's colors as the terminal answered them at start, and
-/// whether the background was light then: they are that background's
-/// colors, known again whenever the terminal is back on it.
-static THEME: OnceLock<(Theme, bool)> = OnceLock::new();
+/// The theme as the terminal said it: the one window's, read by every
+/// frame.
+static SEEN: Seen = Seen::new();
+/// The terminal answered its background at start: its colors are asked
+/// again as it switches and as the window comes to the front.
+static ANSWERS: AtomicBool = AtomicBool::new(false);
+/// What asks a terminal for its colors: background first, so its answer
+/// says which background the rest belong to.
+const ASK_COLORS: &str = "\x1b]11;?\x1b\\\x1b]10;?\x1b\\\x1b]4;1;?\x1b\\\x1b]4;2;?\x1b\\";
 /// Sonny turned the terminal's grapheme clustering on, to be turned off
 /// again as it leaves.
 static CLUSTERED: AtomicBool = AtomicBool::new(false);
 
 pub type Rgb = (u8, u8, u8);
 
-/// The theme's own colors, each as the terminal answered at start; none
-/// it did not answer, and none at all while the background is the other
-/// one of light and dark, whose colors were never asked.
+/// The theme's own colors, each as the terminal last answered it on the
+/// background it shows now; none it did not answer there.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Theme {
     pub foreground: Option<Rgb>,
@@ -46,25 +51,141 @@ pub struct Theme {
     pub green: Option<Rgb>,
 }
 
-pub fn theme() -> Theme {
-    theme_on(THEME.get().copied(), light())
+const FOREGROUND: usize = 0;
+const BACKGROUND: usize = 1;
+const RED: usize = 2;
+const GREEN: usize = 3;
+const KNOWN: u32 = 1 << 24;
+
+/// Whether the background is light, and the theme's colors as last
+/// answered on a dark background and on a light one (foreground,
+/// background, red, green; each `KNOWN | rgb`, 0 when not answered
+/// there), so what one background answered is known again whenever the
+/// terminal is back on it. Atomics: a frame reads them for each banded
+/// cell.
+struct Seen {
+    light: AtomicBool,
+    colors: [[AtomicU32; 4]; 2],
+    /// The theme changed since [`Seen::switched`] was last asked.
+    switched: AtomicBool,
 }
 
-/// The colors `answered` gives for a background that is `light` now.
-fn theme_on(answered: Option<(Theme, bool)>, light: bool) -> Theme {
-    match answered {
-        Some((theme, answered_light)) if answered_light == light => theme,
-        _ => Theme::default(),
+impl Seen {
+    const fn new() -> Seen {
+        Seen {
+            light: AtomicBool::new(true),
+            colors: [const { [const { AtomicU32::new(0) }; 4] }; 2],
+            switched: AtomicBool::new(false),
+        }
+    }
+
+    fn light(&self) -> bool {
+        self.light.load(Ordering::Relaxed)
+    }
+
+    fn theme(&self) -> Theme {
+        let side = &self.colors[usize::from(self.light())];
+        let color = |slot: usize| unpack(side[slot].load(Ordering::Relaxed));
+        Theme {
+            foreground: color(FOREGROUND),
+            background: color(BACKGROUND),
+            red: color(RED),
+            green: color(GREEN),
+        }
+    }
+
+    fn switched(&self) -> bool {
+        self.switched.swap(false, Ordering::Relaxed)
+    }
+
+    /// The background is `light` now: a switch when it was not.
+    fn switch(&self, light: bool) {
+        if self.light.swap(light, Ordering::Relaxed) != light {
+            self.switched.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// `rgb` is the color in `slot` on the background `light`: a switch
+    /// when it changed on the background shown now.
+    fn keep(&self, light: bool, slot: usize, rgb: Option<Rgb>) {
+        let before = self.colors[usize::from(light)][slot].swap(pack(rgb), Ordering::Relaxed);
+        if before != pack(rgb) && light == self.light() {
+            self.switched.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The theme the terminal answered at start, on a background `light`.
+    fn start(&self, light: bool, theme: Theme) {
+        self.light.store(light, Ordering::Relaxed);
+        for (slot, rgb) in [
+            (FOREGROUND, theme.foreground),
+            (BACKGROUND, theme.background),
+            (RED, theme.red),
+            (GREEN, theme.green),
+        ] {
+            self.keep(light, slot, rgb);
+        }
+        self.switched.store(false, Ordering::Relaxed);
+    }
+
+    /// A terminal's answer as Sonny runs: a colour-scheme report switches
+    /// the background, and is true as the colors that go with it are to be
+    /// asked; a background's answer says light or dark and is kept with
+    /// it; the foreground, red and green after it are kept with that one.
+    fn heard(&self, reply: &str) -> bool {
+        if let Some(light) = scheme(reply) {
+            self.switch(light);
+            return true;
+        }
+        let rgb = |answer: &str| {
+            color(reply, answer).map(|(r, g, b)| {
+                let byte = |v: f32| (v * 255.0).round() as u8;
+                (luminance((r, g, b)) > 0.5, (byte(r), byte(g), byte(b)))
+            })
+        };
+        if let Some((light, background)) = rgb("]11;") {
+            self.switch(light);
+            self.keep(light, BACKGROUND, Some(background));
+        }
+        for (answer, slot) in [("]10;", FOREGROUND), ("]4;1;", RED), ("]4;2;", GREEN)] {
+            if let Some((_, color)) = rgb(answer) {
+                self.keep(self.light(), slot, Some(color));
+            }
+        }
+        false
     }
 }
 
-pub fn light() -> bool {
-    LIGHT.load(Ordering::Relaxed)
+fn pack(rgb: Option<Rgb>) -> u32 {
+    rgb.map_or(0, |(r, g, b)| {
+        KNOWN | u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+    })
 }
 
-/// Whether the background switched between light and dark since asked.
+fn unpack(packed: u32) -> Option<Rgb> {
+    (packed & KNOWN != 0).then_some(((packed >> 16) as u8, (packed >> 8) as u8, packed as u8))
+}
+
+pub fn theme() -> Theme {
+    SEEN.theme()
+}
+
+pub fn light() -> bool {
+    SEEN.light()
+}
+
+/// Whether the theme changed since asked: its background between light
+/// and dark, or a color it answered anew.
 pub fn switched() -> bool {
-    SWITCHED.swap(false, Ordering::Relaxed)
+    SEEN.switched()
+}
+
+/// A terminal's answer as Sonny runs (crossterm's `Event::Reply`), kept;
+/// a colour-scheme report asks the colors that go with it.
+pub fn heard(reply: &str) {
+    if SEEN.heard(reply) {
+        ask();
+    }
 }
 
 /// Whether images can be drawn: Kitty graphics answered OK.
@@ -121,8 +242,9 @@ pub fn detect() {
         .or_else(colorfgbg)
         .or(mac)
         .unwrap_or(true);
-    LIGHT.store(light, Ordering::Relaxed);
-    let _ = THEME.set((answered(&reply), light));
+    let theme = answered(&reply);
+    ANSWERS.store(theme.background.is_some(), Ordering::Relaxed);
+    SEEN.start(light, theme);
     let _ = PROBE.set(Probe {
         graphics: reply.contains("_Gi=31;OK"),
         cell: cell_size(&reply).unwrap_or((8, 16)),
@@ -140,20 +262,44 @@ pub fn detect() {
             CLUSTERED.store(true, Ordering::Relaxed);
         }
     }
-    // A terminal on this Mac that matches its appearance now is taken to
-    // follow it, as Rex and Ghostty can.
-    if mac == Some(light) && std::env::var_os("SSH_CONNECTION").is_none() {
+    // A terminal on this Mac that matches its appearance now, and sends no
+    // colour-scheme reports, is taken to follow it, as Rex can.
+    if mac == Some(light)
+        && scheme(&reply).is_none()
+        && std::env::var_os("SSH_CONNECTION").is_none()
+    {
         std::thread::spawn(|| {
             loop {
                 std::thread::sleep(Duration::from_secs(3));
-                if let Some(now) = appearance()
-                    && LIGHT.swap(now, Ordering::Relaxed) != now
-                {
-                    SWITCHED.store(true, Ordering::Relaxed);
+                if let Some(now) = appearance() {
+                    SEEN.switch(now);
                 }
             }
         });
     }
+}
+
+/// Ask the terminal for its colour-scheme reports (mode 2031), or stop:
+/// on while Sonny has the screen, as a report is input. A terminal that
+/// does not know the mode ignores it.
+pub fn follow(on: bool) {
+    let mut stdout = std::io::stdout();
+    let _ = write!(stdout, "\x1b[?2031{}", if on { 'h' } else { 'l' });
+    let _ = stdout.flush();
+}
+
+/// Ask the terminal for its colors again, when it answered them at start:
+/// as the window comes to the front, where a terminal that sends no
+/// colour-scheme reports may have switched meanwhile. The answers come as
+/// input, read by [`heard`].
+pub fn ask() {
+    if !ANSWERS.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut stdout = std::io::stdout();
+    let _ = stdout
+        .write_all(ASK_COLORS.as_bytes())
+        .and_then(|()| stdout.flush());
 }
 
 /// The window's size, in cells and in pixels.
@@ -447,18 +593,49 @@ mod tests {
     }
 
     #[test]
-    fn the_theme_answered_holds_again_once_back_on_its_background() {
+    fn the_theme_follows_what_the_terminal_reports_and_answers() {
+        let seen = Seen::new();
         let dark = Theme {
             foreground: Some((0xce, 0xcd, 0xc3)),
             background: Some((0x10, 0x0f, 0x0f)),
             ..Theme::default()
         };
-        // Answered on a dark background: known there, not on a light one,
-        // and known again once the terminal switches back.
-        assert_eq!(theme_on(Some((dark, false)), false), dark);
-        assert_eq!(theme_on(Some((dark, false)), true), Theme::default());
-        assert_eq!(theme_on(Some((dark, false)), false), dark);
-        assert_eq!(theme_on(None, false), Theme::default());
+        seen.start(false, dark);
+        assert!(!seen.switched());
+        assert_eq!(seen.theme(), dark);
+        // The terminal reports light: switched, its colors asked, and not
+        // known there until it answers them.
+        assert!(seen.heard("\x1b[?997;2n"));
+        assert!(seen.light() && seen.switched());
+        assert_eq!(seen.theme(), Theme::default());
+        assert!(!seen.heard("\x1b]11;rgb:ffff/fcfc/f0f0\x1b\\"));
+        seen.heard("\x1b]10;rgb:10/0f/0f\x07");
+        assert!(seen.switched());
+        assert_eq!(seen.theme().background, Some((0xff, 0xfc, 0xf0)));
+        assert_eq!(seen.theme().foreground, Some((0x10, 0x0f, 0x0f)));
+        // The same answer again changes nothing.
+        seen.heard("\x1b]10;rgb:10/0f/0f\x07");
+        assert!(!seen.switched());
+        // Back to dark by the background's own answer, as asked when the
+        // window comes to the front: what dark answered before holds again.
+        seen.heard("\x1b]11;rgb:1010/0f0f/0f0f\x1b\\");
+        assert!(!seen.light() && seen.switched());
+        assert_eq!(seen.theme(), dark);
+        // A report that names neither is no switch.
+        seen.heard("\x1b[?997;3n");
+        assert!(!seen.switched());
+    }
+
+    #[test]
+    fn a_color_packs_and_unpacks() {
+        for rgb in [
+            None,
+            Some((0, 0, 0)),
+            Some((255, 255, 255)),
+            Some((1, 2, 3)),
+        ] {
+            assert_eq!(unpack(pack(rgb)), rgb);
+        }
     }
 
     #[test]
