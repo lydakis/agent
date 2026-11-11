@@ -266,8 +266,10 @@ const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
 /// This window is a side chat (`--side`).
 static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Into the alternate screen with the mouse, which Sonny owns while it
-/// runs, or out of it, the keys told apart on the screen it is on.
+/// runs, or out of it, the keys told apart on the screen it is on, and the
+/// terminal's colour-scheme reports heard while it is there.
 fn own_screen(own: bool) {
+    term::follow(own);
     keys_apart(false);
     let _ = match own {
         true => execute!(
@@ -12188,6 +12190,11 @@ impl App {
     }
 
     async fn key(&mut self, mut event: Event) {
+        // The terminal answering: its colors, or its light and dark.
+        if let Event::Reply(reply) = &event {
+            term::heard(reply);
+            return;
+        }
         // A key, a click, a paste or the window coming to the front: the
         // person is here, not in another terminal's Sonny.
         if let Some(marker) = &mut self.marker
@@ -12223,8 +12230,11 @@ impl App {
         }
         match &event {
             Event::Resize(..) => self.stale = true,
+            // A terminal that sends no colour-scheme reports may have
+            // switched while elsewhere: its colors are asked again.
             Event::FocusGained => {
                 self.stale = true;
+                term::ask();
                 return;
             }
             Event::Key(key)
