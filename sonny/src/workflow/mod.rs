@@ -1153,11 +1153,15 @@ impl Attempt {
         let Some(wanted) = &asked.schema else {
             return Ok((value, turn, tokens, error));
         };
+        // A turn that did not complete is the call's end, null with why:
+        // only a completed reply that misses the schema is asked again.
+        if turn.is_none() || error.is_some() {
+            return Ok((Value::Null, turn, tokens, error));
+        }
         let text = value.as_str().unwrap_or_default();
-        match (turn, schema::parse(text, wanted)) {
-            (_, Ok(object)) => Ok((object, turn, tokens, None)),
-            (None, _) => Ok((Value::Null, turn, tokens, error)),
-            (Some(_), Err(why)) => {
+        match schema::parse(text, wanted) {
+            Ok(object) => Ok((object, turn, tokens, None)),
+            Err(why) => {
                 // Once more, on the same worker, as Claude Code's
                 // StructuredOutput answers a mismatch.
                 let again = format!(
@@ -1254,26 +1258,29 @@ impl Attempt {
             return Ok((Value::Null, Some(turn), tokens, Some(why)));
         }
         let text = match outcome["text_truncated"] == true {
-            true => self.reply(worker).await?,
+            true => self.reply(worker, turn).await?,
             false => str_of(&outcome["text"]),
         };
         Ok((Value::String(text), Some(turn), tokens, None))
     }
 
-    /// The whole of `worker`'s last reply, which a wait's outcome cuts:
-    /// never the cut one, which would be kept as its value.
-    async fn reply(&self, worker: &str) -> Result<String, Trouble> {
+    /// The whole of `worker`'s last reply in `turn`, which a wait's
+    /// outcome cuts: never the cut one, which would be kept as its value,
+    /// nor one from a later turn.
+    async fn reply(&self, worker: &str, turn: i64) -> Result<String, Trouble> {
         let trouble = |e: agent_client::Error| match lost(&e) {
             true => Trouble::Lost,
             false => Trouble::Thrown(format!("its whole reply could not be read: {e}")),
         };
         let page = self
             .client
-            .request("history_nodes", json!({"bot": worker, "limit": 16}))
+            .request("history_nodes", json!({"bot": worker, "limit": 400}))
             .await
             .map_err(trouble)?;
         let nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
+            .filter(|node| node["turn"] == turn)
             .filter_map(|node| node["node"].as_i64())
+            .take(16)
             .collect();
         let read = self
             .client
