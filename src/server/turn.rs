@@ -6087,16 +6087,7 @@ impl Lifts {
                         _ => outcome,
                     };
                     let outcome = annotate(outcome, turn, &call_id_for_refs);
-                    let mut value = serde_json::from_str(&outcome.output)
-                        .unwrap_or(json!({"output":outcome.output}));
-                    // Its pictures go with it, for the wait that collects it.
-                    if !outcome.parts.is_empty() {
-                        if !value.is_object() {
-                            value = json!({"output":outcome.output});
-                        }
-                        value["parts"] = json!(outcome.parts);
-                    }
-                    (value, outcome.artifacts, outcome.files)
+                    (lifted_result(&outcome), outcome.artifacts, outcome.files)
                 }
                 Err(error) => (
                     json!({"error":error.code,"detail":error.detail}),
@@ -6215,6 +6206,23 @@ async fn not_a_terminal(
         return Ok(Ok(stopped));
     }
     Ok(Err(no_terminal(store, bot, handle, error).await?))
+}
+
+/// A lifted call's result as its command's: its output's own fields, but
+/// for a `parts` of its own, as that name is the result's, for the pictures
+/// that go with it to the wait that collects it.
+fn lifted_result(outcome: &Outcome) -> Value {
+    let mut value = serde_json::from_str::<Value>(&outcome.output)
+        .ok()
+        .filter(|value| value.get("parts").is_none())
+        .unwrap_or(json!({"output":outcome.output}));
+    if !outcome.parts.is_empty() {
+        if !value.is_object() {
+            value = json!({"output":outcome.output});
+        }
+        value["parts"] = json!(outcome.parts);
+    }
+    value
 }
 
 /// When `at` was, in milliseconds since the Unix epoch.
@@ -7319,6 +7327,29 @@ fn priced_at(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_lifted_results_parts_are_only_ever_its_pictures() {
+        use agent_runtime::codec::Part;
+        use agent_runtime::tools::Outcome;
+        use serde_json::json;
+        // A tool's own `parts` stays in its output.
+        let own = super::lifted_result(&Outcome::text(r#"{"parts":["wheel"]}"#.into()));
+        assert_eq!(own, json!({"output": r#"{"parts":["wheel"]}"#}));
+        let mut results = std::collections::BTreeMap::from([("proc:1".to_string(), own.into())]);
+        assert_eq!(super::pictures_of(&mut results).unwrap(), []);
+        // Other fields are the result's, with its pictures beside them.
+        let shown = vec![Part::Text {
+            text: "seen".into(),
+        }];
+        let outcome = Outcome {
+            parts: shown.clone(),
+            ..Outcome::text(r#"{"path":"a.png"}"#.into())
+        };
+        assert_eq!(
+            super::lifted_result(&outcome),
+            json!({"path": "a.png", "parts": shown})
+        );
+    }
     #[test]
     fn a_wait_takes_an_answers_pictures_out_of_its_result() {
         use agent_runtime::codec::Part;

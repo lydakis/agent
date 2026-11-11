@@ -1124,7 +1124,7 @@ impl View {
                 Feed::Held(calls) => {
                     let mut by: HashMap<String, Vec<crate::needs::Held>> = HashMap::new();
                     for held in calls {
-                        by.entry(held.0.clone()).or_default().push(held);
+                        by.entry(held.bot.clone()).or_default().push(held);
                     }
                     for agent in &mut self.agents {
                         let held = by.remove(&agent.name).unwrap_or_default();
@@ -7928,8 +7928,12 @@ mod tests {
             "turn": 1, "data": {"status": "failed", "error": "provider_error"}}),
         ))
         .unwrap();
-        send.send(Feed::Held(vec![("shop.cart".into(), 7, "c0".into())]))
-            .unwrap();
+        send.send(Feed::Held(vec![crate::needs::Held::new(
+            "shop.cart",
+            7,
+            "c0",
+        )]))
+        .unwrap();
         let live = |bot: &str, kind: &str, turn: i64, data: Value| {
             Feed::Live(json!({"event": kind, "bot": bot, "turn": turn, "data": data}))
         };

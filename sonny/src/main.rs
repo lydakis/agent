@@ -734,10 +734,7 @@ async fn read_status(
         };
         // Unlisted, this window's own calls still say what they wait on.
         if name == view.bot && held.is_err() {
-            let calls = (view.approvals.iter()).filter_map(|call| {
-                let (turn, id) = (call["turn"].as_i64()?, call["call_id"].as_str()?);
-                Some((name.to_owned(), turn, id.to_owned()))
-            });
+            let calls = (view.approvals.iter()).filter_map(|call| needs::Held::listed(name, call));
             needs.held(calls.collect(), |bot| bot == name);
         }
         needs.asked(name, ask.clone().filter(|_| !resolved));
@@ -23355,7 +23352,7 @@ mod tests {
         .await;
         let mut fleet = Fleet::in_memory(client.clone(), events, "home", "home.lead");
         fleet.raised.insert("shop.fix".into());
-        let held = vec![("shop.fix".to_owned(), 4, "c1".to_owned())];
+        let held = vec![needs::Held::new("shop.fix", 4, "c1")];
         fleet.needs.held(held, |_| true);
         let mut app = app(client);
         app.bot = "home.lead".into();
@@ -23434,7 +23431,7 @@ mod tests {
         let fleet = app.fleet.as_mut().unwrap();
         fleet
             .needs
-            .held(vec![("shop.fix".to_owned(), 4, "c3".to_owned())], |_| true);
+            .held(vec![needs::Held::new("shop.fix", 4, "c3")], |_| true);
         fleet.event(
             &json!({"event": "step_decided", "bot": "shop.fix", "turn": 4,
             "data": {"call_id": "c3"}}),
