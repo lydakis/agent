@@ -27,10 +27,12 @@ Patched (`src/event.rs`, `src/event/sys/unix/parse.rs`, with tests):
 
 Upstream's lints are left as they are: its `Cargo.toml` allows them.
 
-One test is steadied, since the workspace's test run runs crossterm's too:
-`test_no_color` (`src/style/types/colored.rs`) sets `NO_COLOR` while other
-tests format colours, and one that remembered whether colour is off while
-it was set printed nothing. It now settles that answer before it starts.
+The colour tests are steadied, since the workspace's test run runs
+crossterm's too (`src/style/types/colored.rs`). Whether colour is off is one
+setting for the whole process, and the tests set it (and `NO_COLOR`) while
+others format colours, which then printed nothing. Each test that sets it or
+formats colours now holds one lock, and `test_no_color` settles the
+remembered answer before it changes `NO_COLOR`.
 
 ## When it goes
 
