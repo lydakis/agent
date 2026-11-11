@@ -388,7 +388,7 @@ fn print_flags(flags: &str) {
             ),
             "--model" => (
                 "PROVIDER/MODEL",
-                "The model. A new bot keeps it (default AGENT_MODEL, else model in config.toml); on an existing bot, for this turn only: the bot keeps its own, which Sonny's /model changes",
+                "The model. A new bot keeps it (default AGENT_MODEL, else model in config.toml); on an existing bot, for this turn only: the bot keeps its own",
             ),
             "--tools" => (
                 "LIST",
