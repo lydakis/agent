@@ -945,8 +945,10 @@ browser and the desktop, and nothing that starts agents or reaches the
 person; `start_task` refuses names starting `wf-`. Workers have no tab, no
 `/status` row and no star, and the lookout tells no one of them. A call
 with a `schema` sends it as the turn's `output_schema`, strict (optional
-properties nullable, their nulls left out of what `agent()` returns), and
-asks the same worker once more when the reply does not fit.
+properties nullable, their nulls left out of what `agent()` returns),
+checks the reply whole against it, and asks the same worker once more when
+the reply does not fit. A schema with what strict output does not take
+(`allOf`, `not`, `if`, `prefixItems` and the like) is refused at the call.
 
 A run lives in `STORE.workflows/RUN/`: `run.json` (what it was started
 with), `script.js`, `events.jsonl` (phases, logs and each agent's value,

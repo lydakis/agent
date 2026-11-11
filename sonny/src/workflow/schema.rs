@@ -6,13 +6,37 @@
 //! the object `agent()` returns, which then has the schema's own shape.
 use serde_json::{Map, Value, json};
 
+/// What strict structured output does not take, at any depth.
+const UNTAKEN: [&str; 13] = [
+    "allOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "dependentRequired",
+    "dependentSchemas",
+    "patternProperties",
+    "prefixItems",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "contains",
+    "propertyNames",
+];
+
 /// Whether `schema` is one `agent()` takes: an object schema with
-/// `properties` at its root, `required` naming only those.
+/// `properties` at its root, `required` naming only those, and nothing
+/// strict structured output does not take.
 pub fn check(schema: &Value) -> Result<(), String> {
     const NEEDS: &str = "a schema needs {type: 'object', properties: {...}} at its root, with required a subset of properties";
     let properties = schema["properties"].as_object();
     if schema["type"] != "object" || properties.is_none() {
         return Err(NEEDS.into());
+    }
+    if let Some(key) = untaken(schema, 0) {
+        return Err(format!(
+            "a schema's {key} is not one strict structured output takes; say it with anyOf, \
+             properties and required instead"
+        ));
     }
     let properties = properties.expect("checked");
     match &schema["required"] {
@@ -28,6 +52,36 @@ pub fn check(schema: &Value) -> Result<(), String> {
     }
 }
 
+/// The first keyword of [`UNTAKEN`] in `schema` or a schema within it.
+fn untaken(schema: &Value, depth: usize) -> Option<&'static str> {
+    let fields = schema.as_object().filter(|_| depth < 64)?;
+    if let Some(key) = UNTAKEN.iter().find(|key| fields.contains_key(**key)) {
+        return Some(key);
+    }
+    let within = |key: &str| -> Vec<&Value> {
+        match fields.get(key) {
+            Some(Value::Array(each)) => each.iter().collect(),
+            Some(Value::Object(each)) if matches!(key, "properties" | "$defs" | "definitions") => {
+                each.values().collect()
+            }
+            Some(one) => vec![one],
+            None => Vec::new(),
+        }
+    };
+    ([
+        "properties",
+        "$defs",
+        "definitions",
+        "items",
+        "anyOf",
+        "oneOf",
+        "additionalProperties",
+    ]
+    .iter())
+    .flat_map(|key| within(key))
+    .find_map(|inner| untaken(inner, depth + 1))
+}
+
 /// `schema` as strict structured output takes it.
 pub fn strict(schema: &Value) -> Value {
     let Value::Object(fields) = schema else {
@@ -36,8 +90,8 @@ pub fn strict(schema: &Value) -> Value {
     let mut out = Map::new();
     for (key, value) in fields {
         let value = match key.as_str() {
-            "items" | "additionalItems" | "not" => strict(value),
-            "anyOf" | "oneOf" | "allOf" | "prefixItems" => match value {
+            "items" => strict(value),
+            "anyOf" | "oneOf" => match value {
                 Value::Array(each) => Value::Array(each.iter().map(strict).collect()),
                 other => other.clone(),
             },
@@ -94,25 +148,6 @@ pub fn loosen(value: Value, schema: &Value) -> Value {
 /// one coherent alternative, never requirements mixed from several.
 fn loosen_in(value: Value, schema: &Value, root: &Value, depth: usize) -> Value {
     let schema = resolve(schema, root);
-    // What every part of a conjunction says holds together: read as one.
-    if depth < 16
-        && let Some(parts) = schema["allOf"].as_array()
-    {
-        let mut whole = schema.clone();
-        if let Some(out) = whole.as_object_mut() {
-            out.remove("allOf");
-        }
-        for part in parts {
-            let part = resolve(part, root);
-            whole = with(part, &whole);
-            for key in ["anyOf", "oneOf"] {
-                if let (Some(choice), Some(out)) = (part.get(key), whole.as_object_mut()) {
-                    out.entry(key).or_insert_with(|| choice.clone());
-                }
-            }
-        }
-        return loosen_in(value, &whole, root, depth + 1);
-    }
     let branches: Vec<&Value> = (["anyOf", "oneOf"].iter())
         .flat_map(|key| schema[*key].as_array().into_iter().flatten())
         .collect();
@@ -327,15 +362,16 @@ mod tests {
     }
 
     #[test]
-    fn a_conjunction_loses_its_optional_nulls_too() {
+    fn what_strict_output_does_not_take_is_refused_at_any_depth() {
         let schema = json!({"type": "object", "properties": {"v": {"allOf": [
-            {"type": "object", "properties": {"note": {"type": "string"}}},
-            {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}]}},
-            "required": ["v"]});
-        assert_eq!(
-            parse(r#"{"v": {"note": null, "n": 1}}"#, &schema).unwrap(),
-            json!({"v": {"n": 1}})
-        );
+            {"type": "object", "properties": {"note": {"type": "string"}}}]}}});
+        assert!(check(&schema).unwrap_err().contains("allOf"));
+        let schema = json!({"type": "object", "properties": {"v": {"type": "array",
+            "prefixItems": [{"type": "string"}]}}});
+        assert!(check(&schema).unwrap_err().contains("prefixItems"));
+        // A property may still be called what a keyword is.
+        let schema = json!({"type": "object", "properties": {"not": {"type": "string"}}});
+        assert!(check(&schema).is_ok());
     }
 
     #[test]
