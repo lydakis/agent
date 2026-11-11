@@ -106,9 +106,7 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
              this one another name"
         ));
     }
-    // With the provider keys the app keeps, should this start the daemon;
-    // read before the folder is made, so a bad env file leaves nothing.
-    let mut command = crate::agent_command(&agent)?;
+    let mut command = std::process::Command::new(&agent);
     command.envs(start.env.iter().map(|(key, value)| (key, value)));
     let config = agent_client::config::load()?;
 
@@ -1767,7 +1765,7 @@ fn capitalized(word: &str) -> String {
 
 /// The newest turns of `name`, as `agent turns` lists them, newest first.
 fn turns_of(agent: &Path, name: &str) -> Result<Vec<Value>, String> {
-    let output = crate::agent_command(agent)?
+    let output = std::process::Command::new(agent)
         .args(["turns", "--bot", name, "--newest", "--limit", "16"])
         .stdin(Stdio::null())
         .output()

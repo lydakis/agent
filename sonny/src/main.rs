@@ -1506,56 +1506,49 @@ fn installed_agent(me: &std::path::Path) -> Vec<PathBuf> {
 }
 
 /// `sonny agent ARGS...`: the `agent` Sonny itself starts, run with
-/// ARGS and the same keys, in place of this process, so the person reaches
-/// it whatever else is called `agent` on their PATH.
+/// ARGS in place of this process, so the person reaches it whatever else
+/// is called `agent` on their PATH. It gives a daemon it starts the keys
+/// in ~/.agent/env, as for every other starter.
 fn pass_to_agent(args: &[String]) -> Result<(), String> {
     let bin = agent_bin_or_missing()?;
-    let mut command = agent_command(&bin)?;
+    let mut command = std::process::Command::new(&bin);
     let error = std::os::unix::process::CommandExt::exec(command.args(args));
     Err(format!("{}: {error}", bin.display()))
 }
 
-/// Agent's binary to run, with the provider keys kept in ~/.agent/env
-/// over this shell's own; an empty value unsets one.
-fn agent_command(bin: &std::path::Path) -> Result<std::process::Command, String> {
-    let mut command = std::process::Command::new(bin);
-    apply_env_file(&mut command)?;
-    Ok(command)
+/// What to tell the person when `~/.agent/env` sets one of Agent's own
+/// names, which it never gives a daemon (`agent_client::env_file::refused`):
+/// providers are set by `provider` in `~/.agent/config.toml` (a shell's own
+/// `AGENT_PROVIDER` still wins, for scripts).
+fn env_file_refused() -> Option<String> {
+    env_file_refused_at(&agent_client::env_file::path()?)
 }
 
-/// `~/.agent/env` over `command`'s environment: an empty value unsets.
-/// Its keys only: the providers are set in `~/.agent/config.toml`, so an
-/// `AGENT_PROVIDER` there is passed over ([`env_file_provider`] says so).
-fn apply_env_file(command: &mut std::process::Command) -> Result<(), String> {
-    if let Some(file) = agent_client::env_file::path() {
-        for (key, value) in agent_client::env_file::read(&file)? {
-            if key == "AGENT_PROVIDER" {
-                continue;
-            }
-            match value.is_empty() {
-                true => command.env_remove(key),
-                false => command.env(key, value),
-            };
-        }
-    }
-    Ok(())
-}
-
-/// What to tell the person when `~/.agent/env` still sets `AGENT_PROVIDER`,
-/// which nothing reads now: `~/.agent/config.toml`'s `provider` is the one
-/// place providers are set (a shell's own `AGENT_PROVIDER` still wins, for
-/// scripts).
-fn env_file_provider() -> Option<String> {
-    env_file_provider_at(&agent_client::env_file::path()?)
-}
-
-fn env_file_provider_at(file: &std::path::Path) -> Option<String> {
+fn env_file_refused_at(file: &std::path::Path) -> Option<String> {
     let set = agent_client::env_file::read(file).ok()?;
-    set.iter().any(|(key, value)| key == "AGENT_PROVIDER" && !value.is_empty()).then(|| {
-        format!(
-            "{} sets AGENT_PROVIDER, which is no longer read; move it to provider in ~/.agent/config.toml (/config provider)",
+    let mut names: Vec<&str> = (set.iter())
+        .filter(|(key, value)| agent_client::env_file::refused(key) && !value.is_empty())
+        .map(|(key, _)| key.as_str())
+        .collect();
+    names.dedup();
+    let first = *names.first()?;
+    let move_it = match names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("AGENT_PROVIDER"))
+    {
+        true => "; move the provider to provider in ~/.agent/config.toml (/config provider)",
+        false => "",
+    };
+    Some(match names.len() {
+        1 => format!(
+            "{} sets {first}, which is not read: names starting AGENT_ are Agent's own{move_it}",
             file.display()
-        )
+        ),
+        _ => format!(
+            "{} sets {}, which are not read: names starting AGENT_ are Agent's own{move_it}",
+            file.display(),
+            names.join(", ")
+        ),
     })
 }
 
@@ -1711,8 +1704,11 @@ async fn connect_starting(
     asking: Asking,
     start: impl Fn() -> Result<(), NotStarted>,
 ) -> Result<(Arc<Client>, agent_client::Events), String> {
-    if let Ok(connected) = Client::connect(socket).await {
-        return Ok(connected);
+    match Client::connect(socket).await {
+        Ok(connected) => return Ok(connected),
+        // What this window would start is its own older build.
+        Err(error) if newer_daemon(&error) => return Err(UPGRADED.to_owned()),
+        Err(_) => {}
     }
     match start() {
         Err(failed) if failed.code.as_deref() == Some("provider_required") => {
@@ -1726,10 +1722,35 @@ async fn connect_starting(
             setup::provider(&bin, false)?;
             start().map_err(|e| e.to_string())?;
         }
-        started => started.map_err(|e| e.to_string())?,
+        Err(failed) => {
+            // Lost to the newer daemon that took the store meanwhile.
+            return Err(match Client::connect(socket).await {
+                Err(error) if newer_daemon(&error) => UPGRADED.to_owned(),
+                _ => failed.to_string(),
+            });
+        }
+        Ok(()) => {}
     }
     // The daemon rewrites the model catalog itself, from every start.
-    Client::connect(socket).await.map_err(|e| e.to_string())
+    Client::connect(socket)
+        .await
+        .map_err(|error| match newer_daemon(&error) {
+            true => UPGRADED.to_owned(),
+            false => error.to_string(),
+        })
+}
+
+/// Why a window starts nothing once the daemon speaks a newer protocol
+/// than it: Sonny was upgraded while it was open, and a daemon or
+/// companion it started would be its own older build.
+const UPGRADED: &str = "Sonny was upgraded; reopen this window";
+
+/// Whether `error` met a daemon on a newer protocol than this Sonny's.
+fn newer_daemon(error: &agent_client::Error) -> bool {
+    error.code == "daemon_protocol_mismatch"
+        && (error.facts.as_ref())
+            .and_then(|facts| facts.get("protocol")?.as_u64())
+            .is_some_and(|protocol| protocol > agent_client::PROTOCOL)
 }
 
 /// Why a daemon that stopped is not started again: it has no provider,
@@ -1803,7 +1824,7 @@ fn start_daemon(
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|_| scoped) {
         command.env("XDG_RUNTIME_DIR", runtime);
     }
-    apply_env_file(&mut command)?;
+    // The CLI gives the daemon the keys in ~/.agent/env itself.
     command.env("AGENT_BIN", &bin).env_remove(named::PROGRAM);
     let out = command
         .arg("start")
@@ -2482,7 +2503,7 @@ async fn run() -> Result<(), String> {
             "a new lead for this folder; {above} leads the folder above: sonny --agent {above}"
         ));
     }
-    if let Some(said) = env_file_provider()
+    if let Some(said) = env_file_refused()
         && app.notice.is_none()
     {
         app.notice = Some(said);
@@ -4172,6 +4193,9 @@ struct App {
     lead: String,
     /// When to connect again, while it or the fleet's is down.
     retry: Option<Instant>,
+    /// The daemon is newer than this window: it connects and starts
+    /// nothing again ([`UPGRADED`]).
+    upgraded: bool,
     /// `/model`, open over the composer.
     picker: Option<models::Picker>,
     /// `/switch`'s list of every agent, open over the composer.
@@ -5804,6 +5828,7 @@ impl App {
             move_to: None,
             lead: String::new(),
             retry: None,
+            upgraded: false,
             picker: None,
             searching: None,
             config: None,
@@ -6882,6 +6907,10 @@ impl App {
     /// what happened meanwhile: the bot's new items, and a turn that ended
     /// or began. Tried again every two seconds until it works.
     async fn reattach(&mut self, events: &mut Events) {
+        if self.upgraded {
+            self.retry = None;
+            return;
+        }
         let lead = async {
             let (client, mut fresh) = connect(&self.options, Asking::Never).await?;
             client
@@ -6900,6 +6929,12 @@ impl App {
         if self.down {
             let (client, fresh, record, caught) = match lead.await {
                 Ok(back) => back,
+                Err(error) if error == UPGRADED => {
+                    self.notice = Some(UPGRADED.to_owned());
+                    self.upgraded = true;
+                    self.retry = None;
+                    return;
+                }
                 Err(error) => {
                     self.notice = Some(format!("reconnecting to the daemon: {error}"));
                     self.retry = Some(Instant::now() + Duration::from_secs(2));
@@ -16698,7 +16733,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_env_file_that_sets_providers_is_told_to_move_them() {
+    fn an_env_file_that_sets_agent_s_own_names_is_told_they_are_not_read() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("sonny-env-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -16708,14 +16743,18 @@ mod tests {
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         };
         write("OPENAI_API_KEY=k\nAGENT_PROVIDER=\"openai bedrock\"\n");
-        let said = env_file_provider_at(&file).unwrap();
+        let said = env_file_refused_at(&file).unwrap();
+        assert!(said.contains("AGENT_PROVIDER, which is not read"), "{said}");
+        assert!(said.contains("provider in ~/.agent/config.toml"), "{said}");
+        write("OPENAI_API_KEY=k\nAGENT_SOCKET=/x\nagent_bin=/y\n");
+        let said = env_file_refused_at(&file).unwrap();
         assert!(
-            said.contains("AGENT_PROVIDER, which is no longer read"),
+            said.contains("AGENT_SOCKET, agent_bin, which are not read"),
             "{said}"
         );
-        assert!(said.contains("provider in ~/.agent/config.toml"), "{said}");
+        assert!(!said.contains("config.toml"), "{said}");
         write("OPENAI_API_KEY=k\nAGENT_PROVIDER=\n");
-        assert_eq!(env_file_provider_at(&file), None);
+        assert_eq!(env_file_refused_at(&file), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -22774,6 +22813,33 @@ mod tests {
         let refused = connect_starting(&socket, Asking::Never, start).await;
         assert_eq!(refused.err().as_deref(), Some(NO_PROVIDER));
         assert_eq!(starts.get(), 1, "tried once, never again after a setup");
+    }
+
+    /// A window open across an upgrade that meets the new daemon starts
+    /// nothing: its daemon and companions would be its own older build.
+    #[tokio::test]
+    async fn a_window_that_meets_a_newer_daemon_says_reopen_and_starts_nothing() {
+        use tokio::io::AsyncWriteExt;
+        let dir = std::env::temp_dir().join(format!("sonny-newer-{}", unique("t")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL + 1,
+                    "pid": 4242});
+                let _ = stream.write_all(format!("{ready}\n").as_bytes()).await;
+            }
+        });
+        let starts = std::cell::Cell::new(0);
+        let start = || {
+            starts.set(starts.get() + 1);
+            Ok(())
+        };
+        let refused = connect_starting(&socket, Asking::Never, start).await;
+        assert_eq!(refused.err().as_deref(), Some(UPGRADED));
+        assert_eq!(starts.get(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

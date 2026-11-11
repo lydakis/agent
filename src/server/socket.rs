@@ -265,13 +265,42 @@ impl Drop for Umask {
     }
 }
 
+/// `lock` once its holder lets it go, by `until`. The wait is the kernel's,
+/// on a thread of its own rather than the runtime's; one given up on lets
+/// the lock go as soon as it has it.
+async fn awaited(lock: File, until: tokio::time::Instant) -> Result<File> {
+    let (sender, taken) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("agent-socket-owner".into())
+        .spawn(move || {
+            let held = loop {
+                match lock.lock() {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    held => break held,
+                }
+            };
+            let _ = sender.send(held.map(|()| lock));
+        })?;
+    match tokio::time::timeout_at(until, taken).await {
+        Ok(Ok(Ok(lock))) => Ok(lock),
+        Ok(Ok(Err(error))) => Err(error.into()),
+        Ok(Err(_)) | Err(_) => fail("socket_already_owned"),
+    }
+}
+
 pub struct Owner {
     path: PathBuf,
     identity: (u64, u64),
     _lock: File,
 }
 impl Owner {
-    pub async fn bind(path: &Path) -> Result<(Self, UnixListener)> {
+    /// Own `path` and listen on it. With `until`, a lock another daemon
+    /// holds is waited for until then rather than refused: the daemon this
+    /// one replaces, which lets the socket go as it exits.
+    pub async fn bind(
+        path: &Path,
+        until: Option<tokio::time::Instant>,
+    ) -> Result<(Self, UnixListener)> {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -288,8 +317,11 @@ impl Owner {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(lock_path)?;
-        lock.try_lock()
-            .map_err(|_| Error::new("socket_already_owned"))?;
+        let lock = match (lock.try_lock(), until) {
+            (Ok(()), _) => lock,
+            (Err(_), None) => return fail("socket_already_owned"),
+            (Err(_), Some(until)) => awaited(lock, until).await?,
+        };
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_socket() {
@@ -367,7 +399,7 @@ mod tests {
         let before = directory.join("before");
         File::create(&before).unwrap();
         let path = directory.join("endpoint");
-        let (owner, listener) = Owner::bind(&path).await.unwrap();
+        let (owner, listener) = Owner::bind(&path, None).await.unwrap();
         assert_eq!(mode(&path) & 0o777, 0o600);
         assert_eq!(mode(&directory.join("endpoint.owner-lock")) & 0o777, 0o600);
         // What the process makes afterwards takes the umask it had.
@@ -428,7 +460,7 @@ mod tests {
             std::env::temp_dir().join(format!("agent-socket-owner-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("endpoint");
-        let (owner, listener) = Owner::bind(&path).await.unwrap();
+        let (owner, listener) = Owner::bind(&path, None).await.unwrap();
         let original = directory.join("original");
         std::fs::rename(&path, &original).unwrap();
         let replacement = UnixListener::bind(&path).unwrap();

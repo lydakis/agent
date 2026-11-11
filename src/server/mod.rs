@@ -924,6 +924,10 @@ pub struct Configuration {
     /// Exit a socket daemon after this many seconds with no sessions, no
     /// active turns, and no running background commands; none by default.
     pub idle_exit: Option<u64>,
+    /// Seconds to wait for the daemon that holds the store and the socket
+    /// to exit before taking them, rather than refusing at once: a daemon
+    /// started to replace an older one while it drains; none by default.
+    pub await_owner: Option<u64>,
     /// Names, with `*` and `?` wildcards, of variables no tool shell gets
     /// from the daemon's environment, as Codex's shell environment
     /// excludes; none by default.
@@ -1776,6 +1780,9 @@ impl Binder {
 }
 
 pub async fn run(config: Configuration) -> Result<()> {
+    // From the start: the replaced daemon's drain began before this one.
+    let owner_until = (config.await_owner)
+        .map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
     let limits = Limits::resolve(&config);
     let transport = Transport::new(limits.connecting, limits.connections)?;
     let stall_timeout = config
@@ -1816,7 +1823,19 @@ pub async fn run(config: Configuration) -> Result<()> {
     if providers.is_empty() {
         return fail("no_providers");
     }
-    let (store, publications) = Store::open_with(&config.store, limits.readers).await?;
+    let opened = match owner_until {
+        Some(until) => {
+            let wait = until.saturating_duration_since(tokio::time::Instant::now());
+            Store::open_awaiting(&config.store, limits.readers, wait).await
+        }
+        None => Store::open_with(&config.store, limits.readers).await,
+    };
+    let (store, publications) = match opened {
+        Err(error) if error.code == "store_already_owned" => {
+            return Err(owned_by(error, config.socket.as_deref()).await);
+        }
+        opened => opened?,
+    };
     let (pending, pending_bytes) = (limits.pending, limits.pending_bytes);
     let max_depth = config.max_depth;
     store
@@ -1959,7 +1978,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let stdio_owner = config.socket.is_none();
     let mut socket_owner = None;
     if let Some(socket) = &config.socket {
-        let (owner, listener) = socket::Owner::bind(socket).await?;
+        let (owner, listener) = socket::Owner::bind(socket, owner_until).await?;
         socket_owner = Some(owner);
         tokio::spawn(session::accept(
             listener,
@@ -2526,6 +2545,43 @@ pub async fn run(config: Configuration) -> Result<()> {
     drop(socket_owner);
     // The first failure is the cause: a closed stdout also fails its writer.
     served.and(written).and(failed.map_or(Ok(()), Err))
+}
+
+/// `error`, a store another daemon holds, naming that daemon when it
+/// greets on `socket`: older or newer than this one, by protocol, and its
+/// pid, so whoever started this one can tell an upgrade's leftover from a
+/// start that raced it.
+async fn owned_by(error: Error, socket: Option<&Path>) -> Error {
+    use tokio::io::AsyncBufReadExt;
+    let elsewhere = || Error::with(&error.code, "another process holds this store");
+    let Some(socket) = socket else {
+        return elsewhere();
+    };
+    let greeted = async {
+        let stream = tokio::net::UnixStream::connect(socket).await.ok()?;
+        let line = tokio::io::BufReader::new(stream)
+            .lines()
+            .next_line()
+            .await
+            .ok()??;
+        serde_json::from_str::<Value>(&line)
+            .ok()
+            .filter(|ready| ready["event"] == "ready")
+    };
+    let Ok(Some(ready)) = tokio::time::timeout(Duration::from_secs(1), greeted).await else {
+        return elsewhere();
+    };
+    let (protocol, pid) = (&ready["protocol"], &ready["pid"]);
+    let which = match protocol.as_u64().map(|p| p.cmp(&agent_client::PROTOCOL)) {
+        Some(std::cmp::Ordering::Less) => "an older daemon",
+        Some(std::cmp::Ordering::Greater) => "a newer daemon",
+        _ => "a daemon",
+    };
+    Error::with(
+        &error.code,
+        format!("{which} (protocol {protocol}, pid {pid}) holds this store"),
+    )
+    .facts(json!({"owner": {"protocol": protocol, "pid": pid}}))
 }
 
 // Runs on the storage worker using the bot already read for admission. No
@@ -4655,6 +4711,11 @@ impl Service {
                     })
                     .await?;
                 let (waiters, retained) = self.handles.stats();
+                // A folder read, off the run loop.
+                let (open_files, file_limit) =
+                    tokio::task::spawn_blocking(agent_runtime::open_files::count)
+                        .await
+                        .unwrap_or_default();
                 let providers: serde_json::Map<String, Value> = self
                     .providers
                     .iter()
@@ -4694,6 +4755,9 @@ impl Service {
                     "store": store.stats(),
                     "tokens": self.tokens.snapshot(),
                     "handles": {"waiters": waiters, "retained": retained},
+                    // What the daemon holds open against its limit, so a
+                    // leak (growing while idle) is told from a busy peak.
+                    "files": {"open": open_files, "limit": file_limit},
                     "draining": self.draining(),
                     "paused": self.paused,
                 }))
