@@ -787,15 +787,36 @@ impl Run {
                 .await
             {
                 Ok(page) => {
-                    spent += (page["turns"].as_array().into_iter().flatten())
-                        .filter_map(|turn| turn["output_tokens"].as_u64())
-                        .sum::<u64>();
+                    for turn in page["turns"].as_array().into_iter().flatten() {
+                        // Interrupted, a turn may still be counting what it
+                        // spent: read once it has ended.
+                        let ended = ENDED.contains(&turn["status"].as_str().unwrap_or(""));
+                        let tokens = match (ended, turn["handle"].as_str()) {
+                            (false, Some(handle)) => match Self::ended(client, handle).await {
+                                Ok(turn) => turn["output_tokens"].as_u64(),
+                                Err(error) if lost(&error) => return None,
+                                Err(_) => turn["output_tokens"].as_u64(),
+                            },
+                            _ => turn["output_tokens"].as_u64(),
+                        };
+                        spent += tokens.unwrap_or(0);
+                    }
                 }
                 Err(error) if lost(&error) => return None,
                 Err(_) => {}
             }
         }
         Some(spent)
+    }
+
+    /// The turn `handle` names, once it has ended.
+    async fn ended(client: &Client, handle: &str) -> Result<Value, agent_client::Error> {
+        loop {
+            let mut waited = client.request("wait", json!({"handles": [handle]})).await?;
+            if waited["results"][handle]["pending"] != true {
+                return Ok(waited["results"][handle].take());
+            }
+        }
     }
 
     /// What a worker in `dir`, as profile `role`, is told: composed once a
