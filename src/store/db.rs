@@ -9323,7 +9323,7 @@ impl Database {
             return fail_with("invalid_page", "limit must be 1 to 256 and after 0 or more");
         }
         let mut statement = self.conn.prepare_cached(
-            "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.arguments,a.expires_ms,a.taken_ms FROM answers a
+            "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.arguments,a.expires_ms,a.taken_ms,a.process FROM answers a
              JOIN turns t ON t.id=a.turn JOIN tools l ON l.turn=a.turn AND l.call_id=a.call_id
              WHERE a.tag=? AND a.id>? AND a.output IS NULL
                AND (a.process IS NOT NULL OR (l.status='executing' AND t.status IN ('running','waiting')))
@@ -9345,10 +9345,14 @@ impl Database {
                 continue;
             }
             let arguments: String = r.get(5)?;
-            let entry = json!({"bot":r.get::<_, String>(1)?,"turn":turn,"call_id":call_id,
+            let mut entry = json!({"bot":r.get::<_, String>(1)?,"turn":turn,"call_id":call_id,
                 "name":r.get::<_, String>(4)?,
                 "arguments":serde_json::from_str::<Value>(&arguments).unwrap_or(Value::Null),
                 "expires_ms":r.get::<_, i64>(6)?,"taken_ms":r.get::<_, Option<i64>>(7)?});
+            // One a message lifted waits on past its turn, as its handle.
+            if let Some(process) = r.get::<_, Option<i64>>(8)? {
+                entry["handle"] = format!("proc:{process}").into();
+            }
             let size = crate::output::encoded_len(&entry)? + 1;
             if listed.len() == limit || (!listed.is_empty() && bytes + size > 256 * 1024) {
                 more = true;
@@ -9639,8 +9643,9 @@ impl Database {
                 }
             }
             // Only a bot's running turn and the calls a message lifted to
-            // the background have calls waiting, so one bot's listing reads
-            // those instead of scanning every bot's.
+            // the background (with the steps their clients ask for) have
+            // calls waiting, so one bot's listing reads those instead of
+            // scanning every bot's.
             _ => {
                 let mut statement = match bot {
                     Some(_) => self.conn.prepare_cached(
@@ -9652,6 +9657,13 @@ impl Database {
                          FROM approvals a INDEXED BY approvals_lifted JOIN turns t ON t.id=a.turn
                          JOIN bots b ON b.name=t.bot
                          WHERE a.process IS NOT NULL AND a.id>?1 AND a.id<=?4 AND t.bot=?2
+                           AND a.turn IS NOT b.running_turn
+                         UNION ALL
+                         SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,a.process
+                         FROM answers n INDEXED BY answers_lifted
+                         JOIN approvals a INDEXED BY approvals_steps ON a.turn=n.turn AND a.step_of=n.call_id
+                         JOIN turns t ON t.id=a.turn JOIN bots b ON b.name=t.bot
+                         WHERE n.process IS NOT NULL AND a.id>?1 AND a.id<=?4 AND t.bot=?2
                            AND a.turn IS NOT b.running_turn
                          ORDER BY 1 LIMIT ?3",
                     )?,
@@ -11736,19 +11748,19 @@ impl Database {
         call_id: &str,
         call: Option<&ToolCall>,
         now_ms: u64,
-    ) -> Result<Option<i64>> {
+    ) -> Result<Option<(i64, Option<u64>)>> {
         let bot = self.active(turn)?;
         if (self.live.get(&turn)).is_some_and(|live| live.answers.contains_key(call_id)) {
             return Ok(None);
         }
         let request = self.request(turn, call_id)?;
-        let waits_for = match &request {
+        let (waits_for, lapse) = match &request {
             Some(request)
                 if request.decided() || request.expires_ms().is_some_and(|at| now_ms >= at) =>
             {
                 return Ok(None);
             }
-            Some(_) => "approval",
+            Some(request) => ("approval", request.expires_ms()),
             None => {
                 let answer: Option<(bool, i64, bool)> = self
                     .conn
@@ -11764,7 +11776,7 @@ impl Database {
                     Some((true, expires_ms, paused))
                         if paused || now_ms < expires_ms.max(0) as u64 =>
                     {
-                        "answer"
+                        ("answer", (!paused).then_some(expires_ms.max(0) as u64))
                     }
                     Some(_) => return Ok(None),
                     None => return fail("invalid_tool_state"),
@@ -11826,10 +11838,11 @@ impl Database {
             // with the handle that answers it now.
             let audit: Option<i64> = self
                 .conn
-                .prepare_cached(
-                    "UPDATE tools SET audit=NULL WHERE turn=? AND call_id=? RETURNING audit",
-                )?
+                .prepare_cached("SELECT audit FROM tools WHERE turn=? AND call_id=?")?
                 .query_row(params![turn, call_id], |r| r.get(0))?;
+            self.conn
+                .prepare_cached("UPDATE tools SET audit=NULL WHERE turn=? AND call_id=?")?
+                .execute(params![turn, call_id])?;
             let outcome = Outcome::text(
                 json!({"handle":handle_of(process),"background":true,"steered":true,
                     "waits_for":waits_for})
@@ -11848,7 +11861,7 @@ impl Database {
                     live.verdicts.remove(call_id);
                     live.answered.remove(&request.id);
                 }
-                Ok(Some(process))
+                Ok(Some((process, lapse)))
             }
             Err(error) => {
                 self.conn.execute_batch("ROLLBACK TO lift; RELEASE lift")?;
@@ -12021,15 +12034,14 @@ impl Database {
                 .query_row(params![process, turn, call_id], |r| r.get(0))
                 .optional()?;
             // Its wait ends, allowed, and it starts as its command: its
-            // turn has no call starting, so no `tool_started` says so.
-            event(
-                &tx,
-                &bot.name,
-                Some(turn),
-                "lifted_ended",
-                json!({"call_id":call_id,"handle":format!("proc:{process}"),"outcome":"allowed",
-                    "approvals":request.approvals()}),
-            )?;
+            // turn has no call starting, so no `tool_started` says so. One
+            // its client answers waits on, and ends with that answer.
+            let mut data = json!({"call_id":call_id,"handle":format!("proc:{process}"),
+                "outcome":"allowed","approvals":request.approvals()});
+            if answered.is_some() {
+                data["waits_for"] = "answer".into();
+            }
+            event(&tx, &bot.name, Some(turn), "lifted_ended", data)?;
             tx.commit()?;
             self.approvals -= 1;
             if let Some(expires_ms) = answered {
@@ -13101,8 +13113,14 @@ impl Database {
                 .execute([turn])?;
             tx.prepare_cached("DELETE FROM processes WHERE turn=? AND status!='running'")?
                 .execute([turn])?;
-            tx.prepare_cached("DELETE FROM tools WHERE turn=?")?
-                .execute([turn])?;
+            // A running command's call stays until it ends: a lifted one's
+            // client still lists and answers it, and its row in the audit
+            // trail ends with it.
+            tx.prepare_cached(
+                "DELETE FROM tools WHERE turn=?1 AND call_id NOT IN
+                 (SELECT call_id FROM processes WHERE turn=?1 AND status='running')",
+            )?
+            .execute([turn])?;
             let last: Option<i64> = tx
                 .prepare_cached("SELECT MAX(id) FROM events WHERE turn=?")?
                 .query_row([turn], |r| r.get(0))?;
@@ -14646,7 +14664,8 @@ fn lifted_ended(
         &bot,
         Some(turn),
         "lifted_ended",
-        json!({"call_id":call_id,"handle":format!("proc:{process}"),"outcome":outcome}),
+        json!({"call_id":call_id,"handle":format!("proc:{process}"),"outcome":outcome,
+            "failed":failed,"result":ended_as(result)}),
     )?;
     Ok(())
 }

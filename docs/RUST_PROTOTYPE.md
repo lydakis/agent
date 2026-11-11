@@ -3120,7 +3120,8 @@ stops waiting: `expire_ms` after it started (1 to 3,600,000, default
 `*`, and lists those still waiting with
 `{"op":"tool_calls","tag","after"?,"limit"?}`: oldest first, each with
 `bot`, `turn`, `call_id`, `name`, `arguments`, `expires_ms` and
-`taken_ms`, at most
+`taken_ms`, and `handle` for one a message lifted, which waits on past its
+turn's end, at most
 `limit` (1 to 256, default 64) and 256 KiB a page, continued from
 `next_after`. It answers with
 `{"op":"tool_result","bot","turn","call_id","output"}`, the text the model
@@ -3322,11 +3323,13 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   under its handle, any other call's result as the command's; a call that
   reads or changes its own turn (`wait`, `note`, `history`, `read` of a
   result) fails `turn_ended`. `lifted_ended` `{call_id, handle, outcome}`
-  marks the end of the wait (`allowed`, with `approvals`, `denied`,
-  `expired`, `answered`, `unserved`, `withdrawn` or `stopped`). The end is
-  told as a background command's is, with the first 2,048 bytes of the
-  call's `output` (or of an answered call's `answer`), and a `wait` on the
-  handle collects it whole. The agent may stop it: `write_stdin` with
+  marks the end of the wait: `allowed`, with `approvals` (and `waits_for:
+  "answer"` for a call its client answers, which waits on for that answer),
+  or the call's end, `denied`, `expired`, `answered`, `unserved`,
+  `withdrawn` or `stopped`, with `failed` and its `result` as its bot is
+  told it. The end is told as a background command's is, with the first
+  2,048 bytes of the call's `output` (or of an answered call's `answer`),
+  and a `wait` on the handle collects it whole. The agent may stop it: `write_stdin` with
   `kill: true` on the handle withdraws a request still waiting (`withdrawn`,
   never run) and kills a command it started, answering
   `{"handle","stopped":true,"ran":BOOL}`; the same kill ends any background

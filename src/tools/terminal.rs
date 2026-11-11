@@ -382,7 +382,8 @@ fn open() -> Result<(OwnedFd, OwnedFd)> {
 
 impl Registry {
     /// Start `command` in a terminal of `owner`'s, recorded as proc
-    /// `handle`, and return what it writes within `yield_ms`. Its end goes
+    /// `handle`, and return what it writes within `yield_ms`; with none,
+    /// return at once and leave its output for the next read. Its end goes
     /// to `done`, as a background command's result does.
     #[allow(clippy::too_many_arguments)]
     pub async fn terminal(
@@ -391,7 +392,7 @@ impl Registry {
         handle: i64,
         command: String,
         workspace: PathBuf,
-        yield_ms: u64,
+        yield_ms: Option<u64>,
         environment: Vec<(String, String)>,
         sandbox: Option<Arc<Policy>>,
         done: oneshot::Sender<Result<Outcome>>,
@@ -576,6 +577,9 @@ impl Registry {
                 let _ = done.send(Ok(last));
             });
         }
+        let Some(yield_ms) = yield_ms else {
+            return Ok(report(Some(handle), String::new(), 0, None));
+        };
         terminal.settle(yield_ms).await;
         Ok(terminal.take(self, handle))
     }
@@ -836,7 +840,7 @@ mod tests {
                 7,
                 "printf hi; exit 3".into(),
                 std::env::temp_dir(),
-                5_000,
+                Some(5_000),
                 Vec::new(),
                 None,
                 done,

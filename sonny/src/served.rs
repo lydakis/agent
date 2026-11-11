@@ -1116,10 +1116,33 @@ impl Server {
             Some("resumed") => pause(&self.serving, false),
             _ => {}
         }
-        if event["event"] == "turn_finished"
-            && let Some(turn) = event["turn"].as_i64()
-        {
-            self.serving.lock().unwrap().finish(turn);
+        let key = || {
+            let call = event["data"]["call_id"].as_str().unwrap_or_default();
+            (event["turn"].as_i64().unwrap_or(0), call.to_owned())
+        };
+        match event["event"].as_str() {
+            Some("turn_finished") => {
+                if let Some(turn) = event["turn"].as_i64() {
+                    self.serving.lock().unwrap().finish(turn);
+                }
+            }
+            // A call of Sonny's a message lifted waits on past its turn.
+            Some("call_lifted") if event["data"]["waits_for"] == "answer" => {
+                self.serving.lock().unwrap().lifted.insert(key());
+            }
+            // One allowed waits for its answer now; one whose wait ended
+            // otherwise (stopped, out of time) stops what it runs.
+            Some("lifted_ended") if event["data"]["waits_for"] == "answer" => {
+                self.nudge.notify_one();
+            }
+            Some("lifted_ended") if event["data"]["outcome"] != "allowed" => {
+                let mut calls = self.serving.lock().unwrap();
+                let key = key();
+                if calls.lifted.contains(&key) {
+                    calls.stop(&key);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1159,6 +1182,9 @@ struct Calls {
     ended: HashMap<i64, u64>,
     /// How many listings of the waiting calls were begun.
     looks: u64,
+    /// The calls a message lifted from their turns: they wait on past
+    /// their turn's end, until their own.
+    lifted: HashSet<(i64, String)>,
 }
 
 impl Calls {
@@ -1166,6 +1192,7 @@ impl Calls {
     /// before could still start it again.
     fn retire(&mut self, key: &(i64, String)) {
         self.jobs.remove(key);
+        self.lifted.remove(key);
         self.retired.insert(key.clone(), self.looks);
     }
 
@@ -1173,22 +1200,29 @@ impl Calls {
     /// starts, from a listing read before its end either.
     fn finish(&mut self, turn: i64) {
         let ended: Vec<(i64, String)> = (self.jobs.keys())
-            .filter(|key| key.0 == turn)
+            .filter(|key| key.0 == turn && !self.lifted.contains(*key))
             .cloned()
             .collect();
         for key in ended {
-            if let Some(Job::Running { job, .. }) = self.jobs.get(&key) {
-                job.abort();
-            }
-            self.retire(&key);
+            self.stop(&key);
         }
         self.ended.insert(turn, self.looks);
     }
 
+    /// Stop what the call `key` runs, and let it go.
+    fn stop(&mut self, key: &(i64, String)) {
+        if let Some(Job::Running { job, .. }) = self.jobs.get(key) {
+            job.abort();
+        }
+        self.retire(key);
+    }
+
     /// Whether the call `key` was let go, or its turn ended, since a
-    /// listing that may name it began.
-    fn over(&self, key: &(i64, String)) -> bool {
-        self.retired.contains_key(key) || self.ended.contains_key(&key.0)
+    /// listing that may name it began; a call a message lifted, as the
+    /// listing says with its handle, outlives its turn.
+    fn over(&self, key: &(i64, String), lifted: bool) -> bool {
+        self.retired.contains_key(key)
+            || (!lifted && !self.lifted.contains(key) && self.ended.contains_key(&key.0))
     }
 }
 
@@ -1358,8 +1392,12 @@ where
             nudge.notify_one();
             break;
         }
-        if calls.paused || calls.jobs.contains_key(&key) || calls.over(&key) {
+        let lifted = call["handle"].is_string();
+        if calls.paused || calls.jobs.contains_key(&key) || calls.over(&key, lifted) {
             continue;
+        }
+        if lifted {
+            calls.lifted.insert(key.clone());
         }
         let (client, serving, held) = (client.clone(), serving.clone(), key.clone());
         let nudge = nudge.clone();

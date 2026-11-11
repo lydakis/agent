@@ -18909,9 +18909,11 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
     )
     .unwrap();
     let now = epoch_now();
-    let p1 = db.lift(turn, "s1", Some(&s1), now).unwrap().unwrap();
-    let p2 = db.lift(turn, "s2", Some(&s2), now).unwrap().unwrap();
-    let p3 = db.lift(turn, "s3", Some(&s3), now).unwrap().unwrap();
+    let (p1, lapse) = db.lift(turn, "s1", Some(&s1), now).unwrap().unwrap();
+    // No gate runs it out, so nothing goes on the schedule.
+    assert_eq!(lapse, None);
+    let (p2, _) = db.lift(turn, "s2", Some(&s2), now).unwrap().unwrap();
+    let (p3, _) = db.lift(turn, "s3", Some(&s3), now).unwrap().unwrap();
     // Each call is answered with its handle, so the round is closed and
     // the turn can end.
     let events = db.events("Bob", 0, 256).unwrap()["events"].clone();
@@ -19095,8 +19097,8 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
             db.tool_start(turn, call, false, false).unwrap();
         }
         let now = epoch_now();
-        let p1 = db.lift(turn, "c1", None, now).unwrap().unwrap();
-        let p2 = db.lift(turn, "c2", None, now).unwrap().unwrap();
+        let (p1, _) = db.lift(turn, "c1", None, now).unwrap().unwrap();
+        let (p2, _) = db.lift(turn, "c2", None, now).unwrap().unwrap();
         db.append(turn, vec![assistant("done")], &[], None).unwrap();
         db.finish(turn, None).unwrap();
         (turn, p1, p2)
@@ -19138,6 +19140,132 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
     assert!(db.lifted_waiting().unwrap().is_empty());
     drop(db);
     let _ = std::fs::remove_file(&path);
+}
+
+/// A lifted answered call stays its client's past its turn: its time goes
+/// on the schedule when it lifts, a step its client asks for is listed for
+/// its bot, a prune of its turn leaves it listed and answerable, and its
+/// answer ends its row in the audit trail.
+#[test]
+fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
+    let mut db = db();
+    let run = Declared {
+        name: "run".into(),
+        description: "Run.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: Some(600_000),
+        grammar: None,
+        steps: true,
+        inherit: Inherit::All,
+        kind: None,
+    };
+    let gate = Gate {
+        tag: "manual".into(),
+        tools: vec!["run".into()],
+        expire_ms: None,
+    };
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(std::slice::from_ref(&run)),
+            gate: Some(&gate),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        name: "run".into(),
+        call_id: "c1".into(),
+        arguments: "{}".into(),
+        custom: false,
+    };
+    db.append(turn, vec![], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
+    let now = epoch_now();
+    let (process, lapse) = db.lift(turn, "c1", None, now).unwrap().unwrap();
+    let Some(lapse) = lapse else {
+        panic!("a lifted call with a time of its own was not scheduled");
+    };
+    assert!(lapse > now && lapse <= now + 600_000, "{lapse} {now}");
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    // A step its client asks for past the turn waits for the bot's gate,
+    // listed for the bot.
+    use agent_runtime::store::Step;
+    let Step::Pending { .. } = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "1",
+            "send",
+            json!({}),
+            false,
+            Default::default(),
+            now,
+        )
+        .unwrap()
+        .step
+    else {
+        panic!("a gated step was decided at once");
+    };
+    let listed = db.approvals(Some("Lead"), None, 0, None, 64).unwrap();
+    let steps: Vec<&str> = (listed["approvals"].as_array().unwrap().iter())
+        .filter_map(|call| call["call_id"].as_str())
+        .collect();
+    assert_eq!(steps, ["c1/1"], "{listed}");
+    // Later turns push it past what is kept; a prune keeps its call.
+    for n in 0..2 {
+        let later = db
+            .begin(
+                "Lead",
+                &format!("later-{n}"),
+                "later",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.append(later, vec![assistant("ok")], &[], None).unwrap();
+        db.finish(later, None).unwrap();
+    }
+    db.prune("Lead", 1).unwrap();
+    let calls = db.tool_calls("sonny", 0, 10).unwrap();
+    let listed: Vec<&str> = (calls["calls"].as_array().unwrap().iter())
+        .filter_map(|call| call["call_id"].as_str())
+        .collect();
+    assert_eq!(listed, ["c1"]);
+    db.take_call("Lead", turn, "c1", now).unwrap();
+    let answered = db
+        .answer_call("Lead", turn, "c1", result("{\"ran\":true}"), now)
+        .unwrap();
+    assert_eq!(answered.lifted, Some(process));
+    let Lifted::Ended { .. } = db.lifted_check(process, now, false).unwrap() else {
+        panic!("an answered call did not end");
+    };
+    let trail = db
+        .audit(&agent_runtime::store::audit::Query::default())
+        .unwrap();
+    let row = (trail["rows"].as_array().unwrap().iter())
+        .find(|row| row["call_id"] == "c1" && row["step"].is_null())
+        .unwrap_or_else(|| panic!("{trail}"));
+    assert_eq!(row["outcome"], "completed", "{row}");
 }
 
 /// A message for a turn parked on a verdict wakes it, to lift the call;

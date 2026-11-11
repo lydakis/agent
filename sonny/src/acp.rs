@@ -754,6 +754,9 @@ struct State {
     /// The words of this part sent as they streamed.
     streamed: String,
     calls: HashMap<String, (String, Value)>,
+    /// The calls a message lifted from their turn, which end later, as
+    /// `lifted_ended` says: kept past their turn's end.
+    lifted: HashSet<String>,
     /// Calls put to the person, by call and request, and the lead's
     /// questions, by ask.
     asked: HashSet<String>,
@@ -787,6 +790,14 @@ struct State {
 
 /// How many of the bot's latest replies a client may react to.
 const REPLIES: usize = 64;
+
+impl State {
+    /// A turn's calls are over with it, but for those a message lifted.
+    fn end_calls(&mut self) {
+        let lifted = &self.lifted;
+        self.calls.retain(|call, _| lifted.contains(call));
+    }
+}
 
 struct Bound {
     bot: String,
@@ -891,14 +902,22 @@ impl Session {
             .map_err(|e| e.to_string())?;
         // Calls started before this thread came and not done yet: a task a
         // lead is starting still opens its thread when it is done.
-        let mut started = HashMap::new();
+        let (mut started, mut lifted) = (HashMap::new(), HashSet::new());
         let cursor = live(&mut events, |event| {
-            let call = event["data"]["call_id"].as_str().unwrap_or("").to_owned();
+            let data = &event["data"];
+            let call = data["call_id"].as_str().unwrap_or("").to_owned();
             match event["event"].as_str() {
                 Some("tool_started") => {
-                    started.insert(call, (event["turn"].as_i64(), event["data"].clone()));
+                    started.insert(call, (event["turn"].as_i64(), data.clone()));
                 }
-                Some("tool_completed") => {
+                Some("call_lifted") if started.contains_key(&call) => {
+                    lifted.insert(call);
+                }
+                Some("tool_completed") if !lifted.contains(&call) => {
+                    started.remove(&call);
+                }
+                Some("lifted_ended") if data["waits_for"] != "answer" => {
+                    lifted.remove(&call);
                     started.remove(&call);
                 }
                 _ => {}
@@ -920,14 +939,15 @@ impl Session {
         );
         let effort = record["effort"].as_str().map(str::to_owned);
         let mut calls = HashMap::new();
-        for (turn, data) in started.into_values() {
-            if running.is_some() && turn == running {
+        for (call, (turn, data)) in started {
+            if (running.is_some() && turn == running) || lifted.contains(&call) {
                 let (call, name, arguments) = started_call(&client, &bot, &data).await;
                 if name != reactions::TOOL && name != plan::TOOL {
                     calls.insert(call, (name, arguments));
                 }
             }
         }
+        lifted.retain(|call| calls.contains_key(call));
         let pinned = t3::Pinned {
             bot: bot.clone(),
             bot_id,
@@ -947,6 +967,7 @@ impl Session {
             }
             state.running = running;
             state.calls = calls;
+            state.lifted = lifted;
             state.cursor = cursor;
             // A task keeps the model its lead gave it, whatever T3 Code
             // picked for the thread it opened.
@@ -1608,7 +1629,7 @@ impl Session {
                 {
                     agent.out.answer(&prompt, json!({"stopReason": "end_turn"}));
                 }
-                state.calls.clear();
+                state.end_calls();
             }
             state.running = running;
         }
@@ -1638,7 +1659,7 @@ impl Session {
                 if state.running != turn {
                     state.part = 0;
                     state.streamed.clear();
-                    state.calls.clear();
+                    state.end_calls();
                 }
                 state.running = turn;
                 let ours = match &mut state.prompt {
@@ -1745,8 +1766,32 @@ impl Session {
                 out.update(id, tool_call(&call, &name, &arguments));
                 state.calls.insert(call, (name, arguments));
             }
-            "tool_completed" => {
+            // A call a message lifted goes on in the background: its
+            // turn's answer to it is its handle, and it ends later.
+            "call_lifted" => {
+                let call = data["call_id"].as_str().unwrap_or("");
+                if state.calls.contains_key(call) {
+                    state.lifted.insert(call.to_owned());
+                }
+            }
+            "tool_completed" | "lifted_ended" => {
                 let call = data["call_id"].as_str().unwrap_or("").to_owned();
+                let lifted = event["event"] == "lifted_ended";
+                match lifted {
+                    false if state.lifted.contains(&call) => return,
+                    // Allowed, one its client answers waits on for that
+                    // answer; any other runs as a background command,
+                    // whose end this thread does not show.
+                    true if data["waits_for"] == "answer" => return,
+                    true if data["outcome"] == "allowed" => {
+                        if state.lifted.remove(&call) {
+                            state.calls.remove(&call);
+                        }
+                        return;
+                    }
+                    true if !state.lifted.remove(&call) => return,
+                    _ => {}
+                }
                 state
                     .asked
                     .retain(|asked| !asked.starts_with(&format!("{call}#")));
@@ -1754,7 +1799,14 @@ impl Session {
                     return;
                 };
                 let (mut shown, mut failed) = (String::new(), data["failed"] == true);
-                if let Some(node) = data["node"].as_i64()
+                if lifted {
+                    let result = &data["result"];
+                    shown = (result["answer"].as_str())
+                        .or(result["output"].as_str())
+                        .or(result["detail"].as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                } else if let Some(node) = data["node"].as_i64()
                     && let Some(item) = items(&client, &bot, &[node])
                         .await
                         .into_iter()
@@ -1881,7 +1933,7 @@ impl Session {
                     return;
                 }
                 state.running = None;
-                state.calls.clear();
+                state.end_calls();
                 let reason = match data["status"].as_str().unwrap_or("") {
                     "interrupted" | "cancelled" => "cancelled",
                     _ => "end_turn",

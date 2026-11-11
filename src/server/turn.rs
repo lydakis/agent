@@ -4503,7 +4503,7 @@ impl Turn {
                         id,
                         command,
                         Prepared::folder(workspace, workdir.as_deref()),
-                        yield_ms,
+                        Some(yield_ms),
                         environment.to_vec(),
                         sandbox,
                         sender,
@@ -5247,13 +5247,18 @@ impl Turn {
     /// decided or answered by now: the next check takes it.
     async fn lift_call(&self, call_id: &str, call: Option<&ToolCall>) -> Result<bool> {
         let (turn, id, call) = (self.turn, call_id.to_owned(), call.cloned());
-        Ok(self
+        let lifted = self
             .store
             .op("lift", move |db| {
                 db.lift(turn, &id, call.as_ref(), now_ms())
             })
-            .await?
-            .is_some())
+            .await?;
+        // Its time goes on the schedule now: the turn's own no longer
+        // covers it.
+        if let Some((process, lapse)) = lifted {
+            self.handles.lifted_lapses(process, lapse);
+        }
+        Ok(lifted.is_some())
     }
 
     /// Wait for an answered call's answer: live for the hold, then parked
@@ -5954,12 +5959,10 @@ impl Lifts {
                     let _ = sender.send(Err(error));
                 }
             },
-            // Started as its handle: its first output goes unread, and its
-            // end is told as a background command's.
+            // Started as its handle, its first output left unread for a
+            // write or its end, which is told as a background command's.
             Ok(Prepared::Terminal {
-                command,
-                yield_ms,
-                workdir,
+                command, workdir, ..
             }) => {
                 let registry = self.registry.clone();
                 let folder = Prepared::folder(&workspace, workdir.as_deref());
@@ -5970,7 +5973,7 @@ impl Lifts {
                             process,
                             command,
                             folder,
-                            yield_ms,
+                            None,
                             environment,
                             sandbox,
                             sender,
@@ -6010,7 +6013,7 @@ impl Lifts {
                 let _ = sender.send(Err(Error::with(
                     "turn_ended",
                     format!(
-                        "{} reads or changes its turn, which ended before its approval came; call it again",
+                        "{} reads or changes its turn, which ended before its approval came",
                         call.name
                     ),
                 )));
