@@ -200,10 +200,12 @@ fn str_of(value: &Value) -> String {
     value.as_str().unwrap_or_default().to_owned()
 }
 
+/// Whether `error` is the connection's, not the request's: a request that
+/// could not be written (`io`) is lost as one whose answer never came.
 fn lost(error: &agent_client::Error) -> bool {
     matches!(
         error.code.as_str(),
-        "daemon_disconnected" | "daemon_unavailable" | "daemon_connect_timeout"
+        "daemon_disconnected" | "daemon_unavailable" | "daemon_connect_timeout" | "io"
     )
 }
 
@@ -775,21 +777,25 @@ impl Run {
 
     /// The output tokens of every turn of the workers whose calls were
     /// never answered, which no answer has counted: once interrupted, what
-    /// each turn spent.
-    async fn unanswered(&self, client: &Client) -> u64 {
+    /// each turn spent. None when the connection is lost on the way.
+    async fn unanswered(&self, client: &Client) -> Option<u64> {
         let workers: Vec<String> = self.live.lock().unwrap().keys().cloned().collect();
         let mut spent = 0;
         for bot in workers {
-            if let Ok(page) = client
+            match client
                 .request("turns", json!({"bot": bot, "newest": true, "limit": 16}))
                 .await
             {
-                spent += (page["turns"].as_array().into_iter().flatten())
-                    .filter_map(|turn| turn["output_tokens"].as_u64())
-                    .sum::<u64>();
+                Ok(page) => {
+                    spent += (page["turns"].as_array().into_iter().flatten())
+                        .filter_map(|turn| turn["output_tokens"].as_u64())
+                        .sum::<u64>();
+                }
+                Err(error) if lost(&error) => return None,
+                Err(_) => {}
             }
         }
-        spent
+        Some(spent)
     }
 
     /// What a worker in `dir`, as profile `role`, is told: composed once a
@@ -1478,11 +1484,23 @@ async fn finish(run: &Run, ended: script::Ended, attempt: Option<&Attempt>) {
         tokio::time::sleep(wait).await;
         wait = (wait * 2).min(Duration::from_secs(60));
     }
-    // What the calls never answered spent all the same.
-    let client = attempt.map(|a| &*a.client).or(spoke.as_deref());
-    if let Some(client) = client {
-        let unanswered = run.unanswered(client).await;
-        run.spent.fetch_add(unanswered, Ordering::SeqCst);
+    // What the calls never answered spent all the same, read on the
+    // connection that last worked, or a new one, until it is read.
+    let mut client = spoke.or_else(|| attempt.map(|a| Arc::clone(&a.client)));
+    let mut wait = AGAIN;
+    while !run.live.lock().unwrap().is_empty() {
+        if let Some(client) = &client
+            && let Some(unanswered) = run.unanswered(client).await
+        {
+            run.spent.fetch_add(unanswered, Ordering::SeqCst);
+            break;
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_secs(60));
+        client = Client::connect(&run.socket)
+            .await
+            .ok()
+            .map(|(client, _)| client);
     }
     let (status, result, error) = match ended {
         script::Ended::Returned(value) => ("completed", value, None),
