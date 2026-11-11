@@ -1766,7 +1766,7 @@ impl Session {
                     );
                     return;
                 }
-                out.update(id, tool_call(&call, &name, &arguments));
+                out.update(id, tool_call(&shown_id(turn, &call), &name, &arguments));
                 state.calls.insert((turn, call), (name, arguments));
             }
             // A call a message lifted goes on in the background: its
@@ -1805,6 +1805,9 @@ impl Session {
                 let Some((name, arguments)) = state.calls.remove(&key) else {
                     return;
                 };
+                // The client knows the call by its turn too: a later turn's
+                // call of the same id is another.
+                let shown_call = shown_id(turn, &call);
                 let (mut shown, mut failed) = (String::new(), data["failed"] == true);
                 if lifted {
                     let result = &data["result"];
@@ -1828,7 +1831,7 @@ impl Session {
                 let status = if failed { "failed" } else { "completed" };
                 out.update(
                     id,
-                    json!({"sessionUpdate": "tool_call_update", "toolCallId": call,
+                    json!({"sessionUpdate": "tool_call_update", "toolCallId": shown_call,
                     "status": status, "content": [text_content(&cut(&shown))]}),
                 );
                 // A question the lead put, taken: put to the person as a
@@ -1841,7 +1844,7 @@ impl Session {
                     && !ask.options.is_empty()
                     && state.asked.insert(ask.id.clone())
                 {
-                    let asked = out.asking("elicitation/create", form(id, &ask, Some(&call)));
+                    let asked = out.asking("elicitation/create", form(id, &ask, Some(&shown_call)));
                     let lead = (bot, state.bound.as_ref().and_then(|b| b.bot_id));
                     let (agent, session) = (agent.clone(), self.id.clone());
                     tokio::spawn(async move { elicit(asked, &agent, &session, lead, &ask).await });
@@ -1861,7 +1864,7 @@ impl Session {
                     let session = lead_session(&task, bot_id, client.store());
                     out.update(
                         id,
-                        json!({"sessionUpdate": "tool_call_update", "toolCallId": call,
+                        json!({"sessionUpdate": "tool_call_update", "toolCallId": shown_call,
                         "_meta": {"task": {"sessionId": session, "title": task,
                         "cwd": record["workspace"]}}}),
                     );
@@ -1894,7 +1897,8 @@ impl Session {
                                     thread: &thread,
                                 };
                                 let session = &session_id;
-                                open_task(&opener, session, &client, &at, &arguments, &call).await;
+                                let call = &shown_call;
+                                open_task(&opener, session, &client, &at, &arguments, call).await;
                             });
                             // The person's prompt waits for its tasks' threads,
                             // not for ever: one still opening opens on its own.
@@ -2378,7 +2382,8 @@ async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Va
             .ok()
             .and_then(|read| agent_client::approver::call_arguments(&read["items"][0]["item"], id)),
     };
-    let mut update = tool_call(id, name, arguments.as_ref().unwrap_or(&Value::Null));
+    let shown = shown_id(call["turn"].as_i64(), id);
+    let mut update = tool_call(&shown, name, arguments.as_ref().unwrap_or(&Value::Null));
     if let Value::Object(fields) = &mut update {
         fields.remove("sessionUpdate");
     }
@@ -2755,6 +2760,16 @@ fn words(prompt: &Value) -> (String, Vec<Value>) {
         }
     }
     (text, images)
+}
+
+/// The id a client knows call `call` of `turn` by: a later turn may use
+/// the same call id, so the turn is part of it. The daemon is asked by the
+/// call's own id.
+fn shown_id(turn: Option<i64>, call: &str) -> String {
+    match turn {
+        Some(turn) => format!("{turn}/{call}"),
+        None => call.to_owned(),
+    }
 }
 
 /// The update that shows a call: what it does, in a few words.

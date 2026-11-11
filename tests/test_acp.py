@@ -222,6 +222,10 @@ class AcpTests(ModelFixture):
         # The thread was the lead it asked for, which T3 Code's words never
         # reached: Sonny took the person's out of them.
         [turn] = self.daemon.request('turns', bot='calc.lead')['result']['turns']
+        # The client knows the call by its turn too, from start to end: a
+        # later turn may use the same call id.
+        self.assertRegex(started['toolCallId'], rf"^{turn['turn']}/.+")
+        self.assertEqual(ended['toolCallId'], started['toolCallId'])
         prompts = self.daemon.request('prompts', bot='calc.lead', turn=turn['turn'])['result']['prompts']
         # Stamped with when it was sent, as every message Sonny passes on.
         self.assertRegex(prompts[0]['text'], SENT)
@@ -758,7 +762,8 @@ class AcpTests(ModelFixture):
         [live] = [m for m in thread.until(lambda m: m.get('method') == 'elicitation/create')
                   if m.get('method') == 'elicitation/create']
         self.assertEqual(live['params']['message'].split('\n')[0], 'Which queue?')
-        self.assertEqual(live['params']['toolCallId'], 'script-1')
+        # Known to the client by its turn too.
+        self.assertRegex(live['params']['toolCallId'], r'^\d+/script-1$')
         # A pick naming someone by a name the daemon would not take answers
         # nothing, and is nobody's words.
         thread.send({'id': live['id'], 'result': {'action': 'accept', 'content': {'pick': '2'},
