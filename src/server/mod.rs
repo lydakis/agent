@@ -5627,6 +5627,7 @@ impl Service {
                     origin,
                     person,
                     quotes,
+                    kept: None,
                     budget_tokens,
                     budget_counts,
                     images,

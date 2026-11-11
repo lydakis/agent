@@ -553,12 +553,7 @@ pub fn declined(
     first: bool,
     len: usize,
 ) -> Result<Option<Vec<u8>>> {
-    let why = match category {
-        Some(category) => format!(
-            "the provider's safety classifier declined the request that carried it (category: {category})"
-        ),
-        None => "the provider's safety classifier declined the request that carried it".to_owned(),
-    };
+    let why = refused_why(category);
     let value: serde_json::Value = serde_json::from_slice(item)?;
     let kind = value["type"].as_str().unwrap_or_default();
     let calls: Vec<_> = (value["content"].as_array().into_iter().flatten())
@@ -583,6 +578,40 @@ pub fn declined(
         } else {
             family.user_item(text)?
         };
+        if note.len() <= len {
+            note.resize(len, b' ');
+            return Ok(Some(note));
+        }
+    }
+    Ok(None)
+}
+
+/// Why a declined request's additions are left out, with the refusal's
+/// category when it names one.
+fn refused_why(category: Option<&str>) -> String {
+    match category {
+        Some(category) => format!(
+            "the provider's safety classifier declined the request that carried it (category: {category})"
+        ),
+        None => "the provider's safety classifier declined the request that carried it".to_owned(),
+    }
+}
+
+/// What goes to later requests in place of a message a declined request
+/// carried that goes back in line as it was sent: `declined`'s note for a
+/// message, saying it comes again after the turn, padded to `len` bytes
+/// the same way; none when not even the shortest wording fits.
+pub fn moved(family: Family, category: Option<&str>, len: usize) -> Result<Option<Vec<u8>>> {
+    let full = format!(
+        "[A message here is left out and sent again after this turn: {}.]",
+        refused_why(category)
+    );
+    for text in [
+        full.as_str(),
+        "[Left out; sent again after this turn.]",
+        "[Left out.]",
+    ] {
+        let mut note = family.user_item(text)?;
         if note.len() <= len {
             note.resize(len, b' ');
             return Ok(Some(note));

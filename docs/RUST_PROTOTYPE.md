@@ -902,7 +902,14 @@ continuing... Attempting to continue without resetting will result in
 continued refusals." Each item becomes a note naming the refusal's category,
 so the model knows something was declined: a tool result keeps its call with
 `[This tool result is left out: ...]`, and a message becomes `[A message here
-is left out: ...]`. A note is padded with spaces to the size of the item it
+is left out: ...]`. A message a person or another bot steered into the
+turn goes back in line as it was sent, a queued message of its own with its
+words, pictures, effort, quotes and sender, for the turns after this one;
+its place says `[A message here is left out and sent again after this turn:
+...]`. A strict steer (`expected_turn`) is for that turn alone and an
+attached note is a note, so both stay notes; a queued message has no turn
+to join, so one the classifier declines again as its turn's first request
+is noted, not sent a third time. A note is padded with spaces to the size of the item it
 replaces, so the context's byte accounting does not change; a shorter wording
 is used where the full one does not fit, and an item too small for any keeps
 its own. Everything before it is unchanged, so no thinking binding or prompt
