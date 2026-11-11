@@ -1570,7 +1570,7 @@ mod tests {
             json!({"t": "agent", "key": "k2", "value": null, "output_tokens": 3}),
             json!({"t": "agent", "key": "k3", "value": {"a": 1}, "earlier": true, "output_tokens": 9}),
         ];
-        let mut text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
         // A line a crash cut short inside a character.
         let mut bytes = text.into_bytes();
         bytes.extend_from_slice("{\"t\": \"agent\", \"key\": \"k4\", \"value\": \"é".as_bytes());
