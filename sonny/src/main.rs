@@ -17662,8 +17662,10 @@ mod tests {
     #[tokio::test]
     async fn a_pane_switched_to_the_main_window_s_agent_goes_back_to_it() {
         let mut app = app(daemon_answering(|_| json!({})).await);
-        let mut command = portable_pty::CommandBuilder::new("printf");
-        command.arg("\\033]7700;open=b\\033\\\\");
+        // It stays on after asking: macOS drops what a terminal holds
+        // unread once its program's side closes, as a printf's at once.
+        let mut command = portable_pty::CommandBuilder::new("sh");
+        command.args(["-c", "printf '\\033]7700;open=b\\033\\\\'; exec sleep 30"]);
         let program = embed::Embedded::spawn(command, 5, 20, false, || {}).unwrap();
         let mut pane = pane::Pane::program("fix", program);
         pane.as_agent("shop.fix", false);
