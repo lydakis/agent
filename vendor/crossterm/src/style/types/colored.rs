@@ -308,6 +308,9 @@ mod tests {
 
     #[test]
     fn test_no_color() {
+        // Settle the remembered answer first, so a test formatting colours
+        // at the same time never takes one of the values set here.
+        let _ = Colored::ansi_color_disabled_memoized();
         std::env::set_var("NO_COLOR", "1");
         assert!(Colored::ansi_color_disabled());
         std::env::set_var("NO_COLOR", "XXX");
