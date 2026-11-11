@@ -184,14 +184,14 @@ impl Tool {
                 "required":["url"],"additionalProperties":false}),
             ),
             Tool::WriteStdin => (
-                "Type into a terminal that shell started with tty=true, and return what it wrote since the last read, stdout and stderr together, which echoes what was typed. A terminal runs until it exits or is killed, across turns; wait on its handle reports how it ended. chars is typed as it is: end a line with \\n, and send a control key as its character, such as \\u0003 for Ctrl-C or \\u0004 for Ctrl-D; empty chars only reads. It waits yield_time_ms for output, 250 by default after typing and 5000 when only reading, at most 30000; a command that ends sooner returns at once with its exit_code. kill=true ends the command and every process it started.",
+                "Type into a terminal that shell started with tty=true, and return what it wrote since the last read, stdout and stderr together, which echoes what was typed. A terminal runs until it exits or is killed, across turns; wait on its handle reports how it ended. chars is typed as it is: end a line with \\n, and send a control key as its character, such as \\u0003 for Ctrl-C or \\u0004 for Ctrl-D; empty chars only reads. It waits yield_time_ms for output, 250 by default after typing and 5000 when only reading, at most 30000; a command that ends sooner returns at once with its exit_code. kill=true ends the command and every process it started; on a background command's proc handle, or a call a message moved to the background while it waited for approval or an answer, kill=true stops it (a call still waiting never runs).",
                 json!({"type":"object","properties":{"handle":{"type":"string"},
                 "chars":{"type":"string","maxLength":INPUT_BYTES},
                 "yield_time_ms":{"type":"integer","minimum":0,"maximum":MAX_YIELD_MS},"kill":{"type":"boolean"}},
                 "required":["handle"],"additionalProperties":false}),
             ),
             Tool::Wait => (
-                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting.",
+                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn) or 'proc:N' (a background shell, or a call a message moved to the background). Each result reports the outcome: a peer's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting.",
                 json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
                 "timeout_ms":{"type":"integer","minimum":0,"maximum":MAX_WAIT_TIMEOUT_MS},"any":{"type":"boolean"}},
                 "required":["handles"],"additionalProperties":false}),
@@ -542,6 +542,9 @@ pub struct Registry {
     /// Set once as the daemon stops: background commands still running
     /// end then rather than outlive it.
     stopping: Arc<watch::Sender<bool>>,
+    /// Background commands running, by proc handle, each with what stops
+    /// it when its agent kills it.
+    stops: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<()>>>>,
     /// Counts pulls of the cord: background commands running or waiting
     /// for a slot at one end then.
     pulls: Arc<watch::Sender<u64>>,
@@ -1336,6 +1339,7 @@ impl Registry {
             #[cfg(unix)]
             terminals: Arc::default(),
             stopping: Arc::new(watch::Sender::new(false)),
+            stops: Arc::default(),
             pulls: Arc::new(watch::Sender::new(0)),
             credentials: Credentials::default(),
             environment: Arc::new(Vec::new()),
@@ -2396,6 +2400,7 @@ impl Registry {
     #[allow(clippy::too_many_arguments)]
     pub fn background(
         &self,
+        id: i64,
         command: String,
         workspace: PathBuf,
         timeout_ms: u64,
@@ -2408,6 +2413,7 @@ impl Registry {
         let mut queued = queued;
         let mut stopping = self.stopping.subscribe();
         let mut pulls = self.pulls.subscribe();
+        let stop = self.stoppable(id);
         tokio::spawn(async move {
             let result = async {
                 let slot = match queued.permit.take() {
@@ -2450,8 +2456,48 @@ impl Registry {
                 Ok(()) = pulls.changed() => {
                     let _ = done.send(Err(stopped_by_pause()));
                 }
+                // Its agent killed it: dropped the same way.
+                Ok(()) = stop => {
+                    let _ = done.send(Err(stopped_by_agent()));
+                }
             }
+            registry.stops.lock().unwrap().remove(&id);
         });
+    }
+
+    /// What stops background command `id` when its agent kills it.
+    fn stoppable(&self, id: i64) -> tokio::sync::oneshot::Receiver<()> {
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        self.stops.lock().unwrap().insert(id, stop);
+        stopped
+    }
+
+    /// `run`, a command a steer moved to the background as `id`, ended
+    /// when its agent kills it, as one started there is.
+    pub fn until_stopped<F>(
+        &self,
+        id: i64,
+        run: F,
+    ) -> impl Future<Output = Result<Outcome>> + use<F>
+    where
+        F: Future<Output = Result<Outcome>>,
+    {
+        let (registry, stop) = (self.clone(), self.stoppable(id));
+        async move {
+            let ended = tokio::select! {
+                result = run => result,
+                Ok(()) = stop => Err(stopped_by_agent()),
+            };
+            registry.stops.lock().unwrap().remove(&id);
+            ended
+        }
+    }
+
+    /// Kill background command `id`, dropping it, which kills its group:
+    /// false when none of that handle runs. Whose it is, the caller checks.
+    pub fn stop(&self, id: i64) -> bool {
+        let stop = self.stops.lock().unwrap().remove(&id);
+        stop.is_some_and(|stop| stop.send(()).is_ok())
     }
 
     /// `run`, a command a steer moved to the background, ended as the pull
@@ -2480,6 +2526,14 @@ impl Registry {
     pub fn end_background(&self) {
         self.stopping.send_replace(true);
     }
+}
+
+/// How a background command its agent killed answers.
+fn stopped_by_agent() -> Error {
+    Error::with(
+        "stopped",
+        "its agent killed this command before it finished, so it may have had effects",
+    )
 }
 
 /// How a command the pull cord ended answers. Nothing reruns it; the agent

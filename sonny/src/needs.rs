@@ -283,6 +283,9 @@ pub fn resolved_itself(items: &[Value], bot: &str) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct Needs {
     calls: HashMap<String, BTreeSet<(i64, String)>>,
+    /// Those of `calls` a message lifted out of their turn: they wait on
+    /// past its end, until their verdict.
+    lifted: HashSet<(String, i64, String)>,
     /// Each agent with a question open.
     asks: HashMap<String, Open>,
     /// Agents whose questions an event left unsure, to read again once
@@ -363,6 +366,8 @@ impl Needs {
                 Some(calls) => self.calls.insert(bot.clone(), calls.clone()),
                 None => self.calls.remove(bot),
             };
+            self.lifted.retain(|(of, ..)| of != bot);
+            (self.lifted).extend(other.lifted.iter().filter(|(of, ..)| of == bot).cloned());
         }
         for bot in asks {
             self.version += 1;
@@ -376,6 +381,7 @@ impl Needs {
     /// `bot` is gone, or resolved: nothing of its waits now.
     pub fn forget(&mut self, bot: &str) {
         self.calls.remove(bot);
+        self.lifted.retain(|(of, ..)| of != bot);
         if self.asks.remove(bot).is_some() {
             self.version += 1;
         }
@@ -445,12 +451,36 @@ impl Needs {
                 self.version += 1;
                 self.unsure.insert(bot.to_owned());
             }
-            // Each answer lets go of its call alone; a question refused
-            // was never asked.
-            "step_decided" | "turn_resumed" | "tool_completed" => {
+            // A message lifted the call out of its turn: it waits on.
+            "call_lifted" => {
+                if let Some(id) = data["call_id"].as_str()
+                    && (self.calls.get(bot))
+                        .is_some_and(|calls| calls.contains(&(turn, id.to_owned())))
+                {
+                    self.lifted.insert((bot.to_owned(), turn, id.to_owned()));
+                }
+            }
+            // Its verdict, or its agent, ended a lifted call.
+            "lifted_ended" => {
                 if let Some(id) = data["call_id"].as_str() {
                     if let Some(calls) = self.calls.get_mut(bot) {
+                        calls.retain(|(of, call)| (*of, call.as_str()) != (turn, id));
+                    }
+                    self.lifted.remove(&(bot.to_owned(), turn, id.to_owned()));
+                }
+            }
+            // Each answer lets go of its call alone, but a lifted call's
+            // turn going on is no answer, nor is a parked turn resuming:
+            // a message wakes it too. A question refused was never asked.
+            "step_decided" | "tool_completed" => {
+                if let Some(id) = data["call_id"].as_str() {
+                    let lifted = kind != "step_decided"
+                        && (self.lifted).contains(&(bot.to_owned(), turn, id.to_owned()));
+                    if let Some(calls) = self.calls.get_mut(bot)
+                        && !lifted
+                    {
                         calls.retain(|(_, call)| call != id);
+                        self.lifted.remove(&(bot.to_owned(), turn, id.to_owned()));
                     }
                     let refused = data["failed"] == true || data["denied"] == true;
                     let asking =
@@ -480,7 +510,10 @@ impl Needs {
             // the running turn's end lets go of its calls.
             "turn_finished" if !matches!(data["status"].as_str(), Some("steered" | "attached")) => {
                 if let Some(calls) = self.calls.get_mut(bot) {
-                    calls.retain(|(of, _)| *of != turn);
+                    let lifted = &self.lifted;
+                    calls.retain(|(of, call)| {
+                        *of != turn || lifted.contains(&(bot.to_owned(), *of, call.clone()))
+                    });
                 }
                 if self.unsure.remove(bot) {
                     self.due.push((bot.to_owned(), event["turn"].as_i64()));
@@ -595,6 +628,49 @@ mod tests {
         needs.held(Vec::new(), |bot| bot == "a.x");
         assert!(!needs.waits("a.x"));
         assert!(needs.waits("b.y"));
+    }
+
+    #[test]
+    fn a_lifted_call_waits_past_its_turn_until_its_verdict() {
+        let mut needs = Needs::default();
+        let manual = json!({"calls": [{"call_id": "c1", "gates": ["manual"]}]});
+        needs.event(&event("p.fix", 3, "approval_requested", manual.clone()));
+        // A message lifts it: its turn goes on and ends, and it still waits.
+        for (kind, data) in [
+            ("turn_resumed", json!({"call_id": "c1"})),
+            ("call_lifted", json!({"call_id": "c1", "handle": "proc:1"})),
+            ("tool_completed", json!({"call_id": "c1"})),
+            ("turn_finished", json!({"status": "completed"})),
+        ] {
+            needs.event(&event("p.fix", 3, kind, data));
+        }
+        assert_eq!(needs.calls().collect::<Vec<_>>(), [("p.fix", 3, "c1")]);
+        // Its verdict ends it.
+        needs.event(&event(
+            "p.fix",
+            3,
+            "lifted_ended",
+            json!({"call_id": "c1", "outcome": "denied"}),
+        ));
+        assert!(!needs.waits("p.fix"));
+        // Allowed, it starts as its command.
+        needs.event(&event("p.fix", 4, "approval_requested", manual));
+        needs.event(&event("p.fix", 4, "call_lifted", json!({"call_id": "c1"})));
+        needs.event(&event(
+            "p.fix",
+            4,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        assert!(needs.waits("p.fix"));
+        needs.event(&event(
+            "p.fix",
+            4,
+            "lifted_ended",
+            json!({"call_id": "c1", "handle": "proc:2", "outcome": "allowed"}),
+        ));
+        assert!(!needs.waits("p.fix"));
+        assert!(needs.lifted.is_empty());
     }
 
     #[test]

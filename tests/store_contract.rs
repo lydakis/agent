@@ -4,8 +4,8 @@ use agent_runtime::{
     provider::{ModelTokens, ToolCall, Usage},
     store::{
         Answered, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage, Counts, Database,
-        Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Limit, Planning, QuoteRef, Settings,
-        Strip, TurnBudget, TurnOptions, Wake,
+        Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Lifted, Limit, Planning, QuoteRef,
+        Settings, Strip, TurnBudget, TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome},
 };
@@ -18889,4 +18889,284 @@ fn a_configure_kept_for_a_turns_end_is_kept_once_and_let_go_when_taken() {
         .unwrap();
     assert!(set);
     assert_ne!(db.inspect("Bob").unwrap().instructions, "tried");
+}
+
+/// A gated call a message lifted waits on past its turn, as a background
+/// command: listed with its handle, kept when the turn ends, and its
+/// verdict, given later, runs it or ends it, telling the bot at rest.
+#[test]
+fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (first, s1) = shell_call("fc_1", "s1", "true");
+    let (second, s2) = shell_call("fc_2", "s2", "ls");
+    let (third, s3) = shell_call("fc_3", "s3", "pwd");
+    db.append(
+        turn,
+        vec![first, second, third],
+        &[s1.clone(), s2.clone(), s3.clone()],
+        None,
+    )
+    .unwrap();
+    let now = epoch_now();
+    let p1 = db.lift(turn, "s1", Some(&s1), now).unwrap().unwrap();
+    let p2 = db.lift(turn, "s2", Some(&s2), now).unwrap().unwrap();
+    let p3 = db.lift(turn, "s3", Some(&s3), now).unwrap().unwrap();
+    // Each call is answered with its handle, so the round is closed and
+    // the turn can end.
+    let events = db.events("Bob", 0, 256).unwrap()["events"].clone();
+    let lifted: Vec<&Value> = (events.as_array().unwrap().iter())
+        .filter(|e| e["event"] == "call_lifted")
+        .collect();
+    assert_eq!(lifted.len(), 3);
+    assert_eq!(lifted[0]["data"]["waits_for"], "approval");
+    assert_eq!(lifted[0]["data"]["handle"], format!("proc:{p1}"));
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    // Both still wait, listed for the bot with their handles.
+    let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    let handles: Vec<&Value> = (listed["approvals"].as_array().unwrap().iter())
+        .map(|call| &call["handle"])
+        .collect();
+    assert_eq!(
+        handles,
+        [p1, p2, p3]
+            .map(|p| json!(format!("proc:{p}")))
+            .iter()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(db.lifted_waiting().unwrap().len(), 3);
+    assert_eq!(
+        db.process_result(p1).unwrap().map(|(status, _)| status),
+        Some("running".into())
+    );
+    // Undecided, each waits on with no time of its own.
+    assert!(matches!(
+        db.lifted_check(p1, now, false).unwrap(),
+        Lifted::Waiting(None)
+    ));
+    // Allowed past its turn: run as its command, unless the daemon holds
+    // work back.
+    assert_eq!(allow(&mut db, turn, "s1").unwrap().lifted, Some(p1));
+    assert!(matches!(
+        db.lifted_check(p1, now, true).unwrap(),
+        Lifted::Waiting(None)
+    ));
+    let Lifted::Run(run) = db.lifted_check(p1, now, false).unwrap() else {
+        panic!("an allowed call did not run");
+    };
+    assert_eq!(
+        (
+            run.process,
+            run.turn,
+            run.call.call_id.as_str(),
+            run.call.arguments.as_str()
+        ),
+        (p1, turn, "s1", s1.arguments.as_str())
+    );
+    assert_eq!(run.workspace.as_deref(), Some("/synthetic"));
+    assert!(matches!(
+        db.lifted_check(p1, now, false).unwrap(),
+        Lifted::Gone
+    ));
+    // Denied: its command ends so, and the bot at rest is told.
+    let denied = db
+        .answer(Decision {
+            bot: "Bob",
+            turn,
+            call_id: "s2",
+            request: 1,
+            tag: None,
+            allow: false,
+            unreviewed: false,
+            reason: Some("not now"),
+            by: Some("test"),
+            leased: false,
+        })
+        .unwrap();
+    assert_eq!(denied.lifted, Some(p2));
+    let Lifted::Ended { result, ready } = db.lifted_check(p2, now, false).unwrap() else {
+        panic!("a denied call did not end");
+    };
+    assert_eq!(
+        result,
+        json!({"error":"approval_denied","detail":"not now"})
+    );
+    assert!(ready);
+    assert_eq!(
+        db.process_result(p2).unwrap(),
+        Some(("finished".into(), Some(result.clone())))
+    );
+    let told = db.turns("Bob", 0, None, 16, false).unwrap();
+    let prompts: Vec<&str> = (told["turns"].as_array().unwrap().iter())
+        .filter_map(|t| t["prompt_preview"].as_str())
+        .collect();
+    assert!(
+        prompts
+            .iter()
+            .any(|p| p.contains(&format!("proc:{p2}")) && p.contains("approval_denied")),
+        "{prompts:?}"
+    );
+    // Its agent withdraws one past its turn: it never runs, and a verdict
+    // after finds nothing to decide.
+    let Some(Lifted::Ended {
+        result: withdrawn, ..
+    }) = db.lifted_stop("Bob", p3).unwrap()
+    else {
+        panic!("a waiting call was not withdrawn");
+    };
+    assert_eq!(withdrawn["error"], "stopped");
+    assert!(allow(&mut db, turn, "s3").is_err());
+    assert!(db.lifted_waiting().unwrap().is_empty());
+    // The run's end is its command's, and its row in the trail ends too.
+    db.process_finish(p1, &json!({"exit_code":0,"success":true}), &[], &[])
+        .unwrap();
+    assert!(db.lifted_waiting().unwrap().is_empty());
+    assert_eq!(
+        db.approvals(Some("Bob"), None, 0, None, 64).unwrap()["approvals"],
+        json!([])
+    );
+    let trail = db
+        .audit(&agent_runtime::store::audit::Query::default())
+        .unwrap();
+    let outcomes: Vec<(&str, &str)> = (trail["rows"].as_array().unwrap().iter())
+        .map(|row| {
+            (
+                row["call_id"].as_str().unwrap(),
+                row["outcome"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert!(outcomes.contains(&("s1", "completed")), "{outcomes:?}");
+    assert!(outcomes.contains(&("s2", "denied")), "{outcomes:?}");
+}
+
+/// A call its client answers that a message lifted keeps waiting for that
+/// answer past its turn: listed for its client, answered into its command,
+/// or stopped by its agent; and across a restart it still waits.
+#[test]
+fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart() {
+    let path = std::env::temp_dir().join(format!("agent-lifted-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let start = Declared {
+        name: "start".into(),
+        description: "Start.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        grammar: None,
+        steps: false,
+        inherit: Inherit::All,
+        kind: None,
+    };
+    let (turn, p1, p2) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create(
+            "Lead",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(std::slice::from_ref(&start)),
+                ..binding()
+            },
+        )
+        .unwrap();
+        let turn = db
+            .begin(
+                "Lead",
+                "request",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let calls: Vec<ToolCall> = (1..=2)
+            .map(|n| ToolCall {
+                name: "start".into(),
+                call_id: format!("c{n}"),
+                arguments: "{}".into(),
+                custom: false,
+            })
+            .collect();
+        db.append(turn, vec![], &calls, None).unwrap();
+        for call in &calls {
+            db.tool_start(turn, call, false, false).unwrap();
+        }
+        let now = epoch_now();
+        let p1 = db.lift(turn, "c1", None, now).unwrap().unwrap();
+        let p2 = db.lift(turn, "c2", None, now).unwrap().unwrap();
+        db.append(turn, vec![assistant("done")], &[], None).unwrap();
+        db.finish(turn, None).unwrap();
+        (turn, p1, p2)
+    };
+    // Reopened, as a restart does: the lifted calls still wait.
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(
+        db.process_result(p1).unwrap().map(|(status, _)| status),
+        Some("running".into())
+    );
+    let listed = db.tool_calls("sonny", 0, 10).unwrap();
+    let ids: Vec<&str> = (listed["calls"].as_array().unwrap().iter())
+        .filter_map(|call| call["call_id"].as_str())
+        .collect();
+    assert_eq!(ids, ["c1", "c2"]);
+    let now = epoch_now();
+    db.take_call("Lead", turn, "c1", now).unwrap();
+    let answered = db
+        .answer_call("Lead", turn, "c1", result("{\"started\":true}"), now)
+        .unwrap();
+    assert_eq!(answered.lifted, Some(p1));
+    let Lifted::Ended { result: ended, .. } = db.lifted_check(p1, now, false).unwrap() else {
+        panic!("an answered call did not end");
+    };
+    assert_eq!(ended, json!({"answer":"{\"started\":true}"}));
+    // Its agent stops the other: withdrawn, never answered.
+    let Some(Lifted::Ended {
+        result: stopped, ..
+    }) = db.lifted_stop("Lead", p2).unwrap()
+    else {
+        panic!("a waiting call was not stopped");
+    };
+    assert_eq!(stopped["error"], "stopped");
+    let Err(late) = db.answer_call("Lead", turn, "c2", result("late"), now) else {
+        panic!("a stopped call took an answer");
+    };
+    assert_eq!(late.code, "stale_turn");
+    assert!(db.lifted_stop("Lead", p1).unwrap().is_none());
+    assert!(db.lifted_waiting().unwrap().is_empty());
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A message for a turn parked on a verdict wakes it, to lift the call;
+/// one that cannot join the turn leaves it parked.
+#[test]
+fn a_message_for_the_turn_wakes_a_verdict_park() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (item, call) = shell_call("fc_1", "s1", "true");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    let now = epoch_now();
+    assert!(
+        db.suspend_approval(turn, std::slice::from_ref(&call), now, None, None)
+            .unwrap()
+            .is_some()
+    );
+    assert!(matches!(
+        db.wake("Bob", turn, false).unwrap(),
+        Wake::Later(None)
+    ));
+    assert_eq!(db.steered_park("Bob").unwrap(), None);
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    let sent = db
+        .begin("Bob", "steer", "stop that", true, &steer, allow_provider)
+        .unwrap();
+    assert_eq!(db.steered_park("Bob").unwrap(), Some((turn, sent.turn)));
+    assert!(matches!(db.wake("Bob", turn, false).unwrap(), Wake::Resume));
 }

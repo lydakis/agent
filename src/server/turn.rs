@@ -20,8 +20,8 @@ use agent_runtime::{
     sandbox::Policy,
     store::{
         AfterTurn, Answer, Bot, CallAnswer, Charge, ContextPrefix, ContextUsage, Database,
-        ElisionPlan, Gated, Halt, Halted, Limit, Settings, Slot, Spend, Store, Strip,
-        TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
+        ElisionPlan, Gated, Halt, Halted, Lifted, LiftedRun, Limit, Settings, Slot, Spend, Store,
+        Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
     tools::{Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry},
 };
@@ -458,6 +458,9 @@ impl Stop {
 enum Approval {
     Run,
     Denied,
+    /// A message lifted it to the background: its call is answered with
+    /// the handle, recorded already.
+    Lifted,
     Stop(Stop),
 }
 
@@ -2810,23 +2813,40 @@ impl Turn {
                 // started; an answer park first records the answer, and a
                 // wait park the wait's result.
                 if waiting.answer.is_some() {
-                    let id = waiting.call_id.clone();
-                    let outcome = match self
-                        .store
-                        .op("answer_take", move |db| db.answer_take(turn, &id, now_ms()))
-                        .await?
-                    {
-                        CallAnswer::Given(outcome) => outcome,
+                    let take = || {
+                        let id = waiting.call_id.clone();
+                        self.store
+                            .op("answer_take", move |db| db.answer_take(turn, &id, now_ms()))
+                    };
+                    let outcome = match take().await? {
+                        CallAnswer::Given(outcome) => Some(outcome),
+                        // Woken by a message for the turn: the call is
+                        // lifted to the background, unless its answer came
+                        // or its time ran out meanwhile.
+                        CallAnswer::Pending { .. }
+                            if self.lift.is_armed()
+                                && self.lift_call(&waiting.call_id, None).await? =>
+                        {
+                            None
+                        }
+                        CallAnswer::Pending { .. } if self.lift.is_armed() => match take().await? {
+                            CallAnswer::Given(outcome) => Some(outcome),
+                            CallAnswer::Pending { .. } => {
+                                return fail("invalid_tool_state");
+                            }
+                        },
                         // Woken by a later gated call's lapse, which ends
                         // the turn: the call ends unanswered.
-                        CallAnswer::Pending { .. } => {
-                            unserved("a later call's gate lapsed before the answer".into())
-                        }
+                        CallAnswer::Pending { .. } => Some(unserved(
+                            "a later call's gate lapsed before the answer".into(),
+                        )),
                     };
-                    let id = waiting.call_id.clone();
-                    self.store
-                        .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
-                        .await?;
+                    if let Some(outcome) = outcome {
+                        let id = waiting.call_id.clone();
+                        self.store
+                            .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
+                            .await?;
+                    }
                 } else if waiting.poll {
                     // A terminal poll reads what the terminal wrote while
                     // the turn was parked, or how it ended; a restart ended
@@ -4328,7 +4348,7 @@ impl Turn {
                     .await?
                 {
                     Approval::Run => {}
-                    Approval::Denied => continue,
+                    Approval::Denied | Approval::Lifted => continue,
                     Approval::Stop(stop) => return Ok(Some(stop)),
                 }
             } else {
@@ -4390,7 +4410,9 @@ impl Turn {
                     .await_answer(&call.call_id, &mut calls, route, summary_retry_ms)
                     .await?
                 {
-                    ControlFlow::Continue(outcome) => outcome,
+                    ControlFlow::Continue(Some(outcome)) => outcome,
+                    // Lifted: its handle answers it, recorded already.
+                    ControlFlow::Continue(None) => continue,
                     ControlFlow::Break(stop) => return Ok(Some(stop)),
                 },
                 Ok(Prepared::Declared(result)) => Outcome::text(result),
@@ -4565,9 +4587,14 @@ impl Turn {
                             seen = Self::seen(handle, &outcome);
                             outcome
                         }
-                        Ran::Done(Err(error)) if error.code == "terminal_not_running" => {
-                            failure(self.no_terminal(handle, error).await?)
-                        }
+                        Ran::Done(Err(error)) if error.code == "terminal_not_running" => match kill
+                        {
+                            true => match self.stop_handle(handle).await? {
+                                Some(outcome) => outcome,
+                                None => failure(self.no_terminal(handle, error).await?),
+                            },
+                            false => failure(self.no_terminal(handle, error).await?),
+                        },
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
@@ -5080,11 +5107,21 @@ impl Turn {
                     }
                 }
             };
+            // A message for the turn lifts the call to the background, as
+            // it lifts a command: the turn takes the message, and the call
+            // waits on for its verdict.
+            if self.lift.is_armed() {
+                match self.lift_call(&call.call_id, Some(call)).await? {
+                    true => return Ok(Approval::Lifted),
+                    false => continue,
+                }
+            }
             let wake = lapse.map_or(hold, |lapse| lapse.min(hold));
             if tokio::time::Instant::now() < wake {
                 tokio::select! {
                     () = notify.notified() => continue,
                     () = tokio::time::sleep_until(wake) => {}
+                    () = self.lift.lifted() => continue,
                 }
             }
             // A lapsed gate is judged by the next check.
@@ -5205,6 +5242,20 @@ impl Turn {
         })
     }
 
+    /// Lift `call_id`, waiting on its verdict or its client's answer, to
+    /// the background for a message that joins the turn. False when it is
+    /// decided or answered by now: the next check takes it.
+    async fn lift_call(&self, call_id: &str, call: Option<&ToolCall>) -> Result<bool> {
+        let (turn, id, call) = (self.turn, call_id.to_owned(), call.cloned());
+        Ok(self
+            .store
+            .op("lift", move |db| {
+                db.lift(turn, &id, call.as_ref(), now_ms())
+            })
+            .await?
+            .is_some())
+    }
+
     /// Wait for an answered call's answer: live for the hold, then parked
     /// like `wait`, holding no task and no slot, until the answer comes or
     /// the call's time runs out. Answers wake the task through the worker,
@@ -5215,7 +5266,7 @@ impl Turn {
         calls: &mut std::vec::IntoIter<ToolCall>,
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
-    ) -> Result<ControlFlow<Stop, Outcome>> {
+    ) -> Result<ControlFlow<Stop, Option<Outcome>>> {
         let turn = self.turn;
         // A client that answers is a program, near at hand: a short hold
         // takes its answer live, and a slower one parks without the slot.
@@ -5228,9 +5279,17 @@ impl Turn {
                 .op("answer_take", move |db| db.answer_take(turn, &id, now_ms()))
                 .await?
             {
-                CallAnswer::Given(outcome) => return Ok(ControlFlow::Continue(outcome)),
+                CallAnswer::Given(outcome) => return Ok(ControlFlow::Continue(Some(outcome))),
                 CallAnswer::Pending { notify, expires_ms } => (notify, expires_ms),
             };
+            // A message for the turn lifts the call to the background: its
+            // answer comes later, as the command's result.
+            if self.lift.is_armed() {
+                match self.lift_call(call_id, None).await? {
+                    true => return Ok(ControlFlow::Continue(None)),
+                    false => continue,
+                }
+            }
             // No deadline while a step of the call waits on a gate.
             let lapse = expires_ms.map(|at| {
                 tokio::time::Instant::now() + Duration::from_millis(at.saturating_sub(now_ms()))
@@ -5240,6 +5299,7 @@ impl Turn {
                 tokio::select! {
                     () = notify.notified() => continue,
                     () = tokio::time::sleep_until(wake) => {}
+                    () = self.lift.lifted() => continue,
                 }
             }
             // A call out of time is answered by the next check.
@@ -5628,6 +5688,7 @@ impl Turn {
             .await?;
         let (sender, receiver) = oneshot::channel();
         self.registry.background(
+            id,
             command,
             workspace,
             timeout_ms,
@@ -5662,7 +5723,9 @@ impl Turn {
             .op("process_start", move |db| db.process_start(turn, &started))
             .await?;
         let (sender, receiver) = oneshot::channel();
-        let run = self.registry.until_pulled(run);
+        let run = self
+            .registry
+            .until_stopped(id, self.registry.until_pulled(run));
         // Counted as the process it is now, not as a foreground command too.
         place.lift();
         tokio::spawn(async move {
@@ -5686,13 +5749,308 @@ impl Turn {
         outputs: Option<Outputs>,
         terminal: Option<Registry>,
     ) {
-        let turn = self.turn;
+        let lifts = Lifts {
+            store: self.store.clone(),
+            registry: self.registry.clone(),
+            handles: self.handles.clone(),
+            failures: self.background_failures.clone(),
+        };
+        lifts.collect(
+            &self.bot, self.turn, id, call_id, receiver, outputs, terminal,
+        );
+    }
+}
+
+/// What runs the calls a message lifted from their turns, away from any
+/// turn: the daemon's parts a call and its command's end need.
+#[derive(Clone)]
+pub struct Lifts {
+    pub store: Store,
+    pub registry: Registry,
+    pub handles: Handles,
+    pub failures: mpsc::UnboundedSender<Error>,
+}
+
+impl Lifts {
+    /// Check the calls a message lifted, by their commands, off the run
+    /// loop, and act on what each comes to: its time on the schedule, its
+    /// end recorded and told, or, allowed, its run as its command. While
+    /// the daemon is `held` (paused, stopping), an allowed call waits.
+    pub fn check(&self, processes: Vec<i64>, held: bool) {
+        if processes.is_empty() {
+            return;
+        }
+        let lifts = self.clone();
+        tokio::spawn(async move {
+            for process in processes {
+                if let Err(error) = lifts.check_one(process, held).await {
+                    // A closed receiver means the service has already exited.
+                    let _ = lifts.failures.send(error);
+                }
+            }
+        });
+    }
+
+    async fn check_one(&self, process: i64, held: bool) -> Result<()> {
+        let found = self
+            .store
+            .op("lifted_check", move |db| {
+                db.lifted_check(process, now_ms(), held)
+            })
+            .await?;
+        match found {
+            Lifted::Waiting(at) => self.handles.lifted_lapses(process, at),
+            Lifted::Ended { result, ready } => {
+                self.handles.lifted_lapses(process, None);
+                self.handles.process_finished(process, result);
+                if ready {
+                    self.handles.turn_ready();
+                }
+            }
+            Lifted::Run(run) => {
+                self.handles.lifted_lapses(process, None);
+                self.run(*run).await;
+            }
+            Lifted::Gone => self.handles.lifted_lapses(process, None),
+        }
+        Ok(())
+    }
+
+    /// Run a lifted call its gates allowed, as its command: the bot as it
+    /// is now, in its turn's folder, with what the turn's commands get in
+    /// their environment. A command runs in the background, its end told
+    /// as any background command's is; any other call's result is the
+    /// command's. A call that reads or changes its turn's own state has no
+    /// turn to run in, and says so.
+    async fn run(&self, run: LiftedRun) {
+        let LiftedRun {
+            process,
+            turn,
+            call,
+            bot,
+            workspace,
+            model,
+            effort,
+            ruling,
+            confined,
+        } = run;
+        let (sender, receiver) = oneshot::channel();
+        let Some(workspace) = workspace.map(PathBuf::from) else {
+            self.collect(
+                &bot.name,
+                turn,
+                process,
+                &call.call_id,
+                receiver,
+                None,
+                None,
+            );
+            let _ = sender.send(Err(Error::new("workspace_required")));
+            return;
+        };
+        let mut environment: Vec<(String, String)> = (bot.settings.env.iter())
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        environment.extend([
+            (
+                "AGENT_MODEL".to_owned(),
+                model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model)),
+            ),
+            ("AGENT_BOT".to_owned(), bot.name.clone()),
+            ("AGENT_BOT_ID".to_owned(), bot.bot_id.to_string()),
+            ("AGENT_TURN".to_owned(), turn.to_string()),
+        ]);
+        if let Some(level) = effort.or_else(|| bot.effort.clone()) {
+            environment.push(("AGENT_EFFORT".to_owned(), level));
+        }
+        if let (Some(parent), Some(id)) = (&bot.created_by, bot.created_by_id) {
+            environment.push(("AGENT_PARENT".to_owned(), parent.clone()));
+            environment.push(("AGENT_PARENT_ID".to_owned(), id.to_string()));
+        }
+        let root = (bot.workspace.as_ref()).map_or_else(|| workspace.clone(), PathBuf::from);
+        let outputs = (bot.settings.outputs.as_ref()).map(|folder| Outputs {
+            folder: PathBuf::from(folder),
+            settings: bot.settings.clone(),
+            root: root.clone(),
+            daemon: self.registry.daemon().clone(),
+        });
+        // As its turn would prepare it, its gates having allowed it: the
+        // command rules as its round was announced still refuse a
+        // forbidden command.
+        let prepared = if let Some(tool) = bot.declared(&call.name) {
+            agent_runtime::tools::check_declared(tool, &call.arguments)
+                .map(|()| Prepared::Declared(tool.result.clone()))
+        } else if bot.callable().iter().any(|name| name == &call.name) {
+            self.registry.prepare(&call.name, &call.arguments)
+        } else {
+            Err(Error::with("tool_not_available", call.name.as_str()))
+        };
+        let prepared = prepared.and_then(|prepared| match ruling.as_deref().map(Ruling::read) {
+            Some(Ok(Ruling::Forbidden(why))) => Err(Error::with("command_forbidden", why.as_str())),
+            Some(Err(error)) => Err(error),
+            _ => Ok(prepared),
+        });
+        let sandbox = match (&prepared, confined) {
+            (Ok(_), true) => {
+                let (settings, daemon, id, root) = (
+                    bot.settings.clone(),
+                    self.registry.daemon().clone(),
+                    bot.bot_id,
+                    root.clone(),
+                );
+                match tokio::task::spawn_blocking(move || {
+                    bot_sandbox(&settings, &root, id, &daemon)
+                })
+                .await
+                .map_err(|_| Error::new("sandbox_unavailable"))
+                .flatten()
+                {
+                    Ok(policy) => policy.map(Arc::new),
+                    Err(error) => {
+                        self.collect(
+                            &bot.name,
+                            turn,
+                            process,
+                            &call.call_id,
+                            receiver,
+                            None,
+                            None,
+                        );
+                        let _ = sender.send(Err(error));
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
+        let terminal = matches!(prepared, Ok(Prepared::Terminal { .. }));
+        self.collect(
+            &bot.name,
+            turn,
+            process,
+            &call.call_id,
+            receiver,
+            outputs,
+            terminal.then(|| self.registry.clone()),
+        );
+        match prepared {
+            Ok(Prepared::Shell {
+                command,
+                timeout_ms,
+                workdir,
+                ..
+            }) => match self.registry.queue() {
+                Ok(queued) => self.registry.background(
+                    process,
+                    command,
+                    Prepared::folder(&workspace, workdir.as_deref()),
+                    timeout_ms,
+                    environment,
+                    sandbox,
+                    queued,
+                    sender,
+                ),
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                }
+            },
+            // Started as its handle: its first output goes unread, and its
+            // end is told as a background command's.
+            Ok(Prepared::Terminal {
+                command,
+                yield_ms,
+                workdir,
+            }) => {
+                let registry = self.registry.clone();
+                let folder = Prepared::folder(&workspace, workdir.as_deref());
+                tokio::spawn(async move {
+                    let _ = registry
+                        .terminal(
+                            bot.bot_id,
+                            process,
+                            command,
+                            folder,
+                            yield_ms,
+                            environment,
+                            sandbox,
+                            sender,
+                        )
+                        .await;
+                });
+            }
+            Ok(Prepared::WriteStdin {
+                handle,
+                chars,
+                yield_ms,
+                kill,
+            }) => {
+                let registry = self.registry.clone();
+                tokio::spawn(async move {
+                    let typed = registry
+                        .write_stdin(bot.bot_id, handle, &chars, yield_ms, kill, sandbox)
+                        .await;
+                    let _ = sender.send(typed);
+                });
+            }
+            Ok(Prepared::Declared(result)) => {
+                let _ = sender.send(Ok(Outcome::text(result)));
+            }
+            Ok(
+                Prepared::Wait { .. }
+                | Prepared::Note { .. }
+                | Prepared::History { .. }
+                | Prepared::HistoryAudit(_)
+                | Prepared::HistorySearch { .. }
+                | Prepared::WebSearch(_)
+                | Prepared::Read {
+                    source: ReadSource::Result { .. } | ReadSource::Artifact { .. },
+                    ..
+                },
+            ) => {
+                let _ = sender.send(Err(Error::with(
+                    "turn_ended",
+                    format!(
+                        "{} reads or changes its turn, which ended before its approval came; call it again",
+                        call.name
+                    ),
+                )));
+            }
+            Ok(prepared) => {
+                let registry = self.registry.clone();
+                tokio::spawn(async move {
+                    let ran = registry
+                        .execute(prepared, &workspace, &environment, sandbox)
+                        .await;
+                    let _ = sender.send(ran);
+                });
+            }
+            Err(error) => {
+                let _ = sender.send(Err(error));
+            }
+        }
+    }
+
+    /// Record a background command's result when it arrives and wake those
+    /// waiting on its handle. A terminal's, `terminal`, stays in the
+    /// registry with its end until then, so a poll never finds it gone
+    /// with no result.
+    #[allow(clippy::too_many_arguments)]
+    fn collect(
+        &self,
+        bot: &str,
+        turn: i64,
+        id: i64,
+        call_id: &str,
+        receiver: oneshot::Receiver<Result<Outcome>>,
+        outputs: Option<Outputs>,
+        terminal: Option<Registry>,
+    ) {
         let (store, handles, failures, call_id_for_refs, bot) = (
             self.store.clone(),
             self.handles.clone(),
-            self.background_failures.clone(),
+            self.failures.clone(),
             call_id.to_owned(),
-            self.bot.clone(),
+            bot.to_owned(),
         );
         tokio::spawn(async move {
             let result = receiver.await.unwrap_or_else(|_| fail("process_lost"));
@@ -6753,6 +7111,48 @@ fn completion_text(items: &[Bytes]) -> String {
 }
 
 impl Turn {
+    /// Stop `handle`, a command of this bot's with no terminal: a call a
+    /// message lifted, still waiting for its verdict or answer, is
+    /// withdrawn, never run; a background command is killed. Its end is
+    /// this result, so nothing tells it later. `None` when it is neither.
+    async fn stop_handle(&self, handle: i64) -> Result<Option<Outcome>> {
+        let bot = self.bot.clone();
+        let registry = self.registry.clone();
+        let stopped = self
+            .store
+            .op("stop_handle", move |db| {
+                if let Some(ended) = db.lifted_stop(&bot, handle)? {
+                    db.saw_end(handle)?;
+                    return Ok(Some(Some(ended)));
+                }
+                // Marked seen first: once killed, its end is recorded as it
+                // comes, untold.
+                if db.runs_for(&bot, handle)? && registry.stop(handle) {
+                    db.saw_end(handle)?;
+                    return Ok(Some(None));
+                }
+                Ok(None)
+            })
+            .await?;
+        let name = format!("proc:{handle}");
+        Ok(match stopped {
+            Some(Some(Lifted::Ended { result, ready })) => {
+                self.handles.process_finished(handle, result.clone());
+                if ready {
+                    self.handles.turn_ready();
+                }
+                Some(Outcome::text(
+                    json!({"handle":name,"stopped":true,"ran":false,"detail":result["detail"]})
+                        .to_string(),
+                ))
+            }
+            Some(_) => Some(Outcome::text(
+                json!({"handle":name,"stopped":true,"ran":true}).to_string(),
+            )),
+            None => None,
+        })
+    }
+
     /// Why `write_stdin` found no terminal `handle`: `error`, unless the
     /// handle is a command of this bot's that runs without a terminal.
     async fn no_terminal(&self, handle: i64, error: Error) -> Result<Error> {
@@ -6764,7 +7164,7 @@ impl Turn {
             true => Error::with(
                 "not_a_terminal",
                 format!(
-                    "proc:{handle} is a background command, not a terminal: write_stdin types into and kills only commands started with tty=true; a background command runs until it exits or reaches its timeout_ms, and wait on it reports how it ended"
+                    "proc:{handle} is a background command, not a terminal: write_stdin types only into commands started with tty=true; kill=true ends it, and wait on it reports how it ended"
                 ),
             ),
             false => error,

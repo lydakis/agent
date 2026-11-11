@@ -4793,7 +4793,7 @@ impl Naming {
 
 /// The kinds of event a lead's layout acts on (`Fleet::event`, `taken`,
 /// `resolved::Own::event`).
-const FLEET_KINDS: [&str; 12] = [
+const FLEET_KINDS: [&str; 14] = [
     "created",
     "forked",
     "deleted",
@@ -4807,6 +4807,9 @@ const FLEET_KINDS: [&str; 12] = [
     "tool_completed",
     "turn_resumed",
     "turn_finished",
+    // A call a message lifted out of its turn waits on past it.
+    "call_lifted",
+    "lifted_ended",
 ];
 
 /// How often a lead's window reads again which leads it follows.
@@ -10016,10 +10019,13 @@ impl App {
                     self.rows_drawn += held.len();
                     self.pending.extend(held);
                 }
-                self.approvals.retain(|call| call["call_id"] != id);
+                // One a message lifted waits on past its call's end.
+                self.approvals
+                    .retain(|call| call["call_id"] != id || !call["handle"].is_null());
                 if let Some(running) = &mut self.running {
                     // The judge may still be reviewing the round's others.
-                    running.phase = match self.approvals.is_empty() && !self.reviewing.is_empty() {
+                    let waiting = (self.approvals.iter()).any(|call| call["handle"].is_null());
+                    running.phase = match !waiting && !self.reviewing.is_empty() {
                         true => reviewing(self.reviewing.len()),
                         false => "Working".into(),
                     };
@@ -10028,6 +10034,18 @@ impl App {
             "approval_requested" | "approval_asked" | "step_decided" => {
                 self.approvals_for(turn).await
             }
+            // A message lifted a call out of its turn: it waits on past
+            // that turn, until its verdict or its agent ends its wait.
+            "call_lifted" => {
+                for call in &mut self.approvals {
+                    if call["call_id"] == data["call_id"] && call["turn"].as_i64() == turn {
+                        call["handle"] = data["handle"].clone();
+                    }
+                }
+            }
+            "lifted_ended" => self
+                .approvals
+                .retain(|call| call["handle"] != data["handle"]),
             "turn_waiting" => {
                 if let Some(running) = &mut self.running
                     && data["approval"] != true
@@ -10138,7 +10156,8 @@ impl App {
                     }
                 }
                 self.draw_bot_reactions();
-                self.approvals.clear();
+                // Those a message lifted wait on past it.
+                self.approvals.retain(|call| !call["handle"].is_null());
                 self.notice = None;
                 // Zen the agent set, or put in its own words, as the person
                 // asked: the turn's end is when to look.
@@ -10840,12 +10859,14 @@ impl App {
             })
             .filter_map(|call| call["call_id"].as_str().map(str::to_owned))
             .collect();
+        // The running turn's, and those a message lifted out of their
+        // turn, which wait on past it.
         self.approvals = page["approvals"]
             .as_array()
             .into_iter()
             .flatten()
             .filter(|call| {
-                call["turn"].as_i64() == turn
+                (call["turn"].as_i64() == turn || !call["handle"].is_null())
                     && (!call["asked"].is_null()
                         || call["gates"]
                             .as_array()
@@ -10857,7 +10878,7 @@ impl App {
             whole_arguments(&self.client, &self.bot, call).await;
         }
         if let Some(running) = &mut self.running {
-            if !self.approvals.is_empty() {
+            if (self.approvals.iter()).any(|call| call["handle"].is_null()) {
                 running.phase = "Waiting for your approval".into();
             } else if !self.reviewing.is_empty() {
                 running.phase = reviewing(self.reviewing.len());

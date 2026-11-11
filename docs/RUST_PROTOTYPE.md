@@ -3168,7 +3168,11 @@ call still unanswered at `expires_ms` ends with
 model can act on it; the service wakes a parked one then from its own
 schedule, so a waiting call costs a row and no timer. A later call's gate that
 lapses first ends the wait as `tool_unserved` and the turn as it ends one
-waiting on a verdict. An interrupt ends the call as cancelled, like any
+waiting on a verdict. A message that joins the turn lifts the wait as it
+lifts a verdict's (see [tool approval](#tool-approval)): the call becomes a
+`proc:` handle answered `"waits_for":"answer"`, its client still lists,
+takes and answers it, and the answer ends the command, told as
+`{"answer": TEXT}`. An interrupt ends the call as cancelled, like any
 running call. A call that does not fit its
 parameters is refused at once and waits for no answer.
 
@@ -3301,6 +3305,34 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   it survives restart. A verdict for a parked turn is committed on arrival
   and resumes the turn only if it parked on that call and the call is now
   decided; a verdict for a call after a `wait` waits in the store.
+- **A message lifts the wait** (protocol 64, schema 91). A steer that
+  joins the turn while a call waits for its verdict, held live (after the
+  same 250 ms grace a foreground `shell` gets) or parked, wakes the turn
+  and lifts the call: one commit writes a `processes` row for it, gives
+  its request `process` (an indexed column), and answers the call with
+  `{"handle":"proc:N","background":true,"steered":true,"waits_for":"approval"}`,
+  so the round goes on and the turn reads the message. `call_lifted`
+  `{call_id, handle, waits_for}` says so. Nothing is cancelled: the request
+  stays listed (with `handle`), served and answerable past its turn's end,
+  and a restart keeps it. Its verdict now goes to the command. A deny or a
+  lapse ends it with the result the call would have had; an allow runs the
+  call then, in the background, as the bot is now, in its turn's folder
+  with that turn's model, effort and environment, its command rules as its
+  round was announced: a shell command as a background one, a terminal
+  under its handle, any other call's result as the command's; a call that
+  reads or changes its own turn (`wait`, `note`, `history`, `read` of a
+  result) fails `turn_ended`. `lifted_ended` `{call_id, handle, outcome}`
+  marks the end of the wait (`allowed`, with `approvals`, `denied`,
+  `expired`, `answered`, `unserved`, `withdrawn` or `stopped`). The end is
+  told as a background command's is, with the first 2,048 bytes of the
+  call's `output` (or of an answered call's `answer`), and a `wait` on the
+  handle collects it whole. The agent may stop it: `write_stdin` with
+  `kill: true` on the handle withdraws a request still waiting (`withdrawn`,
+  never run) and kills a command it started, answering
+  `{"handle","stopped":true,"ran":BOOL}`; the same kill ends any background
+  command. The expiry keeps its meaning, on the run loop's one schedule.
+  Waits the agent did not start (a provider's pacing, a pause, a shutdown,
+  the load gate) keep the message for later, and an `attach` never lifts.
 - **Expiry.** With `approve_expire_ms`, a call still without that gate's
   verdict that long after it was announced, however long the calls before
   it ran, is denied with "not reviewed: no verdict" (`tool_completed`
@@ -3333,7 +3365,8 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   name over 128 bytes); `arguments` is null when they are not a JSON
   object, which no tool accepts. The previews are taken once, when the
   call is planned, so a listing reads no item. One bot's listing reads
-  only its running turn's calls, and one tag's only the calls still
+  only its running turn's calls and, through a partial index, those a
+  message lifted (above), and one tag's only the calls still
   waiting on that tag, through an index of each call's tags: written with
   its announcement, and a tag taken out when its answer is stored (every
   tag, for a deny). An answer the storage worker still holds skips the

@@ -1941,6 +1941,63 @@ class RuntimeTests(ModelFixture):
             time.sleep(.05)
         self.assertEqual(client.request('stats')['result']['running_processes'], 0)
 
+    def test_a_message_lifts_an_approval_wait_and_the_verdict_reports_back(self):
+        def respond(request, user):
+            if not user.startswith('lift:'):
+                return None
+            start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user'
+                        and not i['content'][0]['text'].startswith('steer:'))
+            outputs = [i['output'] for i in request['input'][start:] if i.get('type') == 'function_call_output']
+            if outputs:
+                return 'seen:' + outputs[-1]
+            if user.startswith('lift:stop:'):
+                return [['write_stdin', {'handle': user[10:], 'kill': True}]]
+            return [['echo', {'text': 'hi'}]]
+        self.model.respond = respond
+        for hold, bot in ((0, 'Parked'), (60_000, 'Held')):
+            client = self.client('echo,write_stdin', settings={'approval_hold_ms': hold})
+            client.request('create', bot=bot, workspace=str(self.path), approve=['echo'], approver='manual',
+                           tools=['echo', 'write_stdin'])
+            turn = client.request('submit', bot=bot, request_id='a', prompt='lift:approval')['result']['turn']
+            client.receive(lambda m: m.get('event') == 'approval_requested' and m.get('turn') == turn)
+            # A message lifts the wait: the call becomes a handle and the
+            # turn goes on to read the message.
+            client.request('submit', bot=bot, request_id='s', prompt='steer:look', delivery='steer')
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            text = poll(client, bot, turn)['result']['text']
+            lifted = json.loads(text.removeprefix('seen:'))
+            self.assertEqual(lifted, {'handle': lifted['handle'], 'background': True,
+                                      'steered': True, 'waits_for': 'approval'}, bot)
+            # The request outlives the turn; its verdict runs the call and
+            # tells the bot how it ended.
+            client.request('answer', bot=bot, turn=turn, call_id='echo-1', request=1,
+                           decision='allow', by='test')
+            ended = client.receive(lambda m: m.get('event') == 'lifted_ended')
+            self.assertEqual(ended['data']['outcome'], 'allowed')
+            told = client.receive(lambda m: m.get('event') == 'queued' and m['data'].get('origin') == 'background')
+            self.assertEqual(client.finished(told['turn'])['data']['status'], 'completed')
+            reply = poll(client, bot, told['turn'])['result']['text']
+            self.assertIn(lifted['handle'], reply)
+            self.assertIn('hi', reply)
+            # A call still waiting is the agent's to stop: its request goes,
+            # and it never runs.
+            turn = client.request('submit', bot=bot, request_id='b', prompt='lift:approval')['result']['turn']
+            asked = client.receive(lambda m: m.get('event') == 'approval_requested' and m.get('turn') == turn)
+            client.request('submit', bot=bot, request_id='s2', prompt='steer:look', delivery='steer')
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            handle = json.loads(poll(client, bot, turn)['result']['text'].removeprefix('seen:'))['handle']
+            turn = client.request('submit', bot=bot, request_id='c', prompt=f'lift:stop:{handle}')['result']['turn']
+            done = client.finished(turn)
+            self.assertEqual(done['data']['status'], 'completed', done)
+            stopped = json.loads(poll(client, bot, turn)['result']['text'].removeprefix('seen:'))
+            self.assertEqual((stopped['handle'], stopped['stopped'], stopped['ran']), (handle, True, False))
+            ended = client.receive(lambda m: m.get('event') == 'lifted_ended' and m['data']['handle'] == handle)
+            self.assertEqual(ended['data']['outcome'], 'withdrawn')
+            late = client.request('answer', bot=bot, turn=asked['turn'], call_id='echo-1',
+                                  request=asked['data']['calls'][0]['request'], decision='allow', by='test')
+            self.assertIn('error', late)
+            client.close(kill=True)
+
     def test_a_client_searches_every_bots_history_as_the_tool_does(self):
         client = self.client()
         self.addCleanup(lambda: client.close(kill=True))
@@ -2822,16 +2879,18 @@ class RuntimeTests(ModelFixture):
         # A background command has no terminal: write_stdin says so to the
         # bot that started it, and nothing more to another.
         background = call('Bob', 'b1', 'shell', {'command': 'sleep 600', 'background': True})['handle']
-        # Whether it types, polls past the hold, or kills.
+        # Whether it types or polls past the hold; only its own bot kills it.
         for bot, request_id, said, arguments in (
-                ('Bob', 'b2', 'not_a_terminal', {'handle': background, 'kill': True}),
                 ('Bob', 'b3', 'not_a_terminal', {'handle': background}),
                 ('Bob', 'b4', 'not_a_terminal', {'handle': background, 'chars': 'x'}),
-                ('Eve', 'e2', 'terminal_not_running', {'handle': background, 'kill': True})):
+                ('Eve', 'e2', 'terminal_not_running', {'handle': background, 'kill': True}),
+                ('Bob', 'b2', '"stopped":true', {'handle': background, 'kill': True})):
             prompt = 'calls:' + json.dumps([['write_stdin', arguments]])
             turn = client.request('submit', bot=bot, request_id=request_id, prompt=prompt)['result']['turn']
             client.finished(turn)
             self.assertIn(said, poll(client, bot, turn)['result']['text'])
+        stopped = call('Bob', 'b5', 'wait', {'handles': [background]})['results'][background]
+        self.assertEqual(stopped['error'], 'stopped', stopped)
         # One still running ends with the daemon, which stops at once.
         self.assertTrue(call('Bob', 't4', 'shell', {'command': 'sleep 600', 'tty': True,
                                                     'yield_time_ms': 0})['running'])

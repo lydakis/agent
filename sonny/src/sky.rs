@@ -49,6 +49,8 @@ const LIVE: &[&str] = &[
     "step_decided",
     "turn_resumed",
     "turn_finished",
+    "call_lifted",
+    "lifted_ended",
     "configured",
 ];
 /// How long a spark takes to cross.
