@@ -474,11 +474,16 @@ impl Needs {
                     }
                 }
             }
-            // A reviewer handed the call to the person.
+            // A reviewer handed the call to the person, a step with the
+            // call it is a step of.
             "approval_asked" => {
                 if let Some(id) = data["call_id"].as_str() {
                     let calls = self.calls.entry(bot.to_owned()).or_default();
                     calls.insert((turn, id.to_owned()));
+                    if let Some(of) = data["step_of"].as_str() {
+                        let step = (bot.to_owned(), turn, id.to_owned());
+                        self.steps.insert(step, of.to_owned());
+                    }
                 }
             }
             // A call allowed starts; a question is asked as it starts.
@@ -846,6 +851,29 @@ mod tests {
         ));
         assert!(!needs.waits("p.fix"));
         assert!(needs.steps.is_empty() && needs.lifted.is_empty());
+    }
+
+    #[test]
+    fn a_step_a_reviewer_hands_over_waits_with_its_lifted_call() {
+        let mut needs = Needs::default();
+        needs.event(&event("p.fix", 3, "call_lifted", json!({"call_id": "c1"})));
+        // Announced for the reviewer only, then handed to the person.
+        let auto = json!({"calls": [{"call_id": "c1/1", "step_of": "c1", "gates": ["auto"]}]});
+        needs.event(&event("p.fix", 3, "approval_requested", auto));
+        assert!(!needs.waits("p.fix"));
+        needs.event(&event(
+            "p.fix",
+            3,
+            "approval_asked",
+            json!({"call_id": "c1/1", "step_of": "c1", "tag": "auto"}),
+        ));
+        needs.event(&event(
+            "p.fix",
+            3,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        assert_eq!(needs.calls().collect::<Vec<_>>(), [("p.fix", 3, "c1/1")]);
     }
 
     #[test]

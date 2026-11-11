@@ -9519,7 +9519,7 @@ impl Database {
             Some(answer.turn),
             "approval_asked",
             json!({"call_id":answer.call_id,"request":request.request,"tag":tag,
-                "reason":asked.reason,"by":asked.by}),
+                "reason":asked.reason,"by":asked.by,"step_of":request.step_of}),
         )?;
         tx.commit()?;
         Ok(Answered {

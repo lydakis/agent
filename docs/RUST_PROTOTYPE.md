@@ -1539,7 +1539,7 @@ hands the call to a person instead of deciding it. The gate stays open and
 the call keeps waiting; the request's row keeps one `{tag, reason, by,
 at_ms}` per gate that asked, which `approvals` and served listings show as
 `asked` while that gate is open, and the bot's followers get an `approval_asked` event with the call,
-request, tag, reason and `by`. A person then answers it like any other
+request, tag, reason and `by` (and `step_of` for a step, naming its call). A person then answers it like any other
 call, without a lease. Only a gate with no expiry can wait on a person: on
 one with `approve_expire_ms` the ask is refused with
 `approval_ask_expiring`, and the holder decides instead. A call announced
