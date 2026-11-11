@@ -811,6 +811,26 @@ class SocketAndCliTests(ModelFixture):
         kept = self.agent('run', *self.again, '--bot', 'Bob', '--request-id', 'new', 'second', timeout=3)
         self.assertIn('turn_finished', kept.stdout)
 
+    def test_retry_of_a_taken_message_whose_events_were_pruned_returns(self):
+        self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
+        busy = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'slow').stdout)
+        steer = ['run', '--store', str(self.store), '--bot', 'Bob', '--request-id', 'joined', '--delivery', 'steer', 'also']
+        joined = json.loads(self.agent(*steer[:-1], '--detach', 'also').stdout)
+        self.agent('wait', '--store', str(self.store), busy['handle'])
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        sent = control.request('messages', bot='Bob', after=joined['message'] - 1, limit=1)['result']['messages']
+        self.assertEqual((sent[0]['message'], sent[0]['status'], sent[0]['turn']),
+                         (joined['message'], 'taken', busy['turn']))
+        self.agent('run', *self.again, '--bot', 'Bob', 'later')
+        self.agent('prune', '--store', str(self.store), '--bot', 'Bob', '--keep-turns', '1')
+        # Its `steered` event is gone with the turn that took it in; the
+        # retry still learns that turn took it, and ends.
+        retried = self.agent(*steer, timeout=3)
+        self.assertEqual(json.loads(retried.stdout.splitlines()[-1])['event'], 'pruned')
+        pretty = self.agent(*steer[:1], '--pretty', *steer[1:], timeout=3)
+        self.assertIn(f"taken into turn {busy['turn']}", pretty.stderr)
+
     def test_detached_peer_handle_is_collected_by_wait(self):
         common = [*self.common[:-2], '--tools', 'echo,shell,wait']
         nested = '"$AGENT_BIN" run --detach --no-spawn --new --bot Alice -- hello'

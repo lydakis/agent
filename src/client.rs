@@ -3022,27 +3022,36 @@ impl Renderer {
 
     /// Returns an exit code when the followed turn is finished.
     fn event(&mut self, connection: &mut Connection, event: &Value) -> Result<Option<i32>> {
+        let mut taken = None;
         if event["event"] == "pruned"
             && let Some(turn) = self.turn
         {
-            // A retried turn may have lost its terminal event to retention.
-            // Reconcile the selected turn, not merely the bot's newest state.
-            // Retained and running turns still finish through normal events.
+            // A retried message may have lost its terminal event to
+            // retention. Reconcile the selected message, not merely the
+            // bot's newest state. One another turn took in has ended even
+            // when its `steered` event is gone; retained and running turns
+            // still finish through normal events.
             let handle = format!("{}/{turn}", event["bot"].as_str().unwrap_or(""));
             let found = connection.request("wait", json!({"handles":[&handle],"timeout_ms":0}))?;
-            if let Some(error) = Error::reported(&found["results"][&handle]) {
+            let answer = &found["results"][&handle];
+            if let Some(error) = Error::reported(answer) {
                 return Err(error);
+            }
+            if answer["status"] == "taken" {
+                taken = Some(json!({"status":"taken","turn":answer["turn"]}));
             }
         }
         // How the followed message's work ended: the turn it opened
         // finished, another turn took it in, or it ended in line.
-        let finished = self.turn.and_then(|t| match event["event"].as_str() {
-            Some("turn_finished") if event["turn"] == t => Some(event["data"].clone()),
-            Some("steered") if event["message"] == t => {
-                Some(json!({"status":"taken","turn":event["turn"]}))
-            }
-            Some("message_ended") if event["message"] == t => Some(event["data"].clone()),
-            _ => None,
+        let finished = taken.or_else(|| {
+            self.turn.and_then(|t| match event["event"].as_str() {
+                Some("turn_finished") if event["turn"] == t => Some(event["data"].clone()),
+                Some("steered") if event["message"] == t => {
+                    Some(json!({"status":"taken","turn":event["turn"]}))
+                }
+                Some("message_ended") if event["message"] == t => Some(event["data"].clone()),
+                _ => None,
+            })
         });
         if !self.pretty {
             say!("{event}");
