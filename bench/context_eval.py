@@ -142,7 +142,7 @@ def run_condition(binary, provider, family, url, key_env, env, model, condition,
         for index, prompt in enumerate(prompts):
             turns = {}
             for name in names:
-                turns[name] = client.request('submit', bot=name, request_id=f't{index}', prompt=prompt)['result']['turn']
+                turns[name] = client.request('submit', bot=name, request_id=f't{index}', prompt=prompt)['result']['message']
             statuses = {}
             for name, turn in turns.items():
                 finished = client.receive(lambda m, t=turn: m.get('event') == 'turn_finished' and m.get('turn') == t,

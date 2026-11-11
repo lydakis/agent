@@ -2313,7 +2313,7 @@ mod tests {
         let root = home.join(".agents/memory");
         let code = |r: Result<Value, String>| error_json(&r.unwrap_err())["error"].clone();
         let save = json!({"save": {"name": "pinned-version", "type": "reference",
-            "description": "The SDK pin a release note named", "source": "turn:shop.lead/4",
+            "description": "The SDK pin a release note named", "source": "shop.lead/4",
             "text": "Pin the SDK at 2.3.", "external": true}, "user": true});
         call(&home, &home, &save).unwrap();
         let file = std::fs::read_to_string(root.join("pinned-version.md")).unwrap();

@@ -669,7 +669,7 @@ impl Prior {
         }
         let slim = json!({"event": event["event"], "bot": to, "turn": event["turn"],
             "written_ms": event["written_ms"],
-            "data": {"from": data["from"], "steer": data["steer"]}});
+            "data": {"from": data["from"], "message": data["message"]}});
         self.told.insert(self.next, slim);
         self.next += 1;
         while self.told.len() > PRIOR {
@@ -1924,10 +1924,9 @@ impl View {
         }
         match event["event"].as_str().unwrap_or("") {
             kind @ ("queued" | "accepted" | "steered") => {
-                let sent_turn = match kind {
-                    "steered" => data["steer"].as_i64().unwrap_or(turn),
-                    _ => turn,
-                };
+                // The message each names: in line, opening a turn, or
+                // taken into one.
+                let sent_turn = event["message"].as_i64().unwrap_or(turn);
                 let from = self.sender(data, at);
                 // Past turns say who talked to whom; whether an agent works
                 // now is the listing's, and live events' after it.
@@ -2096,8 +2095,7 @@ impl View {
                     self.agents[at].twinkle = Some((now, FAILED, work));
                 }
             }
-            // A steer the running turn absorbed finishes as a turn of its
-            // own: only the running turn's end means the agent stopped.
+            // Only the running turn's end means the agent stopped.
             "turn_finished"
                 if self.agents[at]
                     .running
@@ -6900,7 +6898,7 @@ mod tests {
         // Task updates name no task: what they quote is the person's
         // words, so they come from the edge.
         let tasks = crate::lookout::TASKS_ORIGIN;
-        let quoting = json!({"origin": tasks, "quotes": [{"bot": "shop.login", "turn": 3}]});
+        let quoting = json!({"origin": tasks, "quotes": [{"bot": "shop.login", "message": 3}]});
         assert_eq!(view.sender(&quoting, lead), End::Rim(lead));
         // Follows and other people stay outside.
         assert_eq!(
@@ -7434,10 +7432,10 @@ mod tests {
         let (mut view, send) = view();
         send.send(Feed::Roll(vec![json!({"name": "a", "running_turn": 5})]))
             .unwrap();
-        // The daemon finishes the steer's own turn, then reports it steered.
+        // A message taken into the running turn ends no turn.
         send.send(Feed::Live(
-            json!({"event": "turn_finished", "bot": "a", "turn": 6,
-            "data": {"status": "steered", "into": 5}}),
+            json!({"event": "steered", "bot": "a", "turn": 5, "message": 6,
+            "data": {"message": 6, "node": 9}}),
         ))
         .unwrap();
         view.drain();

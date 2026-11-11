@@ -141,7 +141,7 @@ def run(binary, rounds, judge, *, providers, reasoning, note, parallel, out):
                 submitted = control.request('submit', bot=f'{bot}h', request_id=round['id'],
                                             prompt=round['prompt'])
                 assert 'result' in submitted, submitted
-                turn = submitted['result']['turn']
+                turn = submitted['result']['message']
                 by_turn[(f'{bot}h', turn)] = index
                 running[index] = (f'{bot}h', turn)
 

@@ -107,7 +107,7 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('bot_not_found', missing.stderr)
         first = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--pretty', 'hello')
         self.assertIn('reply:hello', first.stdout)
-        self.assertIn('turn 1 (new bot) in ' + str(self.path.resolve()), first.stderr)
+        self.assertIn('/1 (new bot) in ' + str(self.path.resolve()), first.stderr)
         self.assertIn('completed', first.stderr)
         self.assertTrue(self.socket.exists())
         second = self.agent('run', '--store', str(self.store), '--bot', 'Bob', 'tool:again')
@@ -178,7 +178,7 @@ class SocketAndCliTests(ModelFixture):
         with open(f'{self.store}.owner-lock', 'r+') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         with sqlite3.connect(self.store) as db:
-            status, = db.execute('SELECT status FROM turns WHERE id=?', (handle['turn'],)).fetchone()
+            status, = db.execute('SELECT status FROM turns WHERE id=?', (handle['message'],)).fetchone()
         self.assertNotIn(status, ('queued', 'ready', 'running'))
 
     def test_shutdown_grace_lets_the_running_turn_finish(self):
@@ -208,7 +208,7 @@ class SocketAndCliTests(ModelFixture):
         self.agent('shutdown', '--store', str(self.store), '--grace', '5s')
         self.assertFalse(self.socket.exists())
         with sqlite3.connect(self.store) as db:
-            status, = db.execute('SELECT status FROM turns WHERE id=?', (handle['turn'],)).fetchone()
+            status, = db.execute('SELECT status FROM turns WHERE id=?', (handle['message'],)).fetchone()
         self.assertEqual(status, 'completed')
 
     def test_start_creates_the_store_starts_one_daemon_and_prints_its_ready_line(self):
@@ -267,9 +267,9 @@ class SocketAndCliTests(ModelFixture):
         queued = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Slow', '--detach',
                                        '--delivery', 'queue', 'later').stdout)
         taken = json.loads(self.agent('interrupt', '--store', str(self.store), '--bot', 'Slow',
-                                      '--turn', str(queued['turn'])).stdout)
+                                      '--turn', str(queued['message'])).stdout)
         self.assertEqual((taken['handle'], taken['status'], taken['interrupt_requested']),
-                         (queued['handle'], 'interrupted', True))
+                         (queued['handle'], 'withdrawn', True))
         still = json.loads(self.agent('wait', '--store', str(self.store), '--timeout=0', slow, check=False).stdout)
         self.assertEqual(still['pending'], [slow])
         # interrupt prints the turn view, as it stood when asked.
@@ -320,8 +320,10 @@ class SocketAndCliTests(ModelFixture):
         # Unsaid, a message to a busy bot steers: it waits to join the running turn.
         joined = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'also').stdout)
         self.assertEqual(joined['status'], 'queued')
-        turns = json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)
-        self.assertEqual(next(t for t in turns if t['turn'] == joined['turn'])['delivery'], 'steer')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        sent = control.request('messages', bot='Bob', after=joined['message'] - 1, limit=1)['result']['messages']
+        self.assertEqual((sent[0]['message'], sent[0]['delivery']), (joined['message'], 'steer'))
         refused = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', '--delivery', 'reject',
                              'never', check=False)
         self.assertEqual(refused.returncode, 1)
@@ -353,12 +355,12 @@ class SocketAndCliTests(ModelFixture):
         moving = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', '--delivery', 'queue',
                                        '--workspace', str(other), 'third').stdout)
         steered = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--delivery=steer', '--pretty', 'late')
-        self.assertRegex(steered.stderr, r'steered into turn|completed')
+        self.assertRegex(steered.stderr, r'taken into turn|completed')
         done = json.loads(self.agent('wait', '--store', str(self.store), queued['handle']).stdout)
         self.assertEqual(done['results'][queued['handle']]['text'], 'reply:second')
         self.agent('wait', '--store', str(self.store), moving['handle'])
         turns = {t['turn']: t['workspace'] for t in json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)}
-        self.assertEqual((turns[queued['turn']], turns[moving['turn']]), (str(self.path.resolve()), str(other.resolve())))
+        self.assertEqual((turns[queued['message']], turns[moving['message']]), (str(self.path.resolve()), str(other.resolve())))
         busy = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'slow').stdout)
         strict = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach',
                                        '--delivery', 'steer', '--turn', str(busy['turn']), 'now').stdout)
@@ -452,7 +454,7 @@ class SocketAndCliTests(ModelFixture):
         # On an existing bot a level is that turn's alone, as --model is.
         for name in ('Alice', 'Carol', 'Dan'):
             turn = json.loads(self.agent('turns', '--store', str(self.store), '--bot', name).stdout)[-1]['turn']
-            self.agent('wait', '--store', str(self.store), f'turn:{name}/{turn}')
+            self.agent('wait', '--store', str(self.store), f'{name}/{turn}')
         while not self.model.requests.empty():
             self.model.requests.get_nowait()
         again = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--effort', 'low',
@@ -515,7 +517,7 @@ class SocketAndCliTests(ModelFixture):
                            f'shell:"$AGENT_BIN" run --detach {flags} -- hello')
                 turns = json.loads(self.agent('turns', '--store', str(self.store), '--bot', bot).stdout)
                 turn = turns[-1]
-                self.agent('wait', '--store', str(self.store), f'turn:{bot}/{turn["turn"]}')
+                self.agent('wait', '--store', str(self.store), f'{bot}/{turn["turn"]}')
                 self.assertEqual(turn['model'], f'{provider}/synthetic-model')
         # A one-turn override does not replace the bot's durable choice.
         listed = json.loads(self.agent('ls', '--store', str(self.store)).stdout)
@@ -654,7 +656,7 @@ class SocketAndCliTests(ModelFixture):
         # Resending the command gets the same copy and turn.
         again = json.loads(self.agent('run', *store, '--fork', 'Bob', '--bot', 'Bob.side', '--allow=',
                                       '--expires', '2s', '--detach', '--request-id', 'side', 'where are you?').stdout)
-        self.assertEqual(again['turn'], asked['turn'])
+        self.assertEqual(again['message'], asked['message'])
         listed = lambda: [b['name'] for b in json.loads(self.agent('ls', *store).stdout)]
         deadline = time.monotonic() + 15
         while 'Bob.side' in listed() and time.monotonic() < deadline:
@@ -737,7 +739,7 @@ class SocketAndCliTests(ModelFixture):
             while True:
                 response = client.request('submit', bot='Bob', request_id=str(n), prompt='fast')
                 if 'result' in response:
-                    turns.append(response['result']['turn'])
+                    turns.append(response['result']['message'])
                     break
                 self.assertEqual(response['error'], 'bot_busy')
                 self.assertLess(time.monotonic(), deadline)
@@ -750,10 +752,10 @@ class SocketAndCliTests(ModelFixture):
         client = SocketClient(self.binary, self.store, self.url, 'echo')
         self.addCleanup(client.close)
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='shutdown', prompt='wait')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='shutdown', prompt='wait')['result']['message']
         self.model.requests.get(timeout=3)
         follower = client.followers['Bob']
-        handle = f'turn:Bob/{turn}'
+        handle = f'Bob/{turn}'
         follower.socket.sendall((json.dumps({'id': 'waiter', 'op': 'wait', 'handles': [handle]}) + '\n').encode())
         # This acknowledgment ensures the wait is registered before shutdown
         # arrives on the independent control connection.
@@ -771,8 +773,8 @@ class SocketAndCliTests(ModelFixture):
         run = ['run', *self.common, '--new', '--bot', 'Once', '--request-id', 'once', '--detach', 'hello']
         first = json.loads(self.agent(*run).stdout)
         again = json.loads(self.agent(*run).stdout)
-        self.assertEqual((again['bot_id'], again['turn'], again['duplicate']),
-                         (first['bot_id'], first['turn'], True))
+        self.assertEqual((again['bot_id'], again['message'], again['duplicate']),
+                         (first['bot_id'], first['message'], True))
         changed = self.agent(*run[:-1], 'goodbye', check=False)
         self.assertEqual(json.loads(changed.stderr)['error'], 'idempotency_conflict')
         self.assertEqual(json.loads(changed.stderr)['field'], 'prompt')
@@ -809,6 +811,26 @@ class SocketAndCliTests(ModelFixture):
         kept = self.agent('run', *self.again, '--bot', 'Bob', '--request-id', 'new', 'second', timeout=3)
         self.assertIn('turn_finished', kept.stdout)
 
+    def test_retry_of_a_taken_message_whose_events_were_pruned_returns(self):
+        self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
+        busy = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'slow').stdout)
+        steer = ['run', '--store', str(self.store), '--bot', 'Bob', '--request-id', 'joined', '--delivery', 'steer', 'also']
+        joined = json.loads(self.agent(*steer[:-1], '--detach', 'also').stdout)
+        self.agent('wait', '--store', str(self.store), busy['handle'])
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        sent = control.request('messages', bot='Bob', after=joined['message'] - 1, limit=1)['result']['messages']
+        self.assertEqual((sent[0]['message'], sent[0]['status'], sent[0]['turn']),
+                         (joined['message'], 'taken', busy['turn']))
+        self.agent('run', *self.again, '--bot', 'Bob', 'later')
+        self.agent('prune', '--store', str(self.store), '--bot', 'Bob', '--keep-turns', '1')
+        # Its `steered` event is gone with the turn that took it in; the
+        # retry still learns that turn took it, and ends.
+        retried = self.agent(*steer, timeout=3)
+        self.assertEqual(json.loads(retried.stdout.splitlines()[-1])['event'], 'pruned')
+        pretty = self.agent(*steer[:1], '--pretty', *steer[1:], timeout=3)
+        self.assertIn(f"taken into turn {busy['turn']}", pretty.stderr)
+
     def test_detached_peer_handle_is_collected_by_wait(self):
         common = [*self.common[:-2], '--tools', 'echo,shell,wait']
         nested = '"$AGENT_BIN" run --detach --no-spawn --new --bot Alice -- hello'
@@ -825,7 +847,7 @@ class SocketAndCliTests(ModelFixture):
             sock.sendall((json.dumps({'id': 1, 'op': 'history_items', 'bot': 'Bob', 'nodes': [node]}) + '\n').encode())
             shell_result = json.loads(json.loads(reader.readline())['result']['items'][0]['item']['output'])
         handle = json.loads(shell_result['stdout'])['handle']
-        self.assertTrue(handle.startswith('turn:Alice/'), handle)
+        self.assertTrue(handle.startswith('Alice/'), handle)
         waited = self.agent('run', *with_socket, '--bot', 'Bob', 'wait:' + handle)
         kinds = [json.loads(line)['event'] for line in waited.stdout.splitlines()]
         self.assertIn('turn_waiting', kinds)
@@ -1002,7 +1024,7 @@ class SocketAndCliTests(ModelFixture):
         # turn before attaching, so the assertion actually exercises live follow.
         while True:
             request = self.model.requests.get(timeout=5)
-            if request['input'][-1].get('content') == [{'type': 'input_text', 'text': 'wait'}]:
+            if (request['input'][-1].get('content') or [{}])[0] == {'type': 'input_text', 'text': 'wait'}:
                 break
         follower = subprocess.Popen([*self.base, 'follow', '--store', str(self.store), '--bot', 'Alice',
                                      '--after', str(events[-3]['cursor'])], env=clean_env(),
@@ -1369,7 +1391,7 @@ class CliTests(ModelFixture):
                                             elif request['op'] == 'submit':
                                                 # The turn ran and ended before its submit's reply.
                                                 send(*earlier, *fast,
-                                                     dict(id=request['id'], result=dict(turn=8, cursor=5, status='accepted')))
+                                                     dict(id=request['id'], result=dict(message=8, turn=8, cursor=5, status='accepted')))
                                             else:
                                                 send(dict(id=request['id'], result={}))
                         except Exception as error:
@@ -1403,9 +1425,12 @@ class CliTests(ModelFixture):
                     db.execute("INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning)"
                                " VALUES (?,?,NULL,?,'running',?,'openai','responses','synthetic-model','',NULL)",
                                (f'old-{n}', n, directory, n))
-                    db.execute("INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model) VALUES (?,?,'old','check','running',?,'openai/synthetic-model')",
-                               (n, f'old-{n}', directory))
-                db.execute("UPDATE turn_sequence SET last_id=1024 WHERE singleton=1")
+                    db.execute("INSERT INTO messages(id,bot,request_id,delivery,status,turn,text,workspace,model)"
+                               " VALUES (?,?,'old','reject','taken',?,'check',?,'openai/synthetic-model')",
+                               (n, f'old-{n}', n, directory))
+                    db.execute("INSERT INTO turns(id,bot,status,workspace,model,started_ms)"
+                               " VALUES (?,?,'running',?,'openai/synthetic-model',0)", (n, f'old-{n}', directory))
+                db.execute("UPDATE message_sequence SET last_id=1024 WHERE singleton=1")
                 db.execute("UPDATE bot_sequence SET last_id=1024 WHERE singleton=1")
             barrier = threading.Barrier(16)
             common = ['--store', str(path), '--provider', 'openai=responses,'+self.url,
@@ -1841,7 +1866,7 @@ class CliTests(ModelFixture):
         for n in range(16):
             client.request('create', bot=f'caller-{n}', workspace=str(self.path))
             command = f'"$AGENT_BIN" run --detach --new --bot peer-{n} -- "shell:sleep .3; touch leaf-{n}"'
-            turns.append(client.request('submit', bot=f'caller-{n}', request_id='r', prompt='shell:'+command)['result']['turn'])
+            turns.append(client.request('submit', bot=f'caller-{n}', request_id='r', prompt='shell:'+command)['result']['message'])
         for turn in turns:
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         deadline = time.monotonic()+5

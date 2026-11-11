@@ -84,7 +84,7 @@ class ServedToolTests(ModelFixture):
         self.script.append((name, arguments))
         self.model.call_script = self.script
         turn = self.daemon.request('submit', bot=bot, request_id=f'{name}-{time.monotonic()}',
-                                   prompt='script', **submit)['result']['turn']
+                                   prompt='script', **submit)['result']['message']
         self.assertEqual(self.daemon.finished(turn, wait)['data']['status'], 'completed')
         return self.output(bot, turn)
 
@@ -121,7 +121,7 @@ class ServedToolTests(ModelFixture):
         ruled('cp')
         self.model.call_script = [('shell', {'command': f'cp /dev/null {self.path}/copied'}),
                                   ('shell', {'command': f'mkdir {self.path}/made'})]
-        turn = self.daemon.request('submit', bot='calc.lead', request_id='work', prompt='script')['result']['turn']
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='work', prompt='script')['result']['message']
         deadline = time.monotonic() + 20
         while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
             self.assertLess(time.monotonic(), deadline, 'no approval was asked')
@@ -216,7 +216,7 @@ class ServedToolTests(ModelFixture):
                                                                 expire_ms=120_000)])
         self.host()
         self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
-        turn = self.daemon.request('submit', bot='calc.lead', request_id='slow', prompt='script')['result']['turn']
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='slow', prompt='script')['result']['message']
         pid = self.path / 'setup.pid'
         deadline = time.monotonic() + 30
         while not pid.exists() or not pid.read_text().strip():
@@ -250,7 +250,7 @@ class ServedToolTests(ModelFixture):
                                                                 expire_ms=120_000)])
         old = self.host()
         self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
-        turn = self.daemon.request('submit', bot='calc.lead', request_id='slow', prompt='script')['result']['turn']
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='slow', prompt='script')['result']['message']
         deadline = time.monotonic() + 30
         while not pids.exists() or not pids.read_text().strip():
             self.assertLess(time.monotonic(), deadline, 'the setup never ran')
@@ -283,7 +283,7 @@ class ServedToolTests(ModelFixture):
                             approve=['start_task'], approver='manual')
         self.host()
         self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix it.', 'setup': True})]
-        turn = self.daemon.request('submit', bot='calc.lead', request_id='deny', prompt='script')['result']['turn']
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='deny', prompt='script')['result']['message']
         deadline = time.monotonic() + 10
         while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
             self.assertLess(time.monotonic(), deadline, 'no approval was asked')
@@ -308,7 +308,7 @@ class ServedToolTests(ModelFixture):
         self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
                             instructions='Lead.', declare=[declared('follows', inherit=False)])
         self.model.call_script = [('follows', {})]
-        turn = self.daemon.request('submit', bot='calc.lead', request_id='early', prompt='script')['result']['turn']
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='early', prompt='script')['result']['message']
         deadline = time.monotonic() + 10
         while not self.daemon.request('tool_calls', tag='sonny')['result']['calls']:
             self.assertLess(time.monotonic(), deadline)
@@ -457,7 +457,7 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
             self.script.append(('desktop', {'commands': ['click @s1:e2', 'type @s1:e3 "2+2"', 'press return']}))
             self.model.call_script = self.script
             turn = self.daemon.request('submit', bot='calc.lead', request_id=f'act-{decision}',
-                                       prompt='script')['result']['turn']
+                                       prompt='script')['result']['message']
             deadline = time.monotonic() + 30
             while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
                 self.assertLess(time.monotonic(), deadline, 'no approval was asked')
@@ -550,7 +550,7 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
             self.script.append(('browser', {'commands': ['eval document.title']}))
             self.model.call_script = self.script
             turn = self.daemon.request('submit', bot='calc.lead', request_id=f'eval-{decision}',
-                                       prompt='script')['result']['turn']
+                                       prompt='script')['result']['message']
             deadline = time.monotonic() + 30
             while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
                 self.assertLess(time.monotonic(), deadline, 'no approval was asked')
@@ -567,7 +567,7 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         self.browser(settings={'sandbox': 'read-only'}, approve=['browser'], approver='manual')
         self.script.append(('browser', {'commands': ['open https://example.com']}))
         self.model.call_script = self.script
-        turn = self.daemon.request('submit', bot='calc.lead', request_id='offline', prompt='script')['result']['turn']
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='offline', prompt='script')['result']['message']
         deadline = time.monotonic() + 30
         while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
             self.assertLess(time.monotonic(), deadline, 'no approval was asked')
@@ -733,7 +733,7 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
                                 instructions='Agent.', declare=[declared('commons')])
         # An old agent that once worked on it, and one that did not.
         for bot, prompt in [('shop.b', 'the WAL checkpoint stalls'), ('mail.c', 'hello')]:
-            turn = self.daemon.request('submit', bot=bot, request_id=bot, prompt=prompt)['result']['turn']
+            turn = self.daemon.request('submit', bot=bot, request_id=bot, prompt=prompt)['result']['message']
             self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         self.host()
         post = {'name': 'stalls', 'title': 'Checkpoint stalls under load', 'text': 'Seen this?'}
@@ -774,6 +774,29 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         commons = [t['request_id'] for t in self.daemon.request('turns', bot='shop.b')['result']['turns']
                    if t['request_id'].startswith('commons.')]
         self.assertEqual(commons, ['commons.invite.stalls'])
+
+    def test_an_invite_to_a_busy_agent_waits_in_line_and_counts_as_sent(self):
+        import threading
+        for bot in ('calc.a', 'shop.b'):
+            self.daemon.request('create', bot=bot, workspace=str(self.path), model='openai/synthetic-model',
+                                instructions='Agent.', declare=[declared('commons')])
+        turn = self.daemon.request('submit', bot='shop.b', request_id='old',
+                                   prompt='the WAL checkpoint stalls')['result']['message']
+        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+        # shop.b is in a turn, so its invite waits in line behind it.
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = threading.Event()
+        self.model.all_streaming.set()
+        self.addCleanup(self.model.release_headers.set)
+        busy = self.daemon.request('submit', bot='shop.b', request_id='busy', prompt='gate')['result']['message']
+        self.host()
+        post = {'name': 'stalls', 'title': 'Checkpoint stalls under load', 'text': 'Seen this?'}
+        started = json.loads(self.call('calc.a', 'commons', {'post': post}))
+        self.assertEqual(started['invited'], ['shop.b'], started)
+        listed = json.loads(self.call('calc.a', 'commons', {}))
+        self.assertEqual((listed['invites']['today'], listed['invites']['this_week']), (1, 1), listed)
+        self.model.release_headers.set()
+        self.assertEqual(self.daemon.finished(busy, timeout=10)['data']['status'], 'completed')
 
     def test_a_lead_made_for_a_subfolder_reads_its_own_memory_and_follows_its_folder(self):
         ws = self.path / 'ws'
@@ -846,7 +869,7 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         # A run is put to it first, and refused there.
         self.script.append(('automations', {'run': 'watch'}))
         self.model.call_script = self.script
-        turn = self.daemon.request('submit', bot='calc.lead', request_id='run', prompt='script')['result']['turn']
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='run', prompt='script')['result']['message']
         deadline = time.monotonic() + 30
         while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
             self.assertLess(time.monotonic(), deadline, 'no approval was asked')
@@ -865,7 +888,7 @@ for (let i = 0; ; i++) await agent(`say ${i}`)
         self.host()
         self.script.append(('automations', {'remove': 'watch'}))
         self.model.call_script = self.script
-        turn = self.daemon.request('submit', bot='calc.lead', request_id='remove', prompt='script')['result']['turn']
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='remove', prompt='script')['result']['message']
         deadline = time.monotonic() + 30
         while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
             self.assertLess(time.monotonic(), deadline, 'no approval was asked')
@@ -1024,7 +1047,7 @@ there.wait()
                                 'text(r.content[0].text);'))
             self.model.call_script = self.script
             turn = self.daemon.request('submit', bot='calc.lead', request_id=f'linked-{decision}',
-                                       prompt='script')['result']['turn']
+                                       prompt='script')['result']['message']
             deadline = time.monotonic() + 30
             while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
                 self.assertLess(time.monotonic(), deadline, 'no approval was asked')
@@ -1060,7 +1083,7 @@ there.wait()
         # What acts there is put to the box agent's gate, and runs once allowed.
         self.script.append(('desktop', {'machine': 'laptop', 'commands': ['press return']}))
         self.model.call_script = self.script
-        turn = self.daemon.request('submit', bot='calc.lead', request_id='linked-act', prompt='script')['result']['turn']
+        turn = self.daemon.request('submit', bot='calc.lead', request_id='linked-act', prompt='script')['result']['message']
         deadline = time.monotonic() + 30
         while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
             self.assertLess(time.monotonic(), deadline, 'no approval was asked')

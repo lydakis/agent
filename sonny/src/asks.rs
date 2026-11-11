@@ -283,12 +283,11 @@ pub fn request_id(id: &str, attempt: u32) -> String {
 /// before was taken back unread.
 pub const ATTEMPTS: u32 = 1000;
 
-/// Whether a turn, as `turns` lists it, ended before its message reached
-/// the agent: taken back or bounced while it waited in line. An answer so
-/// ended answered nothing.
-pub fn undelivered(turn: &Value) -> bool {
-    matches!(turn["status"].as_str(), Some("interrupted" | "failed"))
-        && turn["started_ms"].is_null()
+/// Whether a message, as `messages` lists it, ended before it reached the
+/// agent: withdrawn or bounced while it waited in line. An answer so ended
+/// answered nothing.
+pub fn undelivered(message: &Value) -> bool {
+    matches!(message["status"].as_str(), Some("withdrawn" | "failed")) && message["turn"].is_null()
 }
 
 /// The `ask` tool as Sonny declares it on a bot, answered by its tool

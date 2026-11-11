@@ -131,7 +131,7 @@ class ResponsesSocketTests(unittest.TestCase):
             self.addCleanup(client.close)
             client.request('create', bot='Bob', workspace=directory)
             started = time.monotonic()
-            turn = client.request('submit', bot='Bob', request_id='r', prompt='hello')['result']['turn']
+            turn = client.request('submit', bot='Bob', request_id='r', prompt='hello')['result']['message']
             retry = client.receive(lambda e: e.get('event') == 'retry' and e.get('turn') == turn)
             self.assertEqual(retry['data']['error'], 'provider_http_429')
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -148,7 +148,7 @@ class ResponsesSocketTests(unittest.TestCase):
                             f'http://127.0.0.1:{server.server_address[1]}/v1', family='responses-ws')
             self.addCleanup(client.close)
             client.request('create', bot='Bob', workspace=directory)
-            turn = client.request('submit', bot='Bob', request_id='r', prompt='hello')['result']['turn']
+            turn = client.request('submit', bot='Bob', request_id='r', prompt='hello')['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
             bodies = [body for _, body in server.requests]
             # The refusal made no response, so the retry still continues.
@@ -172,7 +172,7 @@ class ResponsesSocketTests(unittest.TestCase):
             self.addCleanup(client.close)
             client.request('create', bot='Bob', workspace=directory)
             for prompt in ('hello', 'again'):
-                turn = client.request('submit', bot='Bob', request_id=prompt, prompt=prompt)['result']['turn']
+                turn = client.request('submit', bot='Bob', request_id=prompt, prompt=prompt)['result']['message']
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
             requests = server.requests
             self.assertEqual(len(server.connections), 1)

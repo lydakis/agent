@@ -5437,7 +5437,7 @@ impl Turn {
         let (family, budget) = self.page_budget(2, "history_context_exhausted").await?;
         // A handle names its bot and the store's number for the turn.
         let (bot, wanted) = match handle.as_deref().map(Handle::parse).transpose()? {
-            Some(Handle::Turn { bot, turn }) => {
+            Some(Handle::Message { bot, message: turn }) => {
                 let named = bot.clone();
                 let number = self
                     .store
@@ -5560,7 +5560,9 @@ impl Turn {
         for text in &handles {
             match Handle::parse(text) {
                 Err(error) => return Ok(ControlFlow::Continue(failure(error))),
-                Ok(Handle::Turn { bot, turn }) if bot == self.bot && turn == self.turn => {
+                Ok(Handle::Message { bot, message: turn })
+                    if bot == self.bot && turn == self.turn =>
+                {
                     return Ok(ControlFlow::Continue(failure(Error::with(
                         "invalid_handle",
                         "a turn cannot wait on itself",
@@ -6657,7 +6659,7 @@ fn for_model(results: BTreeMap<String, Arc<Value>>) -> BTreeMap<String, Arc<Valu
     results
         .into_iter()
         .map(|(handle, result)| match Handle::parse(&handle) {
-            Ok(Handle::Turn { .. }) => {
+            Ok(Handle::Message { .. }) => {
                 let mut outcome = Arc::unwrap_or_clone(result);
                 if let Some(fields) = outcome.as_object_mut() {
                     for key in TURN_VIEW_ACCOUNTING {
@@ -7535,7 +7537,7 @@ mod tests {
 
     #[test]
     fn a_models_wait_keeps_a_turns_outcome_and_drops_its_accounting() {
-        let view = json!({"bot":"Bob","bot_id":2,"turn":3,"handle":"turn:Bob/3",
+        let view = json!({"bot":"Bob","bot_id":2,"turn":3,"handle":"Bob/3",
             "request_id":"r","waiting_on":null,"input_tokens":10,"cached_input_tokens":0,
             "output_tokens":4,"work_tokens":6,"model_rounds":1,"retries":0,"paced_ms":0,
             "started_ms":1,"finished_ms":2});
@@ -7551,17 +7553,17 @@ mod tests {
         pending["status"] = json!("running");
         pending["pending"] = json!(true);
         let results = BTreeMap::from([
-            ("turn:Bob/3".to_string(), Arc::new(failed)),
-            ("turn:Bob/4".to_string(), Arc::new(pending)),
+            ("Bob/3".to_string(), Arc::new(failed)),
+            ("Bob/4".to_string(), Arc::new(pending)),
         ]);
         let model = for_model(results);
         assert_eq!(
-            *model["turn:Bob/3"],
+            *model["Bob/3"],
             json!({"turn":3,"status":"failed","error":"turn_budget_exhausted","detail":"over",
                 "turn_budget_tokens":100,"turn_work_tokens":120})
         );
         assert_eq!(
-            *model["turn:Bob/4"],
+            *model["Bob/4"],
             json!({"turn":3,"status":"running","pending":true})
         );
     }
@@ -7651,7 +7653,7 @@ mod tests {
                 handles.request_waiter(),
                 &steers[..32]
                     .iter()
-                    .map(|id| format!("turn:Bob/{id}"))
+                    .map(|id| format!("Bob/{id}"))
                     .collect::<Vec<_>>(),
                 None,
                 false,
@@ -7708,7 +7710,7 @@ mod tests {
                 .op("turn_status", move |db| db.turn_status("Bob", last))
                 .await
                 .unwrap()
-                != "steered"
+                != "taken"
             {
                 tokio::task::yield_now().await;
             }
@@ -7746,8 +7748,8 @@ mod tests {
         let reply: Value = serde_json::from_slice(&reply).unwrap();
         assert_eq!(reply["result"]["results"].as_object().unwrap().len(), 32);
         for outcome in reply["result"]["results"].as_object().unwrap().values() {
-            assert_eq!(outcome["status"], "steered");
-            assert_eq!(outcome["into"], turn);
+            assert_eq!(outcome["status"], "taken");
+            assert_eq!(outcome["turn"], turn);
         }
         let bytes = drain.await.unwrap();
         let events: Vec<Value> = bytes
@@ -7760,7 +7762,7 @@ mod tests {
         let conn = rusqlite::Connection::open(dir.join("state.sqlite")).unwrap();
         let (steered, queued): (i64, i64) = conn
             .query_row(
-                "SELECT SUM(status='steered'),SUM(status='queued') FROM turns WHERE delivery='steer'",
+                "SELECT SUM(status='taken'),SUM(status='queued') FROM messages WHERE delivery='steer'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -7770,12 +7772,13 @@ mod tests {
             "steered {steered}, queued {queued}"
         );
         assert_eq!(steered + queued, 512);
+        // A steer is no turn: only its taking is published.
         assert_eq!(
             events
                 .iter()
-                .filter(|e| e["event"] == "turn_finished")
-                .count() as i64,
-            steered
+                .filter(|e| e["event"] == "turn_finished" && e["turn"] != turn)
+                .count(),
+            0
         );
         assert_eq!(
             events.iter().filter(|e| e["event"] == "steered").count() as i64,

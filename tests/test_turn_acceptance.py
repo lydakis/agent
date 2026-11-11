@@ -52,7 +52,7 @@ class TurnCompactionAcceptanceTests(ModelFixture):
         self.addCleanup(first.close)
         self.assertIn('result', first.request('follow', bot='Bob', after=0))
         first.receive(lambda e: e.get('event') == 'follow_live')
-        turn = control.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['turn']
+        turn = control.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['message']
         first.receive(lambda e: e.get('event') == 'compacted', timeout=30)
 
         # 2. The client disconnects; the turn goes on and compacts again with
@@ -110,7 +110,7 @@ class TurnCompactionAcceptanceTests(ModelFixture):
         self.assertEqual(control.request('inspect', bot='Branch')['result']['compaction'],
                          second_cut['version'])
         fork_turn = control.request('submit', bot='Branch', request_id='f',
-                                    prompt='tool:after the fork')['result']['turn']
+                                    prompt='tool:after the fork')['result']['message']
         follower = Connection(daemon.socket_path)
         self.addCleanup(follower.close)
         follower.request('follow', bot='Branch', after=0)
@@ -169,7 +169,7 @@ class TurnCompactionAcceptanceTests(ModelFixture):
         ran = len(rounds(self.path))
         self.assertIn(ran, (len(known), len(known) + 1))
         self.assertEqual(rounds(self.path), [str(n) for n in range(ran)])
-        turn = client.request('submit', bot='Bob', request_id='2', prompt='tool:next')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='2', prompt='tool:next')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = work(drain(self.model))
         opening = requests[0]

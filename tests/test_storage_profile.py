@@ -48,26 +48,26 @@ class StorageProfileTests(unittest.TestCase):
             item = json.dumps({'role': 'user', 'content': [{'text': 'é\0hello'}]}).encode()
             with sqlite3.connect(path) as db:
                 db.executescript('''CREATE TABLE nodes(id INTEGER,turn INTEGER,item BLOB);
-                    CREATE TABLE turns(id INTEGER,prompt TEXT);
+                    CREATE TABLE messages(id INTEGER,text TEXT,node INTEGER);
                     CREATE TABLE retained_turns(turn INTEGER);
                     CREATE TABLE artifacts(turn INTEGER,call_id TEXT,stream TEXT,data BLOB,raw_bytes INTEGER);
                     CREATE TABLE events(id INTEGER);
                     CREATE TABLE compactions(node INTEGER);''')
                 db.execute('INSERT INTO nodes VALUES (1,1,?)', (item,))
-                db.execute('INSERT INTO turns VALUES (1,?)', ('é\0hello',))
+                db.execute('INSERT INTO messages VALUES (1,?,1)', ('é\0hello',))
                 db.execute('INSERT INTO artifacts VALUES (1,\'x\',\'stdout\',?,0)', (b'\xff\0output',))
             before = hashlib.sha256(path.read_bytes()).hexdigest()
             result = profile(path)
             self.assertEqual(result['duplicate_prompt_bytes'], len('é\0hello'.encode()))
-            self.assertEqual(result['payload_bytes'], {'nodes': len(item), 'turn_prompts': 8, 'artifacts': 8})
+            self.assertEqual(result['payload_bytes'], {'nodes': len(item), 'message_texts': 8, 'artifacts': 8})
             self.assertEqual(list(export(path)), [('node', item), ('prompt', 'é\0hello'.encode()),
                                                  ('artifact', b'\xff\0output')])
             self.assertEqual(before, hashlib.sha256(path.read_bytes()).hexdigest())
 
-            # Count each turn's redundant prompt once even if later messages echo it.
+            # Count each message's own words once even if later items echo them.
             with sqlite3.connect(path) as db:
                 db.execute('INSERT INTO nodes VALUES (2,1,?)', (item,))
-                db.execute('INSERT INTO turns VALUES (2,?)', ('assistant-only',))
+                db.execute('INSERT INTO messages VALUES (2,?,3)', ('assistant-only',))
                 db.execute('INSERT INTO nodes VALUES (3,2,?)', (json.dumps({
                     'role': 'assistant', 'content': 'assistant-only'}).encode(),))
             self.assertEqual(profile(path)['duplicate_prompt_bytes'], 8)
@@ -77,7 +77,7 @@ class StorageProfileTests(unittest.TestCase):
             path = Path(directory) / 'state.sqlite'
             with sqlite3.connect(path) as db:
                 db.executescript("""CREATE TABLE nodes(id INTEGER,turn INTEGER,item BLOB);
-                    CREATE TABLE turns(id INTEGER,prompt TEXT);
+                    CREATE TABLE messages(id INTEGER,text TEXT,node INTEGER);
                     CREATE TABLE retained_turns(turn INTEGER);
                     CREATE TABLE artifacts(turn INTEGER,call_id TEXT,stream TEXT,data BLOB,raw_bytes INTEGER);
                     CREATE TABLE events(id INTEGER); CREATE TABLE compactions(node INTEGER);

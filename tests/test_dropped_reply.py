@@ -22,7 +22,7 @@ def notes(request):
 class DroppedReplyTests(ModelFixture):
     def turn(self, client, bot='Bob'):
         client.request('create', bot=bot, workspace=str(self.path))
-        return client.request('submit', bot=bot, request_id='r', prompt='go')['result']['turn']
+        return client.request('submit', bot=bot, request_id='r', prompt='go')['result']['message']
 
     def requests(self):
         sent = []
@@ -74,7 +74,7 @@ class DroppedReplyTests(ModelFixture):
         self.assertEqual(last['input'][:len(cut['input'])], cut['input'])
         self.assertEqual(notes(last), [{'dropped': facts}])
         note = last['input'][-1]
-        self.assertEqual(note['content'][1]['text'], '[Sent by limit.]')
+        self.assertEqual(note['content'][1]['text'], f'[Message Bob/{turn + 1}, sent by limit.]')
         self.assertFalse([i for i in last['input'] if i.get('name') == 'write'])
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         self.assertEqual([e['data'] for e in events if e['event'] == 'dropped'], [facts])

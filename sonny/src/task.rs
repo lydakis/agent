@@ -1768,6 +1768,19 @@ pub fn remove(
     if let Some(running) = bot.as_ref().and_then(|bot| bot["running_turn"].as_i64()) {
         return Err(busy(name, running));
     }
+    // A message still in line, waiting for room or behind a hold, would
+    // start in the folder this removes.
+    if bot.is_some()
+        && let Some(waiting) =
+            (messages_of(&agent, (store, socket), name)?.iter()).find(|message| {
+                matches!(
+                    message["status"].as_str(),
+                    Some("queued" | "attached" | "ready")
+                )
+            })
+    {
+        return Err(in_line(name, waiting["message"].as_i64().unwrap_or(0)));
+    }
     let turns = match bot {
         Some(_) => Some(turns_of(&agent, (store, socket), name)?),
         None => None,
@@ -1857,6 +1870,29 @@ fn turns_of(
     }
 }
 
+/// `name`'s newest messages, as `agent messages` at `daemon` lists them.
+fn messages_of(
+    agent: &Path,
+    (store, socket): (&Path, &Path),
+    name: &str,
+) -> Result<Vec<Value>, String> {
+    let output = std::process::Command::new(agent)
+        .args(["messages", "--bot", name, "--newest", "--limit", "16"])
+        .env("AGENT_STORE", store)
+        .env("AGENT_SOCKET", socket)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("running {}: {e}", agent.display()))?;
+    let said = String::from_utf8_lossy(&output.stderr);
+    match serde_json::from_slice::<Value>(&output.stdout) {
+        Ok(Value::Array(messages)) if output.status.success() => Ok(messages),
+        _ => Err(format!(
+            "{name}'s messages could not be read: {}",
+            said.trim()
+        )),
+    }
+}
+
 /// `name` as `agent ls` at `daemon` lists it, none when it is not there.
 fn listing(
     agent: &Path,
@@ -1886,6 +1922,14 @@ fn busy(name: &str, turn: i64) -> String {
         "{name} was left as it is: its turn {turn} has not ended, and only an idle task is cleaned up. \
          Its update reaches you when the turn ends; clean it up then, or end the turn first \
          with `agent interrupt --bot {name}`"
+    )
+}
+
+fn in_line(name: &str, message: i64) -> String {
+    format!(
+        "{name} was left as it is: its message {message} waits in line to run, and only an idle \
+         task is cleaned up. Clean it up once that has run, or withdraw it first with \
+         `agent interrupt --bot {name} --turn {message}`"
     )
 }
 

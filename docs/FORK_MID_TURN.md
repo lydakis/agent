@@ -199,7 +199,7 @@ turn's prompt.
   shell can reach the socket, as it can today, and `agent wait` inside a
   shell tool is already refused. The scoping only stops a fork from
   inheriting its source's results by accident. Tests cover both paths.
-  Peer `turn:BOT/N` handles name another bot's turn and stay valid.
+  Peer `BOT/N` handles name another bot's message or turn and stay valid.
 - **So is the output a process stores when it finishes.** `process_finish`
   (db.rs:2772) stores a background process's large streams under the call
   that started it. `authorize_artifact` (db.rs:3580) lets any branch whose

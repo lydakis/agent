@@ -700,7 +700,7 @@ async fn read_status(
             }
             (true, Some("paced")) => "rate limited".into(),
             (true, _) => "working".into(),
-            (false, Some("completed" | "steered")) => started::IDLE.into(),
+            (false, Some("completed")) => started::IDLE.into(),
             (false, Some("failed")) if ran["error"] == EMPTY => started::QUIET.into(),
             (false, Some("interrupted")) => "stopped".into(),
             (false, Some(other)) => other.to_owned(),
@@ -1154,17 +1154,17 @@ pub(crate) async fn answer_once(
         let mut submitted = submitted.clone();
         submitted["request_id"] = json!(asks::request_id(ask, attempt));
         let reply = client.request("submit", submitted).await;
-        // The turn this attempt's answer started already, if one did.
+        // The message this attempt's answer sent already, if one went.
         let before = match &reply {
-            Ok(reply) if reply["duplicate"] == true => reply["turn"].as_i64(),
+            Ok(reply) if reply["duplicate"] == true => reply["message"].as_i64(),
             Err(error) if error.code == "idempotency_conflict" => (error.facts.as_ref())
-                .and_then(|facts| facts.get("turn"))
+                .and_then(|facts| facts.get("message"))
                 .and_then(Value::as_i64),
             _ => None,
         };
         let taken_back = match before {
             Some(turn) => {
-                (turn_row(client, &bot, turn).await).is_some_and(|row| asks::undelivered(&row))
+                (message_row(client, &bot, turn).await).is_some_and(|row| asks::undelivered(&row))
             }
             None => false,
         };
@@ -1179,16 +1179,19 @@ pub(crate) async fn answer_once(
     }
 }
 
-/// `bot`'s turn `turn`, as `turns` lists it, read by its number: no
-/// number of messages steered or attached since can hide it. `None` when
-/// it has no such turn or it could not be read.
-async fn turn_row(client: &Client, bot: &str, turn: i64) -> Option<Value> {
+/// `bot`'s message `message`, as `messages` lists it, read by its number:
+/// in line, taken in by a turn, or the turn it opened, which shares its
+/// number. `None` when it has no such message or it could not be read.
+async fn message_row(client: &Client, bot: &str, message: i64) -> Option<Value> {
     let page = (client)
-        .request("turns", json!({"bot": bot, "after": turn - 1, "limit": 1}))
+        .request(
+            "messages",
+            json!({"bot": bot, "after": message - 1, "limit": 1}),
+        )
         .await
         .ok()?;
-    let row = page["turns"].get(0)?;
-    (row["turn"].as_i64() == Some(turn)).then(|| row.clone())
+    let row = page["messages"].get(0)?;
+    (row["message"].as_i64() == Some(message)).then(|| row.clone())
 }
 
 /// The turn that says what `bot` does: the one the daemon names running
@@ -1209,52 +1212,24 @@ async fn active_turn(
         .and_then(|turns| turns.iter().find(|turn| turn["turn"].as_i64() == Some(id)));
     Ok(match listed {
         Some(row) => row.clone(),
-        None => (turn_row(client, bot, id).await).unwrap_or(Value::Null),
+        None => (message_row(client, bot, id).await).unwrap_or(Value::Null),
     })
 }
 
-/// The newest turn of `bot` that says what it does: a message steered
-/// into a running turn is a turn of its own, settled at once, one
-/// attached to the next call (a reaction) waits for work that is not
-/// there, and one stopped while it waited in line never started, so the
-/// turn before them is read, page by page back past any number of them,
-/// from `page`, its newest turns as already read, if they were. Its newest
-/// turn when none ran, and null when it has none.
+/// The newest turn of `bot`, which says what it does: turns are runs,
+/// so messages steered, attached or withdrawn in line never hide it. From
+/// `page`, its newest turns as already read, if they were; null when it
+/// has none.
 async fn last_ran(
     client: &Client,
     bot: &str,
     page: Option<Value>,
 ) -> Result<Value, agent_client::Error> {
-    let passive = |turn: &&Value| match turn["status"].as_str() {
-        Some("steered" | "attached") => true,
-        Some("interrupted") => turn["started_ms"].is_null(),
-        _ => false,
-    };
-    let asked = |before: Option<i64>| {
-        let mut asked = json!({"bot": bot, "newest": true, "limit": 64});
-        if let Some(before) = before {
-            asked["before"] = json!(before);
-        }
-        client.request("turns", asked)
-    };
-    let mut page = match page {
+    let page = match page {
         Some(page) => page,
-        None => asked(None).await?,
+        None => (client.request("turns", json!({"bot": bot, "newest": true, "limit": 1}))).await?,
     };
-    let mut newest = Value::Null;
-    loop {
-        let turns = page["turns"].as_array().map_or(&[][..], Vec::as_slice);
-        if newest.is_null() {
-            newest = turns.first().cloned().unwrap_or(Value::Null);
-        }
-        if let Some(ran) = turns.iter().find(|turn| !passive(turn)) {
-            return Ok(ran.clone());
-        }
-        match page["next_before"].as_i64() {
-            Some(before) => page = asked(Some(before)).await?,
-            None => return Ok(newest),
-        }
-    }
+    Ok(page["turns"].get(0).cloned().unwrap_or(Value::Null))
 }
 
 /// What one pass of a [`Spread`] did.
@@ -5612,7 +5587,7 @@ impl Fleet {
                     self.doing(
                         bot,
                         match data["status"].as_str() {
-                            Some("completed" | "steered") => started::IDLE,
+                            Some("completed") => started::IDLE,
                             // A lead says nothing to news by design.
                             Some("failed") if data["error"] == EMPTY && bot == self.lead => {
                                 started::IDLE
@@ -7025,7 +7000,7 @@ impl App {
             if let Some(turn) = self.running.as_ref().map(|r| r.turn)
                 && now != Some(turn)
             {
-                let row = (turn_row(&self.client, &self.bot, turn).await).unwrap_or_default();
+                let row = (message_row(&self.client, &self.bot, turn).await).unwrap_or_default();
                 // A turn's row has no error; its handle's answer does.
                 let row = self.with_error(row).await;
                 let status = row["status"].as_str().unwrap_or("unknown");
@@ -7277,7 +7252,7 @@ impl App {
     fn started_task(&mut self, arguments: &Value, output: &str) -> started::Task {
         let name = arguments["name"].as_str().unwrap_or("task").to_owned();
         let bot = (output.split(|c: char| c.is_whitespace() || c == '"'))
-            .find(|word| word.starts_with("turn:"))
+            .find(|word| calls::handle_parts(word).is_some())
             .map(calls::handle_bot)
             .or_else(|| (self.project.as_ref()).map(|project| format!("{project}.{name}")))
             .unwrap_or_else(|| name.clone());
@@ -8541,10 +8516,13 @@ impl App {
     }
 
     /// When the message at `node` was written, as the daemon dated `item`,
-    /// for the window to show over it under the mouse.
+    /// and its handle, for the window to show over it under the mouse.
     fn dated(&mut self, node: i64, item: &Value) {
         if let Some(ms) = item["written_ms"].as_i64() {
             self.screen.date(node, ms);
+        }
+        if let Some(handle) = item["handle"].as_str() {
+            self.screen.number(node, handle.to_owned());
         }
     }
 
@@ -9327,29 +9305,29 @@ impl App {
     }
 
     /// Drop the staged prompts that landed while Sonny was away, whose
-    /// `accepted` or `steered` it missed: those whose turn no longer waits.
+    /// `accepted` or `steered` it missed: those no longer waiting in line.
     async fn unstage_landed(&mut self) {
-        let ids = self.staged.iter().map(|(turn, _)| *turn);
+        let ids = self.staged.iter().map(|(message, _)| *message);
         let (Some(first), Some(last)) = (ids.clone().min(), ids.max()) else {
             return;
         };
-        // Every turn from the first staged to the last, a page at a time:
-        // other clients may have sent many between them.
+        // Every message from the first staged to the last, a page at a
+        // time: other clients may have sent many between them.
         let mut waiting: Vec<i64> = Vec::new();
         let mut after = first - 1;
         loop {
             let asked = json!({"bot": self.bot, "after": after, "before": last + 1, "limit": 256});
-            let Ok(page) = self.client.request("turns", asked).await else {
+            let Ok(page) = self.client.request("messages", asked).await else {
                 // Unread, they stay as they are.
                 return;
             };
             waiting.extend(
-                page["turns"]
+                page["messages"]
                     .as_array()
                     .into_iter()
                     .flatten()
                     .filter(|row| matches!(row["status"].as_str(), Some("queued" | "ready")))
-                    .filter_map(|row| row["turn"].as_i64()),
+                    .filter_map(|row| row["message"].as_i64()),
             );
             match page["next_after"].as_i64() {
                 Some(next) => after = next,
@@ -9717,7 +9695,7 @@ impl App {
             }
             "steered" => {
                 self.staged
-                    .retain(|(staged, _)| Some(*staged) != data["steer"].as_i64());
+                    .retain(|(staged, _)| Some(*staged) != data["message"].as_i64());
                 // A reaction was drawn when it was sent.
                 if let Some(node) = data["node"].as_i64()
                     && let Some(item) = self.items(&[node]).await.first()
@@ -10181,9 +10159,26 @@ impl App {
                     self.window = window_of(&event).or(self.window);
                 }
             }
+            // A staged prompt that ended in line, never taken in. One that
+            // failed there never ran: its words stay in the transcript,
+            // with why, so they can be sent again.
+            "message_ended" => {
+                let ended = event["message"].as_i64();
+                let Some(at) = (self.staged.iter()).position(|(staged, _)| Some(*staged) == ended)
+                else {
+                    return;
+                };
+                let (_, prompt) = self.staged.remove(at);
+                if data["status"] == "failed" {
+                    let width = self.prose();
+                    let mut lines = staged_body(&prompt, width, None, Path::new(&self.workspace));
+                    lines.push(Line::default());
+                    let why = data["detail"].as_str().or(data["error"].as_str());
+                    lines.push(transcript::finished("not run", why.unwrap_or(""), None));
+                    self.commit(lines);
+                }
+            }
             "turn_finished" => {
-                // A staged prompt whose turn ended without starting.
-                self.staged.retain(|(staged, _)| Some(*staged) != turn);
                 if self.running.as_ref().is_some_and(|r| Some(r.turn) != turn) {
                     return;
                 }
@@ -10219,7 +10214,7 @@ impl App {
                 // Rows already drawn above, as a long reply spills, count.
                 let words =
                     (self.live.as_ref()).is_some_and(|live| live.spilled || !live.rows.is_empty());
-                let ended = matches!(status, "completed" | "steered");
+                let ended = status == "completed";
                 let only_reacted = !words
                     && !self.bot_reactions.is_empty()
                     && self.answering.as_ref().map(|(_, at, _)| *at) == Some(self.rows_drawn);
@@ -10264,7 +10259,7 @@ impl App {
                 }
                 self.rest = Some(match status {
                     _ if quiet => "idle",
-                    "completed" | "steered" => "done",
+                    "completed" => "done",
                     "interrupted" => "idle",
                     _ => "error",
                 });
@@ -10274,7 +10269,7 @@ impl App {
                 // other ends ring from the fleet.
                 match status {
                     _ if quiet => {}
-                    "completed" | "steered" => {
+                    "completed" => {
                         let what = format!("{} is done", self.bot);
                         self.sounds.alert(sound::Alert::LeadDone, &what)
                     }
@@ -13483,8 +13478,8 @@ impl App {
         if origin.is_none() && self.options.side.is_none() {
             project::wrote_to(self.client.store(), &self.workspace, &self.bot);
         }
-        if let Some(turn) = reply["turn"].as_i64() {
-            // A steer is a submission of its own that ends as steered; the
+        if let Some(turn) = reply["message"].as_i64() {
+            // A steer is a message of its own that a turn takes in; the
             // person's is the turn it joins: the running one, or the one the
             // message before it started.
             if origin.is_none() {
@@ -13535,7 +13530,7 @@ impl App {
         self.task_answers.push(TaskAnswer {
             key: ask.key(),
             bot: task.bot.clone(),
-            turn: reply["turn"].as_i64(),
+            turn: reply["message"].as_i64(),
             checked: Instant::now(),
         });
         self.close_ask(ask, prompt);
@@ -13637,7 +13632,7 @@ impl App {
             };
             let bot = answer.bot.clone();
             self.task_answers[at].checked = Instant::now();
-            let Some(row) = turn_row(&self.client, &bot, turn).await else {
+            let Some(row) = message_row(&self.client, &bot, turn).await else {
                 continue;
             };
             if asks::undelivered(&row) {
@@ -17477,7 +17472,7 @@ mod tests {
         let seen = asked.clone();
         let client = daemon_answering(move |request| {
             seen.lock().unwrap().push(request.clone());
-            json!({"turn": 1})
+            json!({"message": 1, "turn": 1})
         })
         .await;
         let mut app = app(client);
@@ -18719,9 +18714,9 @@ mod tests {
         let client = daemon_answering(move |asked| {
             match (asked["op"].as_str(), asked["bot"].as_str()) {
                 (Some("fork"), _) => json!({"bot_id": 9, "head": 4}),
-                (Some("submit"), Some("b")) => json!({"turn": 1}),
-                (Some("submit"), _) => json!({"turn": 1, "handle": "turn:copy/1"}),
-                (Some("wait"), _) => json!({"results": {"turn:copy/1":
+                (Some("submit"), Some("b")) => json!({"message": 1, "turn": 1}),
+                (Some("submit"), _) => json!({"message": 1, "turn": 1, "handle": "copy/1"}),
+                (Some("wait"), _) => json!({"results": {"copy/1":
                     {"status": "completed", "text": said}}}),
                 // Only shop.pricing is an agent the daemon keeps.
                 (Some("bots"), _) => match asked["name"].as_str() {
@@ -18853,9 +18848,9 @@ mod tests {
             seen.lock().unwrap().push(asked.clone());
             match (asked["op"].as_str(), asked["bot"].as_str()) {
                 (Some("fork"), _) => json!({"bot_id": 9, "head": 4}),
-                (Some("submit"), Some("b")) => json!({"turn": 1}),
-                (Some("submit"), _) => json!({"turn": 1, "handle": "turn:copy/1"}),
-                (Some("wait"), _) => json!({"results": {"turn:copy/1":
+                (Some("submit"), Some("b")) => json!({"message": 1, "turn": 1}),
+                (Some("submit"), _) => json!({"message": 1, "turn": 1, "handle": "copy/1"}),
+                (Some("wait"), _) => json!({"results": {"copy/1":
                     {"status": "completed", "text": "Suggestion: run the tests"}}}),
                 _ => json!({}),
             }
@@ -18921,18 +18916,18 @@ mod tests {
         let next = std::sync::atomic::AtomicI64::new(2);
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("submit") => {
-                json!({"turn": next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)})
+                json!({"message": next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)})
             }
             _ => json!({}),
         })
         .await;
         let mut app = app(client);
-        // The lead's turn 1 runs; the person steers it, a submission of its own.
+        // The lead's turn 1 runs; the person steers it, a message of its own.
         app.daemon(turn_event("accepted", 1, json!({}))).await;
         app.input.set("and the reversed range too");
         app.submit().await;
         assert_eq!(app.yours, Some(1));
-        app.daemon(turn_event("turn_finished", 2, json!({"status": "steered"})))
+        app.daemon(turn_event("steered", 1, json!({"message": 2})))
             .await;
         assert!(app.suggesting.is_none());
         app.daemon(turn_event(
@@ -18977,7 +18972,7 @@ mod tests {
                     .unwrap()
                     .push(stamp::unstamped(asked["prompt"].as_str().unwrap()).to_owned());
             }
-            json!({"turn": 2})
+            json!({"message": 2, "turn": 2})
         })
         .await;
         let mut app = app(client);
@@ -19179,7 +19174,8 @@ mod tests {
         let entries = json!([
             {"node": 2, "written_ms": 2_000, "item": {"type": "message", "role": "assistant",
                 "content": [{"type": "output_text", "text": "Both checks pass."}]}},
-            {"node": 1, "written_ms": 1_000, "item": {"type": "message", "role": "user",
+            {"node": 1, "written_ms": 1_000, "message": 1, "handle": "b/1",
+                "item": {"type": "message", "role": "user",
                 "content": [{"type": "input_text", "text": "Check the tally work"}]}},
         ]);
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
@@ -19199,6 +19195,9 @@ mod tests {
         drawn(&mut app);
         assert_eq!(app.screen.dated(1), Some(1_000));
         assert_eq!(app.screen.dated(2), Some(2_000));
+        // The person's message keeps its number too; the reply has none.
+        assert_eq!(app.screen.numbered(1).as_deref(), Some("b/1"));
+        assert_eq!(app.screen.numbered(2), None);
     }
 
     #[tokio::test]
@@ -19276,7 +19275,7 @@ mod tests {
                 {"label": "After", "explanation": "It waits for the focus."}],
             "recommended": 1, "reason": "Nobody waits on it today."});
         let news = "Task updates: what happened in your tasks since you last heard.\n\
-            - calc.neg: turn:calc.neg/3 completed";
+            - calc.neg: calc.neg/3 completed";
         let items: Vec<(i64, i64, Value)> = vec![
             (1, 1, say("user", "Fix the rounding")),
             (
@@ -19605,7 +19604,7 @@ mod tests {
         let client = daemon_serving(providers, move |asked| {
             seen.lock().unwrap().push(asked.clone());
             match asked["op"].as_str() {
-                Some("submit") => json!({"turn": 1}),
+                Some("submit") => json!({"message": 1, "turn": 1}),
                 _ => json!({}),
             }
         })
@@ -19829,7 +19828,7 @@ mod tests {
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("submit") => {
                 seen.lock().unwrap().push(asked["prompt"].clone());
-                json!({"turn": 5})
+                json!({"message": 5, "turn": 5})
             }
             Some("history_nodes") => json!({"nodes": [{"node": 7}, {"node": 6}]}),
             Some("history_items") => {
@@ -20033,7 +20032,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock().unwrap().push(asked.clone());
             }
-            json!({"turn": 2})
+            json!({"message": 2, "turn": 2})
         })
         .await;
         let mut app = app(client);
@@ -20106,7 +20105,7 @@ mod tests {
             sent.push(asked.clone());
             match sent.len() {
                 1 | 2 => json!({"error": "active_agent_limit", "detail": "every slot is taken"}),
-                _ => json!({"turn": 3}),
+                _ => json!({"message": 3, "turn": 3}),
             }
         })
         .await;
@@ -20198,7 +20197,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_staged_message_reads_as_it_will_land_and_is_drawn_once() {
-        let mut app = app(daemon_answering(|_| json!({"turn": 2})).await);
+        let mut app = app(daemon_answering(|_| json!({"message": 2, "turn": 2})).await);
         app.daemon(turn_event("accepted", 1, json!({}))).await;
         app.input
             .set("Use **bold** and `code`:\n\n| a | b |\n|---|---|\n| 1 | 2 |");
@@ -20231,7 +20230,7 @@ mod tests {
         let next = std::sync::atomic::AtomicI64::new(2);
         let client = daemon_answering(move |asked| match asked["op"].as_str() {
             Some("submit") => {
-                json!({"turn": next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)})
+                json!({"message": next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)})
             }
             _ => json!({"items": [{"node": 10, "item": {"type": "message", "role": "user",
                 "content": [{"type": "input_text", "text": "steer one"}]}}]}),
@@ -20252,10 +20251,8 @@ mod tests {
             ["", "›↪ steer one", "", "›↪ steer two", ""],
             "each with a blank row above, a mark for what it waits for"
         );
-        // Turn 1 takes in the first; its own turn ends as steered.
-        app.daemon(turn_event("turn_finished", 2, json!({"status": "steered"})))
-            .await;
-        app.daemon(turn_event("steered", 1, json!({"steer": 2, "node": 10})))
+        // Turn 1 takes in the first.
+        app.daemon(turn_event("steered", 1, json!({"message": 2, "node": 10})))
             .await;
         assert_eq!(staged(&app), [3]);
         assert_eq!(app.running.as_ref().map(|r| r.turn), Some(1));
@@ -20269,16 +20266,33 @@ mod tests {
         assert_eq!(staged(&app), [3]);
         app.daemon(turn_event("accepted", 3, json!({}))).await;
         assert!(app.staged.is_empty());
-        // A prompt whose turn ends without starting is unstaged too.
+        // A prompt that ends in line is unstaged too.
         app.input.set("never ran");
         app.submit().await;
-        app.daemon(turn_event(
-            "turn_finished",
-            4,
-            json!({"status": "interrupted"}),
-        ))
+        app.daemon(
+            json!({"event": "message_ended", "bot": "b", "turn": null, "message": 4,
+            "data": {"status": "withdrawn"}}),
+        )
         .await;
         assert!(app.staged.is_empty());
+        // One that failed there never ran: its words stay, with why.
+        app.pending.clear();
+        app.input.set("ran out");
+        app.submit().await;
+        let failed = staged(&app)[0];
+        app.daemon(
+            json!({"event": "message_ended", "bot": "b", "turn": null, "message": failed,
+            "data": {"status": "failed", "error": "budget_exhausted",
+                "detail": "the bot's budget is spent"}}),
+        )
+        .await;
+        assert!(app.staged.is_empty());
+        let shown: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert!(shown.iter().any(|l| l.contains("ran out")), "{shown:?}");
+        assert_eq!(
+            shown.last().map(String::as_str),
+            Some("not run · the bot's budget is spent")
+        );
     }
 
     #[tokio::test]
@@ -20287,12 +20301,12 @@ mod tests {
         let client =
             daemon_answering(
                 |asked| match (asked["op"].as_str(), asked["after"].as_i64()) {
-                    (Some("turns"), Some(4)) => json!({"turns": [
-                {"turn": 5, "status": "steered"},
-                {"turn": 6, "status": "running"},
+                    (Some("messages"), Some(4)) => json!({"messages": [
+                {"message": 5, "status": "taken"},
+                {"message": 6, "status": "running"},
             ], "next_after": 6}),
-                    (Some("turns"), Some(6)) => json!({"turns": [
-                {"turn": 7, "status": "queued"},
+                    (Some("messages"), Some(6)) => json!({"messages": [
+                {"message": 7, "status": "queued"},
             ], "next_after": null}),
                     _ => json!({}),
                 },
@@ -20693,13 +20707,13 @@ mod tests {
         app.daemon(turn_event("accepted", 1, json!({}))).await;
         // News in, a plan, a send, a call: none of them a row.
         let updates = "Task updates: what happened in your tasks since you last heard.\n\
-            - calc.neg: turn:calc.neg/3 completed";
+            - calc.neg: calc.neg/3 completed";
         app.land(5, (updates, ""), (None, false), false);
         let plan = json!({"steps": ["[x] Read", "[>] Fix", "[ ] Test"]});
         app.commit_call("p1", Some(1), "plan", &plan, "Plan set.", false);
         let steer = json!({"command":
             r#""$AGENT_BIN" run --detach --delivery steer --bot calc.neg -- 'Check div too.'"#});
-        app.commit_call("c0", Some(1), "shell", &steer, "turn:calc.neg/4", false);
+        app.commit_call("c0", Some(1), "shell", &steer, "calc.neg/4", false);
         app.daemon(turn_event(
             "tool_started",
             1,
@@ -20725,14 +20739,7 @@ mod tests {
         // A task started is no row, but tracked, so what it asks reaches
         // this window.
         let start = json!({"name": "add", "brief": "Fix add"});
-        app.commit_call(
-            "s1",
-            Some(1),
-            served::START,
-            &start,
-            "turn:calc.add/1",
-            false,
-        );
+        app.commit_call("s1", Some(1), served::START, &start, "calc.add/1", false);
         assert!(
             app.tasks
                 .values()
@@ -21028,16 +21035,16 @@ mod tests {
     async fn a_failure_is_counted_until_the_person_looks_at_it() {
         let client = daemon_with(json!([])).await;
         let mut app = app(client);
-        app.count_failures(vec!["Trigger/nightly/turn:calc.lead/4/bot_busy".into()]);
+        app.count_failures(vec!["Trigger/nightly/calc.lead/4/bot_busy".into()]);
         assert_eq!(app.failed, 1);
         // /background shows it: the footer stops counting it, also when
         // counted again while it lasts.
         app.background();
         assert_eq!(app.failed, 0);
-        app.count_failures(vec!["Trigger/nightly/turn:calc.lead/4/bot_busy".into()]);
+        app.count_failures(vec!["Trigger/nightly/calc.lead/4/bot_busy".into()]);
         assert_eq!(app.failed, 0);
         // The next fire failing too is news.
-        app.count_failures(vec!["Trigger/nightly/turn:calc.lead/9/bot_busy".into()]);
+        app.count_failures(vec!["Trigger/nightly/calc.lead/9/bot_busy".into()]);
         assert_eq!(app.failed, 1);
     }
 
@@ -21049,7 +21056,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock().unwrap().push(asked.clone());
             }
-            json!({"turn": 9})
+            json!({"message": 9, "turn": 9})
         })
         .await;
         let mut app = app(client);
@@ -21232,7 +21239,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock().unwrap().push(asked.clone());
             }
-            json!({"turn": 9})
+            json!({"message": 9, "turn": 9})
         })
         .await;
         let mut app = app(client);
@@ -21299,7 +21306,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reaction_to_an_older_reply_goes_under_that_reply() {
-        let client = daemon_answering(|_| json!({"turn": 9})).await;
+        let client = daemon_answering(|_| json!({"message": 9, "turn": 9})).await;
         let mut app = app(client);
         app.commit_said(
             4,
@@ -21640,7 +21647,7 @@ mod tests {
         let client = daemon_answering(move |asked| {
             let mut sent = seen.lock().unwrap();
             sent.push(asked.clone());
-            json!({"turn": 1 + sent.len()})
+            json!({"message": 1 + sent.len()})
         })
         .await;
         let mut app = app(client);
@@ -21692,7 +21699,8 @@ mod tests {
         let staged: Vec<String> = app.staged_rows(80).iter().map(|l| l.to_string()).collect();
         assert_eq!(staged[2..], ["", "› now", ""]);
         // Once its turn starts it is no longer waiting.
-        app.daemon(turn_event("turn_finished", 3, json!({}))).await;
+        app.daemon(turn_event("steered", 1, json!({"message": 3})))
+            .await;
         app.daemon(turn_event("accepted", 2, json!({}))).await;
         assert!(app.staged.is_empty());
     }
@@ -21995,7 +22003,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_clean_view_keeps_the_words_and_a_task_started_but_not_a_command() {
-        let started = r#"{"bot":"b.fix","handle":"turn:b.fix/1","status":"running","turn":1}"#;
+        let started = r#"{"bot":"b.fix","handle":"b.fix/1","status":"running","turn":1}"#;
         let client = daemon_answering(move |asked| {
             let item = match asked["nodes"][0].as_i64() {
                 Some(2) => json!({"type": "message", "role": "assistant",
@@ -22059,7 +22067,7 @@ mod tests {
                 4 => "The build is green.\nI pushed the fix to calc.add.",
                 _ => {
                     "Task updates: what happened in your tasks since you last heard.\n\
-                      - calc.neg: turn:calc.neg/3 completed"
+                      - calc.neg: calc.neg/3 completed"
                 }
             };
             match asked["op"].as_str() {
@@ -22108,7 +22116,7 @@ mod tests {
         // Those that come one after another are one row that counts them,
         // and says what the agent did while it said nothing.
         let updates = "Task updates: what happened in your tasks since you last heard.\n\
-            - calc.neg: turn:calc.neg/3 completed";
+            - calc.neg: calc.neg/3 completed";
         app.land(5, (updates, ""), (None, false), false);
         let steer =
             r#""$AGENT_BIN" run --detach --delivery steer --bot calc.neg -- 'Check div too.'"#;
@@ -22117,7 +22125,7 @@ mod tests {
             Some(1),
             "shell",
             &json!({"command": steer}),
-            "turn:calc.neg/4",
+            "calc.neg/4",
             false,
         );
         let shut = "↳ 1 message, 1 task update · calc.add, calc.neg · sent to calc.neg ▸";
@@ -22138,7 +22146,7 @@ mod tests {
         app.press("said/5").await;
         let open = drawn(&mut app);
         assert_eq!(open[2], "  ↳ Task updates ▾");
-        assert_eq!(open[4], "    - calc.neg: turn:calc.neg/3 completed");
+        assert_eq!(open[4], "    - calc.neg: calc.neg/3 completed");
         assert!(open[5].starts_with("  • Steered calc.neg"), "{open:?}");
         app.press("fold/0").await;
         assert_eq!(drawn(&mut app), [shut]);
@@ -22173,7 +22181,7 @@ mod tests {
         app.press("said/8").await;
         assert_eq!(
             drawn(&mut app).last().unwrap(),
-            "  - calc.neg: turn:calc.neg/3 completed"
+            "  - calc.neg: calc.neg/3 completed"
         );
         // A cluster let go takes its messages with it, so Ctrl+O reads
         // none of them; one a newer cluster holds stays.
@@ -22378,38 +22386,24 @@ mod tests {
             if asked["op"] == "inspect" {
                 return json!({"name": "calc.many", "running_turn": 1});
             }
+            // Its messages newest first: seventy taken into turn 1.
             let steers = (2..=71)
                 .rev()
-                .map(|turn| json!({"turn": turn, "status": "steered"}));
-            let rows: Vec<Value> =
-                (steers.chain([json!({"turn": 1, "status": "running"})])).collect();
+                .map(|n| json!({"message": n, "turn": 1, "status": "taken"}));
+            let running = json!({"message": 1, "turn": 1, "status": "running"});
+            let rows: Vec<Value> = (steers.chain([running.clone()])).collect();
             let limit = asked["limit"].as_u64().unwrap_or(64) as usize;
-            match (
-                asked["op"].as_str(),
-                asked["before"].as_i64(),
-                asked["after"].as_i64(),
-            ) {
-                (Some("turns"), None, Some(after))
-                    if !asked["newest"].as_bool().unwrap_or(false) =>
-                {
+            match (asked["op"].as_str(), asked["after"].as_i64()) {
+                (Some("messages"), Some(after)) => {
                     let page: Vec<Value> = (rows.iter().rev())
-                        .filter(|row| row["turn"].as_i64() > Some(after))
+                        .filter(|row| row["message"].as_i64() > Some(after))
                         .take(limit)
                         .cloned()
                         .collect();
-                    json!({"turns": page, "next_after": null})
+                    json!({"messages": page, "next_after": null})
                 }
-                (Some("turns"), before, _) => {
-                    let older: Vec<Value> = (rows.iter())
-                        .filter(|row| {
-                            before.is_none_or(|before| row["turn"].as_i64() < Some(before))
-                        })
-                        .cloned()
-                        .collect();
-                    let page: Vec<Value> = older.iter().take(limit).cloned().collect();
-                    let next = (older.len() > limit).then(|| page.last().unwrap()["turn"].clone());
-                    json!({"turns": page, "next_before": next})
-                }
+                // Turns are runs: the one turn.
+                (Some("turns"), _) => json!({"turns": [running], "next_before": null}),
                 _ => json!({}),
             }
         })
@@ -22419,9 +22413,9 @@ mod tests {
         let ran = last_ran(&client, "calc.many", None).await.unwrap();
         assert_eq!(ran["turn"], 1);
         assert_eq!(ran["status"], "running");
-        let row = turn_row(&client, "calc.many", 1).await.unwrap();
+        let row = message_row(&client, "calc.many", 1).await.unwrap();
         assert_eq!(row["status"], "running");
-        assert_eq!(turn_row(&client, "calc.many", 99).await, None);
+        assert_eq!(message_row(&client, "calc.many", 99).await, None);
         // In the roster it works on, never done.
         let mut app = app(client);
         app.width = 80;
@@ -22431,7 +22425,7 @@ mod tests {
             Some(1),
             served::START,
             &arguments,
-            "turn:calc.many/1",
+            "calc.many/1",
             false,
         );
         app.read_tasks().await;
@@ -22463,14 +22457,7 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let arguments = json!({"name": "add", "brief": "Fix add"});
-        app.commit_call(
-            "c",
-            Some(1),
-            served::START,
-            &arguments,
-            "turn:calc.add/1",
-            false,
-        );
+        app.commit_call("c", Some(1), served::START, &arguments, "calc.add/1", false);
         app.read_tasks().await;
         assert!(!app.asks_seen.contains_key("calc.add"));
         broken.store(false, Ordering::SeqCst);
@@ -22481,8 +22468,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_task_whose_queued_message_was_stopped_reads_as_the_turn_it_works_on() {
-        // Turn 1 runs; turn 2 waited in line behind it and was stopped
-        // there, never starting. The roster reads what `/status` reads.
+        // Turn 1 runs; message 2 waited in line behind it and was stopped
+        // there, never starting, so no turn lists it. The roster reads what
+        // `/status` reads.
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let still = running.clone();
         let client = daemon_answering(move |asked| {
@@ -22491,25 +22479,23 @@ mod tests {
                 true => json!({"turn": 1, "status": "running", "started_ms": 5}),
                 false => json!({"turn": 1, "status": "completed", "started_ms": 5}),
             };
-            let rows = [
-                json!({"turn": 2, "status": "interrupted", "started_ms": null}),
-                first,
-            ];
+            let mut opened = first.clone();
+            opened["message"] = json!(1);
+            let stopped = json!({"message": 2, "turn": null, "status": "withdrawn"});
             match asked["op"].as_str() {
                 Some("approvals") => json!({"approvals": []}),
                 Some("history_nodes") => json!({"nodes": []}),
                 Some("inspect") => {
                     json!({"name": "calc.add", "running_turn": running.then_some(1)})
                 }
-                Some("turns") if asked["after"].is_i64() => {
-                    let after = asked["after"].as_i64().unwrap();
-                    let row = rows
-                        .iter()
-                        .rev()
-                        .find(|row| row["turn"].as_i64() > Some(after));
-                    json!({"turns": row.into_iter().collect::<Vec<_>>(), "next_after": null})
+                Some("messages") => {
+                    let after = asked["after"].as_i64().unwrap_or(0);
+                    let row = [opened, stopped]
+                        .into_iter()
+                        .find(|row| row["message"].as_i64() > Some(after));
+                    json!({"messages": row.into_iter().collect::<Vec<_>>(), "next_after": null})
                 }
-                Some("turns") => json!({"turns": rows, "next_before": null}),
+                Some("turns") => json!({"turns": [first], "next_before": null}),
                 _ => json!({}),
             }
         })
@@ -22517,14 +22503,7 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let arguments = json!({"name": "add", "brief": "Fix add"});
-        app.commit_call(
-            "c",
-            Some(1),
-            served::START,
-            &arguments,
-            "turn:calc.add/1",
-            false,
-        );
+        app.commit_call("c", Some(1), served::START, &arguments, "calc.add/1", false);
         app.read_tasks().await;
         assert_eq!(drawn(&mut app)[1], "  ● add  working  Fix add");
         // Idle, the stopped message never ran: the turn before it says
@@ -22557,12 +22536,11 @@ mod tests {
             }
             let n = read.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match asked["bot"].as_str() {
-                // A reaction attached to the next call: the task is still done.
-                Some("calc.add") => json!({"turns": [
-                    {"turn": 2, "status": "attached"}, {"turn": 1, "status": "completed"}]}),
+                // A reaction attached to the next call is no run: the task
+                // is still done.
+                Some("calc.add") => json!({"turns": [{"turn": 1, "status": "completed"}]}),
                 // A message steered into a running turn: the task still works.
-                Some("calc.neg") if n < 3 => json!({"turns": [
-                    {"turn": 2, "status": "steered"}, {"turn": 1, "status": "running"}]}),
+                Some("calc.neg") if n < 3 => json!({"turns": [{"turn": 1, "status": "running"}]}),
                 Some("calc.gone") => json!({"error": "bot_not_found"}),
                 // The daemon not there for a moment, then there again.
                 _ if (3..5).contains(&n) => json!({"error": "daemon_unavailable"}),
@@ -22574,7 +22552,7 @@ mod tests {
         app.width = 80;
         let start = |app: &mut App, name: &str| {
             let arguments = json!({"name": name, "brief": format!("Fix {name}")});
-            let output = format!("turn:calc.{name}/1");
+            let output = format!("calc.{name}/1");
             app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         };
         start(&mut app, "add");
@@ -22849,13 +22827,13 @@ mod tests {
     #[tokio::test]
     async fn a_task_that_ended_with_nothing_to_say_has_no_reply_and_did_not_fail() {
         let client = daemon_answering(|asked| match asked["op"].as_str() {
-            Some("wait") => json!({"results": {"turn:calc.quiet/1":
+            Some("wait") => json!({"results": {"calc.quiet/1":
                 {"status": "failed", "error": "empty_completion"}}}),
             _ => match asked["bot"].as_str() {
                 Some("calc.quiet") => json!({"turns": [
-                    {"turn": 1, "status": "failed", "handle": "turn:calc.quiet/1"}]}),
+                    {"turn": 1, "status": "failed", "handle": "calc.quiet/1"}]}),
                 _ => {
-                    json!({"turns": [{"turn": 1, "status": "failed", "handle": "turn:calc.bad/1"}]})
+                    json!({"turns": [{"turn": 1, "status": "failed", "handle": "calc.bad/1"}]})
                 }
             },
         })
@@ -22864,7 +22842,7 @@ mod tests {
         app.width = 80;
         for name in ["quiet", "bad"] {
             let arguments = json!({"name": name, "brief": format!("Fix {name}")});
-            let output = format!("turn:calc.{name}/1");
+            let output = format!("calc.{name}/1");
             app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         }
         app.read_tasks().await;
@@ -22983,14 +22961,7 @@ mod tests {
         let mut app = app(client);
         app.width = 80;
         let arguments = json!({"name": "ask", "brief": "Fix ask"});
-        app.commit_call(
-            "c",
-            Some(1),
-            served::START,
-            &arguments,
-            "turn:calc.ask/1",
-            false,
-        );
+        app.commit_call("c", Some(1), served::START, &arguments, "calc.ask/1", false);
         app.read_tasks().await;
         assert_eq!(drawn(&mut app)[1], "  ? ask  needs you  Fix ask");
         // Its history is read once for the turn it ended.
@@ -23007,7 +22978,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock().unwrap().push(json!(words_sent(asked)));
             }
-            json!({"turn": 9})
+            json!({"message": 9, "turn": 9})
         })
         .await;
         let mut app = app(client);
@@ -23081,14 +23052,14 @@ mod tests {
                 let turn = if request.ends_with(".1") { 9 } else { 5 };
                 seen.push(request);
                 match again {
-                    false => json!({"turn": turn}),
-                    true => json!({"error": "idempotency_conflict", "turn": turn}),
+                    false => json!({"message": turn}),
+                    true => json!({"error": "idempotency_conflict", "message": turn}),
                 }
             }
-            Some("turns") => match asked["after"].as_i64() {
-                Some(4) => json!({"turns": [{"turn": 5, "status": "interrupted",
-                    "started_ms": null}]}),
-                _ => json!({"turns": [{"turn": 9, "status": "done", "started_ms": 1}]}),
+            Some("messages") => match asked["after"].as_i64() {
+                Some(4) => json!({"messages": [{"message": 5, "turn": null,
+                    "status": "withdrawn"}]}),
+                _ => json!({"messages": [{"message": 9, "turn": 9, "status": "completed"}]}),
             },
             _ => json!({}),
         })
@@ -23829,7 +23800,7 @@ mod tests {
                 ]}),
                 "submit" => {
                     seen.lock().unwrap().push(asked_for.clone());
-                    json!({"turn": 3})
+                    json!({"message": 3, "turn": 3})
                 }
                 "history_nodes" if bot == "calc.ask" => json!({"nodes": [{"node": 7, "turn": 2}]}),
                 "history_nodes" => json!({"nodes": []}),
@@ -23981,7 +23952,7 @@ mod tests {
                     .unwrap()
                     .push(stamp::unstamped(asked["prompt"].as_str().unwrap()).to_owned());
             }
-            json!({"turn": 2})
+            json!({"message": 2, "turn": 2})
         })
         .await;
         let mut app = app(client);
@@ -24158,11 +24129,11 @@ mod tests {
                 "inspect" => json!({"name": "calc.ask", "head": 7, "running_turn": 2}),
                 "submit" => {
                     seen.lock().unwrap().push(asked_for.clone());
-                    json!({"turn": 9})
+                    json!({"message": 9})
                 }
                 // The answer went as turn 9, and was taken back unread.
-                "turns" if asked_for["after"] == 8 => {
-                    json!({"turns": [{"turn": 9, "status": "interrupted"}]})
+                "messages" if asked_for["after"] == 8 => {
+                    json!({"messages": [{"message": 9, "turn": null, "status": "withdrawn"}]})
                 }
                 "turns" => json!({"turns": [{"turn": 2, "status": "running"}]}),
                 "history_nodes" => json!({"nodes": [{"node": 7, "turn": 2}]}),
@@ -24177,14 +24148,7 @@ mod tests {
         app.bot = "calc.lead".into();
         app.width = 80;
         let arguments = json!({"name": "ask", "brief": "Ask"});
-        app.commit_call(
-            "c",
-            Some(1),
-            served::START,
-            &arguments,
-            "turn:calc.ask/1",
-            false,
-        );
+        app.commit_call("c", Some(1), served::START, &arguments, "calc.ask/1", false);
         drawn(&mut app);
         // Its history could not be read: read again on the next slow pass.
         app.read_tasks().await;
@@ -24244,14 +24208,7 @@ mod tests {
         app.pin_task_asks();
         assert!(app.asks.is_empty());
         let arguments = json!({"name": "ask", "brief": "Ask"});
-        app.commit_call(
-            "c",
-            Some(1),
-            served::START,
-            &arguments,
-            "turn:calc.ask/1",
-            false,
-        );
+        app.commit_call("c", Some(1), served::START, &arguments, "calc.ask/1", false);
         drawn(&mut app);
         app.pin_task_asks();
         assert_eq!(app.asks.len(), 1);
@@ -24522,7 +24479,7 @@ mod tests {
         app.fleet = Some(fleet);
         for name in ["ask", "new"] {
             let arguments = json!({"name": name, "brief": format!("Ask {name}")});
-            let output = format!("turn:calc.{name}/2");
+            let output = format!("calc.{name}/2");
             app.commit_call("c", Some(1), served::START, &arguments, &output, false);
         }
         app.read_tasks().await;
@@ -24570,7 +24527,7 @@ mod tests {
         // The person's words steered into a turn running then answer it,
         // as the fleet follows steers too.
         assert!(FLEET_KINDS.contains(&"steered"));
-        fleet.event(&event("steered", 4, json!({"steer": 5})));
+        fleet.event(&event("steered", 4, json!({"message": 5})));
         assert_eq!(fleet.doing["calc.new"], "idle");
     }
 
@@ -25640,11 +25597,11 @@ mod tests {
         let item = json!({"role": "user", "content": [
             {"type": "input_text", "text": "News from your tasks."},
             {"type": "input_text", "text": "[Sent by lookout.tasks.]"},
-            {"type": "input_text", "text": "[Quoted from turn:calc.fix/5, written by a person:]"},
+            {"type": "input_text", "text": "[Quoted from calc.fix/5, written by a person:]"},
             {"type": "input_text", "text": "yes, ship it\nand tag it"},
-            {"type": "input_text", "text": "[Quoted from the reply of turn:calc.fix/6, written by ana:]"},
+            {"type": "input_text", "text": "[Quoted from the reply of calc.fix/6, written by ana:]"},
             {"type": "input_text", "text": "tagged"}],
-            "quotes": [{"bot": "calc.fix", "turn": 5, "at": 3},
+            "quotes": [{"bot": "calc.fix", "message": 5, "at": 3},
                 {"bot": "calc.fix", "turn": 6, "reply": true, "person": "ana", "at": 5}]});
         assert_eq!(
             quoting(&item),
@@ -26134,7 +26091,7 @@ mod tests {
         let plan = json!({"steps": ["[x] Read", "[>] Fix", "[ ] Test"]});
         app.commit_call("p1", Some(1), "plan", &plan, "Plan set.", false);
         let updates = "Task updates: what happened in your tasks since you last heard.\n\
-            - calc.neg: turn:calc.neg/3 completed";
+            - calc.neg: calc.neg/3 completed";
         app.land(5, (updates, ""), (None, false), false);
         let steer = |bot: &str| {
             json!({"command": format!(
@@ -26146,7 +26103,7 @@ mod tests {
             Some(1),
             "shell",
             &steer("calc.neg"),
-            "turn:calc.neg/4",
+            "calc.neg/4",
             false,
         );
         app.commit_call(
@@ -26154,7 +26111,7 @@ mod tests {
             Some(1),
             "shell",
             &steer("calc.neg"),
-            "turn:calc.neg/5",
+            "calc.neg/5",
             false,
         );
         let save = json!({"command": r#""$HOME/.agent/memory" save flow --type user -- -"#});
@@ -26202,7 +26159,7 @@ mod tests {
             Some(1),
             "shell",
             &steer("calc.neg"),
-            "turn:calc.neg/4",
+            "calc.neg/4",
             false,
         );
         let note = json!({"call_id": "m1", "name": "margin", "arguments": json!({
@@ -26229,7 +26186,7 @@ mod tests {
             Some(1),
             "shell",
             &steer("calc.neg"),
-            "turn:calc.neg/4",
+            "calc.neg/4",
             false,
         );
         verbose.commit_call("c3", Some(1), "shell", &save, r#"{"saved": "flow"}"#, false);
@@ -26269,7 +26226,7 @@ mod tests {
         let news = |task: &str| {
             format!(
                 "Task updates: what happened in your tasks since you last heard.\n\
-                - {task}: turn:{task}/1 completed"
+                - {task}: {task}/1 completed"
             )
         };
         let land = |app: &mut App, node: i64, task: &str| {
@@ -26626,7 +26583,7 @@ mod tests {
             if asked["op"] == "submit" {
                 seen.lock().unwrap().push(asked.clone());
             }
-            json!({"turn": 12})
+            json!({"message": 12, "turn": 12})
         })
         .await;
         let mut app = app(client);

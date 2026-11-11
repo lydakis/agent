@@ -373,7 +373,7 @@ class HarborStoreTest(ModelFixture):
     def test_accounting_reads_a_real_store(self):
         client = self.client()
         client.request('create', bot='task', workspace=str(self.path))
-        turn = client.request('submit', bot='task', request_id='r', prompt='hello')['result']['turn']
+        turn = client.request('submit', bot='task', request_id='r', prompt='hello')['result']['message']
         client.finished(turn)
         listed = client.request('turns', bot='task', after=0, limit=8)['result']['turns']
         Path(self.path, 'stats.json').write_text(json.dumps(client.request('stats')['result']))
@@ -398,7 +398,7 @@ class HarborStoreTest(ModelFixture):
         client = self.client()
         for bot in ('task', 'helper'):
             client.request('create', bot=bot, workspace=str(self.path))
-            turn = client.request('submit', bot=bot, request_id=bot, prompt='hello')['result']['turn']
+            turn = client.request('submit', bot=bot, request_id=bot, prompt='hello')['result']['message']
             client.finished(turn)
         helper = client.request('turns', bot='helper', after=0, limit=8)['result']['turns'][0]
         client.request('delete', bot='helper')

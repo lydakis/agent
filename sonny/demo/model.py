@@ -42,7 +42,7 @@ class Model(http.server.BaseHTTPRequestHandler):
         told = str(items[last_user].get('content')).find('Task updates: ') != -1
         if lead and told and step == 0:
             # Sonny telling the lead a task ended: it reads the reply by its handle.
-            handle = re.search(r'turn:[\w.-]+/\d+', str(items[last_user].get('content'))).group(0)
+            handle = re.search(r'- [\w.-]+: ([\w.-]+/\d+)', str(items[last_user].get('content'))).group(1)
             text = 'A task finished; reading what it did.'
             output = [call('wait', f'w0-{len(items)}', handles=[handle], timeout_ms=0)]
         elif lead and told:
@@ -55,7 +55,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             # The handle `run --detach` printed, waited on: the task's window
             # closes once the wait returns its finished turn.
             started = next(item['output'] for item in reversed(items) if item.get('type') == 'function_call_output')
-            handle = re.search(r'turn:[\w.-]+/\d+', started).group(0)
+            handle = re.search(r'handle\W+([\w.-]+/\d+)', started).group(1)
             text = "Waiting for `fix-avg` to finish."
             output = [call('wait', f'w1-{len(items)}', handles=[handle])]
         elif lead and WAIT:

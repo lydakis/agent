@@ -27,20 +27,26 @@ def node_item(client, bot, node):
     return {'error': entry['error']} if 'error' in entry else {'result': entry['item']}
 
 
-def poll(client, bot, turn):
-    """A turn's outcome without waiting, in `request`'s shape: `result` holds
-    it, or {'finished': False} while the turn runs; `error` says why there is
-    none: `wait` with no time to wait."""
-    handle = f'turn:{bot}/{turn}'
+def poll(client, bot, message):
+    """A message's outcome without waiting, in `request`'s shape: `result`
+    holds it, or {'finished': False} while it waits or its turn runs;
+    `error` says why there is none: `wait` with no time to wait."""
+    handle = f'{bot}/{message}'
     response = client.request('wait', handles=[handle], timeout_ms=0)
     if 'result' not in response:
         return response
     found = response['result']['results'][handle]
     if found.get('pending'):
-        return {'result': {'turn': turn, 'finished': False}}
+        return {'result': {'message': message, 'finished': False}}
     if 'error' in found and ('status' not in found or found['error'] == 'turn_result_pruned'):
         return {'error': found['error']}
     return {'result': found}
+
+
+def number(result):
+    """A submission's number: `message`, or `turn` from a daemon before
+    protocol 65, which the Perf screen runs as the base."""
+    return result['message'] if 'message' in result else result['turn']
 
 
 class Client:
@@ -105,8 +111,19 @@ class Client:
         self.process.stdin.flush()
         return self.receive(lambda m: m.get('id') == self.next_id)
 
-    def finished(self, turn, timeout=5):
-        return self.receive(lambda m: m.get('event') == 'turn_finished' and m.get('turn') == turn, timeout)
+    def finished(self, message, timeout=5):
+        """The event that ended message `message`: the end of the turn it
+        opened, its end in line (`message_ended`), or its being taken into
+        a running turn (`steered`), read here as status `taken` with that
+        turn."""
+        def ends(m):
+            kind = m.get('event')
+            return ((kind == 'turn_finished' and m.get('turn') == message)
+                    or (kind in ('steered', 'message_ended') and m.get('message') == message))
+        event = self.receive(ends, timeout)
+        if event['event'] == 'steered':
+            event = {**event, 'data': {**event['data'], 'status': 'taken', 'turn': event['turn']}}
+        return event
 
     def summarized(self, bot, timeout=5):
         """Wait for the summary a turn of `bot` started as it ended to land,

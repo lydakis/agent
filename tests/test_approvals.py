@@ -57,7 +57,7 @@ class ApprovalTests(ModelFixture):
         # it still does not run, and the turn parks for the next start.
         marker = self.path / 'ran'
         client = self.gated(settings={'approval_hold_ms': 60000})
-        turn = client.request('submit', bot='Bob', request_id='t', prompt=f'shell:touch {marker}')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='t', prompt=f'shell:touch {marker}')['result']['message']
         call_id = self.announced(client, turn)[0]['call_id']
         self.assertTrue(client.request('shutdown', grace_ms=60_000)['result']['shutting_down'])
         self.assertEqual(self.answer(client, turn, call_id)['result']['pending'], [])
@@ -78,7 +78,7 @@ class ApprovalTests(ModelFixture):
         client = self.client('echo,shell')
         created = client.request('create', bot='Bob', workspace=str(self.path))['result']
         self.assertEqual(created['gates'], [])
-        turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:printf hi')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:printf hi')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.events(client, turn, 'approval_requested'), [])
         self.assertNotIn('approvals', self.events(client, turn, 'tool_started')[0])
@@ -89,7 +89,7 @@ class ApprovalTests(ModelFixture):
 
     def test_an_allowed_call_runs_and_records_who_allowed_it(self):
         client = self.gated()
-        turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:printf hi')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:printf hi')['result']['message']
         [call] = self.announced(client, turn)
         self.assertEqual({k: call[k] for k in ('call_id', 'request', 'gates', 'name')},
                          {'call_id': 'shell-1', 'request': 1, 'gates': ['manual'], 'name': 'shell'})
@@ -135,7 +135,7 @@ class ApprovalTests(ModelFixture):
                  ['write', {'path': 'notes.md', 'content': 'x'}],
                  ['write', {'path': f'{outside}/written', 'content': 'x'}]]
         turn = client.request('submit', bot='Bob', request_id='t',
-                              prompt='calls:' + json.dumps(calls))['result']['turn']
+                              prompt='calls:' + json.dumps(calls))['result']['message']
         # Only the two that leave the sandbox wait for a verdict.
         announced = self.announced(client, turn)
         self.assertEqual([call['call_id'] for call in announced], ['shell-2', 'write-4'])
@@ -186,7 +186,7 @@ class ApprovalTests(ModelFixture):
                  ['shell', {'command': f'echo /tmp > {repo}/.git/commondir'}],
                  ['shell', {'command': f'echo /tmp > {repo}/.git/worktrees/tree/commondir'}]]
         turn = client.request('submit', bot='Bob', request_id='t',
-                              prompt='calls:' + json.dumps(calls))['result']['turn']
+                              prompt='calls:' + json.dumps(calls))['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'shell-1')[1]['exit_code'], 0)
         log = subprocess.run(['git', 'log', '--format=%s', 'task'], cwd=repo, capture_output=True, text=True)
@@ -227,7 +227,7 @@ class ApprovalTests(ModelFixture):
                  # A repository it makes is its own.
                  ['shell', {'command': f'git init -q {made} && echo exit 0 > {made}/.git/hooks/pre-commit'}]]
         turn = client.request('submit', bot='Bob', request_id='t',
-                              prompt='calls:' + json.dumps(calls))['result']['turn']
+                              prompt='calls:' + json.dumps(calls))['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'shell-1')[1]['exit_code'], 0)
         log = subprocess.run(['git', 'log', '--format=%s'], cwd=repo, capture_output=True, text=True)
@@ -250,7 +250,7 @@ class ApprovalTests(ModelFixture):
         calls = [['shell', {'command': f'touch {outside}/escaped', 'sandbox_permissions': 'require_escalated'}],
                  ['write', {'path': f'{outside}/written', 'content': 'x'}]]
         turn = client.request('submit', bot='Bob', request_id='t',
-                              prompt='calls:' + json.dumps(calls))['result']['turn']
+                              prompt='calls:' + json.dumps(calls))['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.events(client, turn, 'approval_requested'), [])
         # As Codex refuses an escape under a policy that never asks.
@@ -290,7 +290,7 @@ class ApprovalTests(ModelFixture):
             '        return False\n'
             'print(json.dumps([reached(path) for path in sys.argv[1:]]))\n')
         prompt = f"shell:python3 probe.py {walled / 'host.sock'} {other / 'host.sock'}"
-        turn = daemon.request('submit', bot='Bob', request_id='t', prompt=prompt)['result']['turn']
+        turn = daemon.request('submit', bot='Bob', request_id='t', prompt=prompt)['result']['message']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         probed = json.loads(self.tool_output(daemon, 'shell-1')[1]['stdout'])
         # With the network on it reaches a socket of the person's, as Codex's
@@ -314,7 +314,7 @@ class ApprovalTests(ModelFixture):
         # Another sandboxed bot, whose own socket is open once it has run a
         # command.
         carl = daemon.request('create', bot='Carl', workspace=str(self.path))['result']['bot_id']
-        turn = daemon.request('submit', bot='Carl', request_id='c', prompt='shell:true')['result']['turn']
+        turn = daemon.request('submit', bot='Carl', request_id='c', prompt='shell:true')['result']['message']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         (self.path / 'kid').mkdir()
         act = {'name': 'act', 'description': 'Act.', 'parameters': {'type': 'object'}, 'answered_by': 'client'}
@@ -377,7 +377,7 @@ class ApprovalTests(ModelFixture):
             '    planted = False\n'
             'print(json.dumps({"own": os.environ["AGENT_SOCKET"], "planted": planted, "borrowed": borrowed, "answers": ask(os.environ["AGENT_SOCKET"], requests)}))\n')
         turn = daemon.request('submit', bot='Bob', request_id='t',
-                              prompt=f'shell:python3 probe.py {daemon.socket_path} {carl}')['result']['turn']
+                              prompt=f'shell:python3 probe.py {daemon.socket_path} {carl}')['result']['message']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         probed = json.loads(self.tool_output(daemon, 'shell-1')[1]['stdout'])
         # On Linux its own socket is in the daemon's socket's place, reached
@@ -436,7 +436,7 @@ class ApprovalTests(ModelFixture):
                  ['shell', {'command': f'{meets("b", "a")}; touch {outside}/x'}],
                  ['shell', {'command': f'touch {outside}/escaped', 'sandbox_permissions': 'require_escalated'}]]
         turn = client.request('submit', bot='Bob', request_id='t',
-                              prompt='calls:' + json.dumps(calls))['result']['turn']
+                              prompt='calls:' + json.dumps(calls))['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         # The two confined commands ran at once, each in the sandbox.
         self.assertTrue((self.path / 'a').exists() and (self.path / 'b').exists())
@@ -451,7 +451,7 @@ class ApprovalTests(ModelFixture):
         client = self.gated(settings={'sandbox': 'workspace-write', 'rules': rules})
         self.model.call_script = [('shell', {'command': f'cp /dev/null {self.path}/asked'}),
                                   ('shell', {'command': f'mkdir {self.path}/made'})]
-        turn = client.request('submit', bot='Bob', request_id='script', prompt='script')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='script', prompt='script')['result']['message']
         self.assertEqual([call['call_id'] for call in self.announced(client, turn)], ['script-0'])
         # While its first round waits, a rule forbids what its next does.
         given = {'prefix_rules': rules['prefix_rules'] + [
@@ -485,7 +485,7 @@ class ApprovalTests(ModelFixture):
         self.model.call_script = [('shell', {'command': f'cp /dev/null {self.path}/asked'}),
                                   ('shell', {'command': f'mkdir {self.path}/made'})]
         bots = ('Bob', 'Kid', 'Grandkid')
-        turns = {bot: client.request('submit', bot=bot, request_id='script', prompt='script')['result']['turn']
+        turns = {bot: client.request('submit', bot=bot, request_id='script', prompt='script')['result']['message']
                  for bot in bots}
         for bot in bots:
             self.assertEqual([call['call_id'] for call in self.announced(client, turns[bot])], ['script-0'])
@@ -523,7 +523,7 @@ class ApprovalTests(ModelFixture):
                                   ('together', [['shell', {'command': f"touch '{outside}/one' && touch {outside}/two"}],
                                                 ['shell', {'command': f'touch {outside}/three && true'}]])]:
             turn = client.request('submit', bot='Bob', request_id=request_id,
-                                  prompt='calls:' + json.dumps(calls))['result']['turn']
+                                  prompt='calls:' + json.dumps(calls))['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
             self.assertEqual(self.events(client, turn, 'approval_requested'), [])
         self.assertEqual(sorted(path.name for path in outside.iterdir()), ['alone', 'one', 'two'])
@@ -535,7 +535,7 @@ class ApprovalTests(ModelFixture):
                  ['shell', {'command': f'rm -fr {outside}/keep', 'sandbox_permissions': 'require_escalated',
                             'justification': 'clean up'}]]
         turn = client.request('submit', bot='Bob', request_id='forbidden',
-                              prompt='calls:' + json.dumps(calls))['result']['turn']
+                              prompt='calls:' + json.dumps(calls))['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.events(client, turn, 'approval_requested'), [])
         for call_id in ('shell-1', 'shell-2'):
@@ -546,7 +546,7 @@ class ApprovalTests(ModelFixture):
         # One a rule asks about waits for the gate though the sandbox would
         # hold it, and once allowed runs where it asked to: in the sandbox.
         turn = client.request('submit', bot='Bob', request_id='prompt',
-                              prompt=f'shell:cp /dev/null {outside}/asked')['result']['turn']
+                              prompt=f'shell:cp /dev/null {outside}/asked')['result']['message']
         self.assertEqual([call['call_id'] for call in self.announced(client, turn)], ['shell-1'])
         self.answer(client, turn, 'shell-1')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -556,7 +556,7 @@ class ApprovalTests(ModelFixture):
         client.request('create', bot='Solo', workspace=str(self.path),
                        settings={'sandbox': 'workspace-write', 'rules': rules})
         turn = client.request('submit', bot='Solo', request_id='solo',
-                              prompt=f'shell:cp /dev/null {self.path}/copied')['result']['turn']
+                              prompt=f'shell:cp /dev/null {self.path}/copied')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         output = self.tool_output(client, 'shell-1', bot='Solo')[1]
         self.assertEqual((output['error'], output['detail']),
@@ -567,7 +567,7 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(client.request('configure', bot='Solo', settings={'rules': rules})['result']['changed'],
                          ['rules'])
         turn = client.request('submit', bot='Solo', request_id='later',
-                              prompt=f'shell:mkdir {self.path}/made')['result']['turn']
+                              prompt=f'shell:mkdir {self.path}/made')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'shell-1', bot='Solo')[1]['error'], 'command_forbidden')
         self.assertFalse((self.path / 'made').exists())
@@ -575,7 +575,7 @@ class ApprovalTests(ModelFixture):
         why = 'default.rules:1:1: pattern is empty'
         client.request('configure', bot='Solo', settings={'rules': {'invalid': why}})
         turn = client.request('submit', bot='Solo', request_id='invalid',
-                              prompt=f'shell:touch {self.path}/never')['result']['turn']
+                              prompt=f'shell:touch {self.path}/never')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         output = self.tool_output(client, 'shell-1', bot='Solo')[1]
         self.assertEqual((output['error'], output['detail']), ('rules_invalid', why))
@@ -586,7 +586,7 @@ class ApprovalTests(ModelFixture):
 
     def test_a_denial_is_the_result_and_the_turn_goes_on(self):
         client = self.gated()
-        turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:touch ran')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:touch ran')['result']['message']
         self.announced(client, turn)
         self.answer(client, turn, 'shell-1', decision='deny', reason='not in this repo')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -599,7 +599,7 @@ class ApprovalTests(ModelFixture):
 
     def test_a_slow_verdict_parks_the_turn_and_resumes_it(self):
         client = self.gated(settings={'approval_hold_ms': 100})
-        turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:printf late')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:printf late')['result']['message']
         waiting = client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
         self.assertEqual(waiting['data'], {'call_id': 'shell-1', 'approval': True, 'deadline_ms': None})
         # turn_waiting commits as the turn parks; its slot is let go as its
@@ -623,7 +623,7 @@ class ApprovalTests(ModelFixture):
                 self.setUp()
                 client = self.gated(settings={'approval_hold_ms': hold}, approve_expire_ms=300)
                 turn = client.request('submit', bot='Bob', request_id='t',
-                                      prompt='multi:touch first|touch second')['result']['turn']
+                                      prompt='multi:touch first|touch second')['result']['message']
                 calls = self.announced(client, turn)
                 self.assertEqual([c['call_id'] for c in calls], ['shell-1', 'shell-2'])
                 finished = client.finished(turn)['data']
@@ -643,7 +643,7 @@ class ApprovalTests(ModelFixture):
     def test_a_failed_call_voids_verdicts_for_the_rest_of_its_round(self):
         client = self.gated()
         turn = client.request('submit', bot='Bob', request_id='t',
-                              prompt='multi:false|printf second')['result']['turn']
+                              prompt='multi:false|printf second')['result']['message']
         self.assertEqual([c['request'] for c in self.announced(client, turn)], [1, 1])
         # Answered for the round as planned, before the first call runs.
         self.answer(client, turn, 'shell-2')
@@ -659,7 +659,7 @@ class ApprovalTests(ModelFixture):
         # An ungated command outlasts the gate on the call after it, so that
         # call is past its expiry when it comes up and is judged at once.
         client = self.gated(approve=['echo'], approve_expire_ms=300)
-        turn = client.request('submit', bot='Bob', request_id='t', prompt='shellecho:sleep 1|hi')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='t', prompt='shellecho:sleep 1|hi')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_completed' and m.get('turn') == turn
                        and m['data']['call_id'] == 'shell-1')
         ran = time.monotonic()
@@ -671,7 +671,7 @@ class ApprovalTests(ModelFixture):
         # Echoed text is the call's output, not its status.
         client = self.gated(approve=['shell'])
         turn = client.request('submit', bot='Bob', request_id='t',
-                              prompt='echoshell:{"success":false,"error":"x"}|printf second')['result']['turn']
+                              prompt='echoshell:{"success":false,"error":"x"}|printf second')['result']['message']
         self.announced(client, turn)
         self.answer(client, turn, 'shell-1')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -683,7 +683,7 @@ class ApprovalTests(ModelFixture):
         client.request('create', bot='Alice', workspace=str(self.path))
         alice = client.request('submit', bot='Alice', request_id='a', prompt='slow')['result']
         turn = client.request('submit', bot='Bob', request_id='t',
-                              prompt=f"waitshell:{alice['handle']}|printf after")['result']['turn']
+                              prompt=f"waitshell:{alice['handle']}|printf after")['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
         # Committed while parked on the wait; it does not wake the turn.
         self.assertEqual(self.answer(client, turn, 'shell-1')['result']['pending'], [])
@@ -713,7 +713,7 @@ class ApprovalTests(ModelFixture):
         # A list longer than the daemon's tools is refused before any work on it.
         self.assertEqual(client.request('create', bot='Fay', approve=['shell'] * 20000,
                                         approver='manual')['error'], 'invalid_gate')
-        turn = client.request('submit', bot='Carol', request_id='t', prompt='shell:printf both')['result']['turn']
+        turn = client.request('submit', bot='Carol', request_id='t', prompt='shell:printf both')['result']['message']
         [call] = self.announced(client, turn)
         self.assertEqual(call['gates'], ['manual', 'second'])
         self.assertEqual(self.answer(client, turn, 'shell-1', bot='Carol')['error'], 'approval_tag_required')
@@ -738,7 +738,7 @@ class ApprovalTests(ModelFixture):
         client = self.gated(settings={'approval_hold_ms': 0}, approve_expire_ms=1000)
         client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), approve=['shell'],
                        approver='second', approve_expire_ms=2500)
-        turn = client.request('submit', bot='Carol', request_id='t', prompt='shell:printf x')['result']['turn']
+        turn = client.request('submit', bot='Carol', request_id='t', prompt='shell:printf x')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
         # The earlier gate is allowed while the turn is parked; the later one
         # still lapses on time and ends the turn.
@@ -754,7 +754,7 @@ class ApprovalTests(ModelFixture):
         client = self.gated(approve_expire_ms=300)
         client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), approve=['shell'],
                        approver='second')
-        turn = client.request('submit', bot='Carol', request_id='t', prompt='shell:printf x')['result']['turn']
+        turn = client.request('submit', bot='Carol', request_id='t', prompt='shell:printf x')['result']['message']
         finished = client.finished(turn)['data']
         self.assertEqual((finished['status'], finished['error']), ('interrupted', 'approval_expired'))
         # The gate without an expiry was still open, not lapsed.
@@ -771,7 +771,7 @@ class ApprovalTests(ModelFixture):
                 client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), approve=['echo'],
                                approver='second', approve_expire_ms=300)
                 turn = client.request('submit', bot='Carol', request_id='t',
-                                      prompt='shellecho:touch first|hi')['result']['turn']
+                                      prompt='shellecho:touch first|hi')['result']['message']
                 announced = time.monotonic()
                 finished = client.finished(turn)
                 self.assertEqual((finished['data']['status'], finished['data']['error']),
@@ -790,7 +790,7 @@ class ApprovalTests(ModelFixture):
         client.request('create', bot='Alice', workspace=str(self.path))
         alice = client.request('submit', bot='Alice', request_id='a', prompt='wait')['result']
         turn = client.request('submit', bot='Bob', request_id='t',
-                              prompt=f"waitshell:{alice['handle']}|printf after")['result']['turn']
+                              prompt=f"waitshell:{alice['handle']}|printf after")['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
         finished = client.finished(turn)
         self.assertEqual((finished['data']['status'], finished['data']['error']),
@@ -805,8 +805,8 @@ class ApprovalTests(ModelFixture):
     def test_a_parked_verdict_survives_restart_and_interrupt_cancels_it(self):
         client = self.gated(settings={'approval_hold_ms': 0})
         client.request('create', bot='Dan', workspace=str(self.path), approve=['shell'], approver='manual')
-        turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:printf restarted')['result']['turn']
-        dan = client.request('submit', bot='Dan', request_id='d', prompt='shell:touch never')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:printf restarted')['result']['message']
+        dan = client.request('submit', bot='Dan', request_id='d', prompt='shell:touch never')['result']['message']
         for parked in (turn, dan):
             client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == parked)
         client.close(kill=True)
@@ -842,7 +842,7 @@ class ApprovalTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
                        approve=['shell'], approver='manual', compaction_instructions='Summarize.')
         rounds = 24
-        turn = client.request('submit', bot='Bob', request_id='1', prompt=f'long:{rounds}')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt=f'long:{rounds}')['result']['message']
         calls = [f'long-{n}' for n in range(rounds)]
         client = self.park_and_allow(client, turn, calls, rounds // 2, 'shell,read')
         ended = client.finished(turn, timeout=30)
@@ -877,7 +877,7 @@ class ApprovalTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
                        approve=['shell'], approver='manual', compaction_instructions='Summarize.')
         rounds = 24
-        turn = client.request('submit', bot='Bob', request_id='1', prompt=f'long:{rounds}')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt=f'long:{rounds}')['result']['message']
         beside = 0
         for n in range(rounds):
             call_id = f'long-{n}'
@@ -900,7 +900,7 @@ class ApprovalTests(ModelFixture):
         client = self.client('shell', settings={'approval_hold_ms': 0, 'context_bytes': 24576, 'compact_at': 99})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        approve=['shell'], approver='manual', compaction_instructions='Summarize.')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:4x250,1x600')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:4x250,1x600')['result']['message']
         client = self.park_and_allow(client, turn, [f'long-{n}' for n in range(5)], 4, 'shell')
         ended = client.finished(turn, timeout=30)
         self.assertEqual(ended['data']['status'], 'completed', ended)
@@ -944,7 +944,7 @@ class ServedApprovalTests(ModelFixture):
 
     def test_a_served_tag_gets_its_waiting_calls_then_each_new_one(self):
         daemon = self.daemon(settings={'approval_hold_ms': 60000})
-        first = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf one')['result']['turn']
+        first = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf one')['result']['message']
         deadline = time.monotonic() + 5
         while not daemon.request('approvals', tag='auto')['result']['approvals']:
             self.assertLess(time.monotonic(), deadline)
@@ -974,7 +974,7 @@ class ServedApprovalTests(ModelFixture):
         self.assertEqual(self.answer(approver, first, 'shell-1', tag='auto', lease=lease)['result']['pending'], [])
         self.assertEqual(daemon.finished(first)['data']['status'], 'completed')
         # A call announced after serving began is pushed to the holder only.
-        second = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf two')['result']['turn']
+        second = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf two')['result']['message']
         pushed = self.pushed(approver, second)
         self.assertEqual((pushed['tag'], pushed['lease'], pushed['durable']), ('auto', lease, False))
         self.assertEqual((pushed['data']['part'], pushed['data']['parts']), (1, 1))
@@ -987,7 +987,7 @@ class ServedApprovalTests(ModelFixture):
         # The daemon counts the denial on the bot, and the next call carries it.
         self.assertEqual(daemon.request('inspect', bot='Bob')['result']['denials'],
                          {'auto': {'in_row': 1, 'window': 1, 'turn': second}})
-        third = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf three')['result']['turn']
+        third = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf three')['result']['message']
         [call] = self.pushed(approver, third)['data']['calls']
         self.assertEqual(call['denials'], {'auto': {'in_row': 0, 'recent': 0}})
         # Closing the session frees the tag at once: the next server takes
@@ -1015,7 +1015,7 @@ class ServedApprovalTests(ModelFixture):
         new = next_.request('serve_approvals', tag='auto', lease_ms=5000)['result']['lease']
         lost = quiet.receive(lambda m: m.get('event') == 'approvals_lost')
         self.assertEqual((lost['tag'], lost['lease']), ('auto', old))
-        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf hi')['result']['turn']
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf hi')['result']['message']
         self.pushed(next_, turn)
         # A woken holder's answer under its old lease changes nothing.
         self.assertEqual(self.answer(quiet, turn, 'shell-1', tag='auto', lease=old)['error'], 'approvals_lost')
@@ -1031,7 +1031,7 @@ class ServedApprovalTests(ModelFixture):
         self.assertEqual(quiet.receive(lambda m: m.get('event') == 'approvals_lost')['lease'], short)
         self.assertEqual(daemon.request('stats')['result']['approvers'], ['auto'])
         # An answer without a lease overrides whoever serves the tag.
-        override = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf over')['result']['turn']
+        override = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf over')['result']['message']
         deadline = time.monotonic() + 5
         while not daemon.request('approvals', tag='auto')['result']['approvals']:
             self.assertLess(time.monotonic(), deadline)
@@ -1067,10 +1067,10 @@ class PromptReadTests(ModelFixture):
     def test_a_turn_reads_its_prompts_authors_and_calls(self):
         client = self.client('echo,shell')
         client.request('create', bot='Bob', workspace=str(self.path))
-        first = client.request('submit', bot='Bob', request_id='a', prompt='shell:exit 3')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='a', prompt='shell:exit 3')['result']['message']
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
         read = client.request('prompts', bot='Bob', turn=first)['result']
-        self.assertEqual(read['prompts'], [{'turn': first, 'text': 'shell:exit 3'}])
+        self.assertEqual(read['prompts'], [{'message': first, 'text': 'shell:exit 3'}])
         [call] = read['calls']
         self.assertEqual((call['name'], call['done'], call['failed']), ('shell', True, True))
         self.assertEqual(json.loads(call['arguments'])['command'], 'exit 3')
@@ -1084,17 +1084,17 @@ class PromptReadTests(ModelFixture):
         self.assertEqual(client.request('submit', bot='Bob', request_id='both', prompt='hi',
                                         origin='tasks', **{'from': {'bot': 'Bob', 'turn': first}})['error'], 'invalid_origin')
         second = client.request('submit', bot='Bob', request_id='c', prompt='done',
-                                **{'from': {'bot': 'Bob', 'turn': first}})['result']['turn']
+                                **{'from': {'bot': 'Bob', 'turn': first}})['result']['message']
         self.assertEqual(client.finished(second)['data']['status'], 'completed')
         read = client.request('prompts', bot='Bob', turn=second, bytes=1024)['result']
         # With what the bot said last before it: what a short answer answers.
         reply = read['prompts'][0].pop('reply')['text']
-        self.assertEqual(read['prompts'], [{'turn': second, 'text': 'done',
+        self.assertEqual(read['prompts'], [{'message': second, 'text': 'done',
                                             'from': {'bot': 'Bob', 'turn': first}}])
         self.assertTrue(reply.startswith('echo:'), reply)
         self.assertEqual({**json.loads(reply[len('echo:'):]), 'wall_time_ms': 0},
                          {'exit_code': 3, 'stderr': '', 'stdout': '', 'success': False, 'wall_time_ms': 0})
-        self.assertEqual(read['earlier'], [{'turn': first, 'text': 'shell:exit 3'}])
+        self.assertEqual(read['earlier'], [{'message': first, 'text': 'shell:exit 3'}])
         self.assertEqual((read['status'], read['workspace'], read['more']), ('finished', str(self.path), False))
         self.assertEqual(client.request('prompts', bot='Bob', turn=second, bytes=0)['error'], 'invalid_limit')
         # A person the client names wrote it; and a prompt may quote turns,
@@ -1104,16 +1104,16 @@ class PromptReadTests(ModelFixture):
         self.assertEqual(client.request('submit', bot='Bob', request_id='pf', prompt='hi', person='ana',
                                         origin='tasks')['error'], 'invalid_person')
         self.assertEqual(client.request('submit', bot='Bob', request_id='q0', prompt='hi',
-                                        quotes=[{'bot': 'Bob', 'turn': 0}])['error'], 'invalid_quote')
+                                        quotes=[{'bot': 'Bob', 'message': 0}])['error'], 'invalid_quote')
         self.assertEqual(client.request('submit', bot='Bob', request_id='q1', prompt='hi',
-                                        quotes=[{'bot': 'Bob', 'turn': second + 99}])['error'], 'quote_not_found')
+                                        quotes=[{'bot': 'Bob', 'message': second + 99}])['error'], 'quote_not_found')
         third = client.request('submit', bot='Bob', request_id='q2', prompt='as asked', person='ana',
-                               quotes=[{'bot': 'Bob', 'turn': first},
-                                       {'bot': 'Bob', 'turn': second, 'reply': True}])['result']['turn']
+                               quotes=[{'bot': 'Bob', 'message': first},
+                                       {'bot': 'Bob', 'message': second, 'reply': True}])['result']['message']
         self.assertEqual(client.finished(third)['data']['status'], 'completed')
         [read] = client.request('prompts', bot='Bob', turn=third)['result']['prompts']
         self.assertEqual((read['text'], read['person']), ('as asked', 'ana'))
-        self.assertEqual(read['quotes'][0], {'bot': 'Bob', 'turn': first, 'text': 'shell:exit 3'})
+        self.assertEqual(read['quotes'][0], {'bot': 'Bob', 'message': first, 'text': 'shell:exit 3'})
         self.assertEqual(read['quotes'][1]['from'], {'bot': 'Bob', 'turn': second})
         self.assertEqual(read['quotes'][1]['text'], 'reply:done')
 
@@ -1386,7 +1386,7 @@ class AutoApproverTests(ModelFixture):
     def test_every_call_is_judged_once_a_round_and_risky_ones_are_denied(self):
         daemon = self.daemon()
         _, lines = self.approver(daemon)
-        safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['turn']
+        safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['message']
         self.assertEqual(daemon.finished(safe)['data']['status'], 'completed')
         self.assertEqual((self.path / 'out').read_text(), 'safe')
         round = self.judge.requests.get(timeout=5)
@@ -1401,7 +1401,7 @@ class AutoApproverTests(ModelFixture):
         # A risky call nobody asked for is denied with the reason; the
         # turn's earlier call shows as already allowed, and it succeeded.
         risky_turn = daemon.request('submit', bot='Bob', request_id='b',
-                                    prompt='shell:printf DANGER')['result']['turn']
+                                    prompt='shell:printf DANGER')['result']['message']
         self.assertEqual(daemon.finished(risky_turn)['data']['status'], 'completed')
         reason = self.denial(daemon, risky_turn)
         self.assertTrue(reason.startswith(REJECTED), reason)
@@ -1475,7 +1475,7 @@ class AutoApproverTests(ModelFixture):
         self.assertIn('result', daemon.request('delete', bot='.reviewer.auto.notes'))
         self.assertEqual((bots['.reviewer.auto']['model'], bots['.reviewer.auto']['tools'],
                           bots['.reviewer.auto']['gates']), ('judge-model', LOOKING, []))
-        safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['turn']
+        safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['message']
         self.assertEqual(daemon.finished(safe)['data']['status'], 'completed')
         self.assertEqual((self.path / 'out').read_text(), 'safe')
         request, round = asked.get(timeout=5)
@@ -1492,7 +1492,7 @@ class AutoApproverTests(ModelFixture):
         judged = lines.get(timeout=5)
         self.assertEqual((judged['event'], judged['calls'][0]['decision'], judged['input_tokens']),
                          ('reviewed', 'allow', 100))
-        risky_turn = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf DANGER')['result']['turn']
+        risky_turn = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf DANGER')['result']['message']
         self.assertEqual(daemon.finished(risky_turn)['data']['status'], 'completed')
         reason = self.denial(daemon, risky_turn)
         self.assertTrue(reason.startswith(REJECTED + ' (risk: high, authorization: unknown).\nReason: It deletes'),
@@ -1500,7 +1500,7 @@ class AutoApproverTests(ModelFixture):
         # A reply that is not the verdict's JSON is a failed check, not an
         # allow, and says so.
         parsed[0] = False
-        vague = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf vague')['result']['turn']
+        vague = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf vague')['result']['message']
         self.assertEqual(daemon.finished(vague)['data']['status'], 'completed')
         self.assertTrue(self.denial(daemon, vague).startswith(FAILED + "the reviewer's answer was not the JSON asked for."))
         events = [lines.get(timeout=5) for _ in range(3)]
@@ -1544,7 +1544,7 @@ class AutoApproverTests(ModelFixture):
         calls = [['shell', {'command': 'printf escaped > out', 'sandbox_permissions': 'require_escalated',
                             'justification': 'Do you want to write out?'}]]
         turn = daemon.request('submit', bot='Bob', request_id='a',
-                              prompt='calls:' + json.dumps(calls))['result']['turn']
+                              prompt='calls:' + json.dumps(calls))['result']['message']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         self.assertEqual((self.path / 'out').read_text(), 'escaped')
         round, output = looked.get(timeout=5)
@@ -1570,7 +1570,7 @@ class AutoApproverTests(ModelFixture):
         self.assertIn('approvals_served', refused.stderr)
         kept = daemon.request('inspect', bot='.reviewer.auto')['result']
         self.assertEqual((kept['bot_id'], kept['model']), (base['bot_id'], 'judge-model'))
-        safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['turn']
+        safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['message']
         self.assertEqual(daemon.finished(safe)['data']['status'], 'completed')
         self.assertEqual((self.path / 'out').read_text(), 'safe')
 
@@ -1578,7 +1578,7 @@ class AutoApproverTests(ModelFixture):
         daemon = self.daemon()
         self.approver(daemon)
         prompt = 'shell:printf "Authorization: Bearer synthetic-secret-value" > sent'
-        turn = daemon.request('submit', bot='Bob', request_id='a', prompt=prompt)['result']['turn']
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt=prompt)['result']['message']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         sent = json.dumps(self.judge.requests.get(timeout=5))
         self.assertNotIn('synthetic-secret-value', sent)
@@ -1589,7 +1589,7 @@ class AutoApproverTests(ModelFixture):
         self.approver(daemon)
         # A check that fails once is tried again, and its verdict stands.
         self.judge.failures = 1
-        retried = daemon.request('submit', bot='Bob', request_id='r', prompt='shell:printf one > one')['result']['turn']
+        retried = daemon.request('submit', bot='Bob', request_id='r', prompt='shell:printf one > one')['result']['message']
         self.assertEqual(daemon.finished(retried)['data']['status'], 'completed')
         self.assertEqual((self.path / 'one').read_text(), 'one')
         for _ in range(2):
@@ -1597,7 +1597,7 @@ class AutoApproverTests(ModelFixture):
         # One that fails three times is denied as a review failure, and
         # counts toward no breaker.
         self.judge.failures = 3
-        failed = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf one')['result']['turn']
+        failed = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf one')['result']['message']
         self.assertEqual(daemon.finished(failed)['data']['status'], 'completed')
         self.assertTrue(self.denial(daemon, failed).startswith(FAILED))
         for _ in range(3):
@@ -1608,7 +1608,7 @@ class AutoApproverTests(ModelFixture):
         self.model.call_script = [('shell', {'command': f'printf DANGER-{n}'}) for n in range(5)]
         daemon = self.daemon()
         self.approver(daemon)
-        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['message']
         finished = daemon.finished(turn)
         self.assertEqual(finished['data']['status'], 'interrupted', finished)
         for n in range(3):
@@ -1622,12 +1622,12 @@ class AutoApproverTests(ModelFixture):
         self.model.call_script = [('shell', {'command': f'printf DANGER-{n}'}) for n in range(5)]
         daemon = self.daemon()
         self.approver(daemon)
-        tripped = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
+        tripped = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['message']
         self.assertEqual(daemon.finished(tripped)['data']['status'], 'interrupted')
         self.assertEqual(self.judge.requests.qsize(), 3)
         # The person writes again: the new turn's call is judged, not
         # refused on the last turn's run of denials.
-        turn = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf safe > safe')['result']['turn']
+        turn = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf safe > safe')['result']['message']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         self.assertEqual((self.path / 'safe').read_text(), 'safe')
         self.assertEqual(self.judge.requests.qsize(), 4)
@@ -1642,7 +1642,7 @@ class AutoApproverTests(ModelFixture):
         person = person['result']['turn']
         daemon.finished(person)
         delegated = daemon.request('submit', bot='Carol', request_id='b', prompt='shell:printf DANGER',
-                                   **{'from': {'bot': 'Bob', 'turn': person}})['result']['turn']
+                                   **{'from': {'bot': 'Bob', 'turn': person}})['result']['message']
         daemon.finished(delegated)
         request = self.judge.requests.get(timeout=5)['state']['request']
         self.assertEqual(request, [{'by': 'person', 'text': 'delete the build directory'},
@@ -1663,7 +1663,7 @@ class AutoApproverTests(ModelFixture):
         # A review that never assessed the call hands it to the person as it
         # is, labeled, and leaves the breaker's count where it was.
         self.judge.failures = 3
-        unchecked = daemon.request('submit', bot='Carol', request_id='c', prompt='shell:printf ok')['result']['turn']
+        unchecked = daemon.request('submit', bot='Carol', request_id='c', prompt='shell:printf ok')['result']['message']
         judged = next(line for line in iter(lambda: lines.get(timeout=5), None) if line['event'] == 'reviewed')
         self.assertEqual((judged['turn'], judged['calls'][0]['decision']), (unchecked, 'ask'))
         self.assertTrue(judged['calls'][0]['reason'].startswith(FAILED), judged)
@@ -1692,10 +1692,10 @@ class AutoApproverTests(ModelFixture):
         self.approver(daemon)
         # A person's brief longer than the judge is shown, delegated on.
         brief = 'work through the merge plan ' + 'p' * 200_000
-        person = daemon.request('submit', bot='Bob', request_id='a', prompt=brief)['result']['turn']
+        person = daemon.request('submit', bot='Bob', request_id='a', prompt=brief)['result']['message']
         daemon.finished(person)
         delegated = daemon.request('submit', bot='Carol', request_id='b', prompt='shell:printf safe > safe',
-                                   **{'from': {'bot': 'Bob', 'turn': person}})['result']['turn']
+                                   **{'from': {'bot': 'Bob', 'turn': person}})['result']['message']
         self.assertEqual(daemon.finished(delegated)['data']['status'], 'completed')
         self.assertEqual((self.path / 'safe').read_text(), 'safe')
         body = self.judge.requests.get(timeout=5)
@@ -1705,7 +1705,7 @@ class AutoApproverTests(ModelFixture):
         self.assertNotIn('authorization_unreadable', body['state'])
         # A risky call nobody asked for still is not run.
         risky = daemon.request('submit', bot='Carol', request_id='c', prompt='shell:printf DANGER',
-                               **{'from': {'bot': 'Bob', 'turn': person}})['result']['turn']
+                               **{'from': {'bot': 'Bob', 'turn': person}})['result']['message']
         daemon.finished(risky)
         events = daemon.request('events', bot='Carol', after=0, limit=256)['result']['events']
         [completed] = [e['data'] for e in events if e['turn'] == risky and e['event'] == 'tool_completed']
@@ -1714,12 +1714,12 @@ class AutoApproverTests(ModelFixture):
     def test_a_go_ahead_is_read_against_the_calls_refused_before_it(self):
         daemon = self.daemon()
         self.approver(daemon)
-        refused = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf DANGER')['result']['turn']
+        refused = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf DANGER')['result']['message']
         daemon.finished(refused)
         self.assertTrue(self.denial(daemon, refused).startswith(REJECTED))
         self.judge.requests.get(timeout=5)
         # The person says yes; the judge sees what the bot was refused.
-        turn = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf ok')['result']['turn']
+        turn = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf ok')['result']['message']
         daemon.finished(turn)
         state = self.judge.requests.get(timeout=5)['state']
         [call] = state['earlier_prompts'][0]['refused_calls']
@@ -1732,15 +1732,15 @@ class AutoApproverTests(ModelFixture):
         # A scheduled message is no person's word: like a model's, it is shown but grants nothing.
         for origin in ('tasks', 'schedule'):
             turn = daemon.request('submit', bot='Bob', request_id=origin, prompt='shell:printf DANGER',
-                                  origin=origin)['result']['turn']
+                                  origin=origin)['result']['message']
             daemon.finished(turn)
             request = self.judge.requests.get(timeout=5)['state']['request']
             # After the bot's last message, if it has one: neither is a person's.
             self.assertEqual(request[-1], {'by': 'model', 'text': 'shell:printf DANGER'})
             self.assertEqual({words['by'] for words in request}, {'model'})
             [prompt] = daemon.request('prompts', bot='Bob', turn=turn)['result']['prompts']
-            self.assertEqual({k: prompt[k] for k in ('turn', 'text', 'origin')},
-                             {'turn': turn, 'text': 'shell:printf DANGER', 'origin': origin})
+            self.assertEqual({k: prompt[k] for k in ('message', 'text', 'origin')},
+                             {'message': turn, 'text': 'shell:printf DANGER', 'origin': origin})
             # The call it was refused sits with it.
             self.assertEqual([call['name'] for call in prompt['refused']], ['shell'])
 
@@ -1759,7 +1759,7 @@ class AutoApproverTests(ModelFixture):
         daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell', 'write'], approver='auto',
                        approve_expire_ms=15000)
         self.approver(daemon)
-        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['message']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         self.assertTrue(self.denial(daemon, turn, 'script-1').startswith(REJECTED))
         # A file too large to show is shown by its size, and what it does is
@@ -1794,7 +1794,7 @@ class AutoApproverTests(ModelFixture):
         daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell'], approver='auto',
                        approve_expire_ms=15000)
         self.approver(daemon)
-        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['message']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         self.assertTrue(self.denial(daemon, turn, 'script-1').startswith(REJECTED))
         state = self.judge.requests.get(timeout=5)['state']
@@ -1815,7 +1815,7 @@ class AutoApproverTests(ModelFixture):
         daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell'], approver='auto',
                        approve_expire_ms=15000)
         self.approver(daemon)
-        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['message']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         self.assertFalse(self.poll(daemon, turn, 'script-1').get('denied'))
         state = self.judge.requests.get(timeout=5)['state']
@@ -1841,7 +1841,7 @@ class AutoApproverTests(ModelFixture):
         daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell'], approver='auto',
                        approve_expire_ms=15000, instructions=f'Preamble.{sections}')
         self.approver(daemon)
-        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['message']
         self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
         first, second = [self.judge.requests.get(timeout=5)['state'] for _ in range(2)]
         # The call being judged is not in the transcript; it is planned.

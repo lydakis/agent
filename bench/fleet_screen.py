@@ -31,7 +31,7 @@ from pathlib import Path
 
 import psutil
 
-from .runtime_client import Client
+from .runtime_client import Client, number
 from .synthetic_model import start
 from .targets import file_hash
 
@@ -136,7 +136,7 @@ class Screen:
                 refused[response['error']] = refused.get(response['error'], 0) + 1
                 pending.append(index)
                 return False
-            in_flight[response['result']['turn']] = submitted_at
+            in_flight[number(response['result'])] = submitted_at
             return True
 
         # Fill to the bound, then keep it full as turns finish. A refusal
@@ -170,20 +170,20 @@ class Screen:
                     samples=samples)
 
     def park(self):
-        anchor = self.client.request('submit', bot='b0', request_id='anchor', prompt='hold:')['result']['turn']
+        anchor = number(self.client.request('submit', bot='b0', request_id='anchor', prompt='hold:')['result'])
         started = time.monotonic()
         turns, refused = set(), {}
         pending = list(range(1, self.parked + 1))
         # A parked turn needs an active slot for the model call that parks
         # it, so refusals at the bound are retried as earlier ones park.
         while pending:
-            response = self.client.request('submit', bot=f'b{pending[0]}', request_id='park', prompt=f'wait:turn:b0/{anchor}')
+            response = self.client.request('submit', bot=f'b{pending[0]}', request_id='park', prompt=f'wait:b0/{anchor}')
             if 'error' in response:
                 refused[response['error']] = refused.get(response['error'], 0) + 1
                 self.pump(.02)
                 continue
             pending.pop(0)
-            turns.add(response['result']['turn'])
+            turns.add(number(response['result']))
         deadline = time.monotonic() + 300
         while not turns <= self.waiting and time.monotonic() < deadline:
             self.pump(.1)

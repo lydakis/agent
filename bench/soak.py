@@ -188,7 +188,7 @@ class Soak:
                 child_turn = self.submit('child', child, f'delay:{self.random.choice([500, 1500, 3000])}')
                 if child_turn is None:
                     continue
-                self.submit(role, bot, f'wait:turn:{child}/{child_turn}')
+                self.submit(role, bot, f'wait:{child}/{child_turn}')
                 continue
             self.submit(role, bot, self.prompt(role, bot))
 

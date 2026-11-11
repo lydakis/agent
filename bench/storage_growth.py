@@ -40,7 +40,7 @@ def run(binary, out, boundaries):
                               else f'Turn {k}: ' + 'Keep the public interface stable.\n' * 128)
                     response = client.request('submit', bot=bot, request_id=f't{k}', prompt=prompt)
                     assert 'result' in response, response
-                    pending.append(response['result']['turn'])
+                    pending.append(response['result']['message'])
                 for turn in pending:
                     result = client.finished(turn)
                     assert result['data']['status'] == 'completed', result

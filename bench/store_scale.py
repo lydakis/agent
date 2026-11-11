@@ -150,7 +150,7 @@ class Screen:
                 assert 'result' in response, response
                 if prompt == SHELL:
                     self.shell_turns[bot] = self.shell_turns.get(bot, 0) + 1
-                pending.append((bot, response['result']['turn'], before))
+                pending.append((bot, response['result']['message'], before))
             bot, turn, before = pending.pop(0)
             event = client.receive(lambda m, t=turn: m.get('event') == 'turn_finished' and m.get('turn') == t,
                                    timeout=120)
@@ -243,7 +243,7 @@ class Screen:
             bot = self.name(i)
             response = client.request('submit', bot=bot, request_id=self.request_id(bot), prompt='hold:')
             assert 'result' in response, response
-            held.append((bot, response['result']['turn']))
+            held.append((bot, response['result']['message']))
         deadline = time.monotonic() + timeout
         while self.server.requests - before < len(held):
             if time.monotonic() >= deadline:

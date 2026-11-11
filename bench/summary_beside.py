@@ -46,7 +46,7 @@ def run(binary, prompt, context_bytes, work, summary):
                 client.request('create', bot='Bob', workspace=workspace, tools=['shell', 'read'],
                                compaction_instructions='Summarize.')
                 started = time.monotonic()
-                turn = client.request('submit', bot='Bob', request_id='1', prompt=prompt)['result']['turn']
+                turn = client.request('submit', bot='Bob', request_id='1', prompt=prompt)['result']['message']
                 ended = client.finished(turn, timeout=3600)
                 wall = time.monotonic() - started
                 if ended['data']['status'] != 'completed':

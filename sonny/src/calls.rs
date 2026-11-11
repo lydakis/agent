@@ -449,7 +449,9 @@ fn agent(words: &[String], stdin: Option<&str>, output: &str, failed: bool) -> O
             if let Some(reply) = &reply
                 && refusal.is_none()
             {
-                if let Some(turn) = reply["turn"].as_i64() {
+                // A message in line has no turn yet; the one it opens has
+                // its number.
+                if let Some(turn) = reply["turn"].as_i64().or_else(|| reply["message"].as_i64()) {
                     said.what = format!(
                         "{} · turn {turn}",
                         reply["bot"].as_str().unwrap_or(&said.what)
@@ -569,18 +571,25 @@ const STATUSES: &[&str] = &[
     "failed",
     "interrupted",
     "waiting",
-    "steered",
+    "taken",
     "blocked",
     "paced",
 ];
 
-/// The bot a `turn:BOT/N` handle names.
-pub fn handle_bot(handle: &str) -> String {
-    let bot = handle.strip_prefix("turn:").unwrap_or(handle);
-    match bot.rsplit_once('/') {
-        Some((bot, turn)) if turn.bytes().all(|b| b.is_ascii_digit()) => bot.to_owned(),
-        _ => bot.to_owned(),
+/// The bot and number a `BOT/N` handle names.
+pub fn handle_parts(handle: &str) -> Option<(&str, i64)> {
+    let (bot, number) = handle.rsplit_once('/')?;
+    if bot.is_empty() || bot.contains(['/', ':']) || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
+    Some((bot, number.parse().ok()?))
+}
+
+/// The bot a `BOT/N` handle names.
+pub fn handle_bot(handle: &str) -> String {
+    handle_parts(handle)
+        .map_or(handle, |(bot, _)| bot)
+        .to_owned()
 }
 
 /// The task turns a wait returned completed, by bot and turn, from what
@@ -600,13 +609,7 @@ pub fn returned(printed: &str) -> Vec<(String, i64)> {
             if result["status"] != "completed" {
                 continue;
             }
-            let Some((bot, turn)) = handle
-                .strip_prefix("turn:")
-                .and_then(|h| h.rsplit_once('/'))
-            else {
-                continue;
-            };
-            if let Ok(turn) = turn.parse() {
+            if let Some((bot, turn)) = handle_parts(handle) {
                 turns.push((bot.to_owned(), turn));
             }
         }
@@ -1018,7 +1021,7 @@ mod tests {
     #[test]
     fn a_brief_in_a_document_or_a_capture_still_reads_as_a_start() {
         let line = "h=$(\"$AGENT_BIN\" run --detach --new --bot calc.neg -- \"$(cat <<'EOF'\nAdd a negative test.\nKeep the rest.\nEOF\n)\" | jq -r .handle)";
-        let said = said(line, "turn:calc.neg/3", false).unwrap();
+        let said = said(line, "calc.neg/3", false).unwrap();
         assert_eq!(
             (said.verb.as_str(), said.what.as_str()),
             ("Started", "calc.neg")
@@ -1043,7 +1046,7 @@ mod tests {
         let said = said(
             r#""$AGENT_BIN" run --detach --new --model "$AGENT_MODEL" --bot calc.equal-test -- 'Add a test.
 Keep the rest.'"#,
-            r#"{"bot":"calc.equal-test","handle":"turn:calc.equal-test/7","status":"running","turn":7}"#,
+            r#"{"bot":"calc.equal-test","handle":"calc.equal-test/7","status":"running","turn":7}"#,
             false,
         )
         .unwrap();
@@ -1140,8 +1143,8 @@ Keep the rest.'"#,
     #[test]
     fn a_wait_names_the_bot_not_the_handle() {
         let said = said(
-            r#""$AGENT_BIN" wait turn:calc.equal-test/7"#,
-            r#"{"pending":[],"results":{"turn:calc.equal-test/7":{"status":"completed","text":"Added it.\nMore"}}}"#,
+            r#""$AGENT_BIN" wait calc.equal-test/7"#,
+            r#"{"pending":[],"results":{"calc.equal-test/7":{"status":"completed","text":"Added it.\nMore"}}}"#,
             false,
         )
         .unwrap();
@@ -1256,7 +1259,7 @@ Keep the rest.'"#,
 
     #[test]
     fn a_wait_returns_only_the_turns_that_completed() {
-        let tool = r#"{"results":{"turn:shop.fix/7":{"bot":"shop.fix","status":"completed","text":"ok"},"turn:shop.docs/12":{"pending":true},"turn:shop.bad/3":{"status":"failed"}},"pending":["turn:shop.docs/12"]}"#;
+        let tool = r#"{"results":{"shop.fix/7":{"bot":"shop.fix","status":"completed","text":"ok"},"shop.docs/12":{"pending":true},"shop.bad/3":{"status":"failed"}},"pending":["shop.docs/12"]}"#;
         assert_eq!(returned(tool), [("shop.fix".to_owned(), 7)]);
         let shell = format!("Cloning...\n{tool}\ndone");
         assert_eq!(returned(&shell), [("shop.fix".to_owned(), 7)]);

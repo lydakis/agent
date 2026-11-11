@@ -361,7 +361,7 @@ async fn ask(
         .ok()?;
     let outcome = &waited["results"][handle];
     if outcome["pending"] == true {
-        if let Some(turn) = submitted["turn"].as_i64() {
+        if let Some(turn) = submitted["message"].as_i64() {
             let _ = client
                 .request("interrupt", json!({"bot": name, "turn": turn}))
                 .await;

@@ -419,6 +419,17 @@ enum Command {
         #[serde(default)]
         newest: bool,
     },
+    /// A bot's messages, each with its number, where it stands and the
+    /// turn that took it in, paged as `turns` pages its runs.
+    Messages {
+        bot: String,
+        #[serde(default)]
+        after: i64,
+        before: Option<i64>,
+        limit: Option<usize>,
+        #[serde(default)]
+        newest: bool,
+    },
     /// The tokens bots' turns spent: in all, by bot, by model, and over
     /// time. A read.
     Usage {
@@ -3092,10 +3103,12 @@ impl Service {
         if started.status == "ready" {
             self.ready_hint = true;
         }
+        // The message's number, and the turn's when it opened one.
+        let turn = started.opened.then_some(started.turn);
         Ok(
-            json!({"bot":bot,"bot_id":identity,"turn":started.turn,"request_id":request_id,
-            "duplicate":!started.fresh,"status":started.status,"cursor":cursor,
-            "handle":format!("turn:{bot}/{}", started.turn)}),
+            json!({"bot":bot,"bot_id":identity,"message":started.turn,"turn":turn,
+            "request_id":request_id,"duplicate":!started.fresh,"status":started.status,
+            "cursor":cursor,"handle":format!("{bot}/{}", started.turn)}),
         )
     }
 
@@ -4373,6 +4386,22 @@ impl Service {
                     .await
                 })
             }
+            Command::Messages {
+                bot,
+                after,
+                before,
+                limit,
+                newest,
+            } => {
+                let reader = store.reader();
+                self.observe(session, output, id, async move {
+                    (reader.read("messages", move |db| {
+                        db.messages(&bot, after, before, limit.unwrap_or(64), newest)
+                    }))
+                    .await
+                })
+            }
+
             Command::Usage {
                 name,
                 since_ms,
@@ -5555,13 +5584,16 @@ impl Service {
                 if quotes.len() > MAX_QUOTES {
                     return fail_with(
                         "invalid_quote",
-                        format!("a prompt may quote up to {MAX_QUOTES} turns"),
+                        format!("a prompt may quote up to {MAX_QUOTES} messages"),
                     );
                 }
-                if let Some(quote) = quotes.iter().find(|quote| quote.turn < 1) {
-                    return Err(Error::with("invalid_quote", "a quoted turn is 1 or more")
-                        .facts(json!({"bot":quote.bot,"turn":quote.turn})));
+                if let Some(quote) = quotes.iter().find(|quote| quote.message < 1) {
+                    return Err(
+                        Error::with("invalid_quote", "a quoted message is 1 or more")
+                            .facts(json!({"bot":quote.bot,"message":quote.message})),
+                    );
                 }
+
                 if prompt.len() > 256 * 1024 {
                     return fail_with("prompt_limit", "prompt may be up to 262144 bytes");
                 }
@@ -5764,15 +5796,16 @@ impl Service {
                     .op("turn_status", move |db| db.turn_status(&check, turn))
                     .await?;
                 match status.as_str() {
-                    // A queued turn has no task either; end it where it stands.
+                    // A message in line has no task either; withdraw it.
                     "queued" | "ready" | "attached" => {
                         self.end_queued(bot.clone(), turn, Error::new(turn::INTERRUPTED))
                             .await?;
                         return view(&reader, bot, true).await;
                     }
                     // Repeating an interrupt, or one that crossed the turn's
-                    // own end, finds it ended and says how.
-                    "completed" | "failed" | "interrupted" | "steered" => {
+                    // own end, finds it ended and says how; a message
+                    // another turn took in is that turn's now.
+                    "completed" | "failed" | "interrupted" | "withdrawn" | "taken" => {
                         return view(&reader, bot, false).await;
                     }
                     _ => {}
@@ -7834,9 +7867,11 @@ mod tests {
                 "CREATE TABLE IF NOT EXISTS parent(id INTEGER PRIMARY KEY);
                  CREATE TABLE IF NOT EXISTS child(parent INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
                  CREATE TRIGGER lose_status AFTER UPDATE OF status ON turns WHEN NEW.bot='Bob'
+                 BEGIN INSERT INTO child VALUES (1); END;
+                 CREATE TRIGGER lose_message_status AFTER UPDATE OF status ON messages WHEN NEW.bot='Bob'
                  BEGIN INSERT INTO child VALUES (1); END;"
             } else {
-                "DROP TRIGGER lose_status;"
+                "DROP TRIGGER lose_status; DROP TRIGGER lose_message_status;"
             })
             .unwrap();
     }
@@ -7988,9 +8023,9 @@ mod tests {
         let (store, _publications) = Store::open(&path).await.unwrap();
         let turns = running(&store, &["Bob".into(), "Zed".into()]).await;
         let (bob, zed) = (turns[0].1, turns[1].1);
-        let handle = handles::Handle::Turn {
+        let handle = handles::Handle::Message {
             bot: "Zed".into(),
-            turn: zed,
+            message: zed,
         }
         .to_string();
         let parked = handle.clone();

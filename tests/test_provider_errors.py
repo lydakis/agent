@@ -93,7 +93,7 @@ class ProviderErrorTests(unittest.TestCase):
                                     env={**clean_env(), 'AGENT_ERROR_TEST_KEY':KEY})
                     try:
                         client.request('create', bot='Bob', workspace=directory)
-                        turn = client.request('submit', bot='Bob', request_id='r', prompt='check')['result']['turn']
+                        turn = client.request('submit', bot='Bob', request_id='r', prompt='check')['result']['message']
                         # A refused key is the person's to fix: the turn is
                         # held on it, saying why, rather than ended.
                         held = mode.startswith('http_')

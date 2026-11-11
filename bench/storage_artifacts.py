@@ -52,7 +52,7 @@ def trial(binary, directory, fixture):
                 prompt = f'shell:cat output.txt # {round}' if n < 8 else f'ordinary {round}'
                 submitted = time.monotonic()
                 result = client.request('submit', bot=f'b{n}', request_id=f'r{round}', prompt=prompt)
-                pending.append((n, result['result']['turn'], submitted))
+                pending.append((n, result['result']['message'], submitted))
             for n, turn, submitted in pending:
                 event = client.finished(turn)
                 assert event['data']['status'] == 'completed', event

@@ -111,7 +111,7 @@ class WorkflowTests(ModelFixture):
         if escalated:
             arguments.update(sandbox_permissions='require_escalated', justification='Needs to.')
         turn = self.daemon.request('submit', bot=bot, request_id=f't{self.turns}',
-                                   prompt='calls:' + json.dumps([['shell', arguments]]))['result']['turn']
+                                   prompt='calls:' + json.dumps([['shell', arguments]]))['result']['message']
         asked = False
         if allow is not None:
             event = self.daemon.followers[bot].receive(

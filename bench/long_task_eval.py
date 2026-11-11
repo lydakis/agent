@@ -1024,7 +1024,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
         started, submitted = time.monotonic(), {}
         for name in names:
             submitted[name] = time.monotonic()
-            turns[name] = client.request('submit', bot=name, request_id='task', prompt=task)['result']['turn']
+            turns[name] = client.request('submit', bot=name, request_id='task', prompt=task)['result']['message']
         # Live events: count completed tools per bot, steer once each passes
         # the task's steer point, and collect the terminal events of tasks
         # and steers, with each task's time from its submission to its end
@@ -1032,13 +1032,18 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
         # step record, written before the tool completes.
         done, steers, ends, completed, finished = {}, {}, {}, {name: 0 for name in names}, {}
         while len(done) < len(names):
-            message = client.receive(lambda m: m.get('event') in ('tool_completed', 'turn_finished'),
+            message = client.receive(lambda m: m.get('event') in ('tool_completed', 'turn_finished', 'steered',
+                                                                    'message_ended'),
                                      timeout=timeout)
             name = message.get('bot')
             if name not in turns:
                 continue
-            if message['event'] == 'turn_finished' and message.get('turn') == steers.get(name, {}).get('turn'):
-                ends[name] = message['data']
+            # The correction's own end: taken into the task's turn, or
+            # ended in line.
+            if message['event'] in ('steered', 'message_ended'):
+                if message.get('message') == steers.get(name, {}).get('message'):
+                    ends[name] = ({**message['data'], 'status': 'taken', 'turn': message['turn']}
+                                  if message['event'] == 'steered' else message['data'])
                 continue
             if message.get('turn') != turns[name]:
                 continue
@@ -1054,22 +1059,23 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                                        delivery='steer', expected_turn=turns[name])
                 steers[name] = reply.get('result') or {'error': reply.get('error')}
         wall = round(max(m['_received_at'] for m in done.values()) - started, 1)
-        # A steer still queued when its task ends fails then, as it names
+        # A steer still in line when its task ends fails then, as it names
         # that task's turn.
         for name, steer in steers.items():
-            if 'turn' in steer and name not in ends:
-                ends[name] = client.finished(steer['turn'], timeout=60)['data']
+            if 'message' in steer and name not in ends:
+                ends[name] = client.finished(steer['message'], timeout=60)['data']
         # Failed summaries are reported live only.
         failures = {name: [m.get('error') for m in client.saved
                            if m.get('event') == 'compaction_failed' and m.get('bot') == name] for name in names}
         # Where each sustained bot took in the correction: the steps it had
-        # recorded by the time the daemon marked the steer's turn steered,
+        # recorded by the time the daemon took the steer into its turn,
         # at a round boundary before the model's next call could run one.
         marks = {}
         for name, end in ends.items():
-            if size == 'sustained' and end.get('status') == 'steered':
-                steered = next(t for t in page_rows(client, 'turns', name) if t['turn'] == steers[name]['turn'])
-                marks[name] = steps_before(root / name, steered['finished_ms'])
+            if size == 'sustained' and end.get('status') == 'taken':
+                taken = next(m for m in page_rows(client, 'messages', name)
+                             if m['message'] == steers[name]['message'])
+                marks[name] = steps_before(root / name, taken['taken_ms'])
         for name in names:
             events = list(page_rows(client, 'events', name))
             summary_ms = sum(t['summary_ms'] for t in page_rows(client, 'turns', name))
@@ -1094,9 +1100,9 @@ def steer_outcome(steer, end):
     """Whether the correction reached the task: its turn's final status."""
     if steer is None:
         return 'not sent: the task ended before its steer point'
-    if 'turn' not in steer:
+    if 'message' not in steer:
         return f"refused: {steer['error']}"
-    return end['status'] if end['status'] == 'steered' else f"{end['status']}: {end.get('error')}"
+    return end['status'] if end['status'] == 'taken' else f"{end['status']}: {end.get('error')}"
 
 
 def summarize(block):
@@ -1107,7 +1113,7 @@ def summarize(block):
 
     return {'condition': block['condition'], 'task': block['task'], 'context_bytes': block['context_bytes'],
             'completed': f"{sum(b['status'] == 'completed' for b in bots)}/{len(bots)}",
-            'steered': f"{sum(b['steer'] == 'steered' for b in bots)}/{len(bots)}",
+            'steered': f"{sum(b['steer'] == 'taken' for b in bots)}/{len(bots)}",
             'correct': count('correct'), 'vendor_intact': count('vendor_intact'),
             'reported_throughput': count('reported_throughput'),
             'followed_workflow': count('followed_workflow'),

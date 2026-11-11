@@ -13,6 +13,10 @@ use bytes::Bytes;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
+#[path = "support/schema_90.rs"]
+mod schema_90;
+use schema_90::Older;
+
 // These tests isolate store contracts; runtime tests cover provider admission.
 fn allow_provider(_: &Bot, _: Option<&str>) -> Result<()> {
     Ok(())
@@ -531,7 +535,7 @@ fn restart_repairs_unanswered_tools_once_including_previously_blocked_bots() {
         }
         if state != "running" {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch("UPDATE bots SET status='uncertain',running_turn=NULL; UPDATE turns SET status='uncertain'; PRAGMA user_version=19;").unwrap();
+            conn.older("UPDATE bots SET status='uncertain',running_turn=NULL; UPDATE turns SET status='uncertain'; PRAGMA user_version=19;").unwrap();
             if state == "pruned" {
                 conn.execute_batch(
                     "DELETE FROM tools; DELETE FROM events; DELETE FROM retained_turns;",
@@ -1975,7 +1979,7 @@ fn schema_53_denial_counts_become_the_newest_of_a_window() {
         .unwrap();
     Connection::open(&path)
         .unwrap()
-        .execute_batch("PRAGMA user_version=53;")
+        .older("PRAGMA user_version=53;")
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let denials = db.inspect("Bob").unwrap().denials;
@@ -2002,7 +2006,7 @@ fn schema_49_waiting_calls_were_not_handed_to_anyone() {
     Database::initialize(Connection::open(&path).unwrap()).unwrap();
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE approvals DROP COLUMN asked; PRAGMA user_version=49;")
+        .older("ALTER TABLE approvals DROP COLUMN asked; PRAGMA user_version=49;")
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let turn = gated_turn(&mut db, None);
@@ -2035,7 +2039,7 @@ fn schema_62_had_no_steps_and_no_paused_calls() {
     Database::initialize(Connection::open(&path).unwrap()).unwrap();
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "DROP INDEX approvals_steps; DROP INDEX answers_paused;
              ALTER TABLE approvals DROP COLUMN step_of; ALTER TABLE answers DROP COLUMN paused_ms;
              PRAGMA user_version=62;",
@@ -2284,30 +2288,36 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
     );
     // Short steers from Bob, from the app and from a person each keep
     // their own node; a queued message from the app starts later.
-    db.begin(
-        "Carol",
-        "b2",
-        "also the docs",
-        true,
-        &by_bob(Delivery::Steer),
-        allow_provider,
-    )
-    .unwrap();
-    db.begin(
-        "Carol",
-        "a1",
-        "task update",
-        true,
-        &by_app(Delivery::Steer, "tasks"),
-        allow_provider,
-    )
-    .unwrap();
+    let docs = db
+        .begin(
+            "Carol",
+            "b2",
+            "also the docs",
+            true,
+            &by_bob(Delivery::Steer),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let update = db
+        .begin(
+            "Carol",
+            "a1",
+            "task update",
+            true,
+            &by_app(Delivery::Steer, "tasks"),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
     let steer = TurnOptions {
         delivery: Delivery::Steer,
         ..TurnOptions::default()
     };
-    db.begin("Carol", "p2", "and the tests", true, &steer, allow_provider)
-        .unwrap();
+    let tests = db
+        .begin("Carol", "p2", "and the tests", true, &steer, allow_provider)
+        .unwrap()
+        .turn;
     let absorbed = db
         .absorb(
             turn,
@@ -2319,14 +2329,14 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
             true,
         )
         .unwrap();
-    // Each `steered` event names the steer's turn and who sent its message.
+    // Each `steered` event names the message and who sent it.
     let taken: Vec<Value> = absorbed
         .entries
         .iter()
         .filter(|e| e["event"] == "steered")
         .map(|e| {
             json!([
-                e["data"]["steer"].is_i64(),
+                e["data"]["message"].is_i64(),
                 e["data"]["from"],
                 e["data"]["origin"]
             ])
@@ -2406,18 +2416,38 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
             })
             .collect()
     };
-    // The model reads who sent each prompt no person wrote, after its words.
-    let by = format!("[Written by the agent Bob in turn:Bob/{person}, not by a person.]");
+    // The model reads each prompt's number and who sent it, after its
+    // words.
+    let by = |message: i64| {
+        format!(
+            "[Message Carol/{message}, written by the agent Bob in Bob/{person}, not by a person.]"
+        )
+    };
     let expected = [
         json!(["ran", null, null, null]),
-        json!(["nightly", "[Sent by schedule.]", null, "schedule"]),
+        json!([
+            "nightly",
+            format!("[Message Carol/{later}, sent by schedule.]"),
+            null,
+            "schedule"
+        ]),
         json!(["noted", null, null, null]),
-        json!(["then the changelog", by, bob, null]),
+        json!(["then the changelog", by(waiting), bob, null]),
         json!(["done", null, null, null]),
-        json!(["and the tests", null, null, null]),
-        json!(["task update", "[Sent by tasks.]", null, "tasks"]),
-        json!(["also the docs", by, bob, null]),
-        json!(["delegated work", by, bob, null]),
+        json!([
+            "and the tests",
+            format!("[Message Carol/{tests}.]"),
+            null,
+            null
+        ]),
+        json!([
+            "task update",
+            format!("[Message Carol/{update}, sent by tasks.]"),
+            null,
+            "tasks"
+        ]),
+        json!(["also the docs", by(docs), bob, null]),
+        json!(["delegated work", by(turn), bob, null]),
     ];
     assert_eq!(senders(&db, "Carol"), expected);
     // A fork shares the nodes; the sender outlives the source's turns and
@@ -2428,11 +2458,11 @@ fn history_items_name_who_sent_each_prompt_after_its_turns_are_gone() {
     assert_eq!(senders(&db, "Branch"), expected);
 }
 
-/// A turn's prompt, or with `reply` the reply it ended with, to quote.
-fn quote(bot: &str, turn: i64, reply: bool) -> QuoteRef {
+/// A message, or with `reply` the reply its turn ended with, to quote.
+fn quote(bot: &str, message: i64, reply: bool) -> QuoteRef {
     QuoteRef {
         bot: bot.into(),
-        turn,
+        message,
         reply,
     }
 }
@@ -2472,7 +2502,7 @@ fn a_quote_copies_a_turns_words_with_who_wrote_them() {
     assert_eq!(
         read_item(&db, "Bob", node).unwrap()["content"],
         json!([{"type":"input_text","text":"use tabs"},
-            {"type":"input_text","text":"[Written by ana.]"}])
+            {"type":"input_text","text":format!("[Message Bob/{ana}, written by ana.]")}])
     );
     db.append(ana, vec![assistant("tabs it is")], &[], None)
         .unwrap();
@@ -2500,26 +2530,27 @@ fn a_quote_copies_a_turns_words_with_who_wrote_them() {
     let turn = started.turn;
     let accepted = started.entry.unwrap();
     let node = accepted["data"]["node"].as_i64().unwrap();
-    let by_bob = format!("[Written by the agent Bob in turn:Bob/{ana}, not by a person.]");
+    let by_bob =
+        format!("[Message Carol/{turn}, written by the agent Bob in Bob/{ana}, not by a person.]");
     assert_eq!(
         read_item(&db, "Carol", node).unwrap()["content"],
         json!([
             {"type":"input_text","text":"the person approved this"},
             {"type":"input_text","text":by_bob},
-            {"type":"input_text","text":format!("[Quoted from turn:Bob/{asked}, written by a person:]")},
+            {"type":"input_text","text":format!("[Quoted from message Bob/{asked}, written by a person:]")},
             {"type":"input_text","text":"ship it"},
-            {"type":"input_text","text":format!("[Quoted from the reply of turn:Bob/{asked}, written by the agent Bob:]")},
+            {"type":"input_text","text":format!("[Quoted from the reply to message Bob/{asked}, written by the agent Bob:]")},
             {"type":"input_text","text":"shipped"},
-            {"type":"input_text","text":format!("[Quoted from turn:Bob/{ana}, written by ana:]")},
+            {"type":"input_text","text":format!("[Quoted from message Bob/{ana}, written by ana:]")},
             {"type":"input_text","text":"use tabs"},
         ])
     );
     // Events and history name each quote's writer and where its words
     // are in the item, never the words again.
     let named = json!([
-        {"bot":"Bob","turn":asked,"at":3},
-        {"bot":"Bob","turn":asked,"reply":true,"from":{"bot":"Bob","turn":asked},"at":5},
-        {"bot":"Bob","turn":ana,"person":"ana","at":7},
+        {"bot":"Bob","message":asked,"at":3},
+        {"bot":"Bob","message":asked,"reply":true,"from":{"bot":"Bob","turn":asked},"at":5},
+        {"bot":"Bob","message":ana,"person":"ana","at":7},
     ]);
     assert_eq!(accepted["data"]["quotes"], named);
     let items = db.history_items("Carol", &[node]).unwrap();
@@ -2533,9 +2564,9 @@ fn a_quote_copies_a_turns_words_with_who_wrote_them() {
     assert_eq!(
         prompt["quotes"],
         json!([
-            {"bot":"Bob","turn":asked,"text":"ship it"},
-            {"bot":"Bob","turn":asked,"reply":true,"from":{"bot":"Bob","turn":asked},"text":"shipped"},
-            {"bot":"Bob","turn":ana,"person":"ana","text":"use tabs"},
+            {"bot":"Bob","message":asked,"text":"ship it"},
+            {"bot":"Bob","message":asked,"reply":true,"from":{"bot":"Bob","turn":asked},"text":"shipped"},
+            {"bot":"Bob","message":ana,"person":"ana","text":"use tabs"},
         ])
     );
     // Each quote's record counts against the read's bytes: past them the
@@ -2649,13 +2680,13 @@ fn a_quoted_prompt_brings_its_own_quotes_with_their_first_writers() {
         .unwrap();
     assert_eq!(
         queued.entry.unwrap()["data"]["quotes"],
-        json!([{"bot":"Bob","turn":asked}])
+        json!([{"bot":"Bob","message":asked}])
     );
     db.finish(busy, None).unwrap();
     let (accepted, _) = db.start(queued.turn, allow_provider).unwrap();
     assert_eq!(
         accepted["data"]["quotes"],
-        json!([{"bot":"Bob","turn":asked,"at":3}])
+        json!([{"bot":"Bob","message":asked,"at":3}])
     );
     let carol = queued.turn;
     let pass_on = TurnOptions {
@@ -2670,9 +2701,10 @@ fn a_quoted_prompt_brings_its_own_quotes_with_their_first_writers() {
         read_item(&db, "Dave", node).unwrap()["content"],
         json!([
             {"type":"input_text","text":"see this"},
-            {"type":"input_text","text":format!("[Quoted from turn:Carol/{carol}, sent by lookout:]")},
+            {"type":"input_text","text":format!("[Message Dave/{}.]", started.turn)},
+            {"type":"input_text","text":format!("[Quoted from message Carol/{carol}, sent by lookout:]")},
             {"type":"input_text","text":"from your tasks"},
-            {"type":"input_text","text":format!("[Quoted from turn:Bob/{asked}, written by a person:]")},
+            {"type":"input_text","text":format!("[Quoted from message Bob/{asked}, written by a person:]")},
             {"type":"input_text","text":"approved"},
         ])
     );
@@ -2814,7 +2846,10 @@ fn a_bot_that_hides_senders_reads_quoted_words_without_their_lines() {
         .begin("Carol", "c1", "see this", true, &options, allow_provider)
         .unwrap();
     let data = &started.entry.unwrap()["data"];
-    assert_eq!(data["quotes"], json!([{"bot":"Bob","turn":asked,"at":1}]));
+    assert_eq!(
+        data["quotes"],
+        json!([{"bot":"Bob","message":asked,"at":1}])
+    );
     let node = data["node"].as_i64().unwrap();
     assert_eq!(
         read_item(&db, "Carol", node).unwrap()["content"],
@@ -2830,7 +2865,7 @@ fn schema_64_had_no_people_and_no_quotes() {
     Database::initialize(Connection::open(&path).unwrap()).unwrap();
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "ALTER TABLE turns DROP COLUMN person; ALTER TABLE turns DROP COLUMN quotes;
              ALTER TABLE senders DROP COLUMN person; ALTER TABLE senders DROP COLUMN quotes;
              ALTER TABLE nodes DROP COLUMN written_ms; PRAGMA user_version=64;",
@@ -2840,7 +2875,7 @@ fn schema_64_had_no_people_and_no_quotes() {
     let conn = Connection::open(&path).unwrap();
     let columns: i64 = conn
         .query_row(
-            "SELECT (SELECT count(*) FROM pragma_table_info('turns') WHERE name IN ('person','quotes'))
+            "SELECT (SELECT count(*) FROM pragma_table_info('messages') WHERE name IN ('person','quotes'))
                   + (SELECT count(*) FROM pragma_table_info('senders') WHERE name IN ('person','quotes'))
                   + (SELECT count(*) FROM pragma_table_info('nodes') WHERE name='written_ms')",
             [],
@@ -2958,7 +2993,7 @@ fn schema_69_finds_each_finished_turns_reply() {
     };
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE turns DROP COLUMN reply_node; PRAGMA user_version=69;")
+        .older("ALTER TABLE turns DROP COLUMN reply_node; PRAGMA user_version=69;")
         .unwrap();
     drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
     let conn = Connection::open(&path).unwrap();
@@ -2993,7 +3028,7 @@ fn schema_75_keeps_waiting_notes_waiting_with_no_limit() {
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "DROP INDEX turns_due; DROP INDEX turns_held; ALTER TABLE turns DROP COLUMN held;
              ALTER TABLE turns DROP COLUMN due_ms;
              ALTER TABLE turns DROP COLUMN wait_ms; PRAGMA user_version=75;",
@@ -3035,7 +3070,7 @@ fn a_turn_its_start_refused_for_a_fixable_cause_keeps_its_place_in_line() {
     assert_eq!(db.next_ready().unwrap(), Some(("Bob".into(), first.turn)));
     let refused = Error::with("provider_unavailable", "openai");
     let (events, next) = db.hold(first.turn, &refused).unwrap().unwrap();
-    assert_eq!(events[0]["event"], "turn_held");
+    assert_eq!(events[0]["event"], "held");
     assert_eq!(events[0]["data"]["blocked"]["code"], "provider_unavailable");
     let due = events[0]["data"]["resume_at_ms"].as_i64().unwrap();
     assert_eq!(next, Some(due));
@@ -3055,7 +3090,7 @@ fn a_turn_its_start_refused_for_a_fixable_cause_keeps_its_place_in_line() {
     assert_eq!(view["waiting_on"]["resume_at_ms"], due);
     let held = held_rows(&db);
     assert_eq!(held.len(), 1);
-    assert_eq!(held[0]["turn"], first.turn);
+    assert_eq!(held[0]["message"], first.turn);
     assert_eq!(held[0]["started"], false);
     // Counted by cause, a page at a time, or one bot's only.
     let listed = db.held(0, 1, None).unwrap();
@@ -3287,9 +3322,7 @@ fn schema_77_holds_a_refused_start_in_line() {
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
-            "DROP INDEX turns_held; ALTER TABLE turns DROP COLUMN held; PRAGMA user_version=77;",
-        )
+        .older("DROP INDEX turns_held; ALTER TABLE turns DROP COLUMN held; PRAGMA user_version=77;")
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let (_, turn) = db.next_ready().unwrap().unwrap();
@@ -3311,9 +3344,7 @@ fn store_at_77(name: &str) -> std::path::PathBuf {
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
-            "DROP INDEX turns_held; ALTER TABLE turns DROP COLUMN held; PRAGMA user_version=77;",
-        )
+        .older("DROP INDEX turns_held; ALTER TABLE turns DROP COLUMN held; PRAGMA user_version=77;")
         .unwrap();
     path
 }
@@ -3441,7 +3472,7 @@ fn an_older_store_counts_each_bot_s_depth_along_its_makers() {
     // A store from before schema 83 kept no depth.
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE bots DROP COLUMN depth; PRAGMA user_version=82;")
+        .older("ALTER TABLE bots DROP COLUMN depth; PRAGMA user_version=82;")
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let depth = |name: &str| db.inspect(name).unwrap().depth;
@@ -3477,7 +3508,7 @@ fn a_turn_keeps_the_schema_its_reply_follows() {
     // A store from before schema 81: its turns asked for no schema.
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE turns DROP COLUMN output_schema; PRAGMA user_version=80;")
+        .older("ALTER TABLE turns DROP COLUMN output_schema; PRAGMA user_version=80;")
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let started = db
@@ -3596,7 +3627,7 @@ fn schema_78_counts_a_call_left_unanswered_before_the_upgrade_as_taken() {
     };
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE answers DROP COLUMN taken_ms; PRAGMA user_version=78;")
+        .older("ALTER TABLE answers DROP COLUMN taken_ms; PRAGMA user_version=78;")
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     // Each counts as taken, so no client runs it again.
@@ -3666,7 +3697,7 @@ fn schema_70_finds_each_attached_message_from_its_event() {
     assert_eq!(nodes.len(), 2);
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE senders DROP COLUMN attached; PRAGMA user_version=70;")
+        .older("ALTER TABLE senders DROP COLUMN attached; PRAGMA user_version=70;")
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let read = db.history_items("Bob", &nodes).unwrap();
@@ -3858,7 +3889,7 @@ fn schema_68_events_had_no_times() {
     drop(db);
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE events DROP COLUMN written_ms; PRAGMA user_version=68;")
+        .older("ALTER TABLE events DROP COLUMN written_ms; PRAGMA user_version=68;")
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let page = db.events("Bob", 0, 256).unwrap();
@@ -4018,11 +4049,16 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     // The steer named no folder, so it records the one its turn ran in,
     // which a later move does not rewrite.
     let row = |db: &Database, id: i64| {
+        let messages = db.messages("Carol", 0, None, 10, false).unwrap();
+        let ran = (messages["messages"].as_array().unwrap().iter())
+            .find(|m| m["message"] == id)
+            .unwrap()["turn"]
+            .clone();
         db.turns("Carol", 0, None, 10, false).unwrap()["turns"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|t| t["turn"] == id)
+            .find(|t| t["turn"] == ran)
             .unwrap()["workspace"]
             .clone()
     };
@@ -4046,8 +4082,8 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     let read = db.prompts("Carol", turn, 64 * 1024).unwrap();
     assert_eq!(
         read["prompts"],
-        json!([{"turn":turn,"text":"delegated work","from":{"bot":"Bob","turn":person}},
-            {"turn":steered,"text":"also check the docs","steer":true}])
+        json!([{"message":turn,"text":"delegated work","from":{"bot":"Bob","turn":person}},
+            {"message":steered,"text":"also check the docs","steer":true}])
     );
     assert_eq!(
         read["calls"],
@@ -4066,7 +4102,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     );
     // The author's own turn is a person's words.
     let bob = db.prompts("Bob", person, 1024).unwrap();
-    assert_eq!(bob["prompts"], json!([{"turn":person,"text":"work"}]));
+    assert_eq!(bob["prompts"], json!([{"message":person,"text":"work"}]));
     // A gated call cut short names the item holding its whole arguments.
     let (item, call) = shell_call("fc_b", "b1", "make deploy");
     db.append(person, vec![item], std::slice::from_ref(&call), None)
@@ -4128,7 +4164,7 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     let read = db.prompts("Carol", next, 4 + entry + 3).unwrap();
     assert_eq!(
         read["earlier"],
-        json!([{"turn":steered,"text":"als","truncated":true,"steer":true}])
+        json!([{"message":steered,"text":"als","truncated":true,"steer":true}])
     );
     assert_eq!(read["more"], true);
     let read = db.prompts("Carol", next, 1024).unwrap();
@@ -4208,7 +4244,7 @@ fn a_prompts_read_keeps_the_prompt_and_the_newest_steers() {
     let room = "start".len() + 2 * entry + "no, wait".len() + "hold off".len();
     let cut = db.prompts("Carol", turn, room).unwrap();
     assert_eq!(texts(&cut), ["start", "no, wait", "hold off"]);
-    assert_eq!(cut["prompts"][1]["turn"], steers[1]);
+    assert_eq!(cut["prompts"][1]["message"], steers[1]);
     assert_eq!(cut["prompts_more"], true);
     // A prompt longer than the whole budget still leaves the newest
     // steer room: it takes half, and is cut.
@@ -4326,7 +4362,7 @@ fn schema_38_reads_every_stored_prompt_as_a_persons() {
     };
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "ALTER TABLE turns DROP COLUMN from_bot; ALTER TABLE turns DROP COLUMN from_turn;
              PRAGMA user_version=37;",
         )
@@ -4334,7 +4370,7 @@ fn schema_38_reads_every_stored_prompt_as_a_persons() {
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert_eq!(
         db.prompts("Bob", turn, 1024).unwrap()["prompts"],
-        json!([{"turn":turn,"text":"work"}])
+        json!([{"message":turn,"text":"work"}])
     );
     drop(db);
     let version: i32 = Connection::open(&path)
@@ -4398,7 +4434,7 @@ fn schema_40_keeps_each_bot_written_prompts_sender_with_its_node() {
     // Before 41 a `steered` event named the steer's turn as `from`.
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "DROP TABLE senders; ALTER TABLE turns DROP COLUMN origin;
              ALTER TABLE turns DROP COLUMN from_id;
              UPDATE events SET data=json_object('from',json_extract(data,'$.steer'),
@@ -4506,7 +4542,7 @@ fn schema_39_records_the_folder_each_earlier_turn_ran_in() {
     // named no model stored none either.
     Connection::open(&path)
         .unwrap()
-        .execute_batch(&format!(
+        .older(&format!(
             "UPDATE bots SET workspace='/synthetic' WHERE name='Dan';
              UPDATE turns SET workspace=NULL WHERE id IN ({turn},{steer});
              UPDATE turns SET model=NULL WHERE id={steer}; PRAGMA user_version=38;"
@@ -4514,12 +4550,17 @@ fn schema_39_records_the_folder_each_earlier_turn_ran_in() {
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     // The steer ran with the folder and model of the turn it joined.
+    let messages = db.messages("Dan", 0, None, 10, false).unwrap();
+    let joined = (messages["messages"].as_array().unwrap().iter())
+        .find(|m| m["message"] == steer)
+        .unwrap()["turn"]
+        .clone();
     let listed = db.turns("Dan", 0, None, 10, false).unwrap();
     let row = listed["turns"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|t| t["turn"] == steer)
+        .find(|t| t["turn"] == joined)
         .unwrap();
     assert_eq!(
         (&row["workspace"], &row["model"]),
@@ -4575,7 +4616,7 @@ fn schema_40_gives_every_existing_bot_the_defaults_and_completes_parked_turns() 
         db.suspend(
             turn,
             "w",
-            &["turn:Nobody/1".into()],
+            &["Nobody/1".into()],
             None,
             false,
             &[],
@@ -4588,7 +4629,7 @@ fn schema_40_gives_every_existing_bot_the_defaults_and_completes_parked_turns() 
     // An earlier daemon parked it before these fields were recorded.
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "ALTER TABLE bots DROP COLUMN settings;
              UPDATE turns SET waiting=json_remove(waiting,'$.any','$.paced_since_ms',
                 '$.call_attempts','$.call_spent_ms','$.compaction') WHERE waiting IS NOT NULL;
@@ -4671,7 +4712,7 @@ fn schema_41_turns_ran_at_their_bots_effort() {
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE turns DROP COLUMN reasoning; ALTER TABLE turns DROP COLUMN inherited_reasoning; DELETE FROM events; PRAGMA user_version=41;")
+        .older("ALTER TABLE turns DROP COLUMN reasoning; ALTER TABLE turns DROP COLUMN inherited_reasoning; DELETE FROM events; PRAGMA user_version=41;")
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert_eq!(
@@ -4679,7 +4720,7 @@ fn schema_41_turns_ran_at_their_bots_effort() {
         "medium"
     );
     assert_eq!(
-        db.turns("Bob", 0, None, 10, false).unwrap()["turns"][1]["effort"],
+        db.messages("Bob", 0, None, 10, false).unwrap()["messages"][1]["effort"],
         "medium"
     );
     drop(db);
@@ -4711,7 +4752,7 @@ fn schema_44_turns_report_no_summary_time_and_count_it_after() {
     };
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE turns DROP COLUMN summary_ms; PRAGMA user_version=44;")
+        .older("ALTER TABLE turns DROP COLUMN summary_ms; PRAGMA user_version=44;")
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert_eq!(
@@ -4842,10 +4883,8 @@ fn schema_42_backfills_absorbed_effort_or_rolls_back_when_history_is_missing() {
             db.finish(default, None).unwrap();
         }
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "ALTER TABLE turns DROP COLUMN inherited_reasoning; PRAGMA user_version=42;",
-        )
-        .unwrap();
+        conn.older("ALTER TABLE turns DROP COLUMN inherited_reasoning; PRAGMA user_version=42;")
+            .unwrap();
         match missing {
             Some("event") => {
                 conn.execute(
@@ -4879,12 +4918,12 @@ fn schema_42_backfills_absorbed_effort_or_rolls_back_when_history_is_missing() {
             assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='inherited_reasoning')", [], |r| r.get::<_, bool>(0)).unwrap());
         } else {
             let db = opened.unwrap();
-            let listed = db.turns("Bob", 0, None, 10, false).unwrap();
-            let levels: Vec<_> = listed["turns"]
+            let listed = db.messages("Bob", 0, None, 10, false).unwrap();
+            let levels: Vec<_> = listed["messages"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|t| t["effort"].as_str().unwrap())
+                .map(|m| m["effort"].as_str().unwrap())
                 .collect();
             assert_eq!(levels, ["low", "low", "low", "low", "high", "high"]);
             drop(db);
@@ -5478,7 +5517,7 @@ fn schema_52_bots_declare_no_tools() {
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE bots DROP COLUMN declared; PRAGMA user_version=52;")
+        .older("ALTER TABLE bots DROP COLUMN declared; PRAGMA user_version=52;")
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert!(db.inspect("Bob").unwrap().declared.is_empty());
@@ -5541,7 +5580,7 @@ fn schema_35_starts_every_bot_with_no_denials() {
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE bots DROP COLUMN denials; PRAGMA user_version=34;")
+        .older("ALTER TABLE bots DROP COLUMN denials; PRAGMA user_version=34;")
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert!(db.inspect("Bob").unwrap().denials.is_empty());
@@ -5849,12 +5888,12 @@ fn a_turn_runs_at_its_own_effort_or_its_bots() {
         )
         .unwrap();
     assert_eq!(plain.entry.unwrap()["data"]["effort"], "high");
-    let listed = db.turns("Bob", 0, None, 10, false).unwrap();
-    let levels: Vec<&Value> = listed["turns"]
+    let listed = db.messages("Bob", 0, None, 10, false).unwrap();
+    let levels: Vec<&Value> = listed["messages"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|t| &t["effort"])
+        .map(|m| &m["effort"])
         .collect();
     assert_eq!(levels, ["low", "low", "low", "xhigh", "high", "high"]);
 }
@@ -5919,7 +5958,7 @@ fn absorbed_effort_does_not_change_the_submitted_request() {
             // Both the inline and shared-prompt paths report the effective effort,
             // but retries still compare the original omission or explicit level.
             assert_eq!(
-                db.turns("Bob", 0, None, 10, false).unwrap()["turns"][1]["effort"],
+                db.messages("Bob", 0, None, 10, false).unwrap()["messages"][1]["effort"],
                 "low"
             );
             let retry = db
@@ -7013,7 +7052,7 @@ fn schema_79_counts_on_from_usage_and_reads_through_a_history() {
     };
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "ALTER TABLE bots DROP COLUMN work; ALTER TABLE bots DROP COLUMN work_read;
              ALTER TABLE turns DROP COLUMN work;
              ALTER TABLE turns DROP COLUMN limited; ALTER TABLE bots DROP COLUMN budget_counts;
@@ -7052,7 +7091,7 @@ fn tool_selection_migration_rejects_unknown_policy_without_changing_data() {
         converse(&mut db, "Bob", 1);
     }
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE bots DROP COLUMN tools; PRAGMA user_version=17;")
+    conn.older("ALTER TABLE bots DROP COLUMN tools; PRAGMA user_version=17;")
         .unwrap();
     let nodes: Vec<(i64, Vec<u8>)> = conn
         .prepare("SELECT id,item FROM nodes ORDER BY id")
@@ -7104,7 +7143,7 @@ fn tool_selection_migration_rejects_unknown_policy_without_changing_data() {
     let _ = std::fs::remove_file(&path);
     drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE bots DROP COLUMN tools; PRAGMA user_version=17;")
+    conn.older("ALTER TABLE bots DROP COLUMN tools; PRAGMA user_version=17;")
         .unwrap();
     let mut db = Database::initialize(conn).unwrap();
     let tools = vec!["echo".to_owned()];
@@ -7179,7 +7218,7 @@ fn stores_carry_a_schema_version_and_migrate_older_ones_forward() {
     }
     {
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
+        conn.older(
             "DROP TABLE retained_turns;
              DROP TABLE node_sequence; DROP TABLE turn_sequence; DROP INDEX nodes_turn_seq; DROP INDEX nodes_turn; DROP INDEX nodes_parent; DROP INDEX bots_head;
              DROP INDEX bots_context_start; ALTER TABLE bots DROP COLUMN pruned_cursor;
@@ -7845,7 +7884,7 @@ fn a_running_turn_forks_at_its_newest_finished_round() {
     db.suspend(
         turn,
         "w",
-        &["turn:Nobody/1".into()],
+        &["Nobody/1".into()],
         None,
         false,
         &[],
@@ -8131,7 +8170,7 @@ fn schema_36_ends_a_turn_in_flight_and_keeps_its_history() {
         db.suspend(
             turn,
             "w",
-            &["turn:Nobody/1".into()],
+            &["Nobody/1".into()],
             None,
             false,
             &[],
@@ -8143,7 +8182,7 @@ fn schema_36_ends_a_turn_in_flight_and_keeps_its_history() {
     };
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "ALTER TABLE bots DROP COLUMN closed; ALTER TABLE bots DROP COLUMN open_calls;
              DROP INDEX processes_untold; ALTER TABLE processes DROP COLUMN told;
              ALTER TABLE processes DROP COLUMN delivered; PRAGMA user_version=35;",
@@ -8691,7 +8730,7 @@ fn history_search_of_a_pattern_searches_every_bot_it_matches_newest_first() {
     assert_eq!(matches[0]["turn"], 2);
     assert_eq!(matches[2]["turn"], 1);
     let handle = matches[1]["handle"].as_str().unwrap();
-    assert!(handle.starts_with("turn:p.task/"), "{handle}");
+    assert!(handle.starts_with("p.task/"), "{handle}");
     assert_eq!(found["done"], true);
     // The turn a search runs in is left out.
     let side: i64 = matches[0]["handle"]
@@ -8779,7 +8818,7 @@ fn history_search_of_a_pattern_credits_a_fork_with_what_only_it_has() {
     let found = db
         .history_search_bots("f.*", "between", None, None)
         .unwrap();
-    assert_eq!(found["matches"][0]["handle"], format!("turn:f.two/{turn}"));
+    assert_eq!(found["matches"][0]["handle"], format!("f.two/{turn}"));
     assert_eq!(found["matches"][0]["turn"], 1);
 }
 
@@ -9127,6 +9166,64 @@ fn completion_retention_passes_turns_whose_processes_still_run() {
 }
 
 #[test]
+fn pruning_takes_the_events_of_messages_that_ended_in_line() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    // Bob is busy; one message waits behind its turn and is withdrawn,
+    // another fails there.
+    let busy = db
+        .begin(
+            "Bob",
+            "r",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let mut ended = Vec::new();
+    for (key, error) in [("w", "cancelled"), ("f", "stale_turn")] {
+        let message = db
+            .begin("Bob", key, "never", true, &queue, allow_provider)
+            .unwrap()
+            .turn;
+        db.end_queued(message, &Error::new(error)).unwrap();
+        ended.push(message);
+    }
+    db.append(busy, vec![assistant("done")], &[], None).unwrap();
+    db.finish(busy, None).unwrap();
+    let in_line = |db: &Database| -> i64 {
+        db.events("Bob", 0, 256).unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| ended.iter().any(|m| e["message"] == *m))
+            .count() as i64
+    };
+    assert_eq!(in_line(&db), 4, "queued and message_ended for each");
+    // While they are newer than the turns kept, they stay.
+    db.prune("Bob", 1).unwrap();
+    assert_eq!(in_line(&db), 4);
+    // Older than every turn kept, they go with the turns before them.
+    converse(&mut db, "Bob", 2);
+    let pruned = db.prune("Bob", 1).unwrap();
+    assert_eq!(in_line(&db), 0);
+    assert!(pruned["events"].as_i64().unwrap() >= 4, "{pruned}");
+    // Each message keeps its row: history stays.
+    for message in &ended {
+        assert_eq!(
+            db.messages("Bob", message - 1, None, 1, false).unwrap()["messages"][0]["message"],
+            *message
+        );
+    }
+}
+
+#[test]
 fn pruning_keeps_the_transcript_and_marks_the_replay_gap() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
@@ -9214,7 +9311,7 @@ fn turn_identity_migrates_above_fork_retained_history() {
         // Version 8 has no surviving turn rows, but the branch retains their
         // transcript markers. Migration must include those IDs in its floor.
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
+        conn.older(
             "DROP TABLE retained_turns;
              DROP TABLE node_sequence; DROP TABLE turn_sequence; PRAGMA user_version=8;",
         )
@@ -9259,7 +9356,7 @@ fn checkpoint_identity_survives_migration_deletion_and_restart() {
     }
     {
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
+        conn.older(
             "DROP TABLE retained_turns;
                             DROP TABLE IF EXISTS node_sequence; PRAGMA user_version=9;",
         )
@@ -9382,7 +9479,7 @@ fn retention_candidates_migrate_and_stay_scoped_to_their_bot() {
     }
     let conn = Connection::open(&path).unwrap();
     // Version 10 retains turn rows but has no operational-retention index.
-    conn.execute_batch(
+    conn.older(
         "DROP TABLE retained_turns;
                         PRAGMA user_version=10;",
     )
@@ -9450,7 +9547,7 @@ fn global_replay_gap_survives_deletion_restart_and_migration() {
     for migrate in [false, true] {
         if migrate {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch("DROP TABLE event_retention; PRAGMA user_version=13;")
+            conn.older("DROP TABLE event_retention; PRAGMA user_version=13;")
                 .unwrap();
         }
         let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
@@ -9490,7 +9587,7 @@ fn global_gap_migration_finds_interior_holes_but_not_contiguous_events() {
             }
         }
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("DROP TABLE event_retention; PRAGMA user_version=13;")
+        conn.older("DROP TABLE event_retention; PRAGMA user_version=13;")
             .unwrap();
         let db = Database::initialize(conn).unwrap();
         let page = db.events_after(0, 256).unwrap();
@@ -9572,14 +9669,14 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
     assert_eq!(absorbed.outcomes.len(), 1);
     let (steered, outcome) = &absorbed.outcomes[0];
     assert_eq!(*steered, third.turn);
-    assert_eq!(outcome["status"], "steered");
-    assert_eq!(outcome["into"], first.turn);
+    assert_eq!(outcome["status"], "taken");
+    assert_eq!(outcome["turn"], first.turn);
     let kinds: Vec<&str> = absorbed
         .entries
         .iter()
         .map(|e| e["event"].as_str().unwrap())
         .collect();
-    assert_eq!(kinds, ["turn_finished", "steered"]);
+    assert_eq!(kinds, ["steered"]);
     assert!(!db.steers_waiting("Bob").unwrap());
     let items = stored(&mut db, "Bob");
     assert_eq!(items.len(), 2);
@@ -9639,8 +9736,8 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
     let (entries, outcome) = db
         .end_queued(fourth.turn, &Error::new("cancelled"))
         .unwrap();
-    assert_eq!(entries[0]["data"]["status"], "interrupted");
-    assert_eq!(outcome["status"], "interrupted");
+    assert_eq!(entries[0]["data"]["status"], "withdrawn");
+    assert_eq!(outcome["status"], "withdrawn");
     assert_eq!(db.turn_status("Bob", fifth.turn).unwrap(), "ready");
     db.end_queued(fifth.turn, &Error::new("cancelled")).unwrap();
     assert_eq!(
@@ -9976,13 +10073,13 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
             .0,
         inherited
     );
-    // The steer named neither, so it records the model and folder it ran with.
+    // The steer named neither, so it ran with its turn's model and folder.
     let listed = db.turns("Bob", 0, None, 10, false).unwrap();
     let row = listed["turns"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|t| t["turn"] == inherited)
+        .find(|t| t["turn"] == changed)
         .unwrap();
     assert_eq!(
         (&row["model"], &row["workspace"]),
@@ -10476,7 +10573,7 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
             }
         }
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
+        conn.older(
             "ALTER TABLE turns DROP COLUMN cached_input_tokens;
             ALTER TABLE bots DROP COLUMN input_tokens;
             ALTER TABLE bots DROP COLUMN cached_input_tokens; PRAGMA user_version=18;",
@@ -10558,7 +10655,7 @@ fn schema_45_events_name_identities_bot_id() {
     // Before 46 a made bot's event named its identity `id`, and a sender's too.
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "UPDATE events SET data=json_set(json_remove(data,'$.bot_id'),'$.id',json_extract(data,'$.bot_id'))
              WHERE kind='created';
              UPDATE events SET data=json_set(data,'$.from',json_object('bot','Ann','turn',3,'id',7))
@@ -10613,7 +10710,7 @@ fn schema_46_settings_keep_turns_as_prune_names_it() {
     // Before 47 a bot's settings and its creation named retention `retain_turns`.
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "UPDATE bots SET settings='{\"retain_turns\":1}',
              creation=json_set(json_remove(creation,'$.request.settings.keep_turns'),'$.request.settings.retain_turns',1);
              PRAGMA user_version=46;",
@@ -10675,7 +10772,7 @@ fn schema_47_turns_take_their_own_token_cap() {
     // Before 48 no turn had a cap of its own.
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE turns DROP COLUMN budget_tokens; PRAGMA user_version=47;")
+        .older("ALTER TABLE turns DROP COLUMN budget_tokens; PRAGMA user_version=47;")
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let capped = TurnOptions {
@@ -10787,7 +10884,7 @@ fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
     // version keeps the identities it already has.
     {
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
+        conn.older(
             "DROP INDEX bots_id; ALTER TABLE bots DROP COLUMN id; DROP TABLE bot_sequence;
              PRAGMA user_version=20;",
         )
@@ -10807,7 +10904,7 @@ fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
     }
     {
         let conn = Connection::open(&path).unwrap();
-        conn.pragma_update(None, "user_version", 20).unwrap();
+        conn.older("PRAGMA user_version=20;").unwrap();
     }
     {
         let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
@@ -10839,7 +10936,7 @@ fn identity_migration_seeds_allocation_after_sparse_and_empty_stores() {
         }
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
+            conn.older(
                 "DROP INDEX bots_id; ALTER TABLE bots DROP COLUMN id; DROP TABLE bot_sequence;
                  PRAGMA user_version=20;",
             )
@@ -11311,7 +11408,7 @@ fn a_store_from_before_skip_pointers_places_every_node() {
     drop(db);
     Connection::open(&path)
         .unwrap()
-        .execute_batch("DROP TABLE lineage; PRAGMA user_version=72;")
+        .older("DROP TABLE lineage; PRAGMA user_version=72;")
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert_eq!((lineage(), pages(&db)), before);
@@ -11352,7 +11449,7 @@ fn a_turn_parked_by_a_stop_continues_and_one_a_pull_parked_before_74_keeps_its_p
     // As schema 73 wrote a pull's park.
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "UPDATE turns SET waiting=json_set(json_remove(waiting,'$.halt'),'$.pulled',json('true'));
              PRAGMA user_version=73;",
         )
@@ -11546,7 +11643,9 @@ fn absorption_counts_the_separator_of_every_item_the_request_sends() {
             .unwrap()
             .turn;
         let (family, used, _) = db.turn_usage("Bob", first).unwrap();
-        let steer_bytes = family.user_item("steer").unwrap().len();
+        // The steer as the model reads it: its words, then its line.
+        let line = [format!("[Message Bob/{steer}.]")];
+        let steer_bytes = family.user_item_from("steer", &line, &[]).unwrap().len();
         let budget = used + steer_bytes + spare;
         let absorbed = db
             .absorb(first, None, budget, 64, ContextUsage::default(), true, true)
@@ -11649,15 +11748,17 @@ fn turn_usage_counts_only_the_active_branch_including_absorbed_steers() {
         delivery: Delivery::Steer,
         ..options
     };
-    db.begin(
-        "Bob",
-        "steer",
-        "correction",
-        true,
-        &steer_options,
-        allow_provider,
-    )
-    .unwrap();
+    let steer = db
+        .begin(
+            "Bob",
+            "steer",
+            "correction",
+            true,
+            &steer_options,
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
     db.absorb(
         bob,
         None,
@@ -11670,16 +11771,22 @@ fn turn_usage_counts_only_the_active_branch_including_absorbed_steers() {
     .unwrap();
     let (_, bytes, count) = db.turn_usage("Bob", bob).unwrap();
     assert_eq!(count, 66);
+    // Each prompt as the model reads it: its words, then its line.
+    let item = |words: &str, line: String| {
+        (Family::Responses.user_item_from(words, &[line], &[]))
+            .unwrap()
+            .len()
+    };
     assert_eq!(
         bytes,
-        Family::Responses.user_item("bob").unwrap().len()
+        item("bob", format!("[Message Bob/{bob}.]"))
             + 64 * answer.len()
-            + Family::Responses.user_item("correction").unwrap().len()
+            + item("correction", format!("[Message Bob/{steer}.]"))
     );
     let (_, bytes, count) = db.turn_usage("Alice", alice).unwrap();
     assert_eq!(
         (bytes, count),
-        (Family::Responses.user_item("alice").unwrap().len(), 1)
+        (item("alice", format!("[Message Alice/{alice}.]")), 1)
     );
     assert_eq!(db.turn_usage("Alice", bob).unwrap_err().code, "stale_turn");
     db.finish(bob, None).unwrap();
@@ -12892,7 +12999,7 @@ fn compaction_cut_migrates_without_replacing_the_recorded_summary() {
         conn.execute("UPDATE compactions SET node=?", [cut])
             .unwrap();
         conn.execute("UPDATE bots SET compaction=?", [cut]).unwrap();
-        conn.execute_batch("DROP INDEX compactions_cut; ALTER TABLE compactions DROP COLUMN cut; PRAGMA user_version=23;")
+        conn.older("DROP INDEX compactions_cut; ALTER TABLE compactions DROP COLUMN cut; PRAGMA user_version=23;")
             .unwrap();
     }
     {
@@ -12950,7 +13057,7 @@ fn merged_schema_preserves_stores_from_both_published_branches() {
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             if lineage {
-                conn.execute_batch(
+                conn.older(
                     "DROP INDEX bots_note; DROP INDEX bots_compaction;
                     ALTER TABLE bots DROP COLUMN note;
                     ALTER TABLE bots DROP COLUMN compaction;
@@ -12968,7 +13075,7 @@ fn merged_schema_preserves_stores_from_both_published_branches() {
                 .unwrap();
                 conn.execute("UPDATE bots SET note=? WHERE name='Bob'", [head])
                     .unwrap();
-                conn.execute_batch(
+                conn.older(
                     "DROP INDEX bots_maker;
                     ALTER TABLE bots DROP COLUMN created_by;
                     ALTER TABLE bots DROP COLUMN created_by_id;
@@ -13093,7 +13200,7 @@ fn schema_27_migrates_cache_lineage_and_thinking_sizes() {
     }
     {
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
+        conn.older(
             "ALTER TABLE bots DROP COLUMN cache_bot; ALTER TABLE bots DROP COLUMN thinking_prefix;
              ALTER TABLE bots DROP COLUMN thinking_floor; ALTER TABLE nodes DROP COLUMN thinking;
              PRAGMA user_version=26;",
@@ -13336,7 +13443,7 @@ fn pictures_count_at_their_weight_and_go_whole() {
     let items = sent(&db, &window);
     let data =
         |image: &agent_runtime::codec::Image| format!("data:image/png;base64,{}", image.data);
-    assert_eq!(items[0]["content"][1]["image_url"], data(&shot));
+    assert_eq!(items[0]["content"][2]["image_url"], data(&shot));
     assert_eq!(items[2]["output"][1]["image_url"], data(&photo));
     // A summary would send them whole too.
     let plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
@@ -13358,7 +13465,8 @@ fn pictures_count_at_their_weight_and_go_whole() {
     assert_eq!(
         items[0]["content"],
         json!([{"type":"input_text",
-            "text":"look\n[1 picture(s) sent with this message, elided from this request]"}])
+            "text":"look\n[1 picture(s) sent with this message, elided from this request]"},
+            {"type":"input_text","text":"[Message Bob/1.]"}])
     );
     assert!(
         items[2]["output"]
@@ -13875,7 +13983,7 @@ fn schema_29_adds_elision_without_rewriting_stored_results() {
     };
     {
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
+        conn.older(
             "DROP INDEX bots_elision; ALTER TABLE bots DROP COLUMN elision;
              ALTER TABLE nodes DROP COLUMN elided; ALTER TABLE nodes DROP COLUMN total_elided;
              DROP TABLE stubs; DROP TABLE elisions; PRAGMA user_version=28;",
@@ -14641,7 +14749,7 @@ fn schema_30_adds_the_prompt_a_cut_inside_a_turn_keeps() {
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "DROP INDEX compactions_pinned; ALTER TABLE compactions DROP COLUMN pinned;
              PRAGMA user_version=29;",
         )
@@ -14711,7 +14819,7 @@ fn schema_31_keeps_each_bots_thinking_and_forks_carry_a_strip_from_before_them()
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "ALTER TABLE bots DROP COLUMN thinking_from; ALTER TABLE bots DROP COLUMN thinking_to;
              ALTER TABLE bots DROP COLUMN thinking_elided; PRAGMA user_version=30;",
         )
@@ -14766,7 +14874,7 @@ fn schema_33_adds_approvals_with_no_gates_on_existing_bots() {
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "DROP TABLE approval_tags; DROP TABLE approvals;
              ALTER TABLE bots DROP COLUMN gates; PRAGMA user_version=32;",
         )
@@ -14827,7 +14935,7 @@ fn schema_34_records_whether_a_call_or_a_summary_changed_the_view_last() {
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE turns DROP COLUMN view_sent; PRAGMA user_version=33;")
+        .older("ALTER TABLE turns DROP COLUMN view_sent; PRAGMA user_version=33;")
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let begin = |db: &mut Database, n: usize| {
@@ -14894,7 +15002,7 @@ fn schema_32_sums_thinking_from_the_nodes_stored_after_it() {
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE nodes DROP COLUMN total_thinking; PRAGMA user_version=31;")
+        .older("ALTER TABLE nodes DROP COLUMN total_thinking; PRAGMA user_version=31;")
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     // Nodes stored before count none; each later node adds its own.
@@ -15261,7 +15369,7 @@ fn schema_37_keeps_every_bot_its_tools() {
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE bots DROP COLUMN allowed; PRAGMA user_version=36;")
+        .older("ALTER TABLE bots DROP COLUMN allowed; PRAGMA user_version=36;")
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     let bob = db.inspect("Bob").unwrap();
@@ -15350,7 +15458,7 @@ fn a_refused_call_is_read_after_the_words_it_came_after() {
     let deploy = refuse(&mut db, turn, "s2", "make deploy");
     let read = db.prompts("Bob", turn, 64 * 1024).unwrap();
     assert_eq!(read["prompts"][0]["refused"], json!([push]));
-    assert_eq!(read["prompts"][1]["turn"], steered);
+    assert_eq!(read["prompts"][1]["message"], steered);
     assert_eq!(read["prompts"][1]["refused"], json!([deploy]));
     db.finish(turn, None).unwrap();
     let next = db
@@ -15367,7 +15475,7 @@ fn a_refused_call_is_read_after_the_words_it_came_after() {
     // An earlier turn's refusals sit with its prompt and steers the same way.
     let read = db.prompts("Bob", next, 64 * 1024).unwrap();
     assert!(read["prompts"][0].get("refused").is_none());
-    assert_eq!(read["earlier"][0]["turn"], steered);
+    assert_eq!(read["earlier"][0]["message"], steered);
     assert_eq!(read["earlier"][0]["refused"], json!([deploy]));
     assert_eq!(read["earlier"][1]["refused"], json!([push]));
     // Cut to the budget like any text, after the words: the turn's prompt
@@ -15651,7 +15759,7 @@ fn schema_43_bots_were_made_without_a_key() {
     }
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "ALTER TABLE bots DROP COLUMN creation; DROP TABLE deleted_bots;
              PRAGMA user_version=43;",
         )
@@ -15854,7 +15962,7 @@ fn schema_48_creations_keep_the_instructions_they_were_sent_with() {
     // read the bot's model.
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "UPDATE bots SET creation=json_remove(creation,'$.request.instructions');
              ALTER TABLE turns DROP COLUMN bot_model;
              ALTER TABLE turns DROP COLUMN bot_reasoning;
@@ -15980,7 +16088,7 @@ fn schema_50_bots_never_expire() {
     drop(db);
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "DROP INDEX bots_expiring; ALTER TABLE bots DROP COLUMN expire_ms;
              ALTER TABLE bots DROP COLUMN expires_at; PRAGMA user_version=50;",
         )
@@ -16159,7 +16267,7 @@ fn a_request_keeps_its_newest_pictures_and_older_ones_go_as_their_words() {
         items[0]["content"][0]["text"],
         "look 0\n[20 picture(s) sent with this message, elided from this request]"
     );
-    assert_eq!(items[8]["content"].as_array().unwrap().len(), 21);
+    assert_eq!(items[8]["content"].as_array().unwrap().len(), 22);
     // Their bytes beyond weight bound them too.
     let extra = i64::from(window.pictured[10]);
     assert!(extra > 0);
@@ -16591,7 +16699,7 @@ fn schema_85_files_each_earlier_turn_whole_under_its_own_model() {
         }
     }
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE turn_models; PRAGMA user_version=84;")
+    conn.older("DROP TABLE turn_models; PRAGMA user_version=84;")
         .unwrap();
     let db = Database::initialize(conn).unwrap();
     let usage = db.usage(None, 0, None, 64).unwrap();
@@ -16694,7 +16802,7 @@ fn schema_90_files_earlier_spend_at_standard() {
     }
     let conn = Connection::open(&path).unwrap();
     // The table as schema 89 kept it: no speed, keyed by turn and model.
-    conn.execute_batch(
+    conn.older(
         "CREATE TABLE old_models AS SELECT turn,model,input_tokens,cached_input_tokens,
                 cache_write_tokens,cache_write_1h_tokens,output_tokens FROM turn_models;
          DROP TABLE turn_models;
@@ -16883,7 +16991,7 @@ fn schema_71_held_one_pause_and_forgot_it_when_lifted() {
     Database::initialize(Connection::open(&path).unwrap()).unwrap();
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "DROP TABLE pauses;
              CREATE TABLE pause(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 reason TEXT NOT NULL, pulled_by TEXT, at_ms INTEGER NOT NULL);
@@ -17005,7 +17113,7 @@ fn a_bots_commands_let_out_of_its_sandbox_leave_its_settings_for_the_rules() {
     // As a store before schema 75 kept them.
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             r#"UPDATE bots SET settings='{"sandbox":"read-only","unsandboxed":["mcpx"]}' WHERE name='Bob';
                UPDATE bots SET settings='{"unsandboxed":["mcpx"]}' WHERE name='Ann';
                PRAGMA user_version=73;"#,
@@ -17203,7 +17311,7 @@ fn a_bot_s_variables_are_its_creator_s() {
 fn told(db: &Database, turn: i64) -> (Value, Value) {
     let events = db.events("Bob", 0, 256).unwrap();
     let queued = (events["events"].as_array().unwrap().iter())
-        .find(|e| e["event"] == "queued" && e["turn"] == turn)
+        .find(|e| e["event"] == "queued" && e["message"] == turn)
         .cloned()
         .unwrap();
     let prompts = db.prompts("Bob", turn, 4096).unwrap();
@@ -17509,7 +17617,7 @@ fn schema_76_tells_no_bot_of_commands_that_ended_before() {
     // Bob's turn was still running when that daemon stopped.
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "DROP INDEX processes_untold; DROP INDEX processes_bot_running;
              ALTER TABLE processes DROP COLUMN told;
              ALTER TABLE processes DROP COLUMN bot; PRAGMA user_version=76;",
@@ -17603,7 +17711,7 @@ fn listings_read_each_prompts_opening_never_its_item() {
         .unwrap()
         .execute_batch(
             "UPDATE nodes SET item=zeroblob(70000) WHERE turn_seq IS NOT NULL
-                OR id IN (SELECT prompt_node FROM turns)",
+                OR id IN (SELECT node FROM messages)",
         )
         .unwrap();
     assert_eq!(listed_prompts(&db), before);
@@ -17613,14 +17721,14 @@ fn listings_read_each_prompts_opening_never_its_item() {
     three_prompts(&path);
     Connection::open(&path)
         .unwrap()
-        .execute_batch("DROP TABLE openings; PRAGMA user_version=78;")
+        .older("DROP TABLE openings; PRAGMA user_version=78;")
         .unwrap();
     db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     Connection::open(&path)
         .unwrap()
         .execute_batch(
             "UPDATE nodes SET item=zeroblob(70000) WHERE turn_seq IS NOT NULL
-                OR id IN (SELECT prompt_node FROM turns)",
+                OR id IN (SELECT node FROM messages)",
         )
         .unwrap();
     assert_eq!(listed_prompts(&db), before);
@@ -17650,8 +17758,9 @@ fn a_declined_prompt_is_noted_as_the_model_is_sent_it() {
     let listed = listed_prompts(&db);
     // The model hears of the note it is sent in the prompt's place; the
     // person's listing keeps what they wrote.
-    assert_eq!(listed["omitted"][1], json!([1, "[Left out.]"]));
-    assert_eq!(listed["history"][2], json!([1, "[Left out.]", 11]));
+    let note = "[Left out: the provider's safety classifier declined it.]";
+    assert_eq!(listed["omitted"][1], json!([1, note]));
+    assert_eq!(listed["history"][2], json!([1, note, note.len()]));
     assert_eq!(listed["turns"][0][0], json!("something declined"));
 }
 
@@ -17751,11 +17860,11 @@ fn messages_that_joined_a_declined_request_go_back_in_line_as_sent() {
     // The person's and the agent's messages are in line again, as sent,
     // each its own message, in the order they came; neither the note nor
     // the fact goes again.
-    let listed: Vec<Value> = db.turns("Carol", turn, None, 8, false).unwrap()["turns"]
+    let listed: Vec<Value> = db.messages("Carol", turn, None, 8, false).unwrap()["messages"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|t| t["status"] != "steered")
+        .filter(|t| t["status"] != "taken")
         .cloned()
         .collect();
     let again: Vec<Value> = listed
@@ -17774,8 +17883,8 @@ fn messages_that_joined_a_declined_request_go_back_in_line_as_sent() {
             ])
         ]
     );
-    let first = listed[0]["turn"].as_i64().unwrap();
-    let second = listed[1]["turn"].as_i64().unwrap();
+    let first = listed[0]["message"].as_i64().unwrap();
+    let second = listed[1]["message"].as_i64().unwrap();
     let (accepted, _) = db.start(first, allow_provider).unwrap();
     assert_eq!(accepted["data"]["person"], "pat");
     // In the declined turn the model is told each went again; the note
@@ -17799,7 +17908,7 @@ fn messages_that_joined_a_declined_request_go_back_in_line_as_sent() {
         texts[1..3],
         [
             format!("[A message here is left out and sent again after this turn: {why}.]"),
-            "[Left out; sent again after this turn.]".to_owned()
+            format!("[A message here is left out and sent again after this turn: {why}.]"),
         ]
     );
     assert!(
@@ -17810,7 +17919,10 @@ fn messages_that_joined_a_declined_request_go_back_in_line_as_sent() {
     );
     let opened = sent.last().unwrap();
     assert_eq!(opened["content"][0]["text"], words);
-    assert_eq!(opened["content"][1]["text"], "[Written by pat.]");
+    assert_eq!(
+        opened["content"][1]["text"],
+        format!("[Message Carol/{first}, written by pat.]")
+    );
     assert_eq!(
         opened["content"][2]["image_url"],
         format!("data:image/png;base64,{}", picture.data)
@@ -17867,12 +17979,13 @@ fn a_message_sent_again_runs_where_it_joined_and_daemon_notes_stay_notes() {
     .unwrap();
     let refused = Error::new("provider_refusal").facts(json!({"category":"cyber"}));
     db.finish(turn, Some(&refused)).unwrap();
-    let again: Vec<Value> = (db.turns("Dan", turn, None, 8, false).unwrap()["turns"].as_array())
-        .unwrap()
-        .iter()
-        .filter(|t| t["status"] == "ready" || t["status"] == "queued")
-        .map(|t| json!([t["prompt_preview"], t["workspace"]]))
-        .collect();
+    let again: Vec<Value> = (db.messages("Dan", turn, None, 8, false).unwrap()["messages"]
+        .as_array())
+    .unwrap()
+    .iter()
+    .filter(|t| t["status"] == "ready" || t["status"] == "queued")
+    .map(|t| json!([t["prompt_preview"], t["workspace"]]))
+    .collect();
     assert_eq!(again, [json!(["look here too", "/synthetic"])]);
 }
 
@@ -17931,7 +18044,7 @@ fn a_message_sent_again_keeps_who_sent_it_and_what_it_quoted() {
     db.delete_bot("Bob").unwrap();
     let refused = Error::new("provider_refusal").facts(json!({"category":"cyber"}));
     db.finish(turn, Some(&refused)).unwrap();
-    let again = (db.turns("Carol", turn, None, 8, false).unwrap()["turns"].as_array())
+    let again = (db.messages("Carol", turn, None, 8, false).unwrap()["messages"].as_array())
         .unwrap()
         .iter()
         .find(|t| t["status"] == "ready")
@@ -17939,7 +18052,7 @@ fn a_message_sent_again_keeps_who_sent_it_and_what_it_quoted() {
         .expect("the message did not go back in line");
     assert_eq!(again["prompt_preview"], "see this");
     let (accepted, _) = db
-        .start(again["turn"].as_i64().unwrap(), allow_provider)
+        .start(again["message"].as_i64().unwrap(), allow_provider)
         .unwrap();
     assert_eq!(accepted["data"]["from"]["bot"], "Bob");
     assert!(accepted["data"]["from"]["bot_id"].is_i64(), "{accepted}");
@@ -18456,7 +18569,7 @@ fn schema_84_starts_the_trail_empty() {
     Database::initialize(Connection::open(&path).unwrap()).unwrap();
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "DROP TABLE audit;
              ALTER TABLE tools DROP COLUMN audit;
              PRAGMA user_version=84;",
@@ -18829,7 +18942,7 @@ fn a_store_before_bot_status_reads_each_bots_status_from_its_turns() {
     };
     Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .older(
             "ALTER TABLE bots DROP COLUMN started_ms; ALTER TABLE bots DROP COLUMN waiting_on;
              ALTER TABLE bots DROP COLUMN last_turn; ALTER TABLE bots DROP COLUMN last_status;
              ALTER TABLE bots DROP COLUMN last_started_ms; ALTER TABLE bots DROP COLUMN last_finished_ms;
@@ -18908,6 +19021,367 @@ fn a_configure_kept_for_a_turns_end_is_kept_once_and_let_go_when_taken() {
         .unwrap();
     assert!(set);
     assert_ne!(db.inspect("Bob").unwrap().instructions, "tried");
+}
+
+#[test]
+fn schema_90_turns_become_messages_each_with_its_number() {
+    let path = std::env::temp_dir().join(format!("agent-schema90-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let big = "b".repeat(5000);
+    let (run, steers, attached, quoting, queued, withdrawn, held, forked) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        for bot in ["Bob", "Carol", "Dave", "Gone"] {
+            db.create(bot, Some("/synthetic"), binding()).unwrap();
+        }
+        // An attached note rides Bob's turn; three steers join it, one
+        // long, one short, and one whose events retention will take.
+        let attach = TurnOptions {
+            delivery: Delivery::Attach,
+            ..TurnOptions::default()
+        };
+        let attached = db
+            .begin("Bob", "n", "fyi", true, &attach, allow_provider)
+            .unwrap()
+            .turn;
+        let run = db
+            .begin(
+                "Bob",
+                "r",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let mut steers = Vec::new();
+        for (key, words) in [("s1", big.as_str()), ("s2", "small"), ("s3", "lost words")] {
+            steers.push(
+                db.begin("Bob", key, words, true, &steer, allow_provider)
+                    .unwrap()
+                    .turn,
+            );
+        }
+        db.absorb(
+            run,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap();
+        db.append(run, vec![assistant("done")], &[], None).unwrap();
+        db.finish(run, None).unwrap();
+        // Carol quotes the short steer while busy, so the rest wait in line.
+        let quoting = db
+            .begin(
+                "Carol",
+                "c",
+                "see this",
+                true,
+                &TurnOptions {
+                    quotes: vec![quote("Bob", steers[1], false)],
+                    ..TurnOptions::default()
+                },
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let queued = (db.begin("Carol", "q", "later", true, &queue, allow_provider))
+            .unwrap()
+            .turn;
+        let withdrawn = (db.begin("Carol", "w", "never", true, &queue, allow_provider))
+            .unwrap()
+            .turn;
+        db.end_queued(withdrawn, &Error::new("cancelled")).unwrap();
+        // Dave's message is held in line on a cause a person can fix.
+        let held = (db.begin("Dave", "h", "held", false, &queue, allow_provider))
+            .unwrap()
+            .turn;
+        let (_, ready) = db.next_ready().unwrap().unwrap();
+        assert_eq!(ready, held);
+        db.hold(held, &Error::new("provider_unavailable")).unwrap();
+        // A fork outlives the bot it came from.
+        converse(&mut db, "Gone", 1);
+        db.fork("Gone", "Fork", Fork::default()).unwrap();
+        db.delete_bot("Gone").unwrap();
+        let forked = db.inspect("Fork").unwrap().head.unwrap();
+        (
+            run, steers, attached, quoting, queued, withdrawn, held, forked,
+        )
+    };
+    // As schema 90 kept them, with the last steer's events pruned, and
+    // Bob's turn ending in the millisecond it took that steer in, as a run
+    // after it began: only the run going before the steer was sent took it.
+    Connection::open(&path)
+        .unwrap()
+        .older(&format!(
+            "DELETE FROM events WHERE (kind='steered' AND json_extract(data,'$.steer')={lost})
+                OR (kind='turn_finished' AND turn={lost});
+             UPDATE turns SET finished_ms=(SELECT finished_ms FROM turns WHERE id={lost})
+                WHERE id={run};
+             INSERT INTO turns(id,bot,request_id,prompt,status,started_ms,finished_ms,waiting)
+                SELECT 900000,'Bob','next','next','completed',finished_ms,finished_ms,
+                    json_object('call_id','w','handles',json_array('turn:Bob/{run}','proc:7'))
+                FROM turns WHERE id={lost};",
+            lost = steers[2]
+        ))
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let row = |id: i64| -> (String, Option<i64>, Option<i64>, String) {
+        conn.query_row(
+            "SELECT status,turn,node,text FROM messages WHERE id=?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    };
+    // Every message Bob's turn took in names it, with the node holding its
+    // words; the long one's words live only there.
+    for id in [attached, run, steers[0], steers[1], steers[2]] {
+        let (status, turn, node, _) = row(id);
+        assert_eq!((status.as_str(), turn), ("taken", Some(run)), "{id}");
+        let node = node.unwrap();
+        let named: Option<i64> = conn
+            .query_row("SELECT message FROM nodes WHERE id=?", [node], |r| r.get(0))
+            .unwrap();
+        assert_eq!(named, Some(id));
+    }
+    assert_eq!(row(steers[0]).3, "");
+    assert_eq!(row(steers[1]).3, "small");
+    // Those in line stay there, the first now at its head as Carol's turn
+    // ended with the restart; one withdrawn ended there.
+    assert_eq!(row(queued).0, "ready");
+    assert_eq!(
+        (row(withdrawn).0.as_str(), row(withdrawn).1),
+        ("withdrawn", None)
+    );
+    assert_eq!(row(held).0, "ready");
+    assert_eq!(held_rows(&db).len(), 1);
+    // Only runs are turns, each its opening message's number.
+    let turns: Vec<i64> = conn
+        .prepare("SELECT id FROM turns WHERE bot='Bob' ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(turns, [run, 900000]);
+    // A parked wait names messages in the new form; processes keep theirs.
+    let handles: String = conn
+        .query_row(
+            "SELECT json_type(waiting,'$.handles')||json_extract(waiting,'$.handles')
+             FROM turns WHERE id=900000",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(handles, format!(r#"array["Bob/{run}","proc:7"]"#));
+    // A quote names the message it copied, and copies just that one.
+    let quotes: String = conn
+        .query_row(
+            "SELECT quotes FROM senders WHERE quotes IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        json!(serde_json::from_str::<Value>(&quotes).unwrap()[0]["message"]),
+        json!(steers[1])
+    );
+    let started = db
+        .begin(
+            "Dave",
+            "d",
+            "pass it on",
+            true,
+            &TurnOptions {
+                quotes: vec![quote("Bob", steers[2], false)],
+                delivery: Delivery::Queue,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(
+        started.entry.unwrap()["data"]["quotes"][0]["message"],
+        steers[2]
+    );
+    // The fork's history is whole without its source.
+    assert!(read_item(&db, "Fork", forked).is_ok());
+    // New numbers follow the old.
+    assert!(started.turn > held && started.turn > quoting);
+    drop(conn);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A turn's prompts read in the order it took its messages in, and each
+/// answers what was said just before it was taken: an attached message
+/// sent before a steer may be taken in after it.
+#[test]
+fn schema_90_names_a_pruned_message_s_node_only_where_its_words_are_clear() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema90-order-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let attach = TurnOptions {
+        delivery: Delivery::Attach,
+        ..TurnOptions::default()
+    };
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    let (run, attached, steered, twins) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let run = db
+            .begin(
+                "Bob",
+                "r",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        // The turn takes the steer before the message attached ahead of it,
+        // then two steers with the same words together.
+        let attached = (db.begin("Bob", "a", "by the way", true, &attach, allow_provider))
+            .unwrap()
+            .turn;
+        let steered = (db.begin("Bob", "s", "stop", true, &steer, allow_provider))
+            .unwrap()
+            .turn;
+        let usage = ContextUsage::default();
+        db.append(run, vec![assistant("one")], &[], None).unwrap();
+        db.absorb(run, None, 8 << 20, 4096, usage, false, false)
+            .unwrap();
+        db.append(run, vec![assistant("two")], &[], None).unwrap();
+        db.absorb(run, None, 8 << 20, 4096, usage, false, true)
+            .unwrap();
+        let mut twins = Vec::new();
+        for key in ["t1", "t2"] {
+            twins.push(
+                (db.begin("Bob", key, "again", true, &steer, allow_provider))
+                    .unwrap()
+                    .turn,
+            );
+        }
+        db.append(run, vec![assistant("three")], &[], None).unwrap();
+        db.absorb(run, None, 8 << 20, 4096, usage, false, true)
+            .unwrap();
+        db.append(run, vec![assistant("done")], &[], None).unwrap();
+        db.finish(run, None).unwrap();
+        (run, attached, steered, twins)
+    };
+    let node_of = |conn: &Connection, id: i64| -> Option<i64> {
+        conn.query_row("SELECT node FROM messages WHERE id=?", [id], |r| r.get(0))
+            .unwrap()
+    };
+    let before = Connection::open(&path).unwrap();
+    let nodes: Vec<Option<i64>> = [attached, steered]
+        .iter()
+        .map(|id| node_of(&before, *id))
+        .collect();
+    assert!(nodes.iter().all(Option::is_some));
+    // The steer's node comes before the attached message's.
+    assert!(nodes[1] < nodes[0]);
+    drop(before);
+    // As schema 90 kept them, with every message's events pruned.
+    Connection::open(&path)
+        .unwrap()
+        .older(&format!(
+            "DELETE FROM events WHERE turn IN ({a},{s},{t1},{t2})
+                OR json_extract(data,'$.steer') IN ({a},{s},{t1},{t2});",
+            a = attached,
+            s = steered,
+            t1 = twins[0],
+            t2 = twins[1]
+        ))
+        .unwrap();
+    Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    // Each message whose words only one prompt has gets that prompt's node,
+    // whatever order the turn took them in.
+    assert_eq!(node_of(&conn, attached), nodes[0]);
+    assert_eq!(node_of(&conn, steered), nodes[1]);
+    // Two with the same words could be either: neither is named.
+    for twin in &twins {
+        let (status, turn): (String, Option<i64>) = conn
+            .query_row("SELECT status,turn FROM messages WHERE id=?", [twin], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((status.as_str(), turn), ("taken", Some(run)));
+        assert_eq!(node_of(&conn, *twin), None);
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn prompts_follow_the_order_a_turn_took_its_messages_in() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let run = db
+        .begin(
+            "Bob",
+            "r",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let attach = TurnOptions {
+        delivery: Delivery::Attach,
+        ..TurnOptions::default()
+    };
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    let attached = (db.begin("Bob", "a", "by the way", true, &attach, allow_provider))
+        .unwrap()
+        .turn;
+    let steered = (db.begin("Bob", "s", "stop", true, &steer, allow_provider))
+        .unwrap()
+        .turn;
+    assert!(attached < steered);
+    db.append(run, vec![assistant("before the steer")], &[], None)
+        .unwrap();
+    // A call ending with no tools takes the steer alone; the attached
+    // message waits for the next call.
+    let usage = ContextUsage::default();
+    db.absorb(run, None, 8 << 20, 4096, usage, false, false)
+        .unwrap();
+    db.append(run, vec![assistant("stopping")], &[], None)
+        .unwrap();
+    db.absorb(run, None, 8 << 20, 4096, usage, false, true)
+        .unwrap();
+    db.append(run, vec![assistant("done")], &[], None).unwrap();
+    db.finish(run, None).unwrap();
+    let read = db.prompts("Bob", run, 64 * 1024).unwrap();
+    let read = read["prompts"].as_array().unwrap();
+    let words: Vec<&str> = read.iter().map(|p| p["text"].as_str().unwrap()).collect();
+    assert_eq!(words, ["work", "stop", "by the way"]);
+    assert_eq!(read[1]["reply"]["text"], "before the steer");
+    assert_eq!(read[2]["reply"]["text"], "stopping");
 }
 
 /// A gated call a message lifted waits on past its turn, as a background
@@ -19034,8 +19508,8 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
         db.process_result(p2).unwrap(),
         Some(("finished".into(), Some(result.clone())))
     );
-    let told = db.turns("Bob", 0, None, 16, false).unwrap();
-    let prompts: Vec<&str> = (told["turns"].as_array().unwrap().iter())
+    let told = db.messages("Bob", 0, None, 16, false).unwrap();
+    let prompts: Vec<&str> = (told["messages"].as_array().unwrap().iter())
         .filter_map(|t| t["prompt_preview"].as_str())
         .collect();
     assert!(
@@ -19069,8 +19543,8 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
     // Its bot at rest is told it ended with its tool's own fields, as its
     // turn would have read them.
     db.tell_finished("Bob").unwrap();
-    let told = db.turns("Bob", 0, None, 16, false).unwrap();
-    let prompts: Vec<&str> = (told["turns"].as_array().unwrap().iter())
+    let told = db.messages("Bob", 0, None, 16, false).unwrap();
+    let prompts: Vec<&str> = (told["messages"].as_array().unwrap().iter())
         .filter_map(|t| t["prompt_preview"].as_str())
         .collect();
     assert!(
@@ -19525,4 +19999,50 @@ fn a_message_for_the_turn_wakes_a_verdict_park() {
         .unwrap();
     assert_eq!(db.steered_park("Bob").unwrap(), Some((turn, sent.turn)));
     assert!(matches!(db.wake("Bob", turn, false).unwrap(), Wake::Resume));
+}
+
+#[test]
+fn retention_keeps_the_ending_of_the_message_it_ends() {
+    let mut db = db();
+    let mut kept = binding();
+    kept.settings.keep_turns = Some(1);
+    db.create("Bob", Some("/synthetic"), kept).unwrap();
+    // A note for another folder waits through turns that cannot take it.
+    let elsewhere = TurnOptions {
+        delivery: Delivery::Attach,
+        workspace: Some("/elsewhere".into()),
+        ..TurnOptions::default()
+    };
+    let note = db
+        .begin("Bob", "n", "fyi", true, &elsewhere, allow_provider)
+        .unwrap()
+        .turn;
+    converse(&mut db, "Bob", 2);
+    let status = |db: &Database| -> Value {
+        db.messages("Bob", 0, None, 16, false).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["message"] == note)
+            .unwrap()["status"]
+            .clone()
+    };
+    assert_eq!(status(&db), "attached");
+    // Withdrawn, its ending is still there to publish.
+    db.end_queued(note, &Error::new("cancelled")).unwrap();
+    db.retain("Bob", Some(note)).unwrap();
+    let ended = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["message"] == note && e["event"] == "message_ended");
+    assert!(ended, "the ending of the message being ended stays");
+    // A later pass takes it with the turns before the ones kept.
+    db.retain("Bob", None).unwrap();
+    let left = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["message"] == note);
+    assert!(!left);
 }

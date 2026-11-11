@@ -120,7 +120,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ho
                             .replace('{seed}', str(seed + n)))
             step.chmod(0o755)
             client.request('create', bot=name, workspace=str(work), instructions=instructions(task_prompt), tools=['shell'])
-            turns[name] = client.request('submit', bot=name, request_id='steps', prompt=PROMPT)['result']['turn']
+            turns[name] = client.request('submit', bot=name, request_id='steps', prompt=PROMPT)['result']['message']
         deadline = time.monotonic() + timeout
         while not all(started(root / name, CUT) for name in names):
             if time.monotonic() > deadline:
@@ -143,7 +143,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ho
             client = daemon()
         ends = {}
         for name in names:
-            handle = f'turn:{name}/{turns[name]}'
+            handle = f'{name}/{turns[name]}'
             while True:
                 if time.monotonic() > deadline:
                     raise AssertionError(f'{name} did not finish')

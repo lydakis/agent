@@ -70,7 +70,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             _, name, arguments = tool
             if arguments.get('handles') == 'HANDLE':
                 # The handle `run --detach` printed in the first tool result.
-                handle = re.search(r'turn:[\w.-]+/\d+', results[0]['output']).group(0)
+                handle = re.search(r'handle\W+([\w.-]+/\d+)', results[0]['output']).group(1)
                 arguments = {'handles': [handle]}
             output.append({'type': 'function_call', 'name': name, 'call_id': f'call-{len(results)}',
                            'arguments': json.dumps(arguments)})

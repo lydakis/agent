@@ -39,6 +39,7 @@ impl Lab {
              ls) cat \"$AGENT_LOG.ls\" 2>/dev/null || echo '[]';;\n\
              inspect) cat \"$AGENT_LOG.inspect\" 2>/dev/null || exit 1;;\n\
              turns) cat \"$AGENT_LOG.turns\" 2>/dev/null || echo '[]';;\n\
+             messages) cat \"$AGENT_LOG.messages\" 2>/dev/null || echo '[]';;\n\
              rm) printf '%s\\n' \"$@\" > \"$AGENT_LOG.rm\";;\nesac\n",
         )
         .unwrap();
@@ -507,17 +508,26 @@ fn a_done_worktree_task_is_marked_done_and_its_worktree_removed_with_its_merged_
     assert!(!ok && err.contains("uncommitted changes"), "{err}");
     assert!(worktree.exists() && lab.done("demo.fix").is_none());
     std::fs::remove_file(worktree.join("new.txt")).unwrap();
-    // So does a turn not ended, running or waiting to.
+    // So does a message waiting in line to run, with no turn going.
+    let messages = lab.scratch.join("run.log.messages");
+    std::fs::write(
+        &messages,
+        serde_json::json!([{"message": 9, "status": "queued", "turn": null},
+        {"message": 7, "status": "taken", "turn": 7}])
+        .to_string(),
+    )
+    .unwrap();
+    let (ok, err) = lab.remove(&lab.repo, false);
+    assert!(!ok && err.contains("its message 9 waits in line"), "{err}");
+    assert!(
+        err.contains("agent interrupt --bot demo.fix --turn 9"),
+        "{err}"
+    );
+    assert!(worktree.exists() && lab.done("demo.fix").is_none());
+    std::fs::remove_file(&messages).unwrap();
     let turns = |list: serde_json::Value| {
         std::fs::write(lab.scratch.join("run.log.turns"), list.to_string()).unwrap()
     };
-    turns(
-        serde_json::json!([{"turn": 9, "status": "queued", "finished_ms": null},
-        {"turn": 7, "status": "completed", "finished_ms": 5}]),
-    );
-    let (ok, err) = lab.remove(&lab.repo, false);
-    assert!(!ok && err.contains("its turn 9 has not ended"), "{err}");
-    assert!(worktree.exists() && lab.done("demo.fix").is_none());
     // The turn the daemon says runs keeps it too, however many messages
     // steered into it since, each a turn already ended.
     let ls = lab.scratch.join("run.log.ls");

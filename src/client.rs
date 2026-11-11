@@ -1395,22 +1395,21 @@ fn made_by(
     }
 }
 
-/// A `--quote`: `BOT/TURN`, as a handle names it with or without `turn:`,
-/// and `:reply` for the reply that turn ended with.
+/// A `--quote`: `BOT/N`, a message as its handle names it, and `:reply`
+/// for the reply the turn that took it in ended with.
 fn quote(value: &str) -> Result<Value> {
-    let handle = value.strip_prefix("turn:").unwrap_or(value);
-    let (handle, reply) = match handle.strip_suffix(":reply") {
+    let (handle, reply) = match value.strip_suffix(":reply") {
         Some(handle) => (handle, true),
-        None => (handle, false),
+        None => (value, false),
     };
-    let parsed = handle.rsplit_once('/').and_then(|(bot, turn)| {
-        let turn = turn.parse::<i64>().ok().filter(|turn| *turn > 0)?;
-        (!bot.is_empty()).then_some((bot, turn))
+    let parsed = handle.rsplit_once('/').and_then(|(bot, message)| {
+        let message = message.parse::<i64>().ok().filter(|message| *message > 0)?;
+        (!bot.is_empty() && !bot.contains(':')).then_some((bot, message))
     });
-    let Some((bot, turn)) = parsed else {
-        return fail_with("usage", "--quote needs BOT/TURN or BOT/TURN:reply");
+    let Some((bot, message)) = parsed else {
+        return fail_with("usage", "--quote needs BOT/N or BOT/N:reply");
     };
-    let mut quote = json!({"bot":bot,"turn":turn});
+    let mut quote = json!({"bot":bot,"message":message});
     if reply {
         quote["reply"] = json!(true);
     }
@@ -1544,6 +1543,8 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "wait" => wait(&options),
         "inspect" => inspect(&options),
         "turns" => turns(&options),
+        "messages" => messages(&options),
+
         "usage" => usage(&options),
         "rm" => remove(&options),
         "prune" => prune(&options),
@@ -2058,7 +2059,8 @@ fn run(options: &Options) -> Result<i32> {
         print_json(&submitted, options.pretty)?;
         return Ok(0);
     }
-    let turn = submitted["turn"]
+    // The message's number: the turn it opens, or the one that takes it.
+    let turn = submitted["message"]
         .as_i64()
         .ok_or(Error::new("daemon_protocol_mismatch"))?;
     let first = submitted["cursor"].as_i64().unwrap_or(0);
@@ -2077,7 +2079,10 @@ fn run(options: &Options) -> Result<i32> {
             .pending
             .retain(|event| match event["cursor"].as_i64() {
                 Some(cursor) => cursor >= first,
-                None => event.get("turn").is_none_or(|t| t.is_null() || *t == turn),
+                None => {
+                    event.get("turn").is_none_or(|t| t.is_null() || *t == turn)
+                        || event["message"] == turn
+                }
             });
     }
     let mut renderer = Renderer::new(options.pretty, Some(turn), &options.target);
@@ -2087,7 +2092,7 @@ fn run(options: &Options) -> Result<i32> {
     }
     if options.pretty {
         eprintln!(
-            "agent: {bot} turn {turn}{}{}",
+            "agent: {bot}/{turn}{}{}",
             if created { " (new bot)" } else { "" },
             workspace
                 .as_deref()
@@ -2762,7 +2767,7 @@ fn current_turn(connection: &mut Connection, bot: &str, bot_id: Option<i64>) -> 
         }
     };
     let turn = turn.ok_or_else(|| Error::with("no_turn", format!("{bot} has no turns")))?;
-    Ok(format!("turn:{bot}/{turn}"))
+    Ok(format!("{bot}/{turn}"))
 }
 
 /// A bot's whole record, as the daemon keeps it.
@@ -2794,10 +2799,54 @@ fn usage(options: &Options) -> Result<i32> {
 /// A bot's turns, paged through completely or up to `--limit`, oldest
 /// first or with `--newest` newest first; JSON array or a table.
 fn turns(options: &Options) -> Result<i32> {
+    pages(options, "turns", |turn| {
+        format!(
+            "{:>6} {:<11} in {:>7} out {:>6} rounds {:>3}  {}  {}",
+            turn["turn"],
+            turn["status"].as_str().unwrap_or(""),
+            turn["input_tokens"],
+            turn["output_tokens"],
+            turn["model_rounds"],
+            turn["workspace"].as_str().unwrap_or("-"),
+            preview_line(turn)
+        )
+    })
+}
+
+/// A bot's messages, each with its number, where it stands and the turn
+/// that took it in, paged as `turns` pages its runs.
+fn messages(options: &Options) -> Result<i32> {
+    pages(options, "messages", |message| {
+        format!(
+            "{:>6} {:<10} turn {:>6} {:<6}  {}",
+            message["message"],
+            message["status"].as_str().unwrap_or(""),
+            message["turn"]
+                .as_i64()
+                .map_or("-".into(), |t| t.to_string()),
+            message["delivery"].as_str().unwrap_or(""),
+            preview_line(message)
+        )
+    })
+}
+
+/// A listed prompt's first line, as a table shows it.
+fn preview_line(row: &Value) -> String {
+    (row["prompt_preview"].as_str().unwrap_or("").lines().next())
+        .unwrap_or("")
+        .chars()
+        .take(60)
+        .collect()
+}
+
+/// A bot's `op` listing (`turns` or `messages`), paged through completely
+/// or up to `--limit`, oldest first or with `--newest` newest first; JSON
+/// array or a table of `row`s.
+fn pages(options: &Options, op: &str, row: impl Fn(&Value) -> String) -> Result<i32> {
     let bot = options
         .bot
         .clone()
-        .ok_or(Error::with("usage", "turns needs --bot"))?;
+        .ok_or(Error::with("usage", format!("{op} needs --bot")))?;
     let mut connection = ensure_existing_daemon(options)?;
     let mut after = json!(options.after);
     let mut before = Value::Null;
@@ -2808,33 +2857,16 @@ fn turns(options: &Options) -> Result<i32> {
     }
     loop {
         let page = connection.request(
-            "turns",
+            op,
             json!({"bot":bot,"after":after,"before":before,"limit":left.min(256),"newest":options.newest}),
         )?;
-        let turns = page["turns"]
+        let turns = page[op]
             .as_array()
             .ok_or(Error::new("daemon_protocol_mismatch"))?;
         left -= turns.len();
         for turn in turns {
             if options.pretty {
-                say!(
-                    "{:>6} {:<11} in {:>7} out {:>6} rounds {:>3}  {}  {}",
-                    turn["turn"],
-                    turn["status"].as_str().unwrap_or(""),
-                    turn["input_tokens"],
-                    turn["output_tokens"],
-                    turn["model_rounds"],
-                    turn["workspace"].as_str().unwrap_or("-"),
-                    turn["prompt_preview"]
-                        .as_str()
-                        .unwrap_or("")
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .chars()
-                        .take(60)
-                        .collect::<String>()
-                );
+                say!("{}", row(turn));
             } else {
                 if !first {
                     say_raw!(",");
@@ -2990,35 +3022,56 @@ impl Renderer {
 
     /// Returns an exit code when the followed turn is finished.
     fn event(&mut self, connection: &mut Connection, event: &Value) -> Result<Option<i32>> {
+        let mut taken = None;
         if event["event"] == "pruned"
             && let Some(turn) = self.turn
         {
-            // A retried turn may have lost its terminal event to retention.
-            // Reconcile the selected turn, not merely the bot's newest state.
-            // Retained and running turns still finish through normal events.
-            let handle = format!("turn:{}/{turn}", event["bot"].as_str().unwrap_or(""));
+            // A retried message may have lost its terminal event to
+            // retention. Reconcile the selected message, not merely the
+            // bot's newest state. One another turn took in has ended even
+            // when its `steered` event is gone; retained and running turns
+            // still finish through normal events.
+            let handle = format!("{}/{turn}", event["bot"].as_str().unwrap_or(""));
             let found = connection.request("wait", json!({"handles":[&handle],"timeout_ms":0}))?;
-            if let Some(error) = Error::reported(&found["results"][&handle]) {
+            let answer = &found["results"][&handle];
+            if let Some(error) = Error::reported(answer) {
                 return Err(error);
             }
+            if answer["status"] == "taken" {
+                taken = Some(json!({"status":"taken","turn":answer["turn"]}));
+            }
         }
-        let finished =
-            event["event"] == "turn_finished" && self.turn.is_some_and(|t| event["turn"] == t);
+        // How the followed message's work ended: the turn it opened
+        // finished, another turn took it in, or it ended in line.
+        let finished = taken.or_else(|| {
+            self.turn.and_then(|t| match event["event"].as_str() {
+                Some("turn_finished") if event["turn"] == t => Some(event["data"].clone()),
+                Some("steered") if event["message"] == t => {
+                    Some(json!({"status":"taken","turn":event["turn"]}))
+                }
+                Some("message_ended") if event["message"] == t => Some(event["data"].clone()),
+                _ => None,
+            })
+        });
         if !self.pretty {
             say!("{event}");
             let _ = std::io::stdout().flush();
-            let code = finished.then(|| exit_code(&event["data"]));
+            let code = finished.as_ref().map(exit_code);
             // A run that fails says why where a caller looks for it, not
             // only in the event on stdout.
-            if code.is_some_and(|code| code != 0) {
-                eprintln!("agent: {}", ended(&event["data"], ""));
+            if let (Some(code), Some(data)) = (code, &finished)
+                && code != 0
+            {
+                eprintln!("agent: {}", ended(data, ""));
             }
             return Ok(code);
         }
+        // Another turn's events, but for the one that takes this message.
         if let Some(turn) = self.turn
             && event
                 .get("turn")
                 .is_some_and(|t| !t.is_null() && *t != turn)
+            && event["message"] != turn
         {
             return Ok(None);
         }
@@ -3087,7 +3140,7 @@ impl Renderer {
                 }
             }
             // Held on a cause the person can fix: say what, and how to go on.
-            "turn_paced" | "turn_held" if data["blocked"].is_object() => {
+            "turn_paced" | "held" if data["blocked"].is_object() => {
                 self.flush();
                 let blocked = &data["blocked"];
                 let mut line = format!("⏸ held: {}", blocked["code"].as_str().unwrap_or("?"));
@@ -3102,7 +3155,8 @@ impl Renderer {
                 self.usage.1 += data["output_tokens"].as_u64().unwrap_or(0);
                 self.usage.2 += data["cached_input_tokens"].as_u64().unwrap_or(0);
             }
-            "turn_finished" if finished => {
+            _ if finished.is_some() => {
+                let data = finished.unwrap_or_default();
                 self.flush();
                 let status = data["status"].as_str().unwrap_or("unknown");
                 let (input, output, cached) = self.usage;
@@ -3113,10 +3167,10 @@ impl Renderer {
                 };
                 match status {
                     "completed" => eprintln!("agent: ✔ completed{tokens}"),
-                    "steered" => eprintln!("agent: ✔ steered into turn {}", data["into"]),
-                    _ => eprintln!("agent: ✘ {}", ended(data, &tokens)),
+                    "taken" => eprintln!("agent: ✔ taken into turn {}", data["turn"]),
+                    _ => eprintln!("agent: ✘ {}", ended(&data, &tokens)),
                 }
-                return Ok(Some(exit_code(data)));
+                return Ok(Some(exit_code(&data)));
             }
             "follow_lagged" => eprintln!("agent: event stream lagged; re-follow from your cursor"),
             _ => {}
@@ -3188,10 +3242,10 @@ impl Status {
             "turn_finished" => Some(match data["status"].as_str() {
                 Some("completed") => "done",
                 Some("interrupted") => "idle",
-                // The steer's message joined a turn that goes on.
-                Some("steered") => return String::new(),
                 _ => "error",
             }),
+            // A message that ended in line changes nothing the bot does.
+            "message_ended" => return String::new(),
             // Only a bot's own record goes; a clear without an id would
             // remove every record on the terminal.
             "deleted" if self.per_bot => Some("clear"),
@@ -3321,8 +3375,8 @@ fn ended(data: &Value, tokens: &str) -> String {
 }
 
 fn exit_code(data: &Value) -> i32 {
-    // A steer delivered into the running turn did what was asked.
-    if data["status"] == "completed" || data["status"] == "steered" {
+    // A message another turn took in did what was asked.
+    if data["status"] == "completed" || data["status"] == "taken" {
         0
     } else {
         1
@@ -3929,14 +3983,15 @@ mod tests {
             all.event(&at("busy", 1, "approval_requested", ask(json!(["manual"]))))
                 .contains("state=blocked:kind=permission:id=busy:")
         );
-        assert_eq!(all.event(&at("busy", 2, "queued", json!({}))), "");
         assert_eq!(
-            all.event(&at(
-                "busy",
-                2,
-                "turn_finished",
-                json!({"status":"interrupted"})
-            )),
+            all.event(&json!({"event":"queued","bot":"busy","turn":null,"message":2,"data":{}})),
+            ""
+        );
+        assert_eq!(
+            all.event(
+                &json!({"event":"message_ended","bot":"busy","turn":null,"message":2,
+                "data":{"status":"withdrawn"}})
+            ),
             ""
         );
         assert!(
@@ -3945,7 +4000,14 @@ mod tests {
         );
         // An ended turn leaves nothing to remember.
         assert!(all.bots.is_empty());
-        assert_eq!(all.event(&ev("busy", "turn_finished", Some("steered"))), "");
+        // A message that ended in line changes nothing the bot does.
+        assert_eq!(
+            all.event(
+                &json!({"event":"message_ended","bot":"busy","turn":null,"message":5,
+                "data":{"status":"withdrawn"}})
+            ),
+            ""
+        );
         assert_eq!(
             all.event(&json!({"event":"deleted","bot":"busy"})),
             "\x1b]7501;state=clear:id=busy\x1b\\"

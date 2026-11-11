@@ -203,7 +203,7 @@ produce handles, and one consumes them:
 - `shell` with `background: true` starts the command and immediately returns
   `proc:N`. The command holds one unit of the process budget while it runs;
   its bounded output and artifacts are recorded when it exits.
-- `agent run --detach` prints the peer turn's handle, `turn:BOT/N`, from the
+- `agent run --detach` prints the message's handle, `BOT/N`, from the
   `submit` response.
 - `wait` takes up to 64 handles and an optional `timeout_ms`. It parks the turn:
   the turn's task ends, the store records `waiting` with the handles, deadline,
@@ -429,6 +429,44 @@ null otherwise. A `wait` result is the view, plus the
 outcome once finished; an `interrupt` reply is the view plus
 `interrupt_requested`; a `turns` item is the view plus the fields below.
 `submit` answers with the view's identity and status, without a second read.
+
+<a id="messages"></a>Every submission is a message of its own, with its own
+number, whether it opened a turn, joined a running one or was withdrawn in
+line (protocol 65, schema 92). A turn is a run: the model's work from the
+message that opened it to its end, and the tools, approvals and processes
+it made stay keyed by it, as `from:{bot,turn}` does. Messages and turns
+share one store-wide sequence, so a turn's number is the number of the
+message that opened it, and `BOT/N` names either: the message, which for a
+turn's opener is that turn. A message's `status` is `queued`, `attached`
+or `ready` while it waits, `taken` once a turn holds it (the opener, or a
+steer or attached message joined at a round boundary, with `turn` naming
+that turn and `node` its item), `withdrawn` when `interrupt` ended it in
+line, and `failed` when it could not start (`stale_turn`, a provider the
+config lacks). `submit` answers `{bot, bot_id, message, turn, request_id,
+duplicate, status, cursor, handle}`, with `turn` only when the message
+opened one. `messages` (protocol) lists a bot's messages as views,
+each with `message`, `turn` (null until taken), `delivery`, `node`,
+`sent_ms`, `taken_ms`, its sender, its effective effort and folder and a
+prompt preview, paged as `turns` is; `turns` lists runs only, so steers and
+attached messages never hide what a bot did. `wait` on a message's handle
+resolves when it is taken, withdrawn or failed, or for a turn's opener when
+the turn ends; `interrupt` names a message (`turn` keeps its field name)
+and withdraws one in line or stops the turn it opened. A message ended in
+line records `message_ended` (`status` `withdrawn` or `failed`, with the
+error), and one taken into a running turn the `steered` event on that
+turn; `queued`, `attached` and `held` name the message (`turn` null).
+
+The model reads each message's number in a text part after its words:
+`[Message BOT/N.]`, `[Message BOT/N, written by PERSON.]`, `[Message BOT/N,
+sent by ORIGIN.]` or `[Message BOT/N, written by the agent NAME in
+NAME/TURN, not by a person.]`, so an agent quotes exactly the message it
+means. `quotes` and `--quote BOT/N` copy that one message's words; a quote
+of a message another was steered or attached beside copies its own words
+alone. Schema 91 moves each stored turn's message into `messages` under
+its old number: a turn that ran keeps its run in `turns`, a steer is
+`taken` into the turn its `steered` event named, with its item, and a turn
+interrupted in line is `withdrawn`. Stored events take the same shapes,
+and the old per-steer `turn_finished` copies of `steered` are dropped.
 
 `turns` (protocol) and `agent turns --bot NAME` list a bot's turns as views
 with effective workspace, model and effort, delivery, cache hit, and a
@@ -1283,7 +1321,7 @@ own path from the turn. Example requests:
 {"id":15,"op":"delete","bot":"Bob","bot_id":1}
 {"id":16,"op":"follow","bot":"*","after":0}
 {"id":32,"op":"follow","bot":"*","since_ms":1793000000000,"kinds":["accepted","message"]}
-{"id":17,"op":"wait","handles":["turn:Bob/1","turn:Alice/3"],"any":true,"timeout_ms":60000}
+{"id":17,"op":"wait","handles":["Bob/1","Alice/3"],"any":true,"timeout_ms":60000}
 {"id":18,"op":"stats"}
 {"id":19,"op":"provider_models"}
 {"id":21,"op":"create","bot":"Carol","workspace":"/workspaces/project","model":"openai/gpt-6-luna","instructions":"...","tools":["shell","read","write","edit","wait","history"],"approve":["shell","write","edit","read"],"approver":"manual","settings":{"context_bytes":1048576,"keep_turns":16}}
@@ -1631,15 +1669,16 @@ verdict it waits for, or with `load: true` the command the load gate holds, and 
 provider's pool is closed by a rate limit, with `resume_at_ms`, or because the
 pull cord stopped it, with `resume_at_ms` null and `paused: true`, or because
 a cause a person can fix holds it, with `blocked`; it resumes
-through `turn_resumed` like a parked wait), `turn_held` (a ready turn whose
+through `turn_resumed` like a parked wait), `held` (a ready message whose
 start was refused for such a cause, held in line: see
-[held turns](#held-turns)), `steered` (a steer's item joining
-the running turn: `steer` names the steer's turn, `node` its item, `from`
+[held turns](#held-turns)), `steered` (a message's item joining
+the running turn: `message` names it, `node` its item, `from`
 or `origin` its sender as on `accepted`, and `attached: true` when it was sent
-with `delivery: "attach"`), and
-`turn_finished` (with status, checkpoint, error code, and detail; a steered
-turn's carries `into` and `node`). A `submit` response includes the turn's
-`handle`, `turn:BOT/N`, and its `status`.
+with `delivery: "attach"`), `message_ended` (a message ended in line,
+`withdrawn` or `failed`), and
+`turn_finished` (with status, checkpoint, error code, and detail). A
+`submit` response includes the message's `handle`, `BOT/N`, and its
+`status`.
 
 `artifact` reads one retained stream a page at a time: a `stream` from
 `tool_completed` (required), a UTF-8 byte `offset` (default 0), and a byte
@@ -1683,37 +1722,38 @@ approver. The sender's identity is resolved at submit and kept on the turn
 (`turns.from_id`), so a queued message whose sender is deleted before it
 starts still names it. The model reads the sender too, as a text part after
 the prompt's words and before its pictures, so it does not take another
-agent's words for a person's: `[Written by the agent NAME in
-turn:NAME/TURN, not by a person.]` for `from`, `[Sent by ORIGIN.]` for
-`origin`, and nothing for a person's prompt. `content[0]` stays the words.
-A bot made with `hide_senders` reads the words alone.
+agent's words for a person's, in the line that names the message: `[Message
+BOT/N, written by the agent NAME in NAME/TURN, not by a person.]` for
+`from`, `[Message BOT/N, sent by ORIGIN.]` for `origin`, and `[Message
+BOT/N.]` for a person's prompt. `content[0]` stays the words. A bot made
+with `hide_senders` reads the words alone.
 
 A client that speaks for a person other than the daemon's own may name
 them with `person` (a name's characters, else `invalid_person`), exclusive
 with `from` and `origin`. Like `origin` it is the client's word, kept and
-reported the same way, and read by the model as `[Written by PERSON.]`; a
+reported the same way, and read by the model as `[Message BOT/N, written
+by PERSON.]`; a
 prompt with a `person` is no consent to the approver, which answers to the
 daemon's own person only. A command run from a bot's sandboxed tool cannot
 send one (it would speak as a person from inside an agent).
 
-`quotes`, a list of `{bot, turn, reply?}`, copies other turns'
-words into the prompt: a turn's prompt, or with `reply: true` the last
-message the finished turn ended with. The daemon copies them at submit, so
+`quotes`, a list of `{bot, message, reply?}`, copies other messages'
+words into the prompt: a message's own words, or with `reply: true` the
+last message the finished turn it opened ended with. The daemon copies them at submit, so
 what a quote says is what that turn holds, never what the sender retyped,
 and keeps who first wrote them: a quoted prompt's own quotes come along
 with their writers. Each quote is a text part after the sender's line,
-behind a line naming it, `[Quoted from turn:BOT/TURN, written by a
-person:]` or `[Quoted from the reply of turn:BOT/TURN, written by the agent
+behind a line naming it, `[Quoted from message BOT/N, written by a
+person:]` or `[Quoted from the reply to message BOT/N, written by the agent
 BOT:]` (`sent by ORIGIN`, `written by PERSON`, `written by the agent NAME
-in turn:NAME/TURN`); `hide_senders` leaves the lines out too. A turn that
-does not exist, a steer's reply, or a turn that ended without a reply
+in NAME/TURN`); `hide_senders` leaves the lines out too. A message that
+does not exist, the reply to one that opened no turn, or a turn that ended without a reply
 (or whose events were pruned before schema 70) is `quote_not_found`; a
 reply of an unfinished turn `quote_unfinished`; more than 64 quotes, those
 quoted prompts bring counted (marked `nested` in the record, which a retry
 leaves out), or words and quotes past 256 KiB together, each quote's line
 counted at 256 bytes, `quote_too_large`. The CLI's `run --quote
-BOT/TURN` (repeatable; `BOT/TURN:reply` for a reply, `turn:` prefix
-optional) sends them. `prompts` and `history_items` list a prompt's
+BOT/N` (repeatable; `BOT/N:reply` for a reply) sends them. `prompts` and `history_items` list a prompt's
 quotes as `quotes`, each with its writer (`from`, `origin` or `person`,
 none for a person's) and, in `prompts`, its `text` within the read's
 `bytes`, each record counted as an entry; quotes past them are left out,
@@ -1826,8 +1866,8 @@ Protocol 8 adds the turn view.
 is at `--max-active`. It is one required field with four values, since
 what a busy bot does with a message is the client's choice
 (`invalid_delivery` without it); every mode returns
-the turn's id and handle at once, and `wait`, `turns`, and
-`interrupt` work on the turn unchanged.
+the message's number and handle at once, and `wait`, `messages`, and
+`interrupt` work on the message.
 
 - `reject`: `bot_busy` while a turn runs or is parked,
   `active_agent_limit` when no slot is free. Nothing is written. The
@@ -1859,13 +1899,13 @@ the turn's id and handle at once, and `wait`, `turns`, and
 - `steer`: a queued turn the bot's running turn may absorb. At the running
   turn's next round boundary, after its tool results are recorded and before
   the next model call, a snapshot of queued steers joins the lineage as
-  user items, in submission order, and each delivered steer finishes as `steered`
-  with `into` naming the turn that took it and `node` its item; the absorbing
-  turn then records a `steered` event. A steer that arrives while the final model
+  user items, in submission order, and each delivered message is `taken`,
+  with `turn` naming the turn that took it and `node` its item; the absorbing
+  turn records a `steered` event naming the message. A steer that arrives while the final model
   call is in flight keeps that turn going for one more round rather than
   going unheard; one that arrives after the last boundary starts as an
   ordinary turn when its place in the line comes, as does a steer on an idle
-  bot. Waiting on a steer's handle resolves at absorption; wait on `into`
+  bot. Waiting on a steer's handle resolves at absorption; wait on its `turn`
   for the answer. Rounds spent on steers count toward the turn's round limit.
   An explicit workspace or model must match the running turn's effective
   value; omitted overrides inherit that running turn for absorption. A
@@ -1939,9 +1979,9 @@ the turn's id and handle at once, and `wait`, `turns`, and
   next round boundary, or at the first boundary of the bot's next turn,
   after that turn's prompt. Unlike a steer it never keeps a turn going: one
   that arrives while a final reply is in flight waits for the next turn,
-  unless a steer keeps this one going, whose call it then joins. It
-  finishes as `steered` with `into` naming the turn that took it; the
-  submission's event is `attached`. It takes no `workspace`, `model`,
+  unless a steer keeps this one going, whose call it then joins. It is
+  `taken` with `turn` naming the turn that took it; the submission's event
+  is `attached`. It takes no `workspace`, `model`,
   `effort`, `budget_tokens` or `expected_turn` (`invalid_delivery`), since
   it joins whatever call comes next. For the same reason the bot's default
   model is not checked and it needs no folder, even on a bot without one; it
@@ -2290,7 +2330,7 @@ since_ms}`, beside `resume_at_ms`, as the turn view's `waiting_on` does.
 Nothing in its history changes and nothing is resent: the message that
 started it is in its history already. A turn held in line keeps status
 `ready` and its place, so no later message of its bot overtakes it; it is
-told by a `turn_held` event, `{blocked, resume_at_ms}`, and its turn view's
+told by a `held` event, `{blocked, resume_at_ms}`, and its turn view's
 `waiting_on` says the same (schema 78 keeps the cause on the row, `held`, and
 the next try in `due_ms`). Either is tried again after as long as the hold
 has lasted, from a minute up to an hour, so each wait about doubles the last,

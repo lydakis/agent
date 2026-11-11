@@ -429,7 +429,7 @@ fn memory() -> Value {
                 "description": {"type": "string", "minLength": 1,
                     "description": "One line, all a later agent sees in the index."},
                 "source": {"type": "string", "minLength": 1,
-                    "description": "Where it comes from: turn:BOT/N, a commit, path:line, or the person and a date."},
+                    "description": "Where it comes from: BOT/N, a commit, path:line, or the person and a date."},
                 "text": {"type": "string", "minLength": 1,
                     "description": "The fact, then Why: and, where it helps, How to apply:."},
                 "external": {"type": "boolean",

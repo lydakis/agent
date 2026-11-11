@@ -74,6 +74,9 @@ class TriggerFireTests(ModelFixture):
     def turns(self, bot):
         return json.loads(self.agent('turns', '--store', str(self.store), '--bot', bot).stdout)
 
+    def messages(self, bot):
+        return json.loads(self.agent('messages', '--store', str(self.store), '--bot', bot).stdout)
+
     def bot_id(self, bot):
         return next(b['bot_id'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout) if b['name'] == bot)
 
@@ -129,7 +132,7 @@ class TriggerFireTests(ModelFixture):
         return args, env
 
     def settle(self, bot):
-        self.agent('wait', '--store', str(self.store), f"turn:{bot}/{self.turns(bot)[-1]['turn']}")
+        self.agent('wait', '--store', str(self.store), f"{bot}/{self.turns(bot)[-1]['turn']}")
 
     def test_a_fire_wakes_its_resting_bot_and_skips_a_working_one(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
@@ -170,7 +173,7 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual(again['last']['outcome'], 'skipped', again)
         self.model.release_headers.set()
         busy = next(t['turn'] for t in self.turns('p.task') if t['prompt_preview'] == 'gate')
-        self.agent('wait', '--store', str(self.store), f"turn:p.task/{late['last']['turn']}")
+        self.agent('wait', '--store', str(self.store), f"p.task/{late['last']['turn']}")
         turns = self.turns('p.task')
         waited = next(t for t in turns if t['turn'] == late['last']['turn'])
         self.assertGreater(waited['turn'], busy)
@@ -567,6 +570,38 @@ class TriggerFireTests(ModelFixture):
         finally:
             connection.close()
 
+    def test_a_fire_withdrawn_in_line_tells_the_reply_agent_without_naming_a_turn(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        lead = self.bot_id('p.lead')
+        connection = Connection(str(self.store) + '.sock')
+        try:
+            # Busy, the task takes the fire's message in line, where it is
+            # withdrawn.
+            busy = connection.request('submit', bot='p.task', request_id='busy', prompt='slow')['result']
+            fire = self.fire('p.task', 'Check the PR.', wait=False,
+                             extra=['--reply-to', 'p.lead', '--reply-to-id', str(lead)])
+            deadline = time.monotonic() + 30
+            while not (waiting := [m for m in self.messages('p.task') if m['status'] in ('queued', 'ready')]):
+                self.assertLess(time.monotonic(), deadline, 'the fire never reached the daemon')
+                time.sleep(.1)
+            withdrawn = waiting[0]['message']
+            self.assertIn('result', connection.request('interrupt', bot='p.task', turn=withdrawn))
+            self.assertEqual(fire.wait(timeout=60), 0)
+            self.agent('wait', '--store', str(self.store), busy['handle'])
+            last = json.loads((self.home / '.agent/automations/p.task.json').read_text())['last']
+            self.assertEqual(last['reply']['outcome'], 'sent', last)
+            self.settle('p.lead')
+            # It ran in no turn, so the note names none; its words say how
+            # it ended.
+            events = connection.request('events', bot='p.lead', after=0, limit=256)['result']['events']
+            told = [e['data'] for e in events if e['event'] == 'accepted'][-1]
+            self.assertNotIn('from', told)
+            self.assertRegex(self.turns('p.lead')[-1]['prompt_preview'],
+                             '^' + LINE.format('p.task', f'p.task turn {withdrawn} withdrawn'))
+        finally:
+            connection.close()
+
     def test_a_shadow_fire_reports_from_a_read_only_copy_that_then_goes(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
@@ -577,7 +612,7 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual((last['outcome'], last['reply']['outcome']), ('sent', 'sent'), sent)
         copy = last['shadow']
         self.assertRegex(copy, r'^p\.task\.shadow-[0-9a-f]{1,6}$')
-        self.assertEqual(last['handle'], f'turn:{copy}/{last["turn"]}')
+        self.assertEqual(last['handle'], f'{copy}/{last["turn"]}')
         # The agent it copies did nothing; the copy is gone once its report went.
         self.assertEqual(len(self.turns('p.task')), 1)
         names = [b['name'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)]
@@ -639,20 +674,20 @@ class TriggerFireTests(ModelFixture):
         failed = self.fire('p.task', 'x', extra=['--if', 'true', '--dir', str(gone)])
         self.assertEqual(failed['last']['outcome'], 'failed', failed)
         self.assertIn('--if', failed['last']['detail'])
-        # No turn ran; the agent has one note, attached to its next call.
-        notes = [t for t in self.turns('p.task') if t['turn'] > 1]
-        self.assertEqual([t['status'] for t in notes], ['attached'], notes)
+        # No turn ran; the agent has one note, attached to its next turn.
+        notes = [m for m in self.messages('p.task') if m['message'] > 1]
+        self.assertEqual([m['status'] for m in notes], ['attached'], notes)
         self.assertIn('its --if could not check', notes[0]['prompt_preview'])
         self.assertTrue(failed['checked']['told'], failed)
         # Told once: the next failure adds nothing; working again is one more note.
         generation = failed['generation']
         self.fire('p.task', 'x', extra=['--if', 'true', '--dir', str(gone)], generation=generation)
-        self.assertEqual(len(self.turns('p.task')), 2)
+        self.assertEqual(len(self.messages('p.task')), 2)
         gone.mkdir()
         works = self.fire('p.task', 'x', extra=['--if', 'exit 1', '--dir', str(gone)], generation=generation)
         self.assertEqual(works['checked']['gate'], 'no', works)
         self.assertNotIn('told', works['checked'], 'nothing more is owed')
-        notes = [t for t in self.turns('p.task') if t['turn'] > 1]
+        notes = [m for m in self.messages('p.task') if m['message'] > 1]
         self.assertEqual(len(notes), 2, notes)
         self.assertRegex(notes[1]['prompt_preview'], r' · its --if works again\]$')
 
@@ -664,8 +699,8 @@ class TriggerFireTests(ModelFixture):
         self.assertEqual((failed['last']['outcome'], failed['checked']['gate']), ('failed', 'failed'), failed)
         self.assertIn('127', failed['last']['detail'])
         self.assertIn('no-such-gate-here', failed['last']['detail'])
-        notes = [t for t in self.turns('p.task') if t['turn'] > 1]
-        self.assertEqual([t['status'] for t in notes], ['attached'], notes)
+        notes = [m for m in self.messages('p.task') if m['message'] > 1]
+        self.assertEqual([m['status'] for m in notes], ['attached'], notes)
         self.assertIn('its --if could not check', notes[0]['prompt_preview'])
 
     def test_a_gate_waits_out_a_pause_before_it_runs(self):
@@ -920,7 +955,7 @@ class TriggerFireTests(ModelFixture):
         fired = json.loads(trigger('run', name).stdout)
         self.assertEqual((fired['name'], fired['ran'], fired['outcome']), (name, True, 'sent'), fired)
         self.assertTrue(self.until(lambda: len(self.turns('p.task')) == 4, 60), 'fire did not run it')
-        self.assertEqual(fired['handle'], f"turn:p.task/{self.turns('p.task')[-1]['turn']}")
+        self.assertEqual(fired['handle'], f"p.task/{self.turns('p.task')[-1]['turn']}")
         self.assertTrue(self.turns('p.task')[-1]['prompt_preview'].startswith(f'[automation {name} · '))
         # A trigger that recurs leaves the scheduler as it was: nothing for the system to tell anyone about.
         trigger('add', '--bot', 'p.task', '--name', 'p.next', '--every', '30m', '--', 'look')

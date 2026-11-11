@@ -48,11 +48,14 @@ const AGAIN: Duration = Duration::from_secs(2);
 /// `result.json`.
 const TOLD_BYTES: usize = 8 * 1024;
 
-/// A worker's turn in `Run::live` while its submission has no answer.
+/// A worker's message in `Run::live` while its submission has no answer.
 const SUBMITTED: i64 = -1;
 
 /// The statuses of a turn that has ended.
-const ENDED: [&str; 4] = ["completed", "failed", "interrupted", "steered"];
+const ENDED: [&str; 3] = ["completed", "failed", "interrupted"];
+
+/// The statuses of a message still waiting in line.
+const IN_LINE: [&str; 3] = ["queued", "attached", "ready"];
 
 /// What every worker is told after its folder's rules.
 const TOLD: &str = "You are one agent in a workflow: a script another agent wrote runs you, and \
@@ -748,16 +751,10 @@ impl Run {
         let mut heard = true;
         for (bot, turn) in &live {
             // A submission whose answer never came: each of its worker's
-            // turns not yet ended, running or still queued.
+            // turns not yet ended and messages still in line.
             let turns = match *turn {
-                SUBMITTED => match client
-                    .request("turns", json!({"bot": bot, "newest": true, "limit": 8}))
-                    .await
-                {
-                    Ok(page) => (page["turns"].as_array().into_iter().flatten())
-                        .filter(|turn| !ENDED.contains(&turn["status"].as_str().unwrap_or("")))
-                        .filter_map(|turn| turn["turn"].as_i64())
-                        .collect(),
+                SUBMITTED => match Self::pending(client, bot).await {
+                    Ok(pending) => pending.into_iter().map(|(number, _)| number).collect(),
                     Err(error) => {
                         heard &= !lost(&error);
                         Vec::new()
@@ -812,6 +809,30 @@ impl Run {
     }
 
     /// The turn `handle` names, once it has ended.
+    /// `bot`'s turns not yet ended and messages still in line, each by
+    /// its number and handle.
+    async fn pending(
+        client: &Client,
+        bot: &str,
+    ) -> Result<Vec<(i64, String)>, agent_client::Error> {
+        let page =
+            |op: &'static str| client.request(op, json!({"bot": bot, "newest": true, "limit": 8}));
+        let (turns, messages) = (page("turns").await?, page("messages").await?);
+        let runs = (turns["turns"].as_array().into_iter().flatten())
+            .filter(|turn| !ENDED.contains(&turn["status"].as_str().unwrap_or("")));
+        let waiting = (messages["messages"].as_array().into_iter().flatten())
+            .filter(|message| IN_LINE.contains(&message["status"].as_str().unwrap_or("")));
+        Ok(runs
+            .chain(waiting)
+            .filter_map(|row| {
+                Some((
+                    row["turn"].as_i64().or(row["message"].as_i64())?,
+                    row["handle"].as_str()?.to_owned(),
+                ))
+            })
+            .collect())
+    }
+
     async fn ended(client: &Client, handle: &str) -> Result<Value, agent_client::Error> {
         loop {
             let mut waited = client.request("wait", json!({"handles": [handle]})).await?;
@@ -1041,8 +1062,8 @@ impl script::Host for Attempt {
         if run.stopping() {
             return Err("the workflow is stopping".into());
         }
-        // A worker the daemon has a turn for is taken up again, spent or
-        // not: no new work starts for it. One whose submission never
+        // A worker the daemon has a message for is taken up again, spent
+        // or not: no new work starts for it. One whose submission never
         // reached the daemon is new work.
         if let Some(total) = run.plan.budget
             && run.spent.load(Ordering::SeqCst) >= total
@@ -1050,10 +1071,10 @@ impl script::Host for Attempt {
             let started = match survived {
                 false => false,
                 true => match (self.client)
-                    .request("turns", json!({"bot": worker, "limit": 1}))
+                    .request("messages", json!({"bot": worker, "limit": 1}))
                     .await
                 {
-                    Ok(page) => page["turns"].as_array().is_some_and(|t| !t.is_empty()),
+                    Ok(page) => page["messages"].as_array().is_some_and(|m| !m.is_empty()),
                     Err(error) if lost(&error) => {
                         self.lost.store(true, Ordering::SeqCst);
                         run.halt.notify_waiters();
@@ -1152,16 +1173,9 @@ impl Attempt {
     /// Give back the slot held for survivor `worker` once its turns have
     /// ended, if its call has not taken it up by then.
     async fn release_when_ended(self: Arc<Self>, worker: String) {
-        if let Ok(page) = (self.client)
-            .request("turns", json!({"bot": worker, "newest": true, "limit": 8}))
-            .await
-        {
-            for turn in page["turns"].as_array().into_iter().flatten() {
-                if !ENDED.contains(&turn["status"].as_str().unwrap_or(""))
-                    && let Some(handle) = turn["handle"].as_str()
-                {
-                    let _ = Run::ended(&self.client, handle).await;
-                }
+        if let Ok(pending) = Run::pending(&self.client, &worker).await {
+            for (_, handle) in pending {
+                let _ = Run::ended(&self.client, &handle).await;
             }
         }
         if self.reserved.lock().unwrap().remove(&worker) {
@@ -1353,12 +1367,12 @@ impl Attempt {
                 };
             }
         };
-        let Some(turn) = submitted["turn"].as_i64() else {
+        let Some(number) = submitted["message"].as_i64() else {
             live(None);
-            return Ok((Value::Null, None, 0, Some("no turn started".into())));
+            return Ok((Value::Null, None, 0, Some("no message was taken".into())));
         };
-        live(Some(turn));
-        let handle = format!("turn:{worker}/{turn}");
+        live(Some(number));
+        let handle = format!("{worker}/{number}");
         let waited = loop {
             match self
                 .client
@@ -1380,6 +1394,8 @@ impl Attempt {
             false => Trouble::Thrown(e.to_string()),
         })?;
         let tokens = outcome["output_tokens"].as_u64().unwrap_or(0);
+        // The turn that ran it: the one it opened, numbered as it is.
+        let turn = outcome["turn"].as_i64().unwrap_or(number);
         if outcome["status"] != "completed" {
             let why = match outcome["detail"].as_str().or(outcome["error"].as_str()) {
                 Some(detail) => format!("its turn {}: {detail}", str_of(&outcome["status"])),

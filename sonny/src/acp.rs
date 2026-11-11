@@ -1452,7 +1452,7 @@ impl Session {
                 }
                 // Stopped while it was being sent.
                 if std::mem::take(&mut state.cancelled)
-                    && let (Some(bound), Some(turn)) = (&state.bound, reply["turn"].as_i64())
+                    && let (Some(bound), Some(turn)) = (&state.bound, reply["message"].as_i64())
                 {
                     let _ = (bound.client)
                         .request("interrupt", json!({"bot": bound.bot, "turn": turn}))
@@ -1462,7 +1462,7 @@ impl Session {
                 if let Some((prompt, turn)) = &mut state.prompt
                     && prompt == id
                 {
-                    *turn = match (reply["turn"].as_i64(), steered) {
+                    *turn = match (reply["message"].as_i64(), steered) {
                         (Some(sent), Some((steer, into))) if sent == steer => Some(into),
                         (sent, _) => sent,
                     };
@@ -1925,21 +1925,20 @@ impl Session {
                 drop(state);
                 self.approvals(agent, &client, &bot, turn).await;
             }
-            "turn_finished" => {
-                // A steer the running turn took in: the prompt waits on that
-                // turn now.
-                if data["status"] == "steered" {
-                    let into = data["into"].as_i64();
-                    if let (Some(steer), Some(into)) = (turn, into) {
-                        state.steered = Some((steer, into));
-                    }
-                    if let Some((_, at)) = &mut state.prompt
-                        && *at == turn
-                    {
-                        *at = into;
-                    }
-                    return;
+            "steered" => {
+                // A message the running turn took in: the prompt that sent
+                // it waits on that turn now.
+                let steer = data["message"].as_i64();
+                if let (Some(steer), Some(into)) = (steer, turn) {
+                    state.steered = Some((steer, into));
                 }
+                if let Some((_, at)) = &mut state.prompt
+                    && *at == steer
+                {
+                    *at = turn;
+                }
+            }
+            "turn_finished" => {
                 if state.running.is_some() && state.running != turn {
                     return;
                 }
@@ -1970,6 +1969,25 @@ impl Session {
                     }
                     // A task T3 Code opens as a child of this prompt opens
                     // while its run is on.
+                    if state.opening > 0 {
+                        state.held.push((prompt, result));
+                    } else {
+                        out.answer(&prompt, result);
+                    }
+                }
+            }
+            "message_ended" => {
+                // A prompt that ended in line, withdrawn or failed before
+                // any turn took it in: answered now. A turn running for
+                // another message goes on.
+                let ended = event["message"].as_i64();
+                let ours = matches!(&state.prompt, Some((_, at)) if at.is_some() && *at == ended);
+                if ours && let Some((prompt, _)) = state.prompt.take() {
+                    let result = match data["status"].as_str() {
+                        Some("withdrawn") => json!({"stopReason": "cancelled"}),
+                        _ => json!({"stopReason": "end_turn", "error": {"code": FAILED,
+                            "message": data["error"].as_str().unwrap_or("the message failed")}}),
+                    };
                     if state.opening > 0 {
                         state.held.push((prompt, result));
                     } else {
@@ -2650,11 +2668,13 @@ async fn open_task(
             .request("inspect", json!({"bot": bot}))
             .await
             .map_err(|e| e.to_string())?;
-        let turns = client
-            .request("turns", json!({"bot": bot, "limit": 1}))
+        // Its first message is its brief, whether or not a turn has taken
+        // it in yet: a task may wait for room to start.
+        let messages = client
+            .request("messages", json!({"bot": bot, "after": 0, "limit": 1}))
             .await
             .map_err(|e| e.to_string())?;
-        let first = &turns["turns"][0]["turn"];
+        let first = &messages["messages"][0]["message"];
         let prompts = client
             .request("prompts", json!({"bot": bot, "turn": first}))
             .await

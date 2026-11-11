@@ -22,8 +22,10 @@ from .runtime_client import Client
 from .targets import file_hash
 
 
-def user(text):
-    return {'role': 'user', 'content': [{'type': 'input_text', 'text': text}]}
+def user(text, handle):
+    """A message as the model reads it: its words, then the line naming it."""
+    return {'role': 'user', 'content': [{'type': 'input_text', 'text': text},
+                                        {'type': 'input_text', 'text': f'[Message {handle}.]'}]}
 
 
 def reply(round_id, count):
@@ -91,7 +93,7 @@ def run(binary, *, bots=8, rounds=20, steers=40, output_items=1):
             for n in range(bots):
                 name = f'b{n}'
                 assert 'result' in client.request('create', bot=name, workspace=directory)
-                expected[name] = [user(name)]
+                expected[name] = []
             initial = client.request('stats')['result']['store']
             def sample():
                 while not stop.is_set():
@@ -102,7 +104,9 @@ def run(binary, *, bots=8, rounds=20, steers=40, output_items=1):
             cpu0 = process.cpu_times()
             started = time.monotonic()
             roots = {name: client.request('submit', bot=name, request_id='root',
-                                         prompt=name)['result']['turn'] for name in expected}
+                                         prompt=name)['result']['message'] for name in expected}
+            for name, root in roots.items():
+                expected[name].append(user(name, f'{name}/{root}'))
             latency, byte_count, digest = [], 0, hashlib.sha256()
             releases = {}
             pending = []
@@ -121,7 +125,7 @@ def run(binary, *, bots=8, rounds=20, steers=40, output_items=1):
                     byte_count += size
                 for name, turn in pending:
                     outcome = client.finished(turn)['data']
-                    assert outcome['status'] == 'steered' and outcome['into'] == roots[name]
+                    assert outcome['status'] == 'taken' and outcome['turn'] == roots[name]
                     absorbed_count += 1
                 pending.clear()
                 # All prior boundary events have now arrived. Keep controller
@@ -142,8 +146,8 @@ def run(binary, *, bots=8, rounds=20, steers=40, output_items=1):
                             assert 'result' in response, response
                             result = response['result']
                             assert result['status'] == 'queued'
-                            pending.append((name, result['turn']))
-                            expected[name].append(user(prompt))
+                            pending.append((name, result['message']))
+                            expected[name].append(user(prompt, result['handle']))
                 for name, gate in arrivals.items():
                     releases[name] = time.monotonic()
                     gate.put(output)

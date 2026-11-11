@@ -42,7 +42,7 @@ def export(store):
             raise ValueError('corpus export requires raw artifacts; export decoded bytes through the artifact protocol first')
         for kind, query in (
                 ('node', 'SELECT item FROM nodes ORDER BY id'),
-                ('prompt', 'SELECT CAST(prompt AS BLOB) FROM turns ORDER BY id'),
+                ('prompt', 'SELECT CAST(text AS BLOB) FROM messages ORDER BY id'),
                 ('artifact', 'SELECT data FROM artifacts ORDER BY turn,call_id,stream')):
             for (data,) in db.execute(query):
                 yield kind, bytes(data)

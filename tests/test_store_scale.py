@@ -24,7 +24,7 @@ class StoreScaleTests(unittest.TestCase):
         server = SimpleNamespace(requests=10000)
         screen = Screen(None, None, None, server, CONCURRENCY, None)
         client = screen.client = Mock()
-        client.request.side_effect = [{'result': {'turn': n}} for n in range(CONCURRENCY)]
+        client.request.side_effect = [{'result': {'message': n, 'turn': n}} for n in range(CONCURRENCY)]
         with self.assertRaisesRegex(TimeoutError, '0/32'):
             screen.crash_restart(timeout=0)
         client.close.assert_not_called()

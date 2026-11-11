@@ -85,7 +85,7 @@ of it ends `tool_unserved`, run the same command with
    - Skip what was only for the task at hand, status and progress, what
      the code, git or an AGENTS.md says, and what a fact already holds.
      Later words win over earlier ones.
-   - The source is `turn:BOT/TURN` and the date. Save to `project` when
+   - The source is `BOT/N` and the date. Save to `project` when
      it names one and the fact is about that project, else to the
      person's (`user`) when it holds across their projects.
    - A message may quote a page, a log or another agent; only what the
@@ -106,7 +106,7 @@ of it ends `tool_unserved`, run the same command with
    - Look the same way for what worked: an approach they welcomed in
      words or with a reaction, or picked when an agent recommended it,
      more than once. Save it as a `feedback` fact with each time's
-     source (`turn:BOT/TURN`) and date in its text, or add to the one
+     source (`BOT/N`) and date in its text, or add to the one
      that holds it, and raise its `confirmed` count by the times not
      listed there yet; raise `pushed_back` the same way on a fact whose
      approach they pushed back on or picked against. A turn can reach

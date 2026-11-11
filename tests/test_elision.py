@@ -41,7 +41,7 @@ class ElisionTests(ModelFixture):
         client = self.client(tools='shell,read', settings={'context_bytes': 65536})
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['shell', 'read']))
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:24')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:24')['result']['message']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         requests = drain(self.model)
@@ -83,7 +83,7 @@ class ElisionTests(ModelFixture):
         bound = [m['version'] for m in moves if m['version'] <= fork_at]
         self.assertEqual(client.request('inspect', bot='Branch')['result']['elision'],
                          bound[-1] if bound else None)
-        turn = client.request('submit', bot='Branch', request_id='2', prompt='long:14')['result']['turn']
+        turn = client.request('submit', bot='Branch', request_id='2', prompt='long:14')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         branch = drain(self.model)
         self.assertTrue(all(encoded(r['input']) <= 65536 for r in branch))
@@ -96,7 +96,7 @@ class ElisionTests(ModelFixture):
         client = self.client(tools='shell,read', settings={'context_bytes': 65536})
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['shell', 'read']))
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:24')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:24')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = drain(self.model)
         events, after = [], 0
@@ -130,7 +130,7 @@ class ElisionTests(ModelFixture):
         client = self.client(tools='shell,read', settings={'context_bytes': 65536, 'compact_keep': 50})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'])
         turn = client.request('submit', bot='Bob', request_id='1',
-                              prompt='long:36x40,2x600,10x40')['result']['turn']
+                              prompt='long:36x40,2x600,10x40')['result']['message']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         requests = drain(self.model)
@@ -149,12 +149,12 @@ class ElisionTests(ModelFixture):
                              settings={'context_bytes': 24576, 'compact_keep': 50})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read', 'note'])
         self.model.note_text = 'N' * 8000
-        noted = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['turn']
+        noted = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['message']
         self.assertEqual(client.finished(noted)['data']['status'], 'completed')
         del self.model.note_text
         drain(self.model)
         turn = client.request('submit', bot='Bob', request_id='2',
-                              prompt='long:20x1,2x220,4x1')['result']['turn']
+                              prompt='long:20x1,2x220,4x1')['result']['message']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         requests = drain(self.model)
@@ -179,12 +179,12 @@ class ElisionTests(ModelFixture):
                              settings={'context_bytes': 24576, 'compact_keep': 50})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read', 'note'])
         self.model.note_text = 'N' * 8000
-        noted = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['turn']
+        noted = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['message']
         self.assertEqual(client.finished(noted)['data']['status'], 'completed')
         del self.model.note_text
         drain(self.model)
         turn = client.request('submit', bot='Bob', request_id='2',
-                              prompt='long:14x1,1x140,1x380,1x150,2x1')['result']['turn']
+                              prompt='long:14x1,1x140,1x380,1x150,2x1')['result']['message']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         self.assertTrue(all(encoded(r['input']) <= 24576 for r in drain(self.model)))
@@ -199,7 +199,7 @@ class ElisionTests(ModelFixture):
         # A stub names a read the model could not make.
         client = self.client(tools='shell,read', settings={'context_bytes': 65536})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:24')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:24')['result']['message']
         ended = client.finished(turn)
         self.assertNotEqual(ended['data']['status'], 'completed', ended)
         self.assertIn('context_limit', json.dumps(ended['data']))
@@ -216,7 +216,7 @@ class ElisionTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
                        compaction_instructions='Summarize.')
         for n in range(2):
-            turn = client.request('submit', bot='Bob', request_id=str(n), prompt='long:10')['result']['turn']
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt='long:10')['result']['message']
             ended = client.finished(turn)
             self.assertEqual(ended['data']['status'], 'completed', ended)
         requests = drain(self.model)
@@ -239,7 +239,7 @@ class ElisionTests(ModelFixture):
         # stops where it fits.
         client = self.client(tools='shell,read', settings={'context_bytes': 24576})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'])
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:1x1200,2x1')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:1x1200,2x1')['result']['message']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         requests = drain(self.model)
@@ -261,7 +261,7 @@ class ElisionTests(ModelFixture):
                        compaction_instructions='Summarize.')
         self.model.compaction_refusals = 1
         turn = client.request('submit', bot='Bob', request_id='1',
-                              prompt='long:1x600,35x40,1x700,2x1')['result']['turn']
+                              prompt='long:1x600,35x40,1x700,2x1')['result']['message']
         # The pause comes after some forty rounds, slower than the default
         # wait when four modules share the runner.
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn, timeout=30)
@@ -292,15 +292,15 @@ class ElisionTests(ModelFixture):
         client = self.client(tools='shell,read', settings={'context_bytes': 24576})
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['shell', 'read'], compaction_instructions='Summarize.'))
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:16')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:16')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn
                        and m.get('data', {}).get('call_id') == 'long-1')
         correction = 'steer:' + 'x' * 1000
         steer = client.request('submit', bot='Bob', request_id='s', prompt=correction,
-                               delivery='steer', expected_turn=turn)['result']['turn']
+                               delivery='steer', expected_turn=turn)['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         outcome = client.finished(steer)['data']
-        self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn), outcome)
+        self.assertEqual((outcome['status'], outcome.get('turn')), ('taken', turn), outcome)
         work = [r for r in drain(self.model) if not is_summary(r)]
         steered = [n for n, r in enumerate(work)
                    if any(i.get('role') == 'user' and i['content'][0]['text'] == correction for i in r['input'])]
@@ -324,11 +324,11 @@ class ElisionTests(ModelFixture):
         client = self.client(tools='shell,read', settings={'context_bytes': 24576})
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['shell', 'read'], compaction_instructions='Summarize.'))
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40x40')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40x40')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn
                        and m.get('data', {}).get('call_id') == 'long-10')
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:' + 'x' * 17000,
-                               delivery='steer', expected_turn=turn)['result']['turn']
+                               delivery='steer', expected_turn=turn)['result']['message']
         ended = client.finished(turn, timeout=30)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         self.assertEqual(client.finished(steer)['data']['error'], 'stale_turn')
@@ -366,7 +366,7 @@ class ElisionTests(ModelFixture):
                                                tools=['shell', 'read'], compaction_instructions='Summarize.'))
         turn, ended, outcome, correction = self.steer_behind_a_large_result(client)
         self.assertEqual(ended['status'], 'completed', ended)
-        self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn), outcome)
+        self.assertEqual((outcome['status'], outcome.get('turn')), ('taken', turn), outcome)
         carried = lambda r: any(i.get('role') == 'user' and i['content'][0]['text'] == correction
                                 for i in r['input'])
         requests = drain(self.model)
@@ -408,13 +408,13 @@ class ElisionTests(ModelFixture):
         self.model.request_gates = queue.Queue()
         self.model.request_gates.put(passed)
         self.model.request_gates.put(gate)
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:1x10,1x800')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:1x10,1x800')['result']['message']
         # The call that asks for the large result waits while the steer lands.
         self.model.requests.get(timeout=5)
         self.model.requests.get(timeout=5)
         correction = 'steer:' + 'x' * 3500
         steer = client.request('submit', bot='Bob', request_id='s', prompt=correction,
-                               delivery='steer', expected_turn=turn)['result']['turn']
+                               delivery='steer', expected_turn=turn)['result']['message']
         gate.set()
         return turn, client.finished(turn, timeout=30)['data'], client.finished(steer)['data'], correction
 
@@ -428,10 +428,10 @@ class ElisionTests(ModelFixture):
         gate = threading.Event()
         self.model.request_gates = queue.Queue()
         self.model.request_gates.put(gate)
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='hello')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='hello')['result']['message']
         self.model.requests.get(timeout=5)
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:stop',
-                               delivery='steer', expected_turn=turn)['result']['turn']
+                               delivery='steer', expected_turn=turn)['result']['message']
         gate.set()
         ended = client.finished(turn)['data']
         self.assertEqual(ended['status'], 'completed', ended)
@@ -454,7 +454,7 @@ class AnthropicElisionTests(ModelFixture):
                         settings={'context_bytes': 65536})
         self.addCleanup(client.close)
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), effort='low'))
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:16')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:16')['result']['message']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         self.assertEqual(self.model.binding_errors, [])

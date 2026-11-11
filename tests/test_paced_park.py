@@ -43,8 +43,8 @@ class PacedParkTests(ModelFixture):
         # caught parked or in a live attempt.
         self.assertEqual(client.request('submit', bot='a0', request_id='again', prompt='x')['error'], 'bot_busy')
         self.assertIn(client.request('inspect', bot='a0')['result']['status'], ('paced', 'running'))
-        self.assertIn('interrupt_requested', client.request('interrupt', bot='a0', turn=throttled[0]['turn'])['result'])
-        self.assertEqual(client.finished(throttled[0]['turn'])['data']['status'], 'interrupted')
+        self.assertIn('interrupt_requested', client.request('interrupt', bot='a0', turn=throttled[0]['message'])['result'])
+        self.assertEqual(client.finished(throttled[0]['message'])['data']['status'], 'interrupted')
         for t in throttled[1:]:
             client.request('interrupt', bot=t['bot'], turn=t['turn'])
 
@@ -55,9 +55,9 @@ class PacedParkTests(ModelFixture):
         for bot in ('Outage', 'Healthy'):
             client.request('create', bot=bot, workspace=str(self.path),
                            model=('b' if bot == 'Healthy' else 'openai') + '/synthetic-model')
-        outage = client.request('submit', bot='Outage', request_id='o', prompt='outage:4')['result']['turn']
+        outage = client.request('submit', bot='Outage', request_id='o', prompt='outage:4')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == outage, timeout=5)
-        healthy = client.request('submit', bot='Healthy', request_id='h', prompt='hello', delivery='queue')['result']['turn']
+        healthy = client.request('submit', bot='Healthy', request_id='h', prompt='hello', delivery='queue')['result']['message']
         ended = client.receive(lambda m: m.get('event') == 'turn_finished' and m.get('turn') == healthy, timeout=10)
         self.assertEqual(ended['data']['status'], 'completed')
         # Before, the healthy turn waited out the outage's backoffs behind it;
@@ -76,10 +76,10 @@ class PacedParkTests(ModelFixture):
             client.request('create', bot=bot, workspace=str(self.path),
                            model=('b' if bot == 'Healthy' else 'openai') + '/synthetic-model')
         started = time.monotonic()
-        seed = client.request('submit', bot='Seed', request_id='s', prompt='limited-forever:seed')['result']['turn']
+        seed = client.request('submit', bot='Seed', request_id='s', prompt='limited-forever:seed')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == seed)
-        blocked = client.request('submit', bot='Blocked', request_id='b', prompt='hello', delivery='queue')['result']['turn']
-        healthy = client.request('submit', bot='Healthy', request_id='h', prompt='hello', delivery='queue')['result']['turn']
+        blocked = client.request('submit', bot='Blocked', request_id='b', prompt='hello', delivery='queue')['result']['message']
+        healthy = client.request('submit', bot='Healthy', request_id='h', prompt='hello', delivery='queue')['result']['message']
         ended = client.receive(lambda m: m.get('event') == 'turn_finished' and m.get('turn') == healthy, timeout=2)
         self.assertEqual(ended['data']['status'], 'completed')
         self.assertEqual(client.request('inspect', bot='Blocked')['result']['status'], 'paced')
@@ -94,7 +94,7 @@ class PacedParkTests(ModelFixture):
                 ('Blocked', blocked, 'b', 'hello', 'queue')):
             duplicate = client.request('submit', bot=bot, request_id=request_id,
                                        prompt=prompt, delivery=delivery)['result']
-            self.assertEqual((duplicate['duplicate'], duplicate['turn'], duplicate['status']),
+            self.assertEqual((duplicate['duplicate'], duplicate['message'], duplicate['status']),
                              (True, turn, 'paced'))
             self.assertFalse(poll(client, bot, turn)['result']['finished'])
         self.assertEqual(self.model.requests.qsize(), 2)
@@ -111,7 +111,7 @@ class PacedParkTests(ModelFixture):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
         started = time.monotonic()
-        turn = client.request('submit', bot='Bob', request_id='r', prompt='limited:elapsed')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='r', prompt='limited:elapsed')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
         client.close(kill=True)
         # The deadline expires while the daemon is down; the park lasts until
@@ -131,7 +131,7 @@ class PacedParkTests(ModelFixture):
     def test_next_model_call_gets_fresh_retry_budget_after_paced_tool_call(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='r', prompt='tool:park-rounds')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='r', prompt='tool:park-rounds')['result']['message']
         ended = client.receive(lambda m: m.get('event') == 'turn_finished' and m.get('turn') == turn, timeout=10)
         self.assertEqual(ended['data']['status'], 'completed')
         self.assertEqual(self.model.attempts['tool:park-rounds'], 11)
@@ -142,7 +142,7 @@ class PacedParkTests(ModelFixture):
         self.model.retry_delays = ['0.3']
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='t', prompt='limited-forever:x')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='t', prompt='limited-forever:x')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
         client.close(kill=True)
         with sqlite3.connect(self.path / 'state.sqlite') as db:
@@ -166,7 +166,7 @@ class PacedParkTests(ModelFixture):
         client.request('interrupt', bot='Bob', turn=turn)
         self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
         # The bot is usable again, and nothing about the conversation was written for the held turn.
-        again = client.request('submit', bot='Bob', request_id='again', prompt='hello')['result']['turn']
+        again = client.request('submit', bot='Bob', request_id='again', prompt='hello')['result']['message']
         self.assertEqual(client.finished(again)['data']['status'], 'completed')
 
 

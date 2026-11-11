@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 
-from .runtime_client import Client, serve_args
+from .runtime_client import Client, number, serve_args
 from .targets import clean_env
 
 
@@ -117,7 +117,7 @@ class SocketClient:
             assert 'result' in follower.request('follow', bot=bot, after=0)
             follower.receive(lambda e: e.get('event') == 'follow_live')
         if op == 'submit':
-            self.turns[response['result']['turn']] = params['bot']
+            self.turns[number(response['result'])] = params['bot']
         return response
 
     def finished(self, turn, timeout=5):

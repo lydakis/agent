@@ -73,7 +73,7 @@ def running_work():
 def turn_ended(conn, bot, turn, timeout=600):
     """Waits on the connection's own session, which waits for nothing else,
     so the screen adds no polling of its own to the daemon's work."""
-    handle, deadline = f'turn:{bot}/{turn}', time.monotonic() + timeout
+    handle, deadline = f'{bot}/{turn}', time.monotonic() + timeout
     while time.monotonic() < deadline:
         found = conn.request('wait', handles=[handle], timeout_ms=30_000)['result']['results'][handle]
         if not found.get('pending'):

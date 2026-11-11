@@ -43,16 +43,16 @@ class ImageTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path))
         shot = image()
         first = client.request('submit', bot='Bob', request_id='a', prompt='slow',
-                               images=[shot])['result']['turn']
+                               images=[shot])['result']['message']
         request = self.model.requests.get(timeout=3)
         user = [i for i in request['input'] if i.get('role') == 'user'][-1]
         self.assertEqual(user['content'][0], {'type': 'input_text', 'text': 'slow'})
         self.assertEqual(pictures(user), [f"data:image/png;base64,{shot['data']}"])
         # A steer's pictures go with it into the running turn.
         steer = client.request('submit', bot='Bob', request_id='b', prompt='steer:and this',
-                               images=[shot, shot], delivery='steer')['result']['turn']
+                               images=[shot, shot], delivery='steer')['result']['message']
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
-        self.assertEqual(client.finished(steer)['data']['status'], 'steered')
+        self.assertEqual(client.finished(steer)['data']['status'], 'taken')
         while True:
             request = self.model.requests.get(timeout=3)
             steered = [i for i in request['input'] if i.get('role') == 'user'
@@ -64,15 +64,16 @@ class ImageTests(ModelFixture):
         events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
         node = next(e for e in events if e['event'] == 'accepted' and e['turn'] == first)['data']['node']
         read = node_item(client, 'Bob', node)['result']
-        self.assertEqual(read['content'][1], {'type': 'input_image', 'image_url': 'data:image/png;base64,',
+        self.assertEqual(read['content'][1], {'type': 'input_text', 'text': f'[Message Bob/{first}.]'})
+        self.assertEqual(read['content'][2], {'type': 'input_image', 'image_url': 'data:image/png;base64,',
                                               'omitted_bytes': len(shot['data'])})
-        # The node keeps the pictures; the turns keep only their digest,
+        # The node keeps the pictures; the messages keep only their digest,
         # which a retry with the same ones matches.
         with sqlite3.connect(self.path / 'state.sqlite') as db:
-            kept = [row[0] for row in db.execute('SELECT images FROM turns WHERE id IN (?,?)', (first, steer))]
+            kept = [row[0] for row in db.execute('SELECT images FROM messages WHERE id IN (?,?)', (first, steer))]
         self.assertTrue(all(len(digest) == 64 and not digest.startswith('[') for digest in kept), kept)
         again = client.request('submit', bot='Bob', request_id='a', prompt='slow', images=[shot])
-        self.assertEqual(again['result']['turn'], first)
+        self.assertEqual(again['result']['message'], first)
         # A retry must carry the same pictures.
         retried = client.request('submit', bot='Bob', request_id='a', prompt='slow', images=[])
         self.assertEqual(retried['error'], 'idempotency_conflict')
@@ -86,7 +87,7 @@ class ImageTests(ModelFixture):
         shots = [image(noise(200)) for _ in range(3)]
         for n, shot in enumerate(shots):
             turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'look {n}',
-                                  images=[shot])['result']['turn']
+                                  images=[shot])['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         while not self.model.requests.empty():
             request = self.model.requests.get()
@@ -102,7 +103,7 @@ class ImageTests(ModelFixture):
         shots = [image(png(4, 4))] * 20
         for n in range(6):
             turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'look {n}',
-                                  images=shots)['result']['turn']
+                                  images=shots)['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         while not self.model.requests.empty():
             request = self.model.requests.get()
@@ -110,13 +111,14 @@ class ImageTests(ModelFixture):
         self.assertEqual([len(pictures(user)) for user in users], [0, 0, 0, 0, 20, 20])
         self.assertEqual(users[0]['content'], [{
             'type': 'input_text',
-            'text': 'look 0\n[20 picture(s) sent with this message, elided from this request]'}])
+            'text': 'look 0\n[20 picture(s) sent with this message, elided from this request]'},
+            {'type': 'input_text', 'text': f'[Message Bob/{turn - 5}.]'}])
 
     def test_read_sends_an_image_file_as_a_picture_scaled_to_fit(self):
         (self.path / 'shot.png').write_bytes(png(3000, 2000))
         client = self.client('read')
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='a', prompt='readpic:shot.png')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='a', prompt='readpic:shot.png')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         while True:
             request = self.model.requests.get(timeout=3)
