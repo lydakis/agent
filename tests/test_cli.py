@@ -1738,10 +1738,9 @@ class CliTests(ModelFixture):
                                     env=env, capture_output=True, text=True, timeout=2)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('blocking_tool_client', result.stderr)
-            # It names the reads that answer how turns and calls ended, and
+            # It names the reads that list how turns and calls ended, and
             # those return at once from the same shell.
-            self.assertIn('turns --bot \\"$AGENT_BOT\\" --newest --limit 20', result.stderr)
-            self.assertIn('audit --bot \\"$AGENT_BOT\\" --limit 20', result.stderr)
+            self.assertIn('turns and audit', result.stderr)
         for args in [('turns','--bot','peer-0','--newest','--limit','20'), ('audit','--bot','peer-0','--limit','20')]:
             result = subprocess.run([str(self.binary), *args, '--store', str(self.path/'peers.db'), '--socket', str(client.socket_path)],
                                     env=env, capture_output=True, text=True, timeout=2)

@@ -1422,9 +1422,8 @@ pub fn main(args: Vec<String>) -> Result<i32> {
     {
         return fail_with(
             "blocking_tool_client",
-            "use run --detach to submit peer work and the wait tool to collect it; a blocking client would hold a process-budget unit while waiting. \
-             To see how your turns and calls ended, read `\"$AGENT_BIN\" turns --bot \"$AGENT_BOT\" --newest --limit 20` \
-             and `\"$AGENT_BIN\" audit --bot \"$AGENT_BOT\" --limit 20`, which return at once",
+            "use run --detach to submit peer work and the wait tool to collect it; a blocking client would hold a process-budget unit while waiting; \
+             turns and audit, which list how a bot's turns and calls ended, return at once",
         );
     }
     match command {
