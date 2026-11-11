@@ -15,8 +15,13 @@ use serde_json::{Map, Value, json};
 const MAX_DECLARED: usize = 32;
 const DECLARED_BYTES: usize = 64 * 1024;
 
-/// Sonny's tools, as it declares them on a bot in `role`.
+/// Sonny's tools, as it declares them on a bot in `role`: a workflow's
+/// worker, which no one talks to, goes without those that reach the
+/// person.
 pub fn tools(role: Role) -> Vec<Value> {
+    if role.worker {
+        return crate::served::tools(role).into_iter().map(kinded).collect();
+    }
     let mut tools = vec![
         crate::reactions::tool(),
         crate::asks::tool(),
@@ -79,12 +84,17 @@ pub fn lead_by(record: &Value, maker: impl Fn(&Value) -> Option<Value>) -> Optio
     None
 }
 
-/// The role of the bot `record` describes: a lead's, by its name, or a
-/// task's.
+/// The role of the bot `record` describes: a lead's or a workflow
+/// worker's, by its name, or a task's.
 pub fn role(record: &Value) -> Role {
-    match crate::project::is_lead(record["name"].as_str().unwrap_or_default()) {
-        true => Role::LEAD,
-        false => Role::TASK,
+    let name = record["name"].as_str().unwrap_or_default();
+    match (
+        crate::project::is_lead(name),
+        crate::workflow::is_worker(name),
+    ) {
+        (true, _) => Role::LEAD,
+        (false, true) => Role::WORKER,
+        (false, false) => Role::TASK,
     }
 }
 
@@ -129,7 +139,7 @@ fn wanted(record: &Value, role: Role) -> Option<Vec<Value>> {
     let mut declared = record["declared"].as_array().cloned().unwrap_or_default();
     let mut ours = tools(role);
     // A task resolves itself, as its lead resolves it.
-    if !role.lead && resolves(record) {
+    if !role.lead && !role.worker && resolves(record) {
         ours.push(kinded(crate::resolved::tool()));
     }
     // A gate Sonny did not set, as another client's tag or several, is
@@ -189,7 +199,12 @@ pub fn refresh(record: &Value) -> Option<Map<String, Value>> {
     {
         return None;
     }
-    fields(record, declared_role(declared))
+    // A workflow's worker stays one, by its name.
+    let role = match (record["name"].as_str()).is_some_and(crate::workflow::is_worker) {
+        true => Role::WORKER,
+        false => declared_role(declared),
+    };
+    fields(record, role)
 }
 
 /// The role of a bot Sonny declared `declared` on: a lead by the tool only
@@ -281,6 +296,41 @@ mod tests {
             a_lead()
         );
         assert_eq!(declared_role(&[]), a_task());
+    }
+
+    #[test]
+    fn a_workflow_s_worker_starts_no_agents_and_stays_a_worker() {
+        let names = |tools: Vec<Value>| -> Vec<String> {
+            (tools.iter())
+                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                .collect()
+        };
+        let worker = names(tools(Role::WORKER));
+        assert!(worker.contains(&crate::served::MEMORY.to_owned()));
+        for none in [
+            crate::served::START,
+            crate::served::REMOVE,
+            crate::served::WORKFLOW,
+            crate::reactions::TOOL,
+            crate::asks::TOOL,
+            crate::resolved::TOOL,
+        ] {
+            assert!(!worker.contains(&none.to_owned()), "{none}");
+        }
+        // A task runs workflows, while they are on.
+        assert_eq!(
+            names(tools(Role::TASK)).contains(&crate::served::WORKFLOW.to_owned()),
+            crate::workflow::on()
+        );
+        // A lead made it, yet it marks nothing done, and a refresh keeps it
+        // a worker.
+        let record = json!({"name": "shop.wf-1a2b3c4d-0a1b2c3d4e5f", "created_by": "shop.lead",
+            "declared": tools(Role::WORKER)});
+        assert_eq!(role(&record), Role::WORKER);
+        assert_eq!(declare(&record, Role::WORKER), None);
+        assert!(
+            refresh(&record).is_none_or(|fields| fields["declare"] == json!(tools(Role::WORKER)))
+        );
     }
 
     #[test]

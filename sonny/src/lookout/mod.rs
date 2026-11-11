@@ -2669,7 +2669,9 @@ impl Lookout {
     /// the makers of, or one its names match. The subscriber's own doings
     /// are never news.
     fn sub_watches(&self, sub: &subs::Sub, bot: &str) -> bool {
-        if bot == self.lead {
+        // A workflow's workers wake no one: their run tells its caller
+        // once, at its end.
+        if bot == self.lead || crate::workflow::is_worker(bot) {
             return false;
         }
         let made = |root: &String| {

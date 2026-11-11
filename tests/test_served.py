@@ -594,6 +594,67 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
         refused = json.loads(self.call('calc.lead', 'memory', {'save': dict(fact, name='x', type='mood')}))
         self.assertEqual(refused['error'], 'memory_refused')
 
+    def test_a_workflow_runs_its_agents_and_tells_its_caller_once_when_it_ends(self):
+        made = dict(declare=[declared('workflow')])
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', **made)
+        self.keeps_its_tools(self.host(), 'calc.lead', **made)
+        # An agent asked for a schema answers with JSON; the others echo.
+        self.model.reply_for = lambda request, user: (
+            json.dumps({'word': user.rsplit(' ', 1)[-1], 'note': None})
+            if 'json_schema' in json.dumps(request) else None)
+        script = """export const meta = { name: 'words', description: 'Two agents, one with a schema' }
+const WORD = { type: 'object', properties: { word: { type: 'string' }, note: { type: 'string' } }, required: ['word'] }
+phase('Ask')
+const out = await parallel([
+  () => agent('say a', { label: 'plain' }),
+  () => agent('say b', { label: 'shaped', schema: WORD }),
+])
+log('asked')
+return out
+"""
+        started = self.call('calc.lead', 'workflow', {'script': script})
+        run = re.search(r'as run (\S+?)\.', started).group(1)
+        told = self.told('calc.lead', run)
+        self.assertIn(f'Workflow words (run {run}) completed', told)
+        self.assertIn('2 agents', told)
+        self.assertIn('"reply:say a"', told)
+        self.assertIn('"word": "b"', told)
+        # The optional property the reply left null is left out.
+        self.assertNotIn('note', told)
+        # Its agents are the caller's, one generation down, and kept apart
+        # from tasks.
+        workers = [bot for bot in self.daemon.request('bots')['result']['bots']
+                   if bot['name'].startswith(f'calc.wf-{run}-')]
+        self.assertEqual(len(workers), 2)
+        self.assertEqual({bot['created_by'] for bot in workers}, {'calc.lead'})
+        # The run's journal holds each agent's value.
+        events = [json.loads(line) for line in
+                  (self.path / f'state.sqlite.workflows/{run}/events.jsonl').read_text().splitlines()]
+        self.assertEqual(sorted(e['label'] for e in events if e['t'] == 'agent'), ['plain', 'shaped'])
+        # Run again from it, the same script makes no agent at all.
+        again = self.call('calc.lead', 'workflow', {'script': script, 'resume_from_run_id': run})
+        rerun = re.search(r'as run (\S+?)\.', again).group(1)
+        told = self.told('calc.lead', rerun)
+        self.assertIn(f'2 answered from run {run}', told)
+        self.assertIn('"word": "b"', told)
+        self.assertFalse([bot for bot in self.daemon.request('bots')['result']['bots']
+                          if bot['name'].startswith(f'calc.wf-{rerun}-')])
+
+    def told(self, bot, run, wait=30):
+        """The message `run` sent `bot` when it ended, once its turn has."""
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            for turn in self.daemon.request('turns', bot=bot)['result']['turns']:
+                prompts = self.daemon.request('prompts', bot=bot, turn=turn['turn'])['result']['prompts']
+                text = ''.join(prompt['text'] for prompt in prompts)
+                if f'(run {run})' in text:
+                    self.assertEqual(self.daemon.followers[bot].finished(turn['turn'], wait)['data']['status'],
+                                     'completed')
+                    return text
+            time.sleep(.1)
+        self.fail(f'run {run} told {bot} nothing')
+
     def test_agents_share_a_thread_in_the_commons_and_hear_of_replies(self):
         for bot in ('calc.a', 'shop.b'):
             self.daemon.request('create', bot=bot, workspace=str(self.path), model='openai/synthetic-model',

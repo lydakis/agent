@@ -90,7 +90,8 @@ permissions.
 Keep a small set of execution and context-access primitives. Models can build
 scripts and tools in the supplied workspace and choose how to coordinate agents.
 A tool catalog, workflow engine, or per-agent language kernel is not a core
-requirement. The harness still owns durable state, provider protocol fidelity,
+requirement. (Sonny's `workflow` tool is a client's: a model writes the plan,
+and Sonny runs it over the daemon's own create, submit and wait.) The harness still owns durable state, provider protocol fidelity,
 event delivery, cancellation, and resource bounds. Those guarantees must survive
 the model stopping or failing.
 

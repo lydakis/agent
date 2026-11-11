@@ -106,6 +106,7 @@ mod upgrade;
 mod usage;
 mod used;
 mod user_shell;
+mod workflow;
 mod zen;
 
 use agent_client::{Client, Events};
@@ -617,9 +618,22 @@ async fn read_status(
     let mut kept = HashMap::new();
     let (mut fresh, mut whole) = (false, true);
     for bot in &listed {
-        let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
+        let Some(name) = (bot["name"].as_str()).filter(|_| bot["expire_ms"].is_null()) else {
             continue;
         };
+        // Nor are a workflow's workers: its run is one item. What one asks
+        // the person is read with the agents', while it runs and a while
+        // after, so a window raises it and lets it go once answered.
+        if workflow::is_worker(name) {
+            let ended = bot["last"]["finished_ms"].as_u64().unwrap_or(0);
+            let held_here = held
+                .as_ref()
+                .is_ok_and(|held| held.iter().any(|(of, ..)| of == name));
+            if bot["running_turn"].is_i64() || held_here || now.saturating_sub(ended) < 600_000 {
+                read.push(name.to_owned());
+            }
+            continue;
+        }
         if let Some(mine) = &mine
             && name != lead
             && !mine.contains(name)
@@ -4964,8 +4978,11 @@ impl Fleet {
             self.needs.held(held, |_| true);
         }
         for bot in &bots {
-            // Side chats are never tasks, as when they are made.
-            let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
+            // Side chats are never tasks, as when they are made, nor are
+            // a workflow's workers.
+            let Some(name) = (bot["name"].as_str())
+                .filter(|name| bot["expire_ms"].is_null() && !workflow::is_worker(name))
+            else {
                 continue;
             };
             if name != self.lead
@@ -5026,7 +5043,13 @@ impl Fleet {
     /// Whether what waits on the person in `bot` waits in this window: one
     /// of the lineage, or of a lead followed.
     fn below(&self, bot: &str) -> bool {
-        self.lineage.contains(bot) || self.raised.contains(bot)
+        self.lineage.contains(bot)
+            || self.raised.contains(bot)
+            // A workflow's worker is no task here, but what it asks the
+            // person comes to its project's lead's window.
+            || workflow::worker_project(bot).is_some_and(|project| {
+                project::lead_project(&self.lead) == Some(project)
+            })
     }
 
     /// `bot` as this window names it: a task by its short name, another
@@ -5573,8 +5596,11 @@ impl Fleet {
             }
         }
         match kind {
-            // A copy that goes once idle is a side chat, not a task.
-            "created" | "forked" if event["data"]["expire_ms"].is_null() => {
+            // A copy that goes once idle is a side chat, not a task, and a
+            // workflow's worker is its run's.
+            "created" | "forked"
+                if event["data"]["expire_ms"].is_null() && !workflow::is_worker(bot) =>
+            {
                 let by = event["data"]["created_by"].as_str().unwrap_or("");
                 match kin(
                     bot,

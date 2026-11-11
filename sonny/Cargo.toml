@@ -71,6 +71,9 @@ signal-hook = "0.4"
 # Moves the cursor and wraps by what the terminal draws as one character.
 unicode-segmentation = "1"
 unicode-width = "0.2"
+# Checks a workflow agent's structured reply against its schema, as Claude
+# Code checks one; no remote $refs.
+jsonschema = { version = "0.61.1", default-features = false }
 
 [dev-dependencies]
 # A stand-in daemon on a Unix socket, for the event handling's tests.

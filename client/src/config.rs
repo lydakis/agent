@@ -91,6 +91,11 @@
 //! machine = "laptop"            # what the agents there call this machine, its hostname by default
 //! browser_profile = "Default"   # the Chrome profile their shared browser is copied from once, Default by default, or a folder; "" a fresh one each
 //! calls = 16                    # how many of their calls this machine runs at once, 4 per CPU by default
+//! [sonny.workflows]             # the workflow tool: a script an agent writes that runs many fresh agents
+//! enabled = false               # agents go without it, on by default
+//! concurrency = 8               # workers one run has going at once; 0, the default, the CPUs less two, at most 16
+//! max_agents = 1000             # workers one run starts in all, 1000 by default
+//! max_runs = 8                  # runs going at once, 8 by default
 //! [sonny.sources.slack]         # what Sonny's lookout runs for news
 //! command = "~/bin/slack-poll"  # run with sh -c; each line it prints is one event
 //! every = "1m"                  # how long after it exits it runs again
@@ -644,6 +649,78 @@ pub struct Sonny {
     /// The hosts this machine is linked to over SSH, by name, whose agents
     /// may use this machine's browser, MCP servers and opens.
     pub links: BTreeMap<String, Link>,
+    /// The `workflow` tool, `[sonny.workflows]`.
+    pub workflows: Workflows,
+}
+
+/// `[sonny.workflows]`: scripts an agent writes that run many fresh
+/// agents in code, as Claude Code's dynamic workflows do.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Workflows {
+    /// Whether agents have the `workflow` tool.
+    pub enabled: bool,
+    /// The most workers one run has going at once; 0 for Claude Code's
+    /// own bound, the CPUs less two, at most 16.
+    pub concurrency: u64,
+    /// The most workers one run starts in all, a runaway loop's backstop.
+    pub max_agents: u64,
+    /// The most runs going at once on this daemon.
+    pub max_runs: u64,
+}
+
+impl Default for Workflows {
+    fn default() -> Self {
+        Workflows {
+            enabled: true,
+            concurrency: 0,
+            max_agents: 1000,
+            max_runs: 8,
+        }
+    }
+}
+
+impl Workflows {
+    /// The workers one run has going at once: `concurrency`, else the
+    /// CPUs less two, from 1 to 16.
+    pub fn at_once(&self) -> usize {
+        match self.concurrency {
+            0 => std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .saturating_sub(2)
+                .clamp(1, 16),
+            n => n as usize,
+        }
+    }
+}
+
+/// The `workflow` tool's settings `[sonny.workflows]` gives.
+fn workflows(value: &toml::Value) -> Result<Workflows, String> {
+    let at = "sonny.workflows";
+    let table = value
+        .as_table()
+        .ok_or_else(|| format!("{at} must be a table"))?;
+    let mut workflows = Workflows::default();
+    for (key, value) in table {
+        let key_at = format!("{at}.{key}");
+        let count = |least: i64| {
+            (value.as_integer())
+                .filter(|n| *n >= least)
+                .map(|n| n as u64)
+                .ok_or_else(|| format!("{key_at} is a whole number, {least} or more"))
+        };
+        match key.as_str() {
+            "enabled" => {
+                workflows.enabled = value
+                    .as_bool()
+                    .ok_or_else(|| format!("{key_at} must be true or false"))?
+            }
+            "concurrency" => workflows.concurrency = count(0)?,
+            "max_agents" => workflows.max_agents = count(1)?,
+            "max_runs" => workflows.max_runs = count(1)?,
+            _ => return Err(format!("unknown key {at}.{key}")),
+        }
+    }
+    Ok(workflows)
 }
 
 /// The speeds a task may be given: the daemon's tiers by name.
@@ -766,6 +843,7 @@ impl Default for Sonny {
             sources: Vec::new(),
             browser_confirm: BROWSER_CONFIRM.map(str::to_owned).to_vec(),
             links: BTreeMap::new(),
+            workflows: Workflows::default(),
         }
     }
 }
@@ -1471,6 +1549,10 @@ fn parse(text: &str) -> Result<Config, String> {
                         .links
                         .insert(link.clone(), self::link(link, value)?);
                 }
+                continue;
+            }
+            if (name.as_str(), key.as_str()) == ("sonny", "workflows") {
+                config.sonny.workflows = workflows(value)?;
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "sources") {
@@ -2277,6 +2359,31 @@ mod tests {
         let config = parse("[sonny.links.box]\nhost = \"box\"\ncalls = 2\n").unwrap();
         assert_eq!(config.sonny.links["box"].calls, Some(2));
         assert!(parse("[sonny.links.box]\nhost = \"box\"\ncalls = 0\n").is_err());
+    }
+
+    #[test]
+    fn workflows_are_on_with_claude_code_s_bounds_unless_the_config_says() {
+        let config = parse("").unwrap();
+        assert_eq!(config.sonny.workflows, Workflows::default());
+        assert!(config.sonny.workflows.enabled);
+        assert!((1..=16).contains(&config.sonny.workflows.at_once()));
+        let config = parse(
+            "[sonny.workflows]\nenabled = false\nconcurrency = 3\nmax_agents = 50\nmax_runs = 2\n",
+        )
+        .unwrap();
+        let workflows = &config.sonny.workflows;
+        assert!(!workflows.enabled);
+        assert_eq!(
+            (
+                workflows.at_once(),
+                workflows.max_agents,
+                workflows.max_runs
+            ),
+            (3, 50, 2)
+        );
+        assert!(parse("[sonny.workflows]\nmax_runs = 0\n").is_err());
+        assert!(parse("[sonny.workflows]\ntimeout = 1\n").is_err());
+        assert!(parse("[sonny.workflows]\nenabled = 1\n").is_err());
     }
 
     #[test]
