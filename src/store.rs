@@ -1167,7 +1167,7 @@ mod tests {
         let path = scratch_path("retention-publication");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let (store, mut publications) = Store::open(&path).await.unwrap();
-        let (first, queued, other) = store
+        let (zero, first, queued, other) = store
             .call(|db| {
                 for name in ["Bob", "Alice"] {
                     db.create(
@@ -1195,6 +1195,18 @@ mod tests {
                         },
                     )?;
                 }
+                // An earlier turn, which keeping one turn prunes.
+                let zero = db
+                    .begin(
+                        "Bob",
+                        "z",
+                        "earlier",
+                        true,
+                        &TurnOptions::default(),
+                        |_, _| Ok(()),
+                    )?
+                    .turn;
+                db.finish(zero, None)?;
                 let first = db
                     .begin("Bob", "a", "work", true, &TurnOptions::default(), |_, _| {
                         Ok(())
@@ -1223,7 +1235,7 @@ mod tests {
                         |_, _| Ok(()),
                     )?
                     .turn;
-                Ok((first, queued, other))
+                Ok((zero, first, queued, other))
             })
             .await
             .unwrap();
@@ -1255,7 +1267,7 @@ mod tests {
         // This read also waits for the preceding group's publication to drain.
         assert_eq!(
             store
-                .call(move |db| db.turn_outcome("Bob", first))
+                .call(move |db| db.turn_outcome("Bob", zero))
                 .await
                 .unwrap_err()
                 .code,
@@ -1266,7 +1278,7 @@ mod tests {
         let (pruned, kept) = store
             .read("turn_answers", move |db| {
                 Ok((
-                    db.turn_answer("Bob", first)?,
+                    db.turn_answer("Bob", zero)?,
                     db.turn_answer("Alice", other)?,
                 ))
             })
@@ -1280,7 +1292,7 @@ mod tests {
                 &pruned["pending"]
             ),
             (
-                &json!(first),
+                &json!(zero),
                 &json!("completed"),
                 &json!("turn_result_pruned"),
                 &Value::Null
@@ -1303,15 +1315,18 @@ mod tests {
         assert!(kept["text"].is_string());
         let mut terminal = Vec::new();
         while let Ok(publication) = publications.try_recv() {
-            if let Publication::Event(event) = publication
-                && event["event"] == "turn_finished"
-            {
-                terminal.push(event["turn"].as_i64().unwrap());
+            // A turn's end, or a message's that ended in line.
+            if let Publication::Event(event) = publication {
+                match event["event"].as_str() {
+                    Some("turn_finished") => terminal.push(event["turn"].as_i64().unwrap()),
+                    Some("message_ended") => terminal.push(event["message"].as_i64().unwrap()),
+                    _ => {}
+                }
             }
         }
         assert_eq!(
             terminal,
-            [first, other, queued],
+            [zero, first, other, queued],
             "pruning must not erase live completion"
         );
         assert_eq!(
@@ -1585,7 +1600,7 @@ mod tests {
         let lost = store
             .call(|db| {
                 db.connection()
-                    .execute_batch("ROLLBACK; ALTER TABLE turns RENAME TO turns_away;")?;
+                    .execute_batch("ROLLBACK; ALTER TABLE messages RENAME TO messages_away;")?;
                 Ok(())
             })
             .await;
@@ -1599,7 +1614,7 @@ mod tests {
         );
         Connection::open(scratch_path("recount"))
             .unwrap()
-            .execute_batch("ALTER TABLE turns_away RENAME TO turns;")
+            .execute_batch("ALTER TABLE messages_away RENAME TO messages;")
             .unwrap();
         assert_eq!(store.call(|db| db.pending()).await.unwrap(), (1, 4));
     }

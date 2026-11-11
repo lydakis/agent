@@ -42,8 +42,9 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "interrupt",
-        about: "Stop a bot's running turn, or with --turn end one still queued; prints its turn view",
-        usage: "interrupt --bot NAME [--turn TURN]",
+        about: "Stop a bot's running turn, or with --turn N withdraw message N still in line; prints its view",
+        usage: "interrupt --bot NAME [--turn N]",
+
         flags: "--bot --turn --pretty --no-spawn",
         settings: "",
         startup: false,
@@ -68,6 +69,14 @@ const COMMANDS: &[Command] = &[
         name: "turns",
         about: "A bot's turns and how each ended",
         usage: "turns --bot NAME [--after TURN] [--newest] [--limit N]",
+        flags: "--bot --after --newest --limit --pretty --no-spawn",
+        settings: "",
+        startup: true,
+    },
+    Command {
+        name: "messages",
+        about: "A bot's messages, each by its number: where it stands and the turn that took it in",
+        usage: "messages --bot NAME [--after N] [--newest] [--limit N]",
         flags: "--bot --after --newest --limit --pretty --no-spawn",
         settings: "",
         startup: true,
@@ -304,7 +313,11 @@ fn print_flags(flags: &str) {
                 "DURATION",
                 "Delete the fork once it has been idle this long, from 1s to 168h",
             ),
-            "--detach" => ("", "Submit and return a JSON turn handle immediately"),
+            "--detach" => (
+                "",
+                "Submit and return the message's JSON handle immediately",
+            ),
+
             "--delivery" => (
                 "MODE",
                 "If the bot is busy: steer joins its running turn, queue runs after it, reject refuses; attach adds the message to its next model call without starting a turn; default AGENT_DELIVERY, else steer, or queue with --workspace or --turn-budget-tokens",
@@ -359,8 +372,8 @@ fn print_flags(flags: &str) {
                 "Send this PNG, JPEG, GIF or WebP with the prompt; repeat for more",
             ),
             "--quote" => (
-                "BOT/TURN",
-                "Copy that turn's prompt after this prompt, with who wrote it; BOT/TURN:reply copies the reply it ended with; repeat for more",
+                "BOT/N",
+                "Copy exactly message N, as its number shows it, after this prompt, with who wrote it; BOT/N:reply copies the reply of the turn that took it in; repeat for more",
             ),
             "--pretty" => ("", "Render human-readable output"),
             "--no-spawn" => ("", "Require an already running daemon"),

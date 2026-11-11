@@ -4,6 +4,9 @@ use agent_runtime::{
 };
 use rusqlite::{Connection, params};
 
+#[path = "support/schema_90.rs"]
+mod schema_90;
+
 /// A whole artifact stream, read page by page as clients read it.
 fn artifact(
     db: &Database,
@@ -109,7 +112,7 @@ fn shared_prompts_survive_queue_steer_restart_and_source_deletion() {
             let conn = Connection::open(&path).unwrap();
             let bytes: i64 = conn
                 .query_row(
-                    "SELECT sum(length(CAST(prompt AS BLOB))) FROM turns",
+                    "SELECT sum(length(CAST(text AS BLOB))) FROM messages",
                     [],
                     |r| r.get(0),
                 )
@@ -184,6 +187,7 @@ fn old_prompt_copies_migrate_without_touching_queued_work() {
     }
     {
         let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(schema_90::UNSPLIT).unwrap();
         conn.execute(
             "UPDATE turns SET prompt=? WHERE request_id='first'",
             params![&prompt],
@@ -217,7 +221,7 @@ fn old_prompt_copies_migrate_without_touching_queued_work() {
     let conn = Connection::open(&path).unwrap();
     assert_eq!(
         conn.query_row(
-            "SELECT sum(length(CAST(prompt AS BLOB))) FROM turns",
+            "SELECT sum(length(CAST(text AS BLOB))) FROM messages",
             [],
             |r| r.get::<_, i64>(0)
         )

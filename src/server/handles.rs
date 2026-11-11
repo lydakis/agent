@@ -21,30 +21,37 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Handle {
-    Turn { bot: String, turn: i64 },
+    /// A message, `BOT/N`: what it asked for, as the turn it opened or
+    /// the one that took it in answers it.
+    Message {
+        bot: String,
+        message: i64,
+    },
     Process(i64),
 }
 
 impl Handle {
     pub fn parse(text: &str) -> Result<Handle> {
-        if let Some(rest) = text.strip_prefix("turn:")
-            && let Some((bot, turn)) = rest.rsplit_once('/')
-            && let Ok(turn) = turn.parse::<i64>()
-            && !bot.is_empty()
-            && turn > 0
-            && text == format!("turn:{bot}/{turn}")
-        {
-            return Ok(Handle::Turn {
-                bot: bot.into(),
-                turn,
-            });
+        if let Some(rest) = text.strip_prefix("proc:") {
+            if let Ok(id) = rest.parse::<i64>()
+                && id > 0
+                && rest == id.to_string()
+            {
+                return Ok(Handle::Process(id));
+            }
+            return fail_with("invalid_handle", text);
         }
-        if let Some(rest) = text.strip_prefix("proc:")
-            && let Ok(id) = rest.parse::<i64>()
-            && id > 0
-            && rest == id.to_string()
+        if let Some((bot, message)) = text.rsplit_once('/')
+            && let Ok(message) = message.parse::<i64>()
+            && !bot.is_empty()
+            && !bot.contains(':')
+            && message > 0
+            && text == format!("{bot}/{message}")
         {
-            return Ok(Handle::Process(id));
+            return Ok(Handle::Message {
+                bot: bot.into(),
+                message,
+            });
         }
         fail_with("invalid_handle", text)
     }
@@ -52,7 +59,7 @@ impl Handle {
 impl std::fmt::Display for Handle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Handle::Turn { bot, turn } => write!(f, "turn:{bot}/{turn}"),
+            Handle::Message { bot, message } => write!(f, "{bot}/{message}"),
             Handle::Process(id) => write!(f, "proc:{id}"),
         }
     }
@@ -289,9 +296,9 @@ impl Handles {
     /// Wake every waiter parked on a finished peer turn.
     pub fn turn_finished(&self, bot: &str, turn: i64, outcome: Value) {
         let mut inner = self.inner.lock().unwrap();
-        let handle = Handle::Turn {
+        let handle = Handle::Message {
             bot: bot.into(),
-            turn,
+            message: turn,
         }
         .to_string();
         let outcome = Arc::new(outcome);
@@ -379,7 +386,9 @@ impl Handles {
                     .iter()
                     .filter(|(_, result)| result["pending"] == true)
                     .filter_map(|(text, _)| match Handle::parse(text) {
-                        Ok(Handle::Turn { bot, turn }) => Some((text.clone(), bot, turn)),
+                        Ok(Handle::Message { bot, message: turn }) => {
+                            Some((text.clone(), bot, turn))
+                        }
                         _ => None,
                     })
                     .collect();
@@ -452,7 +461,7 @@ impl Handles {
             }
             for handle in parsed.iter().flatten() {
                 match handle {
-                    Handle::Turn { bot, turn } => {
+                    Handle::Message { bot, message: turn } => {
                         let key = (bot.clone(), *turn);
                         inner.by_turn.entry(key).or_default().insert(waiter);
                     }
@@ -537,7 +546,7 @@ impl Handles {
         }
         let result = match parsed {
             Err(error) => Some((failed(&error), false)),
-            Ok(Handle::Turn { bot, turn }) => {
+            Ok(Handle::Message { bot, message: turn }) => {
                 match store
                     .op("turn_answer", move |db| db.turn_answer(&bot, turn))
                     .await
@@ -700,7 +709,9 @@ impl Handles {
         let handles = waiting.remaining.iter().chain(waiting.results.keys());
         for handle in handles.filter_map(|text| Handle::parse(text).ok()) {
             match handle {
-                Handle::Turn { bot, turn } => unlist(&mut inner.by_turn, (bot, turn), waiter),
+                Handle::Message { bot, message: turn } => {
+                    unlist(&mut inner.by_turn, (bot, turn), waiter)
+                }
                 Handle::Process(id) => unlist(&mut inner.by_process, id, waiter),
             }
         }
@@ -808,7 +819,7 @@ mod tests {
                     any: true,
                     remaining: ["proc:2".into()].into(),
                     results: BTreeMap::from([(
-                        "turn:Bob/1".to_string(),
+                        "Bob/1".to_string(),
                         Arc::new(json!({"pending":true})),
                     )]),
                     completion: Completion::Respond {
@@ -963,7 +974,7 @@ mod tests {
                 Waiting {
                     generation: turn as u64,
                     any: false,
-                    remaining: [format!("proc:{turn}"), format!("turn:Peer/{turn}")].into(),
+                    remaining: [format!("proc:{turn}"), format!("Peer/{turn}")].into(),
                     results: BTreeMap::new(),
                     completion: Completion::Resume {
                         bot: format!("b{turn}"),
@@ -1180,7 +1191,7 @@ mod tests {
             .attach(
                 &store,
                 Waiter::Turn(1),
-                &["turn:Ann/5".into()],
+                &["Ann/5".into()],
                 None,
                 false,
                 resume,
@@ -1202,17 +1213,23 @@ mod tests {
     #[test]
     fn handles_parse_and_print_round_trip() {
         assert_eq!(
-            Handle::parse("turn:Bob/3").unwrap(),
-            Handle::Turn {
+            Handle::parse("Bob/3").unwrap(),
+            Handle::Message {
                 bot: "Bob".into(),
-                turn: 3
+                message: 3
             }
+        );
+        assert_eq!(
+            Handle::parse("shop.fix/48213").unwrap().to_string(),
+            "shop.fix/48213"
         );
         assert_eq!(Handle::parse("proc:7").unwrap().to_string(), "proc:7");
         for bad in [
-            "turn:Bob",
-            "turn:/3",
-            "turn:Bob/0",
+            "Bob",
+            "/3",
+            "Bob/0",
+            "Bob/03",
+            "turn:Bob/3",
             "proc:x",
             "proc:0",
             "job:1",

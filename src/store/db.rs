@@ -1113,12 +1113,12 @@ pub struct Lapsed {
     /// wakes, and the newest queued steer.
     pub parked: Option<(i64, i64)>,
 }
-/// A turn whose words a prompt quotes: its prompt, or with `reply` the
-/// last message with text it ended with.
+/// A message whose words a prompt quotes: exactly that message, or with
+/// `reply` the last message with text the turn that took it in ended with.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct QuoteRef {
     pub bot: String,
-    pub turn: i64,
+    pub message: i64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reply: bool,
 }
@@ -2098,18 +2098,41 @@ fn pause_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     Ok(pause)
 }
 
-/// The columns of the turn view, from `turns t JOIN bots b ON b.name=t.bot`.
-/// A wait result, a `turns` item and an `interrupt` reply all start from it,
-/// so a client reads one shape wherever it meets a turn.
-const TURN_VIEW: &str = "t.id,t.bot,b.id,t.request_id,t.status,t.input_tokens,
-    t.cached_input_tokens,t.output_tokens,t.model_rounds,t.retries,t.paced_ms,t.started_ms,
+/// The columns of the message view, from `MESSAGE_FROM`: a message, and the
+/// turn it opened when it opened one. A wait result, a `turns` item and an
+/// `interrupt` reply all start from it, so a client reads one shape wherever
+/// it meets a message or the turn it opened.
+const TURN_VIEW: &str = "m.id,m.bot,b.id,m.request_id,COALESCE(t.status,m.status),
+    COALESCE(t.input_tokens,0),COALESCE(t.cached_input_tokens,0),COALESCE(t.output_tokens,0),
+    COALESCE(t.model_rounds,0),COALESCE(t.retries,0),COALESCE(t.paced_ms,0),t.started_ms,
     t.finished_ms,json_extract(t.waiting,'$.call_id'),json_extract(t.waiting,'$.approval'),
     json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
     json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
     json_extract(t.waiting,'$.halt'),json_extract(t.waiting,'$.load'),
-    json_extract(t.waiting,'$.blocked'),t.held,t.due_ms,t.work,t.limited";
+    json_extract(t.waiting,'$.blocked'),m.held,m.due_ms,COALESCE(t.work,0),t.limited,m.turn";
+/// Where `TURN_VIEW` reads: the message, its bot, and the turn it opened.
+const MESSAGE_FROM: &str = "messages m JOIN bots b ON b.name=m.bot LEFT JOIN turns t ON t.id=m.id";
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
-const TURN_VIEW_COLUMNS: usize = 26;
+const TURN_VIEW_COLUMNS: usize = 27;
+/// A message's words, from `messages m` joined by `MESSAGE_NODE`: kept on
+/// the message, or once 4 KiB or more were taken in, read from its node.
+const MESSAGE_TEXT: &str = "CASE WHEN n.id IS NULL THEN m.text
+    ELSE json_extract(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content[0].text') END";
+/// A message's words previewed and their length, from `messages m` joined
+/// by `PREVIEW_NODE`: kept on the message, or read from its node's
+/// opening, which a whole read never needs.
+const PREVIEW: &str = "CASE WHEN m.text<>'' OR m.node IS NULL THEN substr(m.text,1,200)
+        WHEN d.node IS NULL THEN substr(o.text,1,200)
+        ELSE substr(json_extract(CAST(d.item AS TEXT),'$.content[0].text'),1,200) END,
+    CASE WHEN m.text<>'' OR m.node IS NULL THEN length(m.text) WHEN d.node IS NULL THEN o.chars
+        ELSE length(json_extract(CAST(d.item AS TEXT),'$.content[0].text')) END";
+/// The node `PREVIEW` reads.
+const PREVIEW_NODE: &str = "LEFT JOIN openings o ON o.node=m.node AND m.text=''
+    LEFT JOIN declined d ON d.node=m.node AND m.text=''";
+/// The node `MESSAGE_TEXT` reads, joined only when the words live there.
+
+const MESSAGE_NODE: &str = "LEFT JOIN nodes n ON n.id=m.node AND m.text=''
+    LEFT JOIN declined d ON d.node=n.id";
 
 /// The turn view's own fields beside a turn's identity and status: who asked,
 /// what it waits on, its usage and timing. A model's `wait` leaves them out.
@@ -2133,6 +2156,7 @@ pub const TURN_VIEW_ACCOUNTING: [&str; 14] = [
 /// One turn as it stands. `waiting_on` is what a parked turn waits for, as
 /// its `turn_waiting` or `turn_paced` event said, and null otherwise.
 fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    // The message's number, which is also the turn's when it opened one.
     let turn: i64 = r.get(0)?;
     let bot: String = r.get(1)?;
     let status: String = r.get(4)?;
@@ -2172,8 +2196,11 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         },
         _ => Value::Null,
     };
-    let mut view = json!({"bot":bot,"bot_id":r.get::<_, i64>(2)?,"turn":turn,
-        "handle":format!("turn:{bot}/{turn}"),"request_id":r.get::<_, String>(3)?,
+    // A message names the turn that took it in once one did: its own
+    // number when it opened it.
+    let mut view = json!({"bot":bot,"bot_id":r.get::<_, i64>(2)?,"message":turn,
+        "turn":r.get::<_, Option<i64>>(26)?,
+        "handle":format!("{bot}/{turn}"),"request_id":r.get::<_, String>(3)?,
         "status":status,"waiting_on":waiting_on,
         "input_tokens":r.get::<_, i64>(5)?,"cached_input_tokens":r.get::<_, i64>(6)?,
         "output_tokens":r.get::<_, i64>(7)?,"work_tokens":r.get::<_, i64>(24)?,
@@ -2345,6 +2372,20 @@ fn conflict(name: &str, field: &str) -> Error {
 fn entry(cursor: i64, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Value {
     json!({"cursor":cursor,"bot":bot,"turn":turn,"event":kind,"data":data})
 }
+/// An entry about a message: the message it names, and the turn that took
+/// it in once one did.
+fn message_entry(
+    cursor: i64,
+    bot: &str,
+    turn: Option<i64>,
+    message: i64,
+    kind: &str,
+    data: Value,
+) -> Value {
+    let mut entry = entry(cursor, bot, turn, kind, data);
+    entry["message"] = json!(message);
+    entry
+}
 /// The most kinds `events_of_kinds` takes, each read from its place in the
 /// index (SQLite allows 500 arms in a compound). A follow of more pages
 /// every event and filters them as they are sent, which costs each page its
@@ -2352,7 +2393,7 @@ fn entry(cursor: i64, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> 
 pub const EVENT_PAGE_KINDS: usize = 64;
 /// Every bot's next events of one kind (`?3`) after `?1`, at most `?2`,
 /// from the kind's place in the index.
-const KINDS_PAGE: &str = "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE id IN
+const KINDS_PAGE: &str = "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE id IN
     (SELECT id FROM events INDEXED BY events_kind_cursor WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2)
     ORDER BY id LIMIT ?2";
 const KIND_CURSORS: &str = "SELECT id FROM events INDEXED BY events_kind_cursor WHERE kind=?3 AND id>?1 ORDER BY id LIMIT ?2";
@@ -2388,11 +2429,15 @@ fn stored_entry(
     cursor: i64,
     bot: &str,
     turn: Option<i64>,
+    message: Option<i64>,
     kind: &str,
     data: Value,
     written_ms: Option<i64>,
 ) -> Value {
-    let mut event = entry(cursor, bot, turn, kind, data);
+    let mut event = match message {
+        Some(message) => message_entry(cursor, bot, turn, message, kind, data),
+        None => entry(cursor, bot, turn, kind, data),
+    };
     if let Some(written_ms) = written_ms {
         event["written_ms"] = json!(written_ms);
     }
@@ -2404,7 +2449,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 90;
+    pub const SCHEMA: i32 = 91;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2491,6 +2536,10 @@ impl Database {
         // so a release can go back to the store as it was.
         if version != 0 && version < Self::SCHEMA {
             back_up(&conn, version)?;
+            // A migration that rebuilds a table others point at runs with
+            // foreign keys off, as SQLite's rebuild steps ask, and checks
+            // them itself before it commits. Off only outside a transaction.
+            conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
         }
         // Initialize a fresh store atomically; existing stores must match.
         let tx = conn.unchecked_transaction()?;
@@ -2516,7 +2565,7 @@ impl Database {
                 turn INTEGER, turn_seq INTEGER, thinking INTEGER NOT NULL DEFAULT 0,
                 elided INTEGER NOT NULL DEFAULT 0, total_elided INTEGER NOT NULL DEFAULT 0,
                 total_thinking INTEGER NOT NULL DEFAULT 0, pictured INTEGER NOT NULL DEFAULT 0,
-                pictures INTEGER NOT NULL DEFAULT 0, written_ms INTEGER);
+                pictures INTEGER NOT NULL DEFAULT 0, written_ms INTEGER, message INTEGER);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
             CREATE TABLE IF NOT EXISTS lineage(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 parent INTEGER, depth INTEGER NOT NULL, skip INTEGER, start INTEGER);
@@ -2601,25 +2650,39 @@ impl Database {
             CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent);
             CREATE INDEX IF NOT EXISTS bots_head ON bots(head);
             CREATE INDEX IF NOT EXISTS bots_context_start ON bots(context_start);
-            CREATE TABLE IF NOT EXISTS turns(id INTEGER PRIMARY KEY, bot TEXT NOT NULL REFERENCES bots(name),
-                request_id TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
-                prompt_node INTEGER REFERENCES nodes(id),
-                workspace TEXT, model TEXT, waiting TEXT, model_rounds INTEGER NOT NULL DEFAULT 0, view_sent INTEGER,
-                input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
-                started_ms INTEGER, finished_ms INTEGER,
-                retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
-                summary_ms INTEGER NOT NULL DEFAULT 0, budget_tokens INTEGER,
-                delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
-                cached_input_tokens INTEGER NOT NULL DEFAULT 0,
-                from_bot TEXT, from_turn INTEGER, from_id INTEGER, origin TEXT, reasoning TEXT, inherited_reasoning TEXT,
-                bot_model TEXT, bot_reasoning TEXT, images TEXT, person TEXT, quotes TEXT, reply_node INTEGER,
-                wait_ms INTEGER, due_ms INTEGER, held TEXT,
-                work INTEGER NOT NULL DEFAULT 0, limited TEXT, budget_counts TEXT, output_schema TEXT,
-                drops INTEGER NOT NULL DEFAULT 0,
+            CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, bot TEXT NOT NULL REFERENCES bots(name),
+                request_id TEXT NOT NULL, delivery TEXT NOT NULL, status TEXT NOT NULL,
+                turn INTEGER, node INTEGER REFERENCES nodes(id), text TEXT NOT NULL,
+                images TEXT, quotes TEXT, from_bot TEXT, from_turn INTEGER, from_id INTEGER,
+                origin TEXT, person TEXT, expected_turn INTEGER,
+                workspace TEXT, model TEXT, reasoning TEXT, budget_tokens INTEGER, budget_counts TEXT,
+                output_schema TEXT, wait_ms INTEGER, due_ms INTEGER, held TEXT,
+                sent_ms INTEGER, taken_ms INTEGER,
                 UNIQUE(bot,request_id));
+            CREATE INDEX IF NOT EXISTS messages_bot_id ON messages(bot,id);
+            CREATE INDEX IF NOT EXISTS messages_turn ON messages(turn) WHERE turn IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS messages_queued ON messages(bot,id) WHERE status='queued';
+            CREATE INDEX IF NOT EXISTS messages_steers ON messages(bot,id) WHERE status='queued' AND delivery='steer';
+            CREATE INDEX IF NOT EXISTS messages_attached ON messages(bot,id) WHERE status='attached';
+            CREATE INDEX IF NOT EXISTS messages_due ON messages(due_ms) WHERE status='attached' AND due_ms IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS messages_held ON messages(due_ms) WHERE status='ready' AND held IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS messages_ready ON messages(id) WHERE status='ready';
+            CREATE INDEX IF NOT EXISTS messages_ready_bot ON messages(bot) WHERE status='ready';
+            CREATE TABLE IF NOT EXISTS message_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                last_id INTEGER NOT NULL CHECK(last_id>=0));
+            INSERT OR IGNORE INTO message_sequence VALUES (1,0);
+            CREATE TABLE IF NOT EXISTS turns(id INTEGER PRIMARY KEY REFERENCES messages(id),
+                bot TEXT NOT NULL REFERENCES bots(name), status TEXT NOT NULL,
+                workspace TEXT, model TEXT, reasoning TEXT, bot_model TEXT, bot_reasoning TEXT,
+                budget_tokens INTEGER, budget_counts TEXT, output_schema TEXT,
+                waiting TEXT, model_rounds INTEGER NOT NULL DEFAULT 0, view_sent INTEGER,
+                input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                started_ms INTEGER NOT NULL, finished_ms INTEGER,
+                retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
+                summary_ms INTEGER NOT NULL DEFAULT 0, reply_node INTEGER,
+                work INTEGER NOT NULL DEFAULT 0, limited TEXT, drops INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
-            CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS turns_prompt_node ON turns(prompt_node) WHERE prompt_node IS NOT NULL;
             CREATE TABLE IF NOT EXISTS turn_models(turn INTEGER NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
                 model TEXT NOT NULL, speed TEXT NOT NULL DEFAULT 'standard', input_tokens INTEGER NOT NULL DEFAULT 0,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
@@ -2628,9 +2691,6 @@ impl Database {
             CREATE TABLE IF NOT EXISTS retained_turns(turn INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
                 bot TEXT NOT NULL REFERENCES bots(name));
             CREATE INDEX IF NOT EXISTS retained_turns_bot ON retained_turns(bot,turn);
-            CREATE TABLE IF NOT EXISTS turn_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                last_id INTEGER NOT NULL CHECK(last_id>=0));
-            INSERT OR IGNORE INTO turn_sequence VALUES (1,0);
             CREATE TABLE IF NOT EXISTS checkpoints(bot TEXT NOT NULL REFERENCES bots(name), head INTEGER NOT NULL REFERENCES nodes(id),
                 PRIMARY KEY(bot,head));
             CREATE TABLE IF NOT EXISTS companions(name TEXT PRIMARY KEY, spec TEXT NOT NULL);
@@ -2671,24 +2731,18 @@ impl Database {
                 stream TEXT NOT NULL, data BLOB NOT NULL, raw_bytes INTEGER NOT NULL DEFAULT 0, file TEXT,
                 PRIMARY KEY(turn,call_id,stream));
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, bot TEXT NOT NULL REFERENCES bots(name),
-                turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL, written_ms INTEGER);
+                turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL, written_ms INTEGER, message INTEGER);
             CREATE TABLE IF NOT EXISTS event_retention(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 pruned_cursor INTEGER NOT NULL);
             INSERT OR IGNORE INTO event_retention VALUES (1,0);
             CREATE INDEX IF NOT EXISTS events_bot_cursor ON events(bot,id);
             CREATE INDEX IF NOT EXISTS events_turn_kind_cursor ON events(turn,kind,id);
             CREATE INDEX IF NOT EXISTS events_kind_cursor ON events(kind,id);
+            CREATE INDEX IF NOT EXISTS events_message ON events(message) WHERE message IS NOT NULL;
             CREATE INDEX IF NOT EXISTS checkpoints_head ON checkpoints(head);
             CREATE INDEX IF NOT EXISTS turns_running ON turns(id) WHERE status='running';
             CREATE INDEX IF NOT EXISTS turns_waiting ON turns(id) WHERE status='waiting';
             CREATE INDEX IF NOT EXISTS turns_paced ON turns(id) WHERE status='paced';
-            CREATE INDEX IF NOT EXISTS turns_queued ON turns(bot,id) WHERE status='queued';
-            CREATE INDEX IF NOT EXISTS turns_steers ON turns(bot,id) WHERE status='queued' AND delivery='steer';
-            CREATE INDEX IF NOT EXISTS turns_attached ON turns(bot,id) WHERE status='attached';
-            CREATE INDEX IF NOT EXISTS turns_due ON turns(due_ms) WHERE status='attached' AND due_ms IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS turns_held ON turns(due_ms) WHERE status='ready' AND held IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS turns_ready ON turns(id) WHERE status='ready';
-            CREATE INDEX IF NOT EXISTS turns_ready_bot ON turns(bot) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
             CREATE INDEX IF NOT EXISTS bots_deleting ON bots(name) WHERE status='deleting';
             CREATE INDEX IF NOT EXISTS bots_running ON bots(name) WHERE running_turn IS NOT NULL;
@@ -2698,6 +2752,7 @@ impl Database {
             tx.pragma_update(None, "user_version", Self::SCHEMA)?;
         }
         tx.commit()?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         // Background command ownership is lost across daemon restart. This
         // does not prove the OS process stopped; never reuse its handle.
         conn.execute(
@@ -2747,14 +2802,14 @@ impl Database {
         for turn in pending {
             db.finish(turn, Some(&Error::new("process_interrupted")))?;
         }
-        // Queued turns outlive a restart. The oldest one of each idle bot
+        // Queued messages outlive a restart. The oldest one of each idle bot
         // waits only for a slot; those behind a parked turn stay queued.
         db.conn.execute(
-            "UPDATE turns SET status='ready' WHERE id IN (
-                SELECT MIN(t.id) FROM turns t JOIN bots b ON b.name=t.bot
-                WHERE t.status='queued' AND b.running_turn IS NULL
-                  AND NOT EXISTS(SELECT 1 FROM turns r WHERE r.bot=t.bot AND r.status='ready')
-                GROUP BY t.bot)",
+            "UPDATE messages SET status='ready' WHERE id IN (
+                SELECT MIN(m.id) FROM messages m JOIN bots b ON b.name=m.bot
+                WHERE m.status='queued' AND b.running_turn IS NULL
+                  AND NOT EXISTS(SELECT 1 FROM messages r WHERE r.bot=m.bot AND r.status='ready')
+                GROUP BY m.bot)",
             [],
         )?;
         // A command that ended with the daemon, or while it was down, is
@@ -2784,8 +2839,8 @@ impl Database {
             .prepare_cached("SELECT COUNT(*) FROM approvals")?
             .query_row([], |r| r.get(0))?;
         for statement in [
-            "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0)),0) FROM turns WHERE status='queued'",
-            "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0)),0) FROM turns WHERE status='ready'",
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(text AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0)),0) FROM messages WHERE status='queued'",
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(text AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0)),0) FROM messages WHERE status='ready'",
         ] {
             let (turns, bytes): (i64, i64) = self
                 .conn
@@ -2923,7 +2978,7 @@ impl Database {
     ) -> Result<()> {
         loop {
             let mut statement = self.conn.prepare_cached(
-                "SELECT id,bot,turn,kind,data,written_ms FROM events WHERE id>? ORDER BY id LIMIT 256",
+                "SELECT id,bot,turn,kind,data,written_ms,message FROM events WHERE id>? ORDER BY id LIMIT 256",
             )?;
             let mut rows = statement.query([*watermark])?;
             let mut delivered = 0;
@@ -2934,6 +2989,7 @@ impl Database {
                     cursor,
                     &row.get::<_, String>(1)?,
                     row.get(2)?,
+                    row.get(6)?,
                     &row.get::<_, String>(3)?,
                     data,
                     row.get(5)?,
@@ -2993,8 +3049,8 @@ impl Database {
         Ok(self
             .conn
             .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM turns WHERE bot=?1 AND status='queued' AND delivery='steer')
-                     OR EXISTS(SELECT 1 FROM turns WHERE bot=?1 AND status='attached')",
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE bot=?1 AND status='queued' AND delivery='steer')
+                     OR EXISTS(SELECT 1 FROM messages WHERE bot=?1 AND status='attached')",
             )?
             .query_row([name], |r| r.get(0))?)
     }
@@ -3017,7 +3073,7 @@ impl Database {
                 "SELECT (s.workspace IS NULL OR s.workspace=COALESCE(t.workspace,b.workspace))
                     AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
                     AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning))
-                 FROM bots b JOIN turns t ON t.id=b.running_turn JOIN turns s ON s.bot=b.name
+                 FROM bots b JOIN turns t ON t.id=b.running_turn JOIN messages s ON s.bot=b.name
                  WHERE b.name=? AND s.status='queued' AND s.delivery='steer'
                    AND (s.expected_turn IS NULL OR s.expected_turn=t.id)
                  ORDER BY s.id LIMIT 1",
@@ -3050,7 +3106,7 @@ impl Database {
         let newest: i64 = self
             .conn
             .prepare_cached(
-                "SELECT max(id) FROM turns WHERE bot=? AND status='queued' AND delivery='steer'",
+                "SELECT max(id) FROM messages WHERE bot=? AND status='queued' AND delivery='steer'",
             )?
             .query_row([name], |r| r.get(0))?;
         Ok(Some((turn, newest)))
@@ -3311,7 +3367,7 @@ impl Database {
         let tx = self.conn.savepoint()?;
         tx.execute(
             "UPDATE turns SET (bot_model,bot_reasoning)=(SELECT provider||'/'||model,reasoning FROM bots WHERE id=?1)
-              WHERE bot=?2 AND bot_model IS NULL AND status NOT IN ('queued','ready','attached')
+              WHERE bot=?2 AND bot_model IS NULL
                 AND EXISTS(SELECT 1 FROM bots WHERE id=?1 AND (provider<>?3 OR model<>?4 OR reasoning IS NOT ?5))",
             params![id, name, provider, model, effort],
         )?;
@@ -3501,9 +3557,9 @@ impl Database {
         // still starts on that model's provider: each status read through
         // its own index, never the whole history.
         let mut statement = self.conn.prepare(
-            "SELECT bot,model FROM turns WHERE status='queued' AND model IS NOT NULL
-             UNION ALL SELECT bot,model FROM turns WHERE status='attached' AND model IS NOT NULL
-             UNION ALL SELECT bot,model FROM turns WHERE status='ready' AND model IS NOT NULL
+            "SELECT bot,model FROM messages WHERE status='queued' AND model IS NOT NULL
+             UNION ALL SELECT bot,model FROM messages WHERE status='attached' AND model IS NOT NULL
+             UNION ALL SELECT bot,model FROM messages WHERE status='ready' AND model IS NOT NULL
              UNION ALL SELECT bot,model FROM turns WHERE status='running' AND model IS NOT NULL
              UNION ALL SELECT bot,model FROM turns WHERE status='waiting' AND model IS NOT NULL
              UNION ALL SELECT bot,model FROM turns WHERE status='paced' AND model IS NOT NULL",
@@ -5921,23 +5977,29 @@ impl Database {
         while let Some(r) = rows.next()? {
             let (owner, id): (Option<String>, Option<i64>) = (r.get(1)?, r.get(2)?);
             turns.push(json!({"turn":r.get::<_, i64>(0)?,
-                "handle":owner.zip(id).map(|(owner, id)| format!("turn:{owner}/{id}")),
+                "handle":owner.zip(id).map(|(owner, id)| format!("{owner}/{id}")),
                 "status":r.get::<_, Option<String>>(3)?,
                 "prompt":r.get::<_, Option<String>>(4)?,
                 "prompt_bytes":r.get::<_, Option<i64>>(5)?}));
         }
         Ok(json!({"bot":name,"turns":turns}))
     }
-    /// The number `history_read` gives the turn `turn` (the store's, as a
-    /// handle names it) in `name`'s history, which may hold it from before
-    /// a fork.
-    pub fn history_number(&self, name: &str, turn: i64) -> Result<i64> {
+    /// The number `history_read` gives the turn that took message
+    /// `message` in (the store's number, as a handle names it) in `name`'s
+    /// history, which may hold it from before a fork.
+    pub fn history_number(&self, name: &str, message: i64) -> Result<i64> {
         let head: Option<i64> = self
             .conn
             .prepare_cached("SELECT head FROM bots WHERE name=?")?
             .query_row([name], |r| r.get(0))
             .optional()?
             .ok_or(Error::new("bot_not_found"))?;
+        // A message a fork's source took in, after that source was removed,
+        // is named by the turn it opened.
+        let turn: i64 = self
+            .conn
+            .prepare_cached("SELECT COALESCE((SELECT turn FROM messages WHERE id=?1),?1)")?
+            .query_row([message], |r| r.get(0))?;
         // Turn ids only grow along a history: stop past the turn.
         self.conn
             .prepare_cached(
@@ -5952,7 +6014,7 @@ impl Database {
             .ok_or_else(|| {
                 Error::with(
                     "turn_not_in_history",
-                    format!("turn:{name}/{turn} did not start a turn in {name}'s history"),
+                    format!("{name}/{message} is not a message in {name}'s history"),
                 )
             })
     }
@@ -6296,7 +6358,7 @@ impl Database {
                     continue;
                 }
                 found["turn"] = json!(number);
-                found["handle"] = json!(format!("turn:{}/{turn}", bots[bot].0));
+                found["handle"] = json!(format!("{}/{turn}", bots[bot].0));
                 matches.push((node, found));
             }
         };
@@ -6463,9 +6525,10 @@ impl Database {
         let prior: Option<Prior> = self
             .conn
             .query_row(
-                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node,from_bot,from_turn,origin,reasoning,budget_tokens,images,
-                    person,quotes,wait_ms,budget_counts,output_schema
-                 FROM turns WHERE bot=? AND request_id=?",
+                "SELECT m.id,m.text,COALESCE(t.status,m.status),m.workspace,m.model,m.delivery,m.expected_turn,
+                    m.node,m.from_bot,m.from_turn,m.origin,m.reasoning,m.budget_tokens,m.images,
+                    m.person,m.quotes,m.wait_ms,m.budget_counts,m.output_schema
+                 FROM messages m LEFT JOIN turns t ON t.id=m.id WHERE m.bot=? AND m.request_id=?",
                 params![name, request_id],
                 |r| {
                     Ok((
@@ -6525,12 +6588,15 @@ impl Database {
                 },
             )
             .optional()?;
-        if let Some((turn, mut saved, status, saved_options, prompt_node, saved_images)) = prior {
-            if let Some(node) = prompt_node {
+        if let Some((turn, mut saved, status, saved_options, node, saved_images)) = prior {
+            // Words of 4 KiB or more live only in the node they became.
+            if saved.is_empty()
+                && let Some(node) = node
+            {
                 saved = self.conn.prepare_cached(
                     "SELECT json_extract(CAST(COALESCE((SELECT item FROM declined WHERE node=?1),item) AS TEXT),
                         '$.content[0].text') FROM nodes WHERE id=?1"
-                )?.query_row([node], |r| r.get(0))?;
+                )?.query_row([node], |r| r.get::<_, Option<String>>(0))?.unwrap_or_default();
             }
             // A turn records the folder it runs in; a retry that names none
             // means wherever the first attempt went.
@@ -6586,9 +6652,9 @@ impl Database {
             if let Some(field) = differs {
                 return Err(Error::with(
                     "idempotency_conflict",
-                    format!("{field} differs from the request that started turn {turn}"),
+                    format!("{field} differs from the request that sent message {turn}"),
                 )
-                .facts(json!({"field":field,"turn":turn})));
+                .facts(json!({"field":field,"message":turn})));
             }
             return Ok(Started {
                 turn,
@@ -6744,35 +6810,36 @@ impl Database {
             }
         }
         let tx = self.conn.savepoint()?;
-        // A deleted bot must never make an old turn handle refer to new work.
+        // A deleted bot must never make an old handle refer to new work.
         let turn: i64 = tx
             .prepare_cached(
-                "UPDATE turn_sequence SET last_id=last_id+1 WHERE singleton=1 RETURNING last_id",
+                "UPDATE message_sequence SET last_id=last_id+1 WHERE singleton=1 RETURNING last_id",
             )?
             .query_row([], |r| r.get(0))?;
+        let now = epoch_ms();
+        // A message starting at once is in line until `start_locked` takes
+        // it in, in this same job.
         tx.prepare_cached(
-            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images,person,quotes,
-                wait_ms,due_ms,budget_counts,output_schema)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages(id,bot,request_id,text,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images,person,quotes,
+                wait_ms,due_ms,budget_counts,output_schema,sent_ms)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )?.execute(
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
-            params![turn, name, request_id, prompt, status,
+            params![turn, name, request_id, prompt, if status == "running" { "ready" } else { status },
                 if matches!(options.delivery, Delivery::Steer | Delivery::Attach) { options.workspace.as_deref() } else { workspace.as_deref() },
                 options.model, options.delivery.name(), options.expected_turn,
                 options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin,
                 options.effort, options.budget_tokens.map(|n| n as i64),
                 stored_images(&options.images)?, options.person, quotes,
                 options.wait_ms.map(|n| n as i64),
-                options.wait_ms.map(|n| epoch_ms().saturating_add(n as i64)),
-                options.budget_counts.stored(), options.output_schema],
+                options.wait_ms.map(|n| now.saturating_add(n as i64)),
+                options.budget_counts.stored(), options.output_schema, now],
         )?;
         if moved {
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
                 .execute(params![workspace, name])?;
         }
-        tx.prepare_cached("INSERT INTO retained_turns(turn,bot) VALUES (?,?)")?
-            .execute(params![turn, name])?;
         let model = options
             .model
             .clone()
@@ -6801,7 +6868,9 @@ impl Database {
             );
             (if attach { "attached" } else { "queued" }, data)
         };
-        let cursor = event(&tx, name, Some(turn), kind, data.clone())?;
+        // The message's own event; one that opened a turn names it too.
+        let opened = (status == "running").then_some(turn);
+        let cursor = message_event(&tx, name, opened, Some(turn), kind, data.clone())?;
         tx.commit()?;
         if status != "running" && !attach {
             self.pending.0 += 1;
@@ -6820,7 +6889,8 @@ impl Database {
             fresh: true,
             attached,
             status,
-            entry: Some(entry(cursor, name, Some(turn), kind, data)),
+            entry: Some(message_entry(cursor, name, opened, turn, kind, data)),
+
             joins,
             parked,
         })
@@ -6849,8 +6919,8 @@ impl Database {
         let (name, request_id, prompt, status, workspace, model, strict, reasoning, waiting): Queued = self
             .conn
             .query_row(
-                "SELECT bot,request_id,prompt,status,workspace,model,expected_turn IS NOT NULL,reasoning,
-                    length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0) FROM turns WHERE id=?",
+                "SELECT bot,request_id,text,status,workspace,model,expected_turn IS NOT NULL,reasoning,
+                    length(CAST(text AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0) FROM messages WHERE id=?",
                 [turn],
                 |r| {
                     Ok((
@@ -6880,7 +6950,7 @@ impl Database {
             // Back in line behind the bot's work, so the dispatcher never
             // picks the same ready row twice.
             self.conn
-                .execute("UPDATE turns SET status='queued' WHERE id=?", [turn])?;
+                .execute("UPDATE messages SET status='queued' WHERE id=?", [turn])?;
             return fail("bot_busy");
         }
         if let Some(budget) =
@@ -6898,43 +6968,46 @@ impl Database {
         let mut data = json!({"request_id":request_id,"workspace":workspace,"model":model,
             "effort":effort});
         start_locked(&tx, &bot, turn, &prompt, &mut data)?;
-        let cursor = event(&tx, &name, Some(turn), "accepted", data.clone())?;
+        let cursor = message_event(&tx, &name, Some(turn), Some(turn), "accepted", data.clone())?;
         tx.commit()?;
         self.pending_left(waiting as usize);
         let steers = self.steers_waiting(&name)?;
-        Ok((entry(cursor, &name, Some(turn), "accepted", data), steers))
+        Ok((
+            message_entry(cursor, &name, Some(turn), turn, "accepted", data),
+            steers,
+        ))
     }
     /// An idle bot's line has exactly one ready head, including after recovery.
     /// Only inspect that head; running/parked bots are checked by the caller.
     fn has_ready_turn(&self, name: &str) -> Result<bool> {
         Ok(self
             .conn
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM turns WHERE bot=? AND status='ready')")?
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM messages WHERE bot=? AND status='ready')")?
             .query_row([name], |r| r.get(0))?)
     }
-    /// The oldest turn waiting only for an active slot: one held on a
-    /// cause (`hold`) once its next try is due.
+    /// The oldest message waiting only for an active slot to open its
+    /// turn: one held on a cause (`hold`) once its next try is due.
     pub fn next_ready(&self) -> Result<Option<(String, i64)>> {
         Ok(self
             .conn
             .prepare_cached(
-                "SELECT bot,id FROM turns WHERE status='ready' AND (held IS NULL OR due_ms<=?)
+                "SELECT bot,id FROM messages WHERE status='ready' AND (held IS NULL OR due_ms<=?)
                  ORDER BY id LIMIT 1",
             )?
             .query_row([epoch_ms()], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?)
     }
-    /// Hold a ready turn its start refused for a cause a person can fix,
-    /// rather than end it: it keeps its place in the bot's line, so no
+    /// Hold a ready message its start refused for a cause a person can
+    /// fix, rather than end it: it keeps its place in the bot's line, so no
     /// later message overtakes it, and is tried again after the hold's
     /// wait, or at once when `retry_held` says the cause may be fixed.
-    /// Returns its `turn_held` event and when the next held turn is due, or
+    /// Returns its `held` event and when the next held message is due, or
     /// nothing once it has been held its bot's `hold_ms`: it ends instead.
     pub fn hold(&mut self, turn: i64, error: &Error) -> Result<Option<(Vec<Value>, Option<i64>)>> {
         let (name, status, held): (String, String, Option<String>) = self
             .conn
             .query_row(
-                "SELECT bot,status,held FROM turns WHERE id=?",
+                "SELECT bot,status,held FROM messages WHERE id=?",
                 [turn],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -6961,7 +7034,7 @@ impl Database {
         let due = now + blocked.wait_ms(now, settings.hold_ms());
         let tx = self.conn.savepoint()?;
         tx.execute(
-            "UPDATE turns SET held=?2,due_ms=?3 WHERE id=?1",
+            "UPDATE messages SET held=?2,due_ms=?3 WHERE id=?1",
             params![turn, serde_json::to_string(&blocked)?, due as i64],
         )?;
         let data = json!({"blocked":blocked,"resume_at_ms":due});
@@ -6972,11 +7045,11 @@ impl Database {
              WHERE name=?1 AND running_turn IS NULL AND status!='deleting'",
         )?
         .execute(params![name, data.to_string()])?;
-        let cursor = event(&tx, &name, Some(turn), "turn_held", data.clone())?;
+        let cursor = message_event(&tx, &name, None, Some(turn), "held", data.clone())?;
         let next = next_held(&tx, now as i64)?;
         tx.commit()?;
         Ok(Some((
-            vec![entry(cursor, &name, Some(turn), "turn_held", data)],
+            vec![message_entry(cursor, &name, None, turn, "held", data)],
             next,
         )))
     }
@@ -7000,8 +7073,8 @@ impl Database {
         }
         // The held turns, as a bench/query_plans.py fragment.
         const HELD: &str =
-            "SELECT t.id,t.bot,b.id,t.held,t.due_ms,0 FROM turns t JOIN bots b ON b.name=t.bot
-             WHERE t.status='ready' AND t.held IS NOT NULL AND (?1 IS NULL OR t.bot=?1)
+            "SELECT m.id,m.bot,b.id,m.held,m.due_ms,0 FROM messages m JOIN bots b ON b.name=m.bot
+             WHERE m.status='ready' AND m.held IS NOT NULL AND (?1 IS NULL OR m.bot=?1)
              UNION ALL
              SELECT t.id,t.bot,b.id,json_extract(t.waiting,'$.blocked'),
                 json_extract(t.waiting,'$.deadline_ms'),1
@@ -7020,8 +7093,10 @@ impl Database {
                 continue;
             };
             let (turn, name): (i64, String) = (r.get(0)?, r.get(1)?);
-            let row = json!({"bot":name,"bot_id":r.get::<_, i64>(2)?,"turn":turn,
-                "handle":format!("turn:{name}/{turn}"),"started":r.get::<_, i64>(5)? == 1,
+            // One held in line is a message; one parked on a call, the turn
+            // it opened. Either way its number.
+            let row = json!({"bot":name,"bot_id":r.get::<_, i64>(2)?,"message":turn,
+                "handle":format!("{name}/{turn}"),"started":r.get::<_, i64>(5)? == 1,
                 "blocked":blocked,"resume_at_ms":r.get::<_, Option<i64>>(4)?});
             let size = crate::output::encoded_len(&row)? + 1;
             if held.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
@@ -7055,7 +7130,7 @@ impl Database {
     pub fn retry_held(&mut self, bot: Option<&str>) -> Result<(Vec<(String, i64)>, usize)> {
         let now = epoch_ms();
         let lined = self.conn.execute(
-            "UPDATE turns SET due_ms=?1 WHERE status='ready' AND held IS NOT NULL
+            "UPDATE messages SET due_ms=?1 WHERE status='ready' AND held IS NOT NULL
                 AND (?2 IS NULL OR bot=?2)",
             params![now, bot],
         )?;
@@ -7071,21 +7146,25 @@ impl Database {
         }
         Ok((parked, lined))
     }
-    /// A turn's own status, for a caller that names the bot.
+    /// A message's status, or the status of the turn it opened, for a
+    /// caller that names the bot.
     pub fn turn_status(&self, name: &str, turn: i64) -> Result<String> {
         self.conn
-            .prepare_cached("SELECT status FROM turns WHERE id=? AND bot=?")?
+            .prepare_cached(
+                "SELECT COALESCE(t.status,m.status) FROM messages m LEFT JOIN turns t ON t.id=m.id
+                 WHERE m.id=? AND m.bot=?",
+            )?
             .query_row(params![turn, name], |r| r.get(0))
             .optional()?
             .ok_or(Error::new("turn_not_found"))
     }
-    /// End a turn that never started. A ready turn's place goes to the bot's
-    /// next queued one.
+    /// End a message no turn took in: withdrawn when cancelled, else
+    /// failed. A ready message's place goes to the bot's next queued one.
     pub fn end_queued(&mut self, turn: i64, error: &Error) -> Result<(Vec<Value>, Value)> {
         let (name, status, prompt_bytes): (String, String, i64) = self
             .conn
             .query_row(
-                "SELECT bot,status,length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0) FROM turns WHERE id=?",
+                "SELECT bot,status,length(CAST(text AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0) FROM messages WHERE id=?",
                 [turn],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -7095,15 +7174,15 @@ impl Database {
             return fail("stale_turn");
         }
         let ended = if error.code == "cancelled" {
-            "interrupted"
+            "withdrawn"
         } else {
             "failed"
         };
         let finished = epoch_ms();
         let tx = self.conn.savepoint()?;
         tx.execute(
-            "UPDATE turns SET status=?,finished_ms=? WHERE id=?",
-            params![ended, finished, turn],
+            "UPDATE messages SET status=?,held=NULL,due_ms=NULL WHERE id=?",
+            params![ended, turn],
         )?;
         // One that failed is its bot's newest ending, and its status when
         // none runs; one cancelled in line did nothing. Ending the held turn
@@ -7129,9 +7208,9 @@ impl Database {
         if status == "ready" {
             promote(&tx, &name)?;
         }
-        let mut data = json!({"status":ended,"checkpoint":Value::Null,"error":error.code,"detail":error.detail});
+        let mut data = json!({"status":ended,"error":error.code,"detail":error.detail});
         with_facts(&mut data, Some(error));
-        let cursor = event(&tx, &name, Some(turn), "turn_finished", data.clone())?;
+        let cursor = message_event(&tx, &name, None, Some(turn), "message_ended", data.clone())?;
         tx.commit()?;
         if status != "attached" {
             self.pending_left(prompt_bytes as usize);
@@ -7141,7 +7220,14 @@ impl Database {
             .ok_or_else(|| Error::new("stale_turn"))?;
         self.announce(&name, turn, outcome.clone());
         Ok((
-            vec![entry(cursor, &name, Some(turn), "turn_finished", data)],
+            vec![message_entry(
+                cursor,
+                &name,
+                None,
+                turn,
+                "message_ended",
+                data,
+            )],
             outcome,
         ))
     }
@@ -7166,8 +7252,8 @@ impl Database {
         let through = match through {
             Some(id) => Some(id),
             None => self.conn.prepare_cached(
-                "SELECT MAX(id) FROM (SELECT MAX(id) id FROM turns WHERE bot=?1 AND status='queued' AND delivery='steer'
-                    UNION ALL SELECT MAX(id) FROM turns WHERE ?2 AND bot=?1 AND status='attached')",
+                "SELECT MAX(id) FROM (SELECT MAX(id) id FROM messages WHERE bot=?1 AND status='queued' AND delivery='steer'
+                    UNION ALL SELECT MAX(id) FROM messages WHERE ?2 AND bot=?1 AND status='attached')",
             )?.query_row(params![&bot.name, attached], |r| r.get::<_, Option<i64>>(0))?,
         };
         let Some(through) = through else {
@@ -7229,19 +7315,19 @@ impl Database {
             // Each partial index skips ordinary queued and finished work. Read at most one
             // candidate beyond the byte budget, without copying its prompt.
             let mut statement = self.conn.prepare_cached(
-                "SELECT s.id,s.prompt,length(CAST(s.prompt AS BLOB)),
+                "SELECT s.id,s.text,length(CAST(s.text AS BLOB)),
                     (s.workspace IS NULL OR s.workspace=COALESCE(t.workspace,b.workspace))
                     AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
                     AND (s.reasoning IS NULL OR s.reasoning IS COALESCE(t.reasoning,b.reasoning)),
                     s.status='attached',length(s.images),
-                    length(CAST(s.prompt AS BLOB))+COALESCE(length(CAST(s.quotes AS BLOB)),0),
+                    length(CAST(s.text AS BLOB))+COALESCE(length(CAST(s.quotes AS BLOB)),0),
                     s.expected_turn IS ?2 AND s.origin IS ?6
-                 FROM (SELECT id FROM turns WHERE bot=?1 AND status='queued' AND delivery='steer'
+                 FROM (SELECT id FROM messages WHERE bot=?1 AND status='queued' AND delivery='steer'
                          AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
-                       UNION ALL SELECT id FROM turns WHERE ?5 AND bot=?1 AND status='attached'
+                       UNION ALL SELECT id FROM messages WHERE ?5 AND bot=?1 AND status='attached'
                          AND id<=?4 AND (expected_turn IS NULL OR expected_turn=?2)
                        ORDER BY id LIMIT ?3) c
-                 JOIN turns s ON s.id=c.id JOIN turns t ON t.id=?2 JOIN bots b ON b.name=s.bot
+                 JOIN messages s ON s.id=c.id JOIN turns t ON t.id=?2 JOIN bots b ON b.name=s.bot
                  ORDER BY c.id",
             )?;
             let mut rows = statement.query(params![
@@ -7295,12 +7381,12 @@ impl Database {
                 let (images, (after, quotes)) = self
                     .conn
                     .prepare_cached(
-                        "SELECT images,from_bot,from_turn,origin,person,quotes FROM turns WHERE id=?",
+                        "SELECT images,from_bot,from_turn,origin,person,quotes FROM messages WHERE id=?",
                     )?
                     .query_row([id], |r| {
                         Ok((
                             r.get::<_, Option<String>>(0)?,
-                            after_words(r, 1, bot.settings.hide_senders)?,
+                            after_words(r, 1, bot.settings.hide_senders, &bot.name, id)?,
                         ))
                     })?;
                 let pictures = images_from(images.as_deref())?;
@@ -7330,45 +7416,35 @@ impl Database {
         let tx = self.conn.savepoint()?;
         let mut head = bot.head;
         let mut steered = Vec::with_capacity(steers.len());
-        // Preserve the submitted effort for exact retries; only omitted effort
-        // needs a separate execution value when the running turn overrides it.
+        let now = epoch_ms();
+        // Each message keeps what it asked for; it runs with the turn's.
         for (steer, prompted, size, waiting, images, quotes) in steers {
-            let id = prompt_node(&tx, head, &prompted, None)?;
+            let id = prompt_node(&tx, head, &prompted, None, steer)?;
             head = Some(id);
             keep_once(&tx, steer, images.as_deref())?;
             keep_quotes(&tx, steer, quotes.as_deref(), id)?;
-            if size >= PROMPT_SHARE_BYTES {
-                tx.execute("UPDATE turns SET status='steered',finished_ms=?1,prompt='',prompt_node=?2,
-                    (workspace,model,inherited_reasoning)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model),
-                        CASE WHEN s.reasoning IS NULL THEN t.reasoning END
-                        FROM turns s, turns t WHERE s.id=?4 AND t.id=?3) WHERE id=?4",
-                    params![epoch_ms(), id, turn, steer])?;
-            } else {
-                // A steer that named no folder, model or effort records the
-                // ones it ran with.
-                tx.execute(
-                    "UPDATE turns SET status='steered',finished_ms=?1,
-                        (workspace,model,inherited_reasoning)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model),
-                            CASE WHEN s.reasoning IS NULL THEN t.reasoning END
-                            FROM turns s, turns t WHERE s.id=?3 AND t.id=?2) WHERE id=?3",
-                    params![epoch_ms(), turn, steer],
-                )?;
-            }
-            // The running turn's `steered` event names who sent the message
-            // it takes in, as `accepted` does for a turn's first.
-            let mut taken = json!({"steer":steer,"node":id});
-            keep_sender(&tx, steer, id, &mut taken)?;
-            let data = json!({"status":"steered","into":turn,"node":id,"checkpoint":Value::Null,
-                "error":Value::Null,"detail":Value::Null});
-            let cursor = event(&tx, &bot.name, Some(steer), "turn_finished", data.clone())?;
-            absorbed
-                .entries
-                .push(entry(cursor, &bot.name, Some(steer), "turn_finished", data));
-            let data = taken;
-            let cursor = event(&tx, &bot.name, Some(turn), "steered", data.clone())?;
-            absorbed
-                .entries
-                .push(entry(cursor, &bot.name, Some(turn), "steered", data));
+            take(&tx, steer, turn, id, size, now)?;
+            // The running turn's `steered` event is the message's taking:
+            // it names the message, its node, and who sent it, as
+            // `accepted` does for a turn's first.
+            let mut data = json!({"message":steer,"node":id});
+            keep_sender(&tx, steer, id, &mut data)?;
+            let cursor = message_event(
+                &tx,
+                &bot.name,
+                Some(turn),
+                Some(steer),
+                "steered",
+                data.clone(),
+            )?;
+            absorbed.entries.push(message_entry(
+                cursor,
+                &bot.name,
+                Some(turn),
+                steer,
+                "steered",
+                data,
+            ));
             steered.push((steer, waiting));
         }
         // Steers go in only at a round boundary and hold no calls.
@@ -7391,7 +7467,7 @@ impl Database {
             absorbed.attached_left = self
                 .conn
                 .prepare_cached(
-                    "SELECT EXISTS(SELECT 1 FROM turns WHERE bot=? AND status='attached')",
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE bot=? AND status='attached')",
                 )?
                 .query_row([&bot.name], |r| r.get(0))?;
         }
@@ -7956,7 +8032,7 @@ impl Database {
             None
         };
         let elided = stub.as_ref().map_or(0, |stub| (weight - stub.len()) as i64);
-        let head = insert_node(&tx, bot.head, &item, None, elided, pictured)?;
+        let head = insert_node(&tx, bot.head, &item, None, None, elided, pictured)?;
         if head != next {
             return fail("storage_error");
         }
@@ -9603,21 +9679,27 @@ impl Database {
     /// What each quote counts against `QUOTED_BYTES` beyond its words: the
     /// line naming it and its record.
     const QUOTE_BYTES: usize = 256;
-    /// The words of the turns `quotes` names, in order, each with who
-    /// wrote them, as the turn keeps them until its item holds them: a
-    /// turn's prompt with the turns that prompt quotes after it, still
-    /// each with its writer, or the reply a finished turn ended with,
-    /// which its bot wrote. `None` for no quotes. With the prompt's own
-    /// `words`, they may have `QUOTED_BYTES`.
+    /// The words of the messages `quotes` names, in order, each with who
+    /// wrote them, as the message keeps them until its item holds them:
+    /// exactly that message's words with the messages it quotes after
+    /// them, still each with its writer, or the reply the turn that took
+    /// it in ended with, which its bot wrote. `None` for no quotes. With
+    /// the prompt's own `words`, they may have `QUOTED_BYTES`.
     fn quote(&self, quotes: &[QuoteRef], words: usize) -> Result<Option<String>> {
         if quotes.is_empty() {
             return Ok(None);
         }
         let mut copied = Vec::new();
         let mut bytes = words;
-        for QuoteRef { bot, turn, reply } in quotes {
+        for QuoteRef {
+            bot,
+            message,
+            reply,
+        } in quotes
+        {
             type Row = (
-                String,
+                Option<i64>,
+                Option<String>,
                 Option<String>,
                 Option<String>,
                 Option<i64>,
@@ -9627,16 +9709,12 @@ impl Database {
             );
             let row: Option<Row> = self
                 .conn
-                .prepare_cached(
-                    "SELECT t.status,
-                        CASE WHEN t.prompt_node IS NULL THEN t.prompt
-                        ELSE json_extract(CAST(COALESCE(d.item,n.item) AS TEXT),'$.content[0].text') END,
-                        t.from_bot,t.from_turn,t.origin,t.person,t.quotes
-                     FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node
-                     LEFT JOIN declined d ON d.node=t.prompt_node
-                     WHERE t.id=? AND t.bot=?",
-                )?
-                .query_row(params![turn, bot], |r| {
+                .prepare_cached(&format!(
+                    "SELECT m.turn,t.status,{MESSAGE_TEXT},m.from_bot,m.from_turn,m.origin,m.person,m.quotes
+                     FROM messages m {MESSAGE_NODE} LEFT JOIN turns t ON t.id=m.turn
+                     WHERE m.id=? AND m.bot=?"
+                ))?
+                .query_row(params![message, bot], |r| {
                     Ok((
                         r.get(0)?,
                         r.get(1)?,
@@ -9645,42 +9723,45 @@ impl Database {
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get(7)?,
                     ))
                 })
                 .optional()?;
-            let Some((status, text, from, from_turn, origin, person, nested)) = row else {
-                return Err(
-                    Error::with("quote_not_found", format!("{bot} has no turn {turn}"))
-                        .facts(json!({"bot":bot,"turn":turn})),
-                );
+            let Some((turn, status, text, from, from_turn, origin, person, nested)) = row else {
+                return Err(Error::with(
+                    "quote_not_found",
+                    format!("{bot} has no message {message}"),
+                )
+                .facts(json!({"bot":bot,"message":message})));
             };
-            let mut quote = json!({"bot":bot,"turn":turn});
+            let mut quote = json!({"bot":bot,"message":message});
             if *reply {
-                if status == "steered" {
+                let (Some(turn), Some(status)) = (turn, status) else {
                     return Err(Error::with(
-                        "quote_not_found",
-                        format!(
-                            "turn {turn} was a message into another of {bot}'s turns, which replied"
-                        ),
+                        "quote_unfinished",
+                        format!("no turn of {bot}'s has taken message {message} in"),
                     )
-                    .facts(json!({"bot":bot,"turn":turn})));
-                }
+                    .facts(json!({"bot":bot,"message":message})));
+                };
                 if turn_status_name(&status) != "finished" {
                     return Err(Error::with(
                         "quote_unfinished",
-                        format!("{bot}'s turn {turn} has not ended"),
+                        format!(
+                            "{bot}'s turn {turn}, which took message {message} in, has not ended"
+                        ),
                     )
-                    .facts(json!({"bot":bot,"turn":turn})));
+                    .facts(json!({"bot":bot,"message":message,"turn":turn})));
                 }
-                let Some(text) = self.reply_text(*turn)? else {
+                let Some(text) = self.reply_text(turn)? else {
                     return Err(Error::with(
                         "quote_not_found",
-                        format!("{bot}'s turn {turn} has no reply to quote: it ended without one"),
+                        format!("{bot}'s turn {turn}, which took message {message} in, ended without a reply"),
                     )
-                    .facts(json!({"bot":bot,"turn":turn})));
+                    .facts(json!({"bot":bot,"message":message,"turn":turn})));
                 };
                 quote["reply"] = json!(true);
-                authored(&mut quote, Some((bot.clone(), *turn)), None, None);
+                authored(&mut quote, Some((bot.clone(), turn)), None, None);
+
                 bytes += text.len() + Self::QUOTE_BYTES;
                 quote["text"] = json!(text);
                 copied.push(quote);
@@ -9741,8 +9822,9 @@ impl Database {
     /// read returns, from its end.
     pub const PROMPTS_REPLY: usize = 2048;
     /// A turn's words and calls, as a program judging its calls reads them:
-    /// the turn's prompt and each steer it absorbed, in order, with the bot
-    /// turn that wrote each (none for a person's words); the calls it
+    /// the messages it took in, its opening one and each steered or
+    /// attached after, in order, each with its number and the bot turn
+    /// that wrote it (none for a person's words); the calls it
     /// started, with argument previews and whether each failed; then the
     /// bot's earlier prompts, newest first. Each prompt or steer carries
     /// the calls refused after it (`refused`), and this turn's carry the
@@ -9764,13 +9846,11 @@ impl Database {
         }
         let row = self
             .conn
-            .prepare_cached(
-                "SELECT t.status,COALESCE(t.workspace,b.workspace),
-                    CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
-                    t.from_bot,t.from_turn,t.origin,t.person,t.quotes
-                 FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
-                 WHERE t.id=? AND t.bot=?",
-            )?
+            .prepare_cached(&format!(
+                "SELECT COALESCE(t.status,m.status),COALESCE(t.workspace,m.workspace,b.workspace),
+                    {MESSAGE_TEXT},m.from_bot,m.from_turn,m.origin,m.person,m.quotes
+                 FROM {MESSAGE_FROM} {MESSAGE_NODE} WHERE m.id=? AND m.bot=?"
+            ))?
             .query_row(params![turn, name], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -9789,7 +9869,7 @@ impl Database {
         // goes to them too.
         let steered: bool = self
             .conn
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM events WHERE turn=? AND kind='steered')")?
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM messages WHERE turn=?1 AND id<>?1)")?
             .query_row([turn], |r| r.get(0))?;
         let kept_for_steers = if steered { bytes / 2 } else { 0 };
         let mut left = bytes - kept_for_steers;
@@ -9818,19 +9898,19 @@ impl Database {
         let mut prompts_more = false;
         // The newest steers first, as Codex's reviewer keeps a person's
         // newest words: what is left out is older than all that is read.
-        // Each row names the steer before it, whose event its reply is
-        // read after; read a row at a time, and only while there is room.
+        // Each row names its `steered` event and the one before it, which
+        // the reply it answers is read between; read a row at a time, and
+        // only while there is room.
         let mut steers = self.conn.prepare_cached(
-            "SELECT json_extract(e.data,'$.steer'),e.id,
-                COALESCE((SELECT MAX(b.id) FROM events b
-                          WHERE b.turn=e.turn AND b.kind='steered' AND b.id<e.id),0)
-             FROM events e WHERE e.turn=? AND e.kind='steered' ORDER BY e.id DESC",
+            "SELECT m.id,(SELECT e.id FROM events e WHERE e.message=m.id AND e.kind='steered'),
+                COALESCE((SELECT e.id FROM events e WHERE e.kind='steered' AND e.message=
+                    (SELECT MAX(p.id) FROM messages p WHERE p.turn=?1 AND p.id<m.id AND p.id<>?1)),0)
+             FROM messages m WHERE m.turn=?1 AND m.id<>?1 ORDER BY m.id DESC",
         )?;
-        let mut steer = self.conn.prepare_cached(
-            "SELECT CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
-                t.from_bot,t.from_turn,t.origin,t.person,t.quotes
-             FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node WHERE t.id=?",
-        )?;
+        let mut steer = self.conn.prepare_cached(&format!(
+            "SELECT {MESSAGE_TEXT},m.from_bot,m.from_turn,m.origin,m.person,m.quotes
+             FROM messages m {MESSAGE_NODE} WHERE m.id=?"
+        ))?;
         let mut kept = Vec::new();
         let mut rows = steers.query([turn])?;
         while let Some(r) = rows.next()? {
@@ -9839,11 +9919,14 @@ impl Database {
                 break;
             }
             left -= Self::PROMPTS_ENTRY;
-            let (id, event, since): (i64, i64, i64) = (r.get(0)?, r.get(1)?, r.get(2)?);
+            let (id, event, since): (i64, Option<i64>, i64) = (r.get(0)?, r.get(1)?, r.get(2)?);
             let words = steer.query_row([id], |r| Words::read(r, 0))?;
             let mut entry = self.prompt_entry(id, words, &mut left)?;
             entry["steer"] = json!(true);
-            if let Some(said) = self.said(turn, since, event)? {
+            // Retention may have pruned the events that place its reply.
+            if let Some(event) = event
+                && let Some(said) = self.said(turn, since, event)?
+            {
                 entry["reply"] = Self::reply(&said, &mut left);
             }
             kept.push(entry);
@@ -9991,14 +10074,12 @@ impl Database {
         calls.reverse();
         let mut earlier = Vec::new();
         let mut more = false;
-        let mut statement = self.conn.prepare_cached(
-            "SELECT t.id,t.status='steered',
-                CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,
-                t.from_bot,t.from_turn,t.origin,t.person,t.quotes
-             FROM turns t LEFT JOIN nodes n ON n.id=t.prompt_node
-             WHERE t.bot=? AND t.id<? AND (t.started_ms IS NOT NULL OR t.status='steered')
-             ORDER BY t.id DESC",
-        )?;
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT m.id,m.turn<>m.id,{MESSAGE_TEXT},m.from_bot,m.from_turn,m.origin,m.person,m.quotes
+             FROM messages m {MESSAGE_NODE}
+             WHERE m.bot=? AND m.id<? AND m.status='taken'
+             ORDER BY m.id DESC"
+        ))?;
         let mut rows = statement.query(params![name, turn])?;
         while let Some(r) = rows.next()? {
             if left < Self::PROMPTS_ENTRY {
@@ -10037,7 +10118,8 @@ impl Database {
         } = words;
         let mut text = text.unwrap_or_default();
         let truncated = cut(&mut text, left);
-        let mut entry = json!({"turn":turn,"text":text});
+        let mut entry = json!({"message":turn,"text":text});
+
         if truncated {
             entry["truncated"] = json!(true);
         }
@@ -10122,7 +10204,7 @@ impl Database {
         let mut statement = self.conn.prepare_cached(
             "SELECT json_extract(e.data,'$.name'),json_extract(e.data,'$.arguments'),
                 json_extract(e.data,'$.arguments_truncated'),
-                (SELECT json_extract(s.data,'$.steer') FROM events s
+                (SELECT s.message FROM events s
                   WHERE s.turn=e.turn AND s.kind='steered' AND s.id<e.id ORDER BY s.id DESC LIMIT 1),
                 e.id
              FROM events e WHERE e.turn=?1 AND e.kind='tool_completed' AND json_extract(e.data,'$.denied')
@@ -10139,7 +10221,7 @@ impl Database {
              -- later in the turn as it was, and done.
              SELECT json_extract(e.data,'$.name'),json_extract(e.data,'$.arguments'),
                 json_extract(e.data,'$.arguments_truncated'),
-                (SELECT json_extract(s.data,'$.steer') FROM events s
+                (SELECT s.message FROM events s
                   WHERE s.turn=e.turn AND s.kind='steered' AND s.id<e.id ORDER BY s.id DESC LIMIT 1),
                 e.id
              FROM events e WHERE e.turn=?1 AND e.kind='step_decided' AND json_extract(e.data,'$.denied')
@@ -10240,7 +10322,8 @@ impl Database {
                 "SELECT COALESCE(t.model,t.bot_model,?3),t.view_sent IS 1 AND p.turn IS NULL,
                         COALESCE(t.reasoning,CASE WHEN t.bot_model IS NULL THEN ?4 ELSE t.bot_reasoning END)
                    FROM turns t,nodes s LEFT JOIN nodes p ON p.id=s.parent
-                  WHERE t.bot=?1 AND t.id<?2 AND t.started_ms IS NOT NULL AND s.turn=?2
+                  WHERE t.bot=?1 AND t.id<?2 AND s.turn=?2
+
                   ORDER BY t.id DESC LIMIT 1",
             )?
             .query_row(params![bot.name, turn, default, bot.effort], |r| {
@@ -11059,11 +11142,38 @@ impl Database {
         }
     }
     fn outcome_of(&self, mut outcome: Value, turn: i64) -> Result<Option<Value>> {
-        if matches!(
-            outcome["status"].as_str(),
-            Some("running" | "waiting" | "paced" | "queued" | "ready" | "attached")
-        ) {
-            return Ok(None);
+        match outcome["status"].as_str() {
+            Some("running" | "waiting" | "paced" | "queued" | "ready" | "attached") => {
+                return Ok(None);
+            }
+            // Joined a running turn: its answer is that turn's, which the
+            // view names, and its words are at its node.
+            Some("taken") => {
+                outcome["node"] = json!(
+                    self.conn
+                        .prepare_cached("SELECT node FROM messages WHERE id=?")?
+                        .query_row([turn], |r| r.get::<_, Option<i64>>(0))?
+                );
+                return Ok(Some(outcome));
+            }
+            // Ended in line: how, from its own event.
+            Some("withdrawn" | "failed") if outcome["turn"].is_null() => {
+                let ended: Option<String> = self
+                    .conn
+                    .prepare_cached(
+                        "SELECT data FROM events WHERE message=? AND kind='message_ended'
+                         ORDER BY id DESC LIMIT 1",
+                    )?
+                    .query_row([turn], |r| r.get(0))
+                    .optional()?;
+                let ended: serde_json::Map<String, Value> = match ended {
+                    Some(data) => serde_json::from_str(&data)?,
+                    None => return fail("turn_result_pruned"),
+                };
+                outcome.as_object_mut().unwrap().extend(ended);
+                return Ok(Some(outcome));
+            }
+            _ => {}
         }
         let finished: Option<String> = self
             .conn
@@ -11077,7 +11187,7 @@ impl Database {
             Some(data) => serde_json::from_str(&data)?,
             None => return fail("turn_result_pruned"),
         };
-        // How it ended: checkpoint, error and detail, or the turn a steer joined.
+        // How it ended: checkpoint, error and detail.
         outcome.as_object_mut().unwrap().extend(finished);
         let last: Option<i64> = self
             .conn
@@ -11137,7 +11247,7 @@ impl Database {
     pub fn turn_view(&self, name: &str, turn: i64) -> Result<Value> {
         self.conn
             .prepare_cached(&format!(
-                "SELECT {TURN_VIEW} FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=? AND t.bot=?"
+                "SELECT {TURN_VIEW} FROM {MESSAGE_FROM} WHERE m.id=? AND m.bot=?"
             ))?
             .query_row(params![turn, name], turn_view)
             .optional()?
@@ -11766,6 +11876,7 @@ impl Database {
                 next,
                 &bot,
                 row.get::<_, Option<i64>>(1)?,
+                row.get(6)?,
                 &row.get::<_, String>(2)?,
                 serde_json::from_str::<Value>(&data)?,
                 row.get(5)?,
@@ -11786,8 +11897,8 @@ impl Database {
         let mut rows = match kinds {
             None => {
                 stmt = self.conn.prepare_cached(match name {
-                    Some(_) => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
-                    None => "SELECT id,turn,kind,data,bot,written_ms FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
+                    Some(_) => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
+                    None => "SELECT id,turn,kind,data,bot,written_ms,message FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
                 })?;
                 stmt.query(params![name, after, limit as i64])?
             }
@@ -11852,8 +11963,8 @@ impl Database {
         Ok(self
             .conn
             .prepare_cached(
-                "SELECT MIN(t.due_ms) FROM turns t JOIN bots b ON b.name=t.bot
-                 WHERE t.status='attached' AND t.due_ms IS NOT NULL AND b.status!='deleting'",
+                "SELECT MIN(m.due_ms) FROM messages m JOIN bots b ON b.name=m.bot
+                 WHERE m.status='attached' AND m.due_ms IS NOT NULL AND b.status!='deleting'",
             )?
             .query_row([], |r| r.get(0))?)
     }
@@ -11863,9 +11974,9 @@ impl Database {
         let mut bots: Vec<String> = self
             .conn
             .prepare_cached(
-                "SELECT t.bot FROM turns t JOIN bots b ON b.name=t.bot
-                 WHERE t.status='attached' AND t.due_ms<=?1 AND b.status!='deleting'
-                 ORDER BY t.due_ms,t.id LIMIT ?2",
+                "SELECT m.bot FROM messages m JOIN bots b ON b.name=m.bot
+                 WHERE m.status='attached' AND m.due_ms<=?1 AND b.status!='deleting'
+                 ORDER BY m.due_ms,m.id LIMIT ?2",
             )?
             .query_map(params![now, limit as i64], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -11883,9 +11994,9 @@ impl Database {
         let due: Vec<(i64, String)> = self
             .conn
             .prepare_cached(
-                "SELECT t.id,t.bot FROM turns t JOIN bots b ON b.name=t.bot
-                 WHERE t.status='attached' AND t.due_ms<=?1 AND b.status!='deleting'
-                 ORDER BY t.due_ms,t.id LIMIT ?2",
+                "SELECT m.id,m.bot FROM messages m JOIN bots b ON b.name=m.bot
+                 WHERE m.status='attached' AND m.due_ms<=?1 AND b.status!='deleting'
+                 ORDER BY m.due_ms,m.id LIMIT ?2",
             )?
             .query_map(params![now, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -11928,9 +12039,9 @@ impl Database {
             );
             let (request_id, workspace, model, effort, from_bot, from_turn, from_id, origin, person, quotes, held): Row = tx
                 .prepare_cached(
-                    "UPDATE turns SET status=?2,delivery='steer' WHERE id=?1 AND status='attached'
+                    "UPDATE messages SET status=?2,delivery='steer' WHERE id=?1 AND status='attached'
                      RETURNING request_id,workspace,model,reasoning,from_bot,from_turn,from_id,origin,person,quotes,
-                        length(CAST(prompt AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0)",
+                        length(CAST(text AS BLOB))+COALESCE(length(CAST(quotes AS BLOB)),0)",
                 )?
                 .query_row(params![turn, status], |r| {
                     Ok((
@@ -11961,7 +12072,7 @@ impl Database {
                 quotes.as_deref(),
                 false,
             );
-            event(&tx, name, Some(*turn), "queued", data)?;
+            message_event(&tx, name, None, Some(*turn), "queued", data)?;
         }
         tx.commit()?;
         self.pending.0 += planned.len() as i64;
@@ -11993,7 +12104,8 @@ impl Database {
             .prepare_cached(
                 "SELECT b.name,b.id FROM bots b WHERE b.expires_at<=?1 AND b.running_turn IS NULL
                  AND b.status!='deleting'
-                 AND NOT EXISTS(SELECT 1 FROM turns t WHERE t.bot=b.name AND t.status IN ('queued','ready'))
+                 AND NOT EXISTS(SELECT 1 FROM messages m WHERE m.bot=b.name AND m.status IN ('queued','ready'))
+
                  AND NOT EXISTS(SELECT 1 FROM processes p JOIN turns t ON t.id=p.turn
                      WHERE p.status='running' AND t.bot=b.name)
                  ORDER BY b.expires_at LIMIT ?2",
@@ -12058,13 +12170,13 @@ impl Database {
                 .prepare_cached(
                     "SELECT EXISTS(SELECT 1 FROM turns t JOIN processes p ON p.turn=t.id
                  WHERE t.bot=? AND p.status='running')
-                 OR EXISTS(SELECT 1 FROM turns WHERE bot=? AND status IN ('queued','ready'))",
+                 OR EXISTS(SELECT 1 FROM messages WHERE bot=? AND status IN ('queued','ready'))",
                 )?
                 .query_row([name, name], |r| r.get(0))?;
             if running {
                 return fail_with(
                     "bot_busy",
-                    "a command it started is running or turns are queued",
+                    "a command it started is running or messages are queued",
                 );
             }
             // Preserve identity before freeing the suffix, in the same transaction.
@@ -12119,16 +12231,19 @@ impl Database {
             self.forget_files(files);
             return Ok(out);
         }
-        // Then the turn rows and what remains keyed by the bot alone.
-        let has_turns: bool = tx
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM turns WHERE bot=?)")?
+        // Then the turn rows, the messages they opened with, and what
+        // remains keyed by the bot alone.
+        let has_messages: bool = tx
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM messages WHERE bot=?)")?
             .query_row([name], |r| r.get(0))?;
-        if has_turns {
+        if has_messages {
             out["events"] = json!(tx.execute("DELETE FROM events WHERE bot=?", [name])?);
             out["turns"] = json!(tx.execute("DELETE FROM turns WHERE bot=?", [name])?);
+            tx.execute("DELETE FROM messages WHERE bot=?", [name])?;
             tx.commit()?;
             return Ok(out);
         }
+
         // Walk back from the head, freeing nodes until one is still reached
         // by another bot: as a head, a saved context start, or a parent of
         // a surviving branch. A fork's own suffix is what it leaves behind.
@@ -12275,9 +12390,9 @@ impl Database {
                 "SELECT id FROM turns WHERE bot=?1 AND id < COALESCE(
                     (SELECT MIN(id) FROM (
                         SELECT running_turn AS id FROM bots WHERE name=?1
-                        UNION ALL SELECT MIN(id) FROM turns WHERE bot=?1 AND status='queued'
-                        UNION ALL SELECT MIN(id) FROM turns WHERE bot=?1 AND status='ready'
-                        UNION ALL SELECT MIN(id) FROM turns WHERE bot=?1 AND status='attached'
+                        UNION ALL SELECT MIN(id) FROM messages WHERE bot=?1 AND status='queued'
+                        UNION ALL SELECT MIN(id) FROM messages WHERE bot=?1 AND status='ready'
+                        UNION ALL SELECT MIN(id) FROM messages WHERE bot=?1 AND status='attached'
                     )), 9223372036854775807)
                  ORDER BY id DESC LIMIT 1 OFFSET ?2",
             )?
@@ -12301,8 +12416,9 @@ impl Database {
                  AND (EXISTS(SELECT 1 FROM events WHERE turn=r.turn)
                       OR NOT EXISTS(SELECT 1 FROM processes WHERE turn=r.turn AND status='running'))
                  AND NOT EXISTS(SELECT 1 FROM processes p WHERE p.turn=r.turn AND p.told>0
-                      AND EXISTS(SELECT 1 FROM turns t WHERE t.id=p.told
-                                 AND t.status IN ('queued','ready','running')))
+                      AND EXISTS(SELECT 1 FROM messages m LEFT JOIN turns t ON t.id=m.id
+                                 WHERE m.id=p.told
+                                   AND (m.status IN ('queued','ready') OR t.status='running')))
                  AND NOT EXISTS(SELECT 1 FROM processes p WHERE p.turn=r.turn
                       AND p.told IS NULL AND p.delivered IS NULL AND p.status<>'running')
                  ORDER BY turn LIMIT ?5",
@@ -12332,6 +12448,21 @@ impl Database {
             events += tx
                 .prepare_cached("DELETE FROM events WHERE turn=?")?
                 .execute([turn])?;
+            // And what its messages said of themselves in line.
+            let last: Option<i64> = tx
+                .prepare_cached(
+                    "SELECT MAX(id) FROM events WHERE turn IS NULL
+                        AND message IN (SELECT id FROM messages WHERE turn=?)",
+                )?
+                .query_row([turn], |r| r.get(0))?;
+            cursor = cursor.max(last);
+            events += tx
+                .prepare_cached(
+                    "DELETE FROM events WHERE turn IS NULL
+                        AND message IN (SELECT id FROM messages WHERE turn=?)",
+                )?
+                .execute([turn])?;
+
             // Keep pending background results discoverable by later prunes, even
             // after their launching turn's events and tool records are gone.
             tx.prepare_cached(
@@ -12672,21 +12803,17 @@ impl Database {
             );
         }
         let order = if newest { "DESC" } else { "ASC" };
+        // Its opening message's words, previewed.
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT {TURN_VIEW},COALESCE(t.workspace,b.workspace),
                     COALESCE(t.model,t.bot_model,b.provider||'/'||b.model),
-                    CASE WHEN t.prompt_node IS NULL THEN substr(t.prompt,1,200)
-                        WHEN d.node IS NULL THEN substr(o.text,1,200)
-                        ELSE substr(json_extract(CAST(d.item AS TEXT),'$.content[0].text'),1,200) END,
-                    CASE WHEN t.prompt_node IS NULL THEN length(t.prompt) WHEN d.node IS NULL THEN o.chars
-                        ELSE length(json_extract(CAST(d.item AS TEXT),'$.content[0].text')) END,
-                    t.delivery,COALESCE(t.reasoning,t.inherited_reasoning,
-                        CASE WHEN t.bot_model IS NULL THEN b.reasoning ELSE t.bot_reasoning END),t.summary_ms,
-                    t.budget_tokens,t.budget_counts
-             FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN openings o ON o.node=t.prompt_node
-             LEFT JOIN declined d ON d.node=t.prompt_node
+                    {PREVIEW},m.delivery,
+                    COALESCE(t.reasoning,CASE WHEN t.bot_model IS NULL THEN b.reasoning ELSE t.bot_reasoning END),
+                    t.summary_ms,t.budget_tokens,t.budget_counts
+             FROM turns t JOIN messages m ON m.id=t.id JOIN bots b ON b.name=t.bot {PREVIEW_NODE}
              WHERE t.bot=?1 AND t.id>?2 AND t.id<?3 ORDER BY t.id {order} LIMIT ?4"
         ))?;
+
         let before = before.unwrap_or(i64::MAX);
         let mut rows = statement.query(params![name, after, before, (limit + 1) as i64])?;
         let mut turns = Vec::new();
@@ -12729,6 +12856,70 @@ impl Database {
             false => json!({"turns":turns,"next_after":next}),
         })
     }
+    /// A page of a bot's messages between `after` and `before`, as `turns`
+    /// pages its runs: each as sent, with where it stands (in line, taken
+    /// in by `turn`, withdrawn or failed), its words previewed, when it was
+    /// sent and taken in, and the effort it ran at or asked for.
+    pub fn messages(
+        &self,
+        name: &str,
+        after: i64,
+        before: Option<i64>,
+        limit: usize,
+        newest: bool,
+    ) -> Result<Value> {
+        self.inspect(name)?;
+        if after < 0 || before.is_some_and(|b| b < 1) || !(1..=256).contains(&limit) {
+            return fail_with(
+                "invalid_message_page",
+                "limit must be 1 to 256, after 0 or more and before 1 or more",
+            );
+        }
+        let order = if newest { "DESC" } else { "ASC" };
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT {TURN_VIEW},{PREVIEW},m.delivery,m.node,m.sent_ms,m.taken_ms,
+                    m.from_bot,m.from_turn,m.origin,m.person,
+                    CASE WHEN r.id IS NULL THEN COALESCE(m.reasoning,b.reasoning)
+                         ELSE COALESCE(r.reasoning,CASE WHEN r.bot_model IS NULL THEN b.reasoning
+                            ELSE r.bot_reasoning END) END
+             FROM {MESSAGE_FROM} LEFT JOIN turns r ON r.id=m.turn {PREVIEW_NODE}
+             WHERE m.bot=?1 AND m.id>?2 AND m.id<?3 ORDER BY m.id {order} LIMIT ?4"
+        ))?;
+        let before = before.unwrap_or(i64::MAX);
+        let mut rows = statement.query(params![name, after, before, (limit + 1) as i64])?;
+        let mut messages = Vec::new();
+        let mut more = false;
+        while let Some(r) = rows.next()? {
+            if messages.len() == limit {
+                more = true;
+                break;
+            }
+            let mut message = turn_view(r)?;
+            let at = TURN_VIEW_COLUMNS;
+            message["prompt_preview"] = json!(r.get::<_, String>(at)?);
+            message["prompt_bytes"] = json!(r.get::<_, i64>(at + 1)?);
+            message["delivery"] = json!(r.get::<_, String>(at + 2)?);
+            message["node"] = json!(r.get::<_, Option<i64>>(at + 3)?);
+            message["sent_ms"] = json!(r.get::<_, Option<i64>>(at + 4)?);
+            message["taken_ms"] = json!(r.get::<_, Option<i64>>(at + 5)?);
+            let from = (r.get::<_, Option<String>>(at + 6)?).zip(r.get::<_, Option<i64>>(at + 7)?);
+            authored(&mut message, from, r.get(at + 8)?, r.get(at + 9)?);
+            // The level it ran at once taken in, else the one it asked.
+            message["effort"] = json!(r.get::<_, Option<String>>(at + 10)?);
+            messages.push(message);
+        }
+        let next = more.then(|| {
+            messages
+                .last()
+                .map(|m| m["message"].clone())
+                .unwrap_or(Value::Null)
+        });
+        Ok(match newest {
+            true => json!({"messages":messages,"next_before":next}),
+            false => json!({"messages":messages,"next_after":next}),
+        })
+    }
+
     /// What the turns of the bots whose names match `name` (every bot
     /// when absent) spent, from those started at `since_ms` or later: in
     /// all, by bot (the `limit` that spent most, the rest summed as one),
@@ -12775,8 +12966,8 @@ impl Database {
         let snapshot = self.conn.unchecked_transaction()?;
         let mut statement = snapshot.prepare_cached(&format!(
             "SELECT t.bot,b.id,(t.started_ms-?1)/?2,COUNT(*),SUM(t.input_tokens),
-                    SUM(t.cached_input_tokens),SUM(t.output_tokens),t.origin
-             FROM turns t JOIN bots b ON b.name=t.bot
+                    SUM(t.cached_input_tokens),SUM(t.output_tokens),m.origin
+             FROM turns t JOIN bots b ON b.name=t.bot JOIN messages m ON m.id=t.id
              WHERE t.started_ms>=?1{glob} GROUP BY 1,3,8"
         ))?;
         let width = bucket_ms.unwrap_or(i64::MAX);
@@ -13918,12 +14109,31 @@ fn ended(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Option<Ended>> {
 /// the event before it was: times rise with cursors, as a log's time index
 /// keeps them (Kafka's), so a follow from a time skips nothing.
 fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Result<i64> {
+    message_event(conn, bot, turn, None, kind, data)
+}
+/// An event that names a message: one before or apart from any turn has
+/// no turn, and one a turn took in names both.
+fn message_event(
+    conn: &Connection,
+    bot: &str,
+    turn: Option<i64>,
+    message: Option<i64>,
+    kind: &str,
+    data: Value,
+) -> Result<i64> {
     conn.prepare_cached(
-        "INSERT INTO events(bot,turn,kind,data,written_ms) VALUES (?1,?2,?3,?4,
-            MAX(?5,COALESCE((SELECT written_ms FROM events
-                WHERE id=(SELECT MAX(id) FROM events)),?5)))",
+        "INSERT INTO events(bot,turn,message,kind,data,written_ms) VALUES (?1,?2,?3,?4,?5,
+            MAX(?6,COALESCE((SELECT written_ms FROM events
+                WHERE id=(SELECT MAX(id) FROM events)),?6)))",
     )?
-    .execute(params![bot, turn, kind, data.to_string(), epoch_ms()])?;
+    .execute(params![
+        bot,
+        turn,
+        message,
+        kind,
+        data.to_string(),
+        epoch_ms()
+    ])?;
     Ok(conn.last_insert_rowid())
 }
 /// Keep who sent a turn's prompt with the prompt's node, where it outlives
@@ -13939,7 +14149,8 @@ fn keep_sender(tx: &Connection, turn: i64, node: i64, data: &mut Value) -> Resul
         "INSERT INTO senders(node,bot,bot_id,turn,origin,person,quotes,attached)
          SELECT ?2,t.from_bot,t.from_id,t.from_turn,t.origin,t.person,t.quotes,
             CASE WHEN t.delivery='attach' THEN 1 END
-         FROM turns t WHERE t.id=?1 AND (t.from_bot IS NOT NULL OR t.origin IS NOT NULL
+         FROM messages t WHERE t.id=?1 AND (t.from_bot IS NOT NULL OR t.origin IS NOT NULL
+
             OR t.person IS NOT NULL OR t.quotes IS NOT NULL OR t.delivery='attach')
          RETURNING bot,turn,bot_id,origin,person,quotes,attached",
     )?
@@ -13965,7 +14176,7 @@ fn keep_sender(tx: &Connection, turn: i64, node: i64, data: &mut Value) -> Resul
 fn next_held(conn: &Connection, after: i64) -> Result<Option<i64>> {
     Ok(conn
         .prepare_cached(
-            "SELECT MIN(due_ms) FROM turns WHERE status='ready' AND held IS NOT NULL AND due_ms>?",
+            "SELECT MIN(due_ms) FROM messages WHERE status='ready' AND held IS NOT NULL AND due_ms>?",
         )?
         .query_row([after], |r| r.get(0))?)
 }
@@ -14024,10 +14235,10 @@ fn authored(
 fn quote_author(quote: &Value) -> String {
     let from = &quote["from"];
     if let (Some(bot), Some(turn)) = (from["bot"].as_str(), from["turn"].as_i64()) {
-        // A reply is its own turn's.
-        return match quote["reply"] == true && quote["bot"] == bot && quote["turn"] == turn {
+        // A reply is the agent's own, in the turn that took the message.
+        return match quote["reply"] == true && quote["bot"] == bot {
             true => format!("written by the agent {bot}"),
-            false => format!("written by the agent {bot} in turn:{bot}/{turn}"),
+            false => format!("written by the agent {bot} in {bot}/{turn}"),
         };
     }
     match (quote["origin"].as_str(), quote["person"].as_str()) {
@@ -14036,18 +14247,21 @@ fn quote_author(quote: &Value) -> String {
         (None, None) => "written by a person".to_owned(),
     }
 }
-/// What a prompt's item carries after its words, read from a turn's
+/// What a prompt's item carries after its words, read from a message's
 /// `from_bot`, `from_turn`, `origin`, `person` and `quotes` at `at`: a line
-/// saying who sent it when another bot's turn, a named client or a named
-/// person did, so the model does not take it for its own person's; then
-/// each quote's words, after a line saying whose they are. `hide` leaves
-/// both kinds of line out. Also the quotes as the turn keeps them once
-/// its item holds their words: where in the item each is, in place of
-/// its text.
+/// naming the message by its number, `message` of `to`, and who sent it
+/// when another bot's turn, a named client or a named person did, so the
+/// model can quote it and does not take another's words for its own
+/// person's; then each quote's words, after a line saying whose they are.
+/// `hide` leaves both kinds of line out. Also the quotes as the message
+/// keeps them once its item holds their words: where in the item each
+/// is, in place of its text.
 fn after_words(
     r: &rusqlite::Row,
     at: usize,
     hide: bool,
+    to: &str,
+    message: i64,
 ) -> rusqlite::Result<(Vec<String>, Option<String>)> {
     let bot: Option<String> = r.get(at)?;
     let turn: Option<i64> = r.get(at + 1)?;
@@ -14055,14 +14269,14 @@ fn after_words(
     let person: Option<String> = r.get(at + 3)?;
     let quotes: Option<String> = r.get(at + 4)?;
     let line = match (bot, turn, origin, person) {
-        (Some(bot), Some(turn), _, _) => Some(format!(
-            "[Written by the agent {bot} in turn:{bot}/{turn}, not by a person.]"
-        )),
-        (_, _, Some(origin), _) => Some(format!("[Sent by {origin}.]")),
-        (_, _, None, Some(person)) => Some(format!("[Written by {person}.]")),
-        _ => None,
+        (Some(bot), Some(turn), _, _) => format!(
+            "[Message {to}/{message}, written by the agent {bot} in {bot}/{turn}, not by a person.]"
+        ),
+        (_, _, Some(origin), _) => format!("[Message {to}/{message}, sent by {origin}.]"),
+        (_, _, None, Some(person)) => format!("[Message {to}/{message}, written by {person}.]"),
+        _ => format!("[Message {to}/{message}.]"),
     };
-    let mut parts: Vec<String> = line.filter(|_| !hide).into_iter().collect();
+    let mut parts: Vec<String> = Some(line).filter(|_| !hide).into_iter().collect();
     let Some(quotes) = quotes else {
         return Ok((parts, None));
     };
@@ -14073,13 +14287,13 @@ fn after_words(
     for quote in &mut quotes {
         if !hide {
             let what = match quote["reply"] == true {
-                true => "the reply of turn",
-                false => "turn",
+                true => "the reply to message",
+                false => "message",
             };
             parts.push(format!(
-                "[Quoted from {what}:{}/{}, {}:]",
+                "[Quoted from {what} {}/{}, {}:]",
                 quote["bot"].as_str().unwrap_or_default(),
-                quote["turn"],
+                quote["message"],
                 quote_author(quote)
             ));
         }
@@ -14157,31 +14371,33 @@ fn start_locked(
 ) -> Result<Option<i64>> {
     let (images, (after, quotes)) = tx
         .prepare_cached(
-            "SELECT images,from_bot,from_turn,origin,person,quotes FROM turns WHERE id=?",
+            "SELECT images,from_bot,from_turn,origin,person,quotes FROM messages WHERE id=?",
         )?
         .query_row([turn], |r| {
             Ok((
                 r.get::<_, Option<String>>(0)?,
-                after_words(r, 1, bot.settings.hide_senders)?,
+                after_words(r, 1, bot.settings.hide_senders, &bot.name, turn)?,
             ))
         })?;
     let pictures = images_from(images.as_deref())?;
     let prompted = prompt_item(bot.family()?, prompt, &after, &pictures)?;
-    let head = prompt_node(tx, bot.head, &prompted, Some(turn))?;
+    let head = prompt_node(tx, bot.head, &prompted, Some(turn), turn)?;
     keep_once(tx, turn, images.as_deref())?;
     keep_quotes(tx, turn, quotes.as_deref(), head)?;
     data["node"] = json!(head);
     keep_sender(tx, turn, head, data)?;
     let now = epoch_ms();
-    if prompt.len() >= PROMPT_SHARE_BYTES {
-        tx.prepare_cached(
-            "UPDATE turns SET status='running',started_ms=?,held=NULL,prompt='',prompt_node=? WHERE id=?",
-        )?
-        .execute(params![now, head, turn])?;
-    } else {
-        tx.prepare_cached("UPDATE turns SET status='running',started_ms=?,held=NULL WHERE id=?")?
-            .execute(params![now, turn])?;
-    }
+    take(tx, turn, turn, head, prompt.len(), now)?;
+    // The run it opens, named by its number, with what the message asked.
+    tx.prepare_cached(
+        "INSERT INTO turns(id,bot,status,workspace,model,reasoning,budget_tokens,budget_counts,
+            output_schema,started_ms)
+         SELECT id,bot,'running',workspace,model,reasoning,budget_tokens,budget_counts,
+            output_schema,?2 FROM messages WHERE id=?1",
+    )?
+    .execute(params![turn, now])?;
+    tx.prepare_cached("INSERT INTO retained_turns(turn,bot) VALUES (?,?)")?
+        .execute(params![turn, bot.name])?;
     // `finish` answers every call, so a turn starts on a closed head.
     tx.prepare_cached(
         "UPDATE bots SET head=?1,status='running',running_turn=?2,closed=?1,open_calls=0,
@@ -14190,8 +14406,24 @@ fn start_locked(
     .execute(params![head, turn, bot.name, now])?;
     Ok(Some(head))
 }
-/// The pictures a turn's prompt was sent with, as its `images` column
-/// keeps them.
+/// A turn takes message `message` in as node `node`: words of 4 KiB or
+/// more then live only there.
+fn take(tx: &Connection, message: i64, turn: i64, node: i64, bytes: usize, now: i64) -> Result<()> {
+    tx.prepare_cached(
+        "UPDATE messages SET status='taken',turn=?2,node=?3,taken_ms=?4,held=NULL,due_ms=NULL,
+            text=CASE WHEN ?5 THEN '' ELSE text END WHERE id=?1",
+    )?
+    .execute(params![
+        message,
+        turn,
+        node,
+        now,
+        bytes >= PROMPT_SHARE_BYTES
+    ])?;
+    Ok(())
+}
+/// The pictures a message was sent with, as its `images` column keeps
+/// them.
 fn images_from(json: Option<&str>) -> rusqlite::Result<Vec<crate::codec::Image>> {
     json.map_or(Ok(Vec::new()), |json| {
         serde_json::from_str(json).map_err(|e| {
@@ -14225,7 +14457,7 @@ fn pictures_digest(kept: &str) -> String {
 /// only their digest, for a retry to be checked against.
 fn keep_once(tx: &Connection, turn: i64, images: Option<&str>) -> Result<()> {
     if let Some(json) = images.filter(|json| json.starts_with('[')) {
-        tx.prepare_cached("UPDATE turns SET images=? WHERE id=?")?
+        tx.prepare_cached("UPDATE messages SET images=? WHERE id=?")?
             .execute(params![pictures_digest(json), turn])?;
     }
     Ok(())
@@ -14238,7 +14470,7 @@ fn keep_quotes(tx: &Connection, turn: i64, quotes: Option<&str>, node: i64) -> R
         for quote in &mut quotes {
             quote["node"] = json!(node);
         }
-        tx.prepare_cached("UPDATE turns SET quotes=? WHERE id=?")?
+        tx.prepare_cached("UPDATE messages SET quotes=? WHERE id=?")?
             .execute(params![serde_json::to_string(&quotes)?, turn])?;
     }
     Ok(())
@@ -14315,8 +14547,8 @@ ELSE item END";
 fn promote(tx: &Connection, bot: &str) -> Result<bool> {
     let delivery: Option<String> = tx
         .prepare_cached(
-            "UPDATE turns SET status='ready' WHERE id=(
-                SELECT MIN(id) FROM turns WHERE bot=? AND status='queued') RETURNING delivery",
+            "UPDATE messages SET status='ready' WHERE id=(
+                SELECT MIN(id) FROM messages WHERE bot=? AND status='queued') RETURNING delivery",
         )?
         .query_row([bot], |r| r.get(0))
         .optional()?;
@@ -14327,6 +14559,7 @@ fn turn_status_name(status: &str) -> &'static str {
         "queued" => "queued",
         "ready" => "ready",
         "attached" => "attached",
+        "taken" => "taken",
         "waiting" => "waiting",
         "paced" => "paced",
         "running" => "running",
@@ -15650,6 +15883,212 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              ALTER TABLE turn_models_speed RENAME TO turn_models;",
         )?;
     }
+    // Schema 91: a message is its own row with its own number, and a turn
+    // is a run that took messages in. Each old turns row was a message.
+    if from < 91 {
+        migrate_messages(conn)?;
+    }
+
+    Ok(())
+}
+/// 90 -> 91: every turns row becomes a message with its number; the rows
+/// that started stay as turns, with only what a run keeps. A steer's turn
+/// is the bot's turn running when it was taken in, which needs no event;
+/// its node is its own when it kept one, its `steered` event's, or the
+/// prompt in that turn whose opening is its words. Run with foreign keys
+/// off, as SQLite's table rebuild asks, and checked before it commits.
+fn migrate_messages(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE nodes ADD COLUMN message INTEGER;
+         ALTER TABLE events ADD COLUMN message INTEGER;
+         CREATE TABLE messages(id INTEGER PRIMARY KEY, bot TEXT NOT NULL REFERENCES bots(name),
+            request_id TEXT NOT NULL, delivery TEXT NOT NULL, status TEXT NOT NULL,
+            turn INTEGER, node INTEGER REFERENCES nodes(id), text TEXT NOT NULL,
+            images TEXT, quotes TEXT, from_bot TEXT, from_turn INTEGER, from_id INTEGER,
+            origin TEXT, person TEXT, expected_turn INTEGER,
+            workspace TEXT, model TEXT, reasoning TEXT, budget_tokens INTEGER, budget_counts TEXT,
+            output_schema TEXT, wait_ms INTEGER, due_ms INTEGER, held TEXT,
+            sent_ms INTEGER, taken_ms INTEGER,
+            UNIQUE(bot,request_id));
+         INSERT INTO messages(id,bot,request_id,delivery,status,turn,node,text,images,quotes,
+                from_bot,from_turn,from_id,origin,person,expected_turn,workspace,model,reasoning,
+                budget_tokens,budget_counts,output_schema,wait_ms,due_ms,held,sent_ms,taken_ms)
+            SELECT t.id,t.bot,t.request_id,t.delivery,
+                CASE WHEN t.started_ms IS NOT NULL OR t.status='steered' THEN 'taken'
+                     WHEN t.status IN ('queued','ready','attached') THEN t.status
+                     WHEN t.status='interrupted' THEN 'withdrawn' ELSE 'failed' END,
+                CASE WHEN t.started_ms IS NOT NULL THEN t.id END,
+                CASE WHEN t.started_ms IS NOT NULL
+                     THEN COALESCE(t.prompt_node,(SELECT n.id FROM nodes n WHERE n.turn=t.id))
+                     ELSE t.prompt_node END,
+                t.prompt,t.images,t.quotes,t.from_bot,t.from_turn,t.from_id,t.origin,t.person,
+                t.expected_turn,t.workspace,t.model,t.reasoning,t.budget_tokens,t.budget_counts,
+                t.output_schema,t.wait_ms,
+                CASE WHEN t.status IN ('attached','ready') THEN t.due_ms END,
+                CASE WHEN t.status='ready' THEN t.held END,
+                (SELECT MIN(e.written_ms) FROM events e WHERE e.turn=t.id
+                    AND e.kind IN ('queued','attached','accepted')),
+                CASE WHEN t.started_ms IS NOT NULL THEN t.started_ms
+                     WHEN t.status='steered' THEN t.finished_ms END
+            FROM turns t;
+         -- A steer's turn and node, from its `steered` event where kept.
+         UPDATE messages SET turn=e.turn,node=COALESCE(messages.node,json_extract(e.data,'$.node'))
+            FROM events e WHERE e.kind='steered' AND json_extract(e.data,'$.steer')=messages.id
+            AND messages.status='taken' AND messages.turn IS NULL;
+         -- Else the one turn its bot ran when it was taken in.
+         UPDATE messages SET turn=(SELECT r.id FROM turns r WHERE r.bot=messages.bot
+                AND r.started_ms IS NOT NULL AND r.started_ms<=messages.taken_ms
+                AND (r.finished_ms IS NULL OR r.finished_ms>=messages.taken_ms)
+              ORDER BY r.id DESC LIMIT 1)
+            WHERE status='taken' AND turn IS NULL;",
+    )?;
+    // The nodes of old steers that kept none, matched by their words in
+    // the one turn that took them: its prompts after its own, in order.
+    let mut turns = conn.prepare(
+        "SELECT DISTINCT turn FROM messages WHERE status='taken' AND node IS NULL
+            AND turn IS NOT NULL AND turn<>id ORDER BY turn",
+    )?;
+    let turns: Vec<i64> = turns
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for turn in turns {
+        // Where the turn's nodes end: before its bot's next turn's first
+        // node, or at its bot's head.
+        let (first, end): (Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT (SELECT n.id FROM nodes n WHERE n.turn=t.id),
+                COALESCE((SELECT p.parent FROM turns r JOIN nodes p ON p.turn=r.id
+                    WHERE r.bot=t.bot AND r.id>t.id AND r.started_ms IS NOT NULL
+                    ORDER BY r.id LIMIT 1),b.head)
+             FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=?",
+            [turn],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let (Some(first), Some(end)) = (first, end) else {
+            continue;
+        };
+        // Its prompts, newest first, then put oldest first.
+        let mut prompts: Vec<(i64, String, i64)> = Vec::new();
+        let mut at = Some(end);
+        while let Some(node) = at.filter(|node| *node != first) {
+            let (parent, opening): (Option<i64>, Option<(String, i64)>) = conn.query_row(
+                "SELECT n.parent,o.text,o.chars FROM nodes n LEFT JOIN openings o ON o.node=n.id
+                 WHERE n.id=?",
+                [node],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        match (r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?) {
+                            (Some(text), Some(chars)) => Some((text, chars)),
+                            _ => None,
+                        },
+                    ))
+                },
+            )?;
+            if let Some((text, chars)) = opening {
+                prompts.push((node, text, chars));
+            }
+            at = parent;
+        }
+        prompts.reverse();
+        let claimed: std::collections::HashSet<i64> = conn
+            .prepare("SELECT node FROM messages WHERE turn=? AND node IS NOT NULL")?
+            .query_map([turn], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        prompts.retain(|(node, ..)| !claimed.contains(node));
+        let steers: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT id,text FROM messages WHERE turn=? AND id<>turn AND node IS NULL ORDER BY id",
+            )?
+            .query_map([turn], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut from = 0;
+        for (steer, text) in steers {
+            let chars = text.chars().count() as i64;
+            let opening: String = text.chars().take(Database::OPENING_CHARS).collect();
+            let found = (prompts[from..].iter())
+                .position(|(_, kept, count)| *count == chars && *kept == opening);
+            if let Some(found) = found {
+                conn.execute(
+                    "UPDATE messages SET node=? WHERE id=?",
+                    params![prompts[from + found].0, steer],
+                )?;
+                from += found + 1;
+            }
+        }
+    }
+    conn.execute_batch(
+        "UPDATE nodes SET message=m.id FROM messages m WHERE m.node=nodes.id;
+         -- A quote names the message it copied, under the number it had.
+         UPDATE messages SET quotes=(SELECT json_group_array(json(CASE
+                WHEN json_type(q.value,'$.turn') IS NULL THEN q.value
+                ELSE json_remove(json_set(q.value,'$.message',json_extract(q.value,'$.turn')),'$.turn')
+                END)) FROM json_each(messages.quotes) q)
+            WHERE quotes IS NOT NULL;
+         UPDATE senders SET quotes=(SELECT json_group_array(json(CASE
+                WHEN json_type(q.value,'$.turn') IS NULL THEN q.value
+                ELSE json_remove(json_set(q.value,'$.message',json_extract(q.value,'$.turn')),'$.turn')
+                END)) FROM json_each(senders.quotes) q)
+            WHERE quotes IS NOT NULL;
+
+         -- Events about a message name it; those before or apart from a
+         -- turn name no turn.
+         UPDATE events SET message=turn,turn=NULL WHERE kind IN ('queued','attached');
+         UPDATE events SET message=turn,turn=NULL,kind='held' WHERE kind='turn_held';
+         UPDATE events SET message=turn WHERE kind='accepted';
+         UPDATE events SET message=json_extract(data,'$.steer'),
+                data=json_remove(json_set(data,'$.message',json_extract(data,'$.steer')),'$.steer')
+            WHERE kind='steered';
+         -- A steer's own ending repeated its `steered` event; a message
+         -- ended in line ended as a message.
+         DELETE FROM events WHERE kind='turn_finished' AND json_extract(data,'$.status')='steered';
+         UPDATE events SET message=turn,turn=NULL,kind='message_ended',
+                data=json_set(data,'$.status',CASE json_extract(data,'$.status')
+                    WHEN 'interrupted' THEN 'withdrawn' ELSE 'failed' END)
+            WHERE kind='turn_finished' AND turn IN
+                (SELECT id FROM messages WHERE status IN ('withdrawn','failed'));
+         DELETE FROM retained_turns WHERE turn NOT IN
+            (SELECT id FROM turns WHERE started_ms IS NOT NULL);
+         CREATE TABLE turns_runs(id INTEGER PRIMARY KEY REFERENCES messages(id),
+            bot TEXT NOT NULL REFERENCES bots(name), status TEXT NOT NULL,
+            workspace TEXT, model TEXT, reasoning TEXT, bot_model TEXT, bot_reasoning TEXT,
+            budget_tokens INTEGER, budget_counts TEXT, output_schema TEXT,
+            waiting TEXT, model_rounds INTEGER NOT NULL DEFAULT 0, view_sent INTEGER,
+            input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+            started_ms INTEGER NOT NULL, finished_ms INTEGER,
+            retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
+            summary_ms INTEGER NOT NULL DEFAULT 0, reply_node INTEGER,
+            work INTEGER NOT NULL DEFAULT 0, limited TEXT, drops INTEGER NOT NULL DEFAULT 0);
+         INSERT INTO turns_runs SELECT id,bot,status,workspace,model,reasoning,bot_model,
+                bot_reasoning,budget_tokens,budget_counts,output_schema,waiting,model_rounds,
+                view_sent,input_tokens,output_tokens,cached_input_tokens,started_ms,finished_ms,
+                retries,paced_ms,summary_ms,reply_node,work,limited,drops
+            FROM turns WHERE started_ms IS NOT NULL;
+         DROP TABLE turns;
+         ALTER TABLE turns_runs RENAME TO turns;
+         CREATE TABLE message_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            last_id INTEGER NOT NULL CHECK(last_id>=0));
+         INSERT INTO message_sequence SELECT 1,last_id FROM turn_sequence;
+         DROP TABLE turn_sequence;",
+    )?;
+    // Every row a rebuilt table's children point at is still there.
+    let broken: Option<String> = conn
+        .query_row(
+            "SELECT \"table\" FROM pragma_foreign_key_check WHERE \"table\" IN
+                ('turns','messages','tools','approvals','answers','processes','artifacts',
+                 'turn_models','retained_turns') LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(table) = broken {
+        return fail_with(
+            "store_migration_failed",
+            format!(
+                "{table} names a turn the store no longer has; the store was left at schema 90"
+            ),
+        );
+    }
     Ok(())
 }
 /// 87 -> 88: each bot's status, from the turns it has.
@@ -15688,9 +16127,17 @@ fn migrate_bot_status(conn: &Connection) -> Result<()> {
         )?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let mut view = conn.prepare(&format!(
-        "SELECT {TURN_VIEW} FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=?"
-    ))?;
+    // The view as schema 88 read it, before messages left turns.
+    let mut view = conn.prepare(
+        "SELECT t.id,t.bot,b.id,t.request_id,t.status,t.input_tokens,
+            t.cached_input_tokens,t.output_tokens,t.model_rounds,t.retries,t.paced_ms,t.started_ms,
+            t.finished_ms,json_extract(t.waiting,'$.call_id'),json_extract(t.waiting,'$.approval'),
+            json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
+            json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
+            json_extract(t.waiting,'$.halt'),json_extract(t.waiting,'$.load'),
+            json_extract(t.waiting,'$.blocked'),t.held,t.due_ms,0,NULL,t.id
+         FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=?",
+    )?;
     let mut update = conn.prepare("UPDATE bots SET waiting_on=? WHERE name=?")?;
     for (bot, turn) in parked {
         let on = view.query_row([turn], turn_view)?["waiting_on"].take();
@@ -15804,7 +16251,7 @@ fn cut(text: &mut String, left: &mut usize) -> bool {
 /// refused after words left out is left out with them, as under other
 /// words it would read as refused after those.
 fn attach(entries: &mut [Value], after: i64, call: Value) {
-    if let Some(entry) = entries.iter_mut().rfind(|entry| entry["turn"] == after) {
+    if let Some(entry) = entries.iter_mut().rfind(|entry| entry["message"] == after) {
         match entry["refused"].as_array_mut() {
             Some(calls) => calls.push(call),
             None => entry["refused"] = json!([call]),
@@ -16005,7 +16452,7 @@ fn node_with_turn(
     item: &[u8],
     turn: Option<i64>,
 ) -> Result<i64> {
-    insert_node(conn, parent, item, turn, 0, Pictured::default())
+    insert_node(conn, parent, item, turn, None, 0, Pictured::default())
 }
 /// A node's pictures: how many, and what they add to its length beyond
 /// their weight.
@@ -16071,6 +16518,7 @@ fn prompt_node(
     parent: Option<i64>,
     prompted: &Prompted,
     turn: Option<i64>,
+    message: i64,
 ) -> Result<i64> {
     let weight = prompted.item.len() as i64 - prompted.pictured.extra;
     let elided = prompted
@@ -16082,6 +16530,7 @@ fn prompt_node(
         parent,
         &prompted.item,
         turn,
+        Some(message),
         elided,
         prompted.pictured,
     )?;
@@ -16133,6 +16582,7 @@ fn insert_node(
     parent: Option<i64>,
     item: &[u8],
     turn: Option<i64>,
+    message: Option<i64>,
     elided: i64,
     pictured: Pictured,
 ) -> Result<i64> {
@@ -16164,8 +16614,8 @@ fn insert_node(
     // counter write for every message. Callers already hold a transaction.
     conn.prepare_cached(
         "INSERT INTO nodes(id,parent,item,total_bytes,depth,turn,turn_seq,thinking,elided,total_elided,
-            total_thinking,pictured,pictures,written_ms)
-         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?,?,?,?,?
+            total_thinking,pictured,pictures,written_ms,message)
+         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?,?,?,?,?,?
          FROM node_sequence WHERE singleton=1",
     )?
     .execute(params![
@@ -16181,8 +16631,10 @@ fn insert_node(
         thought + thinking,
         pictured.extra,
         pictured.count,
-        epoch_ms()
+        epoch_ms(),
+        message
     ])?;
+
     let id = conn.last_insert_rowid();
     let skip = match parent {
         Some(parent) => ancestor(conn, parent, depth, skip_depth(depth + 1))?,
