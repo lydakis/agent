@@ -132,6 +132,25 @@ pub fn loosen(value: Value, schema: &Value) -> Value {
     }
 }
 
+/// Whether `property` takes null: typed so, or untyped.
+fn takes_null(property: &Value) -> bool {
+    let any = |key: &str| (property[key].as_array().into_iter().flatten()).any(takes_null);
+    match &property["type"] {
+        Value::String(kind) => kind == "null",
+        Value::Array(kinds) => kinds.contains(&json!("null")),
+        _ if property.get("anyOf").is_some() || property.get("oneOf").is_some() => {
+            any("anyOf") || any("oneOf")
+        }
+        _ => {
+            property.get("enum").is_none_or(|values| {
+                values
+                    .as_array()
+                    .is_some_and(|values| values.contains(&Value::Null))
+            }) && property.get("const").is_none_or(Value::is_null)
+        }
+    }
+}
+
 /// The object a worker's reply to `schema` gives, or why there is none.
 pub fn parse(text: &str, schema: &Value) -> Result<Value, String> {
     let text = text.trim();
@@ -149,7 +168,11 @@ pub fn parse(text: &str, schema: &Value) -> Result<Value, String> {
     let value = loosen(value, schema);
     let missing: Vec<&str> = (schema["required"].as_array().into_iter().flatten())
         .filter_map(Value::as_str)
-        .filter(|name| value.get(name).is_none_or(Value::is_null))
+        .filter(|name| match value.get(name) {
+            None => true,
+            Some(Value::Null) => !takes_null(&schema["properties"][name]),
+            Some(_) => false,
+        })
         .collect();
     match missing.is_empty() {
         true => Ok(value),
@@ -194,6 +217,19 @@ mod tests {
             json!({"findings": []})
         );
         assert!(parse("{}", &schema).unwrap_err().contains("findings"));
+        // A required property that may be null is there when null.
+        let nullable = json!({"type": "object", "properties": {
+            "answer": {"type": ["string", "null"]}, "why": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "plain": {"type": "string"}}, "required": ["answer", "why", "plain"]});
+        assert_eq!(
+            parse(r#"{"answer": null, "why": null, "plain": "x"}"#, &nullable).unwrap(),
+            json!({"answer": null, "why": null, "plain": "x"})
+        );
+        assert!(
+            parse(r#"{"answer": null, "why": null, "plain": null}"#, &nullable)
+                .unwrap_err()
+                .contains("plain")
+        );
         assert!(parse("nope", &schema).is_err());
         assert!(parse("[1]", &schema).is_err());
     }

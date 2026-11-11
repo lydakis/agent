@@ -93,7 +93,7 @@ pub fn tool() -> Option<Value> {
                         "description": "An earlier run whose answers to unchanged agent() \
                             calls this run reuses."},
                     "budget_tokens": {"type": "integer", "minimum": 1,
-                        "description": "The run's budget.total, in output tokens."},
+                        "description": "Only when the person names a token budget; by default a run has none. The run's budget.total, in output tokens."},
                     "stop": {"type": "string", "minLength": 1,
                         "description": "A run's id to end now, given alone."}
                 },
@@ -248,13 +248,20 @@ pub async fn call(
         .map_err(refused)?
         .sonny
         .workflows;
-    let going = RUNS.lock().unwrap().len() as u64;
-    if going >= config.max_runs {
-        return Err(refused(format!(
-            "{going} workflows are running, the most at once ([sonny.workflows] max_runs); \
-             wait for one to end"
-        )));
-    }
+    // A place among the runs is held from here, so calls at once never
+    // start more than max_runs between them.
+    let _seat = {
+        let runs = RUNS.lock().unwrap();
+        let going = runs.len() as u64 + STARTING.load(Ordering::SeqCst);
+        if going >= config.max_runs {
+            return Err(refused(format!(
+                "{going} workflows are running, the most at once ([sonny.workflows] \
+                 max_runs); wait for one to end"
+            )));
+        }
+        STARTING.fetch_add(1, Ordering::SeqCst);
+        Seat
+    };
     let workspace = PathBuf::from(str_of(&record["workspace"]));
     let (project, roles) = line_of(client, &record).await;
     let source = source_of(arguments, &workspace, &roles).map_err(refused)?;
@@ -573,10 +580,12 @@ pub fn resume(store: PathBuf, socket: PathBuf) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let ended = path.join("result.json");
-        match std::fs::read(&ended) {
-            Ok(text) => {
-                let result: Value = serde_json::from_slice(&text).unwrap_or_default();
+        let ended = std::fs::read(path.join("result.json"))
+            .ok()
+            .and_then(|text| serde_json::from_slice::<Value>(&text).ok())
+            .filter(Value::is_object);
+        match ended {
+            Some(result) => {
                 if result["told"] == false
                     && let Ok(plan) = read_plan(&path)
                 {
@@ -585,18 +594,31 @@ pub fn resume(store: PathBuf, socket: PathBuf) {
                         if tell(&plan, &result, &path, &socket).await {
                             let mut result = result;
                             result["told"] = json!(true);
-                            let _ = std::fs::write(path.join("result.json"), result.to_string());
+                            let _ = keep_result(&path, &result);
                         }
                     });
                 }
             }
-            Err(_) => {
+            // Unended, or its ending never written whole: run again.
+            None => {
                 if let Ok(run) = load(&path, &store, &socket) {
                     run.note(json!({"t": "replay", "at_ms": now_ms()}));
                     start(run);
                 }
             }
         }
+    }
+}
+
+/// Calls past the check on `max_runs` whose run has not started yet.
+static STARTING: AtomicU64 = AtomicU64::new(0);
+
+/// One of [`STARTING`], given back however its call ends.
+struct Seat;
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        STARTING.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -835,6 +857,9 @@ impl script::Host for Attempt {
             }
             return Ok(value);
         }
+        // Checked once a slot is free: calls queued behind it start no
+        // worker once the run is stopping or its budget is spent.
+        let _slot = self.slots.acquire().await.map_err(|e| e.to_string())?;
         if run.stopping() {
             return Err("the workflow is stopping".into());
         }
@@ -845,7 +870,6 @@ impl script::Host for Attempt {
                 "this run's budget of {total} output tokens is spent"
             ));
         }
-        let _slot = self.slots.acquire().await.map_err(|e| e.to_string())?;
         let worker = format!("{}.{WORKER}{}-{key}", run.plan.project, run.plan.id);
         match self.work(&worker, &key, &prompt, &asked).await {
             Ok((value, turn, tokens, error)) => {
@@ -1089,22 +1113,24 @@ impl Attempt {
             return Ok((Value::Null, Some(turn), tokens, Some(why)));
         }
         let text = match outcome["text_truncated"] == true {
-            true => self
-                .reply(worker)
-                .await
-                .unwrap_or_else(|| str_of(&outcome["text"])),
+            true => self.reply(worker).await?,
             false => str_of(&outcome["text"]),
         };
         Ok((Value::String(text), Some(turn), tokens, None))
     }
 
-    /// The whole of `worker`'s last reply, which a wait's outcome cuts.
-    async fn reply(&self, worker: &str) -> Option<String> {
+    /// The whole of `worker`'s last reply, which a wait's outcome cuts:
+    /// never the cut one, which would be kept as its value.
+    async fn reply(&self, worker: &str) -> Result<String, Trouble> {
+        let trouble = |e: agent_client::Error| match lost(&e) {
+            true => Trouble::Lost,
+            false => Trouble::Thrown(format!("its whole reply could not be read: {e}")),
+        };
         let page = self
             .client
             .request("history_nodes", json!({"bot": worker, "limit": 16}))
             .await
-            .ok()?;
+            .map_err(trouble)?;
         let nodes: Vec<i64> = (page["nodes"].as_array().into_iter().flatten())
             .filter_map(|node| node["node"].as_i64())
             .collect();
@@ -1112,12 +1138,13 @@ impl Attempt {
             .client
             .request("history_items", json!({"bot": worker, "nodes": nodes}))
             .await
-            .ok()?;
+            .map_err(trouble)?;
         (read["items"].as_array().into_iter().flatten())
             .flat_map(|entry| crate::responses(&entry["item"]))
             .filter(|item| item["role"] == "assistant")
             .map(|item| crate::text(&item))
             .find(|text| !text.is_empty())
+            .ok_or_else(|| Trouble::Thrown("its whole reply could not be found".into()))
     }
 }
 
@@ -1211,12 +1238,19 @@ async fn finish(run: &Run, ended: script::Ended, attempt: Option<&Attempt>) {
         "reused": count(|a| &a.reused), "output_tokens": run.spent.load(Ordering::SeqCst),
         "kept": kept, "ended_ms": now_ms(), "told": false});
     run.note(json!({"t": "end", "status": status, "error": error, "at_ms": now_ms()}));
-    let path = run.dir.join("result.json");
-    let _ = std::fs::write(&path, ended.to_string());
+    let _ = keep_result(&run.dir, &ended);
     if tell(plan, &ended, &run.dir, &run.socket).await {
         ended["told"] = json!(true);
-        let _ = std::fs::write(&path, ended.to_string());
+        let _ = keep_result(&run.dir, &ended);
     }
+}
+
+/// Write how the run in `dir` ended, whole or not at all: a host stopped
+/// mid-write leaves the run unended, to be run again from its journal.
+fn keep_result(dir: &Path, ended: &Value) -> std::io::Result<()> {
+    let part = dir.join("result.json.part");
+    std::fs::write(&part, ended.to_string())?;
+    std::fs::rename(&part, dir.join("result.json"))
 }
 
 /// Tell `plan`'s caller how its run ended, once, as a message from the
