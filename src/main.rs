@@ -136,6 +136,8 @@ fn run() -> Result<i32> {
     }
     if args[0] == "serve" {
         SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Before the runtime's threads: every one shares the limit.
+        agent_runtime::open_files::raise();
         let config = configuration(&args[1..])?;
         runtime()?.block_on(server::run(config))?;
         Ok(0)
@@ -342,6 +344,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut max_load = None;
     let mut max_depth = None;
     let mut idle_exit = None;
+    let mut await_owner = None;
     let mut stall_timeout = None;
     let mut shell_excludes = Vec::new();
     let (mut redact_fields, mut redact_blocks) = (Vec::new(), Vec::new());
@@ -433,6 +436,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                 let seconds = cli::duration_secs(flag, value)?;
                 idle_exit = (seconds > 0).then_some(seconds);
             }
+            "--await-owner" => await_owner = Some(cli::duration_secs(flag, value)?),
             _ => return fail_with("usage", format!("unknown option {flag}")),
         }
     }
@@ -454,6 +458,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         max_load,
         stall_timeout,
         idle_exit,
+        await_owner,
         shell_excludes,
         redact_fields,
         redact_blocks,

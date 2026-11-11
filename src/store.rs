@@ -20,8 +20,8 @@ pub use db::{
     Absorbed, AfterTurn, Answered, Binding, Blocked, Bot, CacheTtl, CallAnswer, CatchUp, Charge,
     CompactionPlan, CompactionView, CopiedCall, Counts, DENIAL_WINDOW, Database, Decision,
     Delivery, ENV_JSON, EVENT_PAGE_KINDS, ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, Halt,
-    Halted, Lapsed, Limit, MAX_GATES, ParkedFallback, Planning, Publication, QuoteRef, RULES_JSON,
-    Room, SANDBOX, SETTINGS, Served, Settings, Spend, Started, Step, Stepped, Strip,
+    Halted, Kept, Lapsed, Limit, MAX_GATES, ParkedFallback, Planning, Publication, QuoteRef,
+    RULES_JSON, Room, SANDBOX, SETTINGS, Served, Settings, Spend, Started, Step, Stepped, Strip,
     TURN_VIEW_ACCOUNTING, TurnBudget, TurnOptions, Waiting, Wake, Window, Work, cache_hit, share,
     unserved,
 };
@@ -611,12 +611,25 @@ impl Store {
         path: &Path,
         readers: usize,
     ) -> Result<(Self, mpsc::Receiver<Publication>)> {
-        Self::open_pooled(path, readers, READER_IDLE).await
+        Self::open_pooled(path, readers, READER_IDLE, None).await
+    }
+    /// `open_with`, waiting up to `wait` for the process that owns the
+    /// store to let it go rather than refusing at once: a daemon started
+    /// to replace an older one while it drains. The wait is the kernel's
+    /// (a blocking `flock`), so the moment the owner exits this one holds
+    /// the store, before any other start that only tries can take it.
+    pub async fn open_awaiting(
+        path: &Path,
+        readers: usize,
+        wait: std::time::Duration,
+    ) -> Result<(Self, mpsc::Receiver<Publication>)> {
+        Self::open_pooled(path, readers, READER_IDLE, Some(wait)).await
     }
     async fn open_pooled(
         path: &Path,
         readers: usize,
         idle: std::time::Duration,
+        wait: Option<std::time::Duration>,
     ) -> Result<(Self, mpsc::Receiver<Publication>)> {
         let path = path.to_path_buf();
         let (sender, mut receiver) = mpsc::channel::<Box<dyn Job>>(GROUP_JOBS);
@@ -624,6 +637,9 @@ impl Store {
         let worker_counters = counters.clone();
         let (publisher, publications) = mpsc::channel::<Publication>(1024);
         let (ready, opened) = oneshot::channel();
+        // Said once the owner lock is held, so a wait for it is bounded
+        // here while the store's own opening, a migration perhaps, is not.
+        let (locked, held) = oneshot::channel::<()>();
         std::thread::Builder::new()
             .name("agent-storage".into())
             .spawn(move || {
@@ -664,8 +680,21 @@ impl Store {
                         .write(true)
                         .mode(0o600)
                         .open(lock_path)?;
-                    lock.try_lock()
-                        .map_err(|_| Error::new("store_already_owned"))?;
+                    match lock.try_lock() {
+                        Ok(()) => {}
+                        Err(_) if wait.is_none() => return crate::fail("store_already_owned"),
+                        Err(_) => loop {
+                            match lock.lock() {
+                                Ok(()) => break,
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                        },
+                    }
+                    // A waiter that gave up lets the store go at once.
+                    if locked.send(()).is_err() {
+                        return crate::fail("store_already_owned");
+                    }
                     // SQLite WAL sidecars cannot safely follow hard-link aliases.
                     #[cfg(unix)]
                     match std::fs::metadata(&path) {
@@ -783,6 +812,16 @@ impl Store {
                     }
                 }
             })?;
+        // A sender dropped unsent is a failure before the lock, which the
+        // worker reports as it opens.
+        if let Some(wait) = wait
+            && tokio::time::timeout(wait, held).await.is_err()
+        {
+            return crate::fail_with(
+                "store_already_owned",
+                format!("its owner did not let it go within {}s", wait.as_secs()),
+            );
+        }
         let store_path = opened
             .await
             .map_err(|_| Error::new("storage_worker_failed"))??;
@@ -1605,6 +1644,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_store_owned_elsewhere_is_refused_or_waited_for_until_let_go() {
+        let path = scratch_path("owned");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let (owner, _publications) = Store::open(&path).await.unwrap();
+        let refused = Store::open(&path).await.err().unwrap();
+        assert_eq!(refused.code, "store_already_owned");
+        let brief = Store::open_awaiting(&path, 1, std::time::Duration::from_millis(100));
+        assert_eq!(brief.await.err().unwrap().code, "store_already_owned");
+        // One that waits takes it once the owner closes, and not before.
+        let waiting = tokio::spawn({
+            let path = path.clone();
+            async move { Store::open_awaiting(&path, 1, std::time::Duration::from_secs(20)).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished());
+        drop(owner);
+        let (taken, _publications) = waiting.await.unwrap().unwrap();
+        taken.call(|db| db.last_event_id()).await.unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
     async fn commits_sync_plainly_and_checkpoints_flush_the_drive() {
         let store = scratch_store("fullfsync").await;
         let writer = store
@@ -1624,7 +1685,7 @@ mod tests {
         let path = scratch_path("readers");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let idle = std::time::Duration::from_millis(500);
-        let (store, _publications) = Store::open_pooled(&path, 4, idle).await.unwrap();
+        let (store, _publications) = Store::open_pooled(&path, 4, idle, None).await.unwrap();
         let open = |store: &Store| store.stats()["readers"]["open"].as_u64().unwrap();
         // A quiet store holds one reader, with the whole cache budget.
         assert_eq!(open(&store), 1);
@@ -1700,7 +1761,7 @@ mod tests {
         let path = scratch_path("reader-shares");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let idle = std::time::Duration::from_millis(500);
-        let (store, _publications) = Store::open_pooled(&path, 4, idle).await.unwrap();
+        let (store, _publications) = Store::open_pooled(&path, 4, idle, None).await.unwrap();
         let held = |store: &Store| store.stats()["readers"]["cache_kib"].as_u64().unwrap();
         let budget = READER_CACHE_KIB as u64;
         store.read("warm", |_| Ok(())).await.unwrap();

@@ -175,9 +175,11 @@ pub const PROTECTED_EXISTING: [&str; 1] = [".aws"];
 /// (`--own-copy`): its user namespace maps the person alone, so root's
 /// files show as nobody's, and ssh refuses each file an `Include` names
 /// that way ("Bad owner or permissions"). Debian's ssh_config includes
-/// these, so no sandboxed command could ssh; Codex has the same bug open
-/// (openai/codex#9286).
-pub const OWN_COPIES: [&str; 1] = ["/etc/ssh/ssh_config.d"];
+/// the first, so no sandboxed command could ssh; Codex has the same bug
+/// open (openai/codex#9286). Fedora's, RHEL's and Amazon Linux's include
+/// the second's `openssh.config` too, a link into `/usr/share`, whose
+/// file the copy holds.
+pub const OWN_COPIES: [&str; 2] = ["/etc/ssh/ssh_config.d", "/etc/crypto-policies/back-ends"];
 
 /// Start `command` in a session of its own, for a service that outlives the
 /// terminal it was started from: closing a Herdr pane, or stopping Herdr,

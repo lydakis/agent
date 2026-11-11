@@ -273,8 +273,8 @@ automations kept the store file's identity, which a replaced file loses, is
 rewritten to the lineage when Sonny next opens on that store. When it fires, Sonny
 runs with `--trigger-fire` and those arguments. It connects to
 the daemon, and when none answers and the store is known, starts one for it
-on that socket as Sonny does, with the `agent` Sonny finds and the login shell's environment and
-`~/.agent/env`. A fire submits with `delivery: queue`, so a working bot gets
+on that socket as Sonny does, with the `agent` Sonny finds and the login shell's environment,
+and `agent` adds `~/.agent/env` as for every daemon it starts. A fire submits with `delivery: queue`, so a working bot gets
 it after its turn and never has it cut in. A repeating automation first
 looks for one of its own fires still waiting behind the bot's work: if one
 is, it skips that fire (`bot_busy`) rather than let fires pile up, as

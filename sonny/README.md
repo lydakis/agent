@@ -35,7 +35,7 @@ from main. Both channels build from source on macOS and Linux; stable
 With `cargo install`, build both (`--path .` for `agent` and
 `--path sonny`) and set `AGENT_BIN` to that `agent`; Sonny never takes an
 `agent` from `PATH`, which may be another program. `sonny agent ARGS` runs
-the one Sonny uses, with the keys in `~/.agent/env`, whatever else is called
+the one Sonny uses, whatever else is called
 `agent` on your `PATH`. It is also the one way in agents are told about:
 Sonny sets `AGENT_CLI` to its own `sonny agent`, so the instructions it
 composes, those the CLI composes for agents started through it, and the
@@ -123,9 +123,10 @@ folder's branch, since the leads share one checkout; the instructions,
 skills and memory of the folder are the same for all of them.
 
 `~/.agent/env` (`KEY=VALUE` lines, readable only by you) holds the provider
-keys, and `AWS_PROFILE` for Bedrock, which Sonny applies over your shell's to
-the daemon it starts; it does not set providers, so an `AGENT_PROVIDER` there
-is passed over and Sonny says to move it to `provider` in
+keys, and `AWS_PROFILE` for Bedrock, which `agent` applies over your shell's
+to every daemon it starts, whoever starts it; it does not set Agent's own
+names, so an `AGENT_` name there (`AGENT_PROVIDER` among them) is passed
+over and Sonny says so, and to move a provider to `provider` in
 `~/.agent/config.toml`; the reviewer and the lookout run as that daemon's
 companions, with its environment, so they live as long as it does whether
 or not a window is open. Settings go in

@@ -52,6 +52,24 @@ class SocketAndCliTests(ModelFixture):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result
 
+    def test_a_daemon_raises_its_open_file_limit_and_its_commands_inherit_it(self):
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard <= 256:
+            self.skipTest('the hard limit leaves nothing to raise')
+        low = lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
+        result = subprocess.run([*self.base, 'run', *self.common, '--new', '--bot', 'Bob',
+                                 'shell:ulimit -n > limit'],
+                                env=clean_env(), capture_output=True, text=True, timeout=30,
+                                cwd=self.path, preexec_fn=low)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        files = json.loads(self.agent('stats', '--store', str(self.store)).stdout)['files']
+        self.assertGreater(files['limit'], 256)
+        self.assertEqual((self.path/'limit').read_text().strip(), str(files['limit']))
+        if sys.platform != 'darwin':
+            self.assertEqual(files['limit'], hard)
+        self.assertGreater(files['open'], 3)
+
     def test_listings_filter_and_stop_at_their_limit(self):
         for bot in ('p.lead', 'p.worker', 'q.lead'):
             self.agent('run', *self.common, '--new', '--bot', bot, 'hello')
@@ -1452,7 +1470,10 @@ class CliTests(ModelFixture):
                 self.assertNotEqual(result.returncode, 0)
                 # The start deadline ended it, not an early give-up; the
                 # subprocess timeout bounds it, with room for a slow machine.
-                self.assertIn('daemon_start_timeout', result.stderr)
+                # What it reports is why its daemon could not start.
+                failure = json.loads(result.stderr)
+                self.assertEqual((failure['error'], failure['detail']),
+                                 ('store_already_owned', 'another process holds this store'))
                 self.assertGreaterEqual(elapsed, 9)
                 self.assertEqual(owner.request('inspect', bot='waiting')['error'], 'bot_not_found')
             finally:
@@ -1605,6 +1626,11 @@ class CliTests(ModelFixture):
                 listener.bind(str(path))
                 listener.listen(4)
                 listener.settimeout(5)
+                # It owns the store and the socket as a daemon does, until it
+                # exits: the new daemon, started at once, waits on them.
+                owned = [open(f'{place}.owner-lock', 'a') for place in (store, path)]
+                for lock in owned:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
                 def older():
                     greeting = (json.dumps(dict(event='ready', protocol=PROTOCOL - 1, pid=daemon.pid))+'\n').encode()
                     try:
@@ -1638,6 +1664,11 @@ class CliTests(ModelFixture):
                                     return
                     except (socket.timeout, OSError):
                         pass
+                    finally:
+                        # As a daemon exits: its socket goes, then its locks.
+                        path.unlink(missing_ok=True)
+                        for lock in owned:
+                            lock.close()
                 server = threading.Thread(target=older, daemon=True)
                 server.start()
                 result = subprocess.run([str(self.binary), command, '--store', str(store), '--socket', str(path), *flags, *extra],
@@ -1648,6 +1679,8 @@ class CliTests(ModelFixture):
                     self.assertIn(b'nothing was sent', result.stderr.lower())
                     self.assertIsNone(daemon.poll())
                     self.assertEqual(asked, [])
+                    for lock in owned:
+                        lock.close()
                     continue
                 self.addCleanup(subprocess.run, [str(self.binary), 'shutdown', '--store', str(store), '--socket', str(path)],
                                 env=clean_env(), capture_output=True, timeout=30)
@@ -1663,6 +1696,89 @@ class CliTests(ModelFixture):
                     self.assertEqual(json.loads(result.stdout), [])
                 else:
                     self.assertEqual(json.loads(result.stdout)['protocol'], PROTOCOL)
+
+    def test_a_replacing_daemon_waits_on_the_store_and_no_other_start_takes_it(self):
+        # An upgrade's new daemon starts while the older one drains and
+        # waits on the store and socket it holds, so a daemon another start
+        # brings up meanwhile (an open window of the older build) is refused
+        # and names who holds the store; the new one takes both the moment
+        # they are let go, the store first as a daemon lets them go.
+        store, path = self.path/'held.db', self.path/'held.sock'
+        owned = {name: open(f'{place}.owner-lock', 'a') for name, place in (('store', store), ('socket', path))}
+        for lock in owned.values():
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(path))
+        listener.listen(8)
+        def older():
+            while True:
+                try:
+                    peer = listener.accept()[0]
+                except OSError:
+                    return
+                with peer:
+                    peer.sendall((json.dumps(dict(event='ready', protocol=PROTOCOL - 1, pid=4242))+'\n').encode())
+        threading.Thread(target=older, daemon=True).start()
+        serve = [str(self.binary), 'serve', '--store', str(store), '--socket', str(path),
+                 '--provider', f'openai=responses,{self.url}']
+        waiting = subprocess.Popen([*serve, '--await-owner', '30s'], env=clean_env(),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(self.stop_process, waiting)
+        refused = subprocess.run(serve, env=clean_env(), capture_output=True, text=True, timeout=10)
+        self.assertEqual(refused.returncode, 75, refused.stderr)
+        said = json.loads(refused.stderr.strip().splitlines()[-1])
+        self.assertEqual(said['error'], 'store_already_owned')
+        self.assertEqual(said['detail'], f'an older daemon (protocol {PROTOCOL - 1}, pid 4242) holds this store')
+        # One that waits only so long gives up, saying so.
+        brief = subprocess.run([*serve, '--await-owner', '1s'], env=clean_env(), capture_output=True, text=True, timeout=10)
+        self.assertEqual(brief.returncode, 75, brief.stderr)
+        self.assertIn('store_already_owned', brief.stderr)
+        self.assertIsNone(waiting.poll())
+        # The older daemon lets the store go, then its socket.
+        owned['store'].close()
+        time.sleep(.5)
+        self.assertIsNone(waiting.poll())
+        listener.close()
+        path.unlink()
+        owned['socket'].close()
+        ready = json.loads(waiting.stdout.readline())
+        self.assertEqual((ready['event'], ready['protocol'], ready['pid']), ('ready', PROTOCOL, waiting.pid))
+        self.assertTrue(path.is_socket())
+
+    def test_a_daemon_the_cli_starts_gets_the_env_file_s_keys_but_not_agent_s_own_names(self):
+        # Every starter of a daemon goes through the CLI, so the keys there
+        # reach it however it is started: their providers count, an empty
+        # value unsets one, and names starting AGENT_ are passed over.
+        home = self.path/'home'
+        (home/'.agent').mkdir(parents=True)
+        env_file = home/'.agent'/'env'
+        env_file.write_text('OPENAI_API_KEY=from-file\nEXTRA_SETTING=from-file\nUNSET_ME=\n'
+                            'ANTHROPIC_API_KEY=\n'
+                            'export AGENT_SOCKET=/nowhere\nagent_store=/nowhere\n')
+        env_file.chmod(0o600)
+        # The caller's own key names a provider too, until the file unsets it.
+        env = {**clean_env(), 'HOME': str(home), 'UNSET_ME': 'caller', 'ANTHROPIC_API_KEY': 'caller'}
+        store = self.path/'keys.db'
+        started = subprocess.run([str(self.binary), 'start', '--store', str(store)], env=env,
+                                 capture_output=True, text=True, timeout=20, cwd=self.path)
+        self.addCleanup(subprocess.run, [str(self.binary), 'shutdown', '--store', str(store)], env=env,
+                        capture_output=True, timeout=30)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        ready = json.loads(started.stdout)
+        # The key in the file named its provider.
+        self.assertEqual(list(ready['providers']), ['openai'])
+        if Path(f'/proc/{ready["pid"]}/environ').exists():
+            daemon = dict(entry.split('=', 1) for entry in
+                          Path(f'/proc/{ready["pid"]}/environ').read_text().split('\0') if '=' in entry)
+            self.assertEqual((daemon.get('EXTRA_SETTING'), daemon.get('UNSET_ME')), ('from-file', None))
+            self.assertNotIn('AGENT_SOCKET', daemon)
+            self.assertNotIn('agent_store', daemon)
+        # A command the daemon answers reads no file: one it cannot read
+        # changes nothing for it.
+        env_file.chmod(0o644)
+        listed = subprocess.run([str(self.binary), 'ls', '--store', str(store)], env=env,
+                                capture_output=True, text=True, timeout=10, cwd=self.path)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
 
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')
@@ -1738,6 +1854,14 @@ class CliTests(ModelFixture):
                                     env=env, capture_output=True, text=True, timeout=2)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('blocking_tool_client', result.stderr)
+            # It names the reads that list how turns and calls ended, and
+            # those return at once from the same shell.
+            self.assertIn('turns and audit', result.stderr)
+        for args in [('turns','--bot','peer-0','--newest','--limit','20'), ('audit','--bot','peer-0','--limit','20')]:
+            result = subprocess.run([str(self.binary), *args, '--store', str(self.path/'peers.db'), '--socket', str(client.socket_path)],
+                                    env=env, capture_output=True, text=True, timeout=2)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(json.loads(result.stdout))
         self.assertEqual(client.control.request('inspect', bot='blocked')['error'], 'bot_not_found')
 
 

@@ -1,6 +1,6 @@
 ---
 name: sonny-config
-description: Where Sonny and its agent daemon keep their settings, every key of ~/.agent/config.toml with its values and default, and a project's own file. Read before changing or explaining a setting, instead of looking it up elsewhere.
+description: Where Sonny and its agent daemon keep their settings, every key of ~/.agent/config.toml with its values and default, a project's own file, and which folders an agent's sandbox writes. Read before changing or explaining a setting, or when the sandbox keeps a command out of a folder it needs, instead of looking it up elsewhere.
 ---
 
 # Sonny's settings
@@ -39,11 +39,20 @@ each setting is; what to set is the person's call.
   (`auto`, the default, `ask` or `read-only`), then what it changes:
   `network` (`true` or `false`), `git` (`"write"`, commits run without
   asking, or `"read-only"`, they ask), `writable` (more folders, `~` for
-  home), `reviewer` (`"model"`, `"you"`, or `"none"`, which refuses what
+  home), `unix_sockets` (with the network off, the only sockets, or
+  folders of them, its commands reach, such as Docker's; with it on, every
+  one is), `reviewer` (`"model"`, `"you"`, or `"none"`, which refuses what
   leaves the sandbox and tells the agent to do without), and a
   `description` for the list. Codex's own stricter workspace is
   `network = false` and `git = "read-only"`. `/permissions` lists it the
   next time it opens; `sonny.default_permissions` names it for new leads.
+- No folder of the person's is shared between leads by default: a
+  sandboxed agent writes its own folder, temp, its lead's state folder
+  and the one `sonny zen` keeps, and past those only its row's
+  `writable`. For a folder several leads' agents write (a tool's cache or
+  ledger, `~/.docker`), the person adds it to a row's `writable` and
+  picks that row: ask them for it, naming the folder, rather than keeping
+  a copy per agent or running the command outside the sandbox.
 - `[context_windows]` in the config: a model's context window in
   tokens, which sets when its agents compact, by `PROVIDER/MODEL` with `*`
   wildcards (`"bedrock/*openai.*" = 1000000`), over what its provider

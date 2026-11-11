@@ -236,7 +236,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --own-copy --context-window --speeds --models --provider-config",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --own-copy --context-window --speeds --models --provider-config --await-owner",
         settings: "",
         startup: true,
     },
@@ -427,6 +427,10 @@ fn print_flags(flags: &str) {
                 "A new bot's speed tier, sent to each model that serves it, at a higher price per token; standard on the rest; default standard",
             ),
             "--idle-exit" => ("DURATION", "Exit after this long idle; 0 disables"),
+            "--await-owner" => (
+                "DURATION",
+                "Wait up to this long for the daemon holding the store and socket to exit, then take them, rather than refusing at once; clients replacing an older daemon pass it, so the new one starts as the old drains and no other start can take the store in between",
+            ),
             "--shell-exclude" => (
                 "PATTERN",
                 "Leave variables named like this (* and ? wildcards, any case) out of tool shells; repeatable; clients pass [shell_environment_policy] from ~/.agent/config.toml",
@@ -658,6 +662,13 @@ const DURATIONS: &[(&str, u64, u64, bool, &str)] = &[
         u64::MAX,
         true,
         "in whole seconds; 0 disables",
+    ),
+    (
+        "--await-owner",
+        0,
+        86_400_000,
+        true,
+        "in whole seconds, up to 24h",
     ),
 ];
 

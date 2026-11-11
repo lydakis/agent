@@ -853,10 +853,12 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
 fn ensure_daemon(options: &Options) -> Result<Connection> {
     match connect_or_start(options) {
         Err(error) if older_daemon(&error).is_some() => match kept_older(options) {
-            // The command, refused by the older daemon, goes to the new one.
-            None if replace_older(&error, &options.socket)? => connect_or_start(options),
-            None => Err(error),
             Some(why) => Err(kept(error, why)),
+            // The command, refused by the older daemon, goes to the new one.
+            None => match Start::read(options)? {
+                start if start.providers.is_empty() => Err(kept(error, NO_PROVIDER_KEPT)),
+                start => replace_older(&error, options, &start),
+            },
         },
         result => result,
     }
@@ -914,15 +916,14 @@ fn kept_older(options: &Options) -> Option<&'static str> {
         )
     } else if options.no_spawn {
         Some("nothing was sent: --no-spawn keeps it running, and `agent start` replaces it")
-    } else if options.providers.is_empty() {
-        Some(
-            "nothing was sent: replacing it starts a new daemon, which needs a provider \
-             (--provider, AGENT_PROVIDER, a provider key, or `provider` in config.toml)",
-        )
     } else {
         None
     }
 }
+
+/// Why an older daemon is kept when no provider is set to start a new one.
+const NO_PROVIDER_KEPT: &str = "nothing was sent: replacing it starts a new daemon, which needs a \
+     provider (--provider, AGENT_PROVIDER, a provider key, or `provider` in config.toml)";
 
 /// `error`, the older daemon's refusal, saying why it was kept.
 fn kept(error: Error, why: &str) -> Error {
@@ -940,22 +941,30 @@ fn kept(error: Error, why: &str) -> Error {
 /// systemd give a stopping service a bounded grace in the same way.
 const REPLACE_GRACE: Duration = Duration::from_secs(120);
 
-/// Stop the older daemon `error` found on `socket`, once its running turns
-/// end or `REPLACE_GRACE` passes, so this agent's own can start: true once
-/// it is gone. The store keeps every chat, and the new daemon upgrades it
-/// as it opens. A newer daemon is left alone and `error` stands; who may
-/// replace one at all, `kept_older` says.
-fn replace_older(error: &Error, socket: &PathBuf) -> Result<bool> {
+/// Replace the older daemon `error` found on this agent's socket with one
+/// of this agent's own, and connect to it. The older one is asked to stop
+/// once its running turns end or `REPLACE_GRACE` passes, and this agent's
+/// daemon starts at once, waiting on the store for it: the kernel hands
+/// the store over the moment the older one exits, so nothing else that
+/// starts a daemon then (a window of the older build that lost its
+/// connection) can take it in between. The store keeps every chat, and
+/// the new daemon upgrades it as it opens. A newer daemon is left alone and
+/// `error` stands; who may replace one at all, `kept_older` says.
+fn replace_older(error: &Error, options: &Options, start: &Start) -> Result<Connection> {
     let Some(pid) = older_daemon(error) else {
-        return Ok(false);
+        return Err(error.clone());
     };
+    let socket = &options.socket;
     let grace_ms = REPLACE_GRACE.as_millis() as u64;
     // Daemons since 0.6.0 take shutdown with a grace; an older one refuses
     // the field, or does not answer in time, and is sent SIGTERM, which
     // every one honours.
     let asked = match Connection::greeted_until(socket, Instant::now() + STARTUP_TIMEOUT) {
-        // Another client replaced it first: this one's daemon is up.
-        Ok(again) if again.ready["pid"].as_u64() != Some(pid as u64) => return Ok(true),
+        // Another client replaced it first: its daemon is up or coming.
+        Ok(again) if again.ready["pid"].as_u64() != Some(pid as u64) => {
+            drop(again);
+            return connect_or_start(options);
+        }
         Ok(mut older) => older
             .reader
             .get_ref()
@@ -967,8 +976,12 @@ fn replace_older(error: &Error, socket: &PathBuf) -> Result<bool> {
     if asked.is_err() {
         terminate(pid)?;
     }
-    await_exit(pid, REPLACE_GRACE + SHUTDOWN_TIMEOUT)?;
-    Ok(true)
+    // Its wait outlasts this one's, so it still takes the store when the
+    // older daemon exits just as this agent stops waiting.
+    let draining = REPLACE_GRACE + SHUTDOWN_TIMEOUT;
+    let mut started = spawn_daemon(options, start, Some(draining + STARTUP_TIMEOUT))?;
+    await_exit_while(pid, draining, &mut started)?;
+    started.ready(options, Instant::now() + STARTUP_TIMEOUT)
 }
 
 /// The pid of the daemon `error` met when it speaks an older protocol than
@@ -1008,9 +1021,9 @@ pub fn lend(flags: &[String], bot: &str, bot_id: Option<i64>) -> Result<Lent> {
     })
 }
 
-fn connect_or_start(options: &Options) -> Result<Connection> {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    let connect = || match Connection::connect_until(&options.socket, deadline) {
+/// The daemon answering on `options`' socket by `deadline`, if one does.
+fn answering(options: &Options, deadline: Instant) -> Result<Option<Connection>> {
+    match Connection::connect_until(&options.socket, deadline) {
         Ok(connection) => {
             check_daemon(options, &connection.ready)?;
             Ok(Some(connection))
@@ -1023,20 +1036,79 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
             Err(error)
         }
         Err(_) => Ok(None),
-    };
-    if let Some(connection) = connect()? {
+    }
+}
+
+fn connect_or_start(options: &Options) -> Result<Connection> {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    if let Some(connection) = answering(options, deadline)? {
         return Ok(connection);
     }
     startup_remaining(deadline)?;
     if options.no_spawn {
         return fail_with("daemon_unavailable", options.socket.display().to_string());
     }
-    if options.providers.is_empty() {
+    let start = Start::read(options)?;
+    if start.providers.is_empty() {
         return fail_with(
             "provider_required",
             "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, bedrock, bedrock-openai, bedrock-openai-runtime, or NAME=FAMILY,URL,KEY_ENV), set AGENT_PROVIDER, or export a provider key",
         );
     }
+    spawn_daemon(options, &start, None)?.ready(options, deadline)
+}
+
+/// What a daemon this agent starts is given beyond the agent's own
+/// environment: the keys in `~/.agent/env`, over it, and the providers.
+/// Read only when a daemon starts, never for a command a daemon answers.
+struct Start {
+    environment: Vec<(String, String)>,
+    providers: Vec<String>,
+}
+
+impl Start {
+    fn read(options: &Options) -> Result<Self> {
+        let environment =
+            agent_client::env_file::for_daemon().map_err(|error| match error.split_once(": ") {
+                Some((code, detail)) => Error::with(code, detail),
+                None => Error::with("env_file_invalid", error),
+            })?;
+        // A key the file sets names its provider as one this agent's
+        // environment sets would; an empty value there unsets it. Only a
+        // `--provider` stands as given; providers inferred from this
+        // agent's environment are inferred again with the file over it.
+        let providers = match options.providers_explicit {
+            true => options.providers.clone(),
+            false => environment_providers(
+                &|name| match environment.iter().rev().find(|(key, _)| key == name) {
+                    Some((_, value)) => Some(value.clone()),
+                    None => std::env::var(name).ok(),
+                },
+                &|| Ok(config()?.provider),
+            )?,
+        };
+        Ok(Self {
+            environment,
+            providers,
+        })
+    }
+}
+
+/// A daemon this agent started, until it answers.
+struct Started {
+    child: std::process::Child,
+    log: std::ffi::OsString,
+    /// Where its output starts in the log other starts append to.
+    from: u64,
+}
+
+/// Start the daemon `options` name, with `start`; with `await_owner`, one
+/// that waits that long for the daemon holding its store to exit.
+fn spawn_daemon(
+    options: &Options,
+    start: &Start,
+    await_owner: Option<Duration>,
+) -> Result<Started> {
     // The daemon's folder and log are its user's alone, as the daemon
     // makes its own files; a folder that exists keeps its mode.
     if let Some(parent) = options.store.parent() {
@@ -1059,16 +1131,27 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
     };
     // Other starts of this store append to the same log; only what follows
     // this point, from our child, is ours to report.
-    let start = log.metadata()?.len();
+    let from = log.metadata()?.len();
     let mut command = Command::new(std::env::current_exe()?);
+    for (key, value) in &start.environment {
+        match value.is_empty() {
+            true => command.env_remove(key),
+            false => command.env(key, value),
+        };
+    }
     command
         .arg("serve")
         .arg("--store")
         .arg(&options.store)
         .arg("--socket")
         .arg(&options.socket);
-    for provider in &options.providers {
+    for provider in &start.providers {
         command.arg("--provider").arg(provider);
+    }
+    if let Some(wait) = await_owner {
+        command
+            .arg("--await-owner")
+            .arg(format!("{}s", wait.as_secs()));
     }
     for (flag, value) in &options.daemon_flags {
         command.arg(flag).arg(value);
@@ -1140,40 +1223,67 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
             .arg(agent_client::models::discovered(&models));
     }
     agent_client::own_session(&mut command);
-    let mut child = command
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .spawn()?;
-    loop {
-        if let Some(connection) = connect()? {
-            return Ok(connection);
-        }
-        startup_remaining(deadline)?;
-        if let Some(status) = child.try_wait()?
-            && status.code() != Some(crate::DAEMON_OWNERSHIP_CONFLICT)
-        {
-            // The owner might have become ready while our child exited.
-            if let Some(connection) = connect()? {
-                return Ok(connection);
+    Ok(Started {
+        child,
+        log: log_path,
+        from,
+    })
+}
+
+impl Started {
+    /// A connection to the daemon on `options`' socket once one of this
+    /// agent's protocol answers there by `deadline`: this one, or the one
+    /// that took the store before it.
+    fn ready(mut self, options: &Options, deadline: Instant) -> Result<Connection> {
+        // A child that lost the store said who holds it.
+        let timed_out = |started: &mut Self, error: Error| match error.code.as_str() {
+            "daemon_start_timeout" => started.failure().unwrap_or(error),
+            _ => error,
+        };
+        loop {
+            match answering(options, deadline) {
+                Ok(Some(connection)) => return Ok(connection),
+                Ok(None) => {}
+                Err(error) => return Err(timed_out(&mut self, error)),
             }
-            startup_remaining(deadline)?;
-            // The child reports its failure as the CLI does, one JSON line
-            // carrying its pid; that error is this command's.
-            if let Some(error) = child_failure(&log_path, start, child.id()) {
-                return Err(error);
+            if let Some(status) = self.child.try_wait()?
+                && status.code() != Some(crate::DAEMON_OWNERSHIP_CONFLICT)
+            {
+                // The owner might have become ready while our child exited.
+                if let Ok(Some(connection)) = answering(options, deadline) {
+                    return Ok(connection);
+                }
+                // The child reports its failure as the CLI does, one JSON
+                // line carrying its pid; that error is this command's.
+                return Err(self.failure().unwrap_or_else(|| {
+                    Error::with(
+                        "daemon_start_failed",
+                        format!(
+                            "daemon exited with {status}; its output is in {}",
+                            Path::new(&self.log).display()
+                        ),
+                    )
+                }));
             }
-            return fail_with(
-                "daemon_start_failed",
-                format!(
-                    "daemon exited with {status}; its output is in {}",
-                    Path::new(&log_path).display()
-                ),
-            );
+            // An ownership-conflict exit only says our child lost. The
+            // winner can still be recovering its store before binding the
+            // socket.
+            match startup_remaining(deadline) {
+                Ok(left) => std::thread::sleep(Duration::from_millis(50).min(left)),
+                Err(error) => return Err(timed_out(&mut self, error)),
+            }
         }
-        // An ownership-conflict exit only says our child lost. The winner
-        // can still be recovering its store before binding the socket.
-        std::thread::sleep(Duration::from_millis(50).min(startup_remaining(deadline)?));
+    }
+
+    /// The error the child reported, once it has exited.
+    fn failure(&mut self) -> Option<Error> {
+        self.child.try_wait().ok().flatten()?;
+        child_failure(&self.log, self.from, self.child.id())
     }
 }
 
@@ -1422,7 +1532,8 @@ pub fn main(args: Vec<String>) -> Result<i32> {
     {
         return fail_with(
             "blocking_tool_client",
-            "use run --detach to submit peer work and the wait tool to collect it; a blocking client would hold a process-budget unit while waiting",
+            "use run --detach to submit peer work and the wait tool to collect it; a blocking client would hold a process-budget unit while waiting; \
+             turns and audit, which list how a bot's turns and calls ended, return at once",
         );
     }
     match command {
@@ -1584,46 +1695,71 @@ fn stopped(pid: i32, pretty: bool) -> Result<i32> {
 /// unreaped zombie counts as gone.
 fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
-    let running = || {
-        // SAFETY: signal 0 only checks that the process exists.
-        let exists = unsafe { libc::kill(pid, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-        if !exists {
-            return false;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // SAFETY: proc_bsdinfo is plain data; all zeroes is a valid value.
-            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-            let size = std::mem::size_of_val(&info) as i32;
-            // SAFETY: info is a live proc_bsdinfo of exactly `size` bytes.
-            let read = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    libc::PROC_PIDTBSDINFO,
-                    0,
-                    (&mut info as *mut libc::proc_bsdinfo).cast(),
-                    size,
-                )
-            };
-            if read == size {
-                return info.pbi_status != libc::SZOMB;
-            }
-            std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-        }
-        #[cfg(not(target_os = "macos"))]
-        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-            stat.rsplit_once(") ")
-                .is_none_or(|(_, state)| !state.starts_with('Z'))
-        })
-    };
-    while running() {
+    while alive(pid) {
         if Instant::now() >= deadline {
             return fail_with("daemon_shutdown_timeout", pid.to_string());
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     Ok(())
+}
+
+/// [`await_exit`], while `started` waits to take the store from it: a
+/// start that fails for another reason fails this at once.
+fn await_exit_while(pid: i32, timeout: Duration, started: &mut Started) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while alive(pid) {
+        if let Some(status) = started.child.try_wait()?
+            && status.code() != Some(crate::DAEMON_OWNERSHIP_CONFLICT)
+        {
+            return Err(started.failure().unwrap_or_else(|| {
+                Error::with(
+                    "daemon_start_failed",
+                    format!("daemon exited with {status}"),
+                )
+            }));
+        }
+        if Instant::now() >= deadline {
+            return fail_with("daemon_shutdown_timeout", pid.to_string());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+/// Whether process `pid` runs; an unreaped zombie does not.
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    let exists = unsafe { libc::kill(pid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if !exists {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: proc_bsdinfo is plain data; all zeroes is a valid value.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as i32;
+        // SAFETY: info is a live proc_bsdinfo of exactly `size` bytes.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        if read == size {
+            return info.pbi_status != libc::SZOMB;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(target_os = "macos"))]
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+        stat.rsplit_once(") ")
+            .is_none_or(|(_, state)| !state.starts_with('Z'))
+    })
 }
 
 /// The person's model list, when `store` is the home store beside it

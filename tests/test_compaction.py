@@ -100,7 +100,12 @@ class AnthropicCompactionTests(ModelFixture):
             self.model.requests.get()
         turn = client.request('submit', bot='Bob', request_id='moved', prompt='after the move')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # Work the last turn started (a compaction after it) can reach the
+        # model after the queue was drained; the moved turn's call is the
+        # one carrying its prompt.
         call = self.model.requests.get(timeout=1)
+        while 'after the move' not in json.dumps(call['messages']):
+            call = self.model.requests.get(timeout=1)
         summary = call['messages'][0]['content'][0]
         self.assertTrue(summary['text'].startswith('[compaction summary'))
         self.assertEqual(summary['cache_control'], {'type': 'ephemeral', 'ttl': '1h'})

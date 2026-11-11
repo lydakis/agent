@@ -902,7 +902,14 @@ continuing... Attempting to continue without resetting will result in
 continued refusals." Each item becomes a note naming the refusal's category,
 so the model knows something was declined: a tool result keeps its call with
 `[This tool result is left out: ...]`, and a message becomes `[A message here
-is left out: ...]`. A note is padded with spaces to the size of the item it
+is left out: ...]`. A message a person or another bot steered into the
+turn goes back in line as it was sent, a queued message of its own with its
+words, pictures, effort, quotes and sender, for the turns after this one;
+its place says `[A message here is left out and sent again after this turn:
+...]`. A strict steer (`expected_turn`) is for that turn alone and an
+attached note is a note, so both stay notes; a queued message has no turn
+to join, so one the classifier declines again as its turn's first request
+is noted, not sent a third time. A note is padded with spaces to the size of the item it
 replaces, so the context's byte accounting does not change; a shorter wording
 is used where the full one does not fit, and an item too small for any keeps
 its own. Everything before it is unchanged, so no thinking binding or prompt
@@ -2888,11 +2895,16 @@ inside as the overflow user's, and a program that takes a file only from
 root or the person refuses it. Each system folder the daemon was started
 with as `serve --own-copy FOLDER` is shown from a copy the person owns,
 kept under `~/.agent/copies`, read-only to every sandbox, bound read-only in
-the folder's place. The CLI passes `agent_client::OWN_COPIES`
-(`/etc/ssh/ssh_config.d`): ssh refuses every file an `Include` names that
+the folder's place. The CLI passes `agent_client::OWN_COPIES`:
+`/etc/ssh/ssh_config.d`, as ssh refuses every file an `Include` names that
 is not root's or the person's ("Bad owner or permissions"), and Debian's
 `/etc/ssh/ssh_config` includes that folder, so no sandboxed command could
-ssh (Codex has the same bug open, openai/codex#9286). Building a policy
+ssh (Codex has the same bug open, openai/codex#9286); and
+`/etc/crypto-policies/back-ends`, whose `openssh.config` Fedora's, RHEL's
+and Amazon Linux's `ssh_config.d/50-redhat.conf` includes: each file there
+is a link into `/usr/share/crypto-policies`, and the copy holds the file it
+points at, copied again when a policy switch points it elsewhere. A folder
+that isn't there, as on Debian, costs one failed listing. Building a policy
 looks at the folder's files (a listing and a `stat` each) and copies them
 again only when one changed, each written beside its name and renamed over
 it, so a running sandbox reads a whole file. A daemon running as root,
