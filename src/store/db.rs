@@ -9935,14 +9935,17 @@ impl Database {
         let mut prompts_more = false;
         // The newest steers first, as Codex's reviewer keeps a person's
         // newest words: what is left out is older than all that is read.
-        // Each row names its `steered` event and the one before it, which
-        // the reply it answers is read between; read a row at a time, and
-        // only while there is room.
+        // Newest as the turn took them in, by their nodes, which need not
+        // be the order they were sent: an attached message waits for a
+        // call boundary that a later steer may not. Each row names its
+        // `steered` event and the turn's one before it, which the reply it
+        // answers is read between; read a row at a time, and only while
+        // there is room.
         let mut steers = self.conn.prepare_cached(
-            "SELECT m.id,(SELECT e.id FROM events e WHERE e.message=m.id AND e.kind='steered'),
-                COALESCE((SELECT e.id FROM events e WHERE e.kind='steered' AND e.message=
-                    (SELECT MAX(p.id) FROM messages p WHERE p.turn=?1 AND p.id<m.id AND p.id<>?1)),0)
-             FROM messages m WHERE m.turn=?1 AND m.id<>?1 ORDER BY m.id DESC",
+            "SELECT m.id,e.id,COALESCE((SELECT MAX(p.id) FROM events p
+                    WHERE p.turn=?1 AND p.kind='steered' AND p.id<e.id),0)
+             FROM messages m LEFT JOIN events e ON e.message=m.id AND e.kind='steered'
+             WHERE m.turn=?1 AND m.id<>?1 ORDER BY m.node IS NULL,m.node DESC,m.id DESC",
         )?;
         let mut steer = self.conn.prepare_cached(&format!(
             "SELECT {MESSAGE_TEXT},m.from_bot,m.from_turn,m.origin,m.person,m.quotes

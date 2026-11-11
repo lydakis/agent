@@ -5064,14 +5064,14 @@ async fn report(
         stamp(now()),
         answer(&result)
     );
-    let sent = client
-        .request(
-            "submit",
-            json!({"bot": to, "bot_id": to_id,
-                "request_id": format!("{}shadow.{to_id}.{id}.{turn}", sent_by(trigger)),
-                "prompt": prompt, "delivery": "steer", "from": {"bot": bot, "turn": turn}}),
-        )
-        .await;
+    let mut asking = json!({"bot": to, "bot_id": to_id,
+        "request_id": format!("{}shadow.{to_id}.{id}.{turn}", sent_by(trigger)),
+        "prompt": prompt, "delivery": "steer"});
+    // From the copy's turn, when its message ran in one.
+    if let Some(ran) = result["turn"].as_i64() {
+        asking["from"] = json!({"bot": bot, "turn": ran});
+    }
+    let sent = client.request("submit", asking).await;
     let mut reply = match sent {
         Ok(sent) => json!({"outcome": "sent", "bot": to, "message": sent["message"]}),
         Err(error) if error.code == "idempotency_conflict" => json!({"outcome": "sent", "bot": to}),
@@ -5494,14 +5494,15 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
         trigger.name,
         stamp(now()),
     );
-    let sent = client
-        .request(
-            "submit",
-            json!({"bot": to, "bot_id": to_id,
-                "request_id": format!("{}reply.{to_id}.{turn}", sent_by(trigger)),
-                "prompt": prompt, "delivery": "steer", "from": {"bot": bot, "turn": turn}}),
-        )
-        .await;
+    let mut asking = json!({"bot": to, "bot_id": to_id,
+        "request_id": format!("{}reply.{to_id}.{turn}", sent_by(trigger)),
+        "prompt": prompt, "delivery": "steer"});
+    // From the turn that ran the message: its own, or the one that took it
+    // in. One that ended in line ran in none, and says so in its words.
+    if let Some(ran) = result["turn"].as_i64() {
+        asking["from"] = json!({"bot": bot, "turn": ran});
+    }
+    let sent = client.request("submit", asking).await;
     outcome["reply"] = match sent {
         Ok(sent) => json!({"outcome": "sent", "bot": to, "message": sent["message"]}),
         // Its request id is the turn's own: another prompt under it is this

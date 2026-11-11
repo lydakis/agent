@@ -2602,11 +2602,13 @@ async fn open_task(
             .request("inspect", json!({"bot": bot}))
             .await
             .map_err(|e| e.to_string())?;
-        let turns = client
-            .request("turns", json!({"bot": bot, "limit": 1}))
+        // Its first message is its brief, whether or not a turn has taken
+        // it in yet: a task may wait for room to start.
+        let messages = client
+            .request("messages", json!({"bot": bot, "after": 0, "limit": 1}))
             .await
             .map_err(|e| e.to_string())?;
-        let first = &turns["turns"][0]["turn"];
+        let first = &messages["messages"][0]["message"];
         let prompts = client
             .request("prompts", json!({"bot": bot, "turn": first}))
             .await

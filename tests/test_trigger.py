@@ -570,6 +570,38 @@ class TriggerFireTests(ModelFixture):
         finally:
             connection.close()
 
+    def test_a_fire_withdrawn_in_line_tells_the_reply_agent_without_naming_a_turn(self):
+        self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
+        self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')
+        lead = self.bot_id('p.lead')
+        connection = Connection(str(self.store) + '.sock')
+        try:
+            # Busy, the task takes the fire's message in line, where it is
+            # withdrawn.
+            busy = connection.request('submit', bot='p.task', request_id='busy', prompt='slow')['result']
+            fire = self.fire('p.task', 'Check the PR.', wait=False,
+                             extra=['--reply-to', 'p.lead', '--reply-to-id', str(lead)])
+            deadline = time.monotonic() + 30
+            while not (waiting := [m for m in self.messages('p.task') if m['status'] in ('queued', 'ready')]):
+                self.assertLess(time.monotonic(), deadline, 'the fire never reached the daemon')
+                time.sleep(.1)
+            withdrawn = waiting[0]['message']
+            self.assertIn('result', connection.request('interrupt', bot='p.task', turn=withdrawn))
+            self.assertEqual(fire.wait(timeout=60), 0)
+            self.agent('wait', '--store', str(self.store), busy['handle'])
+            last = json.loads((self.home / '.agent/automations/p.task.json').read_text())['last']
+            self.assertEqual(last['reply']['outcome'], 'sent', last)
+            self.settle('p.lead')
+            # It ran in no turn, so the note names none; its words say how
+            # it ended.
+            events = connection.request('events', bot='p.lead', after=0, limit=256)['result']['events']
+            told = [e['data'] for e in events if e['event'] == 'accepted'][-1]
+            self.assertNotIn('from', told)
+            self.assertRegex(self.turns('p.lead')[-1]['prompt_preview'],
+                             '^' + LINE.format('p.task', f'p.task turn {withdrawn} withdrawn'))
+        finally:
+            connection.close()
+
     def test_a_shadow_fire_reports_from_a_read_only_copy_that_then_goes(self):
         self.agent('run', *self.common, '--new', '--bot', 'p.lead', 'hello')
         self.agent('run', *self.common, '--new', '--bot', 'p.task', 'hello')

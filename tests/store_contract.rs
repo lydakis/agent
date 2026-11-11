@@ -19207,3 +19207,57 @@ fn schema_90_turns_become_messages_each_with_its_number() {
     drop(db);
     std::fs::remove_file(path).unwrap();
 }
+
+/// A turn's prompts read in the order it took its messages in, and each
+/// answers what was said just before it was taken: an attached message
+/// sent before a steer may be taken in after it.
+#[test]
+fn prompts_follow_the_order_a_turn_took_its_messages_in() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let run = db
+        .begin(
+            "Bob",
+            "r",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let attach = TurnOptions {
+        delivery: Delivery::Attach,
+        ..TurnOptions::default()
+    };
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    let attached = (db.begin("Bob", "a", "by the way", true, &attach, allow_provider))
+        .unwrap()
+        .turn;
+    let steered = (db.begin("Bob", "s", "stop", true, &steer, allow_provider))
+        .unwrap()
+        .turn;
+    assert!(attached < steered);
+    db.append(run, vec![assistant("before the steer")], &[], None)
+        .unwrap();
+    // A call ending with no tools takes the steer alone; the attached
+    // message waits for the next call.
+    let usage = ContextUsage::default();
+    db.absorb(run, None, 8 << 20, 4096, usage, false, false)
+        .unwrap();
+    db.append(run, vec![assistant("stopping")], &[], None)
+        .unwrap();
+    db.absorb(run, None, 8 << 20, 4096, usage, false, true)
+        .unwrap();
+    db.append(run, vec![assistant("done")], &[], None).unwrap();
+    db.finish(run, None).unwrap();
+    let read = db.prompts("Bob", run, 64 * 1024).unwrap();
+    let read = read["prompts"].as_array().unwrap();
+    let words: Vec<&str> = read.iter().map(|p| p["text"].as_str().unwrap()).collect();
+    assert_eq!(words, ["work", "stop", "by the way"]);
+    assert_eq!(read[1]["reply"]["text"], "before the steer");
+    assert_eq!(read[2]["reply"]["text"], "stopping");
+}
