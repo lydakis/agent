@@ -92,6 +92,13 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     if short.is_empty() || !branch_name(name) {
         return Err(format!("{short:?} is not a name a git branch can have"));
     }
+    // A workflow's workers are named so, and are no tasks.
+    if crate::workflow::is_worker(name) {
+        return Err(format!(
+            "names starting {} are a workflow's agents'; give the task another",
+            crate::workflow::WORKER
+        ));
+    }
     if start.brief.trim().is_empty() {
         return Err("a task starts with a brief".into());
     }
@@ -1053,6 +1060,8 @@ impl std::fmt::Display for Size {
 fn own(bots: &[Value], lead: &str) -> Vec<(String, String)> {
     (bots.iter())
         .filter(|bot| bot["created_by"] == lead && bot["expire_ms"].is_null())
+        // A workflow's workers are its run's, not tasks.
+        .filter(|bot| !bot["name"].as_str().is_some_and(crate::workflow::is_worker))
         .filter_map(|bot| {
             let name = bot["name"].as_str()?;
             let status = bot["status"].as_str().unwrap_or("idle");
@@ -1328,6 +1337,20 @@ fn worktree(here: &Path, name: &str, base: &str, confine: bool) -> Result<Place,
         undo,
         copy: Some((top, path)),
     })
+}
+
+/// A worktree of `here`'s repository for the workflow worker `name`, on
+/// the branch agent/NAME from the last commit, as a task's is made, or the
+/// one it was given before, when its run is picked up again: the folder
+/// it works at in it. Outside git, `here` itself. Taken away once its run
+/// ends, as `remove_task` takes a task's, its branch kept while it holds
+/// commits not merged.
+pub(crate) fn worker_tree(here: &Path, name: &str, confine: bool) -> Result<PathBuf, String> {
+    if let Some(path) = worktree_of(here, name) {
+        let prefix = git(here, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+        return Ok(within(&path, Path::new(prefix.trim_end_matches('/'))));
+    }
+    worktree(here, name, "HEAD", confine).map(|place| place.dir)
 }
 
 /// Whether a worktree holds a submodule checked out, which git will not

@@ -53,12 +53,12 @@ impl Picker {
         };
         let mut rows: Vec<&Value> = (bots.iter())
             // Side chats go once idle; they are never switched to, nor
-            // Sonny's own bots.
+            // Sonny's own bots, nor a workflow's workers.
             .filter(|bot| bot["expire_ms"].is_null())
             .filter(|bot| {
-                bot["name"]
-                    .as_str()
-                    .is_some_and(|n| !crate::project::is_internal(n))
+                bot["name"].as_str().is_some_and(|n| {
+                    !crate::project::is_internal(n) && !crate::workflow::is_worker(n)
+                })
             })
             .collect();
         rows.sort_by(|a, b| {

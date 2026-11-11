@@ -926,6 +926,42 @@ has been gone 30 seconds. On starting, it brings every agent Sonny declared
 tools on up to this build's tools. `/background` says "tools not answered"
 when no tool host runs.
 
+## Workflows
+
+An agent can work as a script instead of a conversation: the `workflow`
+tool ([workflow/](../sonny/src/workflow/)) takes a JavaScript plan in
+Claude Code's dynamic workflow language, name for name, and runs it in the
+tool host, in the QuickJS `exec` uses, on a connection of its own. The call
+returns at once with the run's id; the caller hears back once, when the run
+ends, in a message queued with origin `workflow`. The workflow skill is the
+language's reference.
+
+Each `agent()` call makes a worker, `PROJECT.wf-RUN-KEY`: a bot the caller
+made, in its folder (a worktree of it with `isolation: 'worktree'`, taken
+away at the run's end unless it holds commits), confined as the caller's
+permissions row confines it, under the caller's gates, told its folder's
+rules and that its reply is a value. A worker has `memory`, `exec`, the
+browser and the desktop, and nothing that starts agents or reaches the
+person; `start_task` refuses names starting `wf-`. Workers have no tab, no
+`/status` row and no star, and the lookout tells no one of them. A call
+with a `schema` sends it as the turn's `output_schema`, strict (optional
+properties nullable, their nulls left out of what `agent()` returns), and
+asks the same worker once more when the reply does not fit.
+
+A run lives in `STORE.workflows/RUN/`: `run.json` (what it was started
+with), `script.js`, `events.jsonl` (phases, logs and each agent's value,
+appended) and, at the end, `result.json`. A worker is named and asked by
+its call's key, a hash of its prompt and options (not its label or phase)
+with how many such calls came before, so asking again gets the same bot and
+turn. A run whose host stopped is picked up when the next starts, and one
+whose connection went on the next connection, by running its script again
+with every recorded call answered from the journal. `resume_from_run_id`
+starts a new run with an earlier run's answers, so only calls that changed
+cost model calls. `stop` interrupts a run's workers; it ends as stopped.
+
+`[sonny.workflows]` in `config.toml`: `enabled` (true), `concurrency` (0:
+the CPUs less two, at most 16), `max_agents` (1000) and `max_runs` (8).
+
 ## MCP servers
 
 The person's MCP servers live in `~/.agent/config.toml`, under Codex's key

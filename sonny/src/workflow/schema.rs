@@ -1,0 +1,216 @@
+//! An `agent()` call's `schema`, as the worker's turn takes it: the daemon
+//! hands it to the provider as strict structured output (`output_schema`,
+//! as Codex sends a turn's), which takes only objects that list every
+//! property as required and allow no others. So an optional property goes
+//! as one that may be null, and a null the reply gives one is left out of
+//! the object `agent()` returns, which then has the schema's own shape.
+use serde_json::{Map, Value, json};
+
+/// Whether `schema` is one `agent()` takes: an object schema with
+/// `properties` at its root, `required` naming only those.
+pub fn check(schema: &Value) -> Result<(), String> {
+    const NEEDS: &str = "a schema needs {type: 'object', properties: {...}} at its root, with required a subset of properties";
+    let properties = schema["properties"].as_object();
+    if schema["type"] != "object" || properties.is_none() {
+        return Err(NEEDS.into());
+    }
+    let properties = properties.expect("checked");
+    match &schema["required"] {
+        Value::Null => Ok(()),
+        Value::Array(names)
+            if names
+                .iter()
+                .all(|name| name.as_str().is_some_and(|n| properties.contains_key(n))) =>
+        {
+            Ok(())
+        }
+        _ => Err(NEEDS.into()),
+    }
+}
+
+/// `schema` as strict structured output takes it.
+pub fn strict(schema: &Value) -> Value {
+    let Value::Object(fields) = schema else {
+        return schema.clone();
+    };
+    let mut out = Map::new();
+    for (key, value) in fields {
+        let value = match key.as_str() {
+            "items" | "additionalItems" | "not" => strict(value),
+            "anyOf" | "oneOf" | "allOf" | "prefixItems" => match value {
+                Value::Array(each) => Value::Array(each.iter().map(strict).collect()),
+                other => other.clone(),
+            },
+            "$defs" | "definitions" => match value {
+                Value::Object(defs) => {
+                    Value::Object(defs.iter().map(|(k, v)| (k.clone(), strict(v))).collect())
+                }
+                other => other.clone(),
+            },
+            _ => value.clone(),
+        };
+        out.insert(key.clone(), value);
+    }
+    if let Some(Value::Object(properties)) = fields.get("properties") {
+        let required: Vec<&str> = (fields.get("required").and_then(Value::as_array))
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let properties: Map<String, Value> = (properties.iter())
+            .map(|(name, property)| {
+                let property = strict(property);
+                let property = match required.contains(&name.as_str()) {
+                    true => property,
+                    false => nullable(property),
+                };
+                (name.clone(), property)
+            })
+            .collect();
+        out.insert(
+            "required".into(),
+            Value::Array(properties.keys().map(|name| json!(name)).collect()),
+        );
+        out.insert("properties".into(), Value::Object(properties));
+        out.insert("additionalProperties".into(), json!(false));
+    }
+    Value::Object(out)
+}
+
+/// `property`, or null.
+fn nullable(mut property: Value) -> Value {
+    match property.get_mut("type") {
+        Some(Value::String(kind)) => {
+            let kind = std::mem::take(kind);
+            property["type"] = json!([kind, "null"]);
+            property
+        }
+        Some(Value::Array(kinds)) => {
+            if !kinds.contains(&json!("null")) {
+                kinds.push(json!("null"));
+            }
+            property
+        }
+        _ => json!({"anyOf": [property, {"type": "null"}]}),
+    }
+}
+
+/// `value`, a reply to [`strict`]'s `schema`, with the nulls it gives the
+/// properties `schema` does not require left out, at every depth.
+pub fn loosen(value: Value, schema: &Value) -> Value {
+    match value {
+        Value::Object(fields) => {
+            let required: Vec<&str> = (schema["required"].as_array().into_iter().flatten())
+                .filter_map(Value::as_str)
+                .collect();
+            let properties = schema["properties"].as_object();
+            Value::Object(
+                fields
+                    .into_iter()
+                    .filter(|(name, value)| {
+                        !(value.is_null()
+                            && properties.is_some_and(|p| p.contains_key(name))
+                            && !required.contains(&name.as_str()))
+                    })
+                    .map(|(name, value)| {
+                        let inner = properties
+                            .and_then(|p| p.get(&name))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        (name, loosen(value, &inner))
+                    })
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| loosen(item, &schema["items"]))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// The object a worker's reply to `schema` gives, or why there is none.
+pub fn parse(text: &str, schema: &Value) -> Result<Value, String> {
+    let text = text.trim();
+    // A model that fences its JSON in spite of the format.
+    let text = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+        .and_then(|rest| rest.strip_suffix("```"))
+        .unwrap_or(text)
+        .trim();
+    let value: Value = serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
+    if !value.is_object() {
+        return Err("not a JSON object".into());
+    }
+    let value = loosen(value, schema);
+    let missing: Vec<&str> = (schema["required"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .filter(|name| value.get(name).is_none_or(Value::is_null))
+        .collect();
+    match missing.is_empty() {
+        true => Ok(value),
+        false => Err(format!("missing {}", missing.join(", "))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optional_properties_go_as_nullable_and_come_back_left_out() {
+        let schema = json!({"type": "object", "properties": {
+            "findings": {"type": "array", "items": {"type": "object",
+                "properties": {"file": {"type": "string"}, "line": {"type": "integer"}},
+                "required": ["file"]}},
+            "note": {"type": "string"}},
+            "required": ["findings"]});
+        check(&schema).unwrap();
+        let strict = strict(&schema);
+        assert_eq!(strict["additionalProperties"], false);
+        assert_eq!(strict["required"], json!(["findings", "note"]));
+        assert_eq!(
+            strict["properties"]["note"]["type"],
+            json!(["string", "null"])
+        );
+        let item = &strict["properties"]["findings"]["items"];
+        assert_eq!(item["required"], json!(["file", "line"]));
+        assert_eq!(
+            item["properties"]["line"]["type"],
+            json!(["integer", "null"])
+        );
+        assert_eq!(item["additionalProperties"], false);
+        let reply = r#"{"findings": [{"file": "a.rs", "line": null}], "note": null}"#;
+        assert_eq!(
+            parse(reply, &schema).unwrap(),
+            json!({"findings": [{"file": "a.rs"}]})
+        );
+        assert_eq!(
+            parse("```json\n{\"findings\": []}\n```", &schema).unwrap(),
+            json!({"findings": []})
+        );
+        assert!(parse("{}", &schema).unwrap_err().contains("findings"));
+        assert!(parse("nope", &schema).is_err());
+        assert!(parse("[1]", &schema).is_err());
+    }
+
+    #[test]
+    fn a_schema_is_an_object_one_whose_required_it_has() {
+        assert!(check(&json!({"type": "object", "properties": {}})).is_ok());
+        assert!(check(&json!({"type": "array", "items": {}})).is_err());
+        assert!(check(&json!({"type": "object"})).is_err());
+        assert!(
+            check(&json!({"type": "object", "properties": {"a": {}}, "required": ["b"]})).is_err()
+        );
+        // An untyped property may be null as anything else.
+        let strict = strict(&json!({"type": "object", "properties": {"a": {"enum": [1, 2]}}}));
+        assert_eq!(
+            strict["properties"]["a"],
+            json!({"anyOf": [{"enum": [1, 2]}, {"type": "null"}]})
+        );
+    }
+}

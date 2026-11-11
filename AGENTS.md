@@ -9,7 +9,10 @@ is minimal memory, CPU, network overhead, and tail latency for many active agent
 plus named identity, resumption, historical conversation forks, and useful event
 streams. Performance is the first priority; programs are the clients. Do not
 turn it into another command-alias wrapper, chat UI,
-workflow builder, or remote execution service.
+workflow builder, or remote execution service. A script an agent writes for
+one job, which Sonny runs over ordinary bots (its `workflow` tool), is a way an
+agent works, not a workflow builder: nothing is drawn, saved or catalogued by
+hand, and the daemon gains nothing for it.
 
 Errand is separate. Do not modify it or implement its deferred local execution
 and continuation features from this project.

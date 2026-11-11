@@ -106,6 +106,7 @@ mod upgrade;
 mod usage;
 mod used;
 mod user_shell;
+mod workflow;
 mod zen;
 
 use agent_client::{Client, Events};
@@ -617,7 +618,10 @@ async fn read_status(
     let mut kept = HashMap::new();
     let (mut fresh, mut whole) = (false, true);
     for bot in &listed {
-        let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
+        // Nor are a workflow's workers: its run is one item.
+        let Some(name) = (bot["name"].as_str())
+            .filter(|name| bot["expire_ms"].is_null() && !workflow::is_worker(name))
+        else {
             continue;
         };
         if let Some(mine) = &mine
@@ -4989,8 +4993,11 @@ impl Fleet {
             self.needs.held(held, |_| true);
         }
         for bot in &bots {
-            // Side chats are never tasks, as when they are made.
-            let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
+            // Side chats are never tasks, as when they are made, nor are
+            // a workflow's workers.
+            let Some(name) = (bot["name"].as_str())
+                .filter(|name| bot["expire_ms"].is_null() && !workflow::is_worker(name))
+            else {
                 continue;
             };
             if name != self.lead
@@ -5598,8 +5605,11 @@ impl Fleet {
             }
         }
         match kind {
-            // A copy that goes once idle is a side chat, not a task.
-            "created" | "forked" if event["data"]["expire_ms"].is_null() => {
+            // A copy that goes once idle is a side chat, not a task, and a
+            // workflow's worker is its run's.
+            "created" | "forked"
+                if event["data"]["expire_ms"].is_null() && !workflow::is_worker(bot) =>
+            {
                 let by = event["data"]["created_by"].as_str().unwrap_or("");
                 match kin(
                     bot,
