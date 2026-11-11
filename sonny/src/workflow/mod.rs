@@ -50,6 +50,9 @@ const TOLD_BYTES: usize = 8 * 1024;
 /// A worker's turn in `Run::live` while its submission has no answer.
 const SUBMITTED: i64 = -1;
 
+/// The statuses of a turn that has ended.
+const ENDED: [&str; 4] = ["completed", "failed", "interrupted", "steered"];
+
 /// What every worker is told after its folder's rules.
 const TOLD: &str = "You are one agent in a workflow: a script another agent wrote runs you, and \
 passes your final reply to its next step in code. Your final reply is that step's value, not a \
@@ -730,26 +733,31 @@ impl Run {
             .collect();
         let mut heard = true;
         for (bot, turn) in &live {
-            // A submission whose answer never came: its turn as listed.
-            let turn = match *turn {
+            // A submission whose answer never came: each of its worker's
+            // turns not yet ended, running or still queued.
+            let turns = match *turn {
                 SUBMITTED => match client
-                    .request("bots", json!({"name": bot, "limit": 1}))
+                    .request("turns", json!({"bot": bot, "newest": true, "limit": 8}))
                     .await
                 {
-                    Ok(page) => page["bots"][0]["running_turn"].as_i64(),
+                    Ok(page) => (page["turns"].as_array().into_iter().flatten())
+                        .filter(|turn| !ENDED.contains(&turn["status"].as_str().unwrap_or("")))
+                        .filter_map(|turn| turn["turn"].as_i64())
+                        .collect(),
                     Err(error) => {
                         heard &= !lost(&error);
-                        None
+                        Vec::new()
                     }
                 },
-                turn => Some(turn),
+                turn => vec![turn],
             };
-            if let Some(turn) = turn
-                && let Err(error) = client
+            for turn in turns {
+                if let Err(error) = client
                     .request("interrupt", json!({"bot": bot, "turn": turn}))
                     .await
-            {
-                heard &= !lost(&error);
+                {
+                    heard &= !lost(&error);
+                }
             }
         }
         (live.len(), heard)
