@@ -613,14 +613,12 @@ impl Registry {
     }
 
     /// End terminal `handle`, as a pull of the cord does; its end is told
-    /// on its handle.
-    pub fn end_terminal(&self, handle: i64) {
+    /// on its handle. Whether there was one to end.
+    pub fn end_terminal(&self, handle: i64) -> bool {
         let terminal = (self.terminals.lock().unwrap_or_else(|e| e.into_inner()))
             .get(&handle)
             .cloned();
-        if let Some(terminal) = terminal {
-            terminal.kill();
-        }
+        terminal.map(|terminal| terminal.kill()).is_some()
     }
 
     /// Let terminal `handle` go once its handle's result is recorded; it
@@ -984,7 +982,8 @@ mod tests {
         // terminal, not to its place among background commands.
         assert!(!registry.stop(10));
         assert!(registry.terminals.lock().unwrap().contains_key(&10));
-        registry.end_terminal(10);
+        // Which a kill that missed its place finds, and ends.
+        assert!(registry.end_terminal(10));
     }
 
     #[tokio::test]

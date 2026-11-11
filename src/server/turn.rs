@@ -6189,8 +6189,11 @@ async fn stop_handle(
                 return Ok(Some(Some(ended)));
             }
             // Marked seen first: once killed, its end is recorded as it
-            // comes, untold.
-            if db.runs_for(&bot, handle)? && registry.stop(handle) {
+            // comes, untold. A lifted terminal that started since the kill
+            // looked for it has given up its place for its own: ended so.
+            if db.runs_for(&bot, handle)?
+                && (registry.stop(handle) || registry.end_terminal(handle))
+            {
                 db.saw_end(handle)?;
                 return Ok(Some(None));
             }

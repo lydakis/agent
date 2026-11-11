@@ -1208,11 +1208,15 @@ impl Delivery {
 /// index, which holds only what is untold in the whole store, keyed by
 /// bot and id: the first ?2 in order, read where they sit and no further,
 /// never through the bot's history or other bots' commands. Only how each
-/// ended (the fields of `ended_as`), never its output.
+/// ended (the fields of `ended_as`), never a command's output; a lifted
+/// call's output comes as its first page, and one whose result is its
+/// tool's own fields comes as those, without its pictures.
 const UNTOLD: &str = "SELECT p.id,p.result->'$.exit_code',p.result->'$.success',
      p.result->'$.timed_out',p.result->'$.signal',p.result->'$.wall_time_ms',
      p.result->'$.error',substr(p.result->>'$.detail',1,97),substr(p.result->>'$.answer',1,2049),
-     CASE WHEN p.call IS NOT NULL THEN substr(p.result->>'$.output',1,2049) END
+     CASE WHEN p.call IS NOT NULL THEN substr(COALESCE(p.result->>'$.output',
+      CASE WHEN p.result->'$.exit_code' IS NULL AND p.result->'$.error' IS NULL
+       AND p.result->'$.answer' IS NULL THEN json_remove(p.result,'$.parts') END),1,2049) END
      FROM processes p INDEXED BY processes_untold
      WHERE p.bot=?1 AND p.told IS NULL AND p.delivered IS NULL AND p.status<>'running'
      ORDER BY p.id LIMIT ?2";

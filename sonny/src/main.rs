@@ -3889,9 +3889,10 @@ struct App {
     /// The calls below that were looked up, by bot, turn and call: one
     /// the listing no longer held is not looked up again.
     raised_read: std::collections::BTreeSet<(String, i64, String)>,
-    /// Calls Esc set aside, by bot and call: the keys type again, and
-    /// Enter on an empty composer brings them back.
-    calls_aside: std::collections::HashSet<(String, String)>,
+    /// Calls Esc set aside, by bot, turn and call: the keys type again,
+    /// and Enter on an empty composer brings them back. A later turn's
+    /// call of the same id is another.
+    calls_aside: std::collections::HashSet<(String, i64, String)>,
     /// The lead's open questions for the person, oldest first: its `ask`
     /// calls not yet answered, nor set aside, and its tasks' open ones,
     /// pinned here as they come ([`App::pin_task_asks`]).
@@ -11040,12 +11041,9 @@ impl App {
                 self.raised_read.insert(read.clone());
             }
         }
-        let waiting: std::collections::HashSet<(String, String)> =
+        let waiting: std::collections::HashSet<(String, i64, String)> =
             (self.approvals.iter().chain(&self.raised))
-                .map(|call| {
-                    let (bot, _, call) = key(call);
-                    (bot, call)
-                })
+                .map(|call| self.aside_key(call))
                 .collect();
         self.calls_aside.retain(|call| waiting.contains(call));
     }
@@ -11058,9 +11056,17 @@ impl App {
 
     /// Whether Esc set `call` aside.
     fn set_aside(&self, call: &Value) -> bool {
-        let bot = call["bot"].as_str().unwrap_or(&self.bot);
-        let id = call["call_id"].as_str().unwrap_or_default();
-        (self.calls_aside.iter()).any(|(of, aside)| of == bot && aside == id)
+        self.calls_aside.contains(&self.aside_key(call))
+    }
+
+    /// The bot, turn and call `call` is set aside by: this window's own
+    /// unless it names another bot.
+    fn aside_key(&self, call: &Value) -> (String, i64, String) {
+        (
+            call["bot"].as_str().unwrap_or(&self.bot).to_owned(),
+            call["turn"].as_i64().unwrap_or(-1),
+            call["call_id"].as_str().unwrap_or_default().to_owned(),
+        )
     }
 
     /// How many calls wait on the person here, and of those how many Esc
@@ -12790,13 +12796,9 @@ impl App {
                     // typing again, then an open question, as their hints
                     // say.
                     KeyCode::Esc if self.waiting().is_some() => {
-                        let aside: Vec<(String, String)> = (self.approvals.iter())
+                        let aside: Vec<(String, i64, String)> = (self.approvals.iter())
                             .chain(&self.raised)
-                            .map(|call| {
-                                let bot = call["bot"].as_str().unwrap_or(&self.bot);
-                                let id = call["call_id"].as_str().unwrap_or_default();
-                                (bot.to_owned(), id.to_owned())
-                            })
+                            .map(|call| self.aside_key(call))
                             .collect();
                         self.calls_aside.extend(aside);
                     }
@@ -21478,6 +21480,21 @@ mod tests {
         assert_eq!(sent["op"], "configure");
         assert_eq!(sent["declare"], json!(declared::tools(served::Role::TASK)));
         assert!(app.declare.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_later_turns_call_of_a_set_aside_id_still_waits() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let key = |code: KeyCode| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        // A call a message lifted, set aside with Esc.
+        app.approvals
+            .push(json!({"turn": 1, "call_id": "c1", "name": "shell", "handle": "proc:4"}));
+        app.key(key(KeyCode::Esc)).await;
+        assert!(app.waiting().is_none());
+        // A later turn's call of the same id was never set aside.
+        app.approvals
+            .push(json!({"turn": 2, "call_id": "c1", "name": "shell"}));
+        assert_eq!(app.waiting().unwrap()["turn"], 2);
     }
 
     #[tokio::test]

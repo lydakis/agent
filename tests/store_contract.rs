@@ -19062,6 +19062,19 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
         &[],
     )
     .unwrap();
+    // Its bot at rest is told it ended with its tool's own fields, as its
+    // turn would have read them.
+    db.tell_finished("Bob").unwrap();
+    let told = db.turns("Bob", 0, None, 16, false).unwrap();
+    let prompts: Vec<&str> = (told["turns"].as_array().unwrap().iter())
+        .filter_map(|t| t["prompt_preview"].as_str())
+        .collect();
+    assert!(
+        prompts
+            .iter()
+            .any(|p| p.contains(&format!("proc:{p1}")) && p.contains("gone")),
+        "{prompts:?}"
+    );
     assert!(db.lifted_waiting().unwrap().is_empty());
     assert_eq!(
         db.approvals(Some("Bob"), None, 0, None, 64).unwrap()["approvals"],
