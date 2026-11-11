@@ -18957,6 +18957,8 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
             .collect::<Vec<_>>()
     );
     assert_eq!(db.lifted_waiting().unwrap().len(), 3);
+    // Waiting, none runs anything: the daemon may exit idle.
+    assert_eq!(db.running_processes().unwrap(), 0);
     assert_eq!(
         db.process_result(p1).unwrap().map(|(status, _)| status),
         Some("running".into())
@@ -18987,6 +18989,8 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
     let Lifted::Run(run) = db.lifted_check(p1, now, false).unwrap() else {
         panic!("an allowed call did not run");
     };
+    // Run, it is a command that runs.
+    assert_eq!(db.running_processes().unwrap(), 1);
     assert_eq!(
         (
             run.process,

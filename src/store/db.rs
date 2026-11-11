@@ -11748,9 +11748,14 @@ impl Database {
         }
         Ok(())
     }
+    /// How many commands run now: a call a message lifted that still
+    /// waits for its verdict or its client's answer runs nothing here, and
+    /// outlives a restart, so it is not one.
     pub fn running_processes(&self) -> Result<i64> {
         Ok(self.conn.query_row(
-            "SELECT count(*) FROM processes WHERE status='running'",
+            "SELECT count(*) FROM processes p WHERE p.status='running'
+             AND NOT EXISTS (SELECT 1 FROM approvals a WHERE a.process=p.id)
+             AND NOT EXISTS (SELECT 1 FROM answers w WHERE w.process=p.id)",
             [],
             |r| r.get(0),
         )?)

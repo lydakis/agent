@@ -427,10 +427,7 @@ impl Registry {
             }
             // Nor does one the daemon's stop came before.
             if *self.stopping.borrow() {
-                return Err(Error::with(
-                    "daemon_shutdown",
-                    "the daemon was stopping before this command started, so it did not run",
-                ));
+                return Err(super::not_started_by_shutdown());
             }
             let (master, slave) = open()?;
             let mut process = sh(

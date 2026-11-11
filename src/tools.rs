@@ -2528,7 +2528,7 @@ impl Registry {
     /// The pull cord as it is now, for a start decided now that runs
     /// later: one the cord was pulled before does not start.
     pub fn cord(&self) -> Cord {
-        Cord(self.pulls.subscribe())
+        Cord(self.pulls.subscribe(), self.stopping.subscribe())
     }
 
     /// End every background command, terminal and detached command this
@@ -2600,9 +2600,10 @@ impl Drop for Stoppable {
     }
 }
 
-/// The pull cord as it was when a start was decided.
+/// The pull cord as it was when a start was decided, and whether the
+/// daemon is stopping.
 #[derive(Clone)]
-pub struct Cord(watch::Receiver<u64>);
+pub struct Cord(watch::Receiver<u64>, watch::Receiver<bool>);
 
 impl Cord {
     /// Whether the cord was pulled since.
@@ -2610,19 +2611,23 @@ impl Cord {
         self.0.has_changed().unwrap_or(true)
     }
 
-    /// Refuse a start the cord was pulled before.
+    /// Refuse a start the cord was pulled before, or the daemon's stop
+    /// came before.
     pub fn check(&self) -> Result<()> {
-        match self.pulled() {
-            true => Err(Error::with(
+        if self.pulled() {
+            return Err(Error::with(
                 "daemon_paused",
                 "the pause came before this command started, so it did not run; nothing has run it since. Work has since resumed",
-            )),
+            ));
+        }
+        match *self.1.borrow() {
+            true => Err(not_started_by_shutdown()),
             false => Ok(()),
         }
     }
 
-    /// `run`, not begun when the cord was pulled before, and ended as it
-    /// is pulled, as a background command is.
+    /// `run`, not begun when the cord was pulled or the daemon's stop came
+    /// before, and ended as either comes, as a background command is.
     pub async fn until_pulled<F>(mut self, run: F) -> Result<Outcome>
     where
         F: Future<Output = Result<Outcome>>,
@@ -2631,9 +2636,26 @@ impl Cord {
         tokio::select! {
             biased;
             Ok(()) = self.0.changed() => Err(stopped_by_pause()),
+            Ok(_) = self.1.wait_for(|stopping| *stopping) => Err(stopped_by_shutdown()),
             result = run => result,
         }
     }
+}
+
+/// How a command the daemon's stop came before answers.
+pub(crate) fn not_started_by_shutdown() -> Error {
+    Error::with(
+        "daemon_shutdown",
+        "the daemon was stopping before this command started, so it did not run",
+    )
+}
+
+/// How a command the daemon's stop ended answers.
+fn stopped_by_shutdown() -> Error {
+    Error::with(
+        "daemon_shutdown",
+        "the daemon stopped this command before it finished, so it may have had effects; nothing has run it again",
+    )
 }
 
 /// How a command the pull cord ended answers. Nothing reruns it; the agent
@@ -3409,6 +3431,31 @@ mod tests {
         registry.end_running();
         let ended = running.await.unwrap().unwrap_err();
         assert_eq!(ended.code, "daemon_paused");
+    }
+    #[tokio::test]
+    async fn the_daemons_stop_refuses_a_start_and_ends_a_run() {
+        let registry = Registry::new("shell").unwrap();
+        let running = tokio::spawn(registry.cord().until_pulled(std::future::pending()));
+        tokio::task::yield_now().await;
+        registry.end_background();
+        let ended = running.await.unwrap().unwrap_err();
+        assert_eq!(ended.code, "daemon_shutdown");
+        assert!(
+            ended
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("may have had effects")
+        );
+        let refused = registry.cord().check().unwrap_err();
+        assert_eq!(refused.code, "daemon_shutdown");
+        assert!(
+            refused
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("did not run")
+        );
     }
     #[tokio::test]
     async fn a_run_killed_before_it_is_first_polled_never_begins() {
