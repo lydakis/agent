@@ -30,6 +30,9 @@ pub enum Slot {
     Needs,
     Failed,
     Working,
+    /// The agents at rest, and those marked done: the first to go.
+    Idle,
+    Done,
     Background,
     Notes,
     /// The context while under half of it is used: good to know.
@@ -46,7 +49,9 @@ impl Slot {
 
 /// The order things give way: each step takes that item to its next
 /// form, and a step for an item absent or at its last form is passed.
-const LADDER: [Slot; 13] = [
+const LADDER: [Slot; 15] = [
+    Slot::Done,
+    Slot::Idle,
     Slot::Folded,
     Slot::Access,
     Slot::Place,

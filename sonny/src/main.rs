@@ -522,6 +522,9 @@ struct StatusView<'a> {
     turn_model: Option<&'a str>,
     places: mux::Places,
     aside: &'a (dyn Fn(&str) -> bool + Sync),
+    /// Each row's details, its profile and what follows it; with none
+    /// only where each agent stands is read, as the footer counts it.
+    details: bool,
 }
 
 /// What `/status` read: its rows, what waits on the person, and which
@@ -557,9 +560,12 @@ async fn read_status(
         lead,
         glob: pattern,
     } = scope;
-    let behind = background::read(options_store, client.store(), turns, |bot| {
-        lookout::subs::matches(&pattern, bot)
-    });
+    let behind = match view.details {
+        true => background::read(options_store, client.store(), turns, |bot| {
+            lookout::subs::matches(&pattern, bot)
+        }),
+        false => Vec::new(),
+    };
     // Every page of the listing: past the first 256, agents are the
     // project's too.
     let mut listed = Vec::new();
@@ -593,7 +599,10 @@ async fn read_status(
     let store = agent_client::socket::canonical_store(options_store)
         .unwrap_or_else(|_| options_store.to_path_buf());
     // Each source's icon, as the settings give it now.
-    let icons = background::source_icons();
+    let icons = match view.details {
+        true => background::source_icons(),
+        false => HashMap::new(),
+    };
     let mut rows = Vec::new();
     // Each lead's project file read once a refresh; a task's profile
     // is the one noted when it started.
@@ -780,6 +789,7 @@ async fn read_status(
         // A folder's own lead profile is read once; a lead made in a
         // role of its own by `/new` keeps that.
         let profile = match project::is_lead(name) {
+            _ if !view.details => None,
             true => project::chosen(&store, name).or_else(|| {
                 let folder = bot["workspace"].as_str().unwrap_or("").to_owned();
                 (profiles.entry(folder))
@@ -2233,6 +2243,7 @@ fn status_cli(args: &[String]) -> Result<(), String> {
             turn_model: None,
             places: Default::default(),
             aside: &|_| false,
+            details: true,
         };
         let (mut latest, mut asks) = (HashMap::new(), HashMap::new());
         let kept = agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
@@ -3581,6 +3592,53 @@ type Reads = (
     HashMap<String, (i64, Seen)>,
 );
 
+/// What the footer's count of the agents found: the mark of where they
+/// stood, and, when that had changed, the counts with the reads made.
+struct Counted {
+    mark: u64,
+    read: Option<(status::Counts, Reads)>,
+}
+
+/// A mark of where the agents `pattern` names stand, as the daemon lists
+/// them, and of what waits on the person: what decides each one's group,
+/// and a running one's history, whose newest items can hold a question.
+/// `here` is this window's own open question and calls. None when the
+/// daemon could not be asked.
+async fn standing(client: &Client, pattern: &str, here: (usize, usize)) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut mark = std::collections::hash_map::DefaultHasher::new();
+    here.hash(&mut mark);
+    let mut after: Option<String> = None;
+    loop {
+        let mut ask = json!({"name": pattern, "limit": 256});
+        if let Some(after) = &after {
+            ask["after"] = json!(after);
+        }
+        let page = client.request("bots", ask).await.ok()?;
+        for bot in page["bots"].as_array().into_iter().flatten() {
+            for key in [
+                "name",
+                "running_turn",
+                "status",
+                "waiting_on",
+                "last",
+                "expire_ms",
+            ] {
+                bot[key].to_string().hash(&mut mark);
+            }
+            if !bot["running_turn"].is_null() {
+                bot["head"].to_string().hash(&mut mark);
+            }
+        }
+        match page["next_after"].as_str() {
+            Some(next) if after.as_deref() != Some(next) => after = Some(next.to_owned()),
+            _ => break,
+        }
+    }
+    needs::listing(client, None).await.ok().hash(&mut mark);
+    Some(mark.finish())
+}
+
 enum Warming {
     Running(tokio::task::JoinHandle<Option<Reads>>),
     Done,
@@ -3841,9 +3899,6 @@ struct App {
     /// Where the person's reactions to the bot are kept, once its id is
     /// known.
     reactions_key: Option<String>,
-    /// This agent's store-wide id, which the bots it made carry as
-    /// `created_by_id`.
-    bot_id: Option<i64>,
     /// Esc set the questions aside: what is typed is a message of its own.
     chatting: bool,
     /// The waiting call whose whole command was last written out.
@@ -4056,8 +4111,15 @@ struct App {
     /// The tasks this agent started that have a turn running, as the
     /// daemon says without windows for the project's agents; and when
     /// they were last read.
-    tasks_running: Option<std::collections::HashSet<String>>,
-    tasks_running_read: Option<Instant>,
+    /// How many of the project's agents each of `/status`'s groups lists,
+    /// as its last read found: what the footer shows.
+    counts: Option<status::Counts>,
+    /// The footer's own read of them, under way, and when the last began.
+    counting: Option<tokio::task::JoinHandle<Option<Counted>>>,
+    counted_at: Option<Instant>,
+    /// What the listing said where each agent stands, when last counted:
+    /// the agents are counted again only once it changes.
+    counted_mark: Option<u64>,
     folded: Option<(bool, u64)>,
     refold: bool,
     /// The `plan` calls drawn, by the number each is tagged with, and the
@@ -5621,7 +5683,6 @@ impl App {
             task_asks_read: None,
             done_read: None,
             task_needs: Default::default(),
-            bot_id: record["bot_id"].as_i64(),
             reactions_key: record["bot_id"].as_i64().map(|id| {
                 let store =
                     std::fs::canonicalize(&options.store).unwrap_or_else(|_| options.store.clone());
@@ -5719,8 +5780,10 @@ impl App {
             marked: HashMap::new(),
             references: HashMap::new(),
             references_read: None,
-            tasks_running: None,
-            tasks_running_read: None,
+            counts: None,
+            counting: None,
+            counted_at: None,
+            counted_mark: None,
             folded: None,
             refold: false,
             plans: HashMap::new(),
@@ -6086,7 +6149,7 @@ impl App {
             self.raise_approvals().await;
             self.recheck_task_answers().await;
             self.settle_task_asks().await;
-            self.read_running_tasks().await;
+            self.count_agents().await;
             self.read_references().await;
             self.read_names().await;
             self.warm_reads().await;
@@ -8557,37 +8620,61 @@ impl App {
         }
     }
 
-    /// The tasks this agent started with a turn running, read every few
-    /// seconds where no windows for the project's agents say it.
-    async fn read_running_tasks(&mut self) {
-        if self.fleet.is_some()
-            || self.bot_id.is_none()
-            || (self.tasks_running_read).is_some_and(|at| at.elapsed() < Duration::from_secs(3))
+    /// The project's agents counted as `/status` counts them, for the
+    /// footer: off the screen's thread, at most every few seconds, and
+    /// read whole only once where any agent stands changed (its turn,
+    /// what it waits on, a running one's history) or what waits on the
+    /// person did. While `/status` is open, its own reads count them.
+    async fn count_agents(&mut self) {
+        if let Some(job) = self.counting.take_if(|job| job.is_finished())
+            && let Ok(Some(counted)) = job.await
+        {
+            self.counted_mark = Some(counted.mark);
+            if let Some((counts, (latest, seen))) = counted.read {
+                self.counts = Some(counts);
+                self.status_read = latest;
+                self.asks_seen = seen;
+            }
+        }
+        if self.counting.is_some()
+            || (self.counted_at).is_some_and(|at| at.elapsed() < Duration::from_secs(3))
         {
             return;
         }
-        self.tasks_running_read = Some(Instant::now());
-        // Every page of them, or the count stays as it was.
-        let mut running = std::collections::HashSet::new();
-        let mut after = Value::Null;
-        loop {
-            let asked = json!({"active": true, "created_by_id": self.bot_id,
-                "limit": 256, "after": after});
-            let Ok(page) = self.client.request("bots", asked).await else {
-                return;
-            };
-            running.extend(
-                (page["bots"].as_array().into_iter().flatten())
-                    // Its side chats lapse, and are no tasks.
-                    .filter(|bot| bot["expire_ms"].is_null())
-                    .filter_map(|bot| bot["name"].as_str().map(str::to_owned)),
-            );
-            after = page["next_after"].clone();
-            if !after.is_string() {
-                break;
+        self.counted_at = Some(Instant::now());
+        let (client, woken) = (self.client.clone(), self.woken.clone());
+        let (store, scope, bot) = (self.options.store.clone(), self.scope(), self.bot.clone());
+        let (asks, approvals) = (self.asks.clone(), self.approvals.clone());
+        let (mut latest, mut seen) = (self.status_read.clone(), self.asks_seen.clone());
+        let (was, turns) = (self.counted_mark, self.turns.clone());
+        // This window's own question and calls count for its own row.
+        let here = (
+            asks.iter().filter(|ask| ask.task.is_none()).count(),
+            approvals.len(),
+        );
+        self.counting = Some(tokio::spawn(async move {
+            let mark = standing(&client, &scope.glob, here).await?;
+            if was == Some(mark) {
+                return Some(Counted { mark, read: None });
             }
-        }
-        self.tasks_running = Some(running);
+            let view = StatusView {
+                bot: &bot,
+                asks: &asks,
+                approvals: &approvals,
+                turn_model: None,
+                places: Default::default(),
+                aside: &|_| false,
+                details: false,
+            };
+            let read = read_status(&client, &store, scope, &turns, &mut latest, &mut seen, view)
+                .await
+                .ok()?;
+            woken.notify_one();
+            Some(Counted {
+                mark,
+                read: Some((status::counts(&read.rows), (latest, seen))),
+            })
+        }));
     }
 
     /// What `bot` did since `reference` was last read of its note `id`,
@@ -10541,6 +10628,7 @@ impl App {
             turn_model: self.turn_model.as_deref(),
             places: fleet.map(|fleet| fleet.layout.places()).unwrap_or_default(),
             aside: &|name| fleet.is_some_and(|fleet| fleet.layout.aside(name)),
+            details: true,
         };
         let read = read_status(
             &self.client,
@@ -10552,6 +10640,7 @@ impl App {
             view,
         )
         .await?;
+        self.counts = Some(status::counts(&read.rows));
         // The windows' names and the footer say what this read, as it is
         // newer than what they had. A running agent's question is read
         // from its last few items here, so its events keep theirs.
@@ -10588,6 +10677,7 @@ impl App {
                         turn_model: None,
                         places: Default::default(),
                         aside: &|_| false,
+                        details: true,
                     };
                     let turns = HashMap::new();
                     let read =
@@ -11662,53 +11752,6 @@ impl App {
             context: self.context,
             window: self.window,
         }
-    }
-
-    /// The other agents at work, and how many agents wait on the person:
-    /// this one, with a question or a call of its open here, the others
-    /// as their windows' names say ([`Fleet::settle`]), and those of the
-    /// leads followed ([`Fleet::raised`]). Without windows for
-    /// the project's agents, the tasks this one started: those running as
-    /// the daemon says, drawn or not, and those that need the person as
-    /// their rosters read them.
-    fn agents(&self) -> (usize, usize) {
-        let doing: HashMap<&str, &str> = match &self.fleet {
-            Some(fleet) => (fleet.doing.iter())
-                .map(|(bot, doing)| (bot.as_str(), *doing))
-                .collect(),
-            None => {
-                let rostered = (self.tasks.values().flatten())
-                    .map(|task| (task.bot.as_str(), task.state.as_str()));
-                match &self.tasks_running {
-                    Some(running) => (running.iter())
-                        .map(|bot| (bot.as_str(), "working"))
-                        .chain(rostered.filter(|(_, state)| *state == "needs you"))
-                        .collect(),
-                    None => rostered.collect(),
-                }
-            }
-        };
-        let count = |state: &str| {
-            (doing.iter())
-                .filter(|(bot, doing)| **bot != self.bot && **doing == state)
-                .count()
-        };
-        // Its transcript read only so far back, the fleet's read of its
-        // history may hold a question this window does not.
-        // Its tasks' questions pinned here count as theirs.
-        let here = self.asks.iter().any(|ask| ask.task.is_none())
-            || !self.approvals.is_empty()
-            || (self.fleet.as_ref()).is_some_and(|fleet| fleet.needs.waits(&self.bot));
-        // Those of the leads followed wait here too, though no tab is theirs.
-        let raised = (self.fleet.as_ref()).map_or(0, |fleet| {
-            (fleet.raised.iter())
-                .filter(|bot| fleet.needs.waits(bot))
-                .count()
-        });
-        (
-            count("working"),
-            usize::from(here) + count("needs you") + raised,
-        )
     }
 
     /// A button clicked: what Sonny does for it now, or once the loop
@@ -16015,9 +16058,11 @@ impl App {
                 .opens("switch"),
             );
         }
-        let (working, waiting) = self.agents();
-        // Marks as the roster and /status draw them, each with its number,
-        // so the counts read without colour.
+        // The four counts `/status` heads its page with, as it counts
+        // them, each a mark as its rows draw it with its number: what
+        // needs the person, what works, what rests, what is done.
+        let counts = self.counts.unwrap_or_default();
+        let (working, waiting) = (counts.working, counts.needs_you);
         // Something new to answer beats the count a few times, reversed,
         // then it holds still (F12).
         let mut pulse = self.needs_pulse.get();
@@ -16071,6 +16116,15 @@ impl App {
         if working > 0 {
             let forms = footer::count("●", Color::Cyan, working, true);
             items.push(Item::new(Slot::Working, forms).opens("status"));
+        }
+        if counts.idle > 0 {
+            let forms = footer::count("✓", Color::Green, counts.idle, true);
+            items.push(Item::new(Slot::Idle, forms).opens("status"));
+        }
+        if counts.done > 0 {
+            let n = counts.done;
+            let forms = vec![vec![Span::raw(format!("✓ {n}")).dim()], Vec::new()];
+            items.push(Item::new(Slot::Done, forms).opens("status"));
         }
         // Something runs for it with no one typing: /background lists it.
         if self.behind.0 > 0 && !glancing {
@@ -18170,7 +18224,72 @@ mod tests {
         let fleet = app.fleet.as_ref().unwrap();
         assert_eq!(fleet.doing["shop.fix"], "needs you");
         assert_eq!(fleet.doing["shop.web"], "working");
-        assert_eq!(app.agents(), (1, 1));
+        // The footer counts as /status's head does: the lead rests.
+        let counts = status::Counts {
+            needs_you: 1,
+            working: 1,
+            idle: 1,
+            done: 0,
+        };
+        assert_eq!(app.counts, Some(counts));
+    }
+
+    #[tokio::test]
+    async fn the_footer_counts_as_status_does_and_reads_again_only_on_a_change() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let listings = Arc::new(AtomicUsize::new(0));
+        let ended = Arc::new(AtomicBool::new(false));
+        let (listed, over) = (listings.clone(), ended.clone());
+        let client = daemon_answering(move |asked| match asked["op"].as_str().unwrap_or("") {
+            "bots" => {
+                listed.fetch_add(1, Ordering::SeqCst);
+                let fix = match over.load(Ordering::SeqCst) {
+                    false => json!({"name": "shop.fix", "bot_id": 2, "head": 1,
+                        "running_turn": 4, "status": "running", "created_by": "shop.lead"}),
+                    true => json!({"name": "shop.fix", "bot_id": 2, "head": 2,
+                        "last": {"turn": 4, "status": "completed"}, "created_by": "shop.lead"}),
+                };
+                json!({"bots": [
+                    {"name": "shop.lead", "bot_id": 1, "head": 1},
+                    fix,
+                    // A helper of the task folds under it, as on /status.
+                    {"name": "shop.fix.help", "bot_id": 3, "head": 1, "running_turn": 2,
+                        "status": "running", "created_by": "shop.fix"},
+                ], "next_after": null})
+            }
+            "approvals" => json!({"approvals": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        let counted = async |app: &mut App| {
+            app.counted_at = None;
+            app.count_agents().await;
+            while !app.counting.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+            app.counted_at = None;
+            app.count_agents().await;
+        };
+        counted(&mut app).await;
+        let counts = |needs_you, working, idle| status::Counts {
+            needs_you,
+            working,
+            idle,
+            done: 0,
+        };
+        assert_eq!(app.counts, Some(counts(0, 1, 1)));
+        // Its mark, then the read itself.
+        assert_eq!(listings.load(Ordering::SeqCst), 2);
+        // Nothing changed: only the mark is read.
+        counted(&mut app).await;
+        assert_eq!(listings.load(Ordering::SeqCst), 3);
+        // The task's turn ended: read again, and counted at rest.
+        ended.store(true, Ordering::SeqCst);
+        counted(&mut app).await;
+        assert_eq!(listings.load(Ordering::SeqCst), 5);
+        assert_eq!(app.counts, Some(counts(0, 0, 2)));
     }
 
     #[tokio::test]
@@ -19266,6 +19385,10 @@ mod tests {
     async fn a_new_question_beats_the_footer_count_and_then_it_holds() {
         let mut app = app_in_zen(zen_daemon().await);
         app.history().await;
+        app.counts = Some(status::Counts {
+            needs_you: 1,
+            ..Default::default()
+        });
         let mark = |app: &App| {
             let (line, _) = app.footer(60);
             let span = (line.spans.into_iter()).find(|span| span.content == "?");
@@ -19285,6 +19408,12 @@ mod tests {
     async fn in_zen_the_footer_counts_only_what_needs_the_person() {
         let mut app = app_in_zen(zen_daemon().await);
         app.history().await;
+        app.counts = Some(status::Counts {
+            needs_you: 1,
+            working: 2,
+            idle: 3,
+            done: 4,
+        });
         let (footer, counter) = app.footer(60);
         let footer = footer.to_string();
         assert!(footer.starts_with("  zen · the rounding"), "{footer}");
@@ -22932,13 +23061,7 @@ mod tests {
             fleet.rescan().await;
         }
         assert_eq!(fleet.doing["calc.ask"], "needs you");
-        // The footer counts what the tabs say, this agent's own aside.
-        let mut app = app(client);
-        app.bot = "calc.lead".into();
-        app.fleet = Some(fleet);
-        assert_eq!(app.agents(), (0, 3));
         // The call answered, the task works on.
-        let fleet = app.fleet.as_mut().unwrap();
         fleet.event(&event(
             "calc.fix",
             "step_decided",
@@ -22946,7 +23069,6 @@ mod tests {
             json!({"call_id": "c1"}),
         ));
         assert_eq!(fleet.doing["calc.fix"], "working");
-        assert_eq!(app.agents(), (1, 2));
     }
 
     #[tokio::test]
@@ -23251,8 +23373,6 @@ mod tests {
         app.fleet = Some(fleet);
         app.raise_approvals().await;
         assert_eq!(app.raised.len(), 1);
-        // The footer counts it among what needs the person.
-        assert_eq!(app.agents(), (0, 1));
         app.show_asked();
         let text = |lines: &[Line]| -> Vec<String> {
             (lines.iter())
@@ -24128,30 +24248,16 @@ mod tests {
         use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = app(daemon_answering(|_| json!({})).await);
         app.model = "opus".into();
-        // Nothing counted while nothing runs or waits.
+        // Nothing counted before the agents were.
         let (line, opens) = app.footer(100);
         assert!(opens.is_empty() && !line.to_string().contains('●'));
-        let ask = |id: &str| {
-            asks::call(
-                id,
-                &json!({"question": "Merge?", "options": [
-                {"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]}),
-            )
-            .unwrap()
-        };
-        app.asks = vec![ask("c1"), ask("c2")];
-        // With no windows for them, the tasks started, as their roster reads them.
-        let task = |name: &str, state: &str| started::Task {
-            bot: format!("calc.{name}"),
-            name: name.into(),
-            brief: "b".into(),
-            state: state.into(),
-        };
-        // Agents are counted: this one once, however many it asked.
-        app.tasks
-            .insert(0, vec![task("add", "working"), task("neg", "needs you")]);
-        app.tasks
-            .insert(1, vec![task("add", "working"), task("div", "working")]);
+        // The four counts /status heads its page with, marks only.
+        app.counts = Some(status::Counts {
+            needs_you: 2,
+            working: 3,
+            idle: 13,
+            done: 4,
+        });
         let (line, opens) = app.footer(100);
         let text = line.to_string();
         let shown: Vec<(String, &str)> = (opens.iter())
@@ -24165,20 +24271,36 @@ mod tests {
             .collect();
         assert_eq!(
             shown,
-            [("? 2".to_owned(), "status"), ("● 2".to_owned(), "status")]
+            [
+                ("? 2".to_owned(), "status"),
+                ("● 3".to_owned(), "status"),
+                ("✓ 13".to_owned(), "status"),
+                ("✓ 4".to_owned(), "status"),
+            ]
         );
         // The agent's name is the composer's to say, not the footer's.
-        assert!(text.ends_with("  ? 2  ● 2  "), "{text}");
+        assert!(text.ends_with("  ? 2  ● 3  ✓ 13  ✓ 4  "), "{text}");
         assert!(!text.contains(&app.bot), "{text}");
         assert_eq!(text.width(), 100);
+        // Narrow, done goes first, then idle; what needs the person stays.
+        let narrow = app.footer(44).0.to_string();
+        assert!(
+            narrow.contains("? 2") && !narrow.contains("✓ 4"),
+            "{narrow}"
+        );
         let counter = opens[0].0.clone();
-        // Its marks and colors as a roster's: yellow ? for what needs the
-        // person, cyan ● at work.
+        // Its marks and colors as /status's rows: yellow ? for what needs
+        // the person, cyan ● at work, green ✓ at rest, and done dim.
         let marks: Vec<_> = (line.spans.iter())
-            .filter(|span| span.content == "●" || span.content == "?")
+            .filter(|span| ["?", "●", "✓"].contains(&&*span.content))
             .map(|span| span.style.fg)
             .collect();
-        assert_eq!(marks, [Some(Color::Yellow), Some(Color::Cyan)]);
+        assert_eq!(
+            marks,
+            [Some(Color::Yellow), Some(Color::Cyan), Some(Color::Green)]
+        );
+        let done = (line.spans.iter()).find(|span| span.content == "✓ 4");
+        assert!(done.is_some_and(|span| span.style.add_modifier.contains(Modifier::DIM)));
         app.opens_at = vec![(
             20,
             10 + counter.start..10 + counter.end,
@@ -24282,41 +24404,6 @@ mod tests {
             )))
         );
         assert_eq!(marks.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn the_footer_counts_tasks_at_work_whose_rosters_are_not_drawn() {
-        let client = daemon_answering(|asked| {
-            assert_eq!(asked["active"], true);
-            // The daemon keeps to this agent's own tasks.
-            assert_eq!(asked["created_by_id"], 7);
-            // Two pages of them.
-            match asked["after"].as_str() {
-                None => json!({"next_after": "calc.ask", "bots": [
-                    {"name": "calc.add", "created_by": "calc"},
-                    {"name": "calc.ask", "created_by": "calc"}]}),
-                // A side chat of its own is no task.
-                Some(_) => json!({"next_after": null, "bots": [
-                    {"name": "calc.mul", "created_by": "calc"},
-                    {"name": "calc.side", "created_by": "calc", "expire_ms": 60000}]}),
-            }
-        })
-        .await;
-        let mut app = app(client);
-        app.bot = "calc".into();
-        app.bot_id = Some(7);
-        // Only one roster still drawn: its task needs the person.
-        app.tasks.insert(
-            0,
-            vec![started::Task {
-                bot: "calc.ask".into(),
-                name: "ask".into(),
-                brief: "b".into(),
-                state: "needs you".into(),
-            }],
-        );
-        app.read_running_tasks().await;
-        assert_eq!(app.agents(), (2, 1));
     }
 
     #[tokio::test]
