@@ -531,13 +531,17 @@ fn answers_of(dir: &Path) -> HashMap<String, Answer> {
 /// output tokens it cost this run.
 type Answer = (Value, bool, u64);
 
-fn journal_of(dir: &Path) -> (HashMap<String, Answer>, u64) {
+/// Also whether the journal's last line was cut short, so the next line
+/// written starts on a line of its own.
+fn journal_of(dir: &Path) -> (HashMap<String, Answer>, u64, bool) {
     let mut answers = HashMap::new();
     let mut spent = 0;
-    let text = std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
-    for line in text.lines() {
-        let Ok(mut entry) = serde_json::from_str::<Value>(line) else {
-            // A line cut short by a crash is no answer.
+    // Each line is read on its own, from bytes: a line a crash cut short,
+    // even inside a character, costs only that line.
+    let bytes = std::fs::read(dir.join("events.jsonl")).unwrap_or_default();
+    let cut = bytes.last().is_some_and(|last| *last != b'\n');
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let Ok(mut entry) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
         if entry["t"] != "agent" {
@@ -554,7 +558,7 @@ fn journal_of(dir: &Path) -> (HashMap<String, Answer>, u64) {
             (entry["value"].take(), earlier, tokens),
         );
     }
-    (answers, spent)
+    (answers, spent, cut)
 }
 
 /// The run kept in `dir`, read to go on.
@@ -562,12 +566,15 @@ fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
     let plan = read_plan(dir)?;
     let source = read_file(&dir.join("script.js"))?;
     let script = script::read(&source)?;
-    let (answers, spent) = journal_of(dir);
-    let journal = std::fs::OpenOptions::new()
+    let (answers, spent, cut) = journal_of(dir);
+    let mut journal = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .open(dir.join("events.jsonl"))
         .ok();
+    if cut && let Some(file) = journal.as_mut() {
+        let _ = file.write_all(b"\n");
+    }
     Ok(Arc::new(Run {
         script,
         dir: dir.to_owned(),
@@ -1564,10 +1571,13 @@ mod tests {
             json!({"t": "agent", "key": "k3", "value": {"a": 1}, "earlier": true, "output_tokens": 9}),
         ];
         let mut text: String = lines.iter().map(|l| format!("{l}\n")).collect();
-        // A line a crash cut short.
-        text.push_str("{\"t\": \"agent\", \"key\": \"k4\"");
-        std::fs::write(dir.join("events.jsonl"), text).unwrap();
-        let (answers, spent) = journal_of(&dir);
+        // A line a crash cut short inside a character.
+        let mut bytes = text.into_bytes();
+        bytes.extend_from_slice("{\"t\": \"agent\", \"key\": \"k4\", \"value\": \"é".as_bytes());
+        bytes.pop();
+        std::fs::write(dir.join("events.jsonl"), bytes).unwrap();
+        let (answers, spent, cut) = journal_of(&dir);
+        assert!(cut);
         assert_eq!(spent, 10);
         assert_eq!(answers["k1"], (json!("x"), false, 7));
         assert_eq!(answers["k2"], (Value::Null, false, 3));
@@ -1582,7 +1592,7 @@ mod tests {
             "max_agents": 1000, "at_once": 4}))
         .unwrap();
         make(&next, &plan, "export const meta = {}", Some(&dir)).unwrap();
-        let (answers, spent) = journal_of(&next);
+        let (answers, spent, _) = journal_of(&next);
         assert_eq!(spent, 0);
         assert_eq!(answers.len(), 2);
         assert!(
