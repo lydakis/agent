@@ -1968,6 +1968,49 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
+    /// The crypto-policies back-ends, links into the active policy's own
+    /// files elsewhere, are copied as the files they point at, and copied
+    /// again when the person switches policy, which points them anew.
+    #[test]
+    fn a_folder_of_links_is_copied_as_the_files_they_point_at() {
+        let base = std::env::temp_dir().join(format!("agent-sandbox-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let place = base.join("etc/crypto-policies/back-ends");
+        let copy = base.join("copies/etc/crypto-policies/back-ends");
+        let policies = base.join("usr/share/crypto-policies");
+        for (policy, ciphers) in [("DEFAULT", "aes256-gcm"), ("FUTURE", "chacha20")] {
+            std::fs::create_dir_all(policies.join(policy)).unwrap();
+            std::fs::write(
+                policies.join(policy).join("openssh.txt"),
+                format!("Ciphers {ciphers}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(&place).unwrap();
+        let point = |policy: &str| {
+            let _ = std::fs::remove_file(place.join("openssh.config"));
+            std::os::unix::fs::symlink(
+                policies.join(policy).join("openssh.txt"),
+                place.join("openssh.config"),
+            )
+            .unwrap();
+        };
+        point("DEFAULT");
+        // A link to nothing is left out, as a file it can't read.
+        std::os::unix::fs::symlink(base.join("gone"), place.join("nss.config")).unwrap();
+        assert!(copied(&place, &copy));
+        let config = copy.join("openssh.config");
+        assert!(std::fs::symlink_metadata(&config).unwrap().is_file());
+        let read = || std::fs::read_to_string(&config).unwrap();
+        assert_eq!(read(), "Ciphers aes256-gcm\n");
+        assert!(!copy.join("nss.config").exists());
+        // `update-crypto-policies --set FUTURE` points the link elsewhere.
+        point("FUTURE");
+        assert!(copied(&place, &copy));
+        assert_eq!(read(), "Ciphers chacha20\n");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     #[test]
     fn a_git_folder_given_as_a_root_keeps_what_git_runs() {
         let base = std::env::temp_dir().join(format!("agent-sandbox-git-{}", std::process::id()));
