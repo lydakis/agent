@@ -8,6 +8,7 @@ from pathlib import Path
 import queue
 import re
 import signal
+import socket
 import sqlite3
 import shutil
 import subprocess
@@ -2035,6 +2036,54 @@ class RuntimeTests(ModelFixture):
         results = call('w', 'wait', {'handles': [lifted, background]})['results']
         self.assertEqual((results[lifted]['stopped'], results[lifted]['ran']), (True, True), results)
         self.assertEqual(results[background]['error'], 'stopped', results)
+
+    def test_an_allowed_lifted_tool_stops_when_its_agent_kills_it(self):
+        # A page that never answers: the fetch runs until it is killed.
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(4)
+        self.addCleanup(listener.close)
+        url = f'http://127.0.0.1:{listener.getsockname()[1]}/slow'
+
+        def respond(request, user):
+            if not user.startswith('fetch:'):
+                return None
+            start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user'
+                        and not i['content'][0]['text'].startswith('steer:'))
+            outputs = [i['output'] for i in request['input'][start:] if i.get('type') == 'function_call_output']
+            if outputs:
+                return 'seen:' + outputs[-1]
+            return [['web_fetch', {'url': user[6:]}]]
+        self.model.respond = respond
+        client = self.client('web_fetch,write_stdin,wait')
+        client.request('create', bot='Bob', workspace=str(self.path), approve=['web_fetch'],
+                       approver='manual', tools=['web_fetch', 'write_stdin', 'wait'])
+
+        def call(request_id, name, arguments):
+            prompt = 'calls:' + json.dumps([[name, arguments]])
+            turn = client.request('submit', bot='Bob', request_id=request_id, prompt=prompt)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            return json.loads(poll(client, 'Bob', turn)['result']['text'][5:])
+
+        turn = client.request('submit', bot='Bob', request_id='f', prompt=f'fetch:{url}')['result']['turn']
+        asked = client.receive(lambda m: m.get('event') == 'approval_requested' and m.get('turn') == turn)
+        client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        lifted = json.loads(poll(client, 'Bob', turn)['result']['text'].removeprefix('seen:'))['handle']
+        waiting = asked['data']['calls'][0]
+        client.request('answer', bot='Bob', turn=turn, call_id=waiting['call_id'],
+                       request=waiting['request'], decision='allow', by='test')
+        ended = client.receive(lambda m: m.get('event') == 'lifted_ended' and m['data']['handle'] == lifted)
+        self.assertEqual(ended['data']['outcome'], 'allowed')
+        # It has asked for the page, which never comes.
+        listener.settimeout(10)
+        held, _ = listener.accept()
+        self.addCleanup(held.close)
+        # Running as its command, it stops as one does.
+        stopped = call('k', 'write_stdin', {'handle': lifted, 'kill': True})
+        self.assertEqual((stopped['stopped'], stopped['ran']), (True, True), stopped)
+        ended = call('w', 'wait', {'handles': [lifted]})['results'][lifted]
+        self.assertEqual(ended['error'], 'stopped', ended)
 
     def test_a_client_searches_every_bots_history_as_the_tool_does(self):
         client = self.client()

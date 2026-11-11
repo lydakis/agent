@@ -6002,9 +6002,10 @@ impl Lifts {
                     self.handles.clone(),
                 );
                 tokio::spawn(async move {
-                    let typed = cord.until_pulled(
+                    let typed = cord.until_pulled(registry.until_stopped(
+                        process,
                         registry.write_stdin(bot.bot_id, handle, &chars, yield_ms, kill, sandbox),
-                    );
+                    ));
                     let typed = match typed.await {
                         Err(error) if error.code == "terminal_not_running" => not_a_terminal(
                             &store, &registry, &handles, &bot.name, handle, kill, error,
@@ -6039,11 +6040,15 @@ impl Lifts {
                     ),
                 )));
             }
+            // Its agent may kill it by its handle, as a background command.
             Ok(prepared) => {
                 let registry = self.registry.clone();
                 tokio::spawn(async move {
                     let ran = cord
-                        .until_pulled(registry.execute(prepared, &workspace, &environment, sandbox))
+                        .until_pulled(registry.until_stopped(
+                            process,
+                            registry.execute(prepared, &workspace, &environment, sandbox),
+                        ))
                         .await;
                     let _ = sender.send(ran);
                 });

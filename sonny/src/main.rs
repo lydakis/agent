@@ -10882,8 +10882,11 @@ impl App {
     }
 
     /// The turn's calls a person must answer: every `manual` one, and those
-    /// the judge handed over. A program answers the rest.
+    /// the judge handed over. A program answers the rest. The turn running
+    /// now is the turn whose calls these are, whichever turn's event asked:
+    /// a lifted call's step or hand-over names its own older turn.
     async fn approvals_for(&mut self, turn: Option<i64>) {
+        let turn = self.running.as_ref().map(|running| running.turn).or(turn);
         let Ok(page) = self
             .client
             .request("approvals", json!({"bot": self.bot, "limit": 64}))
@@ -18259,6 +18262,38 @@ mod tests {
         // And kept it for the next window.
         assert!(reads_file(&app.options.store, "shop.lead").exists());
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lifted_calls_step_keeps_the_running_turns_approvals() {
+        let client = daemon_answering(|asked| match asked["op"].as_str().unwrap_or("") {
+            "approvals" => json!({"approvals": [
+                {"bot": "y", "turn": 7, "call_id": "n1", "gates": ["manual"],
+                    "name": "shell", "arguments": {}},
+                {"bot": "y", "turn": 3, "call_id": "c1/1", "step_of": "c1", "handle": "proc:9",
+                    "gates": ["manual"], "name": "send", "arguments": {}},
+            ], "next_after": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "y".into();
+        app.running = Some(Running {
+            turn: 7,
+            started: Instant::now(),
+            phase: "Waiting for your approval".into(),
+            note: false,
+            effort: None,
+        });
+        // An older lifted call asks for a step while turn 7 waits.
+        let step = json!({"call_id": "c1/1", "step_of": "c1", "request": 1, "gates": ["manual"]});
+        app.daemon(json!({"event": "approval_requested", "bot": "y", "turn": 3,
+            "data": {"calls": [step]}}))
+            .await;
+        let listed: Vec<&str> = (app.approvals.iter())
+            .filter_map(|call| call["call_id"].as_str())
+            .collect();
+        assert_eq!(listed, ["n1", "c1/1"]);
     }
 
     #[tokio::test]
