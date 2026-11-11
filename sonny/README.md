@@ -1747,16 +1747,19 @@ that isn't its seat's own (`lead` for a lead, `task` for a task). The left
 of the footer says what you talk to and where (the permissions mark, the
 model as pickers name it, its effort, the folder and its branch), and the
 right what wants you (needs you, failed, working, `↻`, `✎`, the
-context). The agent's name is left to the composer, which says it. When
-the window is too narrow for all of it, items give way in one order, as
-Powerline drops its lowest segments first: words before marks, marks
-before whole items, and what needs you never. `⏵⏵ full access` goes to `⏵⏵`, the folder to `~/D/agent` as fish
+context). Its counts of the agents are the ones `/status` heads its
+groups with, marks and numbers only: `? 2  ● 3  ✓ 13  ✓ 4` needs you,
+working, at rest, and done, dim. The agent's name is left to the
+composer, which says it. When the window is too narrow for all of it,
+items give way in one order, as Powerline drops its lowest segments
+first: done and at rest first, words before marks, marks before whole
+items, and what needs you never. `⏵⏵ full access` goes to `⏵⏵`, the folder to `~/D/agent` as fish
 shortens it and then to `agent`, until at 44 columns a busy lead reads
 `⏵⏵ GPT 6.1 Sol high   ? 1  ✗ 1  ● 2  37%`. The hues on it are only for
 what asks something of you: the `?`, the `✗`, the `●` and a context half
 used.
 
-![The footer at 100, 80, 60 and 44 columns: counts are marks and numbers, what needs you stays](../docs/sonny/footer-widths.png) Under the glance are the notes the agent keeps there with its `margin`
+![The footer at 100, 80, 60 and 44 columns: the /status counts as marks and numbers, done and at rest give way first, what needs you stays](../docs/sonny/footer-widths.png) Under the glance are the notes the agent keeps there with its `margin`
 tool: a diagram, a table of findings, a file it is discussing (kept fresh
 as the file changes), or a live view it updates while it works. Each
 note is pinned where the agent first put it: a quiet `✎ title · in the
