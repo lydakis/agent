@@ -1024,6 +1024,7 @@ impl script::Host for Attempt {
                 ));
             }
         }
+        let done = || run.live.lock().unwrap().remove(&worker);
         match self.work(&worker, &key, &prompt, &asked).await {
             Ok((value, turn, tokens, error)) => {
                 run.spent.fetch_add(tokens, Ordering::SeqCst);
@@ -1038,9 +1039,13 @@ impl script::Host for Attempt {
                     .lock()
                     .unwrap()
                     .insert(key, (value.clone(), false, tokens));
+                done();
                 Ok(value)
             }
-            Err(Trouble::Thrown(error)) => Err(error),
+            Err(Trouble::Thrown(error)) => {
+                done();
+                Err(error)
+            }
             Err(Trouble::Lost) => {
                 self.lost.store(true, Ordering::SeqCst);
                 run.halt.notify_waiters();
@@ -1277,11 +1282,9 @@ impl Attempt {
                 Err(error) => break Err(error),
             }
         };
-        // A turn whose wait the connection lost may still run: it stays
-        // known, so a stop interrupts it.
-        if !waited.as_ref().is_err_and(lost) {
-            live(None);
-        }
+        // The worker stays known until its call's answer is recorded: a
+        // turn whose wait the connection lost may still run, and one whose
+        // whole reply is still to be read is taken up again on replay.
         let outcome = waited.map_err(|e| match lost(&e) {
             true => Trouble::Lost,
             false => Trouble::Thrown(e.to_string()),
