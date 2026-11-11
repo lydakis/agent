@@ -1778,7 +1778,8 @@ impl View {
         // mark, are no stars, and what they do is no one's. The
         // reviewer's verdicts streak from the edge onto the agent whose
         // call it was.
-        if crate::project::is_internal(name) {
+        // Nor are a workflow's workers: the agent that runs it shines.
+        if crate::project::is_internal(name) || crate::workflow::is_worker(name) {
             return None;
         }
         // A copy the daemon throws away once idle is no star of its own:
