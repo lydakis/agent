@@ -23,7 +23,7 @@ use agent_runtime::{
         ElisionPlan, Gated, Halt, Halted, Lifted, LiftedRun, Limit, Settings, Slot, Spend, Store,
         Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
-    tools::{Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry},
+    tools::{Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -4590,14 +4590,13 @@ impl Turn {
                             seen = Self::seen(handle, &outcome);
                             outcome
                         }
-                        Ran::Done(Err(error)) if error.code == "terminal_not_running" => match kill
-                        {
-                            true => match self.stop_handle(handle).await? {
-                                Some(outcome) => outcome,
-                                None => failure(self.no_terminal(handle, error).await?),
-                            },
-                            false => failure(self.no_terminal(handle, error).await?),
-                        },
+                        Ran::Done(Err(error)) if error.code == "terminal_not_running" => {
+                            let (store, registry, handles) =
+                                (&self.store, &self.registry, &self.handles);
+                            not_a_terminal(store, registry, handles, &self.bot, handle, kill, error)
+                                .await?
+                                .unwrap_or_else(failure)
+                        }
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(_) => unreachable!("only a command moves to the background"),
                     }
@@ -5783,15 +5782,16 @@ impl Lifts {
     /// Check the calls a message lifted, by their commands, off the run
     /// loop, and act on what each comes to: its time on the schedule, its
     /// end recorded and told, or, allowed, its run as its command. While
-    /// the daemon is `held` (paused, stopping), an allowed call waits.
+    /// the daemon is `held` (paused, stopping), an allowed call waits; one
+    /// a pause comes to after this does not start.
     pub fn check(&self, processes: Vec<i64>, held: bool) {
         if processes.is_empty() {
             return;
         }
-        let lifts = self.clone();
+        let (lifts, cord) = (self.clone(), self.registry.cord());
         tokio::spawn(async move {
             for process in processes {
-                if let Err(error) = lifts.check_one(process, held).await {
+                if let Err(error) = lifts.check_one(process, held, &cord).await {
                     // A closed receiver means the service has already exited.
                     let _ = lifts.failures.send(error);
                 }
@@ -5799,7 +5799,7 @@ impl Lifts {
         });
     }
 
-    async fn check_one(&self, process: i64, held: bool) -> Result<()> {
+    async fn check_one(&self, process: i64, held: bool, cord: &Cord) -> Result<()> {
         let found = self
             .store
             .op("lifted_check", move |db| {
@@ -5817,7 +5817,7 @@ impl Lifts {
             }
             Lifted::Run(run) => {
                 self.handles.lifted_lapses(process, None);
-                self.run(*run).await;
+                self.run(*run, cord.clone()).await;
             }
             Lifted::Gone => self.handles.lifted_lapses(process, None),
         }
@@ -5830,7 +5830,7 @@ impl Lifts {
     /// as any background command's is; any other call's result is the
     /// command's. A call that reads or changes its turn's own state has no
     /// turn to run in, and says so.
-    async fn run(&self, run: LiftedRun) {
+    async fn run(&self, run: LiftedRun, cord: Cord) {
         let LiftedRun {
             process,
             turn,
@@ -5931,6 +5931,8 @@ impl Lifts {
             }
             _ => None,
         };
+        // A pause that came while it was readied stops it before it starts.
+        let prepared = prepared.and_then(|prepared| cord.check().map(|()| prepared));
         let terminal = matches!(prepared, Ok(Prepared::Terminal { .. }));
         self.collect(
             &bot.name,
@@ -5982,6 +5984,10 @@ impl Lifts {
                             sender,
                         )
                         .await;
+                    // A pull while it opened found no terminal to end.
+                    if cord.pulled() {
+                        registry.end_terminal(process);
+                    }
                 });
             }
             Ok(Prepared::WriteStdin {
@@ -5990,11 +5996,23 @@ impl Lifts {
                 yield_ms,
                 kill,
             }) => {
-                let registry = self.registry.clone();
+                let (registry, store, handles) = (
+                    self.registry.clone(),
+                    self.store.clone(),
+                    self.handles.clone(),
+                );
                 tokio::spawn(async move {
-                    let typed = registry
-                        .write_stdin(bot.bot_id, handle, &chars, yield_ms, kill, sandbox)
-                        .await;
+                    let typed = cord.until_pulled(
+                        registry.write_stdin(bot.bot_id, handle, &chars, yield_ms, kill, sandbox),
+                    );
+                    let typed = match typed.await {
+                        Err(error) if error.code == "terminal_not_running" => not_a_terminal(
+                            &store, &registry, &handles, &bot.name, handle, kill, error,
+                        )
+                        .await
+                        .flatten(),
+                        typed => typed,
+                    };
                     let _ = sender.send(typed);
                 });
             }
@@ -6024,8 +6042,8 @@ impl Lifts {
             Ok(prepared) => {
                 let registry = self.registry.clone();
                 tokio::spawn(async move {
-                    let ran = registry
-                        .execute(prepared, &workspace, &environment, sandbox)
+                    let ran = cord
+                        .until_pulled(registry.execute(prepared, &workspace, &environment, sandbox))
                         .await;
                     let _ = sender.send(ran);
                 });
@@ -6069,12 +6087,16 @@ impl Lifts {
                         _ => outcome,
                     };
                     let outcome = annotate(outcome, turn, &call_id_for_refs);
-                    (
-                        serde_json::from_str(&outcome.output)
-                            .unwrap_or(json!({"output":outcome.output})),
-                        outcome.artifacts,
-                        outcome.files,
-                    )
+                    let mut value = serde_json::from_str(&outcome.output)
+                        .unwrap_or(json!({"output":outcome.output}));
+                    // Its pictures go with it, for the wait that collects it.
+                    if !outcome.parts.is_empty() {
+                        if !value.is_object() {
+                            value = json!({"output":outcome.output});
+                        }
+                        value["parts"] = json!(outcome.parts);
+                    }
+                    (value, outcome.artifacts, outcome.files)
                 }
                 Err(error) => (
                     json!({"error":error.code,"detail":error.detail}),
@@ -6111,6 +6133,88 @@ impl Lifts {
             }
         });
     }
+}
+
+/// Stop `handle`, a command of `bot`'s with no terminal: a call a message
+/// lifted, still waiting for its verdict or answer, is withdrawn, never
+/// run; a background command is killed. Its end is this result, so nothing
+/// tells it later. `None` when it is neither.
+async fn stop_handle(
+    store: &Store,
+    registry: &Registry,
+    handles: &Handles,
+    bot: &str,
+    handle: i64,
+) -> Result<Option<Outcome>> {
+    let (bot, registry) = (bot.to_owned(), registry.clone());
+    let stopped = store
+        .op("stop_handle", move |db| {
+            if let Some(ended) = db.lifted_stop(&bot, handle)? {
+                db.saw_end(handle)?;
+                return Ok(Some(Some(ended)));
+            }
+            // Marked seen first: once killed, its end is recorded as it
+            // comes, untold.
+            if db.runs_for(&bot, handle)? && registry.stop(handle) {
+                db.saw_end(handle)?;
+                return Ok(Some(None));
+            }
+            Ok(None)
+        })
+        .await?;
+    let name = format!("proc:{handle}");
+    Ok(match stopped {
+        Some(Some(Lifted::Ended { result, ready })) => {
+            handles.process_finished(handle, result.clone());
+            if ready {
+                handles.turn_ready();
+            }
+            Some(Outcome::text(
+                json!({"handle":name,"stopped":true,"ran":false,"detail":result["detail"]})
+                    .to_string(),
+            ))
+        }
+        Some(_) => Some(Outcome::text(
+            json!({"handle":name,"stopped":true,"ran":true}).to_string(),
+        )),
+        None => None,
+    })
+}
+
+/// Why `write_stdin` found no terminal `handle`: `error`, unless the
+/// handle is a command of `bot`'s that runs without a terminal.
+async fn no_terminal(store: &Store, bot: &str, handle: i64, error: Error) -> Result<Error> {
+    let bot = bot.to_owned();
+    let runs = store
+        .op("runs_for", move |db| db.runs_for(&bot, handle))
+        .await?;
+    Ok(match runs {
+        true => Error::with(
+            "not_a_terminal",
+            format!(
+                "proc:{handle} is a background command, not a terminal: write_stdin types only into commands started with tty=true; kill=true ends it, and wait on it reports how it ended"
+            ),
+        ),
+        false => error,
+    })
+}
+
+/// What a `write_stdin` of `bot`'s that found no terminal `handle` comes
+/// to: with `kill`, a command of the bot's without one is stopped all the
+/// same; otherwise why there was none.
+async fn not_a_terminal(
+    store: &Store,
+    registry: &Registry,
+    handles: &Handles,
+    bot: &str,
+    handle: i64,
+    kill: bool,
+    error: Error,
+) -> Result<Result<Outcome>> {
+    if kill && let Some(stopped) = stop_handle(store, registry, handles, bot, handle).await? {
+        return Ok(Ok(stopped));
+    }
+    Ok(Err(no_terminal(store, bot, handle, error).await?))
 }
 
 /// When `at` was, in milliseconds since the Unix epoch.
@@ -7139,64 +7243,9 @@ fn completion_text(items: &[Bytes]) -> String {
 }
 
 impl Turn {
-    /// Stop `handle`, a command of this bot's with no terminal: a call a
-    /// message lifted, still waiting for its verdict or answer, is
-    /// withdrawn, never run; a background command is killed. Its end is
-    /// this result, so nothing tells it later. `None` when it is neither.
-    async fn stop_handle(&self, handle: i64) -> Result<Option<Outcome>> {
-        let bot = self.bot.clone();
-        let registry = self.registry.clone();
-        let stopped = self
-            .store
-            .op("stop_handle", move |db| {
-                if let Some(ended) = db.lifted_stop(&bot, handle)? {
-                    db.saw_end(handle)?;
-                    return Ok(Some(Some(ended)));
-                }
-                // Marked seen first: once killed, its end is recorded as it
-                // comes, untold.
-                if db.runs_for(&bot, handle)? && registry.stop(handle) {
-                    db.saw_end(handle)?;
-                    return Ok(Some(None));
-                }
-                Ok(None)
-            })
-            .await?;
-        let name = format!("proc:{handle}");
-        Ok(match stopped {
-            Some(Some(Lifted::Ended { result, ready })) => {
-                self.handles.process_finished(handle, result.clone());
-                if ready {
-                    self.handles.turn_ready();
-                }
-                Some(Outcome::text(
-                    json!({"handle":name,"stopped":true,"ran":false,"detail":result["detail"]})
-                        .to_string(),
-                ))
-            }
-            Some(_) => Some(Outcome::text(
-                json!({"handle":name,"stopped":true,"ran":true}).to_string(),
-            )),
-            None => None,
-        })
-    }
-
-    /// Why `write_stdin` found no terminal `handle`: `error`, unless the
-    /// handle is a command of this bot's that runs without a terminal.
+    /// Why `write_stdin` found no terminal `handle`: see [`no_terminal`].
     async fn no_terminal(&self, handle: i64, error: Error) -> Result<Error> {
-        let bot = self.bot.clone();
-        let runs = (self.store)
-            .op("runs_for", move |db| db.runs_for(&bot, handle))
-            .await?;
-        Ok(match runs {
-            true => Error::with(
-                "not_a_terminal",
-                format!(
-                    "proc:{handle} is a background command, not a terminal: write_stdin types only into commands started with tty=true; kill=true ends it, and wait on it reports how it ended"
-                ),
-            ),
-            false => error,
-        })
+        no_terminal(&self.store, &self.bot, handle, error).await
     }
 }
 

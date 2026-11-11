@@ -1998,6 +1998,44 @@ class RuntimeTests(ModelFixture):
             self.assertIn('error', late)
             client.close(kill=True)
 
+    def test_a_lifted_kill_stops_a_background_command_once_allowed(self):
+        def respond(request, user):
+            if not user.startswith('kill:'):
+                return None
+            start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user'
+                        and not i['content'][0]['text'].startswith('steer:'))
+            outputs = [i['output'] for i in request['input'][start:] if i.get('type') == 'function_call_output']
+            if outputs:
+                return 'seen:' + outputs[-1]
+            return [['write_stdin', {'handle': user[5:], 'kill': True}]]
+        self.model.respond = respond
+        client = self.client('shell,write_stdin,wait')
+        client.request('create', bot='Bob', workspace=str(self.path), approve=['write_stdin'],
+                       approver='manual', tools=['shell', 'write_stdin', 'wait'])
+
+        def call(request_id, name, arguments):
+            prompt = 'calls:' + json.dumps([[name, arguments]])
+            turn = client.request('submit', bot='Bob', request_id=request_id, prompt=prompt)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            return json.loads(poll(client, 'Bob', turn)['result']['text'][5:])
+
+        background = call('b', 'shell', {'command': 'sleep 600', 'background': True})['handle']
+        turn = client.request('submit', bot='Bob', request_id='k', prompt=f'kill:{background}')['result']['turn']
+        asked = client.receive(lambda m: m.get('event') == 'approval_requested' and m.get('turn') == turn)
+        client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        lifted = json.loads(poll(client, 'Bob', turn)['result']['text'].removeprefix('seen:'))['handle']
+        # Allowed past its turn, the kill stops the command as it would
+        # have in the turn: it has no terminal, and is the bot's own.
+        waiting = asked['data']['calls'][0]
+        client.request('answer', bot='Bob', turn=turn, call_id=waiting['call_id'],
+                       request=waiting['request'], decision='allow', by='test')
+        ended = client.receive(lambda m: m.get('event') == 'lifted_ended' and m['data']['handle'] == lifted)
+        self.assertEqual(ended['data']['outcome'], 'allowed')
+        results = call('w', 'wait', {'handles': [lifted, background]})['results']
+        self.assertEqual((results[lifted]['stopped'], results[lifted]['ran']), (True, True), results)
+        self.assertEqual(results[background]['error'], 'stopped', results)
+
     def test_a_client_searches_every_bots_history_as_the_tool_does(self):
         client = self.client()
         self.addCleanup(lambda: client.close(kill=True))

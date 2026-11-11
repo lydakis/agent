@@ -60,13 +60,14 @@ class QueryPlanTests(unittest.TestCase):
                              ('nodes_turn', 's'),
                              ('processes_turn', 'processes'),
                              ('turns_running', 'turns'), ('turns_waiting', 'turns'),
-                             ('processes_running', 'processes')]:
+                             # Either index of running commands counts them.
+                             ('processes_running processes_bot_running', 'processes')]:
             with self.subTest(index=index), tempfile.TemporaryDirectory() as directory:
                 store = Path(directory) / 'store.sqlite'
                 with sqlite3.connect(store) as conn:
                     conn.executescript(ddl)
-                    if index:
-                        conn.execute(f'DROP INDEX {index}')
+                    for dropped in (index or '').split():
+                        conn.execute(f'DROP INDEX {dropped}')
                 result = subprocess.run(
                     [sys.executable, '-m', 'bench.query_plans', str(store)],
                     cwd=root, capture_output=True, text=True, timeout=10)

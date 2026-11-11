@@ -29,6 +29,29 @@ const HISTORY_PAGE_BYTES: usize = 256 * 1024;
 /// steer's: a message's pictures may be 5 MiB once decoded.
 const STEER_BATCH_PICTURE_BYTES: usize = 8 * 1024 * 1024;
 
+/// One bot's calls waiting on a verdict: its running turn's, and those a
+/// message lifted to the background with the steps their clients ask for,
+/// found through the bot's own running commands, never another bot's.
+const BOT_APPROVALS: &str = "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,a.process
+     FROM bots b JOIN approvals a ON a.turn=b.running_turn
+     WHERE a.id>?1 AND a.id<=?4 AND b.name=?2
+     UNION ALL
+     SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,a.process
+     FROM processes p
+     JOIN approvals a INDEXED BY approvals_lifted ON a.process=p.id
+     JOIN bots b ON b.name=p.bot
+     WHERE p.bot=?2 AND p.status='running' AND a.id>?1 AND a.id<=?4
+       AND a.turn IS NOT b.running_turn
+     UNION ALL
+     SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,n.process
+     FROM processes p
+     JOIN answers n INDEXED BY answers_lifted ON n.process=p.id
+     JOIN approvals a INDEXED BY approvals_steps ON a.turn=n.turn AND a.step_of=n.call_id
+     JOIN bots b ON b.name=p.bot
+     WHERE p.bot=?2 AND p.status='running' AND a.id>?1 AND a.id<=?4
+       AND a.turn IS NOT b.running_turn
+     ORDER BY 1 LIMIT ?3";
+
 /// How a bot's newest turn that counts ended: one that ran, or one that
 /// failed before it started. A message steered into a running turn, one
 /// riding the next call, and one cancelled while it waited in line never
@@ -2749,6 +2772,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS turns_ready_bot ON turns(bot) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
             CREATE INDEX IF NOT EXISTS approvals_lifted ON approvals(process) WHERE process IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS processes_bot_running ON processes(bot,id) WHERE status='running';
             CREATE INDEX IF NOT EXISTS answers_lifted ON answers(process) WHERE process IS NOT NULL;
             CREATE INDEX IF NOT EXISTS bots_deleting ON bots(name) WHERE status='deleting';
             CREATE INDEX IF NOT EXISTS bots_running ON bots(name) WHERE running_turn IS NOT NULL;
@@ -9631,7 +9655,8 @@ impl Database {
                     "SELECT approval,turn FROM approval_tags WHERE tag=?1 AND approval>?2 AND approval<=?3 ORDER BY approval",
                 )?;
                 let mut call = self.conn.prepare_cached(
-                    "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,a.process
+                    "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,
+                       COALESCE(a.process,(SELECT n.process FROM answers n WHERE n.turn=a.turn AND n.call_id=a.step_of))
                      FROM approvals a JOIN turns t ON t.id=a.turn JOIN bots b ON b.name=t.bot WHERE a.id=?",
                 )?;
                 let mut rows = ids.query(params![tag, after, through])?;
@@ -9658,30 +9683,13 @@ impl Database {
                 }
             }
             // Only a bot's running turn and the calls a message lifted to
-            // the background (with the steps their clients ask for) have
-            // calls waiting, so one bot's listing reads those instead of
-            // scanning every bot's.
+            // the background (with the steps their clients ask for, listed
+            // under their call's handle) have calls waiting, so one bot's
+            // listing reads those, through its own running commands,
+            // instead of scanning every bot's.
             _ => {
                 let mut statement = match bot {
-                    Some(_) => self.conn.prepare_cached(
-                        "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,a.process
-                         FROM bots b JOIN approvals a ON a.turn=b.running_turn
-                         WHERE a.id>?1 AND a.id<=?4 AND b.name=?2
-                         UNION ALL
-                         SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,a.process
-                         FROM approvals a INDEXED BY approvals_lifted JOIN turns t ON t.id=a.turn
-                         JOIN bots b ON b.name=t.bot
-                         WHERE a.process IS NOT NULL AND a.id>?1 AND a.id<=?4 AND t.bot=?2
-                           AND a.turn IS NOT b.running_turn
-                         UNION ALL
-                         SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,a.process
-                         FROM answers n INDEXED BY answers_lifted
-                         JOIN approvals a INDEXED BY approvals_steps ON a.turn=n.turn AND a.step_of=n.call_id
-                         JOIN turns t ON t.id=a.turn JOIN bots b ON b.name=t.bot
-                         WHERE n.process IS NOT NULL AND a.id>?1 AND a.id<=?4 AND t.bot=?2
-                           AND a.turn IS NOT b.running_turn
-                         ORDER BY 1 LIMIT ?3",
-                    )?,
+                    Some(_) => self.conn.prepare_cached(BOT_APPROVALS)?,
                     None => self.conn.prepare_cached(
                         "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,a.process
                          FROM approvals a JOIN turns t ON t.id=a.turn JOIN bots b ON b.name=t.bot
@@ -17261,6 +17269,31 @@ impl Database {
 mod tests {
     use super::*;
 
+    #[test]
+    fn one_bots_approvals_read_only_its_own_running_commands() {
+        let db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+        let plan: Vec<String> = (db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {BOT_APPROVALS}")))
+        .unwrap()
+        .query_map(params![0, "Bob", 64, i64::MAX], |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+        let lifted: Vec<&String> = (plan.iter())
+            .filter(|step| step.contains("processes_bot_running"))
+            .collect();
+        assert_eq!(lifted.len(), 2, "{plan:?}");
+        assert!(
+            lifted.iter().all(|step| step.contains("(bot=?)")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|step| !step.starts_with("SCAN") || step.contains("processes_bot_running")),
+            "never through every bot's calls: {plan:?}"
+        );
+    }
     #[test]
     fn finding_what_to_tell_reads_only_the_untold() {
         let db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();

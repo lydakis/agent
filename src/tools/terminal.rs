@@ -584,6 +584,17 @@ impl Registry {
         Ok(terminal.take(self, handle))
     }
 
+    /// End terminal `handle`, as a pull of the cord does; its end is told
+    /// on its handle.
+    pub fn end_terminal(&self, handle: i64) {
+        let terminal = (self.terminals.lock().unwrap_or_else(|e| e.into_inner()))
+            .get(&handle)
+            .cloned();
+        if let Some(terminal) = terminal {
+            terminal.kill();
+        }
+    }
+
     /// Let terminal `handle` go once its handle's result is recorded; it
     /// ended before.
     pub fn forget_terminal(&self, handle: i64) {

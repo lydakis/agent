@@ -10034,11 +10034,14 @@ impl App {
             "approval_requested" | "approval_asked" | "step_decided" => {
                 self.approvals_for(turn).await
             }
-            // A message lifted a call out of its turn: it waits on past
-            // that turn, until its verdict or its agent ends its wait.
+            // A message lifted a call out of its turn: it, and the steps
+            // its client asks for, wait on past that turn, until its
+            // verdict or its agent ends its wait.
             "call_lifted" => {
                 for call in &mut self.approvals {
-                    if call["call_id"] == data["call_id"] && call["turn"].as_i64() == turn {
+                    if (call["call_id"] == data["call_id"] || call["step_of"] == data["call_id"])
+                        && call["turn"].as_i64() == turn
+                    {
                         call["handle"] = data["handle"].clone();
                     }
                 }
@@ -10860,7 +10863,8 @@ impl App {
             .filter_map(|call| call["call_id"].as_str().map(str::to_owned))
             .collect();
         // The running turn's, and those a message lifted out of their
-        // turn, which wait on past it.
+        // turn (with their steps, listed under their handle), which wait
+        // on past it.
         self.approvals = page["approvals"]
             .as_array()
             .into_iter()

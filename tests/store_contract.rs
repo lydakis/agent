@@ -17492,7 +17492,8 @@ fn schema_76_tells_no_bot_of_commands_that_ended_before() {
     Connection::open(&path)
         .unwrap()
         .execute_batch(
-            "DROP INDEX processes_untold; ALTER TABLE processes DROP COLUMN told;
+            "DROP INDEX processes_untold; DROP INDEX processes_bot_running;
+             ALTER TABLE processes DROP COLUMN told;
              ALTER TABLE processes DROP COLUMN bot; PRAGMA user_version=76;",
         )
         .unwrap();
@@ -19229,6 +19230,23 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         .filter_map(|call| call["call_id"].as_str())
         .collect();
     assert_eq!(steps, ["c1/1"], "{listed}");
+    // Under its call's handle, by bot and by tag alike.
+    let handle = format!("proc:{process}");
+    assert_eq!(
+        listed["approvals"][0]["handle"],
+        handle.as_str(),
+        "{listed}"
+    );
+    let tagged = db.approvals(None, Some("manual"), 0, None, 64).unwrap();
+    assert_eq!(
+        tagged["approvals"][0]["handle"],
+        handle.as_str(),
+        "{tagged}"
+    );
+    // Another bot's listing reads none of it.
+    db.create("Other", Some("/synthetic"), binding()).unwrap();
+    let other = db.approvals(Some("Other"), None, 0, None, 64).unwrap();
+    assert_eq!(other["approvals"], json!([]), "{other}");
     // And it takes its verdict.
     db.answer(Decision {
         bot: "Lead",

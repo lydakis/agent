@@ -2515,6 +2515,12 @@ impl Registry {
         }
     }
 
+    /// The pull cord as it is now, for a start decided now that runs
+    /// later: one the cord was pulled before does not start.
+    pub fn cord(&self) -> Cord {
+        Cord(self.pulls.subscribe())
+    }
+
     /// End every background command, terminal and detached command this
     /// daemon started now, as the pull cord stops the line.
     pub fn end_running(&self) {
@@ -2534,6 +2540,41 @@ fn stopped_by_agent() -> Error {
         "stopped",
         "its agent killed this command before it finished, so it may have had effects",
     )
+}
+
+/// The pull cord as it was when a start was decided.
+#[derive(Clone)]
+pub struct Cord(watch::Receiver<u64>);
+
+impl Cord {
+    /// Whether the cord was pulled since.
+    pub fn pulled(&self) -> bool {
+        self.0.has_changed().unwrap_or(true)
+    }
+
+    /// Refuse a start the cord was pulled before.
+    pub fn check(&self) -> Result<()> {
+        match self.pulled() {
+            true => Err(Error::with(
+                "daemon_paused",
+                "the pause came before this command started, so it did not run; nothing has run it since. Work has since resumed",
+            )),
+            false => Ok(()),
+        }
+    }
+
+    /// `run`, not begun when the cord was pulled before, and ended as it
+    /// is pulled, as a background command is.
+    pub async fn until_pulled<F>(mut self, run: F) -> Result<Outcome>
+    where
+        F: Future<Output = Result<Outcome>>,
+    {
+        self.check()?;
+        tokio::select! {
+            result = run => result,
+            Ok(()) = self.0.changed() => Err(stopped_by_pause()),
+        }
+    }
 }
 
 /// How a command the pull cord ended answers. Nothing reruns it; the agent
@@ -3285,6 +3326,31 @@ async fn shell(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_start_decided_before_a_pull_never_begins_and_one_running_ends() {
+        let registry = Registry::new("shell").unwrap();
+        let before = registry.cord();
+        assert!(before.check().is_ok());
+        registry.end_running();
+        assert_eq!(before.check().unwrap_err().code, "daemon_paused");
+        let begun = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = begun.clone();
+        let refused = before
+            .until_pulled(async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Outcome::text("ran".into()))
+            })
+            .await;
+        assert_eq!(refused.unwrap_err().code, "daemon_paused");
+        assert!(!begun.load(std::sync::atomic::Ordering::SeqCst));
+        // One decided after the pull runs, and a later pull ends it.
+        let after = registry.cord();
+        let running = tokio::spawn(after.until_pulled(std::future::pending()));
+        tokio::task::yield_now().await;
+        registry.end_running();
+        let ended = running.await.unwrap().unwrap_err();
+        assert_eq!(ended.code, "daemon_paused");
+    }
     #[test]
     fn an_answered_call_past_what_its_client_is_sent_is_refused() {
         let tool: Declared = serde_json::from_value(serde_json::json!({

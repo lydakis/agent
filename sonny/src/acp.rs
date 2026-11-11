@@ -753,10 +753,12 @@ struct State {
     part: u32,
     /// The words of this part sent as they streamed.
     streamed: String,
-    calls: HashMap<String, (String, Value)>,
+    /// The calls shown running, by turn and call: a later turn may use a
+    /// lifted call's id again.
+    calls: HashMap<(Option<i64>, String), (String, Value)>,
     /// The calls a message lifted from their turn, which end later, as
     /// `lifted_ended` says: kept past their turn's end.
-    lifted: HashSet<String>,
+    lifted: HashSet<(Option<i64>, String)>,
     /// Calls put to the person, by call and request, and the lead's
     /// questions, by ask.
     asked: HashSet<String>,
@@ -905,10 +907,13 @@ impl Session {
         let (mut started, mut lifted) = (HashMap::new(), HashSet::new());
         let cursor = live(&mut events, |event| {
             let data = &event["data"];
-            let call = data["call_id"].as_str().unwrap_or("").to_owned();
+            let call = (
+                event["turn"].as_i64(),
+                data["call_id"].as_str().unwrap_or("").to_owned(),
+            );
             match event["event"].as_str() {
                 Some("tool_started") => {
-                    started.insert(call, (event["turn"].as_i64(), data.clone()));
+                    started.insert(call, data.clone());
                 }
                 Some("call_lifted") if started.contains_key(&call) => {
                     lifted.insert(call);
@@ -939,11 +944,11 @@ impl Session {
         );
         let effort = record["effort"].as_str().map(str::to_owned);
         let mut calls = HashMap::new();
-        for (call, (turn, data)) in started {
-            if (running.is_some() && turn == running) || lifted.contains(&call) {
+        for (key, data) in started {
+            if (running.is_some() && key.0 == running) || lifted.contains(&key) {
                 let (call, name, arguments) = started_call(&client, &bot, &data).await;
                 if name != reactions::TOOL && name != plan::TOOL {
-                    calls.insert(call, (name, arguments));
+                    calls.insert((key.0, call), (name, arguments));
                 }
             }
         }
@@ -1764,38 +1769,39 @@ impl Session {
                     return;
                 }
                 out.update(id, tool_call(&call, &name, &arguments));
-                state.calls.insert(call, (name, arguments));
+                state.calls.insert((turn, call), (name, arguments));
             }
             // A call a message lifted goes on in the background: its
             // turn's answer to it is its handle, and it ends later.
             "call_lifted" => {
-                let call = data["call_id"].as_str().unwrap_or("");
-                if state.calls.contains_key(call) {
-                    state.lifted.insert(call.to_owned());
+                let key = (turn, data["call_id"].as_str().unwrap_or("").to_owned());
+                if state.calls.contains_key(&key) {
+                    state.lifted.insert(key);
                 }
             }
             "tool_completed" | "lifted_ended" => {
                 let call = data["call_id"].as_str().unwrap_or("").to_owned();
+                let key = (turn, call.clone());
                 let lifted = event["event"] == "lifted_ended";
                 match lifted {
-                    false if state.lifted.contains(&call) => return,
+                    false if state.lifted.contains(&key) => return,
                     // Allowed, one its client answers waits on for that
                     // answer; any other runs as a background command,
                     // whose end this thread does not show.
                     true if data["waits_for"] == "answer" => return,
                     true if data["outcome"] == "allowed" => {
-                        if state.lifted.remove(&call) {
-                            state.calls.remove(&call);
+                        if state.lifted.remove(&key) {
+                            state.calls.remove(&key);
                         }
                         return;
                     }
-                    true if !state.lifted.remove(&call) => return,
+                    true if !state.lifted.remove(&key) => return,
                     _ => {}
                 }
                 state
                     .asked
                     .retain(|asked| !asked.starts_with(&format!("{call}#")));
-                let Some((name, arguments)) = state.calls.remove(&call) else {
+                let Some((name, arguments)) = state.calls.remove(&key) else {
                     return;
                 };
                 let (mut shown, mut failed) = (String::new(), data["failed"] == true);

@@ -3314,8 +3314,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   `{"handle":"proc:N","background":true,"steered":true,"waits_for":"approval"}`,
   so the round goes on and the turn reads the message. `call_lifted`
   `{call_id, handle, waits_for}` says so. Nothing is cancelled: the request
-  stays listed (with `handle`), served and answerable past its turn's end,
-  and a restart keeps it. Its verdict now goes to the command. A deny or a
+  stays listed (with `handle`, as do the steps its client asks for), served
+  and answerable past its turn's end, and a restart keeps it. Its verdict
+  now goes to the command. A deny or a
   lapse ends it with the result the call would have had; an allow runs the
   call then, in the background, as the bot is now, in its turn's folder
   with that turn's model, effort and environment, its command rules as its
