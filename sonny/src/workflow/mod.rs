@@ -152,7 +152,7 @@ struct Run {
     halt: Notify,
     /// The recorded answers, by call key, and whether each came from the
     /// run it was resumed from.
-    answers: Mutex<HashMap<String, (Value, bool)>>,
+    answers: Mutex<HashMap<String, Answer>>,
     spent: AtomicU64,
     /// Workers whose turn runs, by name, for `stop`.
     live: Mutex<HashMap<String, i64>>,
@@ -492,7 +492,7 @@ fn make(dir: &Path, plan: &Plan, source: &str, from: Option<&Path>) -> std::io::
     std::fs::write(dir.join("script.js"), source)?;
     let mut journal = String::new();
     if let Some(from) = from {
-        for (key, (value, _)) in answers_of(from) {
+        for (key, (value, ..)) in answers_of(from) {
             // A worker that failed then runs again.
             if !value.is_null() {
                 journal.push_str(
@@ -517,11 +517,15 @@ fn read_plan(dir: &Path) -> Result<Plan, String> {
 /// The answers the journal in `dir` records, by call key, each with
 /// whether it came from an earlier run, and the output tokens this run's
 /// own agents spent.
-fn answers_of(dir: &Path) -> HashMap<String, (Value, bool)> {
+fn answers_of(dir: &Path) -> HashMap<String, Answer> {
     journal_of(dir).0
 }
 
-fn journal_of(dir: &Path) -> (HashMap<String, (Value, bool)>, u64) {
+/// A call's recorded value, whether an earlier run gave it, and the
+/// output tokens it cost this run.
+type Answer = (Value, bool, u64);
+
+fn journal_of(dir: &Path) -> (HashMap<String, Answer>, u64) {
     let mut answers = HashMap::new();
     let mut spent = 0;
     let text = std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
@@ -534,10 +538,15 @@ fn journal_of(dir: &Path) -> (HashMap<String, (Value, bool)>, u64) {
             continue;
         }
         let earlier = entry["earlier"] == true;
-        if !earlier {
-            spent += entry["output_tokens"].as_u64().unwrap_or(0);
-        }
-        answers.insert(str_of(&entry["key"]), (entry["value"].take(), earlier));
+        let tokens = match earlier {
+            true => 0,
+            false => entry["output_tokens"].as_u64().unwrap_or(0),
+        };
+        spent += tokens;
+        answers.insert(
+            str_of(&entry["key"]),
+            (entry["value"].take(), earlier, tokens),
+        );
     }
     (answers, spent)
 }
@@ -726,6 +735,8 @@ struct Attempt {
     calls: AtomicU64,
     nulls: AtomicU64,
     reused: AtomicU64,
+    /// The output tokens `budget.spent()` shows.
+    shown: AtomicU64,
     lost: AtomicBool,
 }
 
@@ -848,7 +859,10 @@ impl script::Host for Attempt {
             ));
         }
         let answered = run.answers.lock().unwrap().get(&key).cloned();
-        if let Some((value, earlier)) = answered {
+        if let Some((value, earlier, tokens)) = answered {
+            // What the script sees spent grows as its calls are answered
+            // again, as it did the first time.
+            self.shown.fetch_add(tokens, Ordering::SeqCst);
             if earlier {
                 self.reused.fetch_add(1, Ordering::SeqCst);
             }
@@ -874,6 +888,7 @@ impl script::Host for Attempt {
         match self.work(&worker, &key, &prompt, &asked).await {
             Ok((value, turn, tokens, error)) => {
                 run.spent.fetch_add(tokens, Ordering::SeqCst);
+                self.shown.fetch_add(tokens, Ordering::SeqCst);
                 if value.is_null() {
                     self.nulls.fetch_add(1, Ordering::SeqCst);
                 }
@@ -883,7 +898,7 @@ impl script::Host for Attempt {
                 run.answers
                     .lock()
                     .unwrap()
-                    .insert(key, (value.clone(), false));
+                    .insert(key, (value.clone(), false, tokens));
                 Ok(value)
             }
             Err(Trouble::Thrown(error)) => Err(error),
@@ -905,8 +920,11 @@ impl script::Host for Attempt {
             .note(json!({"t": "log", "text": text, "at_ms": now_ms()}));
     }
 
+    /// What this go's calls cost so far, the ones answered from the
+    /// journal as they cost then: so a replay takes the same branches.
+    /// Admission goes by what the run truly spent.
     fn spent(&self) -> u64 {
-        self.run.spent.load(Ordering::SeqCst)
+        self.shown.load(Ordering::SeqCst)
     }
 
     fn load(&self, reference: &Value) -> Result<script::Script, String> {
@@ -1099,7 +1117,11 @@ impl Attempt {
                 Err(error) => break Err(error),
             }
         };
-        self.run.live.lock().unwrap().remove(worker);
+        // A turn whose wait the connection lost may still run: it stays
+        // known, so a stop interrupts it.
+        if !waited.as_ref().is_err_and(lost) {
+            self.run.live.lock().unwrap().remove(worker);
+        }
         let outcome = waited.map_err(|e| match lost(&e) {
             true => Trouble::Lost,
             false => Trouble::Thrown(e.to_string()),
@@ -1173,6 +1195,7 @@ async fn drive(run: Arc<Run>) {
             calls: AtomicU64::new(0),
             nulls: AtomicU64::new(0),
             reused: AtomicU64::new(0),
+            shown: AtomicU64::new(0),
             lost: AtomicBool::new(false),
         });
         let ended = script::run(
@@ -1211,9 +1234,18 @@ async fn halted(run: &Run) {
 /// its caller.
 async fn finish(run: &Run, ended: script::Ended, attempt: Option<&Attempt>) {
     let plan = &run.plan;
-    // What still runs is the run's no longer: a call it did not await.
-    if let Some(attempt) = attempt {
-        run.interrupt(&attempt.client).await;
+    // What still runs is the run's no longer: a call it did not await,
+    // or one whose wait a lost connection left, on a new connection.
+    match attempt {
+        Some(attempt) => {
+            run.interrupt(&attempt.client).await;
+        }
+        None if !run.live.lock().unwrap().is_empty() => {
+            if let Ok((client, _events)) = Client::connect(&run.socket).await {
+                run.interrupt(&client).await;
+            }
+        }
+        None => {}
     }
     let (status, result, error) = match ended {
         script::Ended::Returned(value) => ("completed", value, None),
@@ -1435,9 +1467,9 @@ mod tests {
         std::fs::write(dir.join("events.jsonl"), text).unwrap();
         let (answers, spent) = journal_of(&dir);
         assert_eq!(spent, 10);
-        assert_eq!(answers["k1"], (json!("x"), false));
-        assert_eq!(answers["k2"], (Value::Null, false));
-        assert_eq!(answers["k3"], (json!({"a": 1}), true));
+        assert_eq!(answers["k1"], (json!("x"), false, 7));
+        assert_eq!(answers["k2"], (Value::Null, false, 3));
+        assert_eq!(answers["k3"], (json!({"a": 1}), true, 0));
         assert!(!answers.contains_key("k4"));
         // A run resumed from it starts with what it answered, not its nulls.
         let next = dir.join("next");
@@ -1454,7 +1486,7 @@ mod tests {
         assert!(
             answers
                 .values()
-                .all(|(value, earlier)| !value.is_null() && *earlier)
+                .all(|(value, earlier, tokens)| !value.is_null() && *earlier && *tokens == 0)
         );
         assert_eq!(read_plan(&next).unwrap().id, "next");
         std::fs::remove_dir_all(&dir).unwrap();

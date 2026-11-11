@@ -79,6 +79,10 @@ pub fn strict(schema: &Value) -> Value {
 
 /// `property`, or null.
 fn nullable(mut property: Value) -> Value {
+    // An enum or const holds null out whatever the type says.
+    if property.get("enum").is_some() || property.get("const").is_some() {
+        return json!({"anyOf": [property, {"type": "null"}]});
+    }
     match property.get_mut("type") {
         Some(Value::String(kind)) => {
             let kind = std::mem::take(kind);
@@ -241,6 +245,13 @@ mod tests {
         assert!(check(&json!({"type": "object"})).is_err());
         assert!(
             check(&json!({"type": "object", "properties": {"a": {}}, "required": ["b"]})).is_err()
+        );
+        // An optional enum may be null, as a choice beside its values.
+        let strict_enum = strict(&json!({"type": "object", "properties": {
+            "level": {"type": "string", "enum": ["a", "b"]}}}));
+        assert_eq!(
+            strict_enum["properties"]["level"],
+            json!({"anyOf": [{"type": "string", "enum": ["a", "b"]}, {"type": "null"}]})
         );
         // An untyped property may be null as anything else.
         let strict = strict(&json!({"type": "object", "properties": {"a": {"enum": [1, 2]}}}));
