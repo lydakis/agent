@@ -16181,12 +16181,18 @@ fn migrate_messages(conn: &Connection) -> Result<()> {
          -- Else the one run its bot had going when it was taken in, a steer
          -- joining only one that started before it was sent. Where two
          -- could have, as when one ended and the next began in the same
-         -- millisecond, it names none rather than guess.
-         UPDATE messages SET turn=(SELECT CASE WHEN COUNT(*)=1 THEN MAX(r.id) END
-                FROM turns r WHERE r.bot=messages.bot
-                AND r.started_ms IS NOT NULL AND r.started_ms<=messages.taken_ms
-                AND (r.finished_ms IS NULL OR r.finished_ms>=messages.taken_ms)
-                AND (messages.delivery<>'steer' OR r.id<messages.id))
+         -- millisecond, it names none rather than guess. A bot's runs
+         -- follow one another, so only the last two to start by then can
+         -- have been going: if an earlier one was, both of those were too.
+         -- The index goes with the old table.
+         CREATE INDEX turns_bot_started_ms ON turns(bot,started_ms)
+            WHERE started_ms IS NOT NULL;
+         UPDATE messages SET turn=(SELECT CASE WHEN COUNT(*)=1 THEN MAX(c.id) END
+                FROM (SELECT r.id,r.finished_ms FROM turns r WHERE r.bot=messages.bot
+                    AND r.started_ms IS NOT NULL AND r.started_ms<=messages.taken_ms
+                    AND (messages.delivery<>'steer' OR r.id<messages.id)
+                    ORDER BY r.started_ms DESC,r.id DESC LIMIT 2) c
+                WHERE c.finished_ms IS NULL OR c.finished_ms>=messages.taken_ms)
             WHERE status='taken' AND turn IS NULL;",
     )?;
     // The nodes of old steers that kept none, matched by their words in
