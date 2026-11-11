@@ -153,12 +153,20 @@ fn loosen_in(value: Value, schema: &Value, root: &Value) -> Value {
                     .collect(),
             )
         }
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(|item| loosen_in(item, &schema["items"], root))
-                .collect(),
-        ),
+        Value::Array(items) => {
+            // Of a choice, the branch that takes an array.
+            let schema = (["anyOf", "oneOf"].iter())
+                .flat_map(|key| schema[*key].as_array().into_iter().flatten())
+                .map(|branch| resolve(branch, root))
+                .find(|branch| branch.get("items").is_some())
+                .unwrap_or(schema);
+            Value::Array(
+                items
+                    .into_iter()
+                    .map(|item| loosen_in(item, &schema["items"], root))
+                    .collect(),
+            )
+        }
         other => other,
     }
 }
@@ -261,6 +269,15 @@ mod tests {
         assert_eq!(
             loosen(json!({"x": {"kind": "a", "value": null}}), &schema),
             json!({"x": {"kind": "a"}})
+        );
+        // An array in a choice is loosened by the branch that takes it.
+        let schema = json!({"type": "object", "properties": {"results": {"anyOf": [
+            {"type": "array", "items": {"type": "object",
+                "properties": {"note": {"type": "string"}}}},
+            {"type": "string"}]}}, "required": ["results"]});
+        assert_eq!(
+            loosen(json!({"results": [{"note": null}]}), &schema),
+            json!({"results": [{}]})
         );
         // An optional enum's null placeholder does not rule its branch out.
         let schema = json!({"type": "object", "properties": {"x": {"oneOf": [
