@@ -17803,6 +17803,60 @@ fn messages_that_joined_a_declined_request_go_back_in_line_as_sent() {
     assert_eq!(accepted["data"]["from"]["bot"], "Bob");
 }
 
+/// A bot with no folder of its own sends a message again into the folder
+/// of the turn it joined; the daemon's own note of a background command's
+/// end is a note, left out as before.
+#[test]
+fn a_message_sent_again_runs_where_it_joined_and_daemon_notes_stay_notes() {
+    let mut db = db();
+    db.create("Dan", None, binding()).unwrap();
+    let here = TurnOptions {
+        delivery: Delivery::Steer,
+        workspace: Some("/synthetic".into()),
+        ..TurnOptions::default()
+    };
+    let turn = db
+        .begin("Dan", "d1", "work", true, &here, allow_provider)
+        .unwrap()
+        .turn;
+    db.begin("Dan", "d2", "look here too", true, &here, allow_provider)
+        .unwrap();
+    let note = TurnOptions {
+        delivery: Delivery::Steer,
+        origin: Some("background".into()),
+        workspace: Some("/synthetic".into()),
+        ..TurnOptions::default()
+    };
+    db.begin(
+        "Dan",
+        "background-1",
+        "{\"finished\":{\"proc:1\":{\"exit_code\":0}}}",
+        true,
+        &note,
+        allow_provider,
+    )
+    .unwrap();
+    db.absorb(
+        turn,
+        None,
+        8 << 20,
+        4096,
+        ContextUsage::default(),
+        false,
+        true,
+    )
+    .unwrap();
+    let refused = Error::new("provider_refusal").facts(json!({"category":"cyber"}));
+    db.finish(turn, Some(&refused)).unwrap();
+    let again: Vec<Value> = (db.turns("Dan", turn, None, 8, false).unwrap()["turns"].as_array())
+        .unwrap()
+        .iter()
+        .filter(|t| t["status"] == "ready" || t["status"] == "queued")
+        .map(|t| json!([t["prompt_preview"], t["workspace"]]))
+        .collect();
+    assert_eq!(again, [json!(["look here too", "/synthetic"])]);
+}
+
 /// A message sent again keeps who sent it and the words it quoted,
 /// though that sender and the turn it quoted are gone by then.
 #[test]

@@ -10537,15 +10537,20 @@ impl Database {
         turn: i64,
         error: Option<&Error>,
     ) -> Result<Vec<i64>> {
+        // The daemon's own notes, a background command's end or a dropped
+        // reply, are notes: they are left out as tool output is.
         let joined: HashMap<i64, i64> = self
             .conn
             .prepare_cached(
                 "SELECT json_extract(e.data,'$.node'),t.id FROM events e
                  JOIN turns t ON t.id=json_extract(e.data,'$.steer')
-                 WHERE e.turn=? AND e.kind='steered' AND t.delivery='steer'
-                   AND t.wait_ms IS NULL AND t.expected_turn IS NULL",
+                 WHERE e.turn=?1 AND e.kind='steered' AND t.delivery='steer'
+                   AND t.wait_ms IS NULL AND t.expected_turn IS NULL
+                   AND t.origin IS NOT ?2 AND t.origin IS NOT ?3",
             )?
-            .query_map([turn], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map(params![turn, BACKGROUND_ORIGIN, LIMIT_ORIGIN], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
             .collect::<rusqlite::Result<_>>()?;
         if joined.is_empty() {
             return Ok(Vec::new());
@@ -10554,6 +10559,15 @@ impl Database {
             .and_then(|facts| facts.get("category"))
             .and_then(Value::as_str);
         let family = bot.family()?;
+        // A bot with no folder of its own runs it in this turn's, which
+        // every message that joined it was for.
+        let folder: Option<String> = match bot.workspace {
+            Some(_) => None,
+            None => self
+                .conn
+                .prepare_cached("SELECT workspace FROM turns WHERE id=?")?
+                .query_row([turn], |r| r.get(0))?,
+        };
         // What `finish` will note: the request's additions, oldest first.
         let added = declined_span(&self.conn, &bot.name, turn, bot.head)?;
         let mut requeued = Vec::new();
@@ -10564,9 +10578,10 @@ impl Database {
             if super::context::moved(family, category, item.len())?.is_none() {
                 continue;
             }
-            let Some((prompt, options)) = self.sent_again(steer, family, &item)? else {
+            let Some((prompt, mut options)) = self.sent_again(steer, family, &item)? else {
                 continue;
             };
+            options.workspace = folder.clone();
             let limits = std::mem::take(&mut self.pending_limits);
             let begun = self.begin(
                 &bot.name,
@@ -10589,7 +10604,8 @@ impl Database {
     /// A steered message as it goes back in line: its words and pictures
     /// from `item`, the node it became, and the rest from its row. It runs
     /// where and on what the bot does next, as a queued message that names
-    /// neither does. None for an item with no words to send.
+    /// neither does (a bot with no folder needs one named: its caller's).
+    /// None for an item with no words to send.
     fn sent_again(
         &self,
         steer: i64,
