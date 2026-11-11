@@ -19239,6 +19239,12 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         format!("proc:{process}").as_str(),
         "{running}"
     );
+    let every = db.approvals(None, None, 0, None, 64).unwrap();
+    assert_eq!(
+        every["approvals"][0]["handle"],
+        format!("proc:{process}").as_str(),
+        "{every}"
+    );
     db.answer(Decision {
         bot: "Lead",
         turn,
@@ -19291,6 +19297,8 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         handle.as_str(),
         "{tagged}"
     );
+    let every = db.approvals(None, None, 0, None, 64).unwrap();
+    assert_eq!(every["approvals"][0]["handle"], handle.as_str(), "{every}");
     // Another bot's listing reads none of it.
     db.create("Other", Some("/synthetic"), binding()).unwrap();
     let other = db.approvals(Some("Other"), None, 0, None, 64).unwrap();

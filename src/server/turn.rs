@@ -2906,7 +2906,22 @@ impl Turn {
                             .unwrap_or(false)
                     };
                     let mut results = for_model(results);
-                    let parts = pictures_of(&mut results)?;
+                    // Pictures run to megabytes, and a result another
+                    // waiter shares is copied to take them: off the
+                    // runtime thread.
+                    let parts = match results.values().any(|r| r.get("parts").is_some()) {
+                        false => Vec::new(),
+                        true => {
+                            let (taken, parts) = tokio::task::spawn_blocking(move || {
+                                let parts = pictures_of(&mut results);
+                                (results, parts)
+                            })
+                            .await
+                            .map_err(|_| Error::new("turn_task_failed"))?;
+                            results = taken;
+                            parts?
+                        }
+                    };
                     let mut result = wait_result(results);
                     if steered {
                         result["steered"] = json!(true);

@@ -9693,7 +9693,8 @@ impl Database {
                 let mut statement = match bot {
                     Some(_) => self.conn.prepare_cached(BOT_APPROVALS)?,
                     None => self.conn.prepare_cached(
-                        "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,a.process
+                        "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,
+                                COALESCE(a.process,(SELECT n.process FROM answers n WHERE n.turn=a.turn AND n.call_id=a.step_of))
                          FROM approvals a JOIN turns t ON t.id=a.turn JOIN bots b ON b.name=t.bot
                          WHERE a.id>?1 AND a.id<=?4 ORDER BY a.id LIMIT ?3",
                     )?,
