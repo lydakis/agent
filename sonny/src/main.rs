@@ -18378,11 +18378,9 @@ mod tests {
         failing.store(true, Ordering::SeqCst);
         let _ = app.counting.take().unwrap().await;
         let listed = listings.load(Ordering::SeqCst);
-        (
-            app.status_read.clear(),
-            app.asks_seen.clear(),
-            app.counted_mark = None,
-        );
+        app.status_read.clear();
+        app.asks_seen.clear();
+        app.counted_mark = None;
         counted(&mut app).await;
         assert_eq!(listings.load(Ordering::SeqCst), listed + 2);
         assert_eq!(app.counted_mark, None);
