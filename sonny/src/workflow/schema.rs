@@ -61,6 +61,11 @@ fn untaken(schema: &Value, depth: usize) -> Option<&'static str> {
     if fields.contains_key("anyOf") && fields.contains_key("oneOf") {
         return Some("oneOf beside an anyOf");
     }
+    if fields.contains_key("$ref")
+        && (fields.keys()).any(|key| !matches!(key.as_str(), "$ref" | "description" | "title"))
+    {
+        return Some("$ref with keywords beside it");
+    }
     let within = |key: &str| -> Vec<&Value> {
         match fields.get(key) {
             Some(Value::Array(each)) => each.iter().collect(),
@@ -404,6 +409,12 @@ mod tests {
         );
         let both = json!({"type": "object", "properties": {"v": {"anyOf": [{}], "oneOf": [{}]}}});
         assert!(check(&both).is_err());
+        let beside = json!({"type": "object", "$defs": {"r": {"type": "object"}},
+            "properties": {"v": {"$ref": "#/$defs/r", "required": ["note"]}}});
+        assert!(check(&beside).unwrap_err().contains("$ref"));
+        let described = json!({"type": "object", "$defs": {"r": {"type": "object"}},
+            "properties": {"v": {"$ref": "#/$defs/r", "description": "the result"}}});
+        assert!(check(&described).is_ok());
     }
 
     #[test]
