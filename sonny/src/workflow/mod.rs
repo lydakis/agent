@@ -700,7 +700,7 @@ async fn stop(client: &Client, caller: &str, id: &str) -> Result<String, String>
     run.note(json!({"t": "stop", "at_ms": now_ms()}));
     run.stopping.store(true, Ordering::SeqCst);
     run.halt.notify_waiters();
-    let stopped = run.interrupt(client).await;
+    let (stopped, _) = run.interrupt(client).await;
     Ok(format!(
         "Stopping workflow {} (run {id}): {stopped} running agent{} interrupted. You hear back \
          once it has ended, with what finished.",
@@ -722,28 +722,37 @@ impl Run {
         self.stopping.load(Ordering::SeqCst)
     }
 
-    /// Interrupt every worker whose turn runs: how many.
-    async fn interrupt(&self, client: &Client) -> usize {
+    /// Interrupt every worker whose turn runs: how many there were, and
+    /// whether the daemon heard about each one.
+    async fn interrupt(&self, client: &Client) -> (usize, bool) {
         let live: Vec<(String, i64)> = (self.live.lock().unwrap().iter())
             .map(|(bot, turn)| (bot.clone(), *turn))
             .collect();
+        let mut heard = true;
         for (bot, turn) in &live {
             // A submission whose answer never came: its turn as listed.
             let turn = match *turn {
-                SUBMITTED => (client
+                SUBMITTED => match client
                     .request("bots", json!({"name": bot, "limit": 1}))
-                    .await)
-                    .ok()
-                    .and_then(|page| page["bots"][0]["running_turn"].as_i64()),
+                    .await
+                {
+                    Ok(page) => page["bots"][0]["running_turn"].as_i64(),
+                    Err(error) => {
+                        heard &= !lost(&error);
+                        None
+                    }
+                },
                 turn => Some(turn),
             };
-            if let Some(turn) = turn {
-                let _ = client
+            if let Some(turn) = turn
+                && let Err(error) = client
                     .request("interrupt", json!({"bot": bot, "turn": turn}))
-                    .await;
+                    .await
+            {
+                heard &= !lost(&error);
             }
         }
-        live.len()
+        (live.len(), heard)
     }
 
     /// What a worker in `dir`, as profile `role`, is told: composed once a
@@ -1352,17 +1361,24 @@ async fn finish(run: &Run, ended: script::Ended, attempt: Option<&Attempt>) {
     // Every worktree being made is made, and known, before any is taken.
     drop(run.making.write().await);
     // What still runs is the run's no longer: a call it did not await,
-    // or one whose wait a lost connection left, on a new connection.
-    match attempt {
-        Some(attempt) => {
-            run.interrupt(&attempt.client).await;
-        }
-        None if !run.live.lock().unwrap().is_empty() => {
-            if let Ok((client, _events)) = Client::connect(&run.socket).await {
-                run.interrupt(&client).await;
+    // or one whose wait a lost connection left. The run is not recorded
+    // ended until the daemon has heard every interrupt, on a new
+    // connection if it must; a host gone meanwhile finds them again in the
+    // journal.
+    let mut heard = match attempt {
+        Some(attempt) => run.interrupt(&attempt.client).await.1,
+        None => run.live.lock().unwrap().is_empty(),
+    };
+    let mut wait = AGAIN;
+    while !heard {
+        if let Ok((client, _events)) = Client::connect(&run.socket).await {
+            heard = run.interrupt(&client).await.1;
+            if heard {
+                break;
             }
         }
-        None => {}
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_secs(60));
     }
     let (status, result, error) = match ended {
         script::Ended::Returned(value) => ("completed", value, None),
