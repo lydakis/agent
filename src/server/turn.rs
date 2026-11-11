@@ -6185,6 +6185,7 @@ async fn stop_handle(
     let name = format!("proc:{handle}");
     Ok(match stopped {
         Some(Some(Lifted::Ended { result, ready })) => {
+            handles.lifted_lapses(handle, None);
             handles.process_finished(handle, result.clone());
             if ready {
                 handles.turn_ready();

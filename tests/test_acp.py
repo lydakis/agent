@@ -296,6 +296,33 @@ class AcpTests(ModelFixture):
         self.assertEqual(launch['arguments']['workspaceStrategy'],
                          {'type': 'existing_worktree', 'worktreePath': str(self.path / '.agent/worktrees/calc.fix')})
 
+    def test_a_call_a_message_lifted_is_put_to_a_thread_that_comes_back(self):
+        repo = self.repo()
+        self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Lead.', declare=[declared('start_task', inherit=False)],
+                            approve=['start_task'], approver='manual')
+        thread, session = self.open(repo)
+        self.adopt(thread, session)
+        self.model.call_script = [('start_task', {'name': 'fix', 'brief': 'Fix calc.py.'})]
+        first = thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('script')})
+        [asked] = [m for m in thread.until(lambda m: m.get('method') == 'session/request_permission')
+                   if m.get('method') == 'session/request_permission']
+        thread.close()
+        # A message lifts the wait out of its turn, which ends; the call
+        # still waits for the person.
+        self.daemon.request('submit', bot='calc.lead', request_id='m', prompt='look', delivery='steer')
+        deadline = time.monotonic() + 30
+        while self.daemon.request('inspect', bot='calc.lead')['result'].get('running_turn') is not None:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        # A thread that comes back, with no turn running, puts it again.
+        back = Thread(self, self.env, repo)
+        back.answer_of(back.ask('initialize', {'protocolVersion': 2, 'clientCapabilities': {}}))
+        back.ask('session/resume', {'sessionId': session, 'cwd': str(repo), 'mcpServers': []})
+        [again] = [m for m in back.until(lambda m: m.get('method') == 'session/request_permission')
+                   if m.get('method') == 'session/request_permission']
+        self.assertEqual(again['params']['toolCall']['toolCallId'], asked['params']['toolCall']['toolCallId'])
+
     def test_a_turn_the_lead_takes_on_its_own_shows_in_the_thread(self):
         repo = self.repo()
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',

@@ -1021,9 +1021,9 @@ impl Session {
         };
         let handle = tokio::spawn(async move {
             if let Some((client, bot, turn)) = &waiting {
-                if turn.is_some() {
-                    follower.approvals(&agent, client, bot, *turn).await;
-                }
+                // With no turn running too: calls a message lifted wait
+                // past theirs.
+                follower.approvals(&agent, client, bot, *turn).await;
                 if agent.forms.load(Ordering::Relaxed) {
                     follower.questions(&agent, client, bot).await;
                 }
@@ -1638,9 +1638,7 @@ impl Session {
             }
             state.running = running;
         }
-        if running.is_some() {
-            self.approvals(agent, &client, &bot, running).await;
-        }
+        self.approvals(agent, &client, &bot, running).await;
         Ok(events)
     }
 
@@ -1981,9 +1979,10 @@ impl Session {
         }
     }
 
-    /// The calls of `turn` waiting for the person, each put to them once:
-    /// the gate it waits on is the person's (`ask`), or the judge handed
-    /// it over (`auto`).
+    /// The calls of `turn` waiting for the person, and those a message
+    /// lifted past their turn (listed with a handle, as their steps are),
+    /// each put to them once: the gate it waits on is the person's
+    /// (`ask`), or the judge handed it over (`auto`).
     async fn approvals(
         &self,
         agent: &Arc<Agent>,
@@ -2014,7 +2013,8 @@ impl Session {
             }
         }
         for call in &listed {
-            if call["turn"].as_i64() != turn || !for_person(call) {
+            let lifted = call["handle"].is_string();
+            if (call["turn"].as_i64() != turn && !lifted) || !for_person(call) {
                 continue;
             }
             let key = format!(
