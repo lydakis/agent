@@ -693,6 +693,29 @@ print(json.dumps({{'version': '2.5', 'ok': True, 'command': command, 'data': dat
                    if t['request_id'].startswith('commons.')]
         self.assertEqual(commons, ['commons.invite.stalls'])
 
+    def test_an_invite_to_a_busy_agent_waits_in_line_and_counts_as_sent(self):
+        import threading
+        for bot in ('calc.a', 'shop.b'):
+            self.daemon.request('create', bot=bot, workspace=str(self.path), model='openai/synthetic-model',
+                                instructions='Agent.', declare=[declared('commons')])
+        turn = self.daemon.request('submit', bot='shop.b', request_id='old',
+                                   prompt='the WAL checkpoint stalls')['result']['message']
+        self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+        # shop.b is in a turn, so its invite waits in line behind it.
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = threading.Event()
+        self.model.all_streaming.set()
+        self.addCleanup(self.model.release_headers.set)
+        busy = self.daemon.request('submit', bot='shop.b', request_id='busy', prompt='gate')['result']['message']
+        self.host()
+        post = {'name': 'stalls', 'title': 'Checkpoint stalls under load', 'text': 'Seen this?'}
+        started = json.loads(self.call('calc.a', 'commons', {'post': post}))
+        self.assertEqual(started['invited'], ['shop.b'], started)
+        listed = json.loads(self.call('calc.a', 'commons', {}))
+        self.assertEqual((listed['invites']['today'], listed['invites']['this_week']), (1, 1), listed)
+        self.model.release_headers.set()
+        self.assertEqual(self.daemon.finished(busy, timeout=10)['data']['status'], 'completed')
+
     def test_a_lead_made_for_a_subfolder_reads_its_own_memory_and_follows_its_folder(self):
         ws = self.path / 'ws'
         (ws / '.agents').mkdir(parents=True)

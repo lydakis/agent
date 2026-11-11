@@ -729,7 +729,7 @@ pub async fn invite(home: &Path, started: &Value, author: &str, invite: &Value) 
             if let Ok(started) = client
                 .request("submit", invite_submit(&bot, thread, note, ticket))
                 .await
-                && started["turn"].is_i64()
+                && started["message"].is_i64()
             {
                 invited.push((bot, ticket));
             }

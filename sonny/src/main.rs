@@ -10091,10 +10091,24 @@ impl App {
                     self.window = window_of(&event).or(self.window);
                 }
             }
-            // A staged prompt that ended in line, never taken in.
+            // A staged prompt that ended in line, never taken in. One that
+            // failed there never ran: its words stay in the transcript,
+            // with why, so they can be sent again.
             "message_ended" => {
                 let ended = event["message"].as_i64();
-                self.staged.retain(|(staged, _)| Some(*staged) != ended);
+                let Some(at) = (self.staged.iter()).position(|(staged, _)| Some(*staged) == ended)
+                else {
+                    return;
+                };
+                let (_, prompt) = self.staged.remove(at);
+                if data["status"] == "failed" {
+                    let width = self.prose();
+                    let mut lines = staged_body(&prompt, width, None, Path::new(&self.workspace));
+                    lines.push(Line::default());
+                    let why = data["detail"].as_str().or(data["error"].as_str());
+                    lines.push(transcript::finished("not run", why.unwrap_or(""), None));
+                    self.commit(lines);
+                }
             }
             "turn_finished" => {
                 if self.running.as_ref().is_some_and(|r| Some(r.turn) != turn) {
@@ -20073,6 +20087,24 @@ mod tests {
         )
         .await;
         assert!(app.staged.is_empty());
+        // One that failed there never ran: its words stay, with why.
+        app.pending.clear();
+        app.input.set("ran out");
+        app.submit().await;
+        let failed = staged(&app)[0];
+        app.daemon(
+            json!({"event": "message_ended", "bot": "b", "turn": null, "message": failed,
+            "data": {"status": "failed", "error": "budget_exhausted",
+                "detail": "the bot's budget is spent"}}),
+        )
+        .await;
+        assert!(app.staged.is_empty());
+        let shown: Vec<String> = app.pending.iter().map(|l| l.to_string()).collect();
+        assert!(shown.iter().any(|l| l.contains("ran out")), "{shown:?}");
+        assert_eq!(
+            shown.last().map(String::as_str),
+            Some("not run · the bot's budget is spent")
+        );
     }
 
     #[tokio::test]
