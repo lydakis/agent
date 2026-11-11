@@ -86,145 +86,113 @@ fn nullable(property: Value) -> Value {
 /// `value`, a reply to [`strict`]'s `schema`, with the nulls it gives the
 /// properties `schema` does not require left out, at every depth.
 pub fn loosen(value: Value, schema: &Value) -> Value {
-    loosen_in(value, &[schema], schema)
+    loosen_in(value, schema, schema, 0)
 }
 
-/// [`loosen`] by any of `schemas`, within `root`, whose `$defs` a local
-/// `$ref` names. Of a choice, every branch `value` may fit counts: a null
-/// goes only when none of them requires it, so whichever branch it truly
-/// answers, it still answers without the null.
-fn loosen_in(value: Value, schemas: &[&Value], root: &Value) -> Value {
-    let all: Vec<&Value> = (schemas.iter())
-        .flat_map(|schema| options(schema, root, 0))
-        .collect();
-    let fitting: Vec<&Value> = (all.iter().copied())
-        .filter(|option| fits(&value, option, root, 0))
-        .collect();
-    let options = match fitting.is_empty() {
-        true => all,
-        false => fitting,
-    };
-    match value {
-        Value::Object(fields) => Value::Object(
-            fields
-                .into_iter()
-                .filter_map(|(name, value)| {
-                    let inner: Vec<&Value> = (options.iter())
-                        .filter_map(|option| option["properties"].get(&name))
-                        .collect();
-                    let required = options.iter().any(|option| {
-                        (option["required"].as_array().into_iter().flatten())
-                            .any(|r| r == name.as_str())
-                    });
-                    if value.is_null() && !inner.is_empty() && !required {
-                        return None;
-                    }
-                    let value = loosen_in(value, &inner, root);
-                    Some((name, value))
-                })
-                .collect(),
-        ),
-        Value::Array(items) => {
-            let inner: Vec<&Value> = (options.iter())
-                .filter_map(|option| option.get("items"))
-                .collect();
-            Value::Array(
-                items
-                    .into_iter()
-                    .map(|item| loosen_in(item, &inner, root))
-                    .collect(),
-            )
-        }
-        other => other,
-    }
-}
-
-/// `schema` and, of a choice, every branch within it, followed down.
-fn options<'a>(schema: &'a Value, root: &'a Value, depth: usize) -> Vec<&'a Value> {
-    let schema = resolve(schema, root);
-    let mut out = vec![schema];
-    if depth < 16 {
-        for branch in (["anyOf", "oneOf"].iter())
-            .flat_map(|key| schema[*key].as_array().into_iter().flatten())
-        {
-            out.extend(options(branch, root, depth + 1));
-        }
-    }
-    out
-}
-
-/// Whether `value` may fit `schema` as [`strict`] sent it: optional
-/// properties may be null. What it does not check (bounds, lengths,
-/// patterns), or a schema deeper than `depth` allows, it lets pass, so a
-/// branch a value truly fits is never ruled out.
-fn fits(value: &Value, schema: &Value, root: &Value, depth: usize) -> bool {
-    if depth > 64 {
-        return true;
-    }
-    let depth = depth + 1;
+/// [`loosen`] within `root`, whose `$defs` a local `$ref` names. Of a
+/// choice, by the first branch whose loosening the schema then holds valid:
+/// one coherent alternative, never requirements mixed from several.
+fn loosen_in(value: Value, schema: &Value, root: &Value, depth: usize) -> Value {
     let schema = resolve(schema, root);
     let branches: Vec<&Value> = (["anyOf", "oneOf"].iter())
         .flat_map(|key| schema[*key].as_array().into_iter().flatten())
         .collect();
-    if !branches.is_empty()
-        && !branches
-            .iter()
-            .any(|branch| fits(value, branch, root, depth))
-    {
-        return false;
-    }
-    if schema.get("const").is_some_and(|c| c != value)
-        || (schema["enum"].as_array()).is_some_and(|values| !values.contains(value))
-    {
-        return false;
-    }
-    let typed = |kind: &str| match kind {
-        "null" => value.is_null(),
-        "boolean" => value.is_boolean(),
-        "string" => value.is_string(),
-        "number" => value.is_number(),
-        "integer" => value.as_f64().is_some_and(|n| n.fract() == 0.0),
-        "array" => value.is_array(),
-        "object" => value.is_object(),
-        _ => true,
-    };
-    let kinds_fit = match &schema["type"] {
-        Value::String(kind) => typed(kind),
-        Value::Array(kinds) => kinds.iter().filter_map(Value::as_str).any(typed),
-        _ => true,
-    };
-    if !kinds_fit {
-        return false;
+    if depth < 16 && !branches.is_empty() && (value.is_object() || value.is_array()) {
+        for branch in branches {
+            let alternative = with(schema, resolve(branch, root));
+            let loosened = loosen_in(value.clone(), &alternative, root, depth + 1);
+            if valid(&loosened, schema, root) {
+                return loosened;
+            }
+        }
     }
     match value {
         Value::Object(fields) => {
             let required: Vec<&str> = (schema["required"].as_array().into_iter().flatten())
                 .filter_map(Value::as_str)
                 .collect();
-            if !required.iter().all(|name| fields.contains_key(*name)) {
-                return false;
-            }
-            let Some(properties) = schema["properties"].as_object() else {
-                return true;
-            };
-            fields
-                .iter()
-                .all(|(name, field)| match properties.get(name) {
-                    Some(property) => {
-                        (field.is_null() && !required.contains(&name.as_str()))
-                            || fits(field, property, root, depth)
-                    }
-                    None => schema["additionalProperties"] != false,
-                })
+            let properties = schema["properties"].as_object();
+            Value::Object(
+                fields
+                    .into_iter()
+                    .filter_map(|(name, value)| {
+                        let property = properties.and_then(|p| p.get(&name));
+                        if value.is_null()
+                            && property.is_some()
+                            && !required.contains(&name.as_str())
+                        {
+                            return None;
+                        }
+                        let inner = property.unwrap_or(&Value::Null);
+                        let value = loosen_in(value, inner, root, depth + 1);
+                        Some((name, value))
+                    })
+                    .collect(),
+            )
         }
-        Value::Array(items) => {
-            let Some(item) = schema.get("items") else {
-                return true;
-            };
-            items.iter().all(|value| fits(value, item, root, depth))
-        }
-        _ => true,
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| loosen_in(item, &schema["items"], root, depth + 1))
+                .collect(),
+        ),
+        other => other,
     }
+}
+
+/// `branch` with what `schema` around it says as well: its properties,
+/// what it requires and its items, which hold whichever branch is taken.
+fn with(schema: &Value, branch: &Value) -> Value {
+    let mut alternative = branch.clone();
+    let Some(out) = alternative.as_object_mut() else {
+        return alternative;
+    };
+    if let Some(own) = schema["properties"].as_object() {
+        let properties = out.entry("properties").or_insert_with(|| json!({}));
+        if let Some(properties) = properties.as_object_mut() {
+            for (name, property) in own {
+                properties
+                    .entry(name.clone())
+                    .or_insert_with(|| property.clone());
+            }
+        }
+    }
+    if let Some(own) = schema["required"].as_array() {
+        let required = out.entry("required").or_insert_with(|| json!([]));
+        if let Some(required) = required.as_array_mut() {
+            required.extend(
+                own.iter()
+                    .filter(|name| !required.contains(name))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    if let Some(items) = schema.get("items") {
+        out.entry("items").or_insert_with(|| items.clone());
+    }
+    alternative
+}
+
+/// `schema` as a document of its own: with `root`'s definitions, which
+/// its local `$ref`s name.
+fn document(schema: &Value, root: &Value) -> Value {
+    let mut document = schema.clone();
+    if let Some(out) = document.as_object_mut() {
+        for key in ["$defs", "definitions"] {
+            if let Some(defs) = root.get(key) {
+                out.entry(key).or_insert_with(|| defs.clone());
+            }
+        }
+    }
+    document
+}
+
+/// Whether `value` answers `schema` within `root`. A schema the validator
+/// cannot read holds nothing out.
+fn valid(value: &Value, schema: &Value, root: &Value) -> bool {
+    jsonschema::validator_for(&document(schema, root))
+        .map_or(true, |validator| validator.is_valid(value))
 }
 
 /// `schema`, or what its local `$ref` names in `root`, followed a few
@@ -242,26 +210,9 @@ fn resolve<'a>(mut schema: &'a Value, root: &'a Value) -> &'a Value {
     schema
 }
 
-/// Whether `property` takes null: typed so, or untyped.
-fn takes_null(property: &Value) -> bool {
-    let any = |key: &str| (property[key].as_array().into_iter().flatten()).any(takes_null);
-    match &property["type"] {
-        Value::String(kind) => kind == "null",
-        Value::Array(kinds) => kinds.contains(&json!("null")),
-        _ if property.get("anyOf").is_some() || property.get("oneOf").is_some() => {
-            any("anyOf") || any("oneOf")
-        }
-        _ => {
-            property.get("enum").is_none_or(|values| {
-                values
-                    .as_array()
-                    .is_some_and(|values| values.contains(&Value::Null))
-            }) && property.get("const").is_none_or(Value::is_null)
-        }
-    }
-}
-
-/// The object a worker's reply to `schema` gives, or why there is none.
+/// The object a worker's reply to `schema` gives, or why there is none:
+/// checked whole against `schema`, as Claude Code checks a structured
+/// reply.
 pub fn parse(text: &str, schema: &Value) -> Result<Value, String> {
     let text = text.trim();
     // A model that fences its JSON in spite of the format.
@@ -276,17 +227,18 @@ pub fn parse(text: &str, schema: &Value) -> Result<Value, String> {
         return Err("not a JSON object".into());
     }
     let value = loosen(value, schema);
-    let missing: Vec<&str> = (schema["required"].as_array().into_iter().flatten())
-        .filter_map(Value::as_str)
-        .filter(|name| match value.get(name) {
-            None => true,
-            Some(Value::Null) => !takes_null(&schema["properties"][name]),
-            Some(_) => false,
+    let Ok(validator) = jsonschema::validator_for(schema) else {
+        return Ok(value);
+    };
+    let wrong: Vec<String> = (validator.iter_errors(&value).take(3))
+        .map(|error| match error.instance_path().as_str() {
+            "" => error.to_string(),
+            at => format!("{error} at {at}"),
         })
         .collect();
-    match missing.is_empty() {
+    match wrong.is_empty() {
         true => Ok(value),
-        false => Err(format!("missing {}", missing.join(", "))),
+        false => Err(wrong.join("; ")),
     }
 }
 
@@ -332,6 +284,27 @@ mod tests {
             loosen(json!({"x": {"n": 1.0, "note": null}}), &schema),
             json!({"x": {"n": 1.0}})
         );
+    }
+
+    #[test]
+    fn a_choice_loosens_by_one_alternative_and_what_is_left_is_checked_whole() {
+        // Two overlapping branches: the reply fits both as sent, and goes
+        // back as the first, never with requirements mixed from both.
+        let schema = json!({"type": "object", "properties": {"v": {"anyOf": [
+            {"type": "object", "properties": {"x": {"type": "string"},
+                "y": {"type": ["string", "null"]}}, "required": ["y"]},
+            {"type": "object", "properties": {"x": {"type": ["string", "null"]},
+                "y": {"type": "string"}}, "required": ["x"]}]}},
+            "required": ["v"]});
+        assert_eq!(
+            loosen(json!({"v": {"x": null, "y": null}}), &schema),
+            json!({"v": {"y": null}})
+        );
+        // A reply that holds none of the schema's bounds is no answer.
+        let schema = json!({"type": "object", "properties": {
+            "n": {"type": "integer", "minimum": 0}}, "required": ["n"]});
+        let wrong = parse(r#"{"n": -1}"#, &schema).unwrap_err();
+        assert!(wrong.contains("/n"), "{wrong}");
     }
 
     #[test]
