@@ -19082,6 +19082,78 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
     assert!(outcomes.contains(&("s2", "denied")), "{outcomes:?}");
 }
 
+/// A verdict on a call a message lifted leaves a later turn's denial
+/// counts as they are: they are that turn's.
+#[test]
+fn a_lifted_calls_verdict_leaves_a_later_turns_denials_be() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (first, s1) = shell_call("fc_1", "s1", "true");
+    let (second, s2) = shell_call("fc_2", "s2", "ls");
+    db.append(turn, vec![first, second], &[s1.clone(), s2.clone()], None)
+        .unwrap();
+    let now = epoch_now();
+    let (p1, _) = db.lift(turn, "s1", Some(&s1), now).unwrap().unwrap();
+    let (p2, _) = db.lift(turn, "s2", Some(&s2), now).unwrap().unwrap();
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    // A later turn has a denial of its own under the same gate.
+    let later = db
+        .begin(
+            "Bob",
+            "later",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, n1) = shell_call("fc_n", "n1", "pwd");
+    db.append(later, vec![item], std::slice::from_ref(&n1), None)
+        .unwrap();
+    let deny = |db: &mut Database, turn: i64, call_id: &str| {
+        db.answer(Decision {
+            bot: "Bob",
+            turn,
+            call_id,
+            request: 1,
+            tag: None,
+            allow: false,
+            unreviewed: false,
+            reason: Some("no"),
+            by: Some("test"),
+            leased: false,
+        })
+        .unwrap()
+    };
+    deny(&mut db, later, "n1");
+    assert!(matches!(
+        db.approval_start(later, &n1, false, 0).unwrap(),
+        Gated::Denied
+    ));
+    let counts = |db: &Database| {
+        let denials = db.inspect("Bob").unwrap().denials;
+        let manual = &denials["manual"];
+        (manual.turn, manual.in_row, manual.window.count_ones())
+    };
+    assert_eq!(counts(&db), (later, 1, 1));
+    // The earlier turn's lifted calls, allowed and denied: the later
+    // turn's counts stand.
+    assert!(allow(&mut db, turn, "s1").unwrap().lifted.is_some());
+    assert!(matches!(
+        db.lifted_check(p1, now, false).unwrap(),
+        Lifted::Run(_)
+    ));
+    assert_eq!(counts(&db), (later, 1, 1));
+    deny(&mut db, turn, "s2");
+    assert!(matches!(
+        db.lifted_check(p2, now, false).unwrap(),
+        Lifted::Ended { .. }
+    ));
+    assert_eq!(counts(&db), (later, 1, 1));
+}
+
 /// A call its client answers that a message lifted keeps waiting for that
 /// answer past its turn: listed for its client, answered into its command,
 /// or stopped by its agent; and across a restart it still waits.

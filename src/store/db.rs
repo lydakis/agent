@@ -14371,6 +14371,15 @@ fn count_denials(
 ) -> Result<()> {
     let mut changed = false;
     for tag in tags {
+        // A later turn's counts are its own: a verdict on an earlier
+        // turn's call, which a message lifted, leaves them be.
+        if bot
+            .denials
+            .get(*tag)
+            .is_some_and(|counts| counts.turn > turn)
+        {
+            continue;
+        }
         if denied {
             let counts = bot.denials.entry((*tag).to_owned()).or_default();
             if counts.turn != turn {

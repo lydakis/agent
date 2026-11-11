@@ -2507,8 +2507,10 @@ pub async fn run(config: Configuration) -> Result<()> {
     while service.tails.running.join_next().await.is_some() {}
     // Terminals and background commands end with the daemon, and record
     // how on their handles, so no result task keeps the store open below.
-    service.registry.end_terminals();
+    // Stopping is said first: a terminal starting now either sees it and
+    // ends, or was registered before and ends here.
     service.registry.end_background();
+    service.registry.end_terminals();
     // Every completion is committed. Allow publication to drain before
     // releasing waiters. Background result tasks may still own Store clones,
     // keeping the stream open even after the service is dropped.

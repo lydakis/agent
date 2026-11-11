@@ -425,6 +425,13 @@ impl Registry {
                 cord.check()?;
                 stopper.check()?;
             }
+            // Nor does one the daemon's stop came before.
+            if *self.stopping.borrow() {
+                return Err(Error::with(
+                    "daemon_shutdown",
+                    "the daemon was stopping before this command started, so it did not run",
+                ));
+            }
             let (master, slave) = open()?;
             let mut process = sh(
                 &command,
@@ -490,10 +497,10 @@ impl Registry {
             pruned
         };
         // A kill by its handle finds it registered from here: one that
-        // came as it started ends it now.
-        if let Some((_, stopper)) = lifted
-            && stopper.hand_over()
-        {
+        // came as it started ends it now. So does the daemon's stop, which
+        // ends the registered terminals once it says it is stopping.
+        let killed = lifted.is_some_and(|(_, stopper)| stopper.hand_over());
+        if killed || *self.stopping.borrow() {
             terminal.kill();
         }
         if let Some(pruned) = pruned {
@@ -925,6 +932,33 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!mark.exists());
         assert!(!registry.stop(9), "nothing is left to kill");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_the_daemons_stop_came_before_never_starts() {
+        use super::Registry;
+        let registry = Registry::new("echo").unwrap();
+        registry.end_background();
+        let mark = std::env::temp_dir().join(format!("stopping-{}", std::process::id()));
+        let (done, ended) = tokio::sync::oneshot::channel();
+        let refused = registry
+            .terminal(
+                1,
+                12,
+                format!("touch {}", mark.display()),
+                std::env::temp_dir(),
+                None,
+                Vec::new(),
+                None,
+                Some((registry.cord(), registry.stopper(12))),
+                done,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "daemon_shutdown");
+        assert_eq!(ended.await.unwrap().unwrap_err().code, "daemon_shutdown");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!mark.exists());
     }
 
     #[tokio::test]
