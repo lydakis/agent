@@ -112,12 +112,14 @@ struct Waiting {
     /// When the wait gives up on what is still pending, as scheduled.
     deadline: Option<u64>,
 }
-/// What comes due on the schedule: a wait's deadline, by its generation, or
-/// a waiting step's lapse, by its approval.
+/// What comes due on the schedule: a wait's deadline, by its generation, a
+/// waiting step's lapse, by its approval, or when a call a message lifted
+/// stops waiting for its verdict or answer, by its command.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Due {
     Wait(Waiter, u64),
     Step(i64),
+    Lifted(i64),
 }
 struct Retained {
     value: Arc<Value>,
@@ -145,6 +147,10 @@ struct Inner {
     /// Steps an answer or their turn's end may have decided, by approval,
     /// for the run loop to check.
     stepped: Vec<i64>,
+    /// Each lifted call's time on the schedule, by its command.
+    lifted: HashMap<i64, u64>,
+    /// Lifted calls whose time came, by command, for the run loop to check.
+    lifted_due: Vec<i64>,
 }
 
 #[derive(Clone)]
@@ -214,6 +220,24 @@ impl Handles {
         }
     }
 
+    /// Put the time a lifted call stops waiting on the schedule, in place
+    /// of any it had: none once it ended, or while nothing runs it out.
+    pub fn lifted_lapses(&self, process: i64, at: Option<u64>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(old) = inner.lifted.remove(&process) {
+            inner.schedule.remove(&(old, Due::Lifted(process)));
+        }
+        if let Some(at) = at {
+            inner.lifted.insert(process, at);
+            Self::schedule_locked(&mut inner, &self.sooner, at, Due::Lifted(process));
+        }
+    }
+
+    /// The lifted calls whose time came, for the run loop to check.
+    pub fn take_lifted(&self) -> Vec<i64> {
+        std::mem::take(&mut self.inner.lock().unwrap().lifted_due)
+    }
+
     /// A waiting step was answered, or its turn or call ended: the run
     /// loop checks it. Told after the store committed.
     pub fn stepped(&self, approval: i64) {
@@ -268,6 +292,10 @@ impl Handles {
                 Due::Step(approval) => {
                     inner.lapses.remove(&approval);
                     steps.push(approval);
+                }
+                Due::Lifted(process) => {
+                    inner.lifted.remove(&process);
+                    inner.lifted_due.push(process);
                 }
             }
         }

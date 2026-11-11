@@ -1,5 +1,6 @@
 """Pictures sent with a prompt, validated on submit and put after its words, and image files read."""
 import base64
+import json
 import os
 import sqlite3
 import struct
@@ -7,7 +8,7 @@ import unittest
 import zlib
 
 from tests.test_runtime import ModelFixture
-from bench.runtime_client import node_item
+from bench.runtime_client import node_item, poll
 
 
 def png(width=2, height=2):
@@ -136,6 +137,44 @@ class ImageTests(ModelFixture):
         read = node_item(client, 'Bob', node)['result']
         self.assertEqual(read['output'][1], {'type': 'input_image', 'image_url': 'data:image/png;base64,',
                                              'omitted_bytes': len(picture['image_url']) - len('data:image/png;base64,')})
+
+    def test_a_lifted_read_hands_its_picture_to_the_wait_that_collects_it(self):
+        def respond(request, user):
+            if not user.startswith('liftpic:'):
+                return None
+            start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user'
+                        and not i['content'][0]['text'].startswith('steer:'))
+            outputs = [i['output'] for i in request['input'][start:] if i.get('type') == 'function_call_output']
+            if outputs:
+                return 'seen:' + outputs[-1]
+            return [['read', {'path': user[8:]}]]
+        self.model.respond = respond
+        (self.path / 'shot.png').write_bytes(png(30, 20))
+        client = self.client('read,wait')
+        client.request('create', bot='Bob', workspace=str(self.path), approve=['read'],
+                       approver='manual', tools=['read', 'wait'])
+        turn = client.request('submit', bot='Bob', request_id='a', prompt='liftpic:shot.png')['result']['turn']
+        asked = client.receive(lambda m: m.get('event') == 'approval_requested' and m.get('turn') == turn)
+        client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        handle = json.loads(poll(client, 'Bob', turn)['result']['text'].removeprefix('seen:'))['handle']
+        waiting = asked['data']['calls'][0]
+        client.request('answer', bot='Bob', turn=turn, call_id=waiting['call_id'],
+                       request=waiting['request'], decision='allow', by='test')
+        ended = client.receive(lambda m: m.get('event') == 'lifted_ended' and m['data']['handle'] == handle)
+        self.assertEqual(ended['data']['outcome'], 'allowed')
+        prompt = 'calls:' + json.dumps([['wait', {'handles': [handle]}]])
+        turn = client.request('submit', bot='Bob', request_id='w', prompt=prompt, delivery='queue')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        while True:
+            request = self.model.requests.get(timeout=3)
+            last = request['input'][-1]
+            if last.get('type') == 'function_call_output' and last['call_id'] == 'wait-1':
+                break
+        text, picture = last['output']
+        self.assertIn('shot.png: a PNG image, 30×20', text['text'])
+        self.assertNotIn('"parts"', text['text'])
+        self.assertEqual(picture['type'], 'input_image')
 
     def test_pictures_a_provider_would_refuse_are_refused_on_submit(self):
         client = self.client()

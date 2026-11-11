@@ -1381,8 +1381,9 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
             1,
             "test -t 0 && echo tty; read -p 'name? ' name; echo \"hi $name\"; exit 3".into(),
             cwd.clone(),
-            2000,
+            Some(2000),
             Vec::new(),
+            None,
             None,
             done,
         )
@@ -1434,7 +1435,17 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
     // Ctrl-C reaches the program, as at a terminal; kill ends what ignores it.
     let (done, _end) = tokio::sync::oneshot::channel();
     tools
-        .terminal(1, 2, "cat".into(), cwd.clone(), 0, Vec::new(), None, done)
+        .terminal(
+            1,
+            2,
+            "cat".into(),
+            cwd.clone(),
+            Some(0),
+            Vec::new(),
+            None,
+            None,
+            done,
+        )
         .await
         .unwrap();
     let interrupted = tools
@@ -1443,6 +1454,42 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
         .unwrap();
     let interrupted: Value = serde_json::from_str(&interrupted.output).unwrap();
     assert_eq!(interrupted["signal"], libc::SIGINT);
+    // Started with no wait, as a lifted call's is, it reads nothing yet
+    // and leaves what it writes for the next read.
+    let (done, _end) = tokio::sync::oneshot::channel();
+    let started = tools
+        .terminal(
+            1,
+            4,
+            "printf 'kept\\n'; sleep 60".into(),
+            cwd.clone(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            done,
+        )
+        .await
+        .unwrap();
+    let started: Value = serde_json::from_str(&started.output).unwrap();
+    assert_eq!(
+        (&started["handle"], &started["output"]),
+        (&json!("proc:4"), &json!(""))
+    );
+    let mut read = String::new();
+    for _ in 0..50 {
+        let polled = tools
+            .write_stdin(1, 4, "", Some(100), false, None)
+            .await
+            .unwrap();
+        let polled: Value = serde_json::from_str(&polled.output).unwrap();
+        read.push_str(polled["output"].as_str().unwrap());
+        if read.contains("kept") {
+            break;
+        }
+    }
+    assert_eq!(read, "kept\n");
+    tools.write_stdin(1, 4, "", None, true, None).await.unwrap();
     let (done, _end) = tokio::sync::oneshot::channel();
     tools
         .terminal(
@@ -1450,8 +1497,9 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
             3,
             "trap '' INT; sleep 60".into(),
             cwd.clone(),
-            0,
+            Some(0),
             Vec::new(),
+            None,
             None,
             done,
         )
@@ -1483,8 +1531,9 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
             4,
             "trap '' INT; sleep 60".into(),
             cwd.clone(),
-            0,
+            Some(0),
             Vec::new(),
+            None,
             None,
             done,
         )
@@ -1531,8 +1580,9 @@ async fn terminals_hold_a_lasting_permit_and_end_their_whole_session() {
             handle,
             command.into(),
             cwd.clone(),
-            1000,
+            Some(1000),
             Vec::new(),
+            None,
             None,
             done,
         );
@@ -1605,8 +1655,9 @@ async fn terminals_hold_a_lasting_permit_and_end_their_whole_session() {
                 handle,
                 "sleep 300".into(),
                 cwd.clone(),
-                0,
+                Some(0),
                 Vec::new(),
+                None,
                 None,
                 done,
             )

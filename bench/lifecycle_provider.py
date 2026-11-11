@@ -107,7 +107,7 @@ async def serve(config, stats_path, mode, engine='rust'):
                     assert agent not in pending and turn == turns.get(agent, -1) + 1
                     words = [{'type':'input_text','text':prompt(config,agent,turn)}]
                     # Agent adds the message's number after its words, from
-                    # protocol 64; the Perf screen also runs an older base.
+                    # protocol 65; the Perf screen also runs an older base.
                     line = items[-1]['content'][-1]
                     if engine == 'rust' and len(items[-1]['content']) == 2:
                         assert line['type'] == 'input_text' and re.fullmatch(r'\[Message \S+/\d+\.\]', line['text'])

@@ -4,8 +4,8 @@ use agent_runtime::{
     provider::{ModelTokens, ToolCall, Usage},
     store::{
         Answered, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage, Counts, Database,
-        Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Limit, Planning, QuoteRef, Settings,
-        Strip, TurnBudget, TurnOptions, Wake,
+        Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Lifted, Limit, Planning, QuoteRef,
+        Settings, Strip, TurnBudget, TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome},
 };
@@ -8109,6 +8109,7 @@ fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
     db.process_finish(
         process,
         &json!({"stdout":"large"}),
+        false,
         &[("stdout", b"synthetic output".to_vec())],
         &[],
     )
@@ -9156,7 +9157,7 @@ fn completion_retention_passes_turns_whose_processes_still_run() {
     assert_eq!(db.prune_except("Bob", 1, None).unwrap()["events"], 0);
     assert_eq!(db.running_processes().unwrap(), piece as i64);
     // A process that ends makes its turn prunable again.
-    db.process_finish(processes[0], &json!({"stdout":"done"}), &[], &[])
+    db.process_finish(processes[0], &json!({"stdout":"done"}), false, &[], &[])
         .unwrap();
     // Once Bob has been told of it.
     hear_out(&mut db, "Bob");
@@ -9441,6 +9442,7 @@ fn retention_keeps_running_processes_until_their_results_commit() {
     db.process_finish(
         process,
         &json!({"stdout":"done"}),
+        false,
         &[("stdout", b"full output".to_vec())],
         &[],
     )
@@ -16161,7 +16163,8 @@ fn an_expired_fork_still_running_a_command_holds_back_no_other() {
         db.expired(i64::MAX, 1).unwrap(),
         vec![("idle".to_owned(), idle.bot_id)]
     );
-    db.process_finish(process, &json!({}), &[], &[]).unwrap();
+    db.process_finish(process, &json!({}), false, &[], &[])
+        .unwrap();
     assert_eq!(db.expired(i64::MAX, 16).unwrap().len(), 2);
 }
 
@@ -17336,19 +17339,26 @@ fn a_background_command_no_wait_collected_is_told_once_its_bot_rests() {
     let late = db.process_start(first, "shell-2").unwrap();
     let during = db.process_start(first, "shell-3").unwrap();
     // While its turn runs, an end waits for the turn's end.
-    db.process_finish(waited, &json!({"stdout":"ok","exit_code":0}), &[], &[])
-        .unwrap();
+    db.process_finish(
+        waited,
+        &json!({"stdout":"ok","exit_code":0}),
+        false,
+        &[],
+        &[],
+    )
+    .unwrap();
     assert!(!db.tell_finished("Bob").unwrap());
     // A wait handed this one over; a write showed the bot this one's end.
     let node = db.inspect("Bob").unwrap().head.unwrap();
     db.delivered(node, &[waited]).unwrap();
     db.saw_end(seen).unwrap();
-    db.process_finish(seen, &json!({"output":"$ ","exit_code":0}), &[], &[])
+    db.process_finish(seen, &json!({"output":"$ ","exit_code":0}), false, &[], &[])
         .unwrap();
     db.process_finish(
         during,
         &json!({"stdout":"x".repeat(9000),"stderr":"","exit_code":0,
         "success":true,"wall_time_ms":40}),
+        false,
         &[],
         &[],
     )
@@ -17372,6 +17382,7 @@ fn a_background_command_no_wait_collected_is_told_once_its_bot_rests() {
     db.process_finish(
         late,
         &json!({"error":"daemon_paused","detail":"stopped"}),
+        true,
         &[],
         &[],
     )
@@ -17419,7 +17430,7 @@ fn a_bot_whose_client_collects_results_itself_is_never_told() {
     quiet.settings.quiet_background = true;
     db.create("Carol", Some("/synthetic"), quiet).unwrap();
     let process = started_in_background(&mut db, "Carol", "c1");
-    db.process_finish(process, &json!({"exit_code":0}), &[], &[])
+    db.process_finish(process, &json!({"exit_code":0}), false, &[], &[])
         .unwrap();
     assert!(!db.tell_finished("Carol").unwrap());
     started_in_background(&mut db, "Carol", "c2");
@@ -17441,7 +17452,7 @@ fn submissions_filling_the_pending_bounds_hold_back_no_note() {
         .unwrap();
     let refused = db.begin("Eve", "e2", "more", false, &queue, allow_provider);
     assert_eq!(refused.unwrap_err().code, "pending_limit");
-    db.process_finish(process, &json!({"exit_code":1}), &[], &[])
+    db.process_finish(process, &json!({"exit_code":1}), false, &[], &[])
         .unwrap();
     assert!(db.tell_finished("Bob").unwrap(), "told past the bound");
 }
@@ -17470,6 +17481,7 @@ fn notes_of_many_ended_commands_each_fit_the_bots_context() {
         db.process_finish(
             *id,
             &json!({"error":"process_lost","detail":long}),
+            true,
             &[],
             &[],
         )
@@ -17511,7 +17523,7 @@ fn retention_keeps_what_a_note_still_to_run_tells_of() {
     ))
     .unwrap()
     .turn;
-    db.process_finish(process, &json!({"exit_code":0}), &[], &[])
+    db.process_finish(process, &json!({"exit_code":0}), false, &[], &[])
         .unwrap();
     db.finish(next, None).unwrap();
     db.retain("Dan", Some(next)).unwrap();
@@ -17549,8 +17561,14 @@ fn retention_keeps_ended_commands_a_later_note_is_still_to_tell() {
     .turn;
     let long = "why ".repeat(100);
     for id in [first, second] {
-        db.process_finish(id, &json!({"error":"process_lost","detail":long}), &[], &[])
-            .unwrap();
+        db.process_finish(
+            id,
+            &json!({"error":"process_lost","detail":long}),
+            true,
+            &[],
+            &[],
+        )
+        .unwrap();
     }
     db.finish(third, None).unwrap();
     db.retain("Gus", Some(third)).unwrap();
@@ -17592,7 +17610,7 @@ fn schema_76_tells_no_bot_of_commands_that_ended_before() {
             .turn;
         let ended = db.process_start(turn, "shell-1").unwrap();
         let running = db.process_start(turn, "shell-2").unwrap();
-        db.process_finish(ended, &json!({"exit_code":0}), &[], &[])
+        db.process_finish(ended, &json!({"exit_code":0}), false, &[], &[])
             .unwrap();
         (ended, running)
     };
@@ -17600,7 +17618,8 @@ fn schema_76_tells_no_bot_of_commands_that_ended_before() {
     Connection::open(&path)
         .unwrap()
         .older(
-            "DROP INDEX processes_untold; ALTER TABLE processes DROP COLUMN told;
+            "DROP INDEX processes_untold; DROP INDEX processes_bot_running;
+             ALTER TABLE processes DROP COLUMN told;
              ALTER TABLE processes DROP COLUMN bot; PRAGMA user_version=76;",
         )
         .unwrap();
@@ -19363,4 +19382,621 @@ fn prompts_follow_the_order_a_turn_took_its_messages_in() {
     assert_eq!(words, ["work", "stop", "by the way"]);
     assert_eq!(read[1]["reply"]["text"], "before the steer");
     assert_eq!(read[2]["reply"]["text"], "stopping");
+}
+
+/// A gated call a message lifted waits on past its turn, as a background
+/// command: listed with its handle, kept when the turn ends, and its
+/// verdict, given later, runs it or ends it, telling the bot at rest.
+#[test]
+fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (first, s1) = shell_call("fc_1", "s1", "true");
+    let (second, s2) = shell_call("fc_2", "s2", "ls");
+    let (third, s3) = shell_call("fc_3", "s3", "pwd");
+    db.append(
+        turn,
+        vec![first, second, third],
+        &[s1.clone(), s2.clone(), s3.clone()],
+        None,
+    )
+    .unwrap();
+    let now = epoch_now();
+    let (p1, lapse) = db.lift(turn, "s1", Some(&s1), now).unwrap().unwrap();
+    // No gate runs it out, so nothing goes on the schedule.
+    assert_eq!(lapse, None);
+    let (p2, _) = db.lift(turn, "s2", Some(&s2), now).unwrap().unwrap();
+    let (p3, _) = db.lift(turn, "s3", Some(&s3), now).unwrap().unwrap();
+    // Each call is answered with its handle, so the round is closed and
+    // the turn can end.
+    let events = db.events("Bob", 0, 256).unwrap()["events"].clone();
+    let lifted: Vec<&Value> = (events.as_array().unwrap().iter())
+        .filter(|e| e["event"] == "call_lifted")
+        .collect();
+    assert_eq!(lifted.len(), 3);
+    assert_eq!(lifted[0]["data"]["waits_for"], "approval");
+    assert_eq!(lifted[0]["data"]["handle"], format!("proc:{p1}"));
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    // Both still wait, listed for the bot with their handles.
+    let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    let handles: Vec<&Value> = (listed["approvals"].as_array().unwrap().iter())
+        .map(|call| &call["handle"])
+        .collect();
+    assert_eq!(
+        handles,
+        [p1, p2, p3]
+            .map(|p| json!(format!("proc:{p}")))
+            .iter()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(db.lifted_waiting().unwrap().len(), 3);
+    // Waiting, none runs anything: the daemon may exit idle.
+    assert_eq!(db.running_processes().unwrap(), 0);
+    assert_eq!(
+        db.process_result(p1).unwrap().map(|(status, _)| status),
+        Some("running".into())
+    );
+    // Undecided, each waits on with no time of its own.
+    assert!(matches!(
+        db.lifted_check(p1, now, false).unwrap(),
+        Lifted::Waiting(None)
+    ));
+    // The bot's model and effort change after the turn: the call runs at
+    // its turn's.
+    let was = db.inspect("Bob").unwrap();
+    let ran_at = (
+        format!("{}/{}", was.provider, was.model),
+        was.effort.clone(),
+    );
+    assert!(
+        db.set_model("Bob", None, &was.provider, "other-model", Some("high"))
+            .unwrap()
+    );
+    // Allowed past its turn: run as its command, unless the daemon holds
+    // work back.
+    assert_eq!(allow(&mut db, turn, "s1").unwrap().lifted, Some(p1));
+    assert!(matches!(
+        db.lifted_check(p1, now, true).unwrap(),
+        Lifted::Waiting(None)
+    ));
+    let Lifted::Run(run) = db.lifted_check(p1, now, false).unwrap() else {
+        panic!("an allowed call did not run");
+    };
+    // Run, it is a command that runs.
+    assert_eq!(db.running_processes().unwrap(), 1);
+    assert_eq!(
+        (
+            run.process,
+            run.turn,
+            run.call.call_id.as_str(),
+            run.call.arguments.as_str()
+        ),
+        (p1, turn, "s1", s1.arguments.as_str())
+    );
+    assert_eq!(run.workspace.as_deref(), Some("/synthetic"));
+    assert_eq!((run.model.clone(), run.effort.clone()), ran_at);
+    assert!(matches!(
+        db.lifted_check(p1, now, false).unwrap(),
+        Lifted::Gone
+    ));
+    // Denied: its command ends so, and the bot at rest is told.
+    let denied = db
+        .answer(Decision {
+            bot: "Bob",
+            turn,
+            call_id: "s2",
+            request: 1,
+            tag: None,
+            allow: false,
+            unreviewed: false,
+            reason: Some("not now"),
+            by: Some("test"),
+            leased: false,
+        })
+        .unwrap();
+    assert_eq!(denied.lifted, Some(p2));
+    let Lifted::Ended { result, ready } = db.lifted_check(p2, now, false).unwrap() else {
+        panic!("a denied call did not end");
+    };
+    assert_eq!(
+        result,
+        json!({"error":"approval_denied","detail":"not now"})
+    );
+    assert!(ready);
+    assert_eq!(
+        db.process_result(p2).unwrap(),
+        Some(("finished".into(), Some(result.clone())))
+    );
+    let told = db.messages("Bob", 0, None, 16, false).unwrap();
+    let prompts: Vec<&str> = (told["messages"].as_array().unwrap().iter())
+        .filter_map(|t| t["prompt_preview"].as_str())
+        .collect();
+    assert!(
+        prompts
+            .iter()
+            .any(|p| p.contains(&format!("proc:{p2}")) && p.contains("approval_denied")),
+        "{prompts:?}"
+    );
+    // Its agent withdraws one past its turn: it never runs, and a verdict
+    // after finds nothing to decide.
+    let Some(Lifted::Ended {
+        result: withdrawn, ..
+    }) = db.lifted_stop("Bob", p3).unwrap()
+    else {
+        panic!("a waiting call was not withdrawn");
+    };
+    assert_eq!(withdrawn["error"], "stopped");
+    assert_eq!(withdrawn["ran"], false);
+    assert!(allow(&mut db, turn, "s3").is_err());
+    assert!(db.lifted_waiting().unwrap().is_empty());
+    // The run's end is its command's, and its row in the trail ends too,
+    // failed as whoever ran it said, though no field of its result says so.
+    db.process_finish(
+        p1,
+        &json!({"url":"https://example.test/","status":404,"text":"gone"}),
+        true,
+        &[],
+        &[],
+    )
+    .unwrap();
+    // Its bot at rest is told it ended with its tool's own fields, as its
+    // turn would have read them.
+    db.tell_finished("Bob").unwrap();
+    let told = db.messages("Bob", 0, None, 16, false).unwrap();
+    let prompts: Vec<&str> = (told["messages"].as_array().unwrap().iter())
+        .filter_map(|t| t["prompt_preview"].as_str())
+        .collect();
+    assert!(
+        prompts
+            .iter()
+            .any(|p| p.contains(&format!("proc:{p1}")) && p.contains("gone")),
+        "{prompts:?}"
+    );
+    assert!(db.lifted_waiting().unwrap().is_empty());
+    assert_eq!(
+        db.approvals(Some("Bob"), None, 0, None, 64).unwrap()["approvals"],
+        json!([])
+    );
+    let trail = db
+        .audit(&agent_runtime::store::audit::Query::default())
+        .unwrap();
+    let outcomes: Vec<(&str, &str)> = (trail["rows"].as_array().unwrap().iter())
+        .map(|row| {
+            (
+                row["call_id"].as_str().unwrap(),
+                row["outcome"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert!(outcomes.contains(&("s1", "failed")), "{outcomes:?}");
+    assert!(outcomes.contains(&("s2", "denied")), "{outcomes:?}");
+}
+
+/// A verdict on a call a message lifted leaves a later turn's denial
+/// counts as they are: they are that turn's.
+#[test]
+fn a_lifted_calls_verdict_leaves_a_later_turns_denials_be() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (first, s1) = shell_call("fc_1", "s1", "true");
+    let (second, s2) = shell_call("fc_2", "s2", "ls");
+    db.append(turn, vec![first, second], &[s1.clone(), s2.clone()], None)
+        .unwrap();
+    let now = epoch_now();
+    let (p1, _) = db.lift(turn, "s1", Some(&s1), now).unwrap().unwrap();
+    let (p2, _) = db.lift(turn, "s2", Some(&s2), now).unwrap().unwrap();
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    // A later turn has a denial of its own under the same gate.
+    let later = db
+        .begin(
+            "Bob",
+            "later",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, n1) = shell_call("fc_n", "n1", "pwd");
+    db.append(later, vec![item], std::slice::from_ref(&n1), None)
+        .unwrap();
+    let deny = |db: &mut Database, turn: i64, call_id: &str| {
+        db.answer(Decision {
+            bot: "Bob",
+            turn,
+            call_id,
+            request: 1,
+            tag: None,
+            allow: false,
+            unreviewed: false,
+            reason: Some("no"),
+            by: Some("test"),
+            leased: false,
+        })
+        .unwrap()
+    };
+    deny(&mut db, later, "n1");
+    assert!(matches!(
+        db.approval_start(later, &n1, false, 0).unwrap(),
+        Gated::Denied
+    ));
+    let counts = |db: &Database| {
+        let denials = db.inspect("Bob").unwrap().denials;
+        let manual = &denials["manual"];
+        (manual.turn, manual.in_row, manual.window.count_ones())
+    };
+    assert_eq!(counts(&db), (later, 1, 1));
+    // The earlier turn's lifted calls, allowed and denied: the later
+    // turn's counts stand.
+    assert!(allow(&mut db, turn, "s1").unwrap().lifted.is_some());
+    assert!(matches!(
+        db.lifted_check(p1, now, false).unwrap(),
+        Lifted::Run(_)
+    ));
+    assert_eq!(counts(&db), (later, 1, 1));
+    deny(&mut db, turn, "s2");
+    assert!(matches!(
+        db.lifted_check(p2, now, false).unwrap(),
+        Lifted::Ended { .. }
+    ));
+    assert_eq!(counts(&db), (later, 1, 1));
+}
+
+/// A call its client answers that a message lifted keeps waiting for that
+/// answer past its turn: listed for its client, answered into its command,
+/// or stopped by its agent; and across a restart it still waits.
+#[test]
+fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart() {
+    let path = std::env::temp_dir().join(format!("agent-lifted-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let start = Declared {
+        name: "start".into(),
+        description: "Start.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: None,
+        grammar: None,
+        steps: false,
+        inherit: Inherit::All,
+        kind: None,
+    };
+    let (turn, p1, p2, p3) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create(
+            "Lead",
+            Some("/synthetic"),
+            Binding {
+                declared: Some(std::slice::from_ref(&start)),
+                ..binding()
+            },
+        )
+        .unwrap();
+        let turn = db
+            .begin(
+                "Lead",
+                "request",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let calls: Vec<ToolCall> = (1..=3)
+            .map(|n| ToolCall {
+                name: "start".into(),
+                call_id: format!("c{n}"),
+                arguments: "{}".into(),
+                custom: false,
+            })
+            .collect();
+        db.append(turn, vec![], &calls, None).unwrap();
+        for call in &calls {
+            db.tool_start(turn, call, false, false).unwrap();
+        }
+        let now = epoch_now();
+        let (p1, _) = db.lift(turn, "c1", None, now).unwrap().unwrap();
+        let (p2, _) = db.lift(turn, "c2", None, now).unwrap().unwrap();
+        let (p3, _) = db.lift(turn, "c3", None, now).unwrap().unwrap();
+        db.append(turn, vec![assistant("done")], &[], None).unwrap();
+        db.finish(turn, None).unwrap();
+        (turn, p1, p2, p3)
+    };
+    // Reopened, as a restart does: the lifted calls still wait.
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(
+        db.process_result(p1).unwrap().map(|(status, _)| status),
+        Some("running".into())
+    );
+    let listed = db.tool_calls("sonny", 0, 10).unwrap();
+    let ids: Vec<&str> = (listed["calls"].as_array().unwrap().iter())
+        .filter_map(|call| call["call_id"].as_str())
+        .collect();
+    assert_eq!(ids, ["c1", "c2", "c3"]);
+    let now = epoch_now();
+    db.take_call("Lead", turn, "c1", now).unwrap();
+    let answered = db
+        .answer_call("Lead", turn, "c1", result("{\"started\":true}"), now)
+        .unwrap();
+    assert_eq!(answered.lifted, Some(p1));
+    let Lifted::Ended { result: ended, .. } = db.lifted_check(p1, now, false).unwrap() else {
+        panic!("an answered call did not end");
+    };
+    assert_eq!(ended, json!({"answer":"{\"started\":true}"}));
+    // Its agent stops the other, never answered.
+    let Some(Lifted::Ended {
+        result: stopped, ..
+    }) = db.lifted_stop("Lead", p2).unwrap()
+    else {
+        panic!("a waiting call was not stopped");
+    };
+    assert_eq!(stopped["error"], "stopped");
+    // Its client may run it without taking it first: it may have run.
+    assert_eq!(stopped["ran"], true);
+    let Err(late) = db.answer_call("Lead", turn, "c2", result("late"), now) else {
+        panic!("a stopped call took an answer");
+    };
+    assert_eq!(late.code, "stale_turn");
+    // So may one its client took.
+    db.take_call("Lead", turn, "c3", now).unwrap();
+    let Some(Lifted::Ended { result: taken, .. }) = db.lifted_stop("Lead", p3).unwrap() else {
+        panic!("a taken call was not stopped");
+    };
+    assert_eq!(taken["ran"], true);
+    assert!(db.lifted_stop("Lead", p1).unwrap().is_none());
+    assert!(db.lifted_waiting().unwrap().is_empty());
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A lifted answered call stays its client's past its turn: its time goes
+/// on the schedule when it lifts, a step its client asks for is listed for
+/// its bot, a prune of its turn leaves it listed and answerable, and its
+/// answer ends its row in the audit trail.
+#[test]
+fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
+    let mut db = db();
+    let run = Declared {
+        name: "run".into(),
+        description: "Run.".into(),
+        parameters: json!({"type":"object"}),
+        result: "ok".into(),
+        answered_by: Some("sonny".into()),
+        expire_ms: Some(600_000),
+        grammar: None,
+        steps: true,
+        inherit: Inherit::All,
+        kind: None,
+    };
+    let gate = Gate {
+        tag: "manual".into(),
+        tools: vec!["run".into()],
+        expire_ms: None,
+    };
+    db.create(
+        "Lead",
+        Some("/synthetic"),
+        Binding {
+            declared: Some(std::slice::from_ref(&run)),
+            gate: Some(&gate),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Lead",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        name: "run".into(),
+        call_id: "c1".into(),
+        arguments: "{}".into(),
+        custom: false,
+    };
+    db.append(turn, vec![], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.tool_start(turn, &call, false, false).unwrap();
+    let now = epoch_now();
+    let (process, lapse) = db.lift(turn, "c1", None, now).unwrap().unwrap();
+    let Some(lapse) = lapse else {
+        panic!("a lifted call with a time of its own was not scheduled");
+    };
+    assert!(lapse > now && lapse <= now + 600_000, "{lapse} {now}");
+    // A step asked for while its turn still runs is listed under its
+    // call's handle too.
+    use agent_runtime::store::Step;
+    let Step::Pending { .. } = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "0",
+            "send",
+            json!({}),
+            false,
+            Default::default(),
+            now,
+        )
+        .unwrap()
+        .step
+    else {
+        panic!("a gated step was decided at once");
+    };
+    let running = db.approvals(Some("Lead"), None, 0, None, 64).unwrap();
+    assert_eq!(running["approvals"][0]["call_id"], "c1/0", "{running}");
+    assert_eq!(
+        running["approvals"][0]["handle"],
+        format!("proc:{process}").as_str(),
+        "{running}"
+    );
+    let every = db.approvals(None, None, 0, None, 64).unwrap();
+    assert_eq!(
+        every["approvals"][0]["handle"],
+        format!("proc:{process}").as_str(),
+        "{every}"
+    );
+    db.answer(Decision {
+        bot: "Lead",
+        turn,
+        call_id: "c1/0",
+        request: 1,
+        tag: None,
+        allow: true,
+        unreviewed: false,
+        reason: None,
+        by: Some("test"),
+        leased: false,
+    })
+    .unwrap();
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    // A step its client asks for past the turn waits for the bot's gate,
+    // listed for the bot.
+    let Step::Pending { .. } = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "1",
+            "send",
+            json!({}),
+            false,
+            Default::default(),
+            now,
+        )
+        .unwrap()
+        .step
+    else {
+        panic!("a gated step was decided at once");
+    };
+    let listed = db.approvals(Some("Lead"), None, 0, None, 64).unwrap();
+    let steps: Vec<&str> = (listed["approvals"].as_array().unwrap().iter())
+        .filter_map(|call| call["call_id"].as_str())
+        .collect();
+    assert_eq!(steps, ["c1/1"], "{listed}");
+    // Under its call's handle, by bot and by tag alike.
+    let handle = format!("proc:{process}");
+    assert_eq!(
+        listed["approvals"][0]["handle"],
+        handle.as_str(),
+        "{listed}"
+    );
+    let tagged = db.approvals(None, Some("manual"), 0, None, 64).unwrap();
+    assert_eq!(
+        tagged["approvals"][0]["handle"],
+        handle.as_str(),
+        "{tagged}"
+    );
+    let every = db.approvals(None, None, 0, None, 64).unwrap();
+    assert_eq!(every["approvals"][0]["handle"], handle.as_str(), "{every}");
+    // Another bot's listing reads none of it.
+    db.create("Other", Some("/synthetic"), binding()).unwrap();
+    let other = db.approvals(Some("Other"), None, 0, None, 64).unwrap();
+    assert_eq!(other["approvals"], json!([]), "{other}");
+    // And it takes its verdict.
+    db.answer(Decision {
+        bot: "Lead",
+        turn,
+        call_id: "c1/1",
+        request: 1,
+        tag: None,
+        allow: true,
+        unreviewed: false,
+        reason: None,
+        by: Some("test"),
+        leased: false,
+    })
+    .unwrap();
+    assert_eq!(
+        db.approvals(Some("Lead"), None, 0, None, 64).unwrap()["approvals"],
+        json!([])
+    );
+    // Later turns push it past what is kept; a prune keeps its call.
+    for n in 0..2 {
+        let later = db
+            .begin(
+                "Lead",
+                &format!("later-{n}"),
+                "later",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.append(later, vec![assistant("ok")], &[], None).unwrap();
+        db.finish(later, None).unwrap();
+    }
+    db.prune("Lead", 1).unwrap();
+    let calls = db.tool_calls("sonny", 0, 10).unwrap();
+    let listed: Vec<&str> = (calls["calls"].as_array().unwrap().iter())
+        .filter_map(|call| call["call_id"].as_str())
+        .collect();
+    assert_eq!(listed, ["c1"]);
+    db.take_call("Lead", turn, "c1", now).unwrap();
+    // Answered with a picture: the picture stays with the words, for a
+    // wait on the handle to hand over.
+    let photo = noise(64);
+    let answer = Outcome {
+        parts: vec![agent_runtime::codec::Part::Image(photo.clone())],
+        ..result("{\"ran\":true}")
+    };
+    let answered = db.answer_call("Lead", turn, "c1", answer, now).unwrap();
+    assert_eq!(answered.lifted, Some(process));
+    let Lifted::Ended { result: ended, .. } = db.lifted_check(process, now, false).unwrap() else {
+        panic!("an answered call did not end");
+    };
+    assert_eq!(ended["answer"], "{\"ran\":true}");
+    let parts: Vec<agent_runtime::codec::Part> =
+        serde_json::from_value(ended["parts"].clone()).unwrap();
+    assert_eq!(parts, [agent_runtime::codec::Part::Image(photo)]);
+    let trail = db
+        .audit(&agent_runtime::store::audit::Query::default())
+        .unwrap();
+    let row = (trail["rows"].as_array().unwrap().iter())
+        .find(|row| row["call_id"] == "c1" && row["step"].is_null())
+        .unwrap_or_else(|| panic!("{trail}"));
+    assert_eq!(row["outcome"], "completed", "{row}");
+}
+
+/// A message for a turn parked on a verdict wakes it, to lift the call;
+/// one that cannot join the turn leaves it parked.
+#[test]
+fn a_message_for_the_turn_wakes_a_verdict_park() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (item, call) = shell_call("fc_1", "s1", "true");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    let now = epoch_now();
+    assert!(
+        db.suspend_approval(turn, std::slice::from_ref(&call), now, None, None)
+            .unwrap()
+            .is_some()
+    );
+    assert!(matches!(
+        db.wake("Bob", turn, false).unwrap(),
+        Wake::Later(None)
+    ));
+    assert_eq!(db.steered_park("Bob").unwrap(), None);
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    let sent = db
+        .begin("Bob", "steer", "stop that", true, &steer, allow_provider)
+        .unwrap();
+    assert_eq!(db.steered_park("Bob").unwrap(), Some((turn, sent.turn)));
+    assert!(matches!(db.wake("Bob", turn, false).unwrap(), Wake::Resume));
 }

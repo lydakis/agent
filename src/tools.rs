@@ -184,14 +184,14 @@ impl Tool {
                 "required":["url"],"additionalProperties":false}),
             ),
             Tool::WriteStdin => (
-                "Type into a terminal that shell started with tty=true, and return what it wrote since the last read, stdout and stderr together, which echoes what was typed. A terminal runs until it exits or is killed, across turns; wait on its handle reports how it ended. chars is typed as it is: end a line with \\n, and send a control key as its character, such as \\u0003 for Ctrl-C or \\u0004 for Ctrl-D; empty chars only reads. It waits yield_time_ms for output, 250 by default after typing and 5000 when only reading, at most 30000; a command that ends sooner returns at once with its exit_code. kill=true ends the command and every process it started.",
+                "Type into a terminal that shell started with tty=true, and return what it wrote since the last read, stdout and stderr together, which echoes what was typed. A terminal runs until it exits or is killed, across turns; wait on its handle reports how it ended. chars is typed as it is: end a line with \\n, and send a control key as its character, such as \\u0003 for Ctrl-C or \\u0004 for Ctrl-D; empty chars only reads. It waits yield_time_ms for output, 250 by default after typing and 5000 when only reading, at most 30000; a command that ends sooner returns at once with its exit_code. kill=true ends the command and every process it started; on a background command's proc handle, or a call a message moved to the background while it waited for approval or an answer, kill=true stops it (a call still waiting never runs).",
                 json!({"type":"object","properties":{"handle":{"type":"string"},
                 "chars":{"type":"string","maxLength":INPUT_BYTES},
                 "yield_time_ms":{"type":"integer","minimum":0,"maximum":MAX_YIELD_MS},"kill":{"type":"boolean"}},
                 "required":["handle"],"additionalProperties":false}),
             ),
             Tool::Wait => (
-                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background shell). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
+                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background shell, or a call a message moved to the background). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
  With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting.",
                 json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
                 "timeout_ms":{"type":"integer","minimum":0,"maximum":MAX_WAIT_TIMEOUT_MS},"any":{"type":"boolean"}},
@@ -543,6 +543,9 @@ pub struct Registry {
     /// Set once as the daemon stops: background commands still running
     /// end then rather than outlive it.
     stopping: Arc<watch::Sender<bool>>,
+    /// Background commands running, by proc handle, each with what stops
+    /// it when its agent kills it.
+    stops: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<()>>>>,
     /// Counts pulls of the cord: background commands running or waiting
     /// for a slot at one end then.
     pulls: Arc<watch::Sender<u64>>,
@@ -1338,6 +1341,7 @@ impl Registry {
             #[cfg(unix)]
             terminals: Arc::default(),
             stopping: Arc::new(watch::Sender::new(false)),
+            stops: Arc::default(),
             pulls: Arc::new(watch::Sender::new(0)),
             credentials: Credentials::default(),
             environment: Arc::new(Vec::new()),
@@ -2398,6 +2402,7 @@ impl Registry {
     #[allow(clippy::too_many_arguments)]
     pub fn background(
         &self,
+        stopper: Stopper,
         command: String,
         workspace: PathBuf,
         timeout_ms: u64,
@@ -2410,7 +2415,9 @@ impl Registry {
         let mut queued = queued;
         let mut stopping = self.stopping.subscribe();
         let mut pulls = self.pulls.subscribe();
+        let Stopper { stop, listed } = stopper;
         tokio::spawn(async move {
+            let _listed = listed;
             let result = async {
                 let slot = match queued.permit.take() {
                     Some(permit) => Ok(permit),
@@ -2439,21 +2446,69 @@ impl Registry {
                     })
                     .await
             };
-            // A command still running as the daemon stops is dropped, which
-            // kills its group; its handle then reports the process lost, as
-            // the next start would.
+            // Its agent killed it: dropped, which kills its group. A kill
+            // that came before it began wins, so it never starts.
             tokio::select! {
-                result = result => {
-                    let _ = done.send(result);
+                biased;
+                Ok(()) = stop => {
+                    let _ = done.send(Err(stopped_by_agent()));
                 }
-                _ = stopping.wait_for(|stopping| *stopping) => {}
                 // The cord pulled: dropped the same way, its handle saying
                 // why.
                 Ok(()) = pulls.changed() => {
                     let _ = done.send(Err(stopped_by_pause()));
                 }
+                // A command still running as the daemon stops is dropped
+                // the same way; its handle then reports the process lost,
+                // as the next start would.
+                _ = stopping.wait_for(|stopping| *stopping) => {}
+                result = result => {
+                    let _ = done.send(result);
+                }
             }
         });
+    }
+
+    /// What stops background command `id` when its agent kills it, from
+    /// now until it is dropped, however its run ends: taken before the
+    /// command is readied, so a kill while it is finds it.
+    pub fn stopper(&self, id: i64) -> Stopper {
+        let (sender, stop) = tokio::sync::oneshot::channel();
+        self.stops.lock().unwrap().insert(id, sender);
+        let listed = Stoppable {
+            stops: self.stops.clone(),
+            id,
+        };
+        Stopper { stop, listed }
+    }
+
+    /// `run`, a command a steer moved to the background, ended when its
+    /// agent kills it by `stopper`'s handle, as one started there is.
+    pub fn until_stopped<F>(
+        &self,
+        stopper: Stopper,
+        run: F,
+    ) -> impl Future<Output = Result<Outcome>> + use<F>
+    where
+        F: Future<Output = Result<Outcome>>,
+    {
+        let Stopper { stop, listed } = stopper;
+        async move {
+            let _listed = listed;
+            // A kill that came before it began wins, so it never starts.
+            tokio::select! {
+                biased;
+                Ok(()) = stop => Err(stopped_by_agent()),
+                result = run => result,
+            }
+        }
+    }
+
+    /// Kill background command `id`, dropping it, which kills its group:
+    /// false when none of that handle runs. Whose it is, the caller checks.
+    pub fn stop(&self, id: i64) -> bool {
+        let stop = self.stops.lock().unwrap().remove(&id);
+        stop.is_some_and(|stop| stop.send(()).is_ok())
     }
 
     /// `run`, a command a steer moved to the background, ended as the pull
@@ -2465,10 +2520,17 @@ impl Registry {
         let mut pulls = self.pulls.subscribe();
         async move {
             tokio::select! {
-                result = run => result,
+                biased;
                 Ok(()) = pulls.changed() => Err(stopped_by_pause()),
+                result = run => result,
             }
         }
+    }
+
+    /// The pull cord as it is now, for a start decided now that runs
+    /// later: one the cord was pulled before does not start.
+    pub fn cord(&self) -> Cord {
+        Cord(self.pulls.subscribe(), self.stopping.subscribe())
     }
 
     /// End every background command, terminal and detached command this
@@ -2482,6 +2544,120 @@ impl Registry {
     pub fn end_background(&self) {
         self.stopping.send_replace(true);
     }
+}
+
+/// How a background command its agent killed answers.
+fn stopped_by_agent() -> Error {
+    Error::with(
+        "stopped",
+        "its agent killed this command before it finished, so it may have had effects",
+    )
+}
+
+/// How a command its agent killed before it started answers.
+fn stopped_before_start() -> Error {
+    Error::with(
+        "stopped",
+        "its agent killed this command before it started, so it did not run",
+    )
+}
+
+/// What lets its agent kill a background command by its handle.
+pub struct Stopper {
+    stop: tokio::sync::oneshot::Receiver<()>,
+    listed: Stoppable,
+}
+
+impl Stopper {
+    /// Refuse a start its agent killed before.
+    pub fn check(&mut self) -> Result<()> {
+        match self.stop.try_recv() {
+            Ok(()) => Err(stopped_before_start()),
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Give up the place once the command can be killed another way:
+    /// whether a kill came first, which the caller then carries out. A
+    /// kill after finds the other way, or no place and says so.
+    pub fn hand_over(self) -> bool {
+        let Stopper { mut stop, listed } = self;
+        drop(listed);
+        stop.close();
+        stop.try_recv().is_ok()
+    }
+}
+
+/// A background command's place among those its agent can kill, given
+/// up when dropped: a run a pause or the daemon's stop drops leaves none
+/// behind.
+struct Stoppable {
+    stops: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<()>>>>,
+    id: i64,
+}
+
+impl Drop for Stoppable {
+    fn drop(&mut self) {
+        self.stops.lock().unwrap().remove(&self.id);
+    }
+}
+
+/// The pull cord as it was when a start was decided, and whether the
+/// daemon is stopping.
+#[derive(Clone)]
+pub struct Cord(watch::Receiver<u64>, watch::Receiver<bool>);
+
+impl Cord {
+    /// Whether the cord was pulled since.
+    pub fn pulled(&self) -> bool {
+        self.0.has_changed().unwrap_or(true)
+    }
+
+    /// Refuse a start the cord was pulled before, or the daemon's stop
+    /// came before.
+    pub fn check(&self) -> Result<()> {
+        if self.pulled() {
+            return Err(Error::with(
+                "daemon_paused",
+                "the pause came before this command started, so it did not run; nothing has run it since. Work has since resumed",
+            ));
+        }
+        match *self.1.borrow() {
+            true => Err(not_started_by_shutdown()),
+            false => Ok(()),
+        }
+    }
+
+    /// `run`, not begun when the cord was pulled or the daemon's stop came
+    /// before, and ended as either comes, as a background command is.
+    pub async fn until_pulled<F>(mut self, run: F) -> Result<Outcome>
+    where
+        F: Future<Output = Result<Outcome>>,
+    {
+        self.check()?;
+        tokio::select! {
+            biased;
+            Ok(()) = self.0.changed() => Err(stopped_by_pause()),
+            Ok(_) = self.1.wait_for(|stopping| *stopping) => Err(stopped_by_shutdown()),
+            result = run => result,
+        }
+    }
+}
+
+/// How a command the daemon's stop came before answers.
+pub(crate) fn not_started_by_shutdown() -> Error {
+    Error::with(
+        "daemon_shutdown",
+        "the daemon was stopping before this command started, so it did not run",
+    )
+}
+
+/// How a command the daemon's stop ended answers.
+fn stopped_by_shutdown() -> Error {
+    Error::with(
+        "daemon_shutdown",
+        "the daemon stopped this command before it finished, so it may have had effects; nothing has run it again",
+    )
 }
 
 /// How a command the pull cord ended answers. Nothing reruns it; the agent
@@ -3233,6 +3409,89 @@ async fn shell(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_start_decided_before_a_pull_never_begins_and_one_running_ends() {
+        let registry = Registry::new("shell").unwrap();
+        let before = registry.cord();
+        assert!(before.check().is_ok());
+        registry.end_running();
+        assert_eq!(before.check().unwrap_err().code, "daemon_paused");
+        let begun = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = begun.clone();
+        let refused = before
+            .until_pulled(async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Outcome::text("ran".into()))
+            })
+            .await;
+        assert_eq!(refused.unwrap_err().code, "daemon_paused");
+        assert!(!begun.load(std::sync::atomic::Ordering::SeqCst));
+        // One decided after the pull runs, and a later pull ends it.
+        let after = registry.cord();
+        let running = tokio::spawn(after.until_pulled(std::future::pending()));
+        tokio::task::yield_now().await;
+        registry.end_running();
+        let ended = running.await.unwrap().unwrap_err();
+        assert_eq!(ended.code, "daemon_paused");
+    }
+    #[tokio::test]
+    async fn the_daemons_stop_refuses_a_start_and_ends_a_run() {
+        let registry = Registry::new("shell").unwrap();
+        let running = tokio::spawn(registry.cord().until_pulled(std::future::pending()));
+        tokio::task::yield_now().await;
+        registry.end_background();
+        let ended = running.await.unwrap().unwrap_err();
+        assert_eq!(ended.code, "daemon_shutdown");
+        assert!(
+            ended
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("may have had effects")
+        );
+        let refused = registry.cord().check().unwrap_err();
+        assert_eq!(refused.code, "daemon_shutdown");
+        assert!(
+            refused
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("did not run")
+        );
+    }
+    #[tokio::test]
+    async fn a_run_killed_before_it_is_first_polled_never_begins() {
+        let registry = Registry::new("shell").unwrap();
+        let stopper = registry.stopper(11);
+        assert!(registry.stop(11));
+        let began = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let run = {
+            let began = began.clone();
+            async move {
+                began.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Outcome::text("ran".into()))
+            }
+        };
+        let ended = registry.until_stopped(stopper, run).await.unwrap_err();
+        assert_eq!(ended.code, "stopped");
+        assert!(!began.load(std::sync::atomic::Ordering::SeqCst));
+    }
+    #[tokio::test]
+    async fn a_killable_run_a_pull_drops_leaves_nothing_to_kill() {
+        let registry = Registry::new("shell").unwrap();
+        let running = tokio::spawn(
+            registry
+                .cord()
+                .until_pulled(registry.until_stopped(registry.stopper(7), std::future::pending())),
+        );
+        tokio::task::yield_now().await;
+        assert!(registry.stops.lock().unwrap().contains_key(&7));
+        registry.end_running();
+        let ended = running.await.unwrap().unwrap_err();
+        assert_eq!(ended.code, "daemon_paused");
+        assert!(registry.stops.lock().unwrap().is_empty());
+        assert!(!registry.stop(7));
+    }
     #[test]
     fn an_answered_call_past_what_its_client_is_sent_is_refused() {
         let tool: Declared = serde_json::from_value(serde_json::json!({

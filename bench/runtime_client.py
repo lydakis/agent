@@ -45,7 +45,7 @@ def poll(client, bot, message):
 
 def number(result):
     """A submission's number: `message`, or `turn` from a daemon before
-    protocol 64, which the Perf screen runs as the base."""
+    protocol 65, which the Perf screen runs as the base."""
     return result['message'] if 'message' in result else result['turn']
 
 

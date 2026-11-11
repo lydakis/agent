@@ -20,10 +20,10 @@ pub use db::{
     Absorbed, AfterTurn, Answered, Binding, Blocked, Bot, CacheTtl, CallAnswer, CatchUp, Charge,
     CompactionPlan, CompactionView, CopiedCall, Counts, DENIAL_WINDOW, Database, Decision,
     Delivery, ENV_JSON, EVENT_PAGE_KINDS, ElisionPlan, FOLDERS_JSON, Fork, Gate, Gated, Halt,
-    Halted, Kept, Lapsed, Limit, MAX_GATES, ParkedFallback, Planning, Publication, QuoteRef,
-    RULES_JSON, Room, SANDBOX, SETTINGS, Served, Settings, Spend, Started, Step, Stepped, Strip,
-    TURN_VIEW_ACCOUNTING, TurnBudget, TurnOptions, Waiting, Wake, Window, Work, cache_hit, share,
-    unserved,
+    Halted, Kept, Lapsed, Lifted, LiftedRun, Limit, MAX_GATES, ParkedFallback, Planning,
+    Publication, QuoteRef, RULES_JSON, Room, SANDBOX, SETTINGS, Served, Settings, Spend, Started,
+    Step, Stepped, Strip, TURN_VIEW_ACCOUNTING, TurnBudget, TurnOptions, Waiting, Wake, Window,
+    Work, cache_hit, share, unserved,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;

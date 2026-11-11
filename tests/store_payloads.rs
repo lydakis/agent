@@ -284,6 +284,7 @@ fn large_artifacts_remain_exact_after_reopen_and_background_completion() {
         db.process_finish(
             process,
             &serde_json::json!({"success":true}),
+            false,
             &[("stderr", data.as_bytes().to_vec())],
             &[],
         )

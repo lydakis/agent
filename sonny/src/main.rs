@@ -628,7 +628,7 @@ async fn read_status(
             let ended = bot["last"]["finished_ms"].as_u64().unwrap_or(0);
             let held_here = held
                 .as_ref()
-                .is_ok_and(|held| held.iter().any(|(of, ..)| of == name));
+                .is_ok_and(|held| held.iter().any(|held| held.bot == name));
             if bot["running_turn"].is_i64() || held_here || now.saturating_sub(ended) < 600_000 {
                 read.push(name.to_owned());
             }
@@ -765,10 +765,7 @@ async fn read_status(
         };
         // Unlisted, this window's own calls still say what they wait on.
         if name == view.bot && held.is_err() {
-            let calls = (view.approvals.iter()).filter_map(|call| {
-                let (turn, id) = (call["turn"].as_i64()?, call["call_id"].as_str()?);
-                Some((name.to_owned(), turn, id.to_owned()))
-            });
+            let calls = (view.approvals.iter()).filter_map(|call| needs::Held::listed(name, call));
             needs.held(calls.collect(), |bot| bot == name);
         }
         needs.asked(name, ask.clone().filter(|_| !resolved));
@@ -840,6 +837,24 @@ async fn read_status(
             follows: background::icons(&behind, name, &icons),
             maker: bot["created_by"].as_str().unwrap_or("").to_owned(),
             group,
+        });
+    }
+    // Each workflow that runs is one row, under the agent that started it.
+    for run in workflow::view::live(&store, &project) {
+        if !read.contains(&run.caller) {
+            continue;
+        }
+        rows.push(status::Row {
+            name: format!("workflow {}", run.name),
+            bot: run.bot(),
+            state: run.state(),
+            running: true,
+            seconds: Some(now.saturating_sub(run.started_ms) / 1000),
+            at: Some(run.started_ms),
+            latest: run.more(),
+            maker: run.caller.clone(),
+            group: status::Group::Working,
+            ..Default::default()
         });
     }
     // Agents gone from the listing are forgotten with it.
@@ -3867,9 +3882,10 @@ struct App {
     /// The calls below that were looked up, by bot, turn and call: one
     /// the listing no longer held is not looked up again.
     raised_read: std::collections::BTreeSet<(String, i64, String)>,
-    /// Calls Esc set aside, by bot and call: the keys type again, and
-    /// Enter on an empty composer brings them back.
-    calls_aside: std::collections::HashSet<(String, String)>,
+    /// Calls Esc set aside, by bot, turn and call: the keys type again,
+    /// and Enter on an empty composer brings them back. A later turn's
+    /// call of the same id is another.
+    calls_aside: std::collections::HashSet<(String, i64, String)>,
     /// The lead's open questions for the person, oldest first: its `ask`
     /// calls not yet answered, nor set aside, and its tasks' open ones,
     /// pinned here as they come ([`App::pin_task_asks`]).
@@ -4800,7 +4816,7 @@ impl Naming {
 
 /// The kinds of event a lead's layout acts on (`Fleet::event`, `taken`,
 /// `resolved::Own::event`).
-const FLEET_KINDS: [&str; 12] = [
+const FLEET_KINDS: [&str; 14] = [
     "created",
     "forked",
     "deleted",
@@ -4814,6 +4830,9 @@ const FLEET_KINDS: [&str; 12] = [
     "tool_completed",
     "turn_resumed",
     "turn_finished",
+    // A call a message lifted out of its turn waits on past it.
+    "call_lifted",
+    "lifted_ended",
 ];
 
 /// How often a lead's window reads again which leads it follows.
@@ -5940,6 +5959,9 @@ impl App {
             }
             self.approvals_for(Some(turn)).await;
         } else {
+            // With no turn running, calls a message lifted out of theirs
+            // (and their steps) still wait for the person.
+            self.approvals_for(None).await;
             // Its last turn's end, as a turn's end reports it live: a window
             // opened again on an agent whose turn failed still says so, and
             // keeps its place among the lead's windows.
@@ -7466,6 +7488,8 @@ impl App {
     /// [`Self::open_agent`] opens it; this window's own is here already,
     /// so `/status` listing it closes, as Esc does.
     fn open_picked(&mut self, bot: &str) {
+        // A workflow's row opens the agent that started it.
+        let bot = workflow::view::split(bot).0;
         if bot != self.bot {
             return self.open_agent(bot, false);
         }
@@ -10067,10 +10091,13 @@ impl App {
                     self.rows_drawn += held.len();
                     self.pending.extend(held);
                 }
-                self.approvals.retain(|call| call["call_id"] != id);
+                // One a message lifted waits on past its call's end.
+                self.approvals
+                    .retain(|call| call["call_id"] != id || !call["handle"].is_null());
                 if let Some(running) = &mut self.running {
                     // The judge may still be reviewing the round's others.
-                    running.phase = match self.approvals.is_empty() && !self.reviewing.is_empty() {
+                    let waiting = (self.approvals.iter()).any(|call| call["handle"].is_null());
+                    running.phase = match !waiting && !self.reviewing.is_empty() {
                         true => reviewing(self.reviewing.len()),
                         false => "Working".into(),
                     };
@@ -10079,6 +10106,21 @@ impl App {
             "approval_requested" | "approval_asked" | "step_decided" => {
                 self.approvals_for(turn).await
             }
+            // A message lifted a call out of its turn: it, and the steps
+            // its client asks for, wait on past that turn, until its
+            // verdict or its agent ends its wait.
+            "call_lifted" => {
+                for call in &mut self.approvals {
+                    if (call["call_id"] == data["call_id"] || call["step_of"] == data["call_id"])
+                        && call["turn"].as_i64() == turn
+                    {
+                        call["handle"] = data["handle"].clone();
+                    }
+                }
+            }
+            "lifted_ended" => self
+                .approvals
+                .retain(|call| call["handle"] != data["handle"]),
             "turn_waiting" => {
                 if let Some(running) = &mut self.running
                     && data["approval"] != true
@@ -10206,7 +10248,8 @@ impl App {
                     }
                 }
                 self.draw_bot_reactions();
-                self.approvals.clear();
+                // Those a message lifted wait on past it.
+                self.approvals.retain(|call| !call["handle"].is_null());
                 self.notice = None;
                 // Zen the agent set, or put in its own words, as the person
                 // asked: the turn's end is when to look.
@@ -10884,8 +10927,11 @@ impl App {
     }
 
     /// The turn's calls a person must answer: every `manual` one, and those
-    /// the judge handed over. A program answers the rest.
+    /// the judge handed over. A program answers the rest. The turn running
+    /// now is the turn whose calls these are, whichever turn's event asked:
+    /// a lifted call's step or hand-over names its own older turn.
     async fn approvals_for(&mut self, turn: Option<i64>) {
+        let turn = self.running.as_ref().map(|running| running.turn).or(turn);
         let Ok(page) = self
             .client
             .request("approvals", json!({"bot": self.bot, "limit": 64}))
@@ -10908,12 +10954,15 @@ impl App {
             })
             .filter_map(|call| call["call_id"].as_str().map(str::to_owned))
             .collect();
+        // The running turn's, and those a message lifted out of their
+        // turn (with their steps, listed under their handle), which wait
+        // on past it.
         self.approvals = page["approvals"]
             .as_array()
             .into_iter()
             .flatten()
             .filter(|call| {
-                call["turn"].as_i64() == turn
+                (call["turn"].as_i64() == turn || !call["handle"].is_null())
                     && (!call["asked"].is_null()
                         || call["gates"]
                             .as_array()
@@ -10925,7 +10974,7 @@ impl App {
             whole_arguments(&self.client, &self.bot, call).await;
         }
         if let Some(running) = &mut self.running {
-            if !self.approvals.is_empty() {
+            if (self.approvals.iter()).any(|call| call["handle"].is_null()) {
                 running.phase = "Waiting for your approval".into();
             } else if !self.reviewing.is_empty() {
                 running.phase = reviewing(self.reviewing.len());
@@ -11007,12 +11056,9 @@ impl App {
                 self.raised_read.insert(read.clone());
             }
         }
-        let waiting: std::collections::HashSet<(String, String)> =
+        let waiting: std::collections::HashSet<(String, i64, String)> =
             (self.approvals.iter().chain(&self.raised))
-                .map(|call| {
-                    let (bot, _, call) = key(call);
-                    (bot, call)
-                })
+                .map(|call| self.aside_key(call))
                 .collect();
         self.calls_aside.retain(|call| waiting.contains(call));
     }
@@ -11025,9 +11071,17 @@ impl App {
 
     /// Whether Esc set `call` aside.
     fn set_aside(&self, call: &Value) -> bool {
-        let bot = call["bot"].as_str().unwrap_or(&self.bot);
-        let id = call["call_id"].as_str().unwrap_or_default();
-        (self.calls_aside.iter()).any(|(of, aside)| of == bot && aside == id)
+        self.calls_aside.contains(&self.aside_key(call))
+    }
+
+    /// The bot, turn and call `call` is set aside by: this window's own
+    /// unless it names another bot.
+    fn aside_key(&self, call: &Value) -> (String, i64, String) {
+        (
+            call["bot"].as_str().unwrap_or(&self.bot).to_owned(),
+            call["turn"].as_i64().unwrap_or(-1),
+            call["call_id"].as_str().unwrap_or_default().to_owned(),
+        )
     }
 
     /// How many calls wait on the person here, and of those how many Esc
@@ -11551,6 +11605,25 @@ impl App {
                             && watch.sky.is_none() =>
                     {
                         watch.more = !watch.more
+                    }
+                    // `/status` stops the workflow picked.
+                    KeyCode::Char('s')
+                        if pane.is_card()
+                            && let Some(watch) = &self.watch
+                            && watch.background.is_none()
+                            && watch.usage.is_none()
+                            && watch.audit.is_none()
+                            && watch.commons.is_none()
+                            && watch.sky.is_none()
+                            && let Some(bot) = watch.pick.and_then(|pick| {
+                                card_bots(watch, self.width.max(40)).into_iter().nth(pick)
+                            })
+                            && let (_, Some(run)) = workflow::view::split(&bot) =>
+                    {
+                        self.notice = Some(match workflow::view::stop(&self.options.store, run) {
+                            Ok(()) => format!("stopping workflow run {run}"),
+                            Err(error) => error,
+                        });
                     }
                     // `/status` opens or folds its idle and done tasks.
                     KeyCode::Char(key @ ('i' | 'd'))
@@ -12757,13 +12830,9 @@ impl App {
                     // typing again, then an open question, as their hints
                     // say.
                     KeyCode::Esc if self.waiting().is_some() => {
-                        let aside: Vec<(String, String)> = (self.approvals.iter())
+                        let aside: Vec<(String, i64, String)> = (self.approvals.iter())
                             .chain(&self.raised)
-                            .map(|call| {
-                                let bot = call["bot"].as_str().unwrap_or(&self.bot);
-                                let id = call["call_id"].as_str().unwrap_or_default();
-                                (bot.to_owned(), id.to_owned())
-                            })
+                            .map(|call| self.aside_key(call))
                             .collect();
                         self.calls_aside.extend(aside);
                     }
@@ -15182,7 +15251,14 @@ impl App {
                     list::pick(line);
                     picked = Some(row);
                 }
-                let keys = status_keys(watch, &fold_keys);
+                let mut keys = status_keys(watch, &fold_keys);
+                // A workflow's row picked can be stopped.
+                if let Some((_, screen::Mark::Link(link))) =
+                    watch.pick.and_then(|pick| marks.get(pick))
+                    && link.contains(workflow::view::MARK)
+                {
+                    keys.push_str(" · s stop workflow");
+                }
                 pane.set_card_marked(lines, marks, &keys);
                 // Scrolled to once, as a new pick, so the page keys still
                 // move away from it; after the card, whose swap would
@@ -18058,6 +18134,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_running_workflow_is_one_row_under_its_caller_and_s_stops_it() {
+        let client = daemon_answering(|asked| match asked["op"].as_str().unwrap_or_default() {
+            "bots" => json!({"bots": [{"name": "shop.lead", "bot_id": 1, "head": 1,
+                "status": "idle", "running_turn": null},
+                {"name": "shop.wf-run12345-abc", "bot_id": 2, "head": 1, "status": "running",
+                "running_turn": 1, "created_by": "shop.lead"}], "next_after": null}),
+            "turns" => json!({"turns": [], "next_before": null}),
+            "history_nodes" => json!({"nodes": [], "next_from": null}),
+            "history_items" => json!({"items": []}),
+            _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("sonny-wf-status-{}", std::process::id()));
+        let store = dir.join("state.sqlite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = workflow::view::plant(
+            &store,
+            "run12345",
+            "shop.lead",
+            "audit",
+            &[
+                json!({"t": "phase", "title": "Find"}),
+                json!({"t": "asking", "key": "abc", "phase": "Find"}),
+            ],
+        );
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.options.store = store.clone();
+        let (_, rows) = app.status_rows().await.unwrap();
+        // Its worker is no row; the run is one, opening its caller.
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["lead", "workflow audit"]);
+        let row = &rows[1];
+        assert_eq!(row.state, "Find · 1 running");
+        assert_eq!(row.group, status::Group::Working);
+        assert_eq!(
+            workflow::view::split(&row.bot),
+            ("shop.lead", Some("run12345"))
+        );
+        // A stop is left for the host that runs it, and shows.
+        workflow::view::stop(&store, "run12345").unwrap();
+        assert!(run.join(workflow::view::STOP).exists());
+        let (_, rows) = app.status_rows().await.unwrap();
+        assert_eq!(rows[1].state, "Find · 1 running · stopping");
+        // Once it ends it is no row.
+        std::fs::write(run.join("result.json"), "{}").unwrap();
+        let (_, rows) = app.status_rows().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_window_opening_status_reads_only_the_histories_that_moved_since_the_last() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let histories = Arc::new(AtomicUsize::new(0));
@@ -18258,6 +18386,38 @@ mod tests {
         // And kept it for the next window.
         assert!(reads_file(&app.options.store, "shop.lead").exists());
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lifted_calls_step_keeps_the_running_turns_approvals() {
+        let client = daemon_answering(|asked| match asked["op"].as_str().unwrap_or("") {
+            "approvals" => json!({"approvals": [
+                {"bot": "y", "turn": 7, "call_id": "n1", "gates": ["manual"],
+                    "name": "shell", "arguments": {}},
+                {"bot": "y", "turn": 3, "call_id": "c1/1", "step_of": "c1", "handle": "proc:9",
+                    "gates": ["manual"], "name": "send", "arguments": {}},
+            ], "next_after": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "y".into();
+        app.running = Some(Running {
+            turn: 7,
+            started: Instant::now(),
+            phase: "Waiting for your approval".into(),
+            note: false,
+            effort: None,
+        });
+        // An older lifted call asks for a step while turn 7 waits.
+        let step = json!({"call_id": "c1/1", "step_of": "c1", "request": 1, "gates": ["manual"]});
+        app.daemon(json!({"event": "approval_requested", "bot": "y", "turn": 3,
+            "data": {"calls": [step]}}))
+            .await;
+        let listed: Vec<&str> = (app.approvals.iter())
+            .filter_map(|call| call["call_id"].as_str())
+            .collect();
+        assert_eq!(listed, ["n1", "c1/1"]);
     }
 
     #[tokio::test]
@@ -21428,6 +21588,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_later_turns_call_of_a_set_aside_id_still_waits() {
+        let mut app = app(daemon_answering(|_| json!({})).await);
+        let key = |code: KeyCode| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        // A call a message lifted, set aside with Esc.
+        app.approvals
+            .push(json!({"turn": 1, "call_id": "c1", "name": "shell", "handle": "proc:4"}));
+        app.key(key(KeyCode::Esc)).await;
+        assert!(app.waiting().is_none());
+        // A later turn's call of the same id was never set aside.
+        app.approvals
+            .push(json!({"turn": 2, "call_id": "c1", "name": "shell"}));
+        assert_eq!(app.waiting().unwrap()["turn"], 2);
+    }
+
+    #[tokio::test]
     async fn esc_sets_an_open_question_aside_before_it_stops_the_turn() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
@@ -23491,7 +23666,7 @@ mod tests {
         .await;
         let mut fleet = Fleet::in_memory(client.clone(), events, "home", "home.lead");
         fleet.raised.insert("shop.fix".into());
-        let held = vec![("shop.fix".to_owned(), 4, "c1".to_owned())];
+        let held = vec![needs::Held::new("shop.fix", 4, "c1")];
         fleet.needs.held(held, |_| true);
         let mut app = app(client);
         app.bot = "home.lead".into();
@@ -23568,7 +23743,7 @@ mod tests {
         let fleet = app.fleet.as_mut().unwrap();
         fleet
             .needs
-            .held(vec![("shop.fix".to_owned(), 4, "c3".to_owned())], |_| true);
+            .held(vec![needs::Held::new("shop.fix", 4, "c3")], |_| true);
         fleet.event(
             &json!({"event": "step_decided", "bot": "shop.fix", "turn": 4,
             "data": {"call_id": "c3"}}),
