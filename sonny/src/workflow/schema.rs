@@ -111,18 +111,23 @@ fn loosen_in(value: Value, schema: &Value, root: &Value) -> Value {
     match value {
         Value::Object(fields) => {
             // Of a choice, the branch whose properties name all it gives,
-            // each const or enum among them holding its value.
+            // each const or enum among them holding its value, or null
+            // where the branch does not require it.
             let chosen = (["anyOf", "oneOf"].iter())
                 .flat_map(|key| schema[*key].as_array().into_iter().flatten())
                 .map(|branch| resolve(branch, root))
                 .find(|branch| {
+                    let required = branch["required"].as_array();
                     branch["properties"].as_object().is_some_and(|p| {
                         fields.iter().all(|(name, value)| {
                             p.get(name).is_some_and(|property| {
                                 let property = resolve(property, root);
-                                property.get("const").is_none_or(|c| c == value)
-                                    && (property["enum"].as_array())
-                                        .is_none_or(|values| values.contains(value))
+                                let left_out = value.is_null()
+                                    && required.is_none_or(|r| !r.contains(&json!(name)));
+                                left_out
+                                    || property.get("const").is_none_or(|c| c == value)
+                                        && (property["enum"].as_array())
+                                            .is_none_or(|values| values.contains(value))
                             })
                         })
                     })
@@ -255,6 +260,16 @@ mod tests {
         );
         assert_eq!(
             loosen(json!({"x": {"kind": "a", "value": null}}), &schema),
+            json!({"x": {"kind": "a"}})
+        );
+        // An optional enum's null placeholder does not rule its branch out.
+        let schema = json!({"type": "object", "properties": {"x": {"oneOf": [
+            {"type": "object", "properties": {"kind": {"const": "a"},
+                "level": {"enum": ["low", "high"]}}, "required": ["kind"]},
+            {"type": "object", "properties": {"kind": {"const": "b"}}, "required": ["kind"]}]}},
+            "required": ["x"]});
+        assert_eq!(
+            loosen(json!({"x": {"kind": "a", "level": null}}), &schema),
             json!({"x": {"kind": "a"}})
         );
     }

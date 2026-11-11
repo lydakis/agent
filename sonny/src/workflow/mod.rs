@@ -977,8 +977,7 @@ impl script::Host for Attempt {
 
     fn load(&self, reference: &Value) -> Result<script::Script, String> {
         let plan = &self.run.plan;
-        let path = resolve(reference, &plan.workspace, &plan.roles)?;
-        script::read(&read_file(&path)?)
+        child(&self.run.dir, reference, &plan.workspace, &plan.roles)
     }
 
     fn halted(&self) -> bool {
@@ -1371,12 +1370,43 @@ fn deliver(plan: Plan, mut ended: Value, dir: PathBuf, socket: PathBuf) {
     });
 }
 
+/// The workflow `reference` names, as the run in `dir` first read it: its
+/// source is kept in the run's folder, so a replay runs the same steps
+/// whatever has happened to the file since.
+fn child(
+    dir: &Path,
+    reference: &Value,
+    workspace: &Path,
+    roles: &Path,
+) -> Result<script::Script, String> {
+    let kept = (dir.join("children")).join(format!(
+        "{}.js",
+        key_of(&canonical(reference), &Value::Null)
+    ));
+    if let Ok(source) = std::fs::read_to_string(&kept) {
+        return script::read(&source);
+    }
+    let source = read_file(&resolve(reference, workspace, roles)?)?;
+    let script = script::read(&source)?;
+    keep(&kept, &source).map_err(|e| format!("{}: {e}", kept.display()))?;
+    Ok(script)
+}
+
 /// Write how the run in `dir` ended, whole or not at all: a host stopped
 /// mid-write leaves the run unended, to be run again from its journal.
 fn keep_result(dir: &Path, ended: &Value) -> std::io::Result<()> {
-    let part = dir.join("result.json.part");
-    std::fs::write(&part, ended.to_string())?;
-    std::fs::rename(&part, dir.join("result.json"))
+    keep(&dir.join("result.json"), &ended.to_string())
+}
+
+/// Write `text` to `path` whole or not at all.
+fn keep(path: &Path, text: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    std::fs::write(&part, text)?;
+    std::fs::rename(&part, path)
 }
 
 /// Tell `plan`'s caller how its run ended, once, as a message from the
@@ -1557,6 +1587,31 @@ mod tests {
         assert!(cut.starts_with("aaa") && cut.ends_with("zzz"), "{cut}");
         assert!(cut.len() < 1100);
         assert_eq!(super::cut("short", 1000), "short");
+    }
+
+    #[test]
+    fn a_nested_workflow_replays_as_the_run_first_read_it() {
+        let dir = std::env::temp_dir().join(format!("sonny-workflow-child-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("child.js");
+        let first = "export const meta = {name: 'child', description: 'first'}\nreturn 1\n";
+        std::fs::write(&file, first).unwrap();
+        let reference = json!({"scriptPath": "child.js"});
+        let run = dir.join("run");
+        let name = |script: script::Script| script.name().to_owned();
+        assert_eq!(name(child(&run, &reference, &dir, &dir).unwrap()), "child");
+        std::fs::write(
+            &file,
+            "export const meta = {name: 'edited', description: 'x'}\n",
+        )
+        .unwrap();
+        assert_eq!(name(child(&run, &reference, &dir, &dir).unwrap()), "child");
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(name(child(&run, &reference, &dir, &dir).unwrap()), "child");
+        // Another run reads the file as it is now.
+        assert!(child(&dir.join("other"), &reference, &dir, &dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
