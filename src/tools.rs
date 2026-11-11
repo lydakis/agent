@@ -2444,22 +2444,24 @@ impl Registry {
                     })
                     .await
             };
-            // A command still running as the daemon stops is dropped, which
-            // kills its group; its handle then reports the process lost, as
-            // the next start would.
+            // Its agent killed it: dropped, which kills its group. A kill
+            // that came before it began wins, so it never starts.
             tokio::select! {
-                result = result => {
-                    let _ = done.send(result);
+                biased;
+                Ok(()) = stop => {
+                    let _ = done.send(Err(stopped_by_agent()));
                 }
-                _ = stopping.wait_for(|stopping| *stopping) => {}
                 // The cord pulled: dropped the same way, its handle saying
                 // why.
                 Ok(()) = pulls.changed() => {
                     let _ = done.send(Err(stopped_by_pause()));
                 }
-                // Its agent killed it: dropped the same way.
-                Ok(()) = stop => {
-                    let _ = done.send(Err(stopped_by_agent()));
+                // A command still running as the daemon stops is dropped
+                // the same way; its handle then reports the process lost,
+                // as the next start would.
+                _ = stopping.wait_for(|stopping| *stopping) => {}
+                result = result => {
+                    let _ = done.send(result);
                 }
             }
         });
@@ -2491,9 +2493,11 @@ impl Registry {
         let Stopper { stop, listed } = stopper;
         async move {
             let _listed = listed;
+            // A kill that came before it began wins, so it never starts.
             tokio::select! {
-                result = run => result,
+                biased;
                 Ok(()) = stop => Err(stopped_by_agent()),
+                result = run => result,
             }
         }
     }
@@ -2514,8 +2518,9 @@ impl Registry {
         let mut pulls = self.pulls.subscribe();
         async move {
             tokio::select! {
-                result = run => result,
+                biased;
                 Ok(()) = pulls.changed() => Err(stopped_by_pause()),
+                result = run => result,
             }
         }
     }
@@ -2624,8 +2629,9 @@ impl Cord {
     {
         self.check()?;
         tokio::select! {
-            result = run => result,
+            biased;
             Ok(()) = self.0.changed() => Err(stopped_by_pause()),
+            result = run => result,
         }
     }
 }
@@ -3403,6 +3409,23 @@ mod tests {
         registry.end_running();
         let ended = running.await.unwrap().unwrap_err();
         assert_eq!(ended.code, "daemon_paused");
+    }
+    #[tokio::test]
+    async fn a_run_killed_before_it_is_first_polled_never_begins() {
+        let registry = Registry::new("shell").unwrap();
+        let stopper = registry.stopper(11);
+        assert!(registry.stop(11));
+        let began = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let run = {
+            let began = began.clone();
+            async move {
+                began.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Outcome::text("ran".into()))
+            }
+        };
+        let ended = registry.until_stopped(stopper, run).await.unwrap_err();
+        assert_eq!(ended.code, "stopped");
+        assert!(!began.load(std::sync::atomic::Ordering::SeqCst));
     }
     #[tokio::test]
     async fn a_killable_run_a_pull_drops_leaves_nothing_to_kill() {
