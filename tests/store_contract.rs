@@ -19111,8 +19111,9 @@ fn schema_90_turns_become_messages_each_with_its_number() {
                 OR (kind='turn_finished' AND turn={lost});
              UPDATE turns SET finished_ms=(SELECT finished_ms FROM turns WHERE id={lost})
                 WHERE id={run};
-             INSERT INTO turns(id,bot,request_id,prompt,status,started_ms,finished_ms)
-                SELECT 900000,'Bob','next','next','completed',finished_ms,finished_ms
+             INSERT INTO turns(id,bot,request_id,prompt,status,started_ms,finished_ms,waiting)
+                SELECT 900000,'Bob','next','next','completed',finished_ms,finished_ms,
+                    json_object('call_id','w','handles',json_array('turn:Bob/{run}','proc:7'))
                 FROM turns WHERE id={lost};",
             lost = steers[2]
         ))
@@ -19158,6 +19159,16 @@ fn schema_90_turns_become_messages_each_with_its_number() {
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert_eq!(turns, [run, 900000]);
+    // A parked wait names messages in the new form; processes keep theirs.
+    let handles: String = conn
+        .query_row(
+            "SELECT json_type(waiting,'$.handles')||json_extract(waiting,'$.handles')
+             FROM turns WHERE id=900000",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(handles, format!(r#"array["Bob/{run}","proc:7"]"#));
     // A quote names the message it copied, and copies just that one.
     let quotes: String = conn
         .query_row(

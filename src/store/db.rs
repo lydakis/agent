@@ -16301,6 +16301,13 @@ fn migrate_messages(conn: &Connection) -> Result<()> {
             FROM turns WHERE started_ms IS NOT NULL;
          DROP TABLE turns;
          ALTER TABLE turns_runs RENAME TO turns;
+         -- A parked wait names messages as `BOT/N` now; process handles keep
+         -- their form.
+         UPDATE turns SET waiting=json_set(waiting,'$.handles',
+                json((SELECT json_group_array(CASE WHEN value LIKE 'turn:%'
+                        THEN substr(value,6) ELSE value END)
+                   FROM (SELECT value FROM json_each(turns.waiting,'$.handles') ORDER BY key))))
+            WHERE json_type(waiting,'$.handles')='array';
          CREATE TABLE message_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
             last_id INTEGER NOT NULL CHECK(last_id>=0));
          INSERT INTO message_sequence SELECT 1,last_id FROM turn_sequence;
