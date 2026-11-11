@@ -1661,7 +1661,7 @@ mod tests {
         assert!(!waiting.is_finished());
         drop(owner);
         let (taken, _publications) = waiting.await.unwrap().unwrap();
-        taken.call(|db| Ok(db.last_event_id()?)).await.unwrap();
+        taken.call(|db| db.last_event_id()).await.unwrap();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
