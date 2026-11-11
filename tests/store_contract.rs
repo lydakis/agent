@@ -19236,7 +19236,7 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
         panic!("an answered call did not end");
     };
     assert_eq!(ended, json!({"answer":"{\"started\":true}"}));
-    // Its agent stops the other: withdrawn, never answered.
+    // Its agent stops the other, never answered.
     let Some(Lifted::Ended {
         result: stopped, ..
     }) = db.lifted_stop("Lead", p2).unwrap()
@@ -19244,12 +19244,13 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
         panic!("a waiting call was not stopped");
     };
     assert_eq!(stopped["error"], "stopped");
-    assert_eq!(stopped["ran"], false);
+    // Its client may run it without taking it first: it may have run.
+    assert_eq!(stopped["ran"], true);
     let Err(late) = db.answer_call("Lead", turn, "c2", result("late"), now) else {
         panic!("a stopped call took an answer");
     };
     assert_eq!(late.code, "stale_turn");
-    // One its client took may have done part of it: said so.
+    // So may one its client took.
     db.take_call("Lead", turn, "c3", now).unwrap();
     let Some(Lifted::Ended { result: taken, .. }) = db.lifted_stop("Lead", p3).unwrap() else {
         panic!("a taken call was not stopped");

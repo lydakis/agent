@@ -3335,8 +3335,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   names its own stays whole as `output`) among the wait's own. The agent may stop it: `write_stdin` with
   `kill: true` on the handle withdraws a request still waiting (`withdrawn`,
   never run) and kills a command it started, answering
-  `{"handle","stopped":true,"ran":BOOL}`: an answered call is `ran: true`
-  once its client took it, as it may have done part of it, and its
+  `{"handle","stopped":true,"ran":BOOL}`: only a request still waiting
+  for its verdict is `ran: false`; a call its client answers is `ran:
+  true`, as its client may have done part of it, taken or not, and its
   stopped result says the same; the same kill ends any background
   command. An allowed call can be killed from the moment its approval is
   taken: one killed while it is readied (its sandbox, a slot) never

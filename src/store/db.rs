@@ -12133,10 +12133,10 @@ impl Database {
     /// answer goes, and the command ends as stopped, never run. `None` when
     /// it waits on neither: it runs, or it ended.
     pub fn lifted_stop(&mut self, bot: &str, process: i64) -> Result<Option<Lifted>> {
-        let waiting: Option<(i64, String, Option<i64>, Option<bool>)> = self
+        let waiting: Option<(i64, String, Option<i64>, bool)> = self
             .conn
             .prepare_cached(
-                "SELECT p.turn,p.call_id,a.id,CASE WHEN w.process IS NOT NULL THEN w.taken_ms IS NOT NULL END FROM processes p
+                "SELECT p.turn,p.call_id,a.id,w.process IS NOT NULL FROM processes p
                  LEFT JOIN approvals a ON a.process=p.id AND a.step_of IS NULL
                  LEFT JOIN answers w ON w.process=p.id
                  WHERE p.id=? AND p.bot=? AND p.status='running'",
@@ -12145,30 +12145,26 @@ impl Database {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .optional()?;
-        let Some((turn, call_id, approval, taken)) = waiting else {
+        let Some((turn, call_id, approval, answering)) = waiting else {
             return Ok(None);
         };
-        // Whether it ran: only a call its client took may have done
-        // anything, so the agent knows whether a retry repeats it.
-        let (detail, outcome, ran) = match (approval, taken) {
+        // Whether it may have run, so the agent knows whether a retry
+        // repeats it: only one still waiting for its verdict surely did
+        // not. Its client may run one it answers without taking it first.
+        let (detail, outcome, ran) = match (approval, answering) {
             (Some(_), _) => (
                 "stopped before it ran: its request for approval was withdrawn",
                 "withdrawn",
                 false,
             ),
-            (None, Some(false)) => (
-                "stopped before it ran: its client had not taken it",
-                "stopped",
-                false,
-            ),
-            (None, Some(true)) => (
-                "stopped while it waited for its answer: its client took it, and may have done part of it",
+            (None, true) => (
+                "stopped while it waited for its answer: its client may have done part of it",
                 "stopped",
                 true,
             ),
-            (None, None) => return Ok(None),
+            (None, false) => return Ok(None),
         };
-        if taken.is_some() {
+        if answering {
             let owner = self.call_bot(turn, &call_id)?;
             self.end_steps_of(&owner, turn, &call_id, "the call was stopped")?;
         }
