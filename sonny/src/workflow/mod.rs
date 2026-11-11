@@ -47,6 +47,9 @@ const AGAIN: Duration = Duration::from_secs(2);
 /// `result.json`.
 const TOLD_BYTES: usize = 8 * 1024;
 
+/// A worker's turn in `Run::live` while its submission has no answer.
+const SUBMITTED: i64 = -1;
+
 /// What every worker is told after its folder's rules.
 const TOLD: &str = "You are one agent in a workflow: a script another agent wrote runs you, and \
 passes your final reply to its next step in code. Your final reply is that step's value, not a \
@@ -677,9 +680,20 @@ impl Run {
             .map(|(bot, turn)| (bot.clone(), *turn))
             .collect();
         for (bot, turn) in &live {
-            let _ = client
-                .request("interrupt", json!({"bot": bot, "turn": turn}))
-                .await;
+            // A submission whose answer never came: its turn as listed.
+            let turn = match *turn {
+                SUBMITTED => (client
+                    .request("bots", json!({"name": bot, "limit": 1}))
+                    .await)
+                    .ok()
+                    .and_then(|page| page["bots"][0]["running_turn"].as_i64()),
+                turn => Some(turn),
+            };
+            if let Some(turn) = turn {
+                let _ = client
+                    .request("interrupt", json!({"bot": bot, "turn": turn}))
+                    .await;
+            }
         }
         live.len()
     }
@@ -1084,22 +1098,32 @@ impl Attempt {
         let submit = json!({"bot": worker, "request_id": request, "prompt": prompt,
             "delivery": "queue", "from": {"bot": plan.caller, "turn": plan.turn},
             "output_schema": schema});
+        // Known before it is sent: a call cancelled while the daemon takes
+        // it, or whose connection is lost, still leaves its turn to stop.
+        let live = |turn: Option<i64>| {
+            let mut live = self.run.live.lock().unwrap();
+            match turn {
+                Some(turn) => live.insert(worker.to_owned(), turn),
+                None => live.remove(worker),
+            }
+        };
+        live(Some(SUBMITTED));
         let submitted = match self.client.request("submit", submit).await {
             Ok(submitted) => submitted,
             Err(error) if lost(&error) => return Err(Trouble::Lost),
-            Err(error) if error.code == "invalid_output_schema" => {
-                return Err(Trouble::Thrown(error.to_string()));
+            Err(error) => {
+                live(None);
+                return match error.code == "invalid_output_schema" {
+                    true => Err(Trouble::Thrown(error.to_string())),
+                    false => Ok((Value::Null, None, 0, Some(error.to_string()))),
+                };
             }
-            Err(error) => return Ok((Value::Null, None, 0, Some(error.to_string()))),
         };
         let Some(turn) = submitted["turn"].as_i64() else {
+            live(None);
             return Ok((Value::Null, None, 0, Some("no turn started".into())));
         };
-        self.run
-            .live
-            .lock()
-            .unwrap()
-            .insert(worker.to_owned(), turn);
+        live(Some(turn));
         let handle = format!("turn:{worker}/{turn}");
         let waited = loop {
             match self
@@ -1117,7 +1141,7 @@ impl Attempt {
         // A turn whose wait the connection lost may still run: it stays
         // known, so a stop interrupts it.
         if !waited.as_ref().is_err_and(lost) {
-            self.run.live.lock().unwrap().remove(worker);
+            live(None);
         }
         let outcome = waited.map_err(|e| match lost(&e) {
             true => Trouble::Lost,
@@ -1374,8 +1398,20 @@ fn told(plan: &Plan, ended: &Value, dir: &Path) -> String {
         };
         said.push_str(&format!("Result:\n{}\n\n", cut(&result, TOLD_BYTES)));
     }
-    for kept in ended["kept"].as_array().into_iter().flatten() {
-        said.push_str(&format!("{}\n", str_of(kept)));
+    // What stays, within its share; the rest is in result.json.
+    let kept: Vec<&Value> = ended["kept"].as_array().into_iter().flatten().collect();
+    let mut room = TOLD_BYTES / 2;
+    for (shown, each) in kept.iter().enumerate() {
+        let line = format!("{}\n", str_of(each));
+        if line.len() > room {
+            said.push_str(&format!(
+                "{} more kept; see \"kept\" in result.json.\n",
+                kept.len() - shown
+            ));
+            break;
+        }
+        room -= line.len();
+        said.push_str(&line);
     }
     said.push_str(&format!(
         "The whole result is in {}, each agent's value in {}; to run it again with some steps \
@@ -1532,5 +1568,15 @@ mod tests {
             "{said}"
         );
         assert!(!said.contains("Result:"), "{said}");
+        let kept: Vec<String> = (0..1000)
+            .map(|n| format!("shop.wf-r1-{n:040}'s worktree has uncommitted changes"))
+            .collect();
+        let many = json!({"status": "completed", "result": 1, "ended_ms": 0, "kept": kept});
+        let said = told(&plan, &many, Path::new("/runs/r1"));
+        assert!(said.len() < 2 * TOLD_BYTES, "{}", said.len());
+        assert!(
+            said.contains(" more kept; see \"kept\" in result.json."),
+            "{said}"
+        );
     }
 }
