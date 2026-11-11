@@ -633,8 +633,13 @@ mod tests {
 
     #[test]
     fn a_program_s_ask_to_show_an_agent_is_read_once() {
-        let mut command = CommandBuilder::new("printf");
-        command.arg("hi\\033]7700;open=shop.fix\\033\\\\");
+        // It stays on after asking: macOS drops what a terminal holds
+        // unread once its program's side closes, as a printf's at once.
+        let mut command = CommandBuilder::new("sh");
+        command.args([
+            "-c",
+            "printf 'hi\\033]7700;open=shop.fix\\033\\\\'; exec sleep 30",
+        ]);
         let program = Embedded::spawn(command, 5, 20, false, || {}).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let opened = loop {
