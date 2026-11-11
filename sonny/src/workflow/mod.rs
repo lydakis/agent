@@ -916,7 +916,10 @@ impl script::Host for Attempt {
         if run.stopping() {
             return Err("the workflow is stopping".into());
         }
-        if let Some(total) = run.plan.budget
+        // A worker submitted before is taken up again, spent or not: no
+        // new work starts for it.
+        if !survived
+            && let Some(total) = run.plan.budget
             && run.spent.load(Ordering::SeqCst) >= total
         {
             return Err(format!(
