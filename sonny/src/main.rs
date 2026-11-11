@@ -10644,8 +10644,9 @@ impl App {
     }
 
     /// What `/status` says is broken around the agents: the daemon's
-    /// companions that are down or keep restarting, and turns held on a
-    /// cause the person can fix. Nothing when all is well.
+    /// companions that are down or keep restarting, turns held on a cause
+    /// the person can fix, and a nearly full temporary folder. Nothing
+    /// when all is well.
     async fn status_alerts(&self) -> Vec<status::Alert> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -10660,6 +10661,10 @@ impl App {
         // counted by the daemon, named from the first page.
         if let Ok(listed) = self.client.request("held", json!({"limit": 64})).await {
             alerts.extend(status::held_alerts(&listed));
+        }
+        // The temporary folders every agent's commands share, nearly full.
+        if let Ok(stats) = self.client.request("stats", json!({})).await {
+            alerts.extend(status::temp_alerts(&stats["temp"]));
         }
         alerts
     }

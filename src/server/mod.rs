@@ -943,6 +943,10 @@ pub struct Configuration {
     /// from the daemon's environment, as Codex's shell environment
     /// excludes; none by default.
     pub shell_excludes: Vec<String>,
+    /// Variables every tool shell gets over the daemon's environment, as
+    /// Codex's `shell_environment_policy.set`; a bot's own `env` still
+    /// wins. A `TMPDIR` among them is the shells' temporary folder.
+    pub shell_set: Vec<(String, String)>,
     /// Field names whose values are redacted from tool output.
     pub redact_fields: Vec<String>,
     /// What the headers of PEM blocks redacted from tool output name.
@@ -979,6 +983,31 @@ pub struct Configuration {
 
 /// `path` by its real path, or, while it doesn't exist, by the real path
 /// of the folder that would hold it.
+/// A `--shell-set NAME=VALUE`: a name a shell can set, none of the
+/// daemon's own `AGENT_` ones, and a `TMPDIR` that is an absolute folder.
+pub fn shell_set(value: &str) -> Result<(String, String)> {
+    let usage = |why: &str| fail_with("usage", format!("--shell-set {why}"));
+    let Some((name, value)) = value.split_once('=') else {
+        return usage("needs NAME=VALUE");
+    };
+    let named = name.len() <= 128
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if !named {
+        return usage("names a letter or _, then letters, digits and _");
+    }
+    if name.to_ascii_uppercase().starts_with("AGENT_") {
+        return usage("may not set AGENT_ variables, the daemon's own");
+    }
+    if value.contains('\0') {
+        return usage("values hold no NUL");
+    }
+    if name == "TMPDIR" && !Path::new(value).is_absolute() {
+        return usage("TMPDIR needs an absolute folder");
+    }
+    Ok((name.to_owned(), value.to_owned()))
+}
+
 fn real_or_named(path: &Path) -> Result<PathBuf> {
     let path = std::path::absolute(path)?;
     if let Ok(real) = std::fs::canonicalize(&path) {
@@ -1891,6 +1920,17 @@ pub async fn run(config: Configuration) -> Result<()> {
             Ok(std::fs::canonicalize(&folder)?)
         })
         .collect::<Result<Vec<_>>>()?;
+    // A TMPDIR the shells are given is their temporary folder: made now,
+    // the daemon's user's alone as a folder it makes, and writable in their
+    // sandbox as /tmp is.
+    if let Some((_, folder)) = (config.shell_set.iter()).find(|(name, _)| name == "TMPDIR") {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(folder)?;
+        agent_runtime::sandbox::shell_temporary(folder.into());
+    }
     agent_runtime::sandbox::warm();
     let (sender, mut inbound) = session::channel_with(64, limits.input_bytes);
     let sessions_next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
@@ -1934,6 +1974,8 @@ pub async fn run(config: Configuration) -> Result<()> {
             .collect(),
         config.socket.is_some(),
     );
+    // Every tool shell's, past the daemon's own: a companion is no shell.
+    environment.extend(config.shell_set.iter().cloned());
     let registry = registry
         .with_credentials(credentials)
         .with_environment(environment)
@@ -4774,10 +4816,14 @@ impl Service {
                     .await?;
                 let (waiters, retained) = self.handles.stats();
                 // A folder read, off the run loop.
-                let (open_files, file_limit) =
-                    tokio::task::spawn_blocking(agent_runtime::open_files::count)
-                        .await
-                        .unwrap_or_default();
+                let ((open_files, file_limit), temp) = tokio::task::spawn_blocking(|| {
+                    (
+                        agent_runtime::open_files::count(),
+                        agent_runtime::sandbox::temporary_room(),
+                    )
+                })
+                .await
+                .unwrap_or_default();
                 let providers: serde_json::Map<String, Value> = self
                     .providers
                     .iter()
@@ -4820,6 +4866,10 @@ impl Service {
                     // What the daemon holds open against its limit, so a
                     // leak (growing while idle) is told from a busy peak.
                     "files": {"open": open_files, "limit": file_limit},
+                    // The room left where tool shells write temporary
+                    // files, which every bot shares: bytes and inodes,
+                    // free and in all, each folder once.
+                    "temp": temp,
                     "draining": self.draining(),
                     "paused": self.paused,
                 }))

@@ -279,7 +279,9 @@ which `agent` gives every daemon it starts, whoever asks it to, so nothing
 goes in your shell profile. Tool shells never get the keys the daemon's
 providers use; as in Codex, `[shell_environment_policy]` with
 `ignore_default_excludes = false` also leaves out every variable named like
-`*KEY*`, `*SECRET*` or `*TOKEN*`, and `exclude` lists more. Bots search the web where their provider offers
+`*KEY*`, `*SECRET*` or `*TOKEN*`, `exclude` lists more, and `set`
+sets variables in every tool shell (a `TMPDIR` there is the shells' own
+temporary folder, which the sandbox lets them write). Bots search the web where their provider offers
 it, as Codex's do: OpenAI with an API key, Anthropic, and GPT on Bedrock Mantle. Every
 bot can also read a page with `web_fetch`, which the daemon runs itself. Put
 `web_search = "disabled"` in `config.toml` to leave both out of new bots, or

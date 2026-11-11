@@ -1132,6 +1132,33 @@ class SocketAndCliTests(ModelFixture):
         self.assertTrue((self.path / 'wrote').exists())
         self.assertFalse((kept / 'x').exists())
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_tmpdir_the_shells_are_set_is_their_temporary_folder(self):
+        work, temp = self.path / 'work', self.path / 'shell-temp'
+        work.mkdir()
+        daemon = SocketClient(self.binary, self.store, self.url, 'shell',
+                              extra=['--shell-set', f'TMPDIR={temp}'], env=clean_env())
+        self.addCleanup(daemon.close)
+        # Made as the daemon starts, its user's alone.
+        self.assertEqual(temp.stat().st_mode & 0o777, 0o700)
+        # Its room is the first `stats` reports.
+        room = daemon.request('stats')['result']['temp']
+        self.assertEqual(room[0]['path'], str(temp))
+        self.assertTrue(all(r['bytes_total'] > 0 and r['bytes_free'] <= r['bytes_total'] for r in room))
+        daemon.request('create', bot='Writer', workspace=str(work), settings={'sandbox': 'workspace-write'})
+        ran = subprocess.run([str(self.binary), 'sandbox', '--store', str(self.store), '--socket', str(daemon.socket_path),
+                              '--bot', 'Writer', '--', '/bin/sh', '-c', 'touch "$TMPDIR/wrote" && echo "$TMPDIR"'],
+                             env=clean_env(), capture_output=True, text=True, timeout=30, cwd=work)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        # The bot's commands get it, and may write it from their sandbox,
+        # though it is outside the bot's folder.
+        self.assertEqual(ran.stdout.strip(), str(temp))
+        self.assertTrue((temp / 'wrote').exists())
+        for refused in ('AGENT_STORE=x', 'TMPDIR=relative', 'NO-NAME=1', 'NOVALUE'):
+            usage = self.agent('serve', '--store', str(self.path / 'other.sqlite'), '--provider', f'openai=responses,{self.url}',
+                               '--shell-set', refused, check=False)
+            self.assertEqual(json.loads(usage.stderr)['error'], 'usage', refused)
+
     @unittest.skipUnless(shutil.which('bwrap'), 'placeholders are bubblewrap\'s')
     def test_a_lent_sandbox_s_placeholders_stay_while_any_command_mounts_them(self):
         daemon = SocketClient(self.binary, self.store, self.url, 'shell', extra=['--protect', '.codex'], env=clean_env())

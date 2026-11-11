@@ -1201,6 +1201,9 @@ fn spawn_daemon(
     for pattern in file.shell_environment_policy.excludes() {
         command.arg("--shell-exclude").arg(pattern);
     }
+    for (name, value) in &file.shell_environment_policy.set {
+        command.arg("--shell-set").arg(format!("{name}={value}"));
+    }
     for (pattern, tokens) in &file.context_windows {
         command
             .arg("--context-window")

@@ -36,9 +36,10 @@
 //! model = "openai/gpt-6-luna"   # the model that reviews calls in auto, `sonny reviewer`
 //! effort = "low"                # the reviewer's effort
 //!
-//! [shell_environment_policy]    # what tool shells leave out, as in Codex
+//! [shell_environment_policy]    # what tool shells leave out and set, as in Codex; restart the daemon to apply
 //! ignore_default_excludes = false  # also *KEY*, *SECRET* and *TOKEN*; true, the default, keeps them
 //! exclude = ["AWS_*"]           # names to leave out, * and ? wildcards, any case
+//! set = { TMPDIR = "/home/me/.agent/tmp" }  # set in every tool shell; a TMPDIR set is the shells' temp folder, made and writable in the sandbox
 //!
 //! [sonny]
 //! lead_effort = "medium"        # a new lead's effort
@@ -456,9 +457,10 @@ pub fn daemon_flags(daemon: &BTreeMap<String, String>) -> Result<Vec<(String, St
 /// What Codex's default excludes leave out when they apply.
 pub const DEFAULT_EXCLUDES: [&str; 3] = ["*KEY*", "*SECRET*", "*TOKEN*"];
 
-/// Codex's `[shell_environment_policy]` excludes: variables of the daemon's
+/// Codex's `[shell_environment_policy]`: variables of the daemon's
 /// environment that no tool shell gets, past the provider keys it always
-/// withholds. A daemon takes them when it starts.
+/// withholds, and variables every tool shell gets. A daemon takes them
+/// when it starts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShellEnvironmentPolicy {
     /// False also leaves out `DEFAULT_EXCLUDES`; true, Codex's default,
@@ -466,6 +468,11 @@ pub struct ShellEnvironmentPolicy {
     pub ignore_default_excludes: bool,
     /// Names to leave out, with `*` and `?` wildcards, in any case.
     pub exclude: Vec<String>,
+    /// Codex's `set`: what every tool shell gets, over the daemon's own
+    /// environment; what a bot or its caller sets still wins. A `TMPDIR`
+    /// here is an absolute path, the folder the daemon makes and lets its
+    /// sandboxed shells write as their temporary folder.
+    pub set: BTreeMap<String, String>,
 }
 
 impl Default for ShellEnvironmentPolicy {
@@ -473,8 +480,17 @@ impl Default for ShellEnvironmentPolicy {
         ShellEnvironmentPolicy {
             ignore_default_excludes: true,
             exclude: Vec::new(),
+            set: BTreeMap::new(),
         }
     }
+}
+
+/// Whether `name` is one a shell can set: a letter or `_`, then letters,
+/// digits and `_`.
+fn shell_name(name: &str) -> bool {
+    name.len() <= 128
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 impl ShellEnvironmentPolicy {
@@ -1491,7 +1507,7 @@ fn parse(text: &str) -> Result<Config, String> {
         }
         let keys: &[&str] = match name.as_str() {
             "reviewer" => &["model", "effort"],
-            "shell_environment_policy" => &["ignore_default_excludes", "exclude"],
+            "shell_environment_policy" => &["ignore_default_excludes", "exclude", "set"],
             "sonny" => &[
                 "lead_effort",
                 "task_effort",
@@ -1578,6 +1594,36 @@ fn parse(text: &str) -> Result<Config, String> {
                     policy.ignore_default_excludes = value
                         .as_bool()
                         .ok_or_else(|| format!("{name}.{key} must be true or false"))?;
+                    continue;
+                }
+                if key == "set" {
+                    let table = value
+                        .as_table()
+                        .ok_or_else(|| format!("{name}.set must be a table of NAME = \"value\""))?;
+                    for (variable, value) in table {
+                        if !shell_name(variable) {
+                            return Err(format!(
+                                "{name}.set.{variable}: a name is a letter or _, then letters, digits and _"
+                            ));
+                        }
+                        // As a bot's own `env` may not: the daemon tells its
+                        // shells these itself.
+                        if variable.to_ascii_uppercase().starts_with("AGENT_") {
+                            return Err(format!(
+                                "{name}.set.{variable}: AGENT_ variables are the daemon's own"
+                            ));
+                        }
+                        let value = match value.as_str() {
+                            Some(value) if !value.contains('\0') => value,
+                            _ => return Err(format!("{name}.set.{variable} must be a string")),
+                        };
+                        if variable == "TMPDIR" && !std::path::Path::new(value).is_absolute() {
+                            return Err(format!(
+                                "{name}.set.TMPDIR must be an absolute path, not {value:?}"
+                            ));
+                        }
+                        policy.set.insert(variable.clone(), value.to_owned());
+                    }
                     continue;
                 }
                 let invalid = || format!("{name}.{key} must be a list of names");
@@ -2979,6 +3025,16 @@ mod tests {
             config.shell_environment_policy.excludes(),
             ["*KEY*", "*SECRET*", "*TOKEN*", "AWS_*"]
         );
+        let config =
+            parse("[shell_environment_policy]\nset = { TMPDIR = \"/big/tmp\", LANG = \"C\" }\n")
+                .unwrap();
+        assert_eq!(
+            config.shell_environment_policy.set,
+            BTreeMap::from([
+                ("LANG".to_owned(), "C".to_owned()),
+                ("TMPDIR".to_owned(), "/big/tmp".to_owned())
+            ])
+        );
         for (text, error) in [
             (
                 "[shell_environment_policy]\nexclude = \"AWS_*\"",
@@ -2995,6 +3051,26 @@ mod tests {
             (
                 "[shell_environment_policy]\ninherit = \"core\"",
                 "unknown key shell_environment_policy.inherit",
+            ),
+            (
+                "[shell_environment_policy]\nset = \"TMPDIR=/t\"",
+                "shell_environment_policy.set must be a table of NAME = \"value\"",
+            ),
+            (
+                "[shell_environment_policy]\nset = { \"A-B\" = \"1\" }",
+                "shell_environment_policy.set.A-B: a name is a letter or _, then letters, digits and _",
+            ),
+            (
+                "[shell_environment_policy]\nset = { agent_store = \"x\" }",
+                "shell_environment_policy.set.agent_store: AGENT_ variables are the daemon's own",
+            ),
+            (
+                "[shell_environment_policy]\nset = { N = 1 }",
+                "shell_environment_policy.set.N must be a string",
+            ),
+            (
+                "[shell_environment_policy]\nset = { TMPDIR = \"~/.agent/tmp\" }",
+                "shell_environment_policy.set.TMPDIR must be an absolute path, not \"~/.agent/tmp\"",
             ),
         ] {
             assert_eq!(parse(text).unwrap_err(), error, "{text}");
