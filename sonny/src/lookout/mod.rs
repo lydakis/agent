@@ -1267,11 +1267,10 @@ impl Service {
                         };
                         self.telling.insert(key, telling);
                     }
-                    // The senders of a turn that failed, kept to bounce
-                    // its message back once the lookouts hear its end.
-                    let began = (event["bot"].as_str())
-                        .zip(event["turn"].as_i64())
-                        .and_then(|(bot, turn)| self.in_flight.get(&(bot.to_owned(), turn)).copied());
+                    // The senders of a turn that failed, or of a message
+                    // that ended in line, kept to bounce it back once the
+                    // lookouts hear its end.
+                    let began = self.began(&event);
                     let bounces = self.sent(&event, live);
                     // Each event goes to the lookouts that hear its bot,
                     // as an informer hands a change to the handlers that
@@ -1473,6 +1472,14 @@ impl Service {
                 Some(at) => turn >= at,
                 None => listed.contains(bot.as_str()) && senders.contains_key(key),
             });
+    }
+
+    /// Where the turn or message an event ends began, while it is still
+    /// tracked: a message ending in line has no turn, only its number.
+    fn began(&self, event: &Value) -> Option<i64> {
+        (event["bot"].as_str())
+            .zip(number(event))
+            .and_then(|(bot, n)| self.in_flight.get(&(bot.to_owned(), n)).copied())
     }
 
     /// Note where each turn or message whose end is still owed began, so
@@ -5155,6 +5162,26 @@ mod tests {
         assert_eq!(told.len(), 1);
         service.track(&ev("docs", 3, "turn_finished", failed), false, Some(42));
         assert!(service.in_flight.is_empty() && service.replay_floor().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_message_that_ends_in_line_keeps_where_it_began_for_its_bounce() {
+        let mut service = service(PathBuf::from("/nonexistent"), &[]);
+        let from = json!({"from": {"bot": "api.lead", "turn": 1, "bot_id": 7}});
+        let queued = in_line("docs", 5, "queued", from.clone());
+        service.bounced(&queued, true);
+        service.track(&queued, false, Some(40));
+        // It fails before any turn takes it: its bounce restarts from where
+        // it was queued, not from its end.
+        let mut ended = in_line(
+            "docs",
+            5,
+            "message_ended",
+            json!({"status": "failed", "error": "provider_http_400"}),
+        );
+        ended["data"]["from"] = from["from"].clone();
+        assert_eq!(service.began(&ended), Some(40));
+        assert_eq!(service.bounced(&ended, true).len(), 1);
     }
 
     #[tokio::test]

@@ -6539,14 +6539,17 @@ impl Database {
             TurnOptions,
             Option<i64>,
             Option<String>,
+            bool,
         );
         let prior: Option<Prior> = self
             .conn
-            .query_row(
+            .prepare_cached(
                 "SELECT m.id,m.text,COALESCE(t.status,m.status),m.workspace,m.model,m.delivery,m.expected_turn,
                     m.node,m.from_bot,m.from_turn,m.origin,m.reasoning,m.budget_tokens,m.images,
-                    m.person,m.quotes,m.wait_ms,m.budget_counts,m.output_schema
+                    m.person,m.quotes,m.wait_ms,m.budget_counts,m.output_schema,t.id IS NOT NULL
                  FROM messages m LEFT JOIN turns t ON t.id=m.id WHERE m.bot=? AND m.request_id=?",
+            )?
+            .query_row(
                 params![name, request_id],
                 |r| {
                     Ok((
@@ -6604,11 +6607,12 @@ impl Database {
                         },
                         r.get(7)?,
                         r.get(13)?,
+                        r.get(19)?,
                     ))
                 },
             )
             .optional()?;
-        if let Some((turn, mut saved, status, saved_options, node, saved_images)) = prior {
+        if let Some((turn, mut saved, status, saved_options, node, saved_images, opened)) = prior {
             // Words of 4 KiB or more live only in the node they became.
             if saved.is_empty()
                 && let Some(node) = node
@@ -6678,10 +6682,6 @@ impl Database {
                 )
                 .facts(json!({"field":field,"message":turn})));
             }
-            let opened = self
-                .conn
-                .prepare_cached("SELECT EXISTS(SELECT 1 FROM turns WHERE id=?)")?
-                .query_row([turn], |r| r.get(0))?;
             return Ok(Started {
                 turn,
                 fresh: false,
@@ -6855,12 +6855,14 @@ impl Database {
         // it in, in this same job.
         tx.prepare_cached(
             "INSERT INTO messages(id,bot,request_id,text,status,workspace,model,delivery,expected_turn,from_bot,from_turn,from_id,origin,reasoning,budget_tokens,images,person,quotes,
-                wait_ms,due_ms,budget_counts,output_schema,sent_ms)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                wait_ms,due_ms,budget_counts,output_schema,sent_ms,turn,taken_ms)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )?.execute(
             // Queued work keeps the folder it was sent to even if the bot
             // moves before it starts; a steer without one joins any turn.
-            params![turn, name, request_id, prompt, if status == "running" { "ready" } else { status },
+            // One starting at once is written as taken by the turn it
+            // opens, so it never passes through the line's indexes.
+            params![turn, name, request_id, prompt, if status == "running" { "taken" } else { status },
                 if matches!(options.delivery, Delivery::Steer | Delivery::Attach) { options.workspace.as_deref() } else { workspace.as_deref() },
                 options.model, options.delivery.name(), options.expected_turn,
                 options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1), from_id, options.origin,
@@ -6868,7 +6870,8 @@ impl Database {
                 stored_images(&options.images)?, options.person, quotes,
                 options.wait_ms.map(|n| n as i64),
                 options.wait_ms.map(|n| now.saturating_add(n as i64)),
-                options.budget_counts.stored(), options.output_schema, now],
+                options.budget_counts.stored(), options.output_schema, now,
+                (status == "running").then_some(turn), (status == "running").then_some(now)],
         )?;
         if moved {
             tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
@@ -6882,7 +6885,7 @@ impl Database {
         let (kind, data) = if status == "running" {
             let mut data = json!({"request_id":request_id,"workspace":workspace,"model":model,
                 "effort":effort});
-            start_locked(&tx, &bot, turn, prompt, &mut data)?;
+            start_locked(&tx, &bot, turn, prompt, &mut data, true)?;
             ("accepted", data)
         } else {
             let mut data = json!({"request_id":request_id,"status":status,
@@ -7001,7 +7004,7 @@ impl Database {
         let tx = self.conn.savepoint()?;
         let mut data = json!({"request_id":request_id,"workspace":workspace,"model":model,
             "effort":effort});
-        start_locked(&tx, &bot, turn, &prompt, &mut data)?;
+        start_locked(&tx, &bot, turn, &prompt, &mut data, false)?;
         let cursor = message_event(&tx, &name, Some(turn), Some(turn), "accepted", data.clone())?;
         tx.commit()?;
         self.pending_left(waiting as usize);
@@ -14595,6 +14598,7 @@ fn start_locked(
     turn: i64,
     prompt: &str,
     data: &mut Value,
+    written_taken: bool,
 ) -> Result<Option<i64>> {
     let (images, (after, quotes)) = tx
         .prepare_cached(
@@ -14614,7 +14618,15 @@ fn start_locked(
     data["node"] = json!(head);
     keep_sender(tx, turn, head, data)?;
     let now = epoch_ms();
-    take(tx, turn, turn, head, prompt.len(), now)?;
+    if written_taken {
+        // Its status, turn and time are already the ones `take` writes.
+        tx.prepare_cached(
+            "UPDATE messages SET node=?2,text=CASE WHEN ?3 THEN '' ELSE text END WHERE id=?1",
+        )?
+        .execute(params![turn, head, prompt.len() >= PROMPT_SHARE_BYTES])?;
+    } else {
+        take(tx, turn, turn, head, prompt.len(), now)?;
+    }
     // The run it opens, named by its number, with what the message asked.
     tx.prepare_cached(
         "INSERT INTO turns(id,bot,status,workspace,model,reasoning,budget_tokens,budget_counts,
