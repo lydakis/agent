@@ -15374,16 +15374,16 @@ impl App {
                         )
                     })
                     .collect();
-                // The rows, then what a pick reaches, muted, in the
-                // column of their names.
-                let room = (composer.y as usize).saturating_sub(1);
+                // The rows, then what a pick reaches and how a folder is
+                // shared, muted, in the column of their names.
+                let room = (composer.y as usize).saturating_sub(2);
                 let mut rows = list::lines(&items, list.at(), width, room);
-                let reach = approvals::reach_line(
-                    &self.named(),
-                    self.reach,
-                    width.saturating_sub(list::INDENT),
-                );
-                rows.push(Line::from(format!("{}{reach}", " ".repeat(list::INDENT))).dim());
+                let room = width.saturating_sub(list::INDENT);
+                let indent = " ".repeat(list::INDENT);
+                let reach = approvals::reach_line(&self.named(), self.reach, room);
+                rows.push(Line::from(format!("{indent}{reach}")).dim());
+                let shared = transcript::cut(approvals::SHARED, room);
+                rows.push(Line::from(format!("{indent}{shared}")).dim());
                 over(frame, rows, composer);
                 let (line, cursor) = list.line("permissions");
                 frame.render_widget(Paragraph::new(line), composer);

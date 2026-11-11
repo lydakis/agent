@@ -2895,11 +2895,16 @@ inside as the overflow user's, and a program that takes a file only from
 root or the person refuses it. Each system folder the daemon was started
 with as `serve --own-copy FOLDER` is shown from a copy the person owns,
 kept under `~/.agent/copies`, read-only to every sandbox, bound read-only in
-the folder's place. The CLI passes `agent_client::OWN_COPIES`
-(`/etc/ssh/ssh_config.d`): ssh refuses every file an `Include` names that
+the folder's place. The CLI passes `agent_client::OWN_COPIES`:
+`/etc/ssh/ssh_config.d`, as ssh refuses every file an `Include` names that
 is not root's or the person's ("Bad owner or permissions"), and Debian's
 `/etc/ssh/ssh_config` includes that folder, so no sandboxed command could
-ssh (Codex has the same bug open, openai/codex#9286). Building a policy
+ssh (Codex has the same bug open, openai/codex#9286); and
+`/etc/crypto-policies/back-ends`, whose `openssh.config` Fedora's, RHEL's
+and Amazon Linux's `ssh_config.d/50-redhat.conf` includes: each file there
+is a link into `/usr/share/crypto-policies`, and the copy holds the file it
+points at, copied again when a policy switch points it elsewhere. A folder
+that isn't there, as on Debian, costs one failed listing. Building a policy
 looks at the folder's files (a listing and a `stat` each) and copies them
 again only when one changed, each written beside its name and renamed over
 it, so a running sandbox reads a whole file. A daemon running as root,
