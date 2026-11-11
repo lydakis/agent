@@ -94,6 +94,25 @@ pub fn loosen(value: Value, schema: &Value) -> Value {
 /// one coherent alternative, never requirements mixed from several.
 fn loosen_in(value: Value, schema: &Value, root: &Value, depth: usize) -> Value {
     let schema = resolve(schema, root);
+    // What every part of a conjunction says holds together: read as one.
+    if depth < 16
+        && let Some(parts) = schema["allOf"].as_array()
+    {
+        let mut whole = schema.clone();
+        if let Some(out) = whole.as_object_mut() {
+            out.remove("allOf");
+        }
+        for part in parts {
+            let part = resolve(part, root);
+            whole = with(part, &whole);
+            for key in ["anyOf", "oneOf"] {
+                if let (Some(choice), Some(out)) = (part.get(key), whole.as_object_mut()) {
+                    out.entry(key).or_insert_with(|| choice.clone());
+                }
+            }
+        }
+        return loosen_in(value, &whole, root, depth + 1);
+    }
     let branches: Vec<&Value> = (["anyOf", "oneOf"].iter())
         .flat_map(|key| schema[*key].as_array().into_iter().flatten())
         .collect();
@@ -305,6 +324,18 @@ mod tests {
             "n": {"type": "integer", "minimum": 0}}, "required": ["n"]});
         let wrong = parse(r#"{"n": -1}"#, &schema).unwrap_err();
         assert!(wrong.contains("/n"), "{wrong}");
+    }
+
+    #[test]
+    fn a_conjunction_loses_its_optional_nulls_too() {
+        let schema = json!({"type": "object", "properties": {"v": {"allOf": [
+            {"type": "object", "properties": {"note": {"type": "string"}}},
+            {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}]}},
+            "required": ["v"]});
+        assert_eq!(
+            parse(r#"{"v": {"note": null, "n": 1}}"#, &schema).unwrap(),
+            json!({"v": {"n": 1}})
+        );
     }
 
     #[test]

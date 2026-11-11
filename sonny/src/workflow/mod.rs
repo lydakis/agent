@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, Semaphore};
@@ -862,11 +862,13 @@ struct Attempt {
     run: Arc<Run>,
     client: Arc<Client>,
     slots: Semaphore,
-    /// Workers a lost connection left running, each holding one of
-    /// `slots` until its call reaches it again.
+    /// Workers a lost connection left running, until their calls reach
+    /// them again.
     survivors: Mutex<HashSet<String>>,
-    /// The slots held back for survivors, given back as their calls end.
-    owed: AtomicUsize,
+    /// The survivors one of `slots` is held back for, at most `at_once`:
+    /// given back as each one's call ends, or as its turn ends first, so a
+    /// script that has not reached it yet is never kept waiting on it.
+    reserved: Mutex<HashSet<String>>,
     /// How many calls of each key came before, this go.
     seen: Mutex<HashMap<String, usize>>,
     calls: AtomicU64,
@@ -1030,14 +1032,8 @@ impl script::Host for Attempt {
         // still running from before has its slot already.
         let survived = self.survivors.lock().unwrap().remove(&worker);
         let _slot = match survived {
-            // Never more given back than were held back: at most `at_once`.
-            true => Slot::Held(
-                &self.slots,
-                (self
-                    .owed
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)))
-                .is_ok(),
-            ),
+            // Given back once, by whichever ends first: its call or its turn.
+            true => Slot::Held(&self.slots, self.reserved.lock().unwrap().remove(&worker)),
             false => Slot::Taken(self.slots.acquire().await.map_err(|e| e.to_string())?),
         };
         if run.stopping() {
@@ -1143,6 +1139,26 @@ impl script::Host for Attempt {
 }
 
 impl Attempt {
+    /// Give back the slot held for survivor `worker` once its turns have
+    /// ended, if its call has not taken it up by then.
+    async fn release_when_ended(self: Arc<Self>, worker: String) {
+        if let Ok(page) = (self.client)
+            .request("turns", json!({"bot": worker, "newest": true, "limit": 8}))
+            .await
+        {
+            for turn in page["turns"].as_array().into_iter().flatten() {
+                if !ENDED.contains(&turn["status"].as_str().unwrap_or(""))
+                    && let Some(handle) = turn["handle"].as_str()
+                {
+                    let _ = Run::ended(&self.client, handle).await;
+                }
+            }
+        }
+        if self.reserved.lock().unwrap().remove(&worker) {
+            self.slots.add_permits(1);
+        }
+    }
+
     /// Make worker `worker` for the call `key`, ask it, and wait for its
     /// value: with the turn that gave it, the output tokens it spent and,
     /// for a null, why.
@@ -1437,11 +1453,13 @@ async fn drive(run: Arc<Run>) {
         // Read, so the connection is never closed for a full queue.
         tokio::spawn(async move { while events.recv().await.is_some() {} });
         let survivors: HashSet<String> = run.live.lock().unwrap().keys().cloned().collect();
+        let reserved: HashSet<String> =
+            (survivors.iter()).take(run.plan.at_once).cloned().collect();
         let attempt = Arc::new(Attempt {
             run: Arc::clone(&run),
             client: client.clone(),
-            slots: Semaphore::new(run.plan.at_once.saturating_sub(survivors.len())),
-            owed: AtomicUsize::new(survivors.len().min(run.plan.at_once)),
+            slots: Semaphore::new(run.plan.at_once - reserved.len()),
+            reserved: Mutex::new(reserved.clone()),
             survivors: Mutex::new(survivors),
             seen: Mutex::default(),
             calls: AtomicU64::new(0),
@@ -1450,6 +1468,9 @@ async fn drive(run: Arc<Run>) {
             shown: AtomicU64::new(0),
             lost: AtomicBool::new(false),
         });
+        for worker in reserved {
+            tokio::spawn(Attempt::release_when_ended(Arc::clone(&attempt), worker));
+        }
         let ended = script::run(
             Arc::clone(&attempt),
             &run.script,
@@ -1637,7 +1658,12 @@ async fn tell(plan: &Plan, ended: &Value, dir: &Path, socket: &Path) {
             .await;
         client.close().await;
         match sent {
-            Err(error) if lost(&error) => {
+            // A daemon away, or a caller whose queue is full for now: told
+            // once there is room.
+            Err(error)
+                if lost(&error)
+                    || matches!(error.code.as_str(), "pending_limit" | "pending_bytes_limit") =>
+            {
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(Duration::from_secs(60));
             }
