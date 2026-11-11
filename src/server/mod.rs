@@ -2553,8 +2553,9 @@ pub async fn run(config: Configuration) -> Result<()> {
 /// start that raced it.
 async fn owned_by(error: Error, socket: Option<&Path>) -> Error {
     use tokio::io::AsyncBufReadExt;
+    let elsewhere = || Error::with(&error.code, "another process holds this store");
     let Some(socket) = socket else {
-        return error;
+        return elsewhere();
     };
     let greeted = async {
         let stream = tokio::net::UnixStream::connect(socket).await.ok()?;
@@ -2568,7 +2569,7 @@ async fn owned_by(error: Error, socket: Option<&Path>) -> Error {
             .filter(|ready| ready["event"] == "ready")
     };
     let Ok(Some(ready)) = tokio::time::timeout(Duration::from_secs(1), greeted).await else {
-        return error;
+        return elsewhere();
     };
     let (protocol, pid) = (&ready["protocol"], &ready["pid"]);
     let which = match protocol.as_u64().map(|p| p.cmp(&agent_client::PROTOCOL)) {

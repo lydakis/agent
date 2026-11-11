@@ -1470,7 +1470,10 @@ class CliTests(ModelFixture):
                 self.assertNotEqual(result.returncode, 0)
                 # The start deadline ended it, not an early give-up; the
                 # subprocess timeout bounds it, with room for a slow machine.
-                self.assertIn('daemon_start_timeout', result.stderr)
+                # What it reports is why its daemon could not start.
+                failure = json.loads(result.stderr)
+                self.assertEqual((failure['error'], failure['detail']),
+                                 ('store_already_owned', 'another process holds this store'))
                 self.assertGreaterEqual(elapsed, 9)
                 self.assertEqual(owner.request('inspect', bot='waiting')['error'], 'bot_not_found')
             finally:
