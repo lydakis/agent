@@ -31,7 +31,7 @@ from pathlib import Path
 
 import psutil
 
-from .runtime_client import Client
+from .runtime_client import Client, number
 from .synthetic_model import start
 from .targets import file_hash
 
@@ -136,7 +136,7 @@ class Screen:
                 refused[response['error']] = refused.get(response['error'], 0) + 1
                 pending.append(index)
                 return False
-            in_flight[response['result']['message']] = submitted_at
+            in_flight[number(response['result'])] = submitted_at
             return True
 
         # Fill to the bound, then keep it full as turns finish. A refusal
@@ -170,7 +170,7 @@ class Screen:
                     samples=samples)
 
     def park(self):
-        anchor = self.client.request('submit', bot='b0', request_id='anchor', prompt='hold:')['result']['message']
+        anchor = number(self.client.request('submit', bot='b0', request_id='anchor', prompt='hold:')['result'])
         started = time.monotonic()
         turns, refused = set(), {}
         pending = list(range(1, self.parked + 1))
@@ -183,7 +183,7 @@ class Screen:
                 self.pump(.02)
                 continue
             pending.pop(0)
-            turns.add(response['result']['message'])
+            turns.add(number(response['result']))
         deadline = time.monotonic() + 300
         while not turns <= self.waiting and time.monotonic() < deadline:
             self.pump(.1)

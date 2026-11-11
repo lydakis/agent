@@ -43,6 +43,12 @@ def poll(client, bot, message):
     return {'result': found}
 
 
+def number(result):
+    """A submission's number: `message`, or `turn` from a daemon before
+    protocol 64, which the Perf screen runs as the base."""
+    return result['message'] if 'message' in result else result['turn']
+
+
 class Client:
     def __init__(self, binary, path, url, tools="echo", model="synthetic-model", key_env=None, env=None,
                  provider="openai", family="responses", extra=(), settings=None, command=None,

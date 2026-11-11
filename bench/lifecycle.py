@@ -17,7 +17,7 @@ from .config import digest
 from .events import percentiles
 from .processes import Tree, snapshot
 from .runner import provider_ready, stop
-from .runtime_client import Client, node_item
+from .runtime_client import Client, node_item, number
 from .socket_client import SocketClient
 from .targets import clean_env, file_hash, pi_durable_metadata
 from .responses import prompt
@@ -140,7 +140,7 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
             for agent in range(config['concurrency']):
                 before = time.monotonic()
                 response = client.request('submit', bot=str(agent), request_id=str(turn), prompt=prompt(config,agent,turn))
-                pending.append((agent, response['result']['message'], before))
+                pending.append((agent, number(response['result']), before))
             for agent, native, before in pending:
                 event = client.finished(native)
                 assert event['data']['status'] == 'completed'
