@@ -28,7 +28,7 @@ pub fn person_call(call: &Value) -> bool {
 /// A call waiting on the person: its bot, turn and id, the call it is a
 /// step of, and whether it waits past its turn, as a call a message lifted
 /// (and its steps) does.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Held {
     pub bot: String,
     pub turn: i64,
