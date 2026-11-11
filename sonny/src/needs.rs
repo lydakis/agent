@@ -506,6 +506,14 @@ impl Needs {
                     self.lifted.insert((bot.to_owned(), turn, id.to_owned()));
                 }
             }
+            // Allowed, one its client answers waits on for that answer: no
+            // longer for the person, but lifted still, as its steps are.
+            "lifted_ended" if data["waits_for"] == "answer" => {
+                if let (Some(calls), Some(id)) = (self.calls.get_mut(bot), data["call_id"].as_str())
+                {
+                    calls.retain(|(of, call)| (*of, call.as_str()) != (turn, id));
+                }
+            }
             // Its verdict, or its agent, ended a lifted call, and its steps.
             "lifted_ended" => {
                 if let Some(id) = data["call_id"].as_str() {
@@ -803,6 +811,41 @@ mod tests {
             json!({"status": "completed"}),
         ));
         assert_eq!(needs.calls().collect::<Vec<_>>(), [("p.fix", 5, "c2/1")]);
+    }
+
+    #[test]
+    fn an_allowed_lifted_answers_steps_wait_until_its_answer() {
+        let mut needs = Needs::default();
+        let manual = json!({"calls": [{"call_id": "c1", "gates": ["manual"]}]});
+        needs.event(&event("p.fix", 3, "approval_requested", manual));
+        needs.event(&event("p.fix", 3, "call_lifted", json!({"call_id": "c1"})));
+        // Allowed, it waits for its client's answer, not the person.
+        needs.event(&event(
+            "p.fix",
+            3,
+            "lifted_ended",
+            json!({"call_id": "c1", "outcome": "allowed", "waits_for": "answer"}),
+        ));
+        assert!(!needs.waits("p.fix"));
+        // A step its client asks for then outlives the turn.
+        let step = json!({"calls": [{"call_id": "c1/1", "step_of": "c1", "gates": ["manual"]}]});
+        needs.event(&event("p.fix", 3, "approval_requested", step));
+        needs.event(&event(
+            "p.fix",
+            3,
+            "turn_finished",
+            json!({"status": "completed"}),
+        ));
+        assert_eq!(needs.calls().collect::<Vec<_>>(), [("p.fix", 3, "c1/1")]);
+        // Its answer ends both.
+        needs.event(&event(
+            "p.fix",
+            3,
+            "lifted_ended",
+            json!({"call_id": "c1", "outcome": "answered"}),
+        ));
+        assert!(!needs.waits("p.fix"));
+        assert!(needs.steps.is_empty() && needs.lifted.is_empty());
     }
 
     #[test]

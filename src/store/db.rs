@@ -32,7 +32,9 @@ const STEER_BATCH_PICTURE_BYTES: usize = 8 * 1024 * 1024;
 /// One bot's calls waiting on a verdict: its running turn's, and those a
 /// message lifted to the background with the steps their clients ask for,
 /// found through the bot's own running commands, never another bot's.
-const BOT_APPROVALS: &str = "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,a.process
+/// A step carries its lifted call's handle, in the running turn as after.
+const BOT_APPROVALS: &str = "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,
+       COALESCE(a.process,(SELECT n.process FROM answers n WHERE n.turn=a.turn AND n.call_id=a.step_of))
      FROM bots b JOIN approvals a ON a.turn=b.running_turn
      WHERE a.id>?1 AND a.id<=?4 AND b.name=?2
      UNION ALL
@@ -12123,10 +12125,10 @@ impl Database {
     /// answer goes, and the command ends as stopped, never run. `None` when
     /// it waits on neither: it runs, or it ended.
     pub fn lifted_stop(&mut self, bot: &str, process: i64) -> Result<Option<Lifted>> {
-        let waiting: Option<(i64, String, Option<i64>, bool)> = self
+        let waiting: Option<(i64, String, Option<i64>, Option<bool>)> = self
             .conn
             .prepare_cached(
-                "SELECT p.turn,p.call_id,a.id,w.process IS NOT NULL FROM processes p
+                "SELECT p.turn,p.call_id,a.id,CASE WHEN w.process IS NOT NULL THEN w.taken_ms IS NOT NULL END FROM processes p
                  LEFT JOIN approvals a ON a.process=p.id AND a.step_of IS NULL
                  LEFT JOIN answers w ON w.process=p.id
                  WHERE p.id=? AND p.bot=? AND p.status='running'",
@@ -12135,25 +12137,34 @@ impl Database {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .optional()?;
-        let Some((turn, call_id, approval, answered)) = waiting else {
+        let Some((turn, call_id, approval, taken)) = waiting else {
             return Ok(None);
         };
-        let (detail, outcome) = match (approval, answered) {
+        // Whether it ran: only a call its client took may have done
+        // anything, so the agent knows whether a retry repeats it.
+        let (detail, outcome, ran) = match (approval, taken) {
             (Some(_), _) => (
                 "stopped before it ran: its request for approval was withdrawn",
                 "withdrawn",
+                false,
             ),
-            (None, true) => (
-                "stopped while it waited for its answer: its client was told, and may have done part of it",
+            (None, Some(false)) => (
+                "stopped before it ran: its client had not taken it",
                 "stopped",
+                false,
             ),
-            (None, false) => return Ok(None),
+            (None, Some(true)) => (
+                "stopped while it waited for its answer: its client took it, and may have done part of it",
+                "stopped",
+                true,
+            ),
+            (None, None) => return Ok(None),
         };
-        if answered {
+        if taken.is_some() {
             let owner = self.call_bot(turn, &call_id)?;
             self.end_steps_of(&owner, turn, &call_id, "the call was stopped")?;
         }
-        let result = json!({"error":"stopped","detail":detail});
+        let result = json!({"error":"stopped","detail":detail,"ran":ran});
         let tx = self.conn.savepoint()?;
         if let Some(approval) = approval {
             tx.prepare_cached("DELETE FROM approvals WHERE id=?")?

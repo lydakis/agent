@@ -19019,6 +19019,7 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
         panic!("a waiting call was not withdrawn");
     };
     assert_eq!(withdrawn["error"], "stopped");
+    assert_eq!(withdrawn["ran"], false);
     assert!(allow(&mut db, turn, "s3").is_err());
     assert!(db.lifted_waiting().unwrap().is_empty());
     // The run's end is its command's, and its row in the trail ends too.
@@ -19063,7 +19064,7 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
         inherit: Inherit::All,
         kind: None,
     };
-    let (turn, p1, p2) = {
+    let (turn, p1, p2, p3) = {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         db.create(
             "Lead",
@@ -19085,7 +19086,7 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
             )
             .unwrap()
             .turn;
-        let calls: Vec<ToolCall> = (1..=2)
+        let calls: Vec<ToolCall> = (1..=3)
             .map(|n| ToolCall {
                 name: "start".into(),
                 call_id: format!("c{n}"),
@@ -19100,9 +19101,10 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
         let now = epoch_now();
         let (p1, _) = db.lift(turn, "c1", None, now).unwrap().unwrap();
         let (p2, _) = db.lift(turn, "c2", None, now).unwrap().unwrap();
+        let (p3, _) = db.lift(turn, "c3", None, now).unwrap().unwrap();
         db.append(turn, vec![assistant("done")], &[], None).unwrap();
         db.finish(turn, None).unwrap();
-        (turn, p1, p2)
+        (turn, p1, p2, p3)
     };
     // Reopened, as a restart does: the lifted calls still wait.
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
@@ -19114,7 +19116,7 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
     let ids: Vec<&str> = (listed["calls"].as_array().unwrap().iter())
         .filter_map(|call| call["call_id"].as_str())
         .collect();
-    assert_eq!(ids, ["c1", "c2"]);
+    assert_eq!(ids, ["c1", "c2", "c3"]);
     let now = epoch_now();
     db.take_call("Lead", turn, "c1", now).unwrap();
     let answered = db
@@ -19133,10 +19135,17 @@ fn a_lifted_answered_call_takes_its_answer_or_is_stopped_and_outlives_a_restart(
         panic!("a waiting call was not stopped");
     };
     assert_eq!(stopped["error"], "stopped");
+    assert_eq!(stopped["ran"], false);
     let Err(late) = db.answer_call("Lead", turn, "c2", result("late"), now) else {
         panic!("a stopped call took an answer");
     };
     assert_eq!(late.code, "stale_turn");
+    // One its client took may have done part of it: said so.
+    db.take_call("Lead", turn, "c3", now).unwrap();
+    let Some(Lifted::Ended { result: taken, .. }) = db.lifted_stop("Lead", p3).unwrap() else {
+        panic!("a taken call was not stopped");
+    };
+    assert_eq!(taken["ran"], true);
     assert!(db.lifted_stop("Lead", p1).unwrap().is_none());
     assert!(db.lifted_waiting().unwrap().is_empty());
     drop(db);
@@ -19203,11 +19212,50 @@ fn a_lifted_answered_call_keeps_its_time_steps_listing_and_audit_row() {
         panic!("a lifted call with a time of its own was not scheduled");
     };
     assert!(lapse > now && lapse <= now + 600_000, "{lapse} {now}");
+    // A step asked for while its turn still runs is listed under its
+    // call's handle too.
+    use agent_runtime::store::Step;
+    let Step::Pending { .. } = db
+        .step_announce(
+            "Lead",
+            turn,
+            "c1",
+            "0",
+            "send",
+            json!({}),
+            false,
+            Default::default(),
+            now,
+        )
+        .unwrap()
+        .step
+    else {
+        panic!("a gated step was decided at once");
+    };
+    let running = db.approvals(Some("Lead"), None, 0, None, 64).unwrap();
+    assert_eq!(running["approvals"][0]["call_id"], "c1/0", "{running}");
+    assert_eq!(
+        running["approvals"][0]["handle"],
+        format!("proc:{process}").as_str(),
+        "{running}"
+    );
+    db.answer(Decision {
+        bot: "Lead",
+        turn,
+        call_id: "c1/0",
+        request: 1,
+        tag: None,
+        allow: true,
+        unreviewed: false,
+        reason: None,
+        by: Some("test"),
+        leased: false,
+    })
+    .unwrap();
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     db.finish(turn, None).unwrap();
     // A step its client asks for past the turn waits for the bot's gate,
     // listed for the bot.
-    use agent_runtime::store::Step;
     let Step::Pending { .. } = db
         .step_announce(
             "Lead",

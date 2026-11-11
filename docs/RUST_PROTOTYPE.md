@@ -3335,7 +3335,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   names its own stays whole as `output`) among the wait's own. The agent may stop it: `write_stdin` with
   `kill: true` on the handle withdraws a request still waiting (`withdrawn`,
   never run) and kills a command it started, answering
-  `{"handle","stopped":true,"ran":BOOL}`; the same kill ends any background
+  `{"handle","stopped":true,"ran":BOOL}`: an answered call is `ran: true`
+  once its client took it, as it may have done part of it, and its
+  stopped result says the same; the same kill ends any background
   command. The expiry keeps its meaning, on the run loop's one schedule.
   Waits the agent did not start (a provider's pacing, a pause, a shutdown,
   the load gate) keep the message for later, and an `attach` never lifts.

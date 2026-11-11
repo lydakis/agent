@@ -6091,8 +6091,18 @@ impl Lifts {
                         }
                         _ => outcome,
                     };
-                    let outcome = annotate(outcome, turn, &call_id_for_refs);
-                    (lifted_result(&outcome), outcome.artifacts, outcome.files)
+                    let mut outcome = annotate(outcome, turn, &call_id_for_refs);
+                    let artifacts = std::mem::take(&mut outcome.artifacts);
+                    let files = std::mem::take(&mut outcome.files);
+                    // Pictures run to megabytes: copied into the result
+                    // off the runtime thread.
+                    let value = match outcome.parts.is_empty() {
+                        true => lifted_result(&outcome),
+                        false => tokio::task::spawn_blocking(move || lifted_result(&outcome))
+                            .await
+                            .unwrap_or_else(|_| json!({"error":"process_lost"})),
+                    };
+                    (value, artifacts, files)
                 }
                 Err(error) => (
                     json!({"error":error.code,"detail":error.detail}),
@@ -6104,16 +6114,15 @@ impl Lifts {
             // Report storage failures to the service instead of stranding waiters.
             // A bot at rest is told it ended in the same job; one with a
             // turn running hears at that turn's end, unless a wait takes it.
-            let recorded = value.clone();
             match store
                 .op("process_finish", move |db| {
-                    db.process_finish(id, &recorded, &artifacts, &files)?;
+                    db.process_finish(id, &value, &artifacts, &files)?;
                     files.recorded();
-                    db.tell_finished(&bot)
+                    Ok((value, db.tell_finished(&bot)?))
                 })
                 .await
             {
-                Ok(ready) => {
+                Ok((value, ready)) => {
                     handles.process_finished(id, value);
                     if ready {
                         handles.turn_ready();
@@ -6166,7 +6175,7 @@ async fn stop_handle(
                 handles.turn_ready();
             }
             Some(Outcome::text(
-                json!({"handle":name,"stopped":true,"ran":false,"detail":result["detail"]})
+                json!({"handle":name,"stopped":true,"ran":result["ran"],"detail":result["detail"]})
                     .to_string(),
             ))
         }

@@ -2413,8 +2413,9 @@ impl Registry {
         let mut queued = queued;
         let mut stopping = self.stopping.subscribe();
         let mut pulls = self.pulls.subscribe();
-        let stop = self.stoppable(id);
+        let (stop, listed) = self.stoppable(id);
         tokio::spawn(async move {
+            let _listed = listed;
             let result = async {
                 let slot = match queued.permit.take() {
                     Some(permit) => Ok(permit),
@@ -2461,15 +2462,19 @@ impl Registry {
                     let _ = done.send(Err(stopped_by_agent()));
                 }
             }
-            registry.stops.lock().unwrap().remove(&id);
         });
     }
 
-    /// What stops background command `id` when its agent kills it.
-    fn stoppable(&self, id: i64) -> tokio::sync::oneshot::Receiver<()> {
+    /// What stops background command `id` when its agent kills it, and
+    /// what takes it off the list once dropped, however its run ends.
+    fn stoppable(&self, id: i64) -> (tokio::sync::oneshot::Receiver<()>, Stoppable) {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         self.stops.lock().unwrap().insert(id, stop);
-        stopped
+        let listed = Stoppable {
+            stops: self.stops.clone(),
+            id,
+        };
+        (stopped, listed)
     }
 
     /// `run`, a command a steer moved to the background as `id`, ended
@@ -2482,14 +2487,13 @@ impl Registry {
     where
         F: Future<Output = Result<Outcome>>,
     {
-        let (registry, stop) = (self.clone(), self.stoppable(id));
+        let (stop, listed) = self.stoppable(id);
         async move {
-            let ended = tokio::select! {
+            let _listed = listed;
+            tokio::select! {
                 result = run => result,
                 Ok(()) = stop => Err(stopped_by_agent()),
-            };
-            registry.stops.lock().unwrap().remove(&id);
-            ended
+            }
         }
     }
 
@@ -2540,6 +2544,20 @@ fn stopped_by_agent() -> Error {
         "stopped",
         "its agent killed this command before it finished, so it may have had effects",
     )
+}
+
+/// A background command's place among those its agent can kill, given
+/// up when dropped: a run a pause or the daemon's stop drops leaves none
+/// behind.
+struct Stoppable {
+    stops: Arc<std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<()>>>>,
+    id: i64,
+}
+
+impl Drop for Stoppable {
+    fn drop(&mut self) {
+        self.stops.lock().unwrap().remove(&self.id);
+    }
 }
 
 /// The pull cord as it was when a start was decided.
@@ -3350,6 +3368,22 @@ mod tests {
         registry.end_running();
         let ended = running.await.unwrap().unwrap_err();
         assert_eq!(ended.code, "daemon_paused");
+    }
+    #[tokio::test]
+    async fn a_killable_run_a_pull_drops_leaves_nothing_to_kill() {
+        let registry = Registry::new("shell").unwrap();
+        let running = tokio::spawn(
+            registry
+                .cord()
+                .until_pulled(registry.until_stopped(7, std::future::pending())),
+        );
+        tokio::task::yield_now().await;
+        assert!(registry.stops.lock().unwrap().contains_key(&7));
+        registry.end_running();
+        let ended = running.await.unwrap().unwrap_err();
+        assert_eq!(ended.code, "daemon_paused");
+        assert!(registry.stops.lock().unwrap().is_empty());
+        assert!(!registry.stop(7));
     }
     #[test]
     fn an_answered_call_past_what_its_client_is_sent_is_refused() {
