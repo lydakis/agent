@@ -8366,3 +8366,68 @@ About 0.35 ms more per unsandboxed command for a daemon of this size; a
 standalone spawn loop puts fork's extra at 0.6 ms for a 15 MiB process and
 1 ms for 30 MiB, against a command's own start (a shell) of a few ms. With
 no hook, commands start exactly as before this change.
+
+## Messages split from turns (protocol 64, schema 91)
+
+Every submission is now a `messages` row with its own number, and only a
+message that opens a run has a `turns` row. This changes the admission
+path: a new message writes a `messages` row and, when it starts at once,
+a `turns` row beside it.
+
+Store alone, in process: 32 bots, 60 rounds in memory, each round a
+new submission per bot, a finish, a duplicate resend and an event page.
+Mean µs per call, alternating base and head:
+
+| Call | main | head before trims | head |
+| --- | ---: | ---: | ---: |
+| new submission | 67 to 81 | 93 to 102 | 73 |
+| duplicate resend | 20 to 26 | 33 to 36 | 7 |
+| finish | 62 to 79 | 69 to 74 | 74 |
+| event page | 247 to 313 | 291 to 309 | 295 |
+
+There were two trims. A resend reads its earlier message with a cached
+statement that also says whether that message opened a turn. Before, it
+prepared a join and then asked again. A message that starts at once is
+written as already taken by the turn it opens, so it never enters the
+line's partial indexes and then leaves them.
+
+Daemon screen (`bench.perf_gate`), 4-CPU Linux container, two
+alternating rounds of each bench against main:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 35.502 | 39.017 | +9.9% |
+| admission | burst submit p99, ms | 4.611 | 4.305 | -6.6% |
+| completion | release to terminal p99, ms | 12.096 | 10.438 | -13.7% |
+| footprint | idle RSS, MiB | 17.836 | 15.693 | -12.0% |
+| footprint | per idle bot, KiB | 1.598 | 1.858 | +16.3% |
+| footprint | RSS after a turn each, MiB | 28.219 | 27.639 | -2.1% |
+| footprint | CPU per turn, ms | 0.893 | 0.928 | +4.0% |
+| lifecycle | CPU, s | 0.54 | 0.595 | +10.2% |
+| lifecycle | p95 turn, ms | 582.62 | 586.602 | +0.7% |
+| lifecycle | peak RSS, MiB | 24.672 | 23.943 | -3.0% |
+
+Store work counts are the same on both sides, and the gate warned on no
+row. The CPU rows overlap run to run: lone submit CPU was 31.6 to 43.1 ms
+on main and 31.0 to 43.2 ms on head. A separate interleaved screen
+against 0.9.2 put the team-point store load at the same CPU and turn
+p95, with peak memory about 0.85 MiB higher. Of that, about 0.14 MiB is
+the larger binary. The rest is a larger schema and more cached statements
+per connection.
+
+Upgrade: a schema-90 store made of 50 bots and 1,200 turns (queued,
+steered and attached messages), copied 60 times to 72,000 turns, 247,730
+events and 75.8 MiB. Its steers' `steered` events no longer match their
+copies, so every copy goes through the time-based fallback, which is the
+worst case. Daemon ready, two runs each:
+
+| Binary | Ready, s |
+| --- | ---: |
+| main, schema 90, no upgrade | 0.010 to 0.012 |
+| head, first fallback | 21.3 to 21.4 |
+| head | 2.2 to 2.4 |
+
+The first fallback counted every earlier run of the bot for each
+message. It now looks only at the last two runs to start, through a
+temporary index on `(bot, started_ms)`, and gives the same answers, ties
+included.
