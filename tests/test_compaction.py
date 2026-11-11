@@ -186,6 +186,10 @@ class CompactionTests(ModelFixture):
         for n in range(15):
             self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 150)['data']['status'],
                              'completed')
+        # The last of these ends past the threshold and summarizes after it
+        # reports. Let that summary land before counting the large turns'.
+        client.saved = [m for m in client.saved if m.get('event') != 'compacted']
+        client.summarized('Bob')
         previous = client.request('inspect', bot='Bob')['result']['compaction']
         self.assertIsNotNone(previous)
         self.requests()
