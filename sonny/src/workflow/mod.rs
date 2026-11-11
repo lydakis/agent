@@ -68,8 +68,15 @@ pub fn on() -> bool {
 
 /// Whether `bot` is a workflow's worker, by its name.
 pub fn is_worker(bot: &str) -> bool {
-    bot.split_once('.')
-        .is_some_and(|(project, rest)| !project.is_empty() && rest.starts_with(WORKER))
+    worker_project(bot).is_some()
+}
+
+/// The project of worker `bot`, named `{project}.wf-{run}-{key}`: all
+/// before its last dot, as a project's name may hold dots.
+pub fn worker_project(bot: &str) -> Option<&str> {
+    bot.rsplit_once('.')
+        .filter(|(project, rest)| !project.is_empty() && rest.starts_with(WORKER))
+        .map(|(project, _)| project)
 }
 
 /// The `workflow` tool, while workflows are on.
@@ -1287,8 +1294,16 @@ impl Attempt {
             };
             return Ok((Value::Null, Some(turn), tokens, Some(why)));
         }
+        // A whole reply that cannot be read leaves the call null, with
+        // what its turn spent counted.
         let text = match outcome["text_truncated"] == true {
-            true => self.reply(worker, turn).await?,
+            true => match self.reply(worker, turn).await {
+                Ok(text) => text,
+                Err(Trouble::Thrown(why)) => {
+                    return Ok((Value::Null, Some(turn), tokens, Some(why)));
+                }
+                Err(Trouble::Lost) => return Err(Trouble::Lost),
+            },
             false => str_of(&outcome["text"]),
         };
         Ok((Value::String(text), Some(turn), tokens, None))
@@ -1637,6 +1652,15 @@ fn cut(text: &str, most: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_worker_is_known_by_its_name_in_a_dotted_project_too() {
+        assert_eq!(worker_project("shop.wf-r1-ab12"), Some("shop"));
+        assert_eq!(worker_project("shop.web.wf-r1-ab12"), Some("shop.web"));
+        assert!(!is_worker("shop.web.lead"));
+        assert!(!is_worker(".wf-r1-ab12"));
+        assert!(!is_worker("shop.task"));
+    }
 
     #[test]
     fn a_worker_is_known_by_its_name() {

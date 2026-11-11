@@ -5072,9 +5072,9 @@ impl Fleet {
             || self.raised.contains(bot)
             // A workflow's worker is no task here, but what it asks the
             // person comes to its project's lead's window.
-            || (workflow::is_worker(bot) && project::lead_project(&self.lead).is_some_and(
-                |project| bot.strip_prefix(project).is_some_and(|rest| rest.starts_with('.')),
-            ))
+            || workflow::worker_project(bot).is_some_and(|project| {
+                project::lead_project(&self.lead) == Some(project)
+            })
     }
 
     /// `bot` as this window names it: a task by its short name, another
