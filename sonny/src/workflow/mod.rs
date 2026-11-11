@@ -1215,12 +1215,23 @@ impl Attempt {
             .request("history_items", json!({"bot": worker, "nodes": nodes}))
             .await
             .map_err(trouble)?;
-        (read["items"].as_array().into_iter().flatten())
-            .flat_map(|entry| crate::responses(&entry["item"]))
-            .filter(|item| item["role"] == "assistant")
-            .map(|item| crate::text(&item))
-            .find(|text| !text.is_empty())
-            .ok_or_else(|| Trouble::Thrown("its whole reply could not be found".into()))
+        // Newest first: an item that could not be read before the reply
+        // is found may be the reply, so none older stands in for it.
+        for entry in read["items"].as_array().into_iter().flatten() {
+            if let Some(error) = entry["error"].as_str() {
+                return Err(Trouble::Thrown(format!(
+                    "its whole reply could not be read: {error}"
+                )));
+            }
+            let found = (crate::responses(&entry["item"]).into_iter())
+                .filter(|item| item["role"] == "assistant")
+                .map(|item| crate::text(&item))
+                .find(|text| !text.is_empty());
+            if let Some(text) = found {
+                return Ok(text);
+            }
+        }
+        Err(Trouble::Thrown("its whole reply could not be found".into()))
     }
 }
 
