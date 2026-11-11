@@ -2755,6 +2755,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS events_turn_kind_cursor ON events(turn,kind,id);
             CREATE INDEX IF NOT EXISTS events_kind_cursor ON events(kind,id);
             CREATE INDEX IF NOT EXISTS events_message ON events(message) WHERE message IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS events_in_line ON events(bot,message)
+                WHERE turn IS NULL AND message IS NOT NULL;
             CREATE INDEX IF NOT EXISTS checkpoints_head ON checkpoints(head);
             CREATE INDEX IF NOT EXISTS turns_running ON turns(id) WHERE status='running';
             CREATE INDEX IF NOT EXISTS turns_waiting ON turns(id) WHERE status='waiting';
@@ -12648,6 +12650,28 @@ impl Database {
             )?
             .execute([turn])?;
         }
+        // What the messages older than the kept turns that ended in line,
+        // withdrawn or failed with no turn, said of themselves. Only events
+        // in line are read: those of messages still waiting, of ones the
+        // kept turns took in, and of these.
+        let ended: Vec<i64> = tx
+            .prepare_cached(
+                "SELECT e.id FROM events e JOIN messages m ON m.id=e.message
+                 WHERE e.bot=?1 AND e.turn IS NULL AND e.message IS NOT NULL AND e.message<?2
+                   AND m.turn IS NULL AND m.status IN ('withdrawn','failed')
+                 ORDER BY e.id LIMIT ?3",
+            )?
+            .query_map(
+                params![name, floor, limit.map(|l| l as i64).unwrap_or(-1)],
+                |r| r.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        for id in &ended {
+            events += tx
+                .prepare_cached("DELETE FROM events WHERE id=?")?
+                .execute([id])?;
+        }
+        cursor = cursor.max(ended.last().copied());
         if let Some(cursor) = cursor {
             tx.prepare_cached(
                 "UPDATE event_retention SET pruned_cursor=? WHERE singleton=1 AND pruned_cursor<?",
@@ -12664,8 +12688,10 @@ impl Database {
             })?;
         tx.commit()?;
         self.forget_files(files);
+        // A full page of either is read again from where its turns ended.
         let next_after = match limit {
             Some(limit) if turns.len() == limit => turns.last().copied(),
+            Some(limit) if ended.len() == limit => Some(turns.last().copied().unwrap_or(after)),
             _ => None,
         };
         Ok(json!({"events":events,"pruned_cursor":pruned,"next_after":next_after}))
@@ -16136,11 +16162,19 @@ fn migrate_messages(conn: &Connection) -> Result<()> {
          UPDATE messages SET turn=e.turn,node=COALESCE(messages.node,json_extract(e.data,'$.node'))
             FROM events e WHERE e.kind='steered' AND json_extract(e.data,'$.steer')=messages.id
             AND messages.status='taken' AND messages.turn IS NULL;
-         -- Else the one turn its bot ran when it was taken in.
-         UPDATE messages SET turn=(SELECT r.id FROM turns r WHERE r.bot=messages.bot
+         -- Else the run its node was written in.
+         UPDATE messages SET turn=(SELECT r.id FROM nodes n JOIN turns r ON r.id=n.turn
+                WHERE n.id=messages.node AND r.bot=messages.bot AND r.started_ms IS NOT NULL)
+            WHERE status='taken' AND turn IS NULL AND node IS NOT NULL;
+         -- Else the one run its bot had going when it was taken in, a steer
+         -- joining only one that started before it was sent. Where two
+         -- could have, as when one ended and the next began in the same
+         -- millisecond, it names none rather than guess.
+         UPDATE messages SET turn=(SELECT CASE WHEN COUNT(*)=1 THEN MAX(r.id) END
+                FROM turns r WHERE r.bot=messages.bot
                 AND r.started_ms IS NOT NULL AND r.started_ms<=messages.taken_ms
                 AND (r.finished_ms IS NULL OR r.finished_ms>=messages.taken_ms)
-              ORDER BY r.id DESC LIMIT 1)
+                AND (messages.delivery<>'steer' OR r.id<messages.id))
             WHERE status='taken' AND turn IS NULL;",
     )?;
     // The nodes of old steers that kept none, matched by their words in

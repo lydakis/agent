@@ -90,6 +90,7 @@ pub const UNSPLIT: &str = "
                 WHEN 'withdrawn' THEN 'interrupted' ELSE json_extract(data,'$.status') END)
         WHERE kind='message_ended';
     DROP INDEX events_message;
+    DROP INDEX events_in_line;
     ALTER TABLE events DROP COLUMN message;
     ALTER TABLE nodes DROP COLUMN message;
     PRAGMA user_version=90;";

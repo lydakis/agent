@@ -302,6 +302,26 @@ class AcpTests(ModelFixture):
         self.assertEqual(launch['arguments']['workspaceStrategy'],
                          {'type': 'existing_worktree', 'worktreePath': str(self.path / '.agent/worktrees/calc.fix')})
 
+    def test_a_prompt_cancelled_while_it_waits_in_line_is_answered(self):
+        repo = self.repo()
+        self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',
+                            instructions='Lead.')
+        thread, session = self.open(repo)
+        self.adopt(thread, session)
+        # Paused, the daemon starts nothing: the prompt waits in line.
+        self.assertIn('result', self.daemon.request('pause', reason='rehearsal'))
+        prompt = thread.ask('session/prompt', {'sessionId': session, 'prompt': self.wrapped('hello')})
+        deadline = time.monotonic() + 10
+        while not self.daemon.request('messages', bot='calc.lead')['result']['messages']:
+            self.assertLess(time.monotonic(), deadline, 'the prompt never reached the daemon')
+            time.sleep(.05)
+        thread.send({'method': 'session/cancel', 'params': {'sessionId': session}})
+        answered, _ = thread.answer_of(prompt)
+        self.assertEqual(answered['result'], {'stopReason': 'cancelled'})
+        [sent] = self.daemon.request('messages', bot='calc.lead')['result']['messages']
+        self.assertEqual((sent['status'], sent['turn']), ('withdrawn', None))
+        self.assertEqual(self.daemon.request('turns', bot='calc.lead')['result']['turns'], [])
+
     def test_a_turn_the_lead_takes_on_its_own_shows_in_the_thread(self):
         repo = self.repo()
         self.daemon.request('create', bot='calc.lead', workspace=str(repo), model='openai/synthetic-model',

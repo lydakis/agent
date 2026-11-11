@@ -1277,27 +1277,7 @@ impl Service {
                     // as an informer hands a change to the handlers that
                     // asked for its object; a bot made or deleted, to all.
                     let hearing = self.hearing(&event);
-                    if let (Some(bot), Some(turn)) = (event["bot"].as_str(), number(&event)) {
-                        match event["event"].as_str() {
-                            // A fire's turn too, and one carrying another
-                            // agent's message, so a restart still sees it
-                            // end and can bounce it.
-                            Some(kind @ ("accepted" | "queued" | "steered"))
-                                if (kind != "steered"
-                                    && (!hearing.is_empty()
-                                        || self.fires.contains_key(&(bot.to_owned(), turn))))
-                                    || self.senders.contains_key(&(bot.to_owned(), turn)) =>
-                            {
-                                if let Some(at) = cursor {
-                                    self.in_flight.entry((bot.to_owned(), turn)).or_insert(at);
-                                }
-                            }
-                            Some("turn_finished" | "message_ended") => {
-                                self.in_flight.remove(&(bot.to_owned(), turn));
-                            }
-                            _ => {}
-                        }
-                    }
+                    self.track(&event, !hearing.is_empty(), cursor);
                     for name in &hearing {
                         let Some(lookout) = self.lookouts.get_mut(name) else { continue };
                         lookout.event(&event);
@@ -1495,6 +1475,41 @@ impl Service {
             });
     }
 
+    /// Note where each turn or message whose end is still owed began, so
+    /// a restart reads again from there: one a lookout hears, a fire's,
+    /// and one carrying another agent's message, so a restart still sees
+    /// it end and can bounce it. A message taken into a running turn ends
+    /// in line there: its own number has no end of its own to wait for.
+    fn track(&mut self, event: &Value, heard: bool, cursor: Option<i64>) {
+        let (Some(bot), Some(turn)) = (event["bot"].as_str(), number(event)) else {
+            return;
+        };
+        let key = (bot.to_owned(), turn);
+        match event["event"].as_str() {
+            Some("steered") => {
+                if let Some(message) = event["message"].as_i64() {
+                    self.in_flight.remove(&(bot.to_owned(), message));
+                }
+                if self.senders.contains_key(&key)
+                    && let Some(at) = cursor
+                {
+                    self.in_flight.entry(key).or_insert(at);
+                }
+            }
+            Some("accepted" | "queued")
+                if heard || self.fires.contains_key(&key) || self.senders.contains_key(&key) =>
+            {
+                if let Some(at) = cursor {
+                    self.in_flight.entry(key).or_insert(at);
+                }
+            }
+            Some("turn_finished" | "message_ended") => {
+                self.in_flight.remove(&key);
+            }
+            _ => {}
+        }
+    }
+
     /// Who to tell that a turn their message started or joined ended
     /// failed or interrupted: each agent whose message it carried, other
     /// than the bot itself and any whose lookout hears the bot already
@@ -1506,8 +1521,15 @@ impl Service {
         };
         let data = &event["data"];
         match event["event"].as_str() {
-            // A steer's event comes on the turn it joins.
-            Some("accepted" | "queued" | "steered") => {
+            // A steer's event comes on the turn it joins: its message
+            // reached that turn, so what waited on the message's own end
+            // goes with it, and the turn's end now tells its sender.
+            Some(kind @ ("accepted" | "queued" | "steered")) => {
+                if kind == "steered"
+                    && let Some(message) = event["message"].as_i64()
+                {
+                    self.senders.remove(&(bot.to_owned(), message));
+                }
                 let Some(from) = data["from"]["bot"].as_str().filter(|from| *from != bot) else {
                     return Vec::new();
                 };
@@ -5107,6 +5129,32 @@ mod tests {
         service.ended_unseen(&bots);
         let kept: HashSet<(String, i64)> = service.in_flight.keys().cloned().collect();
         assert_eq!(kept, HashSet::from([("calc.fix".to_owned(), 4)]));
+    }
+
+    #[tokio::test]
+    async fn a_message_taken_into_a_running_turn_is_tracked_by_that_turn() {
+        let mut service = service(PathBuf::from("/nonexistent"), &[]);
+        let from = json!({"from": {"bot": "api.lead", "turn": 1, "bot_id": 7}});
+        // Another agent's message waits in line for docs's running turn 3.
+        let queued = in_line("docs", 5, "queued", from.clone());
+        service.bounced(&queued, true);
+        service.track(&queued, false, Some(40));
+        assert!(service.in_flight.contains_key(&("docs".into(), 5)));
+        // Turn 3 takes it in: nothing waits on message 5 any more, and
+        // turn 3's end is what tells its sender.
+        let mut steered = json!({"bot": "docs", "turn": 3, "message": 5, "event": "steered",
+            "data": {"message": 5, "node": 9}});
+        steered["data"]["from"] = from["from"].clone();
+        service.bounced(&steered, true);
+        service.track(&steered, false, Some(41));
+        assert!(!service.in_flight.contains_key(&("docs".into(), 5)));
+        assert!(!service.senders.contains_key(&("docs".into(), 5)));
+        assert_eq!(service.in_flight.get(&("docs".into(), 3)), Some(&41));
+        let failed = json!({"status": "failed", "error": "provider_http_400"});
+        let told = service.bounced(&ev("docs", 3, "turn_finished", failed.clone()), true);
+        assert_eq!(told.len(), 1);
+        service.track(&ev("docs", 3, "turn_finished", failed), false, Some(42));
+        assert!(service.in_flight.is_empty() && service.replay_floor().is_none());
     }
 
     #[tokio::test]

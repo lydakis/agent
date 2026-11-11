@@ -4616,7 +4616,7 @@ fn schema_40_gives_every_existing_bot_the_defaults_and_completes_parked_turns() 
         db.suspend(
             turn,
             "w",
-            &["turn:Nobody/1".into()],
+            &["Nobody/1".into()],
             None,
             false,
             &[],
@@ -7884,7 +7884,7 @@ fn a_running_turn_forks_at_its_newest_finished_round() {
     db.suspend(
         turn,
         "w",
-        &["turn:Nobody/1".into()],
+        &["Nobody/1".into()],
         None,
         false,
         &[],
@@ -8169,7 +8169,7 @@ fn schema_36_ends_a_turn_in_flight_and_keeps_its_history() {
         db.suspend(
             turn,
             "w",
-            &["turn:Nobody/1".into()],
+            &["Nobody/1".into()],
             None,
             false,
             &[],
@@ -9162,6 +9162,64 @@ fn completion_retention_passes_turns_whose_processes_still_run() {
     hear_out(&mut db, "Bob");
     db.prune_except("Bob", 1, None).unwrap();
     assert!(db.process_result(processes[0]).unwrap().is_none());
+}
+
+#[test]
+fn pruning_takes_the_events_of_messages_that_ended_in_line() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    // Bob is busy; one message waits behind its turn and is withdrawn,
+    // another fails there.
+    let busy = db
+        .begin(
+            "Bob",
+            "r",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let mut ended = Vec::new();
+    for (key, error) in [("w", "cancelled"), ("f", "stale_turn")] {
+        let message = db
+            .begin("Bob", key, "never", true, &queue, allow_provider)
+            .unwrap()
+            .turn;
+        db.end_queued(message, &Error::new(error)).unwrap();
+        ended.push(message);
+    }
+    db.append(busy, vec![assistant("done")], &[], None).unwrap();
+    db.finish(busy, None).unwrap();
+    let in_line = |db: &Database| -> i64 {
+        db.events("Bob", 0, 256).unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| ended.iter().any(|m| e["message"] == *m))
+            .count() as i64
+    };
+    assert_eq!(in_line(&db), 4, "queued and message_ended for each");
+    // While they are newer than the turns kept, they stay.
+    db.prune("Bob", 1).unwrap();
+    assert_eq!(in_line(&db), 4);
+    // Older than every turn kept, they go with the turns before them.
+    converse(&mut db, "Bob", 2);
+    let pruned = db.prune("Bob", 1).unwrap();
+    assert_eq!(in_line(&db), 0);
+    assert!(pruned["events"].as_i64().unwrap() >= 4, "{pruned}");
+    // Each message keeps its row: history stays.
+    for message in &ended {
+        assert_eq!(
+            db.messages("Bob", message - 1, None, 1, false).unwrap()["messages"][0]["message"],
+            *message
+        );
+    }
 }
 
 #[test]
@@ -19043,12 +19101,19 @@ fn schema_90_turns_become_messages_each_with_its_number() {
             run, steers, attached, quoting, queued, withdrawn, held, forked,
         )
     };
-    // As schema 90 kept them, with the last steer's events pruned.
+    // As schema 90 kept them, with the last steer's events pruned, and
+    // Bob's turn ending in the millisecond it took that steer in, as a run
+    // after it began: only the run going before the steer was sent took it.
     Connection::open(&path)
         .unwrap()
         .older(&format!(
             "DELETE FROM events WHERE (kind='steered' AND json_extract(data,'$.steer')={lost})
-                OR (kind='turn_finished' AND turn={lost});",
+                OR (kind='turn_finished' AND turn={lost});
+             UPDATE turns SET finished_ms=(SELECT finished_ms FROM turns WHERE id={lost})
+                WHERE id={run};
+             INSERT INTO turns(id,bot,request_id,prompt,status,started_ms,finished_ms)
+                SELECT 900000,'Bob','next','next','completed',finished_ms,finished_ms
+                FROM turns WHERE id={lost};",
             lost = steers[2]
         ))
         .unwrap();
@@ -19092,7 +19157,7 @@ fn schema_90_turns_become_messages_each_with_its_number() {
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
-    assert_eq!(turns, [run]);
+    assert_eq!(turns, [run, 900000]);
     // A quote names the message it copied, and copies just that one.
     let quotes: String = conn
         .query_row(

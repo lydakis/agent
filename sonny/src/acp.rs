@@ -1913,6 +1913,25 @@ impl Session {
                     }
                 }
             }
+            "message_ended" => {
+                // A prompt that ended in line, withdrawn or failed before
+                // any turn took it in: answered now. A turn running for
+                // another message goes on.
+                let ended = event["message"].as_i64();
+                let ours = matches!(&state.prompt, Some((_, at)) if at.is_some() && *at == ended);
+                if ours && let Some((prompt, _)) = state.prompt.take() {
+                    let result = match data["status"].as_str() {
+                        Some("withdrawn") => json!({"stopReason": "cancelled"}),
+                        _ => json!({"stopReason": "end_turn", "error": {"code": FAILED,
+                            "message": data["error"].as_str().unwrap_or("the message failed")}}),
+                    };
+                    if state.opening > 0 {
+                        state.held.push((prompt, result));
+                    } else {
+                        out.answer(&prompt, result);
+                    }
+                }
+            }
             "deleted" => {
                 if let Some((prompt, _)) = state.prompt.take() {
                     out.fail(&prompt, FAILED, &format!("{bot} was deleted"));
