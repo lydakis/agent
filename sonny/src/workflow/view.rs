@@ -356,6 +356,9 @@ mod tests {
         fold.take(&json!({"t": "replay"}));
         assert_eq!(fold.live().running, 0);
         assert_eq!(Live::default().state(), "starting");
+        // A stop its caller or the lead asked for shows as the window's does.
+        fold.take(&json!({"t": "stop"}));
+        assert!(fold.live().state().ends_with(" · stopping"));
     }
 
     #[test]
