@@ -1081,10 +1081,11 @@ pub struct TurnOptions {
     /// Turns whose words the store copies after this prompt's, each with
     /// who wrote them.
     pub quotes: Vec<QuoteRef>,
-    /// The words `quotes` copied, as a message going back in line holds
-    /// them: kept as they were, whatever became of the turns they came
-    /// from. None copies them now.
-    pub quoted: Option<String>,
+    /// What a message going back in line was admitted with: who sent it
+    /// and the words it quoted, kept as they were, whatever became of that
+    /// sender and those turns since. None checks `from` and copies
+    /// `quotes` now.
+    pub kept: Option<Kept>,
     /// The most tokens, of what `budget_counts` names, this turn may
     /// spend; none is bounded only by the bot's own budget.
     pub budget_counts: Counts,
@@ -1102,6 +1103,13 @@ pub struct TurnOptions {
     /// such as a dropped reply: no budget refuses it, since that turn's
     /// calls are what the budget bounds, and its last call should read it.
     pub fact: bool,
+}
+/// A message's provenance as its first admission checked it: its
+/// sender's bot id, and the words it quoted as JSON.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct Kept {
+    pub from_id: Option<i64>,
+    pub quotes: Option<String>,
 }
 /// An attached message whose wait ran out, delivered now as a steer.
 #[derive(Debug)]
@@ -6514,7 +6522,7 @@ impl Database {
                                 None => Vec::new(),
                             },
                             // What they copied: a retry names the turns.
-                            quoted: None,
+                            kept: None,
                             budget_tokens: r.get::<_, Option<i64>>(12)?.map(|n| n as u64),
                             budget_counts: Counts::from_stored(
                                 r.get::<_, Option<String>>(17)?.as_deref(),
@@ -6558,8 +6566,8 @@ impl Database {
                 origin,
                 person,
                 quotes,
-                // The copy `quotes` names, kept as it was.
-                quoted: _,
+                // As `from` and `quotes` were admitted.
+                kept: _,
                 budget_tokens,
                 budget_counts,
                 images: _,
@@ -6629,8 +6637,12 @@ impl Database {
             .facts(json!({"running_turn":bot.running_turn})));
         }
         // Declared, not verified: the named turn exists and is that bot's.
-        let mut from_id = None;
-        if let Some((from, turn)) = &options.from {
+        // A message going back in line keeps the sender it was admitted
+        // with.
+        let mut from_id = options.kept.as_ref().and_then(|kept| kept.from_id);
+        if let Some((from, turn)) = &options.from
+            && options.kept.is_none()
+        {
             from_id = self
                 .conn
                 .prepare_cached(
@@ -6645,8 +6657,8 @@ impl Database {
         if let Some(level) = &options.effort {
             bot.family()?.check_effort(level)?;
         }
-        let quotes = match &options.quoted {
-            Some(quoted) => Some(quoted.clone()),
+        let quotes = match &options.kept {
+            Some(kept) => kept.quotes.clone(),
             None => self.quote(&options.quotes, prompt.len())?,
         };
         let attach = options.delivery == Delivery::Attach;
@@ -10597,14 +10609,15 @@ impl Database {
             Option<String>,
             Option<String>,
             Option<i64>,
+            Option<i64>,
             Option<String>,
             Option<String>,
             Option<String>,
         );
-        let (effort, from, from_turn, origin, person, quotes): Row = self
+        let (effort, from, from_turn, from_id, origin, person, quotes): Row = self
             .conn
             .prepare_cached(
-                "SELECT reasoning,from_bot,from_turn,origin,person,quotes FROM turns WHERE id=?",
+                "SELECT reasoning,from_bot,from_turn,from_id,origin,person,quotes FROM turns WHERE id=?",
             )?
             .query_row([steer], |r| {
                 Ok((
@@ -10614,11 +10627,13 @@ impl Database {
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             })?;
         // The turns it quoted, as a retry names them, with the words it
-        // copied, read from its own item: those turns may be gone by now.
-        let (quotes, quoted) = match quotes {
+        // copied, read from its own item: those turns, and its sender, may
+        // be gone by now.
+        let (quotes, copied) = match quotes {
             Some(json) => {
                 let copied = quoted(&self.conn, Some(&json), Self::QUOTED_BYTES)?;
                 let named = (copied.iter())
@@ -10641,7 +10656,10 @@ impl Database {
                 origin,
                 person,
                 quotes,
-                quoted,
+                kept: Some(Kept {
+                    from_id,
+                    quotes: copied,
+                }),
                 images,
                 ..TurnOptions::default()
             },

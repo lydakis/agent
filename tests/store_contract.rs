@@ -166,7 +166,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         origin: None,
         person: None,
         quotes: Vec::new(),
-        quoted: None,
+        kept: None,
         budget_tokens: None,
         budget_counts: Default::default(),
         images: Vec::new(),
@@ -6003,7 +6003,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         origin: None,
         person: None,
         quotes: Vec::new(),
-        quoted: None,
+        kept: None,
         budget_tokens: None,
         budget_counts: Default::default(),
         images: Vec::new(),
@@ -6140,7 +6140,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         origin: None,
         person: None,
         quotes: Vec::new(),
-        quoted: None,
+        kept: None,
         budget_tokens: None,
         budget_counts: Default::default(),
         images: Vec::new(),
@@ -7696,7 +7696,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 origin: None,
                 person: None,
                 quotes: Vec::new(),
-                quoted: None,
+                kept: None,
                 budget_tokens: None,
                 budget_counts: Default::default(),
                 images: Vec::new(),
@@ -17803,10 +17803,10 @@ fn messages_that_joined_a_declined_request_go_back_in_line_as_sent() {
     assert_eq!(accepted["data"]["from"]["bot"], "Bob");
 }
 
-/// A message sent again keeps the words it quoted, though the turn it
-/// quoted is gone by then.
+/// A message sent again keeps who sent it and the words it quoted,
+/// though that sender and the turn it quoted are gone by then.
 #[test]
-fn a_message_sent_again_keeps_what_it_quoted() {
+fn a_message_sent_again_keeps_who_sent_it_and_what_it_quoted() {
     let mut db = db();
     for bot in ["Bob", "Carol"] {
         db.create(bot, Some("/synthetic"), binding()).unwrap();
@@ -17837,6 +17837,7 @@ fn a_message_sent_again_keeps_what_it_quoted() {
         .turn;
     let steer = TurnOptions {
         delivery: Delivery::Steer,
+        from: Some(("Bob".into(), bob)),
         quotes: vec![quote("Bob", bob, false)],
         ..TurnOptions::default()
     };
@@ -17864,8 +17865,11 @@ fn a_message_sent_again_keeps_what_it_quoted() {
         .cloned()
         .expect("the message did not go back in line");
     assert_eq!(again["prompt_preview"], "see this");
-    db.start(again["turn"].as_i64().unwrap(), allow_provider)
+    let (accepted, _) = db
+        .start(again["turn"].as_i64().unwrap(), allow_provider)
         .unwrap();
+    assert_eq!(accepted["data"]["from"]["bot"], "Bob");
+    assert!(accepted["data"]["from"]["bot_id"].is_i64(), "{accepted}");
     let opened = stored(&mut db, "Carol").last().unwrap().to_string();
     assert!(opened.contains("the plan is to ship on friday"), "{opened}");
 }
