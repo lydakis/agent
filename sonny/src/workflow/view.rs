@@ -149,6 +149,12 @@ impl Fold {
                     self.live.tokens += line["output_tokens"].as_u64().unwrap_or(0);
                 }
             }
+            // A call that threw ends as failed, though a replay asks again.
+            Some("thrown") => {
+                let key = line["key"].as_str().unwrap_or("");
+                let phase = self.asking.remove(key).unwrap_or_else(|| phase_of(line));
+                self.counts(phase).failed += 1;
+            }
             // The script runs again from the top: what ran is asked again.
             Some("replay") => self.asking.clear(),
             Some("stop") => self.live.stopping = true,
@@ -342,15 +348,17 @@ mod tests {
             json!({"t": "agent", "key": "d", "phase": "Verify", "value": null, "output_tokens": 3}),
             json!({"t": "asking", "key": "e", "phase": "Verify"}),
             json!({"t": "log", "text": "1 of 2 checked"}),
+            json!({"t": "asking", "key": "f", "phase": "Verify"}),
+            json!({"t": "thrown", "key": "f", "phase": "Verify", "error": "no such profile"}),
         ] {
             fold.take(&line);
         }
         let live = fold.live();
-        assert_eq!((live.running, live.done, live.failed), (2, 2, 1));
-        assert_eq!(live.state(), "Verify · 2 running, 2 done, 1 failed");
+        assert_eq!((live.running, live.done, live.failed), (2, 2, 2));
+        assert_eq!(live.state(), "Verify · 2 running, 2 done, 2 failed");
         assert_eq!(
             live.more(),
-            "Find: 1 running, 2 done · Verify: 1 running, 1 failed · 1 of 2 checked · 10 output tokens"
+            "Find: 1 running, 2 done · Verify: 1 running, 2 failed · 1 of 2 checked · 10 output tokens"
         );
         // Run again from the top, what was running is asked again.
         fold.take(&json!({"t": "replay"}));

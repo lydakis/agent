@@ -1093,6 +1093,10 @@ impl script::Host for Attempt {
                 Ok(value)
             }
             Err(Trouble::Thrown(error)) => {
+                // Not an answer: a replay asks again. It ends what a window
+                // counts as running.
+                run.note(json!({"t": "thrown", "key": key, "phase": asked.phase,
+                    "error": error, "at_ms": now_ms()}));
                 done();
                 Err(error)
             }
