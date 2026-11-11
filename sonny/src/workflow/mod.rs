@@ -1134,59 +1134,69 @@ impl Attempt {
             }
             false => plan.workspace.clone(),
         };
-        let told =
-            (self.run.told(&dir, asked.agent_type.as_deref()).await).map_err(Trouble::Thrown)?;
-        let model = (asked.model.clone())
-            .or(told.model.clone())
-            .unwrap_or_else(|| plan.model.clone());
-        let effort = asked
-            .effort
-            .clone()
-            .or_else(|| plan.effort.clone().filter(|_| model == plan.model));
-        let config = agent_client::config::load().unwrap_or_default();
-        let tools = told.tools.clone().unwrap_or_else(|| {
-            agent_client::default_tools(
-                self.client.providers(),
-                &model,
-                config.web_search,
-                &config.web_search_off,
-            )
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
-        });
-        // Confined as the caller's row confines it, in its own folder; the
-        // rest of its settings, rules and environment, its maker's.
-        let mut settings = crate::approvals::sandbox(&plan.mode, &dir, plan.state.as_deref());
-        if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
-            settings.insert("cache_ttl".into(), json!(ttl));
-        }
-        if let Some(outputs) = agent_client::policy::outputs_beside(&self.run.store) {
-            settings.insert("outputs".into(), json!(outputs));
-        }
-        if config.hide_senders {
-            settings.insert("hide_senders".into(), json!(true));
-        }
-        if let Some(ms) = config.hold_ms {
-            settings.insert("hold_ms".into(), json!(ms));
-        }
-        let request = format!("wf-{}-{key}", plan.id);
-        let create = json!({"bot": worker, "workspace": dir, "model": model,
-            "instructions": told.instructions, "effort": effort, "tools": tools,
-            "declare": crate::declared::tools(crate::served::Role::WORKER),
-            "created_by": plan.caller, "created_by_id": plan.caller_id,
-            "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
-            "fallback": config.fallbacks.get(&model), "settings": settings,
-            "request_id": request});
-        if let Err(error) = self.client.request("create", create).await {
-            if lost(&error) {
-                return Err(Trouble::Lost);
-            }
-            // Made by this call before, told what its folder said then.
-            match self.client.request("inspect", json!({"bot": worker})).await {
-                Ok(made) if made["created_by_id"] == plan.caller_id => {}
+        let told = match self.run.told(&dir, asked.agent_type.as_deref()).await {
+            Ok(told) => Some(told),
+            // A worker this call made before the host restarted needs
+            // nothing its profile says now: recover it, as it is.
+            Err(why) => match self.client.request("inspect", json!({"bot": worker})).await {
+                Ok(made) if made["created_by_id"] == plan.caller_id => None,
                 Err(again) if lost(&again) => return Err(Trouble::Lost),
-                _ => return failed(format!("{worker} was not made: {error}")),
+                _ => return Err(Trouble::Thrown(why)),
+            },
+        };
+        let request = format!("wf-{}-{key}", plan.id);
+        if let Some(told) = told {
+            let model = (asked.model.clone())
+                .or(told.model.clone())
+                .unwrap_or_else(|| plan.model.clone());
+            let effort = asked
+                .effort
+                .clone()
+                .or_else(|| plan.effort.clone().filter(|_| model == plan.model));
+            let config = agent_client::config::load().unwrap_or_default();
+            let tools = told.tools.clone().unwrap_or_else(|| {
+                agent_client::default_tools(
+                    self.client.providers(),
+                    &model,
+                    config.web_search,
+                    &config.web_search_off,
+                )
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+            });
+            // Confined as the caller's row confines it, in its own folder; the
+            // rest of its settings, rules and environment, its maker's.
+            let mut settings = crate::approvals::sandbox(&plan.mode, &dir, plan.state.as_deref());
+            if let Some(ttl) = agent_client::policy::cache_ttl(&model) {
+                settings.insert("cache_ttl".into(), json!(ttl));
+            }
+            if let Some(outputs) = agent_client::policy::outputs_beside(&self.run.store) {
+                settings.insert("outputs".into(), json!(outputs));
+            }
+            if config.hide_senders {
+                settings.insert("hide_senders".into(), json!(true));
+            }
+            if let Some(ms) = config.hold_ms {
+                settings.insert("hold_ms".into(), json!(ms));
+            }
+            let create = json!({"bot": worker, "workspace": dir, "model": model,
+                "instructions": told.instructions, "effort": effort, "tools": tools,
+                "declare": crate::declared::tools(crate::served::Role::WORKER),
+                "created_by": plan.caller, "created_by_id": plan.caller_id,
+                "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
+                "fallback": config.fallbacks.get(&model), "settings": settings,
+                "request_id": request});
+            if let Err(error) = self.client.request("create", create).await {
+                if lost(&error) {
+                    return Err(Trouble::Lost);
+                }
+                // Made by this call before, told what its folder said then.
+                match self.client.request("inspect", json!({"bot": worker})).await {
+                    Ok(made) if made["created_by_id"] == plan.caller_id => {}
+                    Err(again) if lost(&again) => return Err(Trouble::Lost),
+                    _ => return failed(format!("{worker} was not made: {error}")),
+                }
             }
         }
         let schema = asked.schema.as_ref().map(schema::strict);

@@ -77,26 +77,10 @@ pub fn strict(schema: &Value) -> Value {
     Value::Object(out)
 }
 
-/// `property`, or null.
-fn nullable(mut property: Value) -> Value {
-    // An enum or const holds null out whatever the type says.
-    if property.get("enum").is_some() || property.get("const").is_some() {
-        return json!({"anyOf": [property, {"type": "null"}]});
-    }
-    match property.get_mut("type") {
-        Some(Value::String(kind)) => {
-            let kind = std::mem::take(kind);
-            property["type"] = json!([kind, "null"]);
-            property
-        }
-        Some(Value::Array(kinds)) => {
-            if !kinds.contains(&json!("null")) {
-                kinds.push(json!("null"));
-            }
-            property
-        }
-        _ => json!({"anyOf": [property, {"type": "null"}]}),
-    }
+/// `property`, or null: the whole of it, so no enum, const or union
+/// within it holds null out.
+fn nullable(property: Value) -> Value {
+    json!({"anyOf": [property, {"type": "null"}]})
 }
 
 /// `value`, a reply to [`strict`]'s `schema`, with the nulls it gives the
@@ -379,14 +363,14 @@ mod tests {
         assert_eq!(strict["additionalProperties"], false);
         assert_eq!(strict["required"], json!(["findings", "note"]));
         assert_eq!(
-            strict["properties"]["note"]["type"],
-            json!(["string", "null"])
+            strict["properties"]["note"],
+            json!({"anyOf": [{"type": "string"}, {"type": "null"}]})
         );
         let item = &strict["properties"]["findings"]["items"];
         assert_eq!(item["required"], json!(["file", "line"]));
         assert_eq!(
-            item["properties"]["line"]["type"],
-            json!(["integer", "null"])
+            item["properties"]["line"],
+            json!({"anyOf": [{"type": "integer"}, {"type": "null"}]})
         );
         assert_eq!(item["additionalProperties"], false);
         let reply = r#"{"findings": [{"file": "a.rs", "line": null}], "note": null}"#;
@@ -430,6 +414,14 @@ mod tests {
         assert_eq!(
             strict_enum["properties"]["level"],
             json!({"anyOf": [{"type": "string", "enum": ["a", "b"]}, {"type": "null"}]})
+        );
+        // So may a typed union whose every branch holds null out.
+        let union = json!({"type": "string", "anyOf": [{"enum": ["a"]}, {"enum": ["b"]}]});
+        let strict_union =
+            strict(&json!({"type": "object", "properties": {"pick": union.clone()}}));
+        assert_eq!(
+            strict_union["properties"]["pick"],
+            json!({"anyOf": [strict(&union), {"type": "null"}]})
         );
         // An untyped property may be null as anything else.
         let strict = strict(&json!({"type": "object", "properties": {"a": {"enum": [1, 2]}}}));
