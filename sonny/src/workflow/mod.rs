@@ -22,6 +22,7 @@
 //! cost model calls.
 pub mod schema;
 pub mod script;
+pub mod view;
 
 use agent_client::Client;
 use serde::{Deserialize, Serialize};
@@ -1069,6 +1070,10 @@ impl script::Host for Attempt {
                 ));
             }
         }
+        run.note(
+            json!({"t": "asking", "key": key, "label": asked.label, "phase": asked.phase,
+            "bot": worker, "at_ms": now_ms()}),
+        );
         let done = || run.live.lock().unwrap().remove(&worker);
         match self.work(&worker, &key, &prompt, &asked).await {
             Ok((value, turn, tokens, error)) => {
@@ -1438,6 +1443,21 @@ impl Attempt {
 /// Run `run`'s script to its end, again on a new connection whenever one
 /// is lost, then record and tell how it ended.
 async fn drive(run: Arc<Run>) {
+    // A window stops a run by leaving a file in its folder.
+    let watch = tokio::spawn({
+        let run = Arc::clone(&run);
+        async move {
+            let stop = run.dir.join(view::STOP);
+            loop {
+                if !run.stopping() && tokio::fs::try_exists(&stop).await.unwrap_or(false) {
+                    run.note(json!({"t": "stop", "at_ms": now_ms()}));
+                    run.stopping.store(true, Ordering::SeqCst);
+                    run.halt.notify_waiters();
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    });
     let (ended, attempt) = loop {
         let connected = tokio::select! {
             connected = Client::connect(&run.socket) => connected.ok(),
@@ -1486,6 +1506,7 @@ async fn drive(run: Arc<Run>) {
         }
         break (ended, Some(attempt));
     };
+    watch.abort();
     finish(&run, ended, attempt.as_deref()).await;
     RUNS.lock().unwrap().remove(&run.plan.id);
 }

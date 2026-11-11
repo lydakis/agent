@@ -842,6 +842,24 @@ async fn read_status(
             group,
         });
     }
+    // Each workflow that runs is one row, under the agent that started it.
+    for run in workflow::view::live(&store, &project) {
+        if !read.contains(&run.caller) {
+            continue;
+        }
+        rows.push(status::Row {
+            name: format!("workflow {}", run.name),
+            bot: run.bot(),
+            state: run.state(),
+            running: true,
+            seconds: Some(now.saturating_sub(run.started_ms) / 1000),
+            at: Some(run.started_ms),
+            latest: run.more(),
+            maker: run.caller.clone(),
+            group: status::Group::Working,
+            ..Default::default()
+        });
+    }
     // Agents gone from the listing are forgotten with it.
     *status_read = kept;
     // The lead first, then by group, the latest first in each.
@@ -7491,6 +7509,8 @@ impl App {
     /// [`Self::open_agent`] opens it; this window's own is here already,
     /// so `/status` listing it closes, as Esc does.
     fn open_picked(&mut self, bot: &str) {
+        // A workflow's row opens the agent that started it.
+        let bot = workflow::view::split(bot).0;
         if bot != self.bot {
             return self.open_agent(bot, false);
         }
@@ -11557,6 +11577,25 @@ impl App {
                     {
                         watch.more = !watch.more
                     }
+                    // `/status` stops the workflow picked.
+                    KeyCode::Char('s')
+                        if pane.is_card()
+                            && let Some(watch) = &self.watch
+                            && watch.background.is_none()
+                            && watch.usage.is_none()
+                            && watch.audit.is_none()
+                            && watch.commons.is_none()
+                            && watch.sky.is_none()
+                            && let Some(bot) = watch.pick.and_then(|pick| {
+                                card_bots(watch, self.width.max(40)).into_iter().nth(pick)
+                            })
+                            && let (_, Some(run)) = workflow::view::split(&bot) =>
+                    {
+                        self.notice = Some(match workflow::view::stop(&self.options.store, run) {
+                            Ok(()) => format!("stopping workflow run {run}"),
+                            Err(error) => error,
+                        });
+                    }
                     // `/status` opens or folds its idle and done tasks.
                     KeyCode::Char(key @ ('i' | 'd'))
                         if pane.is_card()
@@ -15187,7 +15226,14 @@ impl App {
                     list::pick(line);
                     picked = Some(row);
                 }
-                let keys = status_keys(watch, &fold_keys);
+                let mut keys = status_keys(watch, &fold_keys);
+                // A workflow's row picked can be stopped.
+                if let Some((_, screen::Mark::Link(link))) =
+                    watch.pick.and_then(|pick| marks.get(pick))
+                    && link.contains(workflow::view::MARK)
+                {
+                    keys.push_str(" · s stop workflow");
+                }
                 pane.set_card_marked(lines, marks, &keys);
                 // Scrolled to once, as a new pick, so the page keys still
                 // move away from it; after the card, whose swap would
@@ -18060,6 +18106,58 @@ mod tests {
         app.status_rows().await.unwrap();
         assert_eq!(histories.load(Ordering::SeqCst), 259);
         assert_eq!(turn_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_running_workflow_is_one_row_under_its_caller_and_s_stops_it() {
+        let client = daemon_answering(|asked| match asked["op"].as_str().unwrap_or_default() {
+            "bots" => json!({"bots": [{"name": "shop.lead", "bot_id": 1, "head": 1,
+                "status": "idle", "running_turn": null},
+                {"name": "shop.wf-run12345-abc", "bot_id": 2, "head": 1, "status": "running",
+                "running_turn": 1, "created_by": "shop.lead"}], "next_after": null}),
+            "turns" => json!({"turns": [], "next_before": null}),
+            "history_nodes" => json!({"nodes": [], "next_from": null}),
+            "history_items" => json!({"items": []}),
+            _ => json!({"error": {"code": "unexpected", "message": asked.to_string()}}),
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("sonny-wf-status-{}", std::process::id()));
+        let store = dir.join("state.sqlite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = workflow::view::plant(
+            &store,
+            "run12345",
+            "shop.lead",
+            "audit",
+            &[
+                json!({"t": "phase", "title": "Find"}),
+                json!({"t": "asking", "key": "abc", "phase": "Find"}),
+            ],
+        );
+        let mut app = app(client);
+        app.bot = "shop.lead".into();
+        app.options.store = store.clone();
+        let (_, rows) = app.status_rows().await.unwrap();
+        // Its worker is no row; the run is one, opening its caller.
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["lead", "workflow audit"]);
+        let row = &rows[1];
+        assert_eq!(row.state, "Find · 1 running");
+        assert_eq!(row.group, status::Group::Working);
+        assert_eq!(
+            workflow::view::split(&row.bot),
+            ("shop.lead", Some("run12345"))
+        );
+        // A stop is left for the host that runs it, and shows.
+        workflow::view::stop(&store, "run12345").unwrap();
+        assert!(run.join(workflow::view::STOP).exists());
+        let (_, rows) = app.status_rows().await.unwrap();
+        assert_eq!(rows[1].state, "Find · 1 running · stopping");
+        // Once it ends it is no row.
+        std::fs::write(run.join("result.json"), "{}").unwrap();
+        let (_, rows) = app.status_rows().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

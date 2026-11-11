@@ -641,6 +641,27 @@ return out
         self.assertFalse([bot for bot in self.daemon.request('bots')['result']['bots']
                           if bot['name'].startswith(f'calc.wf-{rerun}-')])
 
+    def test_a_workflow_a_window_stops_ends_as_stopped_and_says_so(self):
+        made = dict(declare=[declared('workflow')])
+        self.daemon.request('create', bot='calc.lead', workspace=str(self.path), model='openai/synthetic-model',
+                            instructions='Lead.', **made)
+        self.keeps_its_tools(self.host(), 'calc.lead', **made)
+        script = """export const meta = { name: 'forever', description: 'Agents until stopped' }
+for (let i = 0; ; i++) await agent(`say ${i}`)
+"""
+        started = self.call('calc.lead', 'workflow', {'script': script})
+        run = re.search(r'as run (\S+?)\.', started).group(1)
+        folder = self.path / f'state.sqlite.workflows/{run}'
+        # Some agents ran; then a window leaves its stop.
+        deadline = time.monotonic() + 10
+        while (folder / 'events.jsonl').read_text().count('"t":"agent"') < 3:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        (folder / 'stop').write_text('')
+        told = self.told('calc.lead', run)
+        self.assertIn(f'Workflow forever (run {run}) was stopped', told)
+        self.assertEqual(json.loads((folder / 'result.json').read_text())['status'], 'stopped')
+
     def told(self, bot, run, wait=30):
         """The message `run` sent `bot` when it ended, once its turn has."""
         deadline = time.monotonic() + wait
