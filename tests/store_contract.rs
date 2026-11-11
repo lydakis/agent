@@ -18948,6 +18948,17 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
         db.lifted_check(p1, now, false).unwrap(),
         Lifted::Waiting(None)
     ));
+    // The bot's model and effort change after the turn: the call runs at
+    // its turn's.
+    let was = db.inspect("Bob").unwrap();
+    let ran_at = (
+        format!("{}/{}", was.provider, was.model),
+        was.effort.clone(),
+    );
+    assert!(
+        db.set_model("Bob", None, &was.provider, "other-model", Some("high"))
+            .unwrap()
+    );
     // Allowed past its turn: run as its command, unless the daemon holds
     // work back.
     assert_eq!(allow(&mut db, turn, "s1").unwrap().lifted, Some(p1));
@@ -18968,6 +18979,7 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
         (p1, turn, "s1", s1.arguments.as_str())
     );
     assert_eq!(run.workspace.as_deref(), Some("/synthetic"));
+    assert_eq!((run.model.clone(), run.effort.clone()), ran_at);
     assert!(matches!(
         db.lifted_check(p1, now, false).unwrap(),
         Lifted::Gone

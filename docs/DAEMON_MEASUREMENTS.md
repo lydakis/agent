@@ -8366,3 +8366,65 @@ About 0.35 ms more per unsandboxed command for a daemon of this size; a
 standalone spawn loop puts fork's extra at 0.6 ms for a 15 MiB process and
 1 ms for 30 MiB, against a command's own start (a shell) of a few ms. With
 no hook, commands start exactly as before this change.
+
+## A message lifts a wait the agent started (protocol 64, schema 91, #876)
+
+A message that joins a turn waiting on an approval or a client's answer
+lifts that call to the background as a `proc:N` handle; waits the agent
+did not start keep the message. What each path pays:
+
+- **A turn with no lifted call**: nothing new on submit, admission or a
+  call's completion. The bot's `approvals` listing reads its running
+  turn's calls as before; a call there with no handle of its own looks up
+  the answered call it is a step of in `answers_call`, one probe that
+  finds nothing for an ordinary call. Its lifted branches start from the
+  partial index `processes_bot_running`, so a bot with no running command
+  reads no other bot's (the query-plan gate checks it).
+- **The lift**: one store op (`lift`) per call a message lifts, in place
+  of the steer's wait for the verdict; its time, when a gate or answer
+  has one, goes on the run loop's one schedule (no task, no timer).
+- **The lifted call's end**: one store op, as a background command's end.
+  A result with pictures is built, and a wait's pictures taken out of a
+  shared result, on a blocking worker, never on the runtime thread; the
+  store job hands the result back instead of a copy. A kill by handle
+  takes the call's time off the schedule as it commits, and a killable
+  run's registration goes when the run is dropped, so a pause leaves none
+  behind.
+
+The Perf workflow's screen (`bench.perf_gate`, GitHub's ubuntu-24.04
+runner), the pull request's base against head d21a85e, two alternating
+rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 36.39 | 36.447 | +0.2% |
+| admission | burst submit p99, ms | 4.702 | 4.726 | +0.5% |
+| completion | release to terminal p99, ms | 11.049 | 11.409 | +3.3% |
+| footprint | idle RSS, MiB | 15.799 | 15.828 | +0.2% |
+| footprint | per idle bot, KiB | 1.858 | 2.04 | +9.8% |
+| footprint | RSS after a turn each, MiB | 26.881 | 28.086 | +4.5% |
+| footprint | CPU per turn, ms | 1.01 | 1.005 | -0.5% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 12.5 | 25.0 | +100.0% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 6.25 | 5.0 | -20.0% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 5.0 | 5.125 | +2.5% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 5.5 | 5.62 | +2.2% |
+| sonny | lookout note p95 at 10x100, ms | 2502.0 | 2444.0 | -2.3% |
+| sonny | lookout note p95 at 100x10, ms | 2589.5 | 2689.5 | +3.9% |
+| sonny | quiet window CPU, ms/s | 1.155 | 0.77 | -33.3% |
+| sonny | quiet window RSS, MiB | 23.2 | 23.0 | -0.9% |
+| sonny | sky replay CPU per 1k lines, ms | 12.94 | 13.405 | +3.6% |
+| sonny | sky replay RSS, MiB | 78.5 | 82.25 | +4.8% |
+| lifecycle | CPU, s | 0.535 | 0.525 | -1.9% |
+| lifecycle | p95 turn, ms | 595.696 | 580.987 | -2.5% |
+| lifecycle | peak RSS, MiB | 23.404 | 23.572 | +0.7% |
+
+Store work is the same on both sides: the gate counts every store job in
+the admission, completion and footprint runs and failed on none. The one
+warning, the lookout's CPU at 10x1, is 12.5 ms against 25 ms per 1k
+deltas: a run that small reads its CPU in whole ticks, so one tick more
+doubles it, and the same bench at 10x10 moved the other way. No path the
+screen runs lifts a call, and the change keeps nothing per bot (the
+schedule and the kill registrations hold only lifted calls and running
+commands); per idle bot read 0.18 KiB more and after a turn 1.2 MiB more,
+both under the gate's 15%, the latter as wide as earlier screens' spread
+for that row (-3.7% and +4.1% on changes that touched no memory).

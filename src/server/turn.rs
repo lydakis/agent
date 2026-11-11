@@ -5875,15 +5875,12 @@ impl Lifts {
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
         environment.extend([
-            (
-                "AGENT_MODEL".to_owned(),
-                model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model)),
-            ),
+            ("AGENT_MODEL".to_owned(), model),
             ("AGENT_BOT".to_owned(), bot.name.clone()),
             ("AGENT_BOT_ID".to_owned(), bot.bot_id.to_string()),
             ("AGENT_TURN".to_owned(), turn.to_string()),
         ]);
-        if let Some(level) = effort.or_else(|| bot.effort.clone()) {
+        if let Some(level) = effort {
             environment.push(("AGENT_EFFORT".to_owned(), level));
         }
         if let (Some(parent), Some(id)) = (&bot.created_by, bot.created_by_id) {

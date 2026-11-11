@@ -1759,14 +1759,15 @@ pub enum Lifted {
     Gone,
 }
 /// A lifted call its gates allowed, with what running it needs: its bot
-/// as it is now, and its turn's folder, model and effort.
+/// as it is now, and its turn's folder, model and effort: the turn's own,
+/// else the bot's as that turn ran, kept when the bot's changed since.
 pub struct LiftedRun {
     pub process: i64,
     pub turn: i64,
     pub call: ToolCall,
     pub bot: Bot,
     pub workspace: Option<String>,
-    pub model: Option<String>,
+    pub model: String,
     pub effort: Option<String>,
     /// What the command rules made of it as its round was announced.
     pub ruling: Option<String>,
@@ -12026,20 +12027,26 @@ impl Database {
             if held {
                 return Ok(Lifted::Waiting(None));
             }
-            let context: (
-                Option<String>,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-            ) = self
+            // The turn's own model and effort, else the bot's as it was
+            // while the turn ran (kept when the bot's changed since), else
+            // the bot's now, as `turns` reads them.
+            let context: (Option<String>, String, Option<String>, Option<String>) = self
                 .conn
                 .prepare_cached(
-                    "SELECT t.workspace,t.model,t.reasoning,l.ruling FROM turns t
-                     LEFT JOIN tools l ON l.turn=t.id AND l.call_id=? WHERE t.id=?",
+                    "SELECT t.workspace,COALESCE(t.model,t.bot_model,?3),
+                            COALESCE(t.reasoning,CASE WHEN t.bot_model IS NULL THEN ?4 ELSE t.bot_reasoning END),
+                            l.ruling
+                     FROM turns t LEFT JOIN tools l ON l.turn=t.id AND l.call_id=?1 WHERE t.id=?2",
                 )?
-                .query_row(params![call_id, turn], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                })?;
+                .query_row(
+                    params![
+                        call_id,
+                        turn,
+                        format!("{}/{}", bot.provider, bot.model),
+                        bot.effort
+                    ],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?;
             let (workspace, model, effort, ruling) = context;
             let workspace = workspace.or_else(|| bot.workspace.clone());
             let ruled = ruling.as_deref().map(Ruling::read);

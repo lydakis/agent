@@ -5939,6 +5939,9 @@ impl App {
             }
             self.approvals_for(Some(turn)).await;
         } else {
+            // With no turn running, calls a message lifted out of theirs
+            // (and their steps) still wait for the person.
+            self.approvals_for(None).await;
             // Its last turn's end, as a turn's end reports it live: a window
             // opened again on an agent whose turn failed still says so, and
             // keeps its place among the lead's windows.
