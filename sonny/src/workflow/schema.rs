@@ -110,14 +110,22 @@ fn loosen_in(value: Value, schema: &Value, root: &Value) -> Value {
     let schema = resolve(schema, root);
     match value {
         Value::Object(fields) => {
-            // Of a choice, the branch whose properties name all it gives.
+            // Of a choice, the branch whose properties name all it gives,
+            // each const or enum among them holding its value.
             let chosen = (["anyOf", "oneOf"].iter())
                 .flat_map(|key| schema[*key].as_array().into_iter().flatten())
                 .map(|branch| resolve(branch, root))
                 .find(|branch| {
-                    branch["properties"]
-                        .as_object()
-                        .is_some_and(|p| fields.keys().all(|name| p.contains_key(name)))
+                    branch["properties"].as_object().is_some_and(|p| {
+                        fields.iter().all(|(name, value)| {
+                            p.get(name).is_some_and(|property| {
+                                let property = resolve(property, root);
+                                property.get("const").is_none_or(|c| c == value)
+                                    && (property["enum"].as_array())
+                                        .is_none_or(|values| values.contains(value))
+                            })
+                        })
+                    })
                 });
             let schema = chosen.unwrap_or(schema);
             let required: Vec<&str> = (schema["required"].as_array().into_iter().flatten())
@@ -230,6 +238,24 @@ mod tests {
         assert_eq!(
             loosen(reply, &schema),
             json!({"result": {"n": 1}, "either": {"n": 2}})
+        );
+    }
+
+    #[test]
+    fn a_choice_is_made_by_its_consts_as_well_as_its_names() {
+        let schema = json!({"type": "object", "properties": {"x": {"anyOf": [
+            {"type": "object", "properties": {"kind": {"const": "a"}, "value": {"type": "string"}},
+                "required": ["kind"]},
+            {"type": "object", "properties": {"kind": {"const": "b"},
+                "value": {"type": ["string", "null"]}}, "required": ["kind", "value"]}]}},
+            "required": ["x"]});
+        assert_eq!(
+            loosen(json!({"x": {"kind": "b", "value": null}}), &schema),
+            json!({"x": {"kind": "b", "value": null}})
+        );
+        assert_eq!(
+            loosen(json!({"x": {"kind": "a", "value": null}}), &schema),
+            json!({"x": {"kind": "a"}})
         );
     }
 

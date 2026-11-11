@@ -1359,9 +1359,47 @@ fn worktree(here: &Path, name: &str, base: &str, confine: bool) -> Result<Place,
 pub(crate) fn worker_tree(here: &Path, name: &str, confine: bool) -> Result<PathBuf, String> {
     if let Some(path) = worktree_of(here, name) {
         let prefix = git(here, &["rev-parse", "--show-prefix"]).unwrap_or_default();
-        return Ok(within(&path, Path::new(prefix.trim_end_matches('/'))));
+        let dir = within(&path, Path::new(prefix.trim_end_matches('/')));
+        return inside_tree(&path, dir);
     }
-    worktree(here, name, "HEAD", confine).map(|place| place.dir)
+    let place = worktree(here, name, "HEAD", confine)?;
+    match &place.undo {
+        Undo::Worktree { path, .. } => {
+            inside_tree(path, place.dir.clone()).inspect_err(|_| undo(&place.undo))
+        }
+        _ => Ok(place.dir),
+    }
+}
+
+/// `dir`, a folder in the worktree at `tree`, as a task's is checked: each
+/// folder down to it opened without following a link, and made when the
+/// commit has none, and it, followed, still inside the worktree.
+fn inside_tree(tree: &Path, dir: PathBuf) -> Result<PathBuf, String> {
+    let parts = (dir.strip_prefix(tree).ok()).and_then(|below| {
+        (below.components())
+            .map(|part| match part {
+                std::path::Component::Normal(part) => Some(part),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+    });
+    let made = match parts {
+        Some(parts) => crate::git::folders(tree, &parts, true).map_err(|e| e.to_string()),
+        None => Err("not a folder inside it".to_owned()),
+    };
+    let real = std::fs::canonicalize(tree).unwrap_or_else(|_| tree.to_owned());
+    match made {
+        Ok(_) if std::fs::canonicalize(&dir).is_ok_and(|d| d.starts_with(&real)) => Ok(dir),
+        Ok(_) => Err(format!(
+            "{} is a link in the repository's last commit, leading out of its worktree",
+            dir.display()
+        )),
+        Err(e) => Err(format!(
+            "{}: the folder in its worktree {}, leading out of it or no folder: {e}",
+            dir.display(),
+            tree.display()
+        )),
+    }
 }
 
 /// Whether a worktree holds a submodule checked out, which git will not
