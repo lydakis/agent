@@ -26,7 +26,7 @@ pub mod script;
 use agent_client::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -741,6 +741,9 @@ struct Attempt {
     run: Arc<Run>,
     client: Arc<Client>,
     slots: Semaphore,
+    /// Workers a lost connection left running, each holding one of
+    /// `slots` until its call reaches it again.
+    survivors: Mutex<HashSet<String>>,
     /// How many calls of each key came before, this go.
     seen: Mutex<HashMap<String, usize>>,
     calls: AtomicU64,
@@ -749,6 +752,21 @@ struct Attempt {
     /// The output tokens `budget.spent()` shows.
     shown: AtomicU64,
     lost: AtomicBool,
+}
+
+/// A call's place among a run's `at_once`.
+enum Slot<'a> {
+    Taken(#[allow(dead_code)] tokio::sync::SemaphorePermit<'a>),
+    /// A survivor's, given back to the run when its call ends.
+    Held(&'a Semaphore),
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        if let Slot::Held(slots) = self {
+            slots.add_permits(1);
+        }
+    }
 }
 
 /// The options an `agent()` call takes, Claude Code's; others are left
@@ -882,9 +900,15 @@ impl script::Host for Attempt {
             }
             return Ok(value);
         }
+        let worker = format!("{}.{WORKER}{}-{key}", run.plan.project, run.plan.id);
         // Checked once a slot is free: calls queued behind it start no
-        // worker once the run is stopping or its budget is spent.
-        let _slot = self.slots.acquire().await.map_err(|e| e.to_string())?;
+        // worker once the run is stopping or its budget is spent. A worker
+        // still running from before has its slot already.
+        let survived = self.survivors.lock().unwrap().remove(&worker);
+        let _slot = match survived {
+            true => Slot::Held(&self.slots),
+            false => Slot::Taken(self.slots.acquire().await.map_err(|e| e.to_string())?),
+        };
         if run.stopping() {
             return Err("the workflow is stopping".into());
         }
@@ -895,7 +919,6 @@ impl script::Host for Attempt {
                 "this run's budget of {total} output tokens is spent"
             ));
         }
-        let worker = format!("{}.{WORKER}{}-{key}", run.plan.project, run.plan.id);
         match self.work(&worker, &key, &prompt, &asked).await {
             Ok((value, turn, tokens, error)) => {
                 run.spent.fetch_add(tokens, Ordering::SeqCst);
@@ -1208,10 +1231,12 @@ async fn drive(run: Arc<Run>) {
         };
         // Read, so the connection is never closed for a full queue.
         tokio::spawn(async move { while events.recv().await.is_some() {} });
+        let survivors: HashSet<String> = run.live.lock().unwrap().keys().cloned().collect();
         let attempt = Arc::new(Attempt {
             run: Arc::clone(&run),
             client: client.clone(),
-            slots: Semaphore::new(run.plan.at_once),
+            slots: Semaphore::new(run.plan.at_once.saturating_sub(survivors.len())),
+            survivors: Mutex::new(survivors),
             seen: Mutex::default(),
             calls: AtomicU64::new(0),
             nulls: AtomicU64::new(0),
