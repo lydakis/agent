@@ -18645,3 +18645,189 @@ fn a_configure_kept_for_a_turns_end_is_kept_once_and_let_go_when_taken() {
     assert!(set);
     assert_ne!(db.inspect("Bob").unwrap().instructions, "tried");
 }
+
+#[test]
+fn schema_90_turns_become_messages_each_with_its_number() {
+    let path = std::env::temp_dir().join(format!("agent-schema90-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let big = "b".repeat(5000);
+    let (run, steers, attached, quoting, queued, withdrawn, held, forked) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        for bot in ["Bob", "Carol", "Dave", "Gone"] {
+            db.create(bot, Some("/synthetic"), binding()).unwrap();
+        }
+        // An attached note rides Bob's turn; three steers join it, one
+        // long, one short, and one whose events retention will take.
+        let attach = TurnOptions {
+            delivery: Delivery::Attach,
+            ..TurnOptions::default()
+        };
+        let attached = db
+            .begin("Bob", "n", "fyi", true, &attach, allow_provider)
+            .unwrap()
+            .turn;
+        let run = db
+            .begin(
+                "Bob",
+                "r",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let mut steers = Vec::new();
+        for (key, words) in [("s1", big.as_str()), ("s2", "small"), ("s3", "lost words")] {
+            steers.push(
+                db.begin("Bob", key, words, true, &steer, allow_provider)
+                    .unwrap()
+                    .turn,
+            );
+        }
+        db.absorb(
+            run,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+            true,
+        )
+        .unwrap();
+        db.append(run, vec![assistant("done")], &[], None).unwrap();
+        db.finish(run, None).unwrap();
+        // Carol quotes the short steer while busy, so the rest wait in line.
+        let quoting = db
+            .begin(
+                "Carol",
+                "c",
+                "see this",
+                true,
+                &TurnOptions {
+                    quotes: vec![quote("Bob", steers[1], false)],
+                    ..TurnOptions::default()
+                },
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let queued = (db.begin("Carol", "q", "later", true, &queue, allow_provider))
+            .unwrap()
+            .turn;
+        let withdrawn = (db.begin("Carol", "w", "never", true, &queue, allow_provider))
+            .unwrap()
+            .turn;
+        db.end_queued(withdrawn, &Error::new("cancelled")).unwrap();
+        // Dave's message is held in line on a cause a person can fix.
+        let held = (db.begin("Dave", "h", "held", false, &queue, allow_provider))
+            .unwrap()
+            .turn;
+        let (_, ready) = db.next_ready().unwrap().unwrap();
+        assert_eq!(ready, held);
+        db.hold(held, &Error::new("provider_unavailable")).unwrap();
+        // A fork outlives the bot it came from.
+        converse(&mut db, "Gone", 1);
+        db.fork("Gone", "Fork", Fork::default()).unwrap();
+        db.delete_bot("Gone").unwrap();
+        let forked = db.inspect("Fork").unwrap().head.unwrap();
+        (
+            run, steers, attached, quoting, queued, withdrawn, held, forked,
+        )
+    };
+    // As schema 90 kept them, with the last steer's events pruned.
+    Connection::open(&path)
+        .unwrap()
+        .older(&format!(
+            "DELETE FROM events WHERE (kind='steered' AND json_extract(data,'$.steer')={lost})
+                OR (kind='turn_finished' AND turn={lost});",
+            lost = steers[2]
+        ))
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let row = |id: i64| -> (String, Option<i64>, Option<i64>, String) {
+        conn.query_row(
+            "SELECT status,turn,node,text FROM messages WHERE id=?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    };
+    // Every message Bob's turn took in names it, with the node holding its
+    // words; the long one's words live only there.
+    for id in [attached, run, steers[0], steers[1], steers[2]] {
+        let (status, turn, node, _) = row(id);
+        assert_eq!((status.as_str(), turn), ("taken", Some(run)), "{id}");
+        let node = node.unwrap();
+        let named: Option<i64> = conn
+            .query_row("SELECT message FROM nodes WHERE id=?", [node], |r| r.get(0))
+            .unwrap();
+        assert_eq!(named, Some(id));
+    }
+    assert_eq!(row(steers[0]).3, "");
+    assert_eq!(row(steers[1]).3, "small");
+    // Those in line stay there, the first now at its head as Carol's turn
+    // ended with the restart; one withdrawn ended there.
+    assert_eq!(row(queued).0, "ready");
+    assert_eq!(
+        (row(withdrawn).0.as_str(), row(withdrawn).1),
+        ("withdrawn", None)
+    );
+    assert_eq!(row(held).0, "ready");
+    assert_eq!(held_rows(&db).len(), 1);
+    // Only runs are turns, each its opening message's number.
+    let turns: Vec<i64> = conn
+        .prepare("SELECT id FROM turns WHERE bot='Bob' ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(turns, [run]);
+    // A quote names the message it copied, and copies just that one.
+    let quotes: String = conn
+        .query_row(
+            "SELECT quotes FROM senders WHERE quotes IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        json!(serde_json::from_str::<Value>(&quotes).unwrap()[0]["message"]),
+        json!(steers[1])
+    );
+    let started = db
+        .begin(
+            "Dave",
+            "d",
+            "pass it on",
+            true,
+            &TurnOptions {
+                quotes: vec![quote("Bob", steers[2], false)],
+                delivery: Delivery::Queue,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap();
+    assert_eq!(
+        started.entry.unwrap()["data"]["quotes"][0]["message"],
+        steers[2]
+    );
+    // The fork's history is whole without its source.
+    assert!(read_item(&db, "Fork", forked).is_ok());
+    // New numbers follow the old.
+    assert!(started.turn > held && started.turn > quoting);
+    drop(conn);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}

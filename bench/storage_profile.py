@@ -24,24 +24,25 @@ def profile(path):
                                if path.with_name(path.name + '-wal').exists() else 0),
             'rows': {},
         }
-        for table in ('nodes', 'turns', 'retained_turns', 'artifacts', 'events', 'compactions'):
+        for table in ('nodes', 'messages', 'retained_turns', 'artifacts', 'events', 'compactions'):
             result['rows'][table] = db.execute(f'SELECT count(*) FROM {table}').fetchone()[0]
         result['node_payloads'] = [dict(kind=kind, rows=count, bytes=size) for kind, count, size in db.execute(
             "SELECT coalesce(json_extract(CAST(item AS TEXT),'$.type'),"
             "json_extract(CAST(item AS TEXT),'$.role'),'other'),count(*),sum(length(item)) "
             'FROM nodes GROUP BY 1')]
         result['stored_artifact_bytes'] = db.execute('SELECT coalesce(sum(length(data)),0) FROM artifacts').fetchone()[0]
-        result['payload_bytes'] = dict(zip(('nodes', 'turn_prompts', 'artifacts'), db.execute(
+        result['payload_bytes'] = dict(zip(('nodes', 'message_texts', 'artifacts'), db.execute(
             'SELECT (SELECT coalesce(sum(length(item)),0) FROM nodes),'
-            '(SELECT coalesce(sum(length(CAST(prompt AS BLOB))),0) FROM turns),'
+            '(SELECT coalesce(sum(length(CAST(text AS BLOB))),0) FROM messages),'
             '(SELECT coalesce(sum(CASE WHEN raw_bytes>0 THEN raw_bytes ELSE length(data) END),0) FROM artifacts)').fetchone()))
-        # Count only exact duplicate text, not all turns or guessed JSON overhead.
+        # Count only exact duplicate text: a message whose words its own
+        # item holds too, not all messages or guessed JSON overhead.
         result['duplicate_prompt_bytes'] = db.execute(
-            "SELECT coalesce(sum(length(CAST(t.prompt AS BLOB))),0) FROM turns t "
-            "WHERE EXISTS (SELECT 1 FROM nodes n WHERE n.turn=t.id "
-            "AND json_extract(CAST(n.item AS TEXT),'$.role')='user' AND t.prompt=coalesce("
+            "SELECT coalesce(sum(length(CAST(m.text AS BLOB))),0) FROM messages m "
+            "JOIN nodes n ON n.id=m.node "
+            "WHERE json_extract(CAST(n.item AS TEXT),'$.role')='user' AND m.text=coalesce("
             "json_extract(CAST(n.item AS TEXT),'$.content[0].text'),"
-            "json_extract(CAST(n.item AS TEXT),'$.content')))").fetchone()[0]
+            "json_extract(CAST(n.item AS TEXT),'$.content'))").fetchone()[0]
         try:
             result['objects'] = [dict(name=name, bytes=size, payload_bytes=payload, unused_bytes=unused)
                                  for name, size, payload, unused in db.execute(

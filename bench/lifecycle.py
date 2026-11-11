@@ -140,7 +140,7 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
             for agent in range(config['concurrency']):
                 before = time.monotonic()
                 response = client.request('submit', bot=str(agent), request_id=str(turn), prompt=prompt(config,agent,turn))
-                pending.append((agent, response['result']['turn'], before))
+                pending.append((agent, response['result']['message'], before))
             for agent, native, before in pending:
                 event = client.finished(native)
                 assert event['data']['status'] == 'completed'

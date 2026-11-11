@@ -623,11 +623,11 @@ impl Updates {
         let Some(name) = event["bot"].as_str() else {
             return;
         };
-        let turn = event["turn"].as_i64();
+        let turn = super::number(event);
         let data = &event["data"];
         let key = |turn: i64| (name.to_owned(), turn);
         if let Some(turn) = turn {
-            self.printed(name, kind, turn, data, now);
+            self.printed(name, kind, turn, now);
         }
         self.resolving.event(event, &self.lead);
         match kind {
@@ -811,11 +811,25 @@ impl Updates {
                     bot.waiting_on.clear();
                 }
             }
-            "turn_finished" => {
+            // A message the running turn took in: what was kept for it
+            // goes, as its news is that turn's.
+            "steered" => {
+                if let Some(message) = data["message"].as_i64() {
+                    let message = key(message);
+                    self.started.remove(&message);
+                    self.from.remove(&message);
+                    self.origin.remove(&message);
+                    self.answer_to.remove(&message);
+                    self.noted.remove(&message);
+                    self.wrote.remove(&message);
+                }
+            }
+            // A turn ended, or a message ended in line, never taken in.
+            "turn_finished" | "message_ended" => {
                 let Some(turn) = turn else { return };
-                // A wait still open as its turn ends handed nothing. Another
-                // turn of the lead's ending (a steer it took, a queued one
-                // stopped) leaves the running turn's waits be.
+                // A wait still open as its turn ends handed nothing. A
+                // message of the lead's ending in line leaves the running
+                // turn's waits be.
                 if name == self.lead {
                     let ended: Vec<String> = (self.waits.iter())
                         .filter(|(_, read)| read.turn == turn)
@@ -856,7 +870,7 @@ impl Updates {
                     bot.running = None;
                     bot.waiting_on.clear();
                     bot.status = match status.as_str() {
-                        "completed" | "steered" => "idle".into(),
+                        "completed" => "idle".into(),
                         _ => status.clone(),
                     };
                 }
@@ -868,8 +882,7 @@ impl Updates {
                 if self.live && wrote {
                     self.answered(name, turn);
                 }
-                // A steer's turn is part of the turn it joined.
-                if !self.live || status == "steered" || noted || wrote {
+                if !self.live || noted || wrote {
                     return;
                 }
                 let creator = self.creator(name);
@@ -895,7 +908,7 @@ impl Updates {
     /// Keeps each task's running turn and when it last printed anything:
     /// a turn waiting on the person, on other turns or for a slot is not
     /// silent, and neither is one that ended.
-    fn printed(&mut self, task: &str, kind: &str, turn: i64, data: &Value, now: Instant) {
+    fn printed(&mut self, task: &str, kind: &str, turn: i64, now: Instant) {
         match kind {
             "accepted" | "turn_resumed" => {
                 self.quiet.insert(task.to_owned(), (turn, now, false));
@@ -903,7 +916,7 @@ impl Updates {
             "turn_waiting" | "turn_paced" => {
                 self.quiet.remove(task);
             }
-            "turn_finished" if data["status"] != "steered" => {
+            "turn_finished" => {
                 if (self.quiet.get(task)).is_some_and(|(running, ..)| *running == turn) {
                     self.quiet.remove(task);
                 }
@@ -1352,7 +1365,7 @@ impl Updates {
         if !self.task(name) {
             return;
         }
-        let handle = format!("turn:{name}/{turn}");
+        let handle = format!("{name}/{turn}");
         // The lead may be gone from the listing: its news then waits for no one.
         let waited =
             (self.bots.get(&self.lead)).is_some_and(|lead| lead.waiting_on.contains(&handle));
@@ -1488,7 +1501,7 @@ impl Updates {
     /// turns: what they said is no news to it any more, once the wait
     /// hands them over (`wait_ended`).
     pub fn read(&mut self, lead_turn: i64, call: &str, handles: &HashSet<String>) {
-        let reads = |name: &str, turn: i64| handles.contains(&format!("turn:{name}/{turn}"));
+        let reads = |name: &str, turn: i64| handles.contains(&format!("{name}/{turn}"));
         let mut read = self.waits.remove(call).unwrap_or_default();
         read.turn = lead_turn;
         for (name, news) in &mut self.tasks {
@@ -1965,7 +1978,7 @@ impl Updates {
             read.iter()
                 .any(|(read, _)| read.trim_end_matches('/') == dir)
         };
-        let own = format!("turn:{}/", self.lead);
+        let own = format!("{}/", self.lead);
         let seen = self.memory_seen.as_ref();
         let mut saved: Vec<&Fact> = now
             .values()
@@ -2015,7 +2028,7 @@ impl Updates {
 
 /// A task's latest turn of one kind, as the note names it.
 fn line(name: &str, theirs: bool, t: &Turn) -> Line {
-    let mut text = format!("- {name}: turn:{name}/{} {}", t.turn, t.status);
+    let mut text = format!("- {name}: {name}/{} {}", t.turn, t.status);
     if let Some(by) = &t.by {
         text.push_str(&format!(", asked by {by}"));
     }
@@ -2024,7 +2037,7 @@ fn line(name: &str, theirs: bool, t: &Turn) -> Line {
     }
     if t.count > 1 {
         text.push_str(&format!(
-            ", and {} earlier since turn:{name}/{}",
+            ", and {} earlier since {name}/{}",
             t.count - 1,
             t.first
         ));
@@ -2055,9 +2068,9 @@ fn note_line(name: &str, noted: &Noted) -> Line {
         ..
     } = noted;
     let text = match removed {
-        true => format!("- {name}: turn:{name}/{turn}, took its margin note \"{id}\" away"),
+        true => format!("- {name}: {name}/{turn}, took its margin note \"{id}\" away"),
         false => format!(
-            "- {name}: turn:{name}/{turn}, put the note \"{id}\" in its own margin; the margin \
+            "- {name}: {name}/{turn}, put the note \"{id}\" in its own margin; the margin \
              tool with from \"{name}/{id}\" shows it in yours"
         ),
     };
@@ -2085,7 +2098,7 @@ fn ask_line(name: &str, asked: &Asked) -> Line {
         Some(_) => "a step only they can take, which they run and answer",
         None => "a question to the person, which they answer",
     };
-    let mut text = format!("- {name}: turn:{name}/{turn}, put {what} in {name}:");
+    let mut text = format!("- {name}: {name}/{turn}, put {what} in {name}:");
     let numbered: Vec<String> = (options.iter().enumerate())
         .map(|(at, label)| match *recommended == Some(at) {
             true => format!("{} {label} (recommended)", at + 1),
@@ -2127,7 +2140,7 @@ fn said(name: &str, said: &[Said], quoted: &mut HashMap<String, String>) -> Vec<
         let Some(words) = &message.words else {
             continue;
         };
-        let handle = format!("turn:{name}/{}", message.turn);
+        let handle = format!("{name}/{}", message.turn);
         let line = match quoted.get(words) {
             Some(first) => line(
                 message.turn,
@@ -2149,12 +2162,9 @@ fn said(name: &str, said: &[Said], quoted: &mut HashMap<String, String>) -> Vec<
         from.sort();
         from.dedup();
         let text = match others.len() {
-            1 => format!(
-                "- {name}: turn:{name}/{}, {} wrote in it",
-                last.turn, last.from
-            ),
+            1 => format!("- {name}: {name}/{}, {} wrote in it", last.turn, last.from),
             n => format!(
-                "- {name}: turn:{name}/{}, {n} messages in it since turn:{name}/{}, from {}",
+                "- {name}: {name}/{}, {n} messages in it since {name}/{}, from {}",
                 last.turn,
                 others[0].turn,
                 from.join(", ")
@@ -2307,9 +2317,9 @@ mod tests {
         turn(&mut updates, "shop.fix", 7, lead, "completed");
         assert_eq!(
             text(&updates.take()),
-            "- shop.fix: turn:shop.fix/7 completed, asked by you, and marked itself done, \
-             and 1 earlier since turn:shop.fix/5\n\
-             - shop.docs: turn:shop.docs/6 failed, asked by you"
+            "- shop.fix: shop.fix/7 completed, asked by you, and marked itself done, \
+             and 1 earlier since shop.fix/5\n\
+             - shop.docs: shop.docs/6 failed, asked by you"
         );
     }
 
@@ -2326,7 +2336,7 @@ mod tests {
         let told = updates.take();
         assert_eq!(
             text(&told),
-            "- shop.fix: turn:shop.fix/4 completed, asked by ana"
+            "- shop.fix: shop.fix/4 completed, asked by ana"
         );
         assert!(told.items.iter().all(|line| !line.theirs));
     }
@@ -2373,9 +2383,9 @@ mod tests {
         turn(&mut updates, "shop.docs", 6, lead, "completed");
         assert_eq!(
             text(&updates.take()),
-            "- shop.fix: turn:shop.fix/5 completed, asked by you, and marked itself done, \
-             and 1 earlier since turn:shop.fix/5\n\
-             - shop.docs: turn:shop.docs/6 completed, asked by you"
+            "- shop.fix: shop.fix/5 completed, asked by you, and marked itself done, \
+             and 1 earlier since shop.fix/5\n\
+             - shop.docs: shop.docs/6 completed, asked by you"
         );
     }
 
@@ -2393,7 +2403,7 @@ mod tests {
             now,
         );
         let told = updates.take();
-        assert_eq!(text(&told), "- shop.fix: turn:shop.fix/4 failed");
+        assert_eq!(text(&told), "- shop.fix: shop.fix/4 failed");
         assert!(!told.items[0].theirs);
     }
 
@@ -2416,7 +2426,7 @@ mod tests {
         updates.replied("shop.fix", 4, "done");
         let told = updates.take();
         assert!(
-            text(&told).starts_with("- shop.fix: turn:shop.fix/4 completed, asked by the person"),
+            text(&told).starts_with("- shop.fix: shop.fix/4 completed, asked by the person"),
             "{}",
             text(&told)
         );
@@ -2431,10 +2441,7 @@ mod tests {
         updates.reading_reply("shop.fix", 6);
         updates.reply_unread("shop.fix", 6);
         assert!(!updates.asker_unknown("shop.fix", 6));
-        assert_eq!(
-            text(&updates.take()),
-            "- shop.fix: turn:shop.fix/6 completed"
-        );
+        assert_eq!(text(&updates.take()), "- shop.fix: shop.fix/6 completed");
     }
 
     #[test]
@@ -2457,7 +2464,7 @@ mod tests {
         // One that went wrong is told, words or none.
         assert_eq!(
             text(&updates.take()),
-            "- shop.docs: turn:shop.docs/2 failed, asked by automation"
+            "- shop.docs: shop.docs/2 failed, asked by automation"
         );
         // One with words is told with them.
         turn(&mut updates, "shop.fix", 5, trigger(), "completed");
@@ -2485,9 +2492,9 @@ mod tests {
         updates.replied("shop.fix", 8, "");
         updates.replied("shop.fix", 7, "posted 2 items");
         let told = text(&updates.take());
-        assert!(told.contains("turn:shop.fix/7 completed"), "{told}");
+        assert!(told.contains("shop.fix/7 completed"), "{told}");
         assert!(told.contains("posted 2 items"), "{told}");
-        assert!(told.contains("1 earlier since turn:shop.fix/6"), "{told}");
+        assert!(told.contains("1 earlier since shop.fix/6"), "{told}");
         // A run whose reply could not be read, or whose read was cut off,
         // is told without it.
         turn(&mut updates, "shop.fix", 9, trigger(), "completed");
@@ -2495,8 +2502,8 @@ mod tests {
         turn(&mut updates, "shop.docs", 3, trigger(), "completed");
         updates.replies_dropped();
         let told = text(&updates.take());
-        assert!(told.contains("turn:shop.fix/9 completed"), "{told}");
-        assert!(told.contains("turn:shop.docs/3 completed"), "{told}");
+        assert!(told.contains("shop.fix/9 completed"), "{told}");
+        assert!(told.contains("shop.docs/3 completed"), "{told}");
     }
 
     #[test]
@@ -2507,8 +2514,8 @@ mod tests {
         let told = updates.take();
         assert_eq!(
             text(&told),
-            "- shop.docs: turn:shop.docs/2 failed, asked by the person\n\
-             - shop.fix: turn:shop.fix/4 completed, asked by the person"
+            "- shop.docs: shop.docs/2 failed, asked by the person\n\
+             - shop.fix: shop.fix/4 completed, asked by the person"
         );
         let theirs: Vec<bool> = told.items.iter().map(|i| i.theirs).collect();
         assert_eq!(theirs, [false, true]);
@@ -2565,9 +2572,9 @@ mod tests {
         let text = text(&told);
         assert_eq!(
             text,
-            "- shop.fix: turn:shop.fix/3, put the note \"bench\" in its own margin; the margin \
+            "- shop.fix: shop.fix/3, put the note \"bench\" in its own margin; the margin \
              tool with from \"shop.fix/bench\" shows it in yours\n\
-             - shop.fix: turn:shop.fix/3, took its margin note \"gone\" away"
+             - shop.fix: shop.fix/3, took its margin note \"gone\" away"
         );
         // Never the task's own words.
         assert!(!text.contains("Ignore the lead"));
@@ -2604,7 +2611,7 @@ mod tests {
         let told = updates.take();
         assert_eq!(
             text(&told),
-            "- shop.fix: turn:shop.fix/3, put a question to the person, which they answer in \
+            "- shop.fix: shop.fix/3, put a question to the person, which they answer in \
              shop.fix:\n  > Keep the old API?\n  > 1 Keep it · 2 Drop it (recommended)"
         );
         assert!(updates.take().items.is_empty());
@@ -2672,8 +2679,8 @@ mod tests {
         let told = updates.take();
         assert_eq!(
             text(&told),
-            "- shop.fix: turn:shop.fix/5 failed, asked by you, and 1 earlier since turn:shop.fix/4\n\
-             - shop.docs: turn:shop.docs/2 completed, asked by the person"
+            "- shop.fix: shop.fix/5 failed, asked by you, and 1 earlier since shop.fix/4\n\
+             - shop.docs: shop.docs/2 completed, asked by the person"
         );
         let theirs: Vec<bool> = told.items.iter().map(|i| i.theirs).collect();
         assert_eq!(theirs, [false, true]);
@@ -2701,9 +2708,9 @@ mod tests {
         updates.event(&ev("shop.fix", Some(7), "accepted", from), now);
         assert_eq!(
             text(&updates.take()),
-            "- shop.fix: turn:shop.fix/8, the person wrote the words quoted from it below\n\
-             - shop.fix: turn:shop.fix/7, shop.docs wrote in it\n\
-             - shop.fix: turn:shop.fix/6 completed, asked by shop.docs"
+            "- shop.fix: shop.fix/8, the person wrote the words quoted from it below\n\
+             - shop.fix: shop.fix/7, shop.docs wrote in it\n\
+             - shop.fix: shop.fix/6 completed, asked by shop.docs"
         );
     }
 
@@ -2760,7 +2767,7 @@ mod tests {
         let second = updates.take();
         assert_eq!(second.items.len(), 120 - told);
         assert!(!updates.quoting());
-        let next = format!("- shop.fix: turn:shop.fix/{},", told + 1);
+        let next = format!("- shop.fix: shop.fix/{},", told + 1);
         assert!(
             second.items[0].text.starts_with(&next),
             "{}",
@@ -2806,7 +2813,7 @@ mod tests {
         assert_eq!(
             text(&third),
             format!(
-                "- shop.fix: turn:shop.fix/100, {} messages in it since turn:shop.fix/{}, from the person",
+                "- shop.fix: shop.fix/100, {} messages in it since shop.fix/{}, from the person",
                 100 - NOTE_QUOTES,
                 NOTE_QUOTES + 1
             )
@@ -2826,7 +2833,7 @@ mod tests {
         let told = updates.take();
         assert_eq!(
             told.items[0].text,
-            "- shop.fix: turn:shop.fix/2, the person wrote the words quoted from it below"
+            "- shop.fix: shop.fix/2, the person wrote the words quoted from it below"
         );
         // A hundred tasks ending together go in one note: only its bytes
         // and quotes bound it, so none waits for a note after it.
@@ -2849,7 +2856,7 @@ mod tests {
         turn(&mut updates, "shop.fix", 2, lead, "completed");
         let told = updates.take();
         let text = text(&told);
-        assert!(text.contains("turn:shop.fix/2"), "{text}");
+        assert!(text.contains("shop.fix/2"), "{text}");
         assert!(!text.contains("shop.t0"), "{text}");
         assert_eq!(told.more, 40);
     }
@@ -2888,7 +2895,7 @@ mod tests {
         assert!(
             second.items[0]
                 .text
-                .starts_with("- shop.ui: turn:shop.ui/3 completed")
+                .starts_with("- shop.ui: shop.ui/3 completed")
         );
     }
 
@@ -2955,7 +2962,7 @@ mod tests {
                 "shop.lead",
                 Some(9),
                 "turn_waiting",
-                json!({"handles": ["turn:shop.fix/4"]}),
+                json!({"handles": ["shop.fix/4"]}),
             ),
             now,
         );
@@ -2992,7 +2999,7 @@ mod tests {
         let told = updates.take();
         assert_eq!(
             text(&told),
-            "- shop.docs: turn:shop.docs/2 waiting for the person's approval"
+            "- shop.docs: shop.docs/2 waiting for the person's approval"
         );
         // Refused: the news comes back for next time.
         updates.unsent(told);
@@ -3034,7 +3041,7 @@ mod tests {
                 "shop.lead",
                 Some(9),
                 "turn_waiting",
-                json!({"handles": ["turn:shop.fix/4"]}),
+                json!({"handles": ["shop.fix/4"]}),
             ),
             now,
         );
@@ -3062,7 +3069,7 @@ mod tests {
         assert_eq!(updates.forwarding.len(), 1, "passed on, with its reply");
         updates.expire(Instant::now() + FORWARD);
         let told = text(&updates.take());
-        assert!(told.contains("turn:shop.docs/6 completed"), "{told}");
+        assert!(told.contains("shop.docs/6 completed"), "{told}");
         assert!(told.contains("> not passed on"), "{told}");
         assert!(
             !told.contains("passed on\n") && !told.contains("> passed on"),
@@ -3093,13 +3100,13 @@ mod tests {
         let later = now + QUIET_AFTER;
         assert_eq!(
             silent(&mut updates, later),
-            "- shop.fix: turn:shop.fix/3 has printed nothing for 30 minutes"
+            "- shop.fix: shop.fix/3 has printed nothing for 30 minutes"
         );
         assert_eq!(silent(&mut updates, later + DOUBT), "");
         // A wait that returned before the turn ended read no silence.
         updates.event(&ev("shop.fix", Some(3), "text_delta", json!({})), later);
         updates.expire(later + QUIET_AFTER);
-        updates.read(9, "w", &["turn:shop.fix/3".to_owned()].into());
+        updates.read(9, "w", &["shop.fix/3".to_owned()].into());
         let told = updates.take();
         assert_eq!(told.items.len(), 1);
         // Printing again starts a new silence, which is news of its own.
@@ -3128,8 +3135,7 @@ mod tests {
         // tracked from what it does next.
         updates.event(&ev("shop.fix", Some(8), "tool_started", json!({})), at);
         assert!(
-            silent(&mut updates, at + 4 * QUIET_AFTER)
-                .contains("turn:shop.fix/8 has printed nothing")
+            silent(&mut updates, at + 4 * QUIET_AFTER).contains("shop.fix/8 has printed nothing")
         );
     }
 
@@ -3151,7 +3157,7 @@ mod tests {
         // said nothing is no news.
         updates.event(&done(4), now);
         assert!(updates.asker_unknown("shop.fix", 4));
-        updates.read(9, "w1", &reads("turn:shop.fix/4"));
+        updates.read(9, "w1", &reads("shop.fix/4"));
         assert!(!updates.news());
         updates.asked_by("shop.fix", 4, None, Some("automation".into()));
         updates.replied("shop.fix", 4, "");
@@ -3159,7 +3165,7 @@ mod tests {
         assert!(!updates.news());
         // One the person asked for is theirs.
         updates.event(&done(5), now);
-        updates.read(9, "w2", &reads("turn:shop.fix/5"));
+        updates.read(9, "w2", &reads("shop.fix/5"));
         updates.asked_by("shop.fix", 5, None, None);
         updates.replied("shop.fix", 5, "done");
         updates.wait_ended("w2", false);
@@ -3177,7 +3183,7 @@ mod tests {
         let fire = json!({"request_id": "trigger_t6.to.1"});
         turn(&mut updates, "shop.docs", 6, fire, "completed");
         assert_eq!(updates.forwarding.len(), 1);
-        updates.read(9, "w3", &reads("turn:shop.docs/6"));
+        updates.read(9, "w3", &reads("shop.docs/6"));
         let passed = json!({"from": {"bot": "shop.docs", "turn": 6}});
         updates.event(&ev("shop.lead", Some(10), "accepted", passed), now);
         updates.wait_ended("w3", false);
@@ -3219,9 +3225,9 @@ mod tests {
             "completed",
         );
         // Reading an earlier turn leaves the latest news.
-        updates.read(9, "w", &["turn:shop.fix/4".to_owned()].into());
+        updates.read(9, "w", &["shop.fix/4".to_owned()].into());
         assert!(updates.due());
-        updates.read(9, "w", &["turn:shop.fix/5".to_owned()].into());
+        updates.read(9, "w", &["shop.fix/5".to_owned()].into());
         assert!(!updates.due());
     }
 
@@ -3256,8 +3262,8 @@ mod tests {
             prompt
         };
         assert!(news(&mut updates).contains(&format!("- saved: {}/old.md", root.display())));
-        fact(&project, "flow", "turn:shop.fix/4");
-        fact(&project, "mine", "turn:shop.lead/9");
+        fact(&project, "flow", "shop.fix/4");
+        fact(&project, "mine", "shop.lead/9");
         std::fs::remove_file(root.join("old.md")).unwrap();
         let told = news(&mut updates);
         let memory = told.split_once("\n\n").unwrap().1;

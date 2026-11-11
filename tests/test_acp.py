@@ -4,6 +4,7 @@ in the thread, and a task the lead starts opens as a thread of its own,
 through T3 Code's tools, which that thread then follows."""
 import http.server
 import json
+import re
 import os
 import queue
 import subprocess
@@ -286,8 +287,13 @@ class AcpTests(ModelFixture):
         self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
         # Idle before the answer, which waited for the task's thread.
         self.assertIn('idle', [u.get('state') for u in updates if u['sessionUpdate'] == 'state_update'])
+        # One turn ran; the second prompt was taken into it.
         turns = self.daemon.request('turns', bot='calc.lead')['result']['turns']
-        self.assertEqual(sorted(t['status'] for t in turns), ['completed', 'steered'])
+        self.assertEqual([t['status'] for t in turns], ['completed'])
+        sent = self.daemon.request('messages', bot='calc.lead')['result']['messages']
+        # The opener reads as its turn; the steer as taken into it.
+        self.assertEqual([(m['status'], m['turn']) for m in sent],
+                         [('completed', turns[0]['turn']), ('taken', turns[0]['turn'])])
         # T3 Code would not take the task as a child: it opens as a thread of
         # its own, in its worktree.
         self.assertEqual(self.t3.calls.get(timeout=30)['name'], 'delegate_task')
@@ -356,7 +362,7 @@ class AcpTests(ModelFixture):
         self.assertEqual(picked['result']['configOptions'][0]['currentValue'], 'openai/other-model')
         answered, updates = thread.answer_of(thread.ask('session/prompt', {'sessionId': session,
                                                                             'prompt': self.wrapped('hello')}))
-        self.assertEqual(answered['result'], {'stopReason': 'end_turn'})
+        self.assertEqual(answered.get('result'), {'stopReason': 'end_turn'}, answered)
         lead = self.daemon.request('inspect', bot='calc.lead')['result']
         self.assertEqual((lead['provider'], lead['model']), ('openai', 'other-model'))
         # A lead's thread offers its family's models only.
@@ -569,7 +575,7 @@ class AcpTests(ModelFixture):
         content = self.model.requests.get(timeout=5)['input'][-1]['content']
         self.assertRegex(content[0]['text'], SENT)
         self.assertTrue(content[0]['text'].startswith('script\n\n'))
-        self.assertEqual(content[1]['text'], '[Written by ana.]')
+        self.assertRegex(content[1]['text'], r'^\[Message calc\.lead/\d+, written by ana\.\]$')
         thread.send({'id': asked['id'], 'result': {'outcome': {'outcome': 'selected', 'optionId': 'deny'},
                                                    '_meta': {'person': 'bo'}}})
         answered, _ = thread.answer_of(prompt)
@@ -637,7 +643,7 @@ class AcpTests(ModelFixture):
         self.assertIn('> done\n\n🎉', said)
         self.assertEqual(said.count('> done\n\n🎉'), 1)
         self.assertIn('👍', said)
-        self.assertEqual(said[said.index('👍') + 1], '[Written by ana.]')
+        self.assertRegex(said[said.index('👍') + 1], r'^\[Message calc\.lead/\d+, written by ana\.\]$')
         # Taken off: off in the window too, and the lead is not told.
         self.assertIn('result', react({'messageId': older, 'emoji': '🎉', 'remove': True}))
         self.assertEqual(json.loads(file.read_text()), {})
@@ -705,7 +711,7 @@ class AcpTests(ModelFixture):
                                                       '_meta': {'person': 'ana'}}})
         sent = []
         deadline = time.monotonic() + 30
-        while not ('Postgres' in ''.join(sent) and 'Written by ana' in ''.join(sent)):
+        while not ('Postgres' in ''.join(sent) and 'written by ana' in ''.join(sent)):
             self.assertLess(time.monotonic(), deadline, sent)
             try:
                 sent.append(json.dumps(self.model.requests.get(timeout=1)['input']))
@@ -718,12 +724,13 @@ class AcpTests(ModelFixture):
         self.assertRegex(database_answer, r'^You asked \(ask:\d+/script-0\): Which database\?\n\nPostgres\n\n\[Sent ')
         cache_answer = next(t for t in texts if t.startswith('You asked (') and 'Which cache?' in t)
         self.assertRegex(cache_answer, r'^You asked \(ask:\d+/script-0\.1\): Which cache\?\n\nNone\n\n\[Sent ')
-        self.assertIn('[Written by ana.]', texts)
+        self.assertTrue(any(re.fullmatch(r'\[Message calc\.lead\.script/\d+, written by ana\.\]', t)
+                            for t in texts), texts)
         # Once the person's answers are in, a question asked live comes as a
         # form on the call that put it; declined, it waits on.
         deadline = time.monotonic() + 30
-        while any(t['status'] in ('running', 'queued') for t in
-                  self.daemon.request('turns', bot='calc.lead')['result']['turns']):
+        while any(m['status'] in ('running', 'queued', 'ready') for m in
+                  self.daemon.request('messages', bot='calc.lead')['result']['messages']):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.05)
         self.model.call_script.append(asked('Which queue?', 'None', 'SQS'))
@@ -773,7 +780,7 @@ class AcpTests(ModelFixture):
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(.05)
             submitted = self.daemon.request('submit', bot=bot, prompt=prompt, request_id=f'{bot}-{time.monotonic()}')
-            turn = submitted['result']['turn']
+            turn = submitted['result']['message']
             deadline = time.monotonic() + 30
             while self.daemon.request('inspect', bot=bot)['result']['running_turn'] == turn:
                 self.assertLess(time.monotonic(), deadline)

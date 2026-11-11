@@ -1426,7 +1426,7 @@ impl Session {
                 }
                 // Stopped while it was being sent.
                 if std::mem::take(&mut state.cancelled)
-                    && let (Some(bound), Some(turn)) = (&state.bound, reply["turn"].as_i64())
+                    && let (Some(bound), Some(turn)) = (&state.bound, reply["message"].as_i64())
                 {
                     let _ = (bound.client)
                         .request("interrupt", json!({"bot": bound.bot, "turn": turn}))
@@ -1436,7 +1436,7 @@ impl Session {
                 if let Some((prompt, turn)) = &mut state.prompt
                     && prompt == id
                 {
-                    *turn = match (reply["turn"].as_i64(), steered) {
+                    *turn = match (reply["message"].as_i64(), steered) {
                         (Some(sent), Some((steer, into))) if sent == steer => Some(into),
                         (sent, _) => sent,
                     };
@@ -1862,21 +1862,20 @@ impl Session {
                 drop(state);
                 self.approvals(agent, &client, &bot, turn).await;
             }
-            "turn_finished" => {
-                // A steer the running turn took in: the prompt waits on that
-                // turn now.
-                if data["status"] == "steered" {
-                    let into = data["into"].as_i64();
-                    if let (Some(steer), Some(into)) = (turn, into) {
-                        state.steered = Some((steer, into));
-                    }
-                    if let Some((_, at)) = &mut state.prompt
-                        && *at == turn
-                    {
-                        *at = into;
-                    }
-                    return;
+            "steered" => {
+                // A message the running turn took in: the prompt that sent
+                // it waits on that turn now.
+                let steer = data["message"].as_i64();
+                if let (Some(steer), Some(into)) = (steer, turn) {
+                    state.steered = Some((steer, into));
                 }
+                if let Some((_, at)) = &mut state.prompt
+                    && *at == steer
+                {
+                    *at = turn;
+                }
+            }
+            "turn_finished" => {
                 if state.running.is_some() && state.running != turn {
                     return;
                 }

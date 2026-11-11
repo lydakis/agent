@@ -27,7 +27,7 @@ class AnthropicCompactionTests(ModelFixture):
                                                compaction_instructions='Summarize.', effort='low'))
         for n in range(7):
             prompt = ('tool:' if n == 0 else f'{n}:') + 'x' * 500
-            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=prompt)['result']['turn']
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=prompt)['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = []
         while not self.model.requests.empty():
@@ -67,7 +67,7 @@ class AnthropicCompactionTests(ModelFixture):
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                compaction_instructions='Summarize.', effort='low'))
         for n in range(7):
-            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'{n}:' + 'x' * 500)['result']['turn']
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'{n}:' + 'x' * 500)['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
         requests = []
@@ -91,14 +91,14 @@ class AnthropicCompactionTests(ModelFixture):
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                compaction_instructions='Summarize.', effort='low'))
         for n in range(7):
-            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'{n}:' + 'x' * 500)['result']['turn']
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'{n}:' + 'x' * 500)['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
         self.assertEqual(client.request('configure', bot='Bob', settings={'cache_ttl': '1h'})['result']['changed'], ['cache_ttl'])
         self.model.cache_control = {'type': 'ephemeral', 'ttl': '1h'}
         while not self.model.requests.empty():
             self.model.requests.get()
-        turn = client.request('submit', bot='Bob', request_id='moved', prompt='after the move')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='moved', prompt='after the move')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         call = self.model.requests.get(timeout=1)
         summary = call['messages'][0]['content'][0]
@@ -118,7 +118,7 @@ class AnthropicCompactionTests(ModelFixture):
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['echo', 'shell'], compaction_instructions='Summarize.',
                                                effort='low'))
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:6')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:6')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = []
         while not self.model.requests.empty():
@@ -157,7 +157,7 @@ class AnthropicCompactionTests(ModelFixture):
                                                tools=['echo', 'shell'], compaction_instructions='Summarize.',
                                                effort='low'))
         self.model.compaction_refusals = 1
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:12x40')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:12x40')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
         client.close(kill=True)
         client = start()
@@ -215,7 +215,7 @@ class CompactionTests(ModelFixture):
                 self.addCleanup(client.close)
                 self.create(client)
                 for n in range(7):
-                    self.assertEqual(self.run_turn(client, 'Bob', n, 'x' * 500)['data']['status'], 'completed')
+                    self.assertEqual(self.run_turn(client, 'Bob', n, 'x' * 450)['data']['status'], 'completed')
                 requests = self.requests()
                 self.assertEqual(any(is_summary(r) for r in requests), cap is not None)
                 self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':')).encode()) - 2 <= 8192
@@ -372,7 +372,7 @@ class CompactionTests(ModelFixture):
             self.run_turn(client, 'Bob', n, str(n) * 300)
         self.requests()
         self.model.compaction_refusals = 1
-        turn = client.request('submit', bot='Bob', request_id='next', prompt='2' * 500)['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='next', prompt='2' * 500)['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
         client.close(kill=True)
         # The bot keeps its settings across the restart.
@@ -395,7 +395,7 @@ class CompactionTests(ModelFixture):
                     self.run_turn(client, 'Bob', n, str(n) * 300)
                 self.requests()
                 self.model.compaction_refusals = 64
-                turn = client.request('submit', bot='Bob', request_id='next', prompt='2' * 500)['result']['turn']
+                turn = client.request('submit', bot='Bob', request_id='next', prompt='2' * 500)['result']['message']
                 client.receive(lambda m: m.get('event') == 'compaction_failed', timeout=15)
                 client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
                 if restart:
@@ -415,7 +415,7 @@ class CompactionTests(ModelFixture):
     def run_turn(self, client, bot, request, prompt):
         response = client.request('submit', bot=bot, request_id=str(request), prompt=prompt)
         self.assertIn('result', response)
-        return client.finished(response['result']['turn'])
+        return client.finished(response['result']['message'])
 
     def requests(self):
         out = []
@@ -688,7 +688,7 @@ class AnthropicThinkingBindingTests(ModelFixture):
         return out
 
     def turn(self, client, bot, request, prompt):
-        turn = client.request('submit', bot=bot, request_id=str(request), prompt=prompt)['result']['turn']
+        turn = client.request('submit', bot=bot, request_id=str(request), prompt=prompt)['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
     @staticmethod
@@ -768,7 +768,7 @@ class AnthropicThinkingBindingTests(ModelFixture):
         self.turn(client, 'Bob', 1, 'second')
         self.requests()
         other = client.request('submit', bot='Bob', request_id='2', prompt='other',
-                               model='anthropic/synthetic-claude-2')['result']['turn']
+                               model='anthropic/synthetic-claude-2')['result']['message']
         self.assertEqual(client.finished(other)['data']['status'], 'completed')
         # Back on the bot's model, which did not write the answer before.
         self.turn(client, 'Bob', 3, 'back')
@@ -828,7 +828,7 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         return out
 
     def turn(self, client, request, prompt):
-        turn = client.request('submit', bot='Bob', request_id=str(request), prompt=prompt)['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id=str(request), prompt=prompt)['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
     @staticmethod
@@ -872,7 +872,7 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         self.requests()
         self.model.unreadable_any, self.model.unreadable_error = True, (
             400, 'thinking.budget_tokens: must be less than max_tokens')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='second')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='second')['result']['message']
         finished = client.finished(turn)['data']
         self.assertEqual((finished['status'], finished['error']), ('failed', 'provider_http_400'))
         self.assertEqual([self.signatures(r) for r in self.requests()], [['sig-1'], []])
@@ -915,7 +915,7 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         self.requests()
         self.model.unreadable, self.model.unreadable_error = {'sig-1'}, (
             403, 'The request signature we calculated does not match the signature you provided.')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='second')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='second')['result']['message']
         # A refused signature is the person's to fix (the keys, the clock):
         # the turn is held on it, not ended.
         held = client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn
@@ -933,7 +933,7 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         self.turn(client, 0, 'first')
         self.requests()
         self.model.unreadable, self.model.unreadable_error = {'sig-1'}, ('stream', 'Internal server error')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='second')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='second')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
         client.request('interrupt', bot='Bob', turn=turn)
         self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
@@ -952,7 +952,7 @@ class AnthropicUnreadableThinkingTests(ModelFixture):
         self.model.unreadable, self.model.unreadable_error = {'sig-1'}, (400, 'Invalid request.')
         # Seven rate limits leave the 400 the call's eighth and last attempt.
         self.model.rate_limits = 7
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='second')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='second')['result']['message']
         finished = client.finished(turn)['data']
         self.assertEqual((finished['status'], finished['error']), ('failed', 'provider_http_400'))
         self.assertEqual([self.signatures(r) for r in self.requests()], [['sig-1']] * 8)
@@ -979,7 +979,7 @@ class SummaryCopyTests(ModelFixture):
         return client
 
     def turn(self, client, request, prompt):
-        turn = client.request('submit', bot='Bob', request_id=request, prompt=prompt)['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id=request, prompt=prompt)['result']['message']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
 
@@ -1093,7 +1093,7 @@ class SummaryCopyTests(ModelFixture):
         # step, still copies the call that sent the first two.
         client = self.start(tools='shell', budget=16384)
         turn = client.request('submit', bot='Bob', request_id='1',
-                              prompt='long:2x100,1x700,1x10')['result']['turn']
+                              prompt='long:2x100,1x700,1x10')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = self.requests()
         index, = self.copies(requests)
@@ -1109,7 +1109,7 @@ class SummaryCopyTests(ModelFixture):
         client = self.start(tools='shell', budget=16384)
         self.model.compaction_refusals = 1
         turn = client.request('submit', bot='Bob', request_id='1',
-                              prompt='long:2x100,1x700,1x10')['result']['turn']
+                              prompt='long:2x100,1x700,1x10')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
         client.close(kill=True)
         client = Client(self.binary, self.path / 'state.sqlite', self.url, 'shell',
@@ -1156,7 +1156,7 @@ class SummaryCopyTests(ModelFixture):
         client = self.start()
         for n in range(3):
             turn = client.request('submit', bot='Bob', request_id=str(n), prompt=str(n) * 500,
-                                  model='openai/synthetic-large')['result']['turn']
+                                  model='openai/synthetic-large')['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         # The last turn summarizes as it ends, on the bot's summarizer.
         client.summarized('Bob')
@@ -1184,7 +1184,7 @@ class SummaryCopyTests(ModelFixture):
         for n, size in enumerate((300, 300, 700)):
             model = {'model': 'openai/synthetic-large'} if n < 2 else {}
             turn = client.request('submit', bot='Bob', request_id=str(n), prompt=str(n) * size,
-                                  **model)['result']['turn']
+                                  **model)['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = self.requests()
         index, = [n for n, r in enumerate(requests) if is_summary(r)]
@@ -1201,7 +1201,7 @@ class SummaryCopyTests(ModelFixture):
         self.model.refused_prompts = {'1' * 600}
         client = self.start()
         for n in range(3):
-            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=str(n) * 600)['result']['turn']
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=str(n) * 600)['result']['message']
             ended = client.finished(turn)['data']
             self.assertEqual(ended['status'], 'failed' if n == 1 else 'completed', ended)
         requests = self.requests()
@@ -1222,13 +1222,13 @@ class SummaryCopyTests(ModelFixture):
         gate = threading.Event()
         self.model.request_gates = queue.Queue()
         self.model.request_gates.put(gate)
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='1' * 1200)['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='1' * 1200)['result']['message']
         self.assertTrue(is_summary(self.model.requests.get(timeout=5)))
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:go',
-                               delivery='steer', expected_turn=turn)['result']['turn']
+                               delivery='steer', expected_turn=turn)['result']['message']
         gate.set()
         self.assertEqual(client.finished(turn)['data']['status'], 'failed')
-        self.assertEqual(client.finished(steer)['data'].get('into'), turn)
+        self.assertEqual(client.finished(steer)['data'].get('turn'), turn)
         self.turn(client, '2', '2' * 1200)
         requests = self.requests()
         index, = [n for n, r in enumerate(requests) if is_summary(r)]

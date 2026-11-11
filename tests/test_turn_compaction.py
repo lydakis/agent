@@ -38,7 +38,7 @@ class TurnCompactionTests(ModelFixture):
         client = self.client(tools='shell,read', settings={'context_bytes': 24576})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
                        compaction_instructions='Summarize.')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['message']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         answer = node_item(client, 'Bob', ended['data']['checkpoint'])['result']
@@ -77,15 +77,15 @@ class TurnCompactionTests(ModelFixture):
         client = self.client(tools='shell,read', settings={'context_bytes': 24576})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
                        compaction_instructions='Summarize.')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn
                        and m.get('data', {}).get('call_id') == 'long-3')
         correction = 'steer: round half to even instead'
         steer = client.request('submit', bot='Bob', request_id='s', prompt=correction,
-                               delivery='steer', expected_turn=turn)['result']['turn']
+                               delivery='steer', expected_turn=turn)['result']['message']
         ended = client.finished(turn, timeout=30)
         self.assertEqual(ended['data']['status'], 'completed', ended)
-        self.assertEqual(client.finished(steer)['data']['status'], 'steered')
+        self.assertEqual(client.finished(steer)['data']['status'], 'taken')
         events = all_events(client, 'Bob')
         compacted = [e['data'] for e in events if e['event'] == 'compacted']
         self.assertGreaterEqual(len(compacted), 2)
@@ -114,7 +114,7 @@ class TurnCompactionTests(ModelFixture):
         client = self.client(tools='shell', settings={'context_bytes': 65536})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:150x40')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:150x40')['result']['message']
         ended = client.finished(turn, timeout=60)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         answer = node_item(client, 'Bob', ended['data']['checkpoint'])['result']
@@ -156,7 +156,7 @@ class TurnCompactionTests(ModelFixture):
             client.request('create', bot=bot, workspace=str(self.path), tools=['shell'],
                            compaction_instructions='Summarize.', budget_tokens=10 ** 9,
                            settings={'context_bytes': 65536, **bounded})
-            turn = client.request('submit', bot=bot, request_id='1', prompt='long:150x40')['result']['turn']
+            turn = client.request('submit', bot=bot, request_id='1', prompt='long:150x40')['result']['message']
             ended = client.finished(turn, timeout=60)
             self.assertEqual(ended['data']['status'], 'completed', ended)
             beside = {e['data']['request']['beside'] for e in all_events(client, bot) if e['event'] == 'compacted'}
@@ -172,7 +172,7 @@ class TurnCompactionTests(ModelFixture):
         client = self.client(tools='shell', settings={'context_bytes': 65536})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:150x40')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:150x40')['result']['message']
         deadline = time.monotonic() + 30
         while not any(summary for summary, *_ in self.model.timeline):
             self.assertLess(time.monotonic(), deadline)
@@ -196,7 +196,7 @@ class TurnCompactionTests(ModelFixture):
         client = self.client(tools='shell', settings={'context_bytes': 65536, 'max_rounds': 200})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:250x1')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:250x1')['result']['message']
         ended = client.finished(turn, timeout=90)
         # The last round may call no tool, so the turn ends on its reply.
         self.assertEqual(ended['data']['status'], 'completed', ended)
@@ -214,7 +214,7 @@ class TurnCompactionTests(ModelFixture):
         self.model.fail_billed_at = 199
         client = self.client(tools='shell', settings={'max_rounds': 200})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:250x1')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:250x1')['result']['message']
         ended = client.finished(turn, timeout=90)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         requests = drain(self.model)
@@ -233,7 +233,7 @@ class TurnCompactionTests(ModelFixture):
                                compaction_instructions='Summarize.')
                 record = client.request('inspect', bot=bot)['result']
                 self.assertEqual(record['settings']['compact_tokens'], threshold)
-                turn = client.request('submit', bot=bot, request_id='1', prompt='long:40')['result']['turn']
+                turn = client.request('submit', bot=bot, request_id='1', prompt='long:40')['result']['message']
                 ended = client.finished(turn, timeout=60)
                 self.assertEqual(ended['data']['status'], 'completed', ended)
                 requests = drain(self.model)
@@ -260,7 +260,7 @@ class TurnCompactionTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
         self.assertIsNone(client.request('inspect', bot='Bob')['result']['settings']['compact_tokens'])
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['message']
         self.assertEqual(client.finished(turn, timeout=60)['data']['status'], 'completed')
         self.assertTrue([e for e in all_events(client, 'Bob') if e['event'] == 'compacted'])
         work = [r for r in drain(self.model) if not is_summary(r)]
@@ -277,7 +277,7 @@ class TurnCompactionTests(ModelFixture):
         client.request('provider_models')
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['message']
         self.assertEqual(client.finished(turn, timeout=60)['data']['status'], 'completed')
         events = all_events(client, 'Bob')
         self.assertTrue([e for e in events if e['event'] == 'compacted'])
@@ -294,7 +294,7 @@ class TurnCompactionTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
         for n in range(3):
-            turn = client.request('submit', bot='Bob', request_id=str(n), prompt='long:2')['result']['turn']
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt='long:2')['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         drain(self.model)
         # Idle: it waits for the next turn, once, however often it is asked.
@@ -302,7 +302,7 @@ class TurnCompactionTests(ModelFixture):
         self.assertEqual((asked['running_turn'], asked['duplicate']), (None, False))
         self.assertTrue(client.request('compact', bot='Bob')['result']['duplicate'])
         self.assertTrue(client.request('inspect', bot='Bob')['result']['compaction_requested'])
-        turn = client.request('submit', bot='Bob', request_id='next', prompt='long:1')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='next', prompt='long:1')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = drain(self.model)
         self.assertTrue(is_summary(requests[0]))
@@ -313,7 +313,7 @@ class TurnCompactionTests(ModelFixture):
         # Running: the next round boundary takes it, once however often it
         # is asked while its summary runs.
         self.model.summary_delay = 1.0
-        turn = client.request('submit', bot='Bob', request_id='long', prompt='long:30x40')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='long', prompt='long:30x40')['result']['message']
         client.receive(lambda e: e.get('event') == 'tool_completed' and e.get('turn') == turn)
         asked = client.request('compact', bot='Bob')['result']
         self.assertEqual(asked['running_turn'], turn)
@@ -331,12 +331,12 @@ class TurnCompactionTests(ModelFixture):
         client = self.client(tools='shell')
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
-        turn = client.request('submit', bot='Bob', request_id='0', prompt='long:2')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='0', prompt='long:2')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         drain(self.model)
         self.model.compaction_refusals, self.model.compaction_retry_after = 1, '1'
         client.request('compact', bot='Bob')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:1')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:1')['result']['message']
         ended = client.finished(turn, timeout=30)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         kinds = [e['event'] for e in all_events(client, 'Bob') if e['turn'] == turn]
@@ -357,7 +357,7 @@ class TurnCompactionTests(ModelFixture):
         client = self.client(tools='shell,wait', settings={'context_bytes': 65536})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'wait'],
                        compaction_instructions='Summarize.')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:160x1')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:160x1')['result']['message']
         ended = client.finished(turn, timeout=60)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         events = all_events(client, 'Bob')
@@ -380,7 +380,7 @@ class TurnCompactionTests(ModelFixture):
         client = self.client(tools='shell,wait', settings={'context_bytes': 65536})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'wait'],
                        compaction_instructions='Summarize.')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:160x1')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:160x1')['result']['message']
         ended = client.finished(turn, timeout=60)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         events = all_events(client, 'Bob')
@@ -401,7 +401,7 @@ class TurnCompactionTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'wait'],
                        compaction_instructions='Summarize.')
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:160x1',
-                              model='openai/synthetic-large')['result']['turn']
+                              model='openai/synthetic-large')['result']['message']
         ended = client.finished(turn, timeout=60)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         kinds = [e['event'] for e in all_events(client, 'Bob')]
@@ -416,7 +416,7 @@ class TurnCompactionTests(ModelFixture):
         client = self.client(tools='shell', settings={'context_bytes': 24576, 'compact_at': 99})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:4x250,1x600')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:4x250,1x600')['result']['message']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         answer = node_item(client, 'Bob', ended['data']['checkpoint'])['result']
@@ -438,7 +438,7 @@ class TurnCompactionTests(ModelFixture):
         self.assertEqual(calls, ['long-4'])
 
         client.request('create', bot='Ann', workspace=str(self.path), tools=['shell'])
-        turn = client.request('submit', bot='Ann', request_id='1', prompt='long:4x250,1x600')['result']['turn']
+        turn = client.request('submit', bot='Ann', request_id='1', prompt='long:4x250,1x600')['result']['message']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'failed', ended)
         self.assertEqual(ended['data']['error'], 'context_limit', ended)
@@ -454,7 +454,7 @@ class TurnCompactionTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
         self.model.pace_at = 12
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:12x150,2x1')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:12x150,2x1')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn, timeout=30)
         client.close(kill=True)
         drain(self.model)
@@ -482,7 +482,7 @@ class TurnCompactionTests(ModelFixture):
         client = self.client(tools='shell', settings={'context_bytes': 98304})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['message']
         self.assertEqual(client.finished(turn, timeout=60)['data']['status'], 'completed')
         compacted = [e['data'] for e in all_events(client, 'Bob') if e['event'] == 'compacted']
         self.assertTrue(compacted)
@@ -494,7 +494,7 @@ class TurnCompactionTests(ModelFixture):
         self.model.compaction_text = 's' * 40000
         client.request('create', bot='Ann', workspace=str(self.path), tools=['shell'],
                        compaction_instructions='Summarize.')
-        turn = client.request('submit', bot='Ann', request_id='1', prompt='long:12')['result']['turn']
+        turn = client.request('submit', bot='Ann', request_id='1', prompt='long:12')['result']['message']
         client.finished(turn, timeout=60)
         asks = [asked_bytes(r) for r in drain(self.model) if is_summary(r)]
         self.assertEqual(asks[:2], [32768, 16384])
@@ -515,7 +515,7 @@ class TurnCompactionTests(ModelFixture):
         compacted = []
         for n in range(400):
             turn = client.request('submit', bot='Lead', request_id=str(n),
-                                  prompt=f'long:4x{lines}')['result']['turn']
+                                  prompt=f'long:4x{lines}')['result']['message']
             self.assertEqual(client.finished(turn, timeout=60)['data']['status'], 'completed')
             drain(self.model)
             compacted = [e['data'] for e in all_events(client, 'Lead') if e['event'] == 'compacted']
@@ -564,7 +564,7 @@ class AnthropicTurnCompactionTests(ModelFixture):
         self.addCleanup(client.close)
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), effort='low',
                                                compaction_instructions='Summarize.'))
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:30')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:30')['result']['message']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         answer = node_item(client, 'Bob', ended['data']['checkpoint'])['result']

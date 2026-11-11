@@ -443,15 +443,15 @@ class Bench:
         started, delivered = {}, {'turn': 0, 'steered': 0}
         leads = self.leads()
         for lead, reply in zip(leads, self.control.many(
-                [('turns', {'bot': l, 'limit': 256, 'newest': True}) for l in leads])):
-            for turn in reply.get('result', {}).get('turns', []):
-                if not str(turn.get('request_id', '')).startswith('lookout-'):
+                [('messages', {'bot': l, 'limit': 256, 'newest': True}) for l in leads])):
+            for message in reply.get('result', {}).get('messages', []):
+                if not str(message.get('request_id', '')).startswith('lookout-'):
                     continue
-                if turn.get('status') == 'steered' and turn.get('finished_ms'):
-                    started[(lead, turn['request_id'])] = turn['finished_ms']
+                if message.get('turn') not in (None, message['message']) and message.get('taken_ms'):
+                    started[(lead, message['request_id'])] = message['taken_ms']
                     delivered['steered'] += 1
-                elif turn.get('started_ms'):
-                    started[(lead, turn['request_id'])] = turn['started_ms']
+                elif message.get('turn') == message['message'] and message.get('started_ms'):
+                    started[(lead, message['request_id'])] = message['started_ms']
                     delivered['turn'] += 1
         # Each task's notes, oldest first: when sent, the newest turn named.
         named = {}

@@ -149,7 +149,7 @@ FACTS = {
         '**How to apply:** every exception message and log line an agent writes.'),
     'price-rounding': (
         'project', 'reference', 'Prices round half to even with round_price in shop/money.py',
-        'turn:lead/3',
+        'lead/3',
         'Prices are rounded with `round_price()` in `shop/money.py`, which rounds half to even. '
         'Use it for any new price calculation.'),
 }
@@ -388,7 +388,7 @@ def one_turn(agent, env, name, workspace, model, budget, timeout, message):
     # Turn numbers count across the daemon's bots, so a day two's turn is
     # not /1: take its number from what the run streamed.
     number = next((e['turn'] for e in events(stream) if e['event'] == 'accepted' and 'turn' in e), 1)
-    ref = f'turn:{name}/{number}'
+    ref = f'{name}/{number}'
     # A finished turn returns at once; an interrupted one once it settles.
     view = subprocess.run([*agent, 'wait', '--timeout', '60s', ref], env=env,
                           capture_output=True, text=True, timeout=90)

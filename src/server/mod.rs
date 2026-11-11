@@ -3036,8 +3036,8 @@ impl Service {
         if started.status == "ready" {
             self.ready_hint = true;
         }
-        // The message's number, and the turn's when it opened one now.
-        let turn = (started.status == "running").then_some(started.turn);
+        // The message's number, and the turn's when it opened one.
+        let turn = started.opened.then_some(started.turn);
         Ok(
             json!({"bot":bot,"bot_id":identity,"message":started.turn,"turn":turn,
             "request_id":request_id,"duplicate":!started.fresh,"status":started.status,

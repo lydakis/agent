@@ -4986,7 +4986,7 @@ async fn shadow_run(
         return sent["done"].clone();
     }
     let turn = match client.request("submit", asking).await {
-        Ok(turn) => turn["turn"].as_i64().unwrap_or_default(),
+        Ok(sent) => sent["message"].as_i64().unwrap_or_default(),
         Err(error) => {
             let _ = client
                 .request("delete", json!({"bot": name, "bot_id": id}))
@@ -4995,7 +4995,7 @@ async fn shadow_run(
         }
     };
     let mut outcome = json!({"outcome": "sent", "turn": turn, "shadow": name,
-        "handle": format!("turn:{name}/{turn}")});
+        "handle": format!("{name}/{turn}")});
     if let Some(ask) = ask.filter(|a| a.kind == Ask::Fire) {
         let _ = std::fs::write(&ask.receipt, outcome.to_string());
     }
@@ -5035,7 +5035,7 @@ async fn report(
     let Some((to, to_id)) = reported_to(trigger, kept) else {
         return json!({"outcome": "failed", "detail": "no agent to report to"});
     };
-    let handle = format!("turn:{bot}/{turn}");
+    let handle = format!("{bot}/{turn}");
     let waited = client
         .request(
             "wait",
@@ -5073,7 +5073,7 @@ async fn report(
         )
         .await;
     let mut reply = match sent {
-        Ok(sent) => json!({"outcome": "sent", "bot": to, "turn": sent["turn"]}),
+        Ok(sent) => json!({"outcome": "sent", "bot": to, "message": sent["message"]}),
         Err(error) if error.code == "idempotency_conflict" => json!({"outcome": "sent", "bot": to}),
         Err(error) if error.code == "bot_not_found" => {
             json!({"outcome": "failed", "bot": to, "gone": true, "detail": error.to_string()})
@@ -5153,8 +5153,8 @@ async fn submit(
     let submitted = client.request("submit", asking.clone()).await;
     let outcome = match submitted {
         Ok(turn) => {
-            let mut sent = json!({"outcome": "sent", "turn": turn["turn"],
-                "handle": format!("turn:{bot}/{}", turn["turn"])});
+            let mut sent = json!({"outcome": "sent", "turn": turn["message"],
+                "handle": format!("{bot}/{}", turn["message"])});
             if started {
                 sent["started"] = json!(true);
             }
@@ -5405,15 +5405,16 @@ fn request_id(trigger: &Trigger, id: i64, ask: Option<&Asked>) -> String {
 
 /// Whether another fire of `trigger` already waits behind `bot`'s work.
 /// Queued work starts in order, so nothing older than a turn that started
-/// still waits: the turns are read newest first, a page at a time, until
-/// one that started. Rows that never ran (a steer the running turn took
-/// in, a message cancelled while it waited, a note attached to the next
-/// turn) are passed over. `request` itself, sent before by an attempt cut
-/// short, is not another: sent again, it is the same turn. Turns that
-/// cannot be read hold no fire back, so a fire is never lost to a read.
+/// still waits: the messages are read newest first, a page at a time,
+/// until one that opened a turn. Those that opened none (a steer the
+/// running turn took in, a message withdrawn while it waited, a note
+/// attached to the next turn) are passed over. `request` itself, sent
+/// before by an attempt cut short, is not another: sent again, it is the
+/// same message. Messages that cannot be read hold no fire back, so a fire
+/// is never lost to a read.
 ///
 /// Every repeating fire asks, so the first page is small: an agent at rest
-/// or at work is answered by its newest turn.
+/// or at work is answered by its newest message.
 async fn waiting_fire(client: &Client, trigger: &Trigger, bot: &str, request: &str) -> bool {
     let ours = sent_by(trigger);
     let mut before: Option<i64> = None;
@@ -5423,15 +5424,15 @@ async fn waiting_fire(client: &Client, trigger: &Trigger, bot: &str, request: &s
         if let Some(before) = before {
             page["before"] = json!(before);
         }
-        let Ok(read) = client.request("turns", page).await else {
+        let Ok(read) = client.request("messages", page).await else {
             return false;
         };
-        let Some(turns) = read["turns"].as_array() else {
+        let Some(messages) = read["messages"].as_array() else {
             return false;
         };
-        for turn in turns {
-            let id = turn["request_id"].as_str();
-            match turn["status"].as_str() {
+        for message in messages {
+            let id = message["request_id"].as_str();
+            match message["status"].as_str() {
                 Some("running" | "waiting" | "paced" | "completed" | "failed") | None => {
                     return false;
                 }
@@ -5442,8 +5443,11 @@ async fn waiting_fire(client: &Client, trigger: &Trigger, bot: &str, request: &s
                 _ => {}
             }
         }
-        match turns.last().and_then(|turn| turn["turn"].as_i64()) {
-            Some(oldest) if turns.len() == limit => before = Some(oldest),
+        match messages
+            .last()
+            .and_then(|message| message["message"].as_i64())
+        {
+            Some(oldest) if messages.len() == limit => before = Some(oldest),
             _ => return false,
         }
         limit = 256;
@@ -5458,7 +5462,7 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
     let (Some((to, to_id)), Some(turn)) = (&trigger.reply_to, outcome["turn"].as_i64()) else {
         return outcome;
     };
-    let handle = format!("turn:{bot}/{turn}");
+    let handle = format!("{bot}/{turn}");
     let waited = client
         .request(
             "wait",
@@ -5499,7 +5503,7 @@ async fn reply(client: &Client, trigger: &Trigger, bot: &str, mut outcome: Value
         )
         .await;
     outcome["reply"] = match sent {
-        Ok(sent) => json!({"outcome": "sent", "bot": to, "turn": sent["turn"]}),
+        Ok(sent) => json!({"outcome": "sent", "bot": to, "message": sent["message"]}),
         // Its request id is the turn's own: another prompt under it is this
         // answer, passed on by a fire cut short before it settled.
         Err(error) if error.code == "idempotency_conflict" => {
@@ -6887,7 +6891,7 @@ pub(crate) mod tests {
             let n = runs.running.as_ref().unwrap().n;
             let run = runs.running.as_mut().unwrap();
             run.id = Some(50 + n as i64);
-            run.handle = Some(format!("turn:{}/1", run.bot));
+            run.handle = Some(format!("{}/1", run.bot));
             runs.end(json!({"status": status, "error": null}));
             let next = runs.take("p.r");
             assert_eq!(next.n, n + 1);
@@ -6967,7 +6971,7 @@ pub(crate) mod tests {
                     json!({"results": {handle: {"status": "completed"}}})
                 }
                 Some("create") => json!({"bot_id": 62}),
-                Some("submit") => json!({"turn": 1}),
+                Some("submit") => json!({"message": 1, "turn": 1}),
                 _ => json!({}),
             }
         })
@@ -6991,7 +6995,7 @@ pub(crate) mod tests {
         let mut kept = Kept::default();
         let mut one = kept.runs.take("p.r");
         one.id = Some(61);
-        one.handle = Some("turn:p.r-1/1".into());
+        one.handle = Some("p.r-1/1".into());
         kept.runs.running = Some(one);
         let outcome = deliver(&client, &w.places, &s, &mut kept, "every 30m", None).await;
         assert_eq!(outcome["outcome"], "ended", "{outcome}");
@@ -7000,26 +7004,26 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_save_while_its_agent_works_waits_behind_the_work_once() {
-        // The daemon: an agent at work (turn 1), its turns newest first.
+        // The daemon: an agent at work (turn 1), its messages newest first.
         let turns = std::sync::Arc::new(std::sync::Mutex::new(vec![
-            json!({"turn": 1, "status": "running", "request_id": "r1"}),
+            json!({"message": 1, "turn": 1, "status": "running", "request_id": "r1"}),
         ]));
         let notes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (seen, noted) = (turns.clone(), notes.clone());
         let client = crate::tests::daemon_answering(move |request| {
             let mut turns = seen.lock().unwrap();
             match (request["op"].as_str(), request["delivery"].as_str()) {
-                (Some("turns"), _) => json!({"turns": *turns}),
+                (Some("messages"), _) => json!({"messages": *turns}),
                 (Some("submit"), Some("attach")) => {
                     noted.lock().unwrap().push(request["prompt"].clone());
-                    json!({"turn": 1})
+                    json!({"message": 1, "turn": 1})
                 }
                 (Some("submit"), _) => {
                     let turn = turns.len() + 1;
-                    let queued = json!({"turn": turn, "status": "queued",
+                    let queued = json!({"message": turn, "status": "queued",
                         "request_id": request["request_id"]});
                     turns.insert(0, queued);
-                    json!({"turn": turn, "status": "queued"})
+                    json!({"message": turn, "status": "queued"})
                 }
                 _ => json!({}),
             }
@@ -7069,7 +7073,7 @@ pub(crate) mod tests {
                     json!({"results": {handle: {"status": "failed", "error": "provider_failed"}}})
                 }
                 Some("create") => json!({"bot_id": 62}),
-                Some("submit") => json!({"turn": 1}),
+                Some("submit") => json!({"message": 1, "turn": 1}),
                 _ => json!({}),
             }
         })
@@ -7093,7 +7097,7 @@ pub(crate) mod tests {
         let mut kept = Kept::default();
         let mut one = kept.runs.take("p.r");
         one.id = Some(61);
-        one.handle = Some("turn:p.r-1/1".into());
+        one.handle = Some("p.r-1/1".into());
         kept.runs.running = Some(one);
         let outcome = deliver(&client, &w.places, &s, &mut kept, "every 30m", None).await;
         assert_eq!(outcome["outcome"], "sent", "{outcome}");
@@ -7122,7 +7126,7 @@ pub(crate) mod tests {
         let row = Runs::of(&state(&w.places, &s)["run"]);
         assert_eq!(
             row.running.as_ref().unwrap().handle.as_deref(),
-            Some("turn:p.r-2/1")
+            Some("p.r-2/1")
         );
         assert_eq!(row.failed.as_ref().unwrap().bot, "p.r-1");
         assert!(row.finished.is_none());
@@ -7149,7 +7153,7 @@ pub(crate) mod tests {
         assert_eq!(resent["request_id"], "trigger_test-1_62.run");
         assert_eq!(resent["prompt"].as_str(), Some(prompt));
         let row = Runs::of(&state(&w.places, &s)["run"]);
-        assert_eq!(row.running.unwrap().handle.as_deref(), Some("turn:p.r-2/1"));
+        assert_eq!(row.running.unwrap().handle.as_deref(), Some("p.r-2/1"));
         // A fire someone asked for that takes the run over sends the run's
         // own request too, not one of its ask's.
         kept.runs.running.as_mut().unwrap().handle = None;
@@ -7218,7 +7222,7 @@ pub(crate) mod tests {
                     json!({"results": {handle: {"status": "completed"}}})
                 }
                 Some("create") => json!({"bot_id": 62}),
-                Some("submit") => json!({"turn": 1}),
+                Some("submit") => json!({"message": 1, "turn": 1}),
                 _ => json!({}),
             }
         })
@@ -7241,7 +7245,7 @@ pub(crate) mod tests {
         let mut kept = Kept::default();
         let mut one = kept.runs.take("p.r");
         one.id = Some(61);
-        one.handle = Some("turn:p.r-1/1".into());
+        one.handle = Some("p.r-1/1".into());
         kept.runs.running = Some(one);
         // Replaced while run 1 is waited for: the new definition takes the
         // runs over, and this fire starts none.
@@ -7281,7 +7285,7 @@ pub(crate) mod tests {
         let seen = at_wait.clone();
         let client = crate::tests::daemon_answering(move |request| match request["op"].as_str() {
             Some("create") => json!({"bot_id": 61}),
-            Some("submit") => json!({"turn": 3}),
+            Some("submit") => json!({"message": 3, "turn": 3}),
             Some("wait") => {
                 // What a trigger replacing this one would read meanwhile.
                 *seen.lock().unwrap() = read_json(&row);
@@ -7295,7 +7299,7 @@ pub(crate) mod tests {
         let outcome = deliver(&client, &w.places, &s, &mut kept, "every 30m", None).await;
         assert_eq!(outcome["reply"]["outcome"], "sent", "{outcome}");
         let row = at_wait.lock().unwrap().clone().unwrap();
-        assert_eq!(row["run"]["running"]["handle"], "turn:p.r-1/3");
+        assert_eq!(row["run"]["running"]["handle"], "p.r-1/3");
     }
 
     /// Sonny's scheduler as triggers see it: how often it was rung, and
@@ -8035,7 +8039,7 @@ pub(crate) mod tests {
         // Delivered: its row stays until its turn is known to have ended,
         // and stays when that turn failed.
         w.install(&one).unwrap();
-        let handle = "turn:p.fix-login/2";
+        let handle = "p.fix-login/2";
         w.settle(
             &one,
             json!({"outcome": "sent", "turn": 2, "handle": handle}),
@@ -8255,19 +8259,19 @@ pub(crate) mod tests {
         );
         // Sent, its answer still on its way to `--reply-to`, or the trigger
         // it ended gone: its receipt says, once.
-        let sent = json!({"outcome": "sent", "turn": 7, "handle": "turn:p.fix-login/7"});
+        let sent = json!({"outcome": "sent", "turn": 7, "handle": "p.fix-login/7"});
         let receipt = w.places.receipt(&s.name, &first);
         std::fs::write(&receipt, sent.to_string()).unwrap();
         assert_eq!(
             wait(&first),
             json!({"name": s.name, "ran": true, "outcome": "sent", "turn": 7,
-                "handle": "turn:p.fix-login/7"})
+                "handle": "p.fix-login/7"})
         );
         assert!(!receipt.exists());
         let ending = fire_now(&w.places, &s.name, &|| w.fake.ring()).unwrap();
         std::fs::write(w.places.receipt(&s.name, &ending), sent.to_string()).unwrap();
         w.remove(&s.name).unwrap();
-        assert_eq!(wait(&ending)["handle"], "turn:p.fix-login/7");
+        assert_eq!(wait(&ending)["handle"], "p.fix-login/7");
         w.install(&s).unwrap();
         // Settled: the row says, for this ask and no other.
         let second = fire_now(&w.places, &s.name, &|| w.fake.ring()).unwrap();
@@ -9003,9 +9007,9 @@ pub(crate) mod tests {
         let client = crate::tests::daemon_answering(move |request| {
             let turn = seen.load(std::sync::atomic::Ordering::SeqCst);
             match request["op"].as_str() {
-                // A message steered into turn 11 is a turn of its own.
+                // A message steered into turn 11 opens no turn.
                 Some("turns") if turn == 12 => json!({"turns": [
-                    {"turn": 12, "status": "steered"}, {"turn": 11, "status": "completed"}]}),
+                    {"turn": 11, "status": "completed"}]}),
                 Some("turns") => json!({"turns": [{"turn": turn}]}),
                 // Turn 11 marked the lead done, with no window open to
                 // keep the mark.
@@ -9239,8 +9243,8 @@ pub(crate) mod tests {
                 Some("inspect") => json!({"tools": ["shell", "read"],
                     "declared": [{"name": "exec"}, {"name": "ask"}]}),
                 Some("fork") => json!({"bot_id": 77, "head": 4}),
-                Some("submit") if request["bot_id"] == 77 => json!({"turn": 1}),
-                Some("submit") => json!({"turn": 12}),
+                Some("submit") if request["bot_id"] == 77 => json!({"message": 1, "turn": 1}),
+                Some("submit") => json!({"message": 12, "turn": 12}),
                 Some("wait") => {
                     let handle = request["handles"][0].as_str().unwrap().to_owned();
                     json!({"results": {handle: {"status": "completed",
@@ -9270,10 +9274,10 @@ pub(crate) mod tests {
         let name = outcome["shadow"].as_str().unwrap().to_owned();
         assert_eq!(shadow_source(&name), Some("p.fix-login"));
         assert_eq!(outcome["outcome"], "sent");
-        assert_eq!(outcome["handle"], format!("turn:{name}/1"));
+        assert_eq!(outcome["handle"], format!("{name}/1"));
         assert_eq!(
             outcome["reply"],
-            json!({"outcome": "sent", "bot": "p.lead", "turn": 12})
+            json!({"outcome": "sent", "bot": "p.lead", "message": 12})
         );
         let log = asked.clone();
         let asked = log.lock().unwrap().clone();

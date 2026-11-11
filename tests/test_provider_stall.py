@@ -70,7 +70,7 @@ class ProviderStallTests(unittest.TestCase):
             self.addCleanup(client.close)
             client.request('create', bot='Bob', workspace=directory)
             started = time.monotonic()
-            turn = client.request('submit', bot='Bob', request_id='r', prompt='hello')['result']['turn']
+            turn = client.request('submit', bot='Bob', request_id='r', prompt='hello')['result']['message']
             retry = client.receive(lambda e: e.get('event') == 'retry' and e.get('turn') == turn)
             self.assertEqual((retry['data']['attempt'], retry['data']['error']), (1, 'provider_stream_stalled'))
             # The bound runs from the last content frame, not the last byte.

@@ -100,7 +100,7 @@ class ProviderPacingTests(unittest.TestCase):
 
     def submit(self, client, bot):
         self.assertIn('result', client.request('create', bot=bot, workspace=str(self.path), instructions='x'))
-        return client.request('submit', bot=bot, request_id='run', prompt='hello')['result']['turn']
+        return client.request('submit', bot=bot, request_id='run', prompt='hello')['result']['message']
 
     def test_fresh_token_headers_leave_unused_estimates_available(self):
         self.server.mode = 'pacing'
@@ -136,7 +136,7 @@ class ProviderPacingTests(unittest.TestCase):
         self.assertEqual(client.finished(warm)['data']['status'], 'completed')
         self.assertIn('result', client.request('create', bot='Held', workspace=str(self.path),
                                                instructions='x', model='openai/held-model'))
-        held = client.request('submit', bot='Held', request_id='run', prompt='hello')['result']['turn']
+        held = client.request('submit', bot='Held', request_id='run', prompt='hello')['result']['message']
         self.assertTrue(self.server.held.wait(2))
         cancelled = self.submit(client, 'Cancelled')
         # Let the accepted turn reach the occupied startup semaphore.
@@ -169,7 +169,7 @@ class ProviderPacingTests(unittest.TestCase):
                 self.assertEqual((row['status'], row['retries'], row['model_rounds']), ('paced', 0, 0))
                 self.assertEqual(self.server.calls, 1)
                 listed = client.request('held')['result']['held']
-                self.assertEqual([(h['bot'], h['turn'], h['started']) for h in listed], [('A', turn, True)])
+                self.assertEqual([(h['bot'], h['message'], h['started']) for h in listed], [('A', turn, True)])
                 turn_b = self.submit(client, 'B')
                 self.assertEqual(client.finished(turn_b)['data']['status'], 'completed')
                 self.assertEqual(self.server.calls, 2)

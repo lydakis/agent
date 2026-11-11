@@ -1661,8 +1661,9 @@ pub fn relayed_names(text: &str, from: Option<&str>) -> Vec<String> {
         return from.map(|from| vec![from.to_owned()]).unwrap_or_default();
     };
     crate::calls::once(rest.lines().filter_map(|line| {
-        let (name, _) = line.strip_prefix("- ")?.split_once(": turn:")?;
-        Some(name.to_owned())
+        let (name, rest) = line.strip_prefix("- ")?.split_once(": ")?;
+        rest.starts_with(&format!("{name}/"))
+            .then(|| name.to_owned())
     }))
 }
 
@@ -1884,11 +1885,13 @@ fn news(text: &str) -> Option<Vec<String>> {
             && count.parse::<usize>().is_ok()
         {
             parts.push(format!("+{count} more"));
-        } else if let Some((name, turn)) = item.split_once(": turn:") {
-            // "- shop.fix: turn:shop.fix/5 failed, asked by you"
+        } else if let Some((name, turn)) =
+            (item.split_once(": ")).filter(|(name, turn)| turn.starts_with(&format!("{name}/")))
+        {
+            // "- shop.fix: shop.fix/5 failed, asked by you"
             let status = turn.split_once(' ').map_or("", |(_, s)| s);
             // A message in it: "the person wrote: \"…\"", "shop.api wrote
-            // in it", "3 messages in it since turn:…, from a, b".
+            // in it", "3 messages in it since shop.fix/…, from a, b".
             if status.starts_with("the person wrote") {
                 parts.push(format!("you wrote in {name}"));
             } else if status.starts_with("put the note") {
@@ -2920,7 +2923,10 @@ fn started(output: Option<&str>) -> Option<String> {
         });
     }
     let bot = reply["bot"].as_str()?;
-    let turn = reply["turn"].as_i64()?;
+    // A message in line has no turn yet; the one it opens has its number.
+    let turn = reply["turn"]
+        .as_i64()
+        .or_else(|| reply["message"].as_i64())?;
     reply["handle"].as_str()?;
     Some(format!(
         "{} {bot}, turn {turn}",
@@ -3155,7 +3161,6 @@ fn shown(path: &str, workspace: &str) -> String {
 pub fn finished(status: &str, detail: &str, seconds: Option<u64>) -> Line<'static> {
     let mut label = match status {
         "completed" => "Worked".to_owned(),
-        "steered" => "Steered".to_owned(),
         other => other.to_owned(),
     };
     if let Some(seconds) = seconds {
@@ -3167,7 +3172,7 @@ pub fn finished(status: &str, detail: &str, seconds: Option<u64>) -> Line<'stati
     // Words only, muted: the person's band already parts one turn from the
     // next, and a rule as wide as the column outweighed the reply above it.
     let style = match status {
-        "completed" | "steered" => Style::new().dim(),
+        "completed" => Style::new().dim(),
         _ => Style::new().fg(Color::Red),
     };
     Line::from(Span::styled(label, style))
@@ -3339,11 +3344,11 @@ mod tests {
         assert_eq!(open[1..], rows[1..]);
         // An agent's message is who sent it, its words opened on a click.
         assert_eq!(relayed_head(&long, Some("errand.lead")), "From errand.lead");
-        let handles = ["turn:calc.add/1", "turn:calc.add/2", "turn:calc.add/3"];
+        let handles = ["calc.add/1", "calc.add/2", "calc.add/3"];
         let output = serde_json::json!({"results": {
-            "turn:calc.add/1": {"error": "cancelled"},
-            "turn:calc.add/2": {"status": "steered", "text": ""},
-            "turn:calc.add/3": {"status": "steered", "text": ""}}});
+            "calc.add/1": {"error": "cancelled"},
+            "calc.add/2": {"status": "taken", "turn": 1, "text": ""},
+            "calc.add/3": {"status": "taken", "turn": 1, "text": ""}}});
         let rows = text(&tool(
             "wait",
             &serde_json::json!({"handles": handles}),
@@ -3357,7 +3362,7 @@ mod tests {
             [
                 "• Waited for calc.add",
                 "  └ calc.add: cancelled",
-                "    calc.add steered"
+                "    calc.add taken"
             ]
         );
         let wait = serde_json::json!({"handles": handles});
@@ -3740,9 +3745,9 @@ mod tests {
     #[test]
     fn task_updates_and_lookout_notes_read_as_one_quiet_row() {
         let told = "Task updates: since you last heard, tasks you started ended turns or wait for an approval. The wait tool reads each one's final reply by its handle.\n\
-                    - shop.fix: turn:shop.fix/5 failed, asked by you\n\
+                    - shop.fix: shop.fix/5 failed, asked by you\n\
                     The person asked for these turns in the task themselves, so they are theirs:\n\
-                    - shop.docs: turn:shop.docs/2 completed, asked by the person\n\
+                    - shop.docs: shop.docs/2 completed, asked by the person\n\
                     - 2 more tasks in the next update\n\n\
                     Memory changed since you last heard; each fact is a file, read before relying on it:\n\
                     - saved: /m/flow.md: Reviews go through gft";
@@ -3755,10 +3760,10 @@ mod tests {
             ["↳ Task updates · shop.fix failed · shop…"]
         );
         let note = "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
-             - shop.fix: turn:shop.fix/5 failed, asked by you\n\
-             - shop.docs: turn:shop.docs/2, the person wrote: \"Use tabs.\"\n\
-             - shop.api: turn:shop.api/4, shop.fix wrote in it\n\
-             - shop.web: turn:shop.web/3, 2 messages in it since turn:shop.web/1, from shop.fix, a trigger\n\
+             - shop.fix: shop.fix/5 failed, asked by you\n\
+             - shop.docs: shop.docs/2, the person wrote: \"Use tabs.\"\n\
+             - shop.api: shop.api/4, shop.fix wrote in it\n\
+             - shop.web: shop.web/3, 2 messages in it since shop.web/1, from shop.fix, a trigger\n\
              - 1 more tasks in the next note\n\
              A quoted message is the person's own words.\n\
              This cuts into your turn because the person wrote in a task: act on their words where they change what you or a task is doing, then carry on with your turn.";
@@ -3773,11 +3778,11 @@ mod tests {
     #[test]
     fn a_task_update_says_each_thing_in_a_few_words() {
         let note = "Task updates: what happened in your tasks since you last heard.\n\
-             - shop.fix: turn:shop.fix/3, put the note \"bench\" in its own margin; the margin tool with from \"shop.fix/bench\" shows it in yours\n\
-             - shop.web: turn:shop.web/2, took its margin note \"old\" away\n\
-             - shop.docs: turn:shop.docs/2 waiting for the person's approval\n\
-             - shop.api: turn:shop.api/3 has printed nothing for 30 minutes\n\
-             - shop.db: turn:shop.db/4, put a question to the person, which they answer in shop.db:\n  > Keep it?";
+             - shop.fix: shop.fix/3, put the note \"bench\" in its own margin; the margin tool with from \"shop.fix/bench\" shows it in yours\n\
+             - shop.web: shop.web/2, took its margin note \"old\" away\n\
+             - shop.docs: shop.docs/2 waiting for the person's approval\n\
+             - shop.api: shop.api/3 has printed nothing for 30 minutes\n\
+             - shop.db: shop.db/4, put a question to the person, which they answer in shop.db:\n  > Keep it?";
         assert_eq!(
             text(&super::prompt(note, 160, None).0),
             [
@@ -3788,7 +3793,7 @@ mod tests {
 
     #[test]
     fn messages_in_a_row_are_counted_by_kind() {
-        let updates = "Task updates: since you last heard.\n- a.b: turn:a.b/1 completed";
+        let updates = "Task updates: since you last heard.\n- a.b: a.b/1 completed";
         assert_eq!(relayed_kind(updates, None), "task update");
         assert_eq!(relayed_kind("Look at this", Some("a.b")), "message");
         let kinds = [
@@ -4174,7 +4179,8 @@ mod tests {
 
     #[test]
     fn a_command_line_says_each_known_command() {
-        let output = r#"{"bot":"calc.fix","bot_id":2,"handle":"turn:calc.fix/2","status":"running","turn":2}"#;
+        let output =
+            r#"{"bot":"calc.fix","bot_id":2,"handle":"calc.fix/2","status":"running","turn":2}"#;
         let rows = tool(
             "shell",
             &serde_json::json!({"command":"cd /tmp && agent run --detach --bot calc.fix -- 'Go'"}),
@@ -4330,10 +4336,10 @@ mod tests {
 
     #[test]
     fn a_wait_reads_as_each_turns_ending() {
-        let output = r#"{"pending":[],"results":{"turn:c.fix/2":{"bot":"c.fix","status":"completed","text":"\nFixed it.\nMore."}}}"#;
+        let output = r#"{"pending":[],"results":{"c.fix/2":{"bot":"c.fix","status":"completed","text":"\nFixed it.\nMore."}}}"#;
         let rows = tool(
             "wait",
-            &serde_json::json!({"handles":["turn:c.fix/2"]}),
+            &serde_json::json!({"handles":["c.fix/2"]}),
             Some(output),
             false,
             "/",
@@ -4408,14 +4414,14 @@ mod tests {
         assert_eq!(asked, ["• Asked you Ship it?", "  └ 1 yes · 2 no"]);
         let started = shell(
             r#""$AGENT_BIN" run --detach --new --bot calc.fix -- 'Fix the tests.'"#,
-            r#"{"bot":"calc.fix","handle":"turn:calc.fix/2","turn":2}"#,
+            r#"{"bot":"calc.fix","handle":"calc.fix/2","turn":2}"#,
         );
         assert_eq!(started[0], "• Started calc.fix · turn 2");
         // How a lead in Sonny starts a task.
         let task = clean(
             "start_task",
             serde_json::json!({"name": "fix", "brief": "Fix the tests.", "setup": true}),
-            "Started calc.fix: {\"handle\":\"turn:calc.fix/3\"}",
+            "Started calc.fix: {\"handle\":\"calc.fix/3\"}",
         );
         assert_eq!(task, ["• Started fix", "  └ Fix the tests."]);
         // One that failed says what it tried, and why first.
@@ -4527,7 +4533,7 @@ mod real_calls {
             &format!(
                 r#""$AGENT_BIN" run --detach --new --agents --model "$AGENT_MODEL" {effort} --bot calc.fix-tests --workspace "$PWD" -- 'The person says tests in this folder fail and asks you to fix them. This folder is not a git repository.'"#
             ),
-            r#"{"bot":"calc.fix-tests","bot_id":2,"cursor":33,"duplicate":false,"handle":"turn:calc.fix-tests/2","request_id":"r","status":"running","turn":2}"#,
+            r#"{"bot":"calc.fix-tests","bot_id":2,"cursor":33,"duplicate":false,"handle":"calc.fix-tests/2","request_id":"r","status":"running","turn":2}"#,
             false,
         );
         show(
@@ -4539,7 +4545,7 @@ mod real_calls {
             &format!(
                 r#""$AGENT_BIN" ls --pretty; cat test_calc.py; "$AGENT_BIN" run --detach --delivery queue --model "$AGENT_MODEL" {effort} --bot calc.fix-tests -- 'Please add an explicit test for average of a single number.'"#
             ),
-            "calc.fix-tests           completed   chatgpt/gpt-6-sol  /tmp/calc\ncalc.lead                running     chatgpt/gpt-6-sol  /tmp/calc\nfrom calc import average\ncases = []\n{\"bot\":\"calc.fix-tests\",\"handle\":\"turn:calc.fix-tests/4\",\"status\":\"queued\",\"turn\":4}",
+            "calc.fix-tests           completed   chatgpt/gpt-6-sol  /tmp/calc\ncalc.lead                running     chatgpt/gpt-6-sol  /tmp/calc\nfrom calc import average\ncases = []\n{\"bot\":\"calc.fix-tests\",\"handle\":\"calc.fix-tests/4\",\"status\":\"queued\",\"turn\":4}",
             false,
         );
         show(
@@ -4563,7 +4569,7 @@ mod real_calls {
             &format!(
                 r#""$AGENT_BIN" run --detach --new --agents --model "$AGENT_MODEL" {effort} --bot calc.single-negative --workspace "$PWD" -- 'The person explicitly requests a new task.'"#
             ),
-            "{\"bot\":\"calc.single-negative\",\"handle\":\"turn:calc.single-negative/13\",\"status\":\"running\",\"turn\":13}",
+            "{\"bot\":\"calc.single-negative\",\"handle\":\"calc.single-negative/13\",\"status\":\"running\",\"turn\":13}",
             false,
         );
     }

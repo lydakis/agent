@@ -693,11 +693,7 @@ mod tests {
         for _ in 0..20 {
             let request = tokio::spawn({
                 let client = client.clone();
-                async move {
-                    client
-                        .request("wait", json!({"handles":["turn:Bob:1"]}))
-                        .await
-                }
+                async move { client.request("wait", json!({"handles":["Bob:1"]})).await }
             });
             lines.next_line().await.unwrap().unwrap();
             request.abort();

@@ -430,9 +430,9 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertFalse(early['bench_after_check'] or early['followed_workflow'])
 
     def test_a_steer_counts_only_once_it_reached_the_task(self):
-        self.assertEqual(steer_outcome({'turn': 9}, {'status': 'steered', 'into': 1}), 'steered')
+        self.assertEqual(steer_outcome({'message': 9}, {'status': 'taken', 'turn': 1}), 'taken')
         # Queued behind a full turn until the task ended, then refused.
-        self.assertEqual(steer_outcome({'turn': 9}, {'status': 'failed', 'error': 'stale_turn'}),
+        self.assertEqual(steer_outcome({'message': 9}, {'status': 'failed', 'error': 'stale_turn'}),
                          'failed: stale_turn')
         self.assertEqual(steer_outcome({'error': 'stale_turn'}, None), 'refused: stale_turn')
         self.assertEqual(steer_outcome(None, None), 'not sent: the task ended before its steer point')
@@ -440,7 +440,7 @@ class LongTaskScoreTests(unittest.TestCase):
     def test_a_condition_with_no_correct_task_has_no_cost_per_correct_task(self):
         self.setUp()
         facts = workspace(self.root, 7)
-        bot = {'status': 'completed', 'steer': 'steered', 'wall_s': 1.0, **score(self.root, facts, [], '')}
+        bot = {'status': 'completed', 'steer': 'taken', 'wall_s': 1.0, **score(self.root, facts, [], '')}
         self.assertFalse(bot['correct'])
         block = {'condition': 'compact', 'task': 'small', 'context_bytes': 20480, 'wall_s': 1.0, 'bots': {'b': bot}}
         self.assertIsNone(long_task_eval.summarize(block)['input_token_equivalents_per_correct_task'])
@@ -609,7 +609,7 @@ class LongTaskRunnerTests(ModelFixture):
                                   timeout=60)
         result = block['bots']['compact-0']
         self.assertEqual(result['status'], 'completed', result)
-        self.assertEqual(result['steer'], 'steered')
+        self.assertEqual(result['steer'], 'taken')
         self.assertTrue(result['correct'] and result['vendor_intact'] and result['reported_throughput'], result)
         self.assertTrue(result['followed_workflow'], result)
         self.assertEqual((result['make_quick_runs'], result['migrations_applied']), (1, 1))
@@ -646,7 +646,7 @@ class LongTaskRunnerTests(ModelFixture):
                 self.assertEqual(block['context_bytes'], budget or 256 << 10)
                 result = block['bots'][f'{condition}-0']
                 self.assertEqual(result['status'], 'completed', result)
-                self.assertEqual(result['steer'], 'steered')
+                self.assertEqual(result['steer'], 'taken')
                 self.assertTrue(result['correct'] and result['vendor_intact'] and result['reported_throughput'],
                                 result)
                 self.assertTrue(result['followed_workflow'], result)
@@ -694,7 +694,7 @@ class LongTaskRunnerTests(ModelFixture):
                 self.assertEqual((block['task'], block['context_bytes']), ('sustained', 128 << 10))
                 result = block['bots'][f'{condition}-0']
                 self.assertEqual(result['status'], 'completed', result)
-                self.assertEqual(result['steer'], 'steered')
+                self.assertEqual(result['steer'], 'taken')
                 self.assertTrue(result['correct'] and result['vendor_intact'] and result['reported_throughput'],
                                 {k: result[k] for k in ('hidden_tests', 'closes', 'answer')})
                 self.assertTrue(result['followed_workflow'], result['closes'])

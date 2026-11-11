@@ -117,7 +117,7 @@ class SocketClient:
             assert 'result' in follower.request('follow', bot=bot, after=0)
             follower.receive(lambda e: e.get('event') == 'follow_live')
         if op == 'submit':
-            self.turns[response['result']['turn']] = params['bot']
+            self.turns[response['result']['message']] = params['bot']
         return response
 
     def finished(self, turn, timeout=5):

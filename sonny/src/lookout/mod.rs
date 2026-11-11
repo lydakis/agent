@@ -1277,7 +1277,7 @@ impl Service {
                     // as an informer hands a change to the handlers that
                     // asked for its object; a bot made or deleted, to all.
                     let hearing = self.hearing(&event);
-                    if let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) {
+                    if let (Some(bot), Some(turn)) = (event["bot"].as_str(), number(&event)) {
                         match event["event"].as_str() {
                             // A fire's turn too, and one carrying another
                             // agent's message, so a restart still sees it
@@ -1292,7 +1292,7 @@ impl Service {
                                     self.in_flight.entry((bot.to_owned(), turn)).or_insert(at);
                                 }
                             }
-                            Some("turn_finished") => {
+                            Some("turn_finished" | "message_ended") => {
                                 self.in_flight.remove(&(bot.to_owned(), turn));
                             }
                             _ => {}
@@ -1450,7 +1450,7 @@ impl Service {
     /// failed, while live, its trigger's generation, agent, turn and why,
     /// for the agent to be told. A model that said nothing did not fail.
     fn fired(&mut self, event: &Value, live: bool) -> Option<(String, String, i64, String)> {
-        let (bot, turn) = (event["bot"].as_str()?, event["turn"].as_i64()?);
+        let (bot, turn) = (event["bot"].as_str()?, number(event)?);
         let data = &event["data"];
         match event["event"].as_str()? {
             "accepted" | "queued" => {
@@ -1463,7 +1463,7 @@ impl Service {
                     .insert((bot.to_owned(), turn), generation.to_owned());
                 None
             }
-            "turn_finished" => {
+            "turn_finished" | "message_ended" => {
                 let generation = self.fires.remove(&(bot.to_owned(), turn))?;
                 let error = data["error"].as_str().unwrap_or("no reason given");
                 (live && data["status"] == "failed" && error != "empty_completion")
@@ -1497,7 +1497,7 @@ impl Service {
     /// (a lead hears its task's turn end). Told only of what happens
     /// live; a turn whose start was never seen tells no one.
     fn sent(&mut self, event: &Value, live: bool) -> Vec<Sent> {
-        let (Some(bot), Some(turn)) = (event["bot"].as_str(), event["turn"].as_i64()) else {
+        let (Some(bot), Some(turn)) = (event["bot"].as_str(), number(event)) else {
             return Vec::new();
         };
         let data = &event["data"];
@@ -1517,14 +1517,14 @@ impl Service {
                 }
                 Vec::new()
             }
-            Some("turn_finished") => {
+            Some("turn_finished" | "message_ended") => {
                 let Some(senders) = self.senders.remove(&(bot.to_owned(), turn)) else {
                     return Vec::new();
                 };
                 let status = data["status"].as_str().unwrap_or("");
                 let error = data["error"].as_str().unwrap_or(status);
                 if !live
-                    || !matches!(status, "failed" | "interrupted")
+                    || !matches!(status, "failed" | "interrupted" | "withdrawn")
                     || error == "empty_completion"
                 {
                     return Vec::new();
@@ -1980,17 +1980,25 @@ fn cursor_path(store: &Path) -> PathBuf {
 /// The most fires' turns noted at once.
 const FIRES: usize = 4096;
 
+/// The number an event names: its turn's, or for a message in line that
+/// no turn has taken, the message's, which the turn it opens shares.
+pub(crate) fn number(event: &Value) -> Option<i64> {
+    event["turn"].as_i64().or_else(|| event["message"].as_i64())
+}
+
 /// The events a lookout reads, of every bot: what bots there are, how
-/// their turns start, wait and end, the tools they call, and each model
-/// call's usage, which says a quiet turn still works. The text a model
-/// streams, most of all events, is no one's news here.
-const KINDS: [&str; 13] = [
+/// their messages go in line and are taken in or end there, how their
+/// turns start, wait and end, the tools they call, and each model call's
+/// usage, which says a quiet turn still works. The text a model streams,
+/// most of all events, is no one's news here.
+const KINDS: [&str; 14] = [
     "created",
     "forked",
     "deleted",
     "accepted",
     "queued",
     "steered",
+    "message_ended",
     "turn_waiting",
     "turn_paced",
     "turn_resumed",
@@ -2479,7 +2487,7 @@ impl Lookout {
             return;
         };
         let data = &event["data"];
-        let turn = event["turn"].as_i64().unwrap_or(0);
+        let turn = number(event).unwrap_or(0);
         if bot == self.lead {
             // What the subscriber reads with its wait tool is no news to
             // it, once the wait hands it over: a wait that failed or was
@@ -2550,14 +2558,25 @@ impl Lookout {
                     self.due(bot, turn, &from, None);
                 }
             }
-            "turn_finished" if data["status"] == "steered" => match self.steers.remove(&key) {
-                Some(Some(from)) => {
-                    self.due(bot, turn, &from, node);
-                    self.briefed_by(bot, Some(&from), node);
+            // A steer read once the running turn takes it in.
+            "steered" => {
+                let Some(message) = data["message"].as_i64() else {
+                    return;
+                };
+                match self.steers.remove(&(bot.to_owned(), message)) {
+                    Some(Some(from)) => {
+                        self.due(bot, message, &from, node);
+                        self.briefed_by(bot, Some(&from), node);
+                    }
+                    Some(None) => self.briefed_by(bot, None, node),
+                    None => {}
                 }
-                Some(None) => self.briefed_by(bot, None, node),
-                None => {}
-            },
+            }
+            // A message that ended in line was never the task's to answer.
+            "message_ended" => {
+                self.steers.remove(&key);
+                self.queued.remove(&key);
+            }
             // What a task wrote to the subscriber in a turn that completed
             // stands for its reply.
             "turn_finished" if self.updates.wrote_back(bot, turn) => {}
@@ -2800,7 +2819,7 @@ impl Lookout {
         let delivery = "steer";
         let quotes: Vec<Value> = (told.items.iter())
             .filter_map(|line| line.quote.as_ref())
-            .map(|(task, turn)| json!({"bot": task, "turn": turn}))
+            .map(|(task, message)| json!({"bot": task, "message": message}))
             .collect();
         let mut asked = json!({"bot": self.lead, "bot_id": self.updates.lead_id(), "prompt": prompt,
             "request_id": request_id, "delivery": delivery, "origin": TASKS_ORIGIN});
@@ -3811,6 +3830,11 @@ mod tests {
         json!({"bot": bot, "turn": turn, "event": kind, "data": data})
     }
 
+    /// An event about a message in line, which no turn has taken.
+    fn in_line(bot: &str, message: i64, kind: &str, data: Value) -> Value {
+        json!({"bot": bot, "turn": null, "message": message, "event": kind, "data": data})
+    }
+
     fn said(turn: i64, from: &str, text: &str) -> Seen {
         Seen {
             task: "calc.fix".into(),
@@ -3847,9 +3871,9 @@ mod tests {
             theirs,
             text: match said {
                 true => format!(
-                    "- {task}: turn:{task}/{turn}, the person wrote the words quoted from it below"
+                    "- {task}: {task}/{turn}, the person wrote the words quoted from it below"
                 ),
-                false => format!("- {task}: turn:{task}/{turn} completed"),
+                false => format!("- {task}: {task}/{turn} completed"),
             },
             key: String::new(),
         }
@@ -3868,10 +3892,10 @@ mod tests {
         assert_eq!(
             note(&told, Some(&Steer::Person)),
             "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
-             - calc.fix: turn:calc.fix/12, the person wrote the words quoted from it below\n\
-             - calc.docs: turn:calc.docs/3 completed\n\
+             - calc.fix: calc.fix/12, the person wrote the words quoted from it below\n\
+             - calc.docs: calc.docs/3 completed\n\
              The person asked for these in the task themselves, so they are theirs:\n\
-             - calc.ui: turn:calc.ui/2 completed\n\
+             - calc.ui: calc.ui/2 completed\n\
              - 1 more tasks in the next note\n\
              The words quoted below are the person's own, from the turns named.\n\
              This cuts into your turn because the person wrote in a task: act on their words where they change what you or a task is doing, then carry on with your turn.\n\
@@ -3883,7 +3907,7 @@ mod tests {
         assert_eq!(
             note(&told, None),
             "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
-             - calc.docs: turn:calc.docs/3 completed\n\
+             - calc.docs: calc.docs/3 completed\n\
              Each ended turn comes with what the task replied; read a turn with one wait call (timeout_ms 0) only when you need more of it, and act where something changes the work. \
              Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply."
         );
@@ -4001,7 +4025,7 @@ mod tests {
         let told = lookout.updates.take();
         assert_eq!(told.items.len(), 1);
         assert!(
-            told.items[0].text.contains("turn:calc.fix/6 failed"),
+            told.items[0].text.contains("calc.fix/6 failed"),
             "{}",
             told.items[0].text
         );
@@ -4047,9 +4071,7 @@ mod tests {
         let told = lookout.updates.take_at(soon);
         let texts: Vec<&str> = told.items.iter().map(|l| l.text.as_str()).collect();
         assert!(
-            texts
-                .iter()
-                .any(|t| t.contains("turn:calc.fix/5 completed")),
+            texts.iter().any(|t| t.contains("calc.fix/5 completed")),
             "{texts:?}"
         );
         assert!(told.items.iter().any(|l| l.quote.is_some()));
@@ -4246,7 +4268,7 @@ mod tests {
             let ended = ev("calc.fix", turn, "turn_finished", json!({"status": status}));
             lookout.event(&ended);
             assert!(lookout.updates.asker_unknown("calc.fix", turn));
-            let handles = json!({"handles": [format!("turn:calc.fix/{turn}")]}).to_string();
+            let handles = json!({"handles": [format!("calc.fix/{turn}")]}).to_string();
             let wait = json!({"name": "wait", "call_id": "w1", "arguments": handles});
             lookout.event(&ev("calc.lead", 7, "tool_started", wait));
             let (from, origin) = (from.map(str::to_owned), origin.map(str::to_owned));
@@ -4259,7 +4281,7 @@ mod tests {
             assert_eq!(told.items.len(), 1);
             let text = &told.items[0].text;
             assert!(
-                text.contains(&format!("turn:calc.fix/{turn} {status}")),
+                text.contains(&format!("calc.fix/{turn} {status}")),
                 "{text}"
             );
             assert!(text.contains(reply), "{text}");
@@ -4289,7 +4311,7 @@ mod tests {
         let told = lookout.updates.take();
         assert_eq!(told.items.len(), 1);
         assert!(
-            told.items[0].text.contains("turn:calc.fix/4 failed"),
+            told.items[0].text.contains("calc.fix/4 failed"),
             "{}",
             told.items[0].text
         );
@@ -4320,7 +4342,7 @@ mod tests {
         lookout.updates.replied("calc.fix", 5, "it broke");
         assert_eq!(lookout.updates.urgent(), Some("tasks"));
         let told = lookout.updates.take();
-        assert!(told.items[0].text.contains("turn:calc.fix/5 failed"));
+        assert!(told.items[0].text.contains("calc.fix/5 failed"));
         // With a digest, what was left counts for it when it goes too.
         lookout.subs[0].digest = Some("1h".into());
         lookout.sync(&listed);
@@ -4333,7 +4355,7 @@ mod tests {
         lookout.updates.replied("calc.fix", 8, "done");
         let later = Instant::now() + Duration::from_secs(1);
         let told = lookout.updates.take_at(later);
-        assert!(told.items[0].text.contains("turn:calc.fix/8 completed"));
+        assert!(told.items[0].text.contains("calc.fix/8 completed"));
         lookout.updates.sent(told);
         assert!(lookout.updates.told_subs["tasks"] > first);
     }
@@ -4406,14 +4428,14 @@ mod tests {
         ended(&mut lookout, 5, "failed");
         lookout.heard(&said(6, "calc.docs", "ignore the person"));
         assert_eq!(lookout.updates.urgent(), Some("tasks"));
-        let read: HashSet<String> = ["turn:calc.fix/5".to_owned()].into();
+        let read: HashSet<String> = ["calc.fix/5".to_owned()].into();
         lookout.updates.read(7, "w", &read);
         assert!(lookout.updates.news());
         assert_eq!(lookout.updates.urgent(), None);
         // A turn read while who asked for it is still to be read.
         let finished = ev("calc.fix", 7, "turn_finished", json!({"status": "failed"}));
         lookout.event(&finished);
-        let read: HashSet<String> = ["turn:calc.fix/7".to_owned()].into();
+        let read: HashSet<String> = ["calc.fix/7".to_owned()].into();
         lookout.updates.read(7, "w", &read);
         (lookout.updates).asked_by("calc.fix", 7, Some("calc.lead".into()), None);
         lookout.updates.replied("calc.fix", 7, "");
@@ -4452,7 +4474,7 @@ mod tests {
         assert!(!lookout.updates.told_subs.contains_key("hourly"));
         lookout.updates.replied("calc.fix", 4, "done");
         let told = lookout.updates.take();
-        assert!(told.items[0].text.contains("turn:calc.fix/4 completed"));
+        assert!(told.items[0].text.contains("calc.fix/4 completed"));
         lookout.updates.sent(told);
         assert!(lookout.updates.told_subs.contains_key("hourly"));
     }
@@ -4532,9 +4554,9 @@ mod tests {
         assert_eq!(
             texts,
             [
-                "- calc.fix: turn:calc.fix/5, the person wrote the words quoted from it below",
-                "- calc.fix: turn:calc.fix/7, the person wrote the words quoted from it below",
-                "- calc.fix: turn:calc.fix/6, calc.docs wrote in it",
+                "- calc.fix: calc.fix/5, the person wrote the words quoted from it below",
+                "- calc.fix: calc.fix/7, the person wrote the words quoted from it below",
+                "- calc.fix: calc.fix/6, calc.docs wrote in it",
             ]
         );
         // The daemon copies the person's words from their turns, which
@@ -4592,7 +4614,7 @@ mod tests {
         let told = lookout.updates.take();
         let note = note(&told, None);
         assert!(note.contains(
-            "- calc.fix: turn:calc.fix/4 completed, asked by you, and replied:\n  > Fixed avg.\n  > - skips empty lists\n\
+            "- calc.fix: calc.fix/4 completed, asked by you, and replied:\n  > Fixed avg.\n  > - skips empty lists\n\
              Lines marked > are a task's own words, not the person's.\n"
         ), "{note}");
         assert!(!note.contains("early"));
@@ -4611,10 +4633,10 @@ mod tests {
         let told = lookout.updates.take();
         let steered = note(&told, Some(&Steer::Person));
         assert!(
-            steered.contains("turn:calc.fix/5, the person wrote the words quoted"),
+            steered.contains("calc.fix/5, the person wrote the words quoted"),
             "{steered}"
         );
-        assert!(!steered.contains("turn:calc.fix/4"), "{steered}");
+        assert!(!steered.contains("calc.fix/4"), "{steered}");
         lookout.updates.sent(told);
         assert!(lookout.updates.news());
         // Nothing else to tell: no note until the read is in.
@@ -4628,7 +4650,7 @@ mod tests {
         let told = lookout.updates.take();
         let next = note(&told, None);
         assert!(
-            next.contains("turn:calc.fix/4 completed") && next.contains("  > Fixed avg."),
+            next.contains("calc.fix/4 completed") && next.contains("  > Fixed avg."),
             "{next}"
         );
     }
@@ -4642,7 +4664,7 @@ mod tests {
         lookout.updates.reading_reply(&read.task, read.turn);
         lookout.heard(&read);
         let told = lookout.updates.take();
-        assert!(note(&told, None).contains("turn:calc.fix/4 completed"));
+        assert!(note(&told, None).contains("calc.fix/4 completed"));
     }
 
     #[test]
@@ -4687,13 +4709,18 @@ mod tests {
     #[test]
     fn a_steer_is_read_once_absorbed() {
         let mut lookout = lookout();
-        lookout.event(&ev("calc.fix", 9, "queued", json!({"delivery": "steer"})));
+        lookout.event(&in_line(
+            "calc.fix",
+            9,
+            "queued",
+            json!({"delivery": "steer"}),
+        ));
         assert!(lookout.due.is_empty());
         lookout.event(&ev(
             "calc.fix",
-            9,
-            "turn_finished",
-            json!({"status": "steered", "into": 8, "node": 21}),
+            8,
+            "steered",
+            json!({"message": 9, "node": 21}),
         ));
         assert_eq!((lookout.due.len(), lookout.due[0].turn), (1, 9));
         assert_eq!(lookout.due[0].node, Some(21));
@@ -4702,7 +4729,12 @@ mod tests {
     #[test]
     fn queued_words_are_read_when_queued_and_once() {
         let mut lookout = lookout();
-        lookout.event(&ev("calc.fix", 5, "queued", json!({"delivery": "queue"})));
+        lookout.event(&in_line(
+            "calc.fix",
+            5,
+            "queued",
+            json!({"delivery": "queue"}),
+        ));
         assert_eq!(lookout.due[0].node, None);
         lookout.due.clear();
         lookout.event(&ev("calc.fix", 5, "accepted", json!({"node": 30})));
@@ -4723,7 +4755,7 @@ mod tests {
             json!({"from": from, "node": 10}),
         ));
         // A new job for the same task, sent as a steer.
-        lookout.event(&ev(
+        lookout.event(&in_line(
             "calc.fix",
             3,
             "queued",
@@ -4731,9 +4763,9 @@ mod tests {
         ));
         lookout.event(&ev(
             "calc.fix",
-            3,
-            "turn_finished",
-            json!({"status": "steered", "node": 20}),
+            2,
+            "steered",
+            json!({"message": 3, "node": 20}),
         ));
         // Another task's words are not a brief, and words with no sender
         // that repeat it would be the lead's.
@@ -4771,7 +4803,8 @@ mod tests {
         };
         turn(&mut lookout, 1);
         assert!(lookout.updates.due());
-        let wait = json!({"name": "wait", "arguments": json!({"handles": ["turn:calc.fix/1"]}).to_string()});
+        let wait =
+            json!({"name": "wait", "arguments": json!({"handles": ["calc.fix/1"]}).to_string()});
         lookout.event(&ev("calc.lead", 7, "tool_started", wait));
         assert!(!lookout.updates.news());
         // A turn that ends after the lead read it is news again.
@@ -4804,7 +4837,7 @@ mod tests {
             ));
         };
         let wait = |lookout: &mut Lookout, call: &str, n: i64| {
-            let handles = json!({"handles": [format!("turn:calc.fix/{n}"), "turn:calc.nope/1"]});
+            let handles = json!({"handles": [format!("calc.fix/{n}"), "calc.nope/1"]});
             let started =
                 json!({"name": "wait", "call_id": call, "arguments": handles.to_string()});
             lookout.event(&ev("calc.lead", 7, "tool_started", started));
@@ -4817,7 +4850,7 @@ mod tests {
         let failed = json!({"call_id": "w1", "failed": true});
         lookout.event(&ev("calc.lead", 7, "tool_completed", failed));
         assert!(lookout.updates.news());
-        assert!(text(lookout.updates.take()).contains("turn:calc.fix/1 completed"));
+        assert!(text(lookout.updates.take()).contains("calc.fix/1 completed"));
         // A wait that returned handed its turns over.
         turn(&mut lookout, 2);
         wait(&mut lookout, "w2", 2);
@@ -4835,22 +4868,22 @@ mod tests {
         wait(&mut lookout, "w3", 3);
         let cancelled = json!({"call_id": "w3", "cancelled": true});
         lookout.event(&ev("calc.lead", 7, "tool_completed", cancelled));
-        assert!(text(lookout.updates.take()).contains("turn:calc.fix/3 completed"));
+        assert!(text(lookout.updates.take()).contains("calc.fix/3 completed"));
         turn(&mut lookout, 4);
         wait(&mut lookout, "w4", 4);
-        // Another turn of the lead's ending (a steer it took, a queued one
-        // stopped) leaves the running turn's wait be.
-        lookout.event(&ev(
+        // A message of the lead's ending in line leaves the running
+        // turn's wait be.
+        lookout.event(&in_line(
             "calc.lead",
             8,
-            "turn_finished",
-            json!({"status": "steered"}),
+            "message_ended",
+            json!({"status": "withdrawn"}),
         ));
         assert!(!lookout.updates.news());
         assert!(lookout.updates.waiting());
         let stopped = json!({"status": "interrupted"});
         lookout.event(&ev("calc.lead", 7, "turn_finished", stopped));
-        assert!(text(lookout.updates.take()).contains("turn:calc.fix/4 completed"));
+        assert!(text(lookout.updates.take()).contains("calc.fix/4 completed"));
     }
 
     #[test]
@@ -4871,8 +4904,8 @@ mod tests {
         assert_eq!(
             texts,
             [
-                "- calc.fix.sub: turn:calc.fix.sub/2 completed, asked by tasks",
-                "- calc.ops: turn:calc.ops/2 completed, asked by tasks",
+                "- calc.fix.sub: calc.fix.sub/2 completed, asked by tasks",
+                "- calc.ops: calc.ops/2 completed, asked by tasks",
             ]
         );
     }
@@ -5309,7 +5342,7 @@ mod tests {
         let told = lookout.updates.take();
         assert_eq!(
             (told.items.iter().map(|l| l.text.as_str())).collect::<Vec<_>>(),
-            ["- calc.fix: turn:calc.fix/1 completed, asked by you"]
+            ["- calc.fix: calc.fix/1 completed, asked by you"]
         );
         // A task that subscribes to agents of its own after its news came:
         // no one's task now.
@@ -5326,7 +5359,7 @@ mod tests {
             "calc.lead",
             1,
             "turn_waiting",
-            json!({"handles": ["turn:calc.fix/2"]}),
+            json!({"handles": ["calc.fix/2"]}),
         ));
         turn(lookout, "calc.fix", 2);
         let finished = json!({"status": "completed"});
@@ -5462,10 +5495,7 @@ mod tests {
         ended(&mut lookout, 2);
         lookout.wake(&client, &woken);
         let prompt = got.recv().await.unwrap()["prompt"].clone();
-        assert!(
-            prompt.as_str().unwrap().contains("turn:calc.fix/1"),
-            "{prompt}"
-        );
+        assert!(prompt.as_str().unwrap().contains("calc.fix/1"), "{prompt}");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(got.try_recv().is_err());
         // The connection dropped before the answer came: what the note
@@ -5480,11 +5510,11 @@ mod tests {
             .map(|l| l.text)
             .collect();
         assert!(
-            told.iter().any(|line| line.contains("turn:calc.fix/1")),
+            told.iter().any(|line| line.contains("calc.fix/1")),
             "{told:?}"
         );
         assert!(
-            told.iter().any(|line| line.contains("turn:calc.fix/2")),
+            told.iter().any(|line| line.contains("calc.fix/2")),
             "{told:?}"
         );
     }
@@ -5530,7 +5560,7 @@ mod tests {
         lookout.wake(&client, &woken);
         let submit = got.recv().await.unwrap();
         assert_eq!(submit["origin"], TASKS_ORIGIN);
-        assert_eq!(submit["quotes"], json!([{"bot": "calc.fix", "turn": 5}]));
+        assert_eq!(submit["quotes"], json!([{"bot": "calc.fix", "message": 5}]));
         assert!(!submit["prompt"].as_str().unwrap().contains("ship it"));
     }
 

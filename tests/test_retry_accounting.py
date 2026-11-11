@@ -42,7 +42,7 @@ class RetryAccountingTests(ModelFixture):
         client = self.client()
         persisted = client.request('turns', bot='Bob')['result']['turns'][0]
         self.assertEqual((persisted['retries'], persisted['paced_ms']), (2, row['paced_ms']))
-        following = client.request('submit', bot='Bob', request_id='next', prompt='hello')['result']['turn']
+        following = client.request('submit', bot='Bob', request_id='next', prompt='hello')['result']['message']
         self.assertEqual(client.finished(following)['data']['status'], 'completed')
         self.assertEqual(client.request('turns', bot='Bob')['result']['turns'][-1]['retries'], 0)
 
@@ -76,7 +76,7 @@ class RetryAccountingTests(ModelFixture):
         self.addCleanup(self.model.release_headers.set)
         client = self.client('wait')
         anchor = self.submit(client, 'Anchor', 'gate')
-        turn = self.submit(client, 'Bob', f'waitretry:turn:Anchor/{anchor}')
+        turn = self.submit(client, 'Bob', f'waitretry:Anchor/{anchor}')
         client.receive(lambda e: e.get('event') == 'turn_waiting' and e.get('turn') == turn)
         # Wait for the parked task to retire and flush its execution segment.
         deadline = time.monotonic() + 2

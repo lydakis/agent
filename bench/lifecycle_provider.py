@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import json
+import re
 from pathlib import Path
 import signal
 
@@ -80,7 +81,6 @@ async def serve(config, stats_path, mode, engine='rust'):
                 assert request['model'] == 'synthetic-model' and request['stream'] and not request.get('previous_response_id')
                 items = request['input']
                 user = [x for x in items if x.get('role') == 'user'][-1]['content'][0]['text']
-                import re
                 match = re.match(r'BENCH agent=(\d+) turn=(\d+)\n', user)
                 assert match
                 agent, turn = map(int, match.groups())
@@ -105,7 +105,13 @@ async def serve(config, stats_path, mode, engine='rust'):
                     del pending[agent]
                 else:
                     assert agent not in pending and turn == turns.get(agent, -1) + 1
-                    assert same(items, expected + [{'role':'user','content':[{'type':'input_text','text':prompt(config,agent,turn)}]}])
+                    words = [{'type':'input_text','text':prompt(config,agent,turn)}]
+                    if engine == 'rust':
+                        # Agent adds the message's number after its words.
+                        line = items[-1]['content'][-1]
+                        assert line['type'] == 'input_text' and re.fullmatch(r'\[Message \S+/\d+\.\]', line['text'])
+                        words.append(line)
+                    assert same(items, expected + [{'role':'user','content':words}])
                 stats['requests'] += 1
                 stats['request_body_bytes'] += size
                 stats['active'] += 1

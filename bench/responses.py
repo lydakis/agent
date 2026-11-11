@@ -7,6 +7,9 @@ def prompt(config, agent, turn):
     return f"BENCH agent={agent} turn={turn}\n" + "x" * config["history_bytes"]
 
 
+MESSAGE_LINE = re.compile(r"\[Message \S+/\d+[.,][^\]]*\]")
+
+
 class Transcript:
     """Reject retries, missing context, cross-agent context and overlapping turns."""
 
@@ -27,8 +30,11 @@ class Transcript:
             if item.get("type", "message") != "message":
                 raise ValueError("only text messages supported")
             role, content = item.get("role"), item.get("content", [])
+            # A user message's own words, without the number Agent adds
+            # after them.
             text = content if isinstance(content, str) else "".join(
-                part.get("text", "") for part in content)
+                part.get("text", "") for part in content
+                if not (role == "user" and MESSAGE_LINE.fullmatch(part.get("text", ""))))
             if role == "assistant" or (role == "user" and text.startswith("BENCH agent=")):
                 conversation.append((role, text))
         if not conversation or conversation[-1][0] != "user":

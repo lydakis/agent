@@ -78,7 +78,7 @@ def run(binary, out, items, context_bytes, context_items):
         return Client(binary, store, url, 'echo,history', settings=settings)
 
     def turn(c, bot, request_id, prompt):
-        turn_id = c.request('submit', bot=bot, request_id=request_id, prompt=prompt, workspace=str(out))['result']['turn']
+        turn_id = c.request('submit', bot=bot, request_id=request_id, prompt=prompt, workspace=str(out))['result']['message']
         finished = c.receive(lambda m: m.get("event") == "turn_finished" and m.get("turn") == turn_id, timeout=60)
         assert finished['data']['status'] == 'completed', finished
         c.saved.clear()  # the controller keeps no per-turn events; this measures the daemon

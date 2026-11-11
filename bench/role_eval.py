@@ -976,10 +976,10 @@ def messages(home, out):
         return
     db = sqlite3.connect(f'file:{store}?mode=ro', uri=True)
     # A long message lives in its history node, as the store reads it.
-    rows = db.execute("SELECT t.bot, t.from_bot, t.from_turn, CASE WHEN t.prompt_node IS NULL THEN t.prompt "
-                      "ELSE json_extract(CAST(n.item AS TEXT), '$.content[0].text') END "
-                      "FROM turns t LEFT JOIN nodes n ON n.id = t.prompt_node "
-                      "WHERE t.from_bot IS NOT NULL ORDER BY t.id").fetchall()
+    rows = db.execute("SELECT m.bot, m.from_bot, m.from_turn, CASE WHEN m.text = '' AND m.node IS NOT NULL "
+                      "THEN json_extract(CAST(n.item AS TEXT), '$.content[0].text') ELSE m.text END "
+                      "FROM messages m LEFT JOIN nodes n ON n.id = m.node "
+                      "WHERE m.from_bot IS NOT NULL ORDER BY m.id").fetchall()
     lines = [f"### {sender}/{turn} -> {bot}\n\n{(prompt or '').strip()[:1200]}\n" for bot, sender, turn, prompt in rows]
     (out / 'messages.md').write_text('\n'.join(lines) or '(none)\n')
 

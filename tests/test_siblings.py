@@ -20,21 +20,21 @@ class SiblingTests(ModelFixture):
             client.request('create', bot=bot, workspace=str(self.path))
         turns = []
         for n, prompt in enumerate(('first look', 'second look')):
-            turns.append(client.request('submit', bot='Ann', request_id=str(n), prompt=prompt)['result']['turn'])
+            turns.append(client.request('submit', bot='Ann', request_id=str(n), prompt=prompt)['result']['message'])
             self.assertEqual(client.finished(turns[-1])['data']['status'], 'completed')
         self.model.call_script = [('history', {'bot': 'Ann'}), ('history', {'bot': 'Ann', 'turn': 1}),
                                   ('history', {'bot': 'Nobody'}), ('history', {}),
-                                  ('history', {'handle': f'turn:Ann/{turns[1]}'}),
-                                  ('history', {'handle': 'turn:Ann/999999'}),
-                                  ('history', {'handle': f'turn:Ann/{turns[1]}', 'bot': 'Ann'})]
-        turn = client.request('submit', bot='Bob', request_id='b', prompt='script')['result']['turn']
+                                  ('history', {'handle': f'Ann/{turns[1]}'}),
+                                  ('history', {'handle': 'Ann/999999'}),
+                                  ('history', {'handle': f'Ann/{turns[1]}', 'bot': 'Ann'})]
+        turn = client.request('submit', bot='Bob', request_id='b', prompt='script')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         # Newest first, numbered as Ann's history numbers them.
         listed = self.output(client, 'Bob', 'script-0')
         self.assertEqual(listed['bot'], 'Ann')
         self.assertEqual([(t['turn'], t['handle'], t['status'], t['prompt']) for t in listed['turns']],
-                         [(2, f'turn:Ann/{turns[1]}', 'completed', 'second look'),
-                          (1, f'turn:Ann/{turns[0]}', 'completed', 'first look')])
+                         [(2, f'Ann/{turns[1]}', 'completed', 'second look'),
+                          (1, f'Ann/{turns[0]}', 'completed', 'first look')])
         page = self.output(client, 'Bob', 'script-1')
         self.assertEqual((page['turn'], page['done']), (1, True))
         self.assertIn('first look', page['text'])

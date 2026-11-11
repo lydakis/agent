@@ -58,10 +58,11 @@ class PerfGateTests(unittest.TestCase):
     def test_a_turn_counts_as_told_only_once_its_note_reaches_the_lead(self):
         class Control:
             def many(self, requests):
-                return [{'result': {'turns': replies[r[1]['bot']]}} for r in requests]
+                return [{'result': {r[0]: replies[r[1]['bot']]}} for r in requests]
         replies = {'t1': [{'turn': 1, 'finished_ms': 100}], 't2': [{'turn': 1, 'finished_ms': 100}],
-                   # Only the note about t1 became a turn of the lead's.
-                   'lead': [{'request_id': 'lookout-a', 'started_ms': 400}]}
+                   # Only the note about t1 opened a turn of the lead's.
+                   'lead': [{'message': 7, 'turn': 7, 'request_id': 'lookout-a', 'started_ms': 400},
+                            {'message': 8, 'turn': None, 'request_id': 'lookout-b'}]}
         bench = Bench.__new__(Bench)
         bench.args = type('Args', (), {'tasks': 2})()
         bench.control = Control()

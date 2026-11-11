@@ -59,7 +59,7 @@ class DaemonTests(ModelFixture):
             try:
                 client = Client(self.binary, root/'state.db', f'http://127.0.0.1:{model.server_port}/v1', 'read,write,edit')
                 client.request('create', bot='Bob', workspace=str(root))
-                turn = client.request('submit', bot='Bob', request_id='fifo', prompt='inspect the files')['result']['turn']
+                turn = client.request('submit', bot='Bob', request_id='fifo', prompt='inspect the files')['result']['message']
                 terminal = client.finished(turn)
                 self.assertEqual(terminal['data']['status'], 'completed')
                 events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
@@ -115,7 +115,7 @@ class DaemonTests(ModelFixture):
             try:
                 client = Client(self.binary, root/'state.db', f'http://127.0.0.1:{model.server_port}/v1', 'apply_patch')
                 client.request('create', bot='Bob', workspace=str(root))
-                turn = client.request('submit', bot='Bob', request_id='patch', prompt='patch it')['result']['turn']
+                turn = client.request('submit', bot='Bob', request_id='patch', prompt='patch it')['result']['message']
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
                 # Off OpenAI's own API, declared as a function taking the
                 # patch: other endpoints refuse custom tools.
@@ -142,7 +142,7 @@ class DaemonTests(ModelFixture):
         self.addCleanup(client.close)
         for bot in ('Alice', 'Bob'):
             client.request('create', bot=bot, workspace=str(self.path))
-        first = client.request('submit', bot='Alice', request_id='a', prompt='hi')['result']['turn']
+        first = client.request('submit', bot='Alice', request_id='a', prompt='hi')['result']['message']
         client.finished(first)
         # A controller follows `*` from a store-wide cursor: replay covers
         # both bots in cursor order, then live events for any bot arrive.
@@ -153,7 +153,7 @@ class DaemonTests(ModelFixture):
         self.assertEqual([e['bot'] for e in everyone.durable if e['event'] == 'created'], ['Alice', 'Bob'])
         self.assertTrue(any(e['event'] == 'turn_finished' and e['bot'] == 'Alice' for e in everyone.durable))
         self.assertEqual(live['bot'], '*')
-        second = client.request('submit', bot='Bob', request_id='b', prompt='hi')['result']['turn']
+        second = client.request('submit', bot='Bob', request_id='b', prompt='hi')['result']['message']
         finished = everyone.receive(lambda e: e.get('event') == 'turn_finished' and e.get('turn') == second)
         self.assertEqual(finished['bot'], 'Bob')
         # Cursors are store-wide, so a reconnect resumes from the last one seen.
@@ -207,7 +207,7 @@ class DaemonTests(ModelFixture):
         client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
         self.addCleanup(client.close)
         client.request('create', bot='Alice', workspace=str(self.path))
-        first = client.request('submit', bot='Alice', request_id='a', prompt='hi')['result']['turn']
+        first = client.request('submit', bot='Alice', request_id='a', prompt='hi')['result']['message']
         client.finished(first)
         # A controller that reads only how turns end leaves the rest, the
         # streamed text most of all, out of its queue, in replay and live.
@@ -217,7 +217,7 @@ class DaemonTests(ModelFixture):
         self.assertEqual(following['kinds'], ['turn_finished'])
         ends.receive(lambda e: e.get('event') == 'follow_live')
         self.assertEqual([(e['event'], e['turn']) for e in ends.durable], [('turn_finished', first)])
-        second = client.request('submit', bot='Alice', request_id='b', prompt='hi')['result']['turn']
+        second = client.request('submit', bot='Alice', request_id='b', prompt='hi')['result']['message']
         ends.receive(lambda e: e.get('event') == 'turn_finished' and e.get('turn') == second)
         kinds = {e.get('event') for e in ends.saved + ends.durable if 'bot' in e}
         self.assertEqual(kinds - {'follow_live'}, {'turn_finished'})
@@ -228,7 +228,7 @@ class DaemonTests(ModelFixture):
         client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
         self.addCleanup(client.close)
         client.request('create', bot='Alice', workspace=str(self.path))
-        first = client.request('submit', bot='Alice', request_id='a', prompt='hi')['result']['turn']
+        first = client.request('submit', bot='Alice', request_id='a', prompt='hi')['result']['message']
         client.finished(first)
         history = client.request('events', bot='Alice', after=0, limit=256)['result']['events']
         # A rare kind, written first: everything the turn wrote follows it.
@@ -243,7 +243,7 @@ class DaemonTests(ModelFixture):
         sky.request('follow', bot='*', after=live['cursor'], kinds=['created', 'turn_started', 'turn_finished'])
         sky.receive(lambda e: e.get('event') == 'follow_live')
         self.assertEqual([e['event'] for e in sky.durable], ['created'])
-        second = client.request('submit', bot='Alice', request_id='b', prompt='hi')['result']['turn']
+        second = client.request('submit', bot='Alice', request_id='b', prompt='hi')['result']['message']
         sky.receive(lambda e: e.get('event') == 'turn_finished' and e.get('turn') == second)
         self.assertEqual({e['turn'] for e in sky.durable if e['event'] != 'created'}, {second})
 
@@ -251,7 +251,7 @@ class DaemonTests(ModelFixture):
         client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
         self.addCleanup(client.close)
         client.request('create', bot='Alice', workspace=str(self.path))
-        first = client.request('submit', bot='Alice', request_id='a', prompt='hi')['result']['turn']
+        first = client.request('submit', bot='Alice', request_id='a', prompt='hi')['result']['message']
         client.finished(first)
         everything = Connection(client.socket_path)
         self.addCleanup(everything.close)
@@ -261,7 +261,7 @@ class DaemonTests(ModelFixture):
         self.assertEqual(times, sorted(times))
         # Every event from the second turn's first on, and none before it.
         time.sleep(0.01)
-        second = client.request('submit', bot='Alice', request_id='b', prompt='hi')['result']['turn']
+        second = client.request('submit', bot='Alice', request_id='b', prompt='hi')['result']['message']
         client.finished(second)
         later = client.request('events', bot='Alice', after=0, limit=256)['result']['events']
         since = next(e['written_ms'] for e in later if e['turn'] == second)
@@ -320,7 +320,7 @@ class DaemonTests(ModelFixture):
         self.addCleanup(watcher.close)
         watcher.request('follow', bot='Ann', after=0)
         watcher.receive(lambda e: e.get('event') == 'follow_live')
-        first = client.request('submit', bot='Ann', request_id='one', prompt='gate')['result']['turn']
+        first = client.request('submit', bot='Ann', request_id='one', prompt='gate')['result']['message']
         self.model.requests.get(timeout=3)
         # Accepted while the turn runs: kept, said, and nothing changes yet.
         kept = client.request('configure', bot='Ann', instructions='new', model='openai/other',
@@ -353,7 +353,7 @@ class DaemonTests(ModelFixture):
         ann = client.request('inspect', bot='Ann')['result']
         self.assertEqual((ann['settings'].get('rules'), ann['configure_pending']), (None, later['configure_pending']))
         queued = client.request('submit', bot='Ann', request_id='two', prompt='again',
-                                delivery='queue')['result']['turn']
+                                delivery='queue')['result']['message']
         self.model.release_headers.set()
         client.finished(first)
         # The turn queued behind it starts on what was kept.
@@ -384,7 +384,7 @@ class DaemonTests(ModelFixture):
         started = [r['result'] for r in replies[8:16]]
         self.assertEqual([s['duplicate'] for s in started], [False] * 8)
         self.assertEqual(replies[16]['result']['duplicate'], True)
-        self.assertEqual(replies[16]['result']['turn'], started[0]['turn'])
+        self.assertEqual(replies[16]['result']['message'], started[0]['message'])
         self.assertEqual(replies[17]['result']['store']['operations']['begin']['count'], 9)
         # The same submission from several clients at once runs once.
         clients = [Connection(client.socket_path) for _ in range(4)]
@@ -395,11 +395,11 @@ class DaemonTests(ModelFixture):
             connection.socket.sendall(line.encode())
         answers = [c.receive(lambda e: e.get('id') == 1)['result'] for c in clients]
         self.assertEqual(sorted(a['duplicate'] for a in answers), [False, True, True, True])
-        self.assertEqual({a['turn'] for a in answers}, {answers[0]['turn']})
+        self.assertEqual({a['message'] for a in answers}, {answers[0]['message']})
         everyone = Connection(client.socket_path)
         self.addCleanup(everyone.close)
         everyone.request('follow', bot='*', after=0)
-        for turn in {s['turn'] for s in started} | {answers[0]['turn']}:
+        for turn in {s['message'] for s in started} | {answers[0]['message']}:
             self.assertEqual(everyone.finished(turn)['data']['status'], 'completed')
         self.assertEqual(len([e for e in everyone.durable if e['event'] == 'turn_finished']), 9)
 
@@ -430,7 +430,7 @@ class DaemonTests(ModelFixture):
         self.addCleanup(self.model.release_headers.set)
         client = self.client(extra=('--provider', f'other=responses,{self.url}'))
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='one', prompt='gate')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='one', prompt='gate')['result']['message']
         self.model.requests.get(timeout=3)
         stats = client.request('stats')['result']
         self.assertEqual(sum(stats['transport']['in_flight_by_shard']), 1)

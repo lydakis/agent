@@ -29,30 +29,29 @@ class DeliveryTests(ModelFixture):
         client = self.client(extra=('--max-active', '1'), settings={'keep_turns': 1})
         for bot in ('Alice', 'Bob'):
             client.request('create', bot=bot, workspace=str(self.path))
-        first = client.request('submit', bot='Alice', request_id='a', prompt='gate')['result']['turn']
+        first = client.request('submit', bot='Alice', request_id='a', prompt='gate')['result']['message']
         self.model.requests.get(timeout=3)
         queued = [client.request('submit', bot='Bob', request_id=str(n), prompt='queued',
-                                 delivery='queue')['result']['turn'] for n in range(8)]
+                                 delivery='queue')['result']['message'] for n in range(8)]
         # Finish the oldest last: its captured outcome must still reach an
         # existing waiter even though this completion prunes its own result.
-        handle = f'turn:Bob/{queued[0]}'
+        handle = f'Bob/{queued[0]}'
         client.next_id += 1
         wait_id = client.next_id
         client.process.stdin.write(json.dumps({'id': wait_id, 'op': 'wait', 'handles': [handle]}) + '\n')
         client.process.stdin.flush()
         for turn in reversed(queued):
             client.request('interrupt', bot='Bob', turn=turn)
-            self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
+            self.assertEqual(client.finished(turn)['data']['status'], 'withdrawn')
         waited = client.receive(lambda m: m.get('id') == wait_id)
-        self.assertEqual(waited['result']['results'][handle]['status'], 'interrupted')
-        # A completion never prunes its own records: the last cancellation's
-        # terminal event is published and replayable until the next pass,
-        # alongside the one retention keeps. Its pass could prune the six
-        # turns between them and removes one piece, the oldest four.
-        self.assertEqual(poll(client, 'Bob', queued[0])['result']['status'], 'interrupted')
-        self.assertEqual(poll(client, 'Bob', queued[1])['error'], 'turn_result_pruned')
-        terminal = [e for e in self.events(client, 'Bob') if e['event'] == 'turn_finished']
-        self.assertEqual([e['turn'] for e in terminal], [queued[-1], queued[-2], queued[-3], queued[0]])
+        self.assertEqual(waited['result']['results'][handle]['status'], 'withdrawn')
+        # A message withdrawn in line ran no turn, so retention has nothing
+        # of it to prune: each still reads as withdrawn, and each ending is
+        # published and replayable.
+        for message in queued:
+            self.assertEqual(poll(client, 'Bob', message)['result']['status'], 'withdrawn')
+        terminal = [e for e in self.events(client, 'Bob') if e['event'] == 'message_ended']
+        self.assertEqual([e['message'] for e in terminal], queued[::-1])
         self.assertEqual(client.request('stats')['result']['queued_turns'], 0)
         self.model.release_headers.set()
         client.finished(first)
@@ -63,10 +62,10 @@ class DeliveryTests(ModelFixture):
         requested.mkdir()
         client = self.client('echo,shell')
         client.request('create', bot='Bob', workspace=str(original))
-        first = client.request('submit', bot='Bob', request_id='a', prompt='shell:sleep .3')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='a', prompt='shell:sleep .3')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == first)
         steer = client.request('submit', bot='Bob', request_id='b', prompt='bg:pwd',
-                               workspace=str(requested), delivery='steer')['result']['turn']
+                               workspace=str(requested), delivery='steer')['result']['message']
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
         self.assertEqual(client.finished(steer)['data']['status'], 'completed')
         text = poll(client, 'Bob', steer)['result']['text']
@@ -88,21 +87,21 @@ class DeliveryTests(ModelFixture):
                 self.model.request_gates.put(first_gate)
                 self.model.request_gates.put(final_gate)
                 client.request('create', bot=bot, workspace=str(self.path))
-                turn = client.request('submit', bot=bot, request_id='active', prompt='tool:hello')['result']['turn']
+                turn = client.request('submit', bot=bot, request_id='active', prompt='tool:hello')['result']['message']
                 self.model.requests.get(timeout=3)
                 blocker = client.request('submit', bot=bot, request_id='blocker', prompt='not here',
-                                         delivery='steer', **override)['result']['turn']
+                                         delivery='steer', **override)['result']['message']
                 correction = client.request('submit', bot=bot, request_id='correction', prompt='corrected',
-                                            delivery='steer', expected_turn=turn)['result']['turn']
+                                            delivery='steer', expected_turn=turn)['result']['message']
                 first_gate.set()
                 # The post-tool boundary encountered the incompatible head.
                 # The final response stays held until that blocker is gone.
                 second = self.model.requests.get(timeout=3)
                 self.assertEqual(second['input'][-1]['type'], 'function_call_output')
-                self.assertEqual(client.request('interrupt', bot=bot, turn=blocker)['result']['status'], 'interrupted')
+                self.assertEqual(client.request('interrupt', bot=bot, turn=blocker)['result']['status'], 'withdrawn')
                 final_gate.set()
                 outcome = client.finished(correction)['data']
-                self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn))
+                self.assertEqual((outcome['status'], outcome.get('turn')), ('taken', turn))
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
                 third = self.model.requests.get(timeout=3)
                 self.assertEqual(third['input'][-1]['content'][0]['text'], 'corrected')
@@ -127,7 +126,7 @@ class DeliveryTests(ModelFixture):
         active = {}
         for bot in ('Bob', 'Changed', 'Cancelled'):
             active[bot] = client.request('submit', bot=bot, request_id='active', prompt='gate',
-                                         model='other/synthetic-model')['result']['turn']
+                                         model='other/synthetic-model')['result']['message']
             self.model.requests.get(timeout=3)
         # Inheritance applies only to steers eligible for the running turn.
         for bot, overrides in [('Idle', {}), ('Bob', {'workspace': str(elsewhere)}),
@@ -144,26 +143,26 @@ class DeliveryTests(ModelFixture):
         steers = {}
         for bot in active:
             steers[bot] = client.request('submit', bot=bot, request_id='steer', prompt='continue',
-                                         delivery='steer', workspace=str(self.path) if bot == 'Bob' else None)['result']['turn']
+                                         delivery='steer', workspace=str(self.path) if bot == 'Bob' else None)['result']['message']
         # Cancellation makes this steer start alone, where the default is invalid.
         head = client.request('inspect', bot='Cancelled')['result']['head']
         client.request('interrupt', bot='Cancelled', turn=active['Cancelled'])
         self.assertEqual(client.finished(active['Cancelled'])['data']['status'], 'interrupted')
         # A provider the config lacks is the person's to fix: the steer is
         # held in line on it, not ended, and its words wait outside history.
-        held = client.receive(lambda e: e.get('event') == 'turn_held' and e.get('turn') == steers['Cancelled'])
+        held = client.receive(lambda e: e.get('event') == 'held' and e.get('message') == steers['Cancelled'])
         self.assertEqual(held['data']['blocked']['code'], 'provider_unavailable')
-        view = client.request('turns', bot='Cancelled', after=active['Cancelled'])['result']['turns'][0]
+        view = client.request('messages', bot='Cancelled', after=active['Cancelled'])['result']['messages'][0]
         self.assertEqual((view['status'], view['waiting_on']['blocked']['code']), ('ready', 'provider_unavailable'))
         self.assertEqual(client.request('inspect', bot='Cancelled')['result']['head'], head)
         client.request('interrupt', bot='Cancelled', turn=steers['Cancelled'])
-        self.assertEqual(client.finished(steers['Cancelled'])['data']['status'], 'interrupted')
+        self.assertEqual(client.finished(steers['Cancelled'])['data']['status'], 'withdrawn')
         self.model.release_headers.set()
         for bot in ('Bob', 'Changed'):
-            self.assertEqual(client.finished(steers[bot])['data']['status'], 'steered')
+            self.assertEqual(client.finished(steers[bot])['data']['status'], 'taken')
             self.assertEqual(client.finished(active[bot])['data']['status'], 'completed')
             self.assertEqual(poll(client, bot, active[bot])['result']['text'], 'reply:continue')
-        self.assertEqual(client.finished(notes['Changed']['turn'])['data']['into'], active['Changed'])
+        self.assertEqual(client.finished(notes['Changed']['message'])['data']['turn'], active['Changed'])
 
     def test_multiple_steer_batches_are_delivered_in_order(self):
         import threading
@@ -172,13 +171,13 @@ class DeliveryTests(ModelFixture):
         self.model.all_streaming.set()
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
-        first = client.request('submit', bot='Bob', request_id='a', prompt='gate')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='a', prompt='gate')['result']['message']
         self.model.requests.get(timeout=3)  # Hold the first call until all steers are durable.
         steers = [client.request('submit', bot='Bob', request_id=str(n), prompt=f'steer-{n}',
-                                 delivery='steer')['result']['turn'] for n in range(70)]
+                                 delivery='steer')['result']['message'] for n in range(70)]
         self.model.release_headers.set()
         for turn in steers:
-            self.assertEqual(client.finished(turn)['data']['status'], 'steered')
+            self.assertEqual(client.finished(turn)['data']['status'], 'taken')
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
         self.assertEqual(poll(client, 'Bob', first)['result']['text'], 'reply:steer-69')
         requests = []
@@ -190,13 +189,13 @@ class DeliveryTests(ModelFixture):
     def test_interrupt_queued_work_while_the_bot_is_running(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
-        first = client.request('submit', bot='Bob', request_id='a', prompt='wait')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='a', prompt='wait')['result']['message']
         for delivery in ('queue', 'steer'):
             pending = client.request('submit', bot='Bob', request_id=delivery,
-                                     prompt='unwanted', delivery=delivery)['result']['turn']
+                                     prompt='unwanted', delivery=delivery)['result']['message']
             reply = client.request('interrupt', bot='Bob', turn=pending)
-            self.assertEqual(reply['result']['status'], 'interrupted')
-            self.assertEqual(client.finished(pending)['data']['status'], 'interrupted')
+            self.assertEqual(reply['result']['status'], 'withdrawn')
+            self.assertEqual(client.finished(pending)['data']['status'], 'withdrawn')
         self.assertEqual(client.request('inspect', bot='Bob')['result']['running_turn'], first)
         self.assertEqual(client.request('interrupt', bot='Bob', turn=999)['error'], 'turn_not_found')
         client.request('interrupt', bot='Bob', turn=first)
@@ -205,13 +204,13 @@ class DeliveryTests(ModelFixture):
     def test_interrupt_parked_turn_dispatches_its_successor(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        first = client.request('submit', bot='Bob', request_id='a', prompt='bgwait:sleep 2')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='a', prompt='bgwait:sleep 2')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == first)
         deadline = time.monotonic() + 3
         while client.request('stats')['result']['active_turns']:
             self.assertLess(time.monotonic(), deadline)
         successor = client.request('submit', bot='Bob', request_id='b', prompt='successor',
-                                   delivery='queue')['result']['turn']
+                                   delivery='queue')['result']['message']
         self.assertEqual(client.request('interrupt', bot='Bob', turn=first)['result']['status'], 'interrupted')
         self.assertEqual(client.finished(successor)['data']['status'], 'completed')
         self.assertEqual(poll(client, 'Bob', successor)['result']['text'], 'reply:successor')
@@ -219,16 +218,16 @@ class DeliveryTests(ModelFixture):
     def test_retention_preserves_completion_with_queued_and_steered_work(self):
         client = self.client(settings={'keep_turns': 1})
         client.request('create', bot='Bob', workspace=str(self.path))
-        first = client.request('submit', bot='Bob', request_id='a', prompt='slow')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='a', prompt='slow')['result']['message']
         successor = client.request('submit', bot='Bob', request_id='b', prompt='next',
-                                   delivery='queue')['result']['turn']
+                                   delivery='queue')['result']['message']
         self.assertEqual(client.request('prune', bot='Bob', keep_turns=1)['result']['events'], 0)
         for turn in (first, successor):
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        first = client.request('submit', bot='Bob', request_id='c', prompt='slow')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='c', prompt='slow')['result']['message']
         steer = client.request('submit', bot='Bob', request_id='d', prompt='steering',
-                               delivery='steer')['result']['turn']
-        self.assertEqual(client.finished(steer)['data']['status'], 'steered')
+                               delivery='steer')['result']['message']
+        self.assertEqual(client.finished(steer)['data']['status'], 'taken')
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
         self.assertEqual(client.request('stats')['result']['queued_turns'], 0)
 
@@ -236,7 +235,7 @@ class DeliveryTests(ModelFixture):
         client = self.client(extra=('--max-pending', '2', '--max-pending-bytes', '64'))
         for bot in ('Bob', 'Ann'):
             client.request('create', bot=bot, workspace=str(self.path))
-        first = client.request('submit', bot='Bob', request_id='1', prompt='slow')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='1', prompt='slow')['result']['message']
         for n in ('2', '3'):
             self.assertEqual(client.request('submit', bot='Bob', request_id=n, prompt='x' * 20,
                                             delivery='queue')['result']['status'], 'queued')
@@ -254,9 +253,9 @@ class DeliveryTests(ModelFixture):
         for turn in (first,):
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         # Once the line drains, the bytes bound is the next thing in the way.
-        client.request('wait', handles=[f'turn:Bob/{first + 1}', f'turn:Bob/{first + 2}'], timeout_ms=10000)
+        client.request('wait', handles=[f'Bob/{first + 1}', f'Bob/{first + 2}'], timeout_ms=10000)
         self.assertEqual(client.request('stats')['result']['queued_turns'], 0)
-        blocker = client.request('submit', bot='Bob', request_id='5', prompt='slow')['result']['turn']
+        blocker = client.request('submit', bot='Bob', request_id='5', prompt='slow')['result']['message']
         big = client.request('submit', bot='Bob', request_id='6', prompt='y' * 65, delivery='queue')
         self.assertEqual(big['error'], 'pending_limit')
         self.assertIn('bound of 64', big['detail'])
@@ -273,12 +272,12 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(refused['error'], 'bot_busy')
         # The refusal says what is in the way and which requests get past it.
         self.assertEqual(refused['detail'],
-                         f"turn {first['turn']} is running; submit with delivery \"steer\" and "
-                         f"expected_turn {first['turn']} to add this to it, or delivery \"queue\" "
+                         f"turn {first['message']} is running; submit with delivery \"steer\" and "
+                         f"expected_turn {first['message']} to add this to it, or delivery \"queue\" "
                          "to run it afterwards; to ask without interrupting, fork this bot and "
                          "submit to the fork")
         # The same facts for programs, as of the refusal.
-        self.assertEqual(refused['running_turn'], first['turn'])
+        self.assertEqual(refused['running_turn'], first['message'])
         self.assertIsInstance(refused['fork_point'], int)
         unknown = client.request('submit', bot='Bob', request_id='x', prompt='never', delivery='later')
         self.assertEqual((unknown['error'], unknown['detail'], unknown['deliveries']),
@@ -287,38 +286,38 @@ class DeliveryTests(ModelFixture):
         second = client.request('submit', bot='Bob', request_id='2', prompt='second', delivery='queue')['result']
         third = client.request('submit', bot='Bob', request_id='3', prompt='third', delivery='queue')['result']
         self.assertEqual((second['status'], third['status']), ('queued', 'queued'))
-        self.assertEqual(poll(client, 'Bob', second['turn'])['result'], {'turn': second['turn'], 'finished': False})
-        listed = client.request('turns', bot='Bob', after=first['turn'], limit=2)['result']['turns']
-        self.assertEqual([t['status'] for t in listed], ['queued', 'queued'])
+        self.assertEqual(poll(client, 'Bob', second['message'])['result'], {'message': second['message'], 'finished': False})
+        listed = client.request('messages', bot='Bob', after=first['message'], limit=2)['result']['messages']
+        self.assertEqual([m['status'] for m in listed], ['queued', 'queued'])
         retry = client.request('submit', bot='Bob', request_id='2', prompt='second', delivery='queue')['result']
-        self.assertEqual((retry['turn'], retry['duplicate'], retry['status']), (second['turn'], True, 'queued'))
+        self.assertEqual((retry['message'], retry['duplicate'], retry['status']), (second['message'], True, 'queued'))
         self.assertEqual(client.request('stats')['result']['queued_turns'], 2)
-        for turn in (first['turn'], second['turn'], third['turn']):
+        for turn in (first['message'], second['message'], third['message']):
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        kinds = [(e['turn'], e['event']) for e in self.events(client, 'Bob')
+        kinds = [(e['turn'] or e['message'], e['event']) for e in self.events(client, 'Bob')
                  if e['event'] in ('accepted', 'queued', 'turn_finished')]
         self.assertEqual(kinds, [
-            (first['turn'], 'accepted'), (second['turn'], 'queued'), (third['turn'], 'queued'),
-            (first['turn'], 'turn_finished'), (second['turn'], 'accepted'), (second['turn'], 'turn_finished'),
-            (third['turn'], 'accepted'), (third['turn'], 'turn_finished')])
+            (first['message'], 'accepted'), (second['message'], 'queued'), (third['message'], 'queued'),
+            (first['message'], 'turn_finished'), (second['message'], 'accepted'), (second['message'], 'turn_finished'),
+            (third['message'], 'accepted'), (third['message'], 'turn_finished')])
         listed = client.request('turns', bot='Bob', after=0)['result']['turns']
         self.assertEqual([t['delivery'] for t in listed], ['reject', 'queue', 'queue'])
-        self.assertEqual(poll(client, 'Bob', third['turn'])['result']['text'], 'reply:third')
+        self.assertEqual(poll(client, 'Bob', third['message'])['result']['text'], 'reply:third')
 
     def test_steer_joins_the_running_turn_at_its_next_round_boundary(self):
         client = self.client('echo,shell')
         client.request('create', bot='Bob', workspace=str(self.path))
-        first = client.request('submit', bot='Bob', request_id='1', prompt='shell:sleep .4')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='1', prompt='shell:sleep .4')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == first)
         steer = client.request('submit', bot='Bob', request_id='s', prompt='from-steer', delivery='steer')['result']
         self.assertEqual(steer['status'], 'queued')
         client.process.stdin.write(json.dumps({'id': 'w', 'op': 'wait', 'handles': [steer['handle']]}) + '\n')
         client.process.stdin.flush()
-        done = client.finished(steer['turn'])['data']
-        self.assertEqual((done['status'], done['into']), ('steered', first))
+        done = client.finished(steer['message'])['data']
+        self.assertEqual((done['status'], done['turn']), ('taken', first))
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
         answered = client.receive(lambda m: m.get('id') == 'w')['result']['results'][steer['handle']]
-        self.assertEqual((answered['status'], answered['into']), ('steered', first))
+        self.assertEqual((answered['status'], answered['turn']), ('taken', first))
         # The model saw the steer after the shell result, and answered it.
         requests = []
         while not self.model.requests.empty():
@@ -331,7 +330,7 @@ class DeliveryTests(ModelFixture):
         # On an idle bot a steer is an ordinary turn.
         idle = client.request('submit', bot='Bob', request_id='s2', prompt='alone', delivery='steer')['result']
         self.assertEqual(idle['status'], 'running')
-        self.assertEqual(client.finished(idle['turn'])['data']['status'], 'completed')
+        self.assertEqual(client.finished(idle['message'])['data']['status'], 'completed')
 
     def test_compaction_fires_at_the_threshold_and_replaces_older_turns_with_a_summary(self):
         client = self.client('echo,history', settings={'context_bytes': 4096, 'compact_at': 50, 'compact_keep': 25})
@@ -341,7 +340,7 @@ class DeliveryTests(ModelFixture):
         turns = {}
         for bot in ('Bob', 'Plain'):
             for n, prompt in enumerate(prompts):
-                turn = client.request('submit', bot=bot, request_id=str(n), prompt=prompt)['result']['turn']
+                turn = client.request('submit', bot=bot, request_id=str(n), prompt=prompt)['result']['message']
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
                 turns[(bot, n)] = turn
         compacted = [e for e in self.events(client, 'Bob') if e['event'] == 'compacted']
@@ -380,7 +379,7 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(bob['compaction_instructions'], 'Summarize the conversation.')
         # The transcript is intact: history reads a covered turn; a fork before
         # the compaction has none; a fork at the head inherits it.
-        read = client.request('submit', bot='Bob', request_id='h', prompt='history:1')['result']['turn']
+        read = client.request('submit', bot='Bob', request_id='h', prompt='history:1')['result']['message']
         self.assertEqual(client.finished(read)['data']['status'], 'completed')
         self.assertIn('Task 1: 111', self.tool_output(client, 'Bob', 'history-1'))
         page = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
@@ -398,7 +397,7 @@ class DeliveryTests(ModelFixture):
     def test_carry_forward_note_is_pinned_versioned_and_inherited_by_forks(self):
         client = self.client('echo,note')
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='note:Rule: end every file with the marker.')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='note:Rule: end every file with the marker.')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         completed = [e for e in self.events(client, 'Bob') if e['event'] == 'tool_completed'][-1]
         version = completed['data']['note']
@@ -407,7 +406,7 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(json.loads(node_item(client, 'Bob', version)['result']['output']),
                          {'bytes': 37, 'cleared': False})
         # The next request carries the note ahead of the window, before the prompt.
-        second = client.request('submit', bot='Bob', request_id='2', prompt='hello')['result']['turn']
+        second = client.request('submit', bot='Bob', request_id='2', prompt='hello')['result']['message']
         self.assertEqual(client.finished(second)['data']['status'], 'completed')
         while not self.model.requests.empty():
             request = self.model.requests.get()
@@ -416,16 +415,16 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(texts[-1], 'hello')
         checkpoint = client.request('inspect', bot='Bob')['result']['head']
         # A rewrite is a new version; a fork at the earlier checkpoint keeps the old one.
-        third = client.request('submit', bot='Bob', request_id='3', prompt='note:Rule v2.')['result']['turn']
+        third = client.request('submit', bot='Bob', request_id='3', prompt='note:Rule v2.')['result']['message']
         client.finished(third)
         later = client.request('inspect', bot='Bob')['result']['note']
         self.assertGreater(later, version)
         client.request('fork', source='Bob', checkpoint=checkpoint, bot='Early', workspace=str(self.path))
         self.assertEqual(client.request('inspect', bot='Early')['result']['note'], version)
         # Empty text clears it: the next request has no pinned note.
-        cleared = client.request('submit', bot='Bob', request_id='4', prompt='note:')['result']['turn']
+        cleared = client.request('submit', bot='Bob', request_id='4', prompt='note:')['result']['message']
         client.finished(cleared)
-        after = client.request('submit', bot='Bob', request_id='5', prompt='again')['result']['turn']
+        after = client.request('submit', bot='Bob', request_id='5', prompt='again')['result']['message']
         client.finished(after)
         while not self.model.requests.empty():
             request = self.model.requests.get()
@@ -433,7 +432,7 @@ class DeliveryTests(ModelFixture):
         self.assertFalse(any(t.startswith('[carry-forward note') for t in texts))
         # A bot without the tool cannot call it.
         client.request('create', bot='Plain', workspace=str(self.path), tools=['echo'])
-        refused = client.request('submit', bot='Plain', request_id='1', prompt='note:x')['result']['turn']
+        refused = client.request('submit', bot='Plain', request_id='1', prompt='note:x')['result']['message']
         self.assertEqual(client.finished(refused)['data']['status'], 'completed')
         self.assertEqual(json.loads(self.tool_output(client, 'Plain', 'note-1'))['error'], 'tool_not_available')
 
@@ -447,10 +446,10 @@ class DeliveryTests(ModelFixture):
         gate = threading.Event()
         self.model.request_gates = queue.Queue()
         self.model.request_gates.put(gate)
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['message']
         self.model.requests.get(timeout=5)
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:' + 'x' * 2000,
-                               delivery='steer', expected_turn=turn)['result']['turn']
+                               delivery='steer', expected_turn=turn)['result']['message']
         gate.set()
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
@@ -467,7 +466,7 @@ class DeliveryTests(ModelFixture):
         client = self.client('echo,note', settings={'context_bytes': 8192})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['echo', 'note'])
         self.model.note_text = 'N' * 3500
-        noted = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['turn']
+        noted = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['message']
         self.assertEqual(client.finished(noted)['data']['status'], 'completed')
         del self.model.note_text
         while not self.model.requests.empty():
@@ -476,15 +475,15 @@ class DeliveryTests(ModelFixture):
         gate = threading.Event()
         self.model.request_gates = queue.Queue()
         self.model.request_gates.put(gate)
-        turn = client.request('submit', bot='Bob', request_id='2', prompt='script')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='2', prompt='script')['result']['message']
         self.model.requests.get(timeout=5)
         correction = 'steer:' + 'x' * 2500
         steer = client.request('submit', bot='Bob', request_id='s', prompt=correction,
-                               delivery='steer', expected_turn=turn)['result']['turn']
+                               delivery='steer', expected_turn=turn)['result']['message']
         gate.set()
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         outcome = client.finished(steer)['data']
-        self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn), outcome)
+        self.assertEqual((outcome['status'], outcome.get('turn')), ('taken', turn), outcome)
         requests = []
         while not self.model.requests.empty():
             requests.append(self.model.requests.get())
@@ -501,7 +500,7 @@ class DeliveryTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path), tools=['echo'])
         for n in range(50):
             turn = client.request('submit', bot='Bob', request_id=str(n),
-                                  prompt=f'Task {n}: ' + 'p' * 300)['result']['turn']
+                                  prompt=f'Task {n}: ' + 'p' * 300)['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         while not self.model.requests.empty():
             self.model.requests.get()
@@ -509,18 +508,18 @@ class DeliveryTests(ModelFixture):
         gate = threading.Event()
         self.model.request_gates = queue.Queue()
         self.model.request_gates.put(gate)
-        turn = client.request('submit', bot='Bob', request_id='run', prompt='script')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='run', prompt='script')['result']['message']
         first = self.model.requests.get(timeout=5)
         note = first['input'][0]['content'][0]['text']
         self.assertIn('How they began', note)
         self.assertGreater(len(note), 4000)
         correction = 'steer:' + 'x' * 9000
         steer = client.request('submit', bot='Bob', request_id='s', prompt=correction,
-                               delivery='steer', expected_turn=turn)['result']['turn']
+                               delivery='steer', expected_turn=turn)['result']['message']
         gate.set()
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         outcome = client.finished(steer)['data']
-        self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn), outcome)
+        self.assertEqual((outcome['status'], outcome.get('turn')), ('taken', turn), outcome)
         while not self.model.requests.empty():
             request = self.model.requests.get()
             self.assertLessEqual(len(json.dumps(request['input'], separators=(',', ':')).encode()) - 2, 16384)
@@ -533,7 +532,7 @@ class DeliveryTests(ModelFixture):
                 client = self.client(settings={'context_bytes': 2048, 'note_turns': int(note_turns)})
                 client.request('create', bot=f'Bob{note_turns}', workspace=str(self.path), tools=tools)
                 for n, prompt in enumerate(prompts):
-                    turn = client.request('submit', bot=f'Bob{note_turns}', request_id=str(n), prompt=prompt)['result']['turn']
+                    turn = client.request('submit', bot=f'Bob{note_turns}', request_id=str(n), prompt=prompt)['result']['message']
                     self.assertEqual(client.finished(turn)['data']['status'], 'completed')
                 last = None
                 while not self.model.requests.empty():
@@ -564,30 +563,30 @@ class DeliveryTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path))
         # The first steer moves the command to the background; it outlasts
         # the steers' turns, so its finish joins none of their inputs.
-        first = client.request('submit', bot='Bob', request_id='1', prompt='shell:sleep 5')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='1', prompt='shell:sleep 5')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == first)
         steers = [client.request('submit', bot='Bob', request_id=f's{n}', prompt=f'{n}' * 1500,
-                                 delivery='steer')['result']['turn'] for n in range(3)]
+                                 delivery='steer')['result']['message'] for n in range(3)]
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
         outcomes = [client.finished(turn)['data'] for turn in steers]
-        self.assertEqual([o['status'] for o in outcomes], ['steered', 'completed', 'completed'])
-        self.assertEqual(outcomes[0]['into'], first)
+        self.assertEqual([o['status'] for o in outcomes], ['taken', 'completed', 'completed'])
+        self.assertEqual(outcomes[0]['turn'], first)
         self.assertEqual(poll(client, 'Bob', steers[2])['result']['text'], 'reply:' + '2' * 1500)
 
     def test_a_steer_that_extends_a_turn_brings_the_attached_message_beside_it(self):
         client = self.client('echo,shell')
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='slow')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='slow')['result']['message']
         self.model.requests.get(timeout=5)
         # Both arrive during the final call. The steer keeps the turn going,
         # and the note joins the call it adds.
         note = client.request('submit', bot='Bob', request_id='n', prompt='steer:note',
-                              delivery='attach')['result']['turn']
+                              delivery='attach')['result']['message']
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:more',
-                               delivery='steer')['result']['turn']
+                               delivery='steer')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         for joined in (steer, note):
-            self.assertEqual(client.finished(joined)['data']['into'], turn)
+            self.assertEqual(client.finished(joined)['data']['turn'], turn)
         last = self.model.requests.get(timeout=5)
         texts = [i['content'][0]['text'] for i in last['input'] if i.get('role') == 'user']
         self.assertEqual(texts[-2:], ['steer:more', 'steer:note'])
@@ -608,13 +607,13 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(note['status'], 'attached')
         time.sleep(.3)
         self.assertTrue(self.model.requests.empty())
-        self.assertEqual(poll(client, 'Bob', note['turn'])['result'], {'turn': note['turn'], 'finished': False})
+        self.assertEqual(poll(client, 'Bob', note['message'])['result'], {'message': note['message'], 'finished': False})
         self.assertEqual(client.request('stats')['result']['queued_turns'], 0)
         # The next turn's first call carries it, after its prompt.
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='hello')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='hello')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        done = client.finished(note['turn'])['data']
-        self.assertEqual((done['status'], done['into']), ('steered', turn))
+        done = client.finished(note['message'])['data']
+        self.assertEqual((done['status'], done['turn']), ('taken', turn))
         requests = []
         while not self.model.requests.empty():
             requests.append(self.model.requests.get())
@@ -622,11 +621,11 @@ class DeliveryTests(ModelFixture):
         texts = [i['content'][0]['text'] for i in requests[0]['input'] if i.get('role') == 'user']
         self.assertEqual(texts[-2:], ['hello', 'fyi: scope changed'])
         # Running: it joins the next round boundary.
-        first = client.request('submit', bot='Bob', request_id='2', prompt='shell:sleep .4')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='2', prompt='shell:sleep .4')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == first)
         during = client.request('submit', bot='Bob', request_id='n2', prompt='fyi: mid-turn',
                                 delivery='attach')['result']
-        self.assertEqual(client.finished(during['turn'])['data']['into'], first)
+        self.assertEqual(client.finished(during['message'])['data']['turn'], first)
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
         requests = []
         while not self.model.requests.empty():
@@ -634,16 +633,16 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(requests[-1]['input'][-1]['content'][0]['text'], 'fyi: mid-turn')
         # One that arrives during the final call waits for the next turn
         # rather than extending this one.
-        slow = client.request('submit', bot='Bob', request_id='3', prompt='slow')['result']['turn']
+        slow = client.request('submit', bot='Bob', request_id='3', prompt='slow')['result']['message']
         self.model.requests.get(timeout=5)
         late = client.request('submit', bot='Bob', request_id='n3', prompt='fyi: late',
                               delivery='attach')['result']
         self.assertEqual(client.finished(slow)['data']['status'], 'completed')
         time.sleep(.3)
-        self.assertEqual(poll(client, 'Bob', late['turn'])['result']['finished'], False)
+        self.assertEqual(poll(client, 'Bob', late['message'])['result']['finished'], False)
         # It can be withdrawn while it waits.
-        ended = client.request('interrupt', bot='Bob', turn=late['turn'])['result']
-        self.assertEqual(ended['status'], 'interrupted')
+        ended = client.request('interrupt', bot='Bob', turn=late['message'])['result']
+        self.assertEqual(ended['status'], 'withdrawn')
 
     def test_an_attached_message_that_waits_its_time_goes_as_a_steer(self):
         client = self.client('echo,shell')
@@ -659,18 +658,18 @@ class DeliveryTests(ModelFixture):
         note = client.request('submit', bot='Bob', request_id='n1', prompt='fyi: scope changed',
                               delivery='attach', wait_ms=300)['result']
         self.assertEqual(note['status'], 'attached')
-        lapsed = client.receive(lambda m: m.get('event') == 'queued' and m.get('turn') == note['turn'])
+        lapsed = client.receive(lambda m: m.get('event') == 'queued' and m.get('message') == note['message'])
         self.assertEqual((lapsed['data']['lapsed'], lapsed['data']['delivery']), (True, 'steer'))
-        self.assertEqual(client.finished(note['turn'])['data']['status'], 'completed')
+        self.assertEqual(client.finished(note['message'])['data']['status'], 'completed')
         request = self.model.requests.get(timeout=5)
         texts = [i['content'][0]['text'] for i in request['input'] if i.get('role') == 'user']
         self.assertEqual(texts[-1], 'fyi: scope changed')
         # Running: it joins the next round boundary, as a steer does.
-        first = client.request('submit', bot='Bob', request_id='2', prompt='shell:sleep 1')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='2', prompt='shell:sleep 1')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == first)
         during = client.request('submit', bot='Bob', request_id='n2', prompt='fyi: mid-turn',
                                 delivery='attach', wait_ms=50)['result']
-        self.assertEqual(client.finished(during['turn'])['data']['into'], first)
+        self.assertEqual(client.finished(during['message'])['data']['turn'], first)
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
         self.assertEqual(client.request('stats')['result']['queued_turns'], 0)
 
@@ -678,7 +677,7 @@ class DeliveryTests(ModelFixture):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
         self.model.unauthorized_prompts = {'locked'}
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='locked')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='locked')['result']['message']
         held = client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
         blocked = held['data']['blocked']
         self.assertEqual((blocked['code'], blocked['detail']), ('provider_http_401', 'synthetic bad key'))
@@ -687,7 +686,7 @@ class DeliveryTests(ModelFixture):
         view = client.request('turns', bot='Bob')['result']['turns'][-1]
         self.assertEqual((view['status'], view['waiting_on']['blocked']['code']), ('paced', 'provider_http_401'))
         listed = client.request('held')['result']
-        self.assertEqual([(h['bot'], h['turn'], h['started']) for h in listed['held']], [('Bob', turn, True)])
+        self.assertEqual([(h['bot'], h['message'], h['started']) for h in listed['held']], [('Bob', turn, True)])
         # Counted by cause, so a reader needs no page to say how many.
         self.assertEqual((listed['total'], listed['more']), (1, False))
         self.assertEqual(listed['causes'], [{'code': 'provider_http_401', 'turns': 1, 'bots': 1,
@@ -707,7 +706,7 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(client.request('retry_held')['result']['retried'], 1)
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(poll(client, 'Bob', turn)['result']['text'], 'reply:locked')
-        self.assertEqual(client.finished(later['turn'])['data']['status'], 'completed')
+        self.assertEqual(client.finished(later['message'])['data']['status'], 'completed')
         self.assertEqual(client.request('held')['result']['held'], [])
 
     def test_a_bot_that_holds_nothing_ends_where_another_would_hold(self):
@@ -715,7 +714,7 @@ class DeliveryTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path), settings={'hold_ms': 0})
         self.assertEqual(client.request('inspect', bot='Bob')['result']['settings']['hold_ms'], 0)
         self.model.unauthorized_prompts = {'locked'}
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='locked')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='locked')['result']['message']
         ended = client.finished(turn)['data']
         self.assertEqual((ended['status'], ended['error']), ('failed', 'provider_http_401'))
         self.assertEqual(client.request('held')['result']['held'], [])
@@ -725,7 +724,7 @@ class DeliveryTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path), settings={'hold_ms': 1500})
         self.model.unauthorized_prompts = {'locked'}
         began = time.monotonic()
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='locked')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='locked')['result']['message']
         held = client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
         # Its next try is when the hold ends, not the first hold's minute.
         self.assertLessEqual(held['data']['resume_at_ms'] - held['data']['blocked']['since_ms'], 1500)
@@ -737,7 +736,7 @@ class DeliveryTests(ModelFixture):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
         self.model.unauthorized_prompts = {'locked'}
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='locked')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='locked')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
         client.close()
         # Started again with its provider missing from the config: a start
@@ -757,21 +756,21 @@ class DeliveryTests(ModelFixture):
     def test_a_steer_that_misses_the_last_boundary_becomes_the_next_turn(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
-        first = client.request('submit', bot='Bob', request_id='1', prompt='slow')['result']['turn']
-        steer = client.request('submit', bot='Bob', request_id='s', prompt='late', delivery='steer')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='1', prompt='slow')['result']['message']
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='late', delivery='steer')['result']['message']
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
         # The final call was already in flight: the steer keeps the turn going
         # for one more round, or starts its own turn. Either way it is heard.
         outcome = client.finished(steer)['data']
-        self.assertIn(outcome['status'], ('steered', 'completed'))
-        listed = {t['turn']: t for t in client.request('turns', bot='Bob', after=0)['result']['turns']}
+        self.assertIn(outcome['status'], ('taken', 'completed'))
+        listed = {m['message']: m for m in client.request('messages', bot='Bob', after=0)['result']['messages']}
         self.assertEqual(listed[steer]['delivery'], 'steer')
 
     def test_ready_turns_start_when_a_slot_opens_and_queued_ones_can_be_interrupted(self):
         client = self.client(extra=('--max-active', '1'))
         for bot in ('Alice', 'Bob'):
             client.request('create', bot=bot, workspace=str(self.path))
-        alice = client.request('submit', bot='Alice', request_id='a', prompt='slow')['result']['turn']
+        alice = client.request('submit', bot='Alice', request_id='a', prompt='slow')['result']['message']
         self.assertEqual(client.request('submit', bot='Bob', request_id='x', prompt='never')['error'], 'active_agent_limit')
         bob = client.request('submit', bot='Bob', request_id='b', prompt='ready-work', delivery='queue')['result']
         self.assertEqual(bob['status'], 'ready')
@@ -779,28 +778,31 @@ class DeliveryTests(ModelFixture):
         after = client.request('submit', bot='Bob', request_id='d', prompt='after', delivery='queue')['result']
         self.assertEqual((skipped['status'], after['status']), ('queued', 'queued'))
         self.assertEqual(client.request('delete', bot='Bob')['error'], 'bot_busy')
-        cancelled = client.request('interrupt', bot='Bob', turn=skipped['turn'])['result']
-        # The reply is the turn view; a repeat finds the turn ended and says how.
-        self.assertEqual((cancelled['interrupt_requested'], cancelled['turn'], cancelled['status'], cancelled['handle']),
-                         (True, skipped['turn'], 'interrupted', f"turn:Bob/{skipped['turn']}"))
-        self.assertEqual(client.finished(skipped['turn'])['data']['status'], 'interrupted')
-        again = client.request('interrupt', bot='Bob', turn=skipped['turn'])['result']
-        self.assertEqual((again['interrupt_requested'], again['status']), (False, 'interrupted'))
+        cancelled = client.request('interrupt', bot='Bob', turn=skipped['message'])['result']
+        # The reply is the message's view, withdrawn in line with no turn;
+        # a repeat finds it ended and says how.
+        self.assertEqual((cancelled['interrupt_requested'], cancelled['message'], cancelled['turn'],
+                          cancelled['status'], cancelled['handle']),
+                         (True, skipped['message'], None, 'withdrawn', f"Bob/{skipped['message']}"))
+        self.assertEqual(client.finished(skipped['message'])['data']['status'], 'withdrawn')
+        again = client.request('interrupt', bot='Bob', turn=skipped['message'])['result']
+        self.assertEqual((again['interrupt_requested'], again['status']), (False, 'withdrawn'))
         self.assertEqual(client.request('interrupt', bot='Bob', turn=999)['error'], 'turn_not_found')
         self.assertEqual(client.finished(alice)['data']['status'], 'completed')
-        self.assertEqual(client.finished(bob['turn'])['data']['status'], 'completed')
-        self.assertEqual(client.finished(after['turn'])['data']['status'], 'completed')
+        self.assertEqual(client.finished(bob['message'])['data']['status'], 'completed')
+        self.assertEqual(client.finished(after['message'])['data']['status'], 'completed')
         self.assertEqual(client.request('stats')['result']['queued_turns'], 0)
-        self.assertEqual(client.request('delete', bot='Bob')['result']['turns'], 3)
+        # Two of its three messages ran; the one withdrawn in line ran no turn.
+        self.assertEqual(client.request('delete', bot='Bob')['result']['turns'], 2)
 
     def test_restart_rejects_queued_provider_changes_before_history_mutation(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
         client.request('submit', bot='Bob', request_id='1', prompt='wait')
         default = client.request('submit', bot='Bob', request_id='2', prompt='default',
-                                 delivery='queue')['result']['turn']
+                                 delivery='queue')['result']['message']
         override = client.request('submit', bot='Bob', request_id='3', prompt='override',
-                                  delivery='queue', model='openai/synthetic-model')['result']['turn']
+                                  delivery='queue', model='openai/synthetic-model')['result']['message']
         head = client.request('inspect', bot='Bob')['result']['head']
         client.close(kill=True)
         client = Client(self.binary, self.path / 'state.sqlite', self.url, family='anthropic')
@@ -814,14 +816,14 @@ class DeliveryTests(ModelFixture):
         duplicate = client.request('submit', bot='Bob', request_id='3', prompt='override',
                                    delivery='queue', model='openai/synthetic-model')['result']
         self.assertTrue(duplicate['duplicate'])
-        self.assertEqual(duplicate['turn'], override)
+        self.assertEqual(duplicate['message'], override)
 
     def test_queued_turns_survive_a_restart(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
-        first = client.request('submit', bot='Bob', request_id='1', prompt='wait')['result']['turn']
-        second = client.request('submit', bot='Bob', request_id='2', prompt='second', delivery='queue')['result']['turn']
-        third = client.request('submit', bot='Bob', request_id='3', prompt='third', delivery='steer')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='1', prompt='wait')['result']['message']
+        second = client.request('submit', bot='Bob', request_id='2', prompt='second', delivery='queue')['result']['message']
+        third = client.request('submit', bot='Bob', request_id='3', prompt='third', delivery='steer')['result']['message']
         client.close(kill=True)
         client = self.client()
         # Recovery ends the interrupted turn and the line moves at once.
@@ -834,10 +836,10 @@ class DeliveryTests(ModelFixture):
                   if e['event'] == 'turn_finished' and e['turn'] == third]
         outcome = before[0] if before else client.finished(third)['data']
         text = poll(client, 'Bob', second)['result']['text']
-        if outcome['status'] == 'steered' and outcome['into'] == first:
+        if outcome['status'] == 'taken' and outcome['turn'] == first:
             self.assertEqual(text, 'reply:second')
-        elif outcome['status'] == 'steered':
-            self.assertEqual((outcome['into'], text), (second, 'reply:third'))
+        elif outcome['status'] == 'taken':
+            self.assertEqual((outcome['turn'], text), (second, 'reply:third'))
         else:
             self.assertEqual((outcome['status'], text), ('completed', 'reply:second'))
 
@@ -863,14 +865,16 @@ class DeliveryTests(ModelFixture):
             self.assertLess(len(page['events']), 256)
             replay.extend(e['cursor'] for e in page['events'])
         self.assertEqual(live, sorted(replay), 'live delivery is the replay, complete')
-        # Wait answers followed the terminal events they report.
-        finished = {m['turn'] for m in client.saved if m.get('event') == 'turn_finished'}
-        self.assertEqual(len(finished), len(handles))
+        # Wait answers followed the terminal events they report: a turn's
+        # end, or a message taken into one.
+        ended = {(m['bot'], m['turn']) for m in client.saved if m.get('event') == 'turn_finished'}
+        ended |= {(m['bot'], m['message']) for m in client.saved if m.get('event') == 'steered'}
+        self.assertEqual(len(ended), len(handles))
 
     def test_strict_steers_name_their_turn(self):
         client = self.client('echo,shell')
         client.request('create', bot='Bob', workspace=str(self.path))
-        first = client.request('submit', bot='Bob', request_id='1', prompt='shell:sleep .4')['result']['turn']
+        first = client.request('submit', bot='Bob', request_id='1', prompt='shell:sleep .4')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == first)
         wrong = client.request('submit', bot='Bob', request_id='w', prompt='no', delivery='steer', expected_turn=first + 99)
         self.assertEqual(wrong['error'], 'stale_turn')
@@ -879,13 +883,13 @@ class DeliveryTests(ModelFixture):
         right = client.request('submit', bot='Bob', request_id='r', prompt='correction', delivery='steer',
                                expected_turn=first)['result']
         self.assertEqual(right['status'], 'queued')
-        self.assertEqual(client.finished(right['turn'])['data']['into'], first)
+        self.assertEqual(client.finished(right['message'])['data']['turn'], first)
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
         # Nothing was written for the refused ones, and an idle bot has no turn to steer.
         # The steer moved the running sleep to the background, so its end wakes Bob
         # once more, before or after this read: that turn is the daemon's own.
-        turns = client.request('turns', bot='Bob', after=0)['result']['turns']
-        self.assertEqual([t['request_id'] for t in turns if not t['request_id'].startswith('background-')], ['1', 'r'])
+        sent = client.request('messages', bot='Bob', after=0)['result']['messages']
+        self.assertEqual([m['request_id'] for m in sent if not m['request_id'].startswith('background-')], ['1', 'r'])
         idle = client.request('submit', bot='Bob', request_id='i', prompt='late', delivery='steer', expected_turn=first)
         self.assertEqual(idle['error'], 'stale_turn')
 

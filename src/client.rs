@@ -1956,7 +1956,7 @@ fn run(options: &Options) -> Result<i32> {
     }
     if options.pretty {
         eprintln!(
-            "agent: {bot} turn {turn}{}{}",
+            "agent: {bot}/{turn}{}{}",
             if created { " (new bot)" } else { "" },
             workspace
                 .as_deref()

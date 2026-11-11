@@ -590,19 +590,19 @@ At most 64 quotes go in one note; the rest wait for the next.
 
 ```
 Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.
-- calc.docs: turn:calc.docs/3, the person wrote the words quoted from it below
-- calc.api: turn:calc.api/4, calc.fix wrote in it
-- calc.fix: turn:calc.fix/5 completed, asked by you, and replied:
+- calc.docs: calc.docs/3, the person wrote the words quoted from it below
+- calc.api: calc.api/4, calc.fix wrote in it
+- calc.fix: calc.fix/5 completed, asked by you, and replied:
   > Fixed avg: it skips empty lists now, with a test.
 The person asked for these in the task themselves, so they are theirs:
-- calc.ui: turn:calc.ui/2 completed, asked by the person
+- calc.ui: calc.ui/2 completed, asked by the person
 The words quoted below are the person's own, from the turns named.
 Lines marked > are a task's own words, not the person's.
 Each ended turn comes with what the task replied; read a turn with one wait call (timeout_ms 0) only when you need more of it, and act where something changes the work. Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply.
 
 [Sent by lookout.tasks.]
 
-[Quoted from turn:calc.docs/3, written by a person:]
+[Quoted from message calc.docs/3, written by a person:]
 
 Use tabs.
 ```

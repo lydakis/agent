@@ -78,7 +78,7 @@ def run(binary, bots, timeout_ms, connections):
             assert 'result' in control.request('create', bot=bot, workspace=str(workspace)), bot
             response = control.request('submit', bot=bot, prompt='hold: work', request_id=f'r{n}', delivery='queue')
             assert 'result' in response, response
-            turns.append(f"turn:{bot}/{response['result']['turn']}")
+            turns.append(f"{bot}/{response['result']['message']}")
         # Every wait sent first, then the clock: their deadlines fall within
         # the time it takes to send them.
         share = [[] for _ in range(connections)]

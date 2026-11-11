@@ -32,7 +32,7 @@ class AnsweredToolTests(ModelFixture):
         return client
 
     def submit(self, client):
-        return client.request('submit', bot='Lead', request_id='t', prompt='script')['result']['turn']
+        return client.request('submit', bot='Lead', request_id='t', prompt='script')['result']['message']
 
     def started(self, client, turn):
         return client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)['data']
@@ -218,7 +218,7 @@ class AnsweredToolTests(ModelFixture):
         self.assertEqual(self.output(client), 'after restart')
         # A second turn parks, and an interrupt ends it with the call.
         self.model.call_script = [None, ('start_task', {'name': 'next'})]
-        turn = client.request('submit', bot='Lead', request_id='u', prompt='script')['result']['turn']
+        turn = client.request('submit', bot='Lead', request_id='u', prompt='script')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
         self.assertEqual(client.request('interrupt', bot='Lead', turn=turn)['result']['status'], 'interrupted')
         self.assertEqual(client.request('tool_calls', tag='sonny')['result']['calls'], [])
@@ -469,7 +469,7 @@ class StepTests(ModelFixture):
         daemon.request('create', bot='Lead', workspace=str(self.path), declare=[EXEC],
                        approve=['exec'], approver='manual')
         self.model.call_script = [('exec', {'code': 'run()'})]
-        turn = daemon.request('submit', bot='Lead', request_id='t', prompt='script')['result']['turn']
+        turn = daemon.request('submit', bot='Lead', request_id='t', prompt='script')['result']['message']
         deadline = time.monotonic() + 5
         while not daemon.request('tool_calls', tag='sonny')['result']['calls']:
             self.assertLess(time.monotonic(), deadline)

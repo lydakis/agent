@@ -27,7 +27,7 @@ pub struct Task {
 pub fn state(turn: &Value) -> String {
     match turn["status"].as_str() {
         None => "starting",
-        Some("completed" | "steered") => IDLE,
+        Some("completed") => IDLE,
         Some("failed") if turn["error"] == "empty_completion" => QUIET,
         Some("failed") => "failed",
         Some("interrupted") => "stopped",

@@ -26,7 +26,7 @@ def run(binary, out, bots):
         client = Client(binary, out / 'state.sqlite', f'http://127.0.0.1:{model.server_port}/v1')
         for n in range(bots):
             assert 'result' in client.request('create', bot=str(n), workspace=str(out.resolve()))
-        turns = [client.request('submit', bot=str(n), request_id='first', prompt='hold:completion')['result']['turn']
+        turns = [client.request('submit', bot=str(n), request_id='first', prompt='hold:completion')['result']['message']
                  for n in range(bots)]
         deadline = time.monotonic() + 10
         while model.requests != bots:

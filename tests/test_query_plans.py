@@ -41,13 +41,13 @@ class QueryPlanTests(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         source = (root / 'src/store/db.rs').read_text().split('#[cfg(test)]', 1)[0]
         ddl = source.split('tx.execute_batch("', 1)[1].split('")?;', 1)[0]
-        query = next(q for q in statements(source) if q.startswith('SELECT s.id,s.prompt,length('))
+        query = next(q for q in statements(source) if q.startswith('SELECT s.id,s.text,length('))
         conn = sqlite3.connect(':memory:')
         conn.executescript(ddl)
         steps = [row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + query, ('Bob', 1, 8, 9, 1, 'limit'))]
-        searches = [s for s in steps if s.startswith('SEARCH turns')]
-        self.assertEqual(sorted(searches), ['SEARCH turns USING INDEX turns_attached (bot=? AND id<?)',
-                                            'SEARCH turns USING INDEX turns_steers (bot=? AND id<?)'], steps)
+        searches = [s for s in steps if s.startswith('SEARCH messages USING')]
+        self.assertEqual(sorted(searches), ['SEARCH messages USING INDEX messages_attached (bot=? AND id<?)',
+                                            'SEARCH messages USING INDEX messages_steers (bot=? AND id<?)'], steps)
 
     def test_current_schema_passes_and_missing_indexes_fail(self):
         root = Path(__file__).resolve().parent.parent
@@ -56,7 +56,7 @@ class QueryPlanTests(unittest.TestCase):
         # Use the current runtime's schema and statements, not simplified copies.
         for index, table in [(None, None), ('checkpoints_head', 'checkpoints'),
                              ('compactions_cut', 'compactions'),
-                             ('turns_prompt_node', 'turns'),
+                             ('messages_node', 'messages'),
                              ('nodes_turn', 's'),
                              ('processes_turn', 'processes'),
                              ('turns_running', 'turns'), ('turns_waiting', 'turns'),

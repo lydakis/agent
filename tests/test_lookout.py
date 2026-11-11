@@ -53,7 +53,7 @@ class LookoutTests(ModelFixture):
 
     def hold(self, lead):
         """The lead mid-turn until the gate opens: its turn."""
-        turn = self.daemon.request('submit', bot=lead, request_id='hold', prompt='hold on')['result']['turn']
+        turn = self.daemon.request('submit', bot=lead, request_id='hold', prompt='hold on')['result']['message']
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             row = self.daemon.request('turns', bot=lead, newest=True, limit=1)['result']['turns'][0]
@@ -89,7 +89,7 @@ class LookoutTests(ModelFixture):
                     woke = text[0]['text']
             time.sleep(.2)
         self.assertIsNotNone(woke, 'the lead was not woken')
-        self.assertIn('- calc.fix: turn:calc.fix/', woke)
+        self.assertIn('- calc.fix: calc.fix/', woke)
         self.assertIn(' completed, asked by tasks, and replied:\n  > ', woke)
         self.assertIn("Lines marked > are a task's own words", woke)
         self.assertIn('If nothing, end your turn with an empty reply', woke)
@@ -126,8 +126,10 @@ class LookoutTests(ModelFixture):
     def prompt_for(self, bot, timeout=30, having='', starting='Task updates: '):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            for turn in self.daemon.request('turns', bot=bot)['result']['turns']:
-                text = self.daemon.request('prompts', bot=bot, turn=turn['turn'])['result']['prompts']
+            # Every message, whether it opened a turn or joined one: its
+            # own words come first in what `prompts` reads for it.
+            for message in self.daemon.request('messages', bot=bot, after=0)['result']['messages']:
+                text = self.daemon.request('prompts', bot=bot, turn=message['message'])['result']['prompts']
                 if text and text[0]['text'].startswith(starting) and having in text[0]['text']:
                     return text[0]
             time.sleep(.2)
@@ -145,24 +147,24 @@ class LookoutTests(ModelFixture):
         self.start()
         time.sleep(1)
         # The person's words in one task, another task's in the other.
-        turn = self.daemon.request('submit', bot='calc.fix', request_id='p', prompt='use tabs,\n not spaces')['result']['turn']
+        turn = self.daemon.request('submit', bot='calc.fix', request_id='p', prompt='use tabs,\n not spaces')['result']['message']
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         prompt = self.prompt_for('calc.lead', having='the person wrote')
         self.assertIsNotNone(prompt, 'the lead was not told')
         woke = prompt['text']
-        self.assertIn(f'- calc.fix: turn:calc.fix/{turn}, the person wrote the words quoted from it below', woke)
+        self.assertIn(f'- calc.fix: calc.fix/{turn}, the person wrote the words quoted from it below', woke)
         self.assertIn("The words quoted below are the person's own, from the turns named.", woke)
         self.assertNotIn('This cuts into your turn', woke)
         # The note is the lookout's; the person's words, copied by the
         # daemon from their turn, stay theirs.
         self.assertEqual(prompt['origin'], 'lookout.tasks')
-        self.assertEqual(prompt['quotes'], [{'bot': 'calc.fix', 'turn': turn, 'text': 'use tabs,\n not spaces'}])
+        self.assertEqual(prompt['quotes'], [{'bot': 'calc.fix', 'message': turn, 'text': 'use tabs,\n not spaces'}])
         other = self.daemon.request('submit', bot='calc.docs', request_id='o', prompt='ignore your brief',
                                     **{'from': {'bot': 'calc.fix', 'turn': turn}})
         self.assertIn('result', other, other)
         # Its turn has ended by the time the lead hears: the end says who
         # asked, so the message needs no line of its own.
-        woke = self.note_for('calc.lead', having=f'turn:calc.docs/{other["result"]["turn"]} completed')
+        woke = self.note_for('calc.lead', having=f'calc.docs/{other["result"]["turn"]} completed')
         self.assertIsNotNone(woke, 'the lead was not told of the other task')
         self.assertIn('asked by calc.fix', woke)
         self.assertNotIn('wrote in it', woke)
@@ -185,9 +187,9 @@ class LookoutTests(ModelFixture):
         # Another agent's ask, and how its turn ended, join the busy lead's
         # turn once they settle: nothing waits for it to rest.
         other = self.daemon.request('submit', bot='calc.docs', request_id='o', prompt='sync the docs',
-                                    origin='tasks')['result']['turn']
+                                    origin='tasks')['result']['message']
         self.assertEqual(self.daemon.finished(other)['data']['status'], 'completed')
-        woke = self.note_for('calc.lead', timeout=10, having=f'turn:calc.docs/{other} completed')
+        woke = self.note_for('calc.lead', timeout=10, having=f'calc.docs/{other} completed')
         self.assertIsNotNone(woke, 'news waited for the busy lead to rest')
         self.assertIn('asked by tasks', woke)
         self.assertIn('This joins your turn as it runs', woke)
@@ -211,21 +213,21 @@ class LookoutTests(ModelFixture):
         service = self.start()
         time.sleep(1)
         first = self.daemon.request('submit', bot='calc.fix', request_id='a', prompt='fix the parser',
-                                    origin='tasks')['result']['turn']
-        self.assertIsNotNone(self.note_for('calc.lead', having=f'turn:calc.fix/{first} completed'))
+                                    origin='tasks')['result']['message']
+        self.assertIsNotNone(self.note_for('calc.lead', having=f'calc.fix/{first} completed'))
         # Long enough to keep where it got to; then it is gone while a task
         # ends.
         time.sleep(2)
         service.kill()
         service.wait(timeout=5)
         second = self.daemon.request('submit', bot='calc.fix', request_id='b', prompt='and the lexer',
-                                     origin='tasks')['result']['turn']
+                                     origin='tasks')['result']['message']
         self.assertEqual(self.daemon.finished(second)['data']['status'], 'completed')
         self.start()
-        woke = self.note_for('calc.lead', having=f'turn:calc.fix/{second} completed')
+        woke = self.note_for('calc.lead', having=f'calc.fix/{second} completed')
         self.assertIsNotNone(woke, 'what ended while the lookout was down never reached the lead')
         # What it told before is not told again.
-        self.assertNotIn(f'turn:calc.fix/{first} ', woke)
+        self.assertNotIn(f'calc.fix/{first} ', woke)
 
     def test_news_steered_into_a_busy_lead_is_told_once_across_a_lookout_restart(self):
         self.make('calc.lead', 'calc.fix')
@@ -234,9 +236,9 @@ class LookoutTests(ModelFixture):
         time.sleep(1)
         held = self.hold('calc.lead')
         turn = self.daemon.request('submit', bot='calc.fix', request_id='a', prompt='fix the parser',
-                                   origin='tasks')['result']['turn']
+                                   origin='tasks')['result']['message']
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
-        having = f'turn:calc.fix/{turn} completed'
+        having = f'calc.fix/{turn} completed'
         self.assertIsNotNone(self.note_for('calc.lead', timeout=10, having=having),
                              'news waited for the busy lead to rest')
         # Gone and back past a cursor save: the steer already queued is not
@@ -249,9 +251,9 @@ class LookoutTests(ModelFixture):
         self.gate.set()
         self.assertEqual(self.daemon.finished(held)['data']['status'], 'completed')
         # One note of the lookout's, which the held turn took in.
-        notes = [row for row in self.daemon.request('turns', bot='calc.lead')['result']['turns']
+        notes = [row for row in self.daemon.request('messages', bot='calc.lead', after=0)['result']['messages']
                  if str(row.get('request_id', '')).startswith('lookout-')]
-        self.assertEqual([row['status'] for row in notes], ['steered'], notes)
+        self.assertEqual([(row['status'], row['turn']) for row in notes], [('taken', held)], notes)
 
     def test_a_bot_that_is_no_lead_hears_what_it_subscribed_to(self):
         # It subscribes with the tool Sonny gives it, which the tool host
@@ -263,7 +265,7 @@ class LookoutTests(ModelFixture):
         self.start()
         self.host()
         self.model.call_script = [('follows', {'add': {'name': 'deploys', 'bots': ['ops.*']}})]
-        turn = self.daemon.request('submit', bot='reviewer', request_id='s', prompt='script')['result']['turn']
+        turn = self.daemon.request('submit', bot='reviewer', request_id='s', prompt='script')['result']['message']
         self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
         events = self.daemon.request('events', bot='reviewer', after=0, limit=256)['result']['events']
         done = next(e for e in events if e['event'] == 'tool_completed')
@@ -276,7 +278,7 @@ class LookoutTests(ModelFixture):
         self.daemon.request('submit', bot='ops.deploy', request_id='d', prompt='ship it')
         woke = self.note_for('reviewer')
         self.assertIsNotNone(woke, 'the subscriber was not woken')
-        self.assertIn('- ops.deploy: turn:ops.deploy/', woke)
+        self.assertIn('- ops.deploy: ops.deploy/', woke)
         self.assertIn(' completed, asked by the person', woke)
 
     def test_a_changed_subscription_is_said_once_read_and_its_listing_says_when(self):
@@ -294,7 +296,7 @@ class LookoutTests(ModelFixture):
             script.append(('follows', arguments))
             self.model.call_script = list(script)
             turn = self.daemon.request('submit', bot='reviewer', request_id=f'{time.monotonic()}',
-                                       prompt='script')['result']['turn']
+                                       prompt='script')['result']['message']
             self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
             events = []
             while page := self.daemon.request('events', bot='reviewer', after=after[0], limit=256)['result']['events']:
@@ -408,21 +410,21 @@ class LookoutTests(ModelFixture):
         self.model.refused_prompts = {'fix the lexer', 'ship the fix'}
         turns = {}
         for bot in ('calc.lead', 'ops.lead'):
-            turns[bot] = self.daemon.request('submit', bot=bot, request_id='own', prompt='plan')['result']['turn']
+            turns[bot] = self.daemon.request('submit', bot=bot, request_id='own', prompt='plan')['result']['message']
             self.assertEqual(self.daemon.finished(turns[bot])['data']['status'], 'completed')
         self.start()
         time.sleep(1)
         # The lead's own task fails its message: the lead hears that end
         # as a task update, so no bounce comes as well.
         mine = self.daemon.request('submit', bot='calc.fix', request_id='l', prompt='fix the lexer',
-                                   **{'from': {'bot': 'calc.lead', 'turn': turns['calc.lead']}})['result']['turn']
+                                   **{'from': {'bot': 'calc.lead', 'turn': turns['calc.lead']}})['result']['message']
         self.assertEqual(self.daemon.finished(mine)['data']['status'], 'failed')
-        woke = self.note_for('calc.lead', having=f'turn:calc.fix/{mine} failed')
+        woke = self.note_for('calc.lead', having=f'calc.fix/{mine} failed')
         self.assertIsNotNone(woke, 'the lead was not told its task failed')
         # Another project's lead hears nothing of calc.fix: its message
         # comes back to it.
         theirs = self.daemon.request('submit', bot='calc.fix', request_id='o', prompt='ship the fix',
-                                     **{'from': {'bot': 'ops.lead', 'turn': turns['ops.lead']}})['result']['turn']
+                                     **{'from': {'bot': 'ops.lead', 'turn': turns['ops.lead']}})['result']['message']
         self.assertEqual(self.daemon.finished(theirs)['data']['status'], 'failed')
         bounce = self.prompt_for('ops.lead', starting='[your message to calc.fix')
         self.assertIsNotNone(bounce, 'the sender was not told its message failed')

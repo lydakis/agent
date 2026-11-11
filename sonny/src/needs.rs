@@ -223,6 +223,11 @@ pub async fn items(client: &Client, bot: &str, nodes: &[i64]) -> (Vec<(i64, Valu
                     if item["role"].is_string() && entry["written_ms"].is_i64() {
                         item["written_ms"] = entry["written_ms"].clone();
                     }
+                    // The message it holds, by its handle, which the window
+                    // shows beside that time.
+                    if item["role"] == "user" && entry["handle"].is_string() {
+                        item["handle"] = entry["handle"].clone();
+                    }
                     (node, item)
                 })
         }));
@@ -476,9 +481,9 @@ impl Needs {
                     self.version += 1;
                 }
             }
-            // A steer the running turn took ends as a turn of its own: only
-            // the running turn's end lets go of its calls.
-            "turn_finished" if !matches!(data["status"].as_str(), Some("steered" | "attached")) => {
+            // Only a turn's end lets go of its calls; a message that ended
+            // in line ends as a message.
+            "turn_finished" => {
                 if let Some(calls) = self.calls.get_mut(bot) {
                     calls.retain(|(of, _)| *of != turn);
                 }
@@ -568,12 +573,12 @@ mod tests {
         // The turn picks up again with no call's verdict.
         needs.event(&event("p.fix", 4, "turn_resumed", json!({})));
         assert!(needs.waits("p.fix"));
-        // A steer's own turn ends; the running one goes on waiting.
+        // A message ends in line; the running turn goes on waiting.
         needs.event(&event(
             "p.fix",
             5,
-            "turn_finished",
-            json!({"status": "steered"}),
+            "message_ended",
+            json!({"status": "withdrawn"}),
         ));
         assert!(needs.waits("p.fix"));
         needs.event(&event(

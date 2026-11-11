@@ -23,24 +23,24 @@ class WaitTests(ModelFixture):
             client.request('create', bot=bot, workspace=str(self.path))
         slow = client.request('submit', bot='Alice', request_id='slow', prompt='wait')['result']
         quick = client.request('submit', bot='Carol', request_id='quick', prompt='hi')['result']
-        client.finished(quick['turn'])
+        client.finished(quick['message'])
         turn = client.request('submit', bot='Bob', request_id='poll',
-                              prompt=f"waitt:0:{slow['handle']},{quick['handle']}")['result']['turn']
+                              prompt=f"waitt:0:{slow['handle']},{quick['handle']}")['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         outcome = self.tool_output(client, 'Bob', 'wait-1')
         self.assertEqual(outcome['pending'], [slow['handle']])
         self.assertEqual(outcome['results'][quick['handle']]['text'], 'reply:hi')
         self.assertEqual(client.request('stats')['result']['handles'], {'waiters': 0, 'retained': 0})
-        client.request('interrupt', bot='Alice', turn=slow['turn'])
+        client.request('interrupt', bot='Alice', turn=slow['message'])
 
     def test_retention_applies_when_parked_turns_are_interrupted(self):
         client = self.client('wait', settings={'keep_turns': 1})
         for bot in ('Alice', 'Bob'):
             client.request('create', bot=bot, workspace=str(self.path))
-        alice = client.request('submit', bot='Alice', request_id='a', prompt='wait')['result']['turn']
+        alice = client.request('submit', bot='Alice', request_id='a', prompt='wait')['result']['message']
         for n in range(3):
             turn = client.request('submit', bot='Bob', request_id=str(n),
-                                  prompt=f'wait:turn:Alice/{alice}')['result']['turn']
+                                  prompt=f'wait:Alice/{alice}')['result']['message']
             client.receive(lambda e: e.get('event') == 'turn_waiting' and e.get('turn') == turn)
             time.sleep(.03)  # Let the parked task retire; exercise the direct interrupt path.
             interrupted = client.request('interrupt', bot='Bob', turn=turn)['result']
@@ -57,7 +57,7 @@ class WaitTests(ModelFixture):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='output',
-                              prompt="bg:printf '%065536d' 0; printf '%065536d' 0 >&2")['result']['turn']
+                              prompt="bg:printf '%065536d' 0; printf '%065536d' 0 >&2")['result']['message']
         client.finished(turn)
         handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
         client.request('wait', handles=[handle])
@@ -86,7 +86,7 @@ class WaitTests(ModelFixture):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
         def background(request, command):
-            turn = client.request('submit', bot='Bob', request_id=request, prompt='bg:' + command)['result']['turn']
+            turn = client.request('submit', bot='Bob', request_id=request, prompt='bg:' + command)['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
             return self.tool_output(client, 'Bob', 'bg-1')['handle']
         output = background('output', "while [ ! -f release ]; do sleep .01; done; printf '%065536d' 0; printf '%065536d' 0 >&2")
@@ -112,7 +112,7 @@ class WaitTests(ModelFixture):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='bg',
-                              prompt='bg:while [ ! -f finish ]; do sleep .01; done')['result']['turn']
+                              prompt='bg:while [ ! -f finish ]; do sleep .01; done')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
         # The stop ends the command and records its end itself, instead of
@@ -130,11 +130,11 @@ class WaitTests(ModelFixture):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='old', prompt='hello')['result']
-        client.finished(turn['turn'])
+        client.finished(turn['message'])
         with sqlite3.connect(self.path / 'state.sqlite') as db:
             for kind in ('turn_finished', 'message'):
                 plan = db.execute("EXPLAIN QUERY PLAN SELECT data FROM events WHERE turn=? AND kind=? ORDER BY id DESC LIMIT 1",
-                                  (turn['turn'], kind)).fetchall()
+                                  (turn['message'], kind)).fetchall()
                 self.assertTrue(any('SEARCH events' in row[3] for row in plan), plan)
                 self.assertFalse(any('SCAN events' in row[3] for row in plan), plan)
         outcome = client.request('wait', handles=[turn['handle']])['result']['results'][turn['handle']]
@@ -164,15 +164,15 @@ class WaitTests(ModelFixture):
             client.request('create', bot=bot, workspace=str(self.path))
         # One command runs, one may wait behind it, the next is refused as a
         # tool result the model can act on; the turn itself completes.
-        running = client.request('submit', bot='Run', request_id='r', prompt='bg:sleep 1.5')['result']['turn']
+        running = client.request('submit', bot='Run', request_id='r', prompt='bg:sleep 1.5')['result']['message']
         self.assertEqual(client.finished(running)['data']['status'], 'completed')
-        queued = client.request('submit', bot='Queue', request_id='q', prompt='bg:sleep .1')['result']['turn']
+        queued = client.request('submit', bot='Queue', request_id='q', prompt='bg:sleep .1')['result']['message']
         self.assertEqual(client.finished(queued)['data']['status'], 'completed')
         # The store counts accepted, unfinished commands; the queue is the
         # subset still waiting for a slot.
         stats = client.request('stats')['result']
         self.assertEqual((stats['running_processes'], stats['queued_processes'], stats['process_limit']), (2, 1, 1))
-        over = client.request('submit', bot='Over', request_id='o', prompt='bg:sleep .1')['result']['turn']
+        over = client.request('submit', bot='Over', request_id='o', prompt='bg:sleep .1')['result']['message']
         self.assertEqual(client.finished(over)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Over', 'bg-1')['error'], 'capacity_exhausted')
         # No process record was made for the refusal; the accepted ones resolve in order.
@@ -182,7 +182,7 @@ class WaitTests(ModelFixture):
         self.assertEqual(done['pending'], [])
         self.assertEqual([done['results'][h]['exit_code'] for h in handles], [0, 0])
         # The line is free again.
-        later = client.request('submit', bot='Later', request_id='l', prompt='bg:true')['result']['turn']
+        later = client.request('submit', bot='Later', request_id='l', prompt='bg:true')['result']['message']
         self.assertEqual(client.finished(later)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Later', 'bg-1')['handle'], 'proc:3')
         self.assertEqual(client.request('stats')['result']['queued_processes'], 0)
@@ -190,36 +190,36 @@ class WaitTests(ModelFixture):
     def test_background_command_is_collected_by_a_parked_turn(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep .3; printf out; printf err >&2; exit 3')['result']['turn']
+        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep .3; printf out; printf err >&2; exit 3')['result']['message']
         self.assertEqual(client.finished(started)['data']['status'], 'completed')
         handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
         self.assertTrue(handle.startswith('proc:'))
-        waited = client.request('submit', bot='Bob', request_id='w', prompt='wait:' + handle)['result']['turn']
+        waited = client.request('submit', bot='Bob', request_id='w', prompt='wait:' + handle)['result']['message']
         self.assertEqual(client.finished(waited)['data']['status'], 'completed')
         kinds = self.kinds(client, 'Bob', waited)
         self.assertEqual(kinds.index('turn_waiting') + 1, kinds.index('turn_resumed'))
         result = self.tool_output(client, 'Bob', 'wait-1')['results'][handle]
         self.assertEqual((result['stdout'], result['stderr'], result['exit_code']), ('out', 'err', 3))
         # Process results are durable: a second wait returns the same outcome.
-        again = client.request('submit', bot='Bob', request_id='w2', prompt='wait:' + handle)['result']['turn']
+        again = client.request('submit', bot='Bob', request_id='w2', prompt='wait:' + handle)['result']['message']
         self.assertEqual(client.finished(again)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Bob', 'wait-1')['results'][handle]['exit_code'], 3)
-        unknown = client.request('submit', bot='Bob', request_id='w3', prompt='wait:proc:999')['result']['turn']
+        unknown = client.request('submit', bot='Bob', request_id='w3', prompt='wait:proc:999')['result']['message']
         self.assertEqual(client.finished(unknown)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Bob', 'wait-1')['error'], 'unknown_handle')
 
     def test_a_fork_cannot_collect_its_sources_background_command(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:printf out')['result']['turn']
+        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:printf out')['result']['message']
         self.assertEqual(client.finished(started)['data']['status'], 'completed')
         handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
         client.request('fork', source='Bob', bot='Twin', workspace=str(self.path))
         # The handle is in Twin's history, but the command is Bob's.
-        waited = client.request('submit', bot='Twin', request_id='w', prompt='wait:' + handle)['result']['turn']
+        waited = client.request('submit', bot='Twin', request_id='w', prompt='wait:' + handle)['result']['message']
         self.assertEqual(client.finished(waited)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Twin', 'wait-1')['error'], 'handle_unavailable')
-        mine = client.request('submit', bot='Bob', request_id='w', prompt='wait:' + handle)['result']['turn']
+        mine = client.request('submit', bot='Bob', request_id='w', prompt='wait:' + handle)['result']['message']
         self.assertEqual(client.finished(mine)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Bob', 'wait-1')['results'][handle]['stdout'], 'out')
         # A program holding the handle still resolves it.
@@ -230,37 +230,37 @@ class WaitTests(ModelFixture):
         for bot in ('Bob', 'Alice'):
             client.request('create', bot=bot, workspace=str(self.path))
         alice = client.request('submit', bot='Alice', request_id='a', prompt='slow')['result']
-        self.assertEqual(alice['handle'], f"turn:Alice/{alice['turn']}")
-        bob = client.request('submit', bot='Bob', request_id='b', prompt='wait:' + alice['handle'])['result']['turn']
+        self.assertEqual(alice['handle'], f"Alice/{alice['message']}")
+        bob = client.request('submit', bot='Bob', request_id='b', prompt='wait:' + alice['handle'])['result']['message']
         self.assertEqual(client.request('inspect', bot='Bob')['result']['status'] in ('running', 'waiting'), True)
-        self.assertEqual(client.finished(alice['turn'])['data']['status'], 'completed')
+        self.assertEqual(client.finished(alice['message'])['data']['status'], 'completed')
         self.assertEqual(client.finished(bob)['data']['status'], 'completed')
         result = self.tool_output(client, 'Bob', 'wait-1')['results'][alice['handle']]
-        self.assertEqual((result['status'], result['text'], result['turn']), ('completed', 'reply:slow', alice['turn']))
+        self.assertEqual((result['status'], result['text'], result['turn']), ('completed', 'reply:slow', alice['message']))
         self.assertIsNotNone(result['checkpoint'])
         # The model's copy is the outcome alone; accounting stays out of its context.
         self.assertFalse({'input_tokens', 'bot_id', 'started_ms', 'waiting_on'} & result.keys(), result)
         # Waiting on an already finished turn resolves without parking.
-        done = client.request('submit', bot='Bob', request_id='b2', prompt='wait:' + alice['handle'])['result']['turn']
+        done = client.request('submit', bot='Bob', request_id='b2', prompt='wait:' + alice['handle'])['result']['message']
         self.assertEqual(client.finished(done)['data']['status'], 'completed')
         self.assertIn('turn_resumed', self.kinds(client, 'Bob', done))
         # A turn cannot wait on itself, and unknown peers are errors, not hangs.
-        bad = client.request('submit', bot='Bob', request_id='b3', prompt='wait:turn:Nobody/1')['result']['turn']
+        bad = client.request('submit', bot='Bob', request_id='b3', prompt='wait:Nobody/1')['result']['message']
         self.assertEqual(client.finished(bad)['data']['status'], 'completed')
-        self.assertEqual(self.tool_output(client, 'Bob', 'wait-1')['results']['turn:Nobody/1']['error'], 'turn_not_found')
+        self.assertEqual(self.tool_output(client, 'Bob', 'wait-1')['results']['Nobody/1']['error'], 'turn_not_found')
 
     def test_a_turn_handle_keeps_the_answer_a_steer_came_after(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Alice', workspace=str(self.path))
         alice = client.request('submit', bot='Alice', request_id='a', prompt='sayslow:the review')['result']
-        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == alice['turn'])
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == alice['message'])
         client.request('submit', bot='Alice', request_id='s', prompt='steer:pause', delivery='steer')
-        self.assertEqual(client.finished(alice['turn'])['data']['status'], 'completed')
+        self.assertEqual(client.finished(alice['message'])['data']['status'], 'completed')
         result = client.request('wait', handles=[alice['handle']])['result']['results'][alice['handle']]
         self.assertEqual((result['text'], result['before_steer']), ('heard', 'the review'))
         # A turn no steer reached has its final text alone.
         plain = client.request('submit', bot='Alice', request_id='p', prompt='hello')['result']
-        client.finished(plain['turn'])
+        client.finished(plain['message'])
         result = client.request('wait', handles=[plain['handle']])['result']['results'][plain['handle']]
         self.assertNotIn('before_steer', result)
 
@@ -269,16 +269,16 @@ class WaitTests(ModelFixture):
         for bot in ('Bob', 'Alice', 'Carol'):
             client.request('create', bot=bot, workspace=str(self.path))
         alice = client.request('submit', bot='Alice', request_id='a', prompt='wait')['result']
-        bob = client.request('submit', bot='Bob', request_id='b', prompt='waitt:300:' + alice['handle'])['result']['turn']
+        bob = client.request('submit', bot='Bob', request_id='b', prompt='waitt:300:' + alice['handle'])['result']['message']
         self.assertEqual(client.finished(bob)['data']['status'], 'completed')
         outcome = self.tool_output(client, 'Bob', 'wait-1')
         self.assertEqual(outcome['pending'], [alice['handle']])
         self.assertTrue(outcome['results'][alice['handle']]['pending'])
-        carol = client.request('submit', bot='Carol', request_id='c', prompt='wait:' + alice['handle'])['result']['turn']
+        carol = client.request('submit', bot='Carol', request_id='c', prompt='wait:' + alice['handle'])['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == carol)
         self.assertEqual(client.request('inspect', bot='Carol')['result']['status'], 'waiting')
         # A pending turn is shown as it stands, with what it waits for.
-        handle = f'turn:Carol/{carol}'
+        handle = f'Carol/{carol}'
         polled = client.request('wait', handles=[handle, alice['handle']], timeout_ms=0)['result']['results']
         self.assertEqual((polled[handle]['pending'], polled[handle]['status'], polled[handle]['waiting_on']['handles']),
                          (True, 'waiting', [alice['handle']]))
@@ -290,10 +290,10 @@ class WaitTests(ModelFixture):
         # The abandoned wait received a cancellation result, so the history stays valid.
         cancelled = self.tool_output(client, 'Carol', 'wait-1')
         self.assertEqual(cancelled['error'], 'cancelled')
-        client.request('interrupt', bot='Alice', turn=alice['turn'])
-        self.assertEqual(client.finished(alice['turn'])['data']['status'], 'interrupted')
+        client.request('interrupt', bot='Alice', turn=alice['message'])
+        self.assertEqual(client.finished(alice['message'])['data']['status'], 'interrupted')
         # The interrupted parked turn left no uncertain tool; Carol can work again.
-        again = client.request('submit', bot='Carol', request_id='c2', prompt='hi')['result']['turn']
+        again = client.request('submit', bot='Carol', request_id='c2', prompt='hi')['result']['message']
         self.assertEqual(client.finished(again)['data']['status'], 'completed')
 
     def test_parked_turns_survive_restart_and_lost_processes_are_reported(self):
@@ -301,12 +301,12 @@ class WaitTests(ModelFixture):
         for bot in ('Bob', 'Alice', 'Dave'):
             client.request('create', bot=bot, workspace=str(self.path))
         alice = client.request('submit', bot='Alice', request_id='a', prompt='wait')['result']
-        bob = client.request('submit', bot='Bob', request_id='b', prompt='wait:' + alice['handle'])['result']['turn']
+        bob = client.request('submit', bot='Bob', request_id='b', prompt='wait:' + alice['handle'])['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == bob)
         # The command keeps running after only the daemon is killed: its write lands later.
         survivor = self.path / 'survived'
         dave = client.request('submit', bot='Dave', request_id='d',
-                              prompt='bgwait:sleep 1; printf written > survived')['result']['turn']
+                              prompt='bgwait:sleep 1; printf written > survived')['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == dave)
         client.close(kill=True)
         self.assertFalse(survivor.exists())
@@ -325,15 +325,15 @@ class WaitTests(ModelFixture):
             time.sleep(.05)
         self.assertEqual(survivor.read_text(), 'written')
         # Process ids are store-wide: a new background command never reuses the lost handle.
-        fresh = client.request('submit', bot='Dave', request_id='d2', prompt='bg:printf fresh')['result']['turn']
+        fresh = client.request('submit', bot='Dave', request_id='d2', prompt='bg:printf fresh')['result']['message']
         self.assertEqual(client.finished(fresh)['data']['status'], 'completed')
         self.assertNotEqual(self.tool_output(client, 'Dave', 'bg-1')['handle'], lost)
         # No wait collected the fresh command, so Dave is told of its end
         # in a turn of his own before he takes the next.
         told = client.receive(lambda m: m.get('event') == 'queued'
                               and m.get('data', {}).get('origin') == 'background', 10)
-        self.assertEqual(client.finished(told['turn'])['data']['status'], 'completed')
-        relook = client.request('submit', bot='Dave', request_id='d3', prompt='wait:' + lost)['result']['turn']
+        self.assertEqual(client.finished(told['message'])['data']['status'], 'completed')
+        relook = client.request('submit', bot='Dave', request_id='d3', prompt='wait:' + lost)['result']['message']
         self.assertEqual(client.finished(relook)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Dave', 'wait-1')['results'][lost]['error'], 'process_lost')
 
@@ -346,15 +346,15 @@ class WaitTests(ModelFixture):
     def test_a_steer_wakes_a_parked_wait_and_its_handles_stay_valid(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep 1.5; printf done')['result']['turn']
+        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep 1.5; printf done')['result']['message']
         client.finished(started)
         handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
-        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait:' + handle)['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait:' + handle)['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
         self.assertEqual(steer['status'], 'queued')
-        done = client.finished(steer['turn'])['data']
-        self.assertEqual((done['status'], done['into']), ('steered', turn))
+        done = client.finished(steer['message'])['data']
+        self.assertEqual((done['status'], done['turn']), ('taken', turn))
         # The steer reached the bot before the command ended: the wait
         # returned with its handle still pending.
         early = self.tool_output(client, 'Bob', 'wait-1')
@@ -372,20 +372,20 @@ class WaitTests(ModelFixture):
     def test_an_attached_note_leaves_a_parked_wait_and_a_running_command_alone(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep 1; printf done')['result']['turn']
+        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep 1; printf done')['result']['message']
         client.finished(started)
         handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
-        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait:' + handle)['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait:' + handle)['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
         note = client.request('submit', bot='Bob', request_id='n', prompt='fyi', delivery='attach')['result']
         self.assertEqual(note['status'], 'attached')
         # The wait ran to its end, and the note joined the call after it.
-        self.assertEqual((client.finished(note['turn'])['data']['into']), turn)
+        self.assertEqual((client.finished(note['message'])['data']['turn']), turn)
         result = self.tool_output(client, 'Bob', 'wait-1')
         self.assertEqual((result['pending'], result['results'][handle]['stdout']), ([], 'done'))
         self.assertNotIn('steered', result)
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        lifting = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep .8; printf done')['result']['turn']
+        lifting = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep .8; printf done')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == lifting)
         client.request('submit', bot='Bob', request_id='n2', prompt='fyi', delivery='attach')
         self.assertEqual(client.finished(lifting)['data']['status'], 'completed')
@@ -396,13 +396,13 @@ class WaitTests(ModelFixture):
     def test_a_steer_passes_every_wait_in_the_same_response(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep 1.5; printf done')['result']['turn']
+        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep 1.5; printf done')['result']['message']
         client.finished(started)
         handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
-        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait2:' + handle)['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait2:' + handle)['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
-        self.assertEqual(client.finished(steer['turn'])['data']['status'], 'steered')
+        self.assertEqual(client.finished(steer['message'])['data']['status'], 'taken')
         for call in ('wait-1', 'wait-2'):
             early = self.tool_output(client, 'Bob', call)
             self.assertEqual((early['pending'], early['steered']), ([handle], True))
@@ -412,11 +412,11 @@ class WaitTests(ModelFixture):
     def test_a_steer_moves_a_running_command_to_the_background(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep 3; printf done')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep 3; printf done')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
-        done = client.finished(steer['turn'])['data']
-        self.assertEqual((done['status'], done['into']), ('steered', turn))
+        done = client.finished(steer['message'])['data']
+        self.assertEqual((done['status'], done['turn']), ('taken', turn))
         # Moved to the background before it ended, not waited out.
         lifted = self.tool_output(client, 'Bob', 'lift-1')
         self.assertEqual((lifted['background'], lifted['steered']), (True, True))
@@ -437,7 +437,7 @@ class WaitTests(ModelFixture):
         commands = ['sleep .9; printf 1'] + [f'sleep .6; printf {n}' for n in range(2, 7)]
         started = time.monotonic()
         submitted = client.request('submit', bot='Bob', request_id='p', prompt='para:' + '|'.join(commands))['result']
-        turn = submitted['turn']
+        turn = submitted['message']
         finished = client.finished(turn)['data']
         elapsed = time.monotonic() - started
         self.assertEqual(finished['status'], 'completed')
@@ -456,14 +456,14 @@ class WaitTests(ModelFixture):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='p',
-                              prompt='para:sleep 1.5; printf a|sleep 1.5; printf b|printf c')['result']['turn']
+                              prompt='para:sleep 1.5; printf a|sleep 1.5; printf b|printf c')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn
                        and m['data']['call_id'] == 'para-3')
         time.sleep(.2)
         sent = time.monotonic()
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
-        done = client.finished(steer['turn'])['data']
-        self.assertEqual((done['status'], done['into']), ('steered', turn))
+        done = client.finished(steer['message'])['data']
+        self.assertEqual((done['status'], done['turn']), ('taken', turn))
         self.assertLess(time.monotonic() - sent, 1.0)
         for call in ('para-1', 'para-2'):
             lifted = self.tool_output(client, 'Bob', call)
@@ -473,10 +473,10 @@ class WaitTests(ModelFixture):
     def test_a_command_that_ends_soon_after_a_steer_returns_as_usual(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep .1; printf quick')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep .1; printf quick')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
         steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')['result']
-        self.assertEqual(client.finished(steer['turn'])['data']['status'], 'steered')
+        self.assertEqual(client.finished(steer['message'])['data']['status'], 'taken')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Bob', 'lift-1')['stdout'], 'quick')
 
@@ -485,10 +485,10 @@ class WaitTests(ModelFixture):
         other.mkdir()
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep .8; printf done')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:sleep .8; printf done')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
         steer = client.request('submit', bot='Bob', request_id='s', prompt='elsewhere',
-                               workspace=str(other), delivery='steer')['result']['turn']
+                               workspace=str(other), delivery='steer')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Bob', 'lift-1')['stdout'], 'done')
         self.assertEqual(client.finished(steer)['data']['status'], 'completed')
@@ -497,9 +497,9 @@ class WaitTests(ModelFixture):
         client = self.client('echo,shell,wait', extra=('--max-processes', '1'))
         for bot in ('Hold', 'Bob'):
             client.request('create', bot=bot, workspace=str(self.path))
-        held = client.request('submit', bot='Hold', request_id='h', prompt='bg:sleep .8')['result']['turn']
+        held = client.request('submit', bot='Hold', request_id='h', prompt='bg:sleep .8')['result']['message']
         client.finished(held)
-        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:printf ran')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='l', prompt='liftwait:printf ran')['result']['message']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn)
         client.request('submit', bot='Bob', request_id='s', prompt='steer:look', delivery='steer')
         # It ran once the slot freed, and too quickly to be moved.
@@ -510,10 +510,10 @@ class WaitTests(ModelFixture):
     def test_a_queued_message_leaves_a_parked_wait_alone(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep .6')['result']['turn']
+        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep .6')['result']['message']
         client.finished(started)
         handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
-        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait:' + handle)['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='w', prompt='rewait:' + handle)['result']['message']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
         client.request('submit', bot='Bob', request_id='q', prompt='later', delivery='queue')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -525,7 +525,7 @@ class WaitTests(ModelFixture):
         for bot in ('Bob', 'Alice'):
             client.request('create', bot=bot, workspace=str(self.path))
         alice = client.request('submit', bot='Alice', request_id='a', prompt='slow')['result']
-        bob = client.request('submit', bot='Bob', request_id='b', prompt='waitthen:' + alice['handle'])['result']['turn']
+        bob = client.request('submit', bot='Bob', request_id='b', prompt='waitthen:' + alice['handle'])['result']['message']
         self.assertEqual(client.finished(bob)['data']['status'], 'completed')
         kinds = self.kinds(client, 'Bob', bob)
         # The echo planned after the wait completes after the resume, before the next model call.
@@ -547,8 +547,8 @@ class WaitTests(ModelFixture):
         again = client.request('submit', bot='Alice', request_id='a2', prompt='wait')['result']
         timed = client.request('wait', handles=[again['handle']], timeout_ms=200)['result']
         self.assertEqual(timed['pending'], [again['handle']])
-        client.request('interrupt', bot='Alice', turn=again['turn'])
-        client.finished(again['turn'])
+        client.request('interrupt', bot='Alice', turn=again['message'])
+        client.finished(again['message'])
 
     def test_any_mode_returns_the_first_result_and_keeps_the_rest_valid(self):
         client = self.client('echo,shell,wait')
@@ -562,7 +562,7 @@ class WaitTests(ModelFixture):
         self.assertEqual(first['pending'], [slow['handle']])
         # The tool does the same and the turn continues with what it got.
         bob = client.request('submit', bot='Bob', request_id='b',
-                             prompt=f"waitany:{slow['handle']},{quick['handle']}")['result']['turn']
+                             prompt=f"waitany:{slow['handle']},{quick['handle']}")['result']['message']
         self.assertEqual(client.finished(bob)['data']['status'], 'completed')
         outcome = self.tool_output(client, 'Bob', 'wait-1')
         self.assertEqual(outcome['pending'], [slow['handle']])
@@ -580,14 +580,14 @@ class WaitTests(ModelFixture):
         client = self.client('echo,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='invalid',
-                              prompt='waitthen:bad-handle')['result']['turn']
+                              prompt='waitthen:bad-handle')['result']['message']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'Bob', 'wait-1')['error'], 'invalid_handle')
         self.assertEqual(self.tool_output(client, 'Bob', 'after-1'), 'after-the-wait')
 
     def test_protocol_wait_rejects_malformed_handles_without_hanging(self):
         client = self.client('echo,wait')
-        for handle in ('bad-handle', 'proc:01', 'turn:Bob/+1'):
+        for handle in ('bad-handle', 'proc:01', 'Bob/+1'):
             with self.subTest(handle=handle):
                 result = client.request('wait', handles=[handle], timeout_ms=20)
                 self.assertEqual(result['error'], 'invalid_handle')
@@ -600,7 +600,7 @@ class WaitTests(ModelFixture):
             bot = f'output-{n}'
             client.request('create', bot=bot, workspace=str(self.path))
             turn = client.request('submit', bot=bot, request_id='output',
-                                  prompt="bg:printf '%065536d' 0; printf '%065536d' 0 >&2")['result']['turn']
+                                  prompt="bg:printf '%065536d' 0; printf '%065536d' 0 >&2")['result']['message']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
             handle = self.tool_output(client, bot, 'bg-1')['handle']
             handles.append(handle)
@@ -616,7 +616,7 @@ class WaitTests(ModelFixture):
             client.request('create', bot=bot, workspace=str(self.path))
         alice = client.request('submit', bot='Alice', request_id='a', prompt='wait')['result']
         bob = client.request('submit', bot='Bob', request_id='b',
-                             prompt='waitthen:' + alice['handle'])['result']['turn']
+                             prompt='waitthen:' + alice['handle'])['result']['message']
         client.followers['Bob'].receive(lambda e: e.get('event') == 'turn_waiting')
         client.request('interrupt', bot='Bob', turn=bob)
         self.assertEqual(client.finished(bob)['data']['status'], 'interrupted')
@@ -635,7 +635,7 @@ class WaitTests(ModelFixture):
         for n in range(8):
             client.request('create', bot=f'parent-{n}', workspace=str(self.path))
             turns.append(client.request('submit', bot=f'parent-{n}', request_id='r',
-                                        prompt=f'bgwait:sleep .2; printf done-{n}')['result']['turn'])
+                                        prompt=f'bgwait:sleep .2; printf done-{n}')['result']['message'])
         deadline = time.monotonic() + 10
         for turn in turns:
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -647,7 +647,7 @@ class WaitTests(ModelFixture):
     def test_shutdown_releases_pending_protocol_waits_without_stdin_eof(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep 1')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='bg', prompt='bg:sleep 1')['result']['message']
         client.finished(turn)
         handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
         client.process.stdin.write(json.dumps({'id': 'pending', 'op': 'wait', 'handles': [handle],
@@ -717,7 +717,7 @@ class WaitTests(ModelFixture):
         client.request('create', bot='Loop', workspace=str(self.path), settings={'max_rounds': 200})
         anchor = client.request('submit', bot='Anchor', request_id='a', prompt='gate')['result']
         prompt = 'budget:' + anchor['handle']
-        turn = client.request('submit', bot='Loop', request_id='loop', prompt=prompt)['result']['turn']
+        turn = client.request('submit', bot='Loop', request_id='loop', prompt=prompt)['result']['message']
         client.receive(lambda e: e.get('event') == 'turn_waiting' and e.get('turn') == turn
                        and e['data']['handles'] == [anchor['handle']], timeout=10)
         client.close(kill=True)
@@ -749,10 +749,10 @@ class WaitTests(ModelFixture):
                     db.execute(f"CREATE TRIGGER reject_completion {trigger} BEGIN "
                                "SELECT RAISE(ABORT, 'synthetic write failure'); END")
                 command = "while [ ! -f release ]; do sleep .01; done; printf done >> marker; printf '%070000d' 0"
-                started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:' + command)['result']['turn']
+                started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:' + command)['result']['message']
                 self.assertEqual(client.finished(started)['data']['status'], 'completed')
                 handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
-                waiting = client.request('submit', bot='Bob', request_id='w', prompt='wait:' + handle)['result']['turn']
+                waiting = client.request('submit', bot='Bob', request_id='w', prompt='wait:' + handle)['result']['message']
                 client.receive(lambda e: e.get('event') == 'turn_waiting' and e.get('turn') == waiting)
                 client.process.stdin.write(json.dumps({'id': 'pending', 'op': 'wait', 'handles': [handle]}) + '\n')
                 client.process.stdin.flush()
@@ -775,7 +775,7 @@ class WaitTests(ModelFixture):
                 self.assertEqual((workspace / 'marker').read_text(), 'done')
                 # Repaired storage accepts both a fresh result and its overflow.
                 fresh = recovered.request('submit', bot='Bob', request_id='fresh',
-                                          prompt="bg:printf '%070000d' 0")['result']['turn']
+                                          prompt="bg:printf '%070000d' 0")['result']['message']
                 self.assertEqual(recovered.finished(fresh)['data']['status'], 'completed')
                 fresh_handle = self.tool_output(recovered, 'Bob', 'bg-1')['handle']
                 result = recovered.request('wait', handles=[fresh_handle])['result']['results'][fresh_handle]
@@ -804,7 +804,7 @@ class WaitTests(ModelFixture):
                 time.sleep(.01)
         before = looks(1)
         started = client.request('submit', bot='Bob', request_id='bg',
-                                 prompt="bg:while [ ! -f release ]; do sleep .01; done; printf done > marker")['result']['turn']
+                                 prompt="bg:while [ ! -f release ]; do sleep .01; done; printf done > marker")['result']['message']
         self.assertEqual(client.finished(started)['data']['status'], 'completed')
         looks(before + 1)
         with sqlite3.connect(database) as db:
@@ -845,6 +845,7 @@ class WaitTests(ModelFixture):
         # The submission's turn started, and shutdown ended it like any
         # running turn instead of leaving it for the next start to find.
         with sqlite3.connect(database) as db:
-            status = db.execute("SELECT status FROM turns WHERE request_id='late'").fetchone()[0]
+            status = db.execute("SELECT t.status FROM messages m JOIN turns t ON t.id=m.turn"
+                                " WHERE m.request_id='late'").fetchone()[0]
             self.assertEqual(status, 'interrupted')
             self.assertEqual(db.execute("SELECT count(*) FROM bots WHERE name LIKE 'New%'").fetchone()[0], 8)

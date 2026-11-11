@@ -142,8 +142,8 @@ tries its held turns at once.
   always sends the mode it resolved, so one person's preference never
   changes what a program's submission means. A blocking `run` with `queue`
   follows the turn from its queued state to its end; with `steer` it ends
-  with exit 0 when the message is absorbed (`steered`, naming the turn it
-  joined) or when the turn it started completes. A steer never waits behind
+  with exit 0 when the message is taken into the running turn (`taken`,
+  naming the turn it joined) or when the turn it started completes. A steer never waits behind
   a blocking call and never cancels one: a turn parked on `wait` resumes at
   once with its unresolved handles pending (still valid) and `steered: true`,
   and a foreground `shell` command still running 250 ms after the steer
@@ -479,9 +479,11 @@ turn with a level sees it in its shell as `AGENT_EFFORT`, and a new bot that tak
 from `AGENT_MODEL` takes its level from `AGENT_EFFORT`, so a peer started
 on its creator's model thinks as hard as its creator; a bot given
 `--model` or a profile's model gets only its own `--effort`.
-`run --quote BOT/TURN` copies that turn's prompt after this prompt, with a
-line saying who wrote it; `BOT/TURN:reply` copies the reply the finished
-turn ended with. It repeats, up to 64, the quotes a quoted prompt brings
+`run --quote BOT/N` copies that one message's words after this prompt,
+with a line saying who wrote it, even when other messages were steered or
+attached beside it; `BOT/N:reply` copies the reply the finished turn it
+opened ended with. `N` is the number the model reads after each message
+and Sonny shows beside its time. It repeats, up to 64, the quotes a quoted prompt brings
 counted. The daemon copies the words, so the model reads what was written
 and by whom, never the sender's retelling; a turn without those words is
 refused (`quote_not_found`, `quote_unfinished`, `quote_too_large`). Sonny's

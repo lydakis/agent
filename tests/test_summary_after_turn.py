@@ -31,7 +31,7 @@ class SummaryAfterTurnTests(ModelFixture):
         return client
 
     def turn(self, client, request, prompt, status='completed'):
-        turn = client.request('submit', bot='Bob', request_id=str(request), prompt=prompt)['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id=str(request), prompt=prompt)['result']['message']
         ended = client.finished(turn, timeout=15)
         self.assertEqual(ended['data']['status'], status, ended)
         return ended
@@ -87,7 +87,7 @@ class SummaryAfterTurnTests(ModelFixture):
         self.model.request_gates = queue.Queue()
         self.model.request_gates.put(gate)
         drain(self.model)
-        turn = client.request('submit', bot='Bob', request_id='2', prompt='long:3x1')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='2', prompt='long:3x1')['result']['message']
         self.wait_for(lambda: self.summaries())
         time.sleep(.2)
         gate.set()
@@ -261,7 +261,7 @@ class SummaryAfterTurnTests(ModelFixture):
         gate = threading.Event()
         self.model.request_gates = queue.Queue()
         self.model.request_gates.put(gate)
-        turn = client.request('submit', bot='Bob', request_id='new', prompt='long:2x1')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='new', prompt='long:2x1')['result']['message']
         time.sleep(1.5)
         gate.set()
         self.assertEqual(client.finished(turn, timeout=15)['data']['status'], 'completed')
@@ -285,7 +285,7 @@ class SummaryAfterTurnTests(ModelFixture):
         gate = threading.Event()
         self.model.request_gates = queue.Queue()
         self.model.request_gates.put(gate)
-        turn = client.request('submit', bot='Bob', request_id='new', prompt='long:2x1')['result']['turn']
+        turn = client.request('submit', bot='Bob', request_id='new', prompt='long:2x1')['result']['message']
         time.sleep(3)
         gate.set()
         self.assertEqual(client.finished(turn, timeout=15)['data']['status'], 'completed')

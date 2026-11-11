@@ -477,7 +477,7 @@ pub async fn turn_with(
             return (Err(failed(why)), None);
         }
     };
-    let (Some(turn), Some(handle)) = (submitted["turn"].as_i64(), submitted["handle"].as_str())
+    let (Some(turn), Some(handle)) = (submitted["message"].as_i64(), submitted["handle"].as_str())
     else {
         return (Err(failed("the reviewer's turn was not started")), None);
     };
@@ -564,7 +564,7 @@ pub async fn remove(client: &Client, name: &str, running: Option<i64>) {
         let _ = client
             .request(
                 "wait",
-                json!({"handles": [format!("turn:{name}/{turn}")], "timeout_ms": 5_000}),
+                json!({"handles": [format!("{name}/{turn}")], "timeout_ms": 5_000}),
             )
             .await;
     }

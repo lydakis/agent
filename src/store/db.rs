@@ -1044,6 +1044,9 @@ pub struct Binding<'a> {
 pub struct Started {
     pub turn: i64,
     pub fresh: bool,
+    /// Whether the message opened a turn, which shares its number: now,
+    /// or for a retry, when it was first sent.
+    pub opened: bool,
     /// `running`, `queued` behind the bot's own work, `ready` for a slot,
     /// or `attached` to the bot's next model call.
     pub status: &'static str,
@@ -2130,7 +2133,6 @@ const PREVIEW: &str = "CASE WHEN m.text<>'' OR m.node IS NULL THEN substr(m.text
 const PREVIEW_NODE: &str = "LEFT JOIN openings o ON o.node=m.node AND m.text=''
     LEFT JOIN declined d ON d.node=m.node AND m.text=''";
 /// The node `MESSAGE_TEXT` reads, joined only when the words live there.
-
 const MESSAGE_NODE: &str = "LEFT JOIN nodes n ON n.id=m.node AND m.text=''
     LEFT JOIN declined d ON d.node=n.id";
 
@@ -2661,6 +2663,7 @@ impl Database {
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS messages_bot_id ON messages(bot,id);
             CREATE INDEX IF NOT EXISTS messages_turn ON messages(turn) WHERE turn IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS messages_node ON messages(node) WHERE node IS NOT NULL;
             CREATE INDEX IF NOT EXISTS messages_queued ON messages(bot,id) WHERE status='queued';
             CREATE INDEX IF NOT EXISTS messages_steers ON messages(bot,id) WHERE status='queued' AND delivery='steer';
             CREATE INDEX IF NOT EXISTS messages_attached ON messages(bot,id) WHERE status='attached';
@@ -2683,6 +2686,7 @@ impl Database {
                 summary_ms INTEGER NOT NULL DEFAULT 0, reply_node INTEGER,
                 work INTEGER NOT NULL DEFAULT 0, limited TEXT, drops INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
+            CREATE INDEX IF NOT EXISTS turns_started_ms ON turns(started_ms);
             CREATE TABLE IF NOT EXISTS turn_models(turn INTEGER NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
                 model TEXT NOT NULL, speed TEXT NOT NULL DEFAULT 'standard', input_tokens INTEGER NOT NULL DEFAULT 0,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
@@ -6656,9 +6660,14 @@ impl Database {
                 )
                 .facts(json!({"field":field,"message":turn})));
             }
+            let opened = self
+                .conn
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM turns WHERE id=?)")?
+                .query_row([turn], |r| r.get(0))?;
             return Ok(Started {
                 turn,
                 fresh: false,
+                opened,
                 attached: false,
                 status: turn_status_name(&status),
                 entry: None,
@@ -6887,10 +6896,10 @@ impl Database {
         Ok(Started {
             turn,
             fresh: true,
+            opened: status == "running",
             attached,
             status,
             entry: Some(message_entry(cursor, name, opened, turn, kind, data)),
-
             joins,
             parked,
         })
@@ -12685,10 +12694,10 @@ impl Database {
         // bound is on the item as read, its pictures left out.
         let mut query = self.conn.prepare_cached(&format!(
             "SELECT CASE WHEN length(n.item)<=?2 THEN n.item END,s.bot,s.turn,s.bot_id,s.origin,
-                s.person,s.quotes,n.written_ms,s.attached
-             FROM (SELECT id,{PICTURELESS} AS item,written_ms FROM
-                (SELECT n.id,COALESCE(d.item,n.item) AS item,n.written_ms FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)) n
-             LEFT JOIN senders s ON s.node=n.id"
+                s.person,s.quotes,n.written_ms,s.attached,n.message,m.bot
+             FROM (SELECT id,{PICTURELESS} AS item,written_ms,message FROM
+                (SELECT n.id,COALESCE(d.item,n.item) AS item,n.written_ms,n.message FROM nodes n LEFT JOIN declined d ON d.node=n.id WHERE n.id=?1)) n
+             LEFT JOIN senders s ON s.node=n.id LEFT JOIN messages m ON m.id=n.message"
         ))?;
         for &node in wanted {
             type Row = (
@@ -12701,21 +12710,36 @@ impl Database {
                 Option<String>,
                 Option<i64>,
                 Option<bool>,
+                Option<i64>,
+                Option<String>,
             );
-            let (raw, from, from_turn, bot_id, origin, person, quotes, written, attached): Row =
-                query.query_row(params![node, maximum as i64], |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                        r.get(7)?,
-                        r.get(8)?,
-                    ))
-                })?;
+            let (
+                raw,
+                from,
+                from_turn,
+                bot_id,
+                origin,
+                person,
+                quotes,
+                written,
+                attached,
+                message,
+                to,
+            ): Row = query.query_row(params![node, maximum as i64], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                    r.get(10)?,
+                ))
+            })?;
             let mut entry = match raw {
                 Some(raw) => json!({"node":node,"item":serde_json::from_slice::<Value>(&raw)?}),
                 None => json!({"node":node,"error":"item_too_large"}),
@@ -12724,6 +12748,12 @@ impl Database {
             // keeping it.
             if let Some(written) = written {
                 entry["written_ms"] = json!(written);
+            }
+            // The message an item holds, by the number the model reads on
+            // it, and its handle to quote it by.
+            if let (Some(message), Some(to)) = (message, to) {
+                entry["message"] = json!(message);
+                entry["handle"] = json!(format!("{to}/{message}"));
             }
             sender_fields(
                 &mut entry,
@@ -14276,7 +14306,7 @@ fn after_words(
         (_, _, None, Some(person)) => format!("[Message {to}/{message}, written by {person}.]"),
         _ => format!("[Message {to}/{message}.]"),
     };
-    let mut parts: Vec<String> = Some(line).filter(|_| !hide).into_iter().collect();
+    let mut parts: Vec<String> = (!hide).then_some(line).into_iter().collect();
     let Some(quotes) = quotes else {
         return Ok((parts, None));
     };

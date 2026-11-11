@@ -250,9 +250,18 @@ pub struct Screen {
     /// The react mark drawn last, where the reactions under the agent's
     /// message under the mouse go: its row and column, and the node.
     react: Option<(u16, u16, i64)>,
-    /// When each message was written, by its node, in Unix milliseconds:
-    /// shown over the message under the mouse.
-    dates: HashMap<i64, i64>,
+    /// Each message's handle and when it was written, by its node: shown
+    /// over the message under the mouse.
+    dates: HashMap<i64, Stamp>,
+}
+
+/// What the mark over a message says: its handle, `BOT/N`, the number the
+/// model reads on it and `--quote` takes, and when it was written, in Unix
+/// milliseconds.
+#[derive(Clone, Debug, Default)]
+struct Stamp {
+    handle: Option<String>,
+    ms: Option<i64>,
 }
 
 /// The columns before a message's words: its bullet or arrow and a space.
@@ -394,12 +403,24 @@ impl Screen {
 
     /// When the message at `node` was written, `ms` in Unix milliseconds.
     pub fn date(&mut self, node: i64, ms: i64) {
-        self.dates.insert(node, ms);
+        self.dates.entry(node).or_default().ms = Some(ms);
+    }
+
+    /// The handle of the message at `node`, `BOT/N`.
+    pub fn number(&mut self, node: i64, handle: String) {
+        self.dates.entry(node).or_default().handle = Some(handle);
     }
 
     #[cfg(test)]
     pub fn dated(&self, node: i64) -> Option<i64> {
-        self.dates.get(&node).copied()
+        self.dates.get(&node).and_then(|written| written.ms)
+    }
+
+    #[cfg(test)]
+    pub fn numbered(&self, node: i64) -> Option<String> {
+        self.dates
+            .get(&node)
+            .and_then(|written| written.handle.clone())
     }
 
     /// `mark` on the last row pushed; whether there was one.
@@ -1731,16 +1752,19 @@ impl Screen {
                 .set_symbol(REPLY)
                 .set_style(Style::new().add_modifier(Modifier::DIM));
             self.reply = Some((y, area.x, node));
-            // When it was written, muted, at the top right edge of the
-            // message: the right end of the row over it, only a row on
-            // screen with nothing on it, the gap over an agent's words or
-            // the band's over the person's, so the time never covers
-            // anything and no row is made wider.
+            // Its handle and when it was written, muted, at the top right
+            // edge of the message: the right end of the row over it, only
+            // a row on screen with nothing on it, the gap over an agent's
+            // words or the band's over the person's, so the mark never
+            // covers anything and no row is made wider.
             if at > top
                 && self.shown[at - 1].line.width() == 0
-                && let Some(&ms) = self.dates.get(&node)
+                && let Some(written) = self.dates.get(&node)
             {
-                let when = crate::stamp::written(ms);
+                let when = (written.handle.iter().cloned())
+                    .chain(written.ms.map(crate::stamp::written))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
                 let wide = when.width() as u16;
                 // Inset from the right as the words are from the left.
                 if area.width > 2 * GUTTER + wide {
@@ -2671,6 +2695,15 @@ mod tests {
         );
         assert_eq!(row(&buf, 3).trim_end(), "  ran the tests");
         assert!((0..6).all(|y| !row(&buf, y).contains(&when)));
+        // A message's own number goes before its time: the handle the
+        // model reads on it and `--quote` takes.
+        screen.number(6, "calc.fix/48".into());
+        screen.mouse(mouse(MouseEventKind::Moved, 4, 2));
+        let buf = draw(&mut screen);
+        assert_eq!(
+            row(&buf, 1),
+            format!("{:>38}  ", format!("calc.fix/48 · {when}"))
+        );
     }
 
     #[test]

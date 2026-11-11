@@ -27,7 +27,7 @@ class FleetScreenTests(unittest.TestCase):
             now[0] += .010
             screen.absorb({'event': 'turn_finished', 'turn': index + 1,
                            'data': outcomes[index], '_received_at': received})
-            return {'result': {'turn': index + 1}}
+            return {'result': {'message': index + 1, 'turn': index + 1}}
 
         screen.client = SimpleNamespace(request=submit)
         screen.pump = lambda: now.__setitem__(0, now[0] + 1.0)
@@ -50,7 +50,7 @@ class FleetScreenTests(unittest.TestCase):
                 def submit(op, *, bot, **kwargs):
                     turn = int(bot[1:]) + 1
                     outstanding.append(turn)
-                    return {'result': {'turn': turn}}
+                    return {'result': {'message': turn, 'turn': turn}}
 
                 def pump():
                     batches.append(len(outstanding))
