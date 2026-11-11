@@ -539,6 +539,9 @@ struct StatusRead {
     idle: Vec<String>,
     /// Whether any agent's history was read, not taken from what was kept.
     fresh: bool,
+    /// Whether every history it read was read: one that failed counts as
+    /// nothing until a later read.
+    whole: bool,
 }
 
 /// The agents of `scope` as `/status` shows them, and footers and leads
@@ -612,7 +615,7 @@ async fn read_status(
     let mine = owned(&listed, &project, &lead);
     // Side chats are not the project's agents.
     let mut kept = HashMap::new();
-    let mut fresh = false;
+    let (mut fresh, mut whole) = (false, true);
     for bot in &listed {
         let Some(name) = bot["name"].as_str().filter(|_| bot["expire_ms"].is_null()) else {
             continue;
@@ -632,7 +635,9 @@ async fn read_status(
             Some((seen, latest)) if seen == head && !bot["head"].is_null() => Some(latest),
             _ => {
                 fresh = true;
-                read_latest(client, name).await
+                let latest = read_latest(client, name).await;
+                whole &= latest.is_some();
+                latest
             }
         };
         if let Some(latest) = &latest {
@@ -719,7 +724,10 @@ async fn read_status(
                             asks_seen.insert(name.to_owned(), (last, seen.clone()));
                             seen
                         }
-                        None => Seen::default(),
+                        None => {
+                            whole = false;
+                            Seen::default()
+                        }
                     }
                 }
             },
@@ -838,6 +846,7 @@ async fn read_status(
         read,
         idle,
         fresh,
+        whole,
     })
 }
 
@@ -3594,17 +3603,24 @@ type Reads = (
 
 /// What the footer's count of the agents found: the mark of where they
 /// stood, and, when that had changed, the counts with the reads made.
+/// No mark when a history read failed, so the next count reads again.
 struct Counted {
-    mark: u64,
+    mark: Option<u64>,
     read: Option<(status::Counts, Reads)>,
 }
 
 /// A mark of where the agents `pattern` names stand, as the daemon lists
 /// them, and of what waits on the person: what decides each one's group,
 /// and a running one's history, whose newest items can hold a question.
-/// `here` is this window's own open question and calls. None when the
-/// daemon could not be asked.
-async fn standing(client: &Client, pattern: &str, here: (usize, usize)) -> Option<u64> {
+/// `here` is this window's own open question and calls. A task marked
+/// done beside `store` counts too: a lead elsewhere can mark it without
+/// it moving. None when the daemon could not be asked.
+async fn standing(
+    client: &Client,
+    store: &std::path::Path,
+    pattern: &str,
+    here: (usize, usize),
+) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let mut mark = std::collections::hash_map::DefaultHasher::new();
     here.hash(&mut mark);
@@ -3628,6 +3644,9 @@ async fn standing(client: &Client, pattern: &str, here: (usize, usize)) -> Optio
             }
             if !bot["running_turn"].is_null() {
                 bot["head"].to_string().hash(&mut mark);
+            }
+            if let Some(name) = bot["name"].as_str() {
+                resolved::read(store, name).hash(&mut mark);
             }
         }
         match page["next_after"].as_str() {
@@ -8629,7 +8648,7 @@ impl App {
         if let Some(job) = self.counting.take_if(|job| job.is_finished())
             && let Ok(Some(counted)) = job.await
         {
-            self.counted_mark = Some(counted.mark);
+            self.counted_mark = counted.mark;
             if let Some((counts, (latest, seen))) = counted.read {
                 self.counts = Some(counts);
                 self.status_read = latest;
@@ -8653,9 +8672,14 @@ impl App {
             approvals.len(),
         );
         self.counting = Some(tokio::spawn(async move {
-            let mark = standing(&client, &scope.glob, here).await?;
+            let marks =
+                agent_client::socket::canonical_store(&store).unwrap_or_else(|_| store.clone());
+            let mark = standing(&client, &marks, &scope.glob, here).await?;
             if was == Some(mark) {
-                return Some(Counted { mark, read: None });
+                return Some(Counted {
+                    mark: Some(mark),
+                    read: None,
+                });
             }
             let view = StatusView {
                 bot: &bot,
@@ -8671,7 +8695,7 @@ impl App {
                 .ok()?;
             woken.notify_one();
             Some(Counted {
-                mark,
+                mark: read.whole.then_some(mark),
                 read: Some((status::counts(&read.rows), (latest, seen))),
             })
         }));
@@ -18239,8 +18263,12 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let listings = Arc::new(AtomicUsize::new(0));
         let ended = Arc::new(AtomicBool::new(false));
-        let (listed, over) = (listings.clone(), ended.clone());
+        let failing = Arc::new(AtomicBool::new(false));
+        let (listed, over, fails) = (listings.clone(), ended.clone(), failing.clone());
         let client = daemon_answering(move |asked| match asked["op"].as_str().unwrap_or("") {
+            "history_nodes" | "history" if fails.load(Ordering::SeqCst) => {
+                json!({"error": "store_busy"})
+            }
             "bots" => {
                 listed.fetch_add(1, Ordering::SeqCst);
                 let fix = match over.load(Ordering::SeqCst) {
@@ -18263,6 +18291,9 @@ mod tests {
         .await;
         let mut app = app(client);
         app.bot = "shop.lead".into();
+        let dir = std::env::temp_dir().join(unique("sonny-footer-counts"));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.options.store = dir.join("state.sqlite");
         let counted = async |app: &mut App| {
             app.counted_at = None;
             app.count_agents().await;
@@ -18290,6 +18321,39 @@ mod tests {
         counted(&mut app).await;
         assert_eq!(listings.load(Ordering::SeqCst), 5);
         assert_eq!(app.counts, Some(counts(0, 0, 2)));
+        // Marked done by a lead elsewhere, the task itself unmoved: read
+        // again, and counted done.
+        resolved::keep(&dir.join("state.sqlite"), "shop.fix", 4, "call-1").unwrap();
+        counted(&mut app).await;
+        assert_eq!(listings.load(Ordering::SeqCst), 7);
+        assert_eq!(
+            app.counts,
+            Some(status::Counts {
+                idle: 1,
+                done: 1,
+                ..Default::default()
+            })
+        );
+        // A history read that failed keeps no mark: the next count reads
+        // again, and once it reads whole, only the mark again.
+        failing.store(true, Ordering::SeqCst);
+        let _ = app.counting.take().unwrap().await;
+        let listed = listings.load(Ordering::SeqCst);
+        (
+            app.status_read.clear(),
+            app.asks_seen.clear(),
+            app.counted_mark = None,
+        );
+        counted(&mut app).await;
+        assert_eq!(listings.load(Ordering::SeqCst), listed + 2);
+        assert_eq!(app.counted_mark, None);
+        failing.store(false, Ordering::SeqCst);
+        counted(&mut app).await;
+        assert_eq!(listings.load(Ordering::SeqCst), listed + 4);
+        assert!(app.counted_mark.is_some());
+        counted(&mut app).await;
+        assert_eq!(listings.load(Ordering::SeqCst), listed + 5);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
