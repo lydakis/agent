@@ -5563,6 +5563,7 @@ impl Service {
                     origin,
                     person,
                     quotes,
+                    quoted: None,
                     budget_tokens,
                     budget_counts,
                     images,

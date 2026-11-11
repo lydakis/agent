@@ -1081,6 +1081,10 @@ pub struct TurnOptions {
     /// Turns whose words the store copies after this prompt's, each with
     /// who wrote them.
     pub quotes: Vec<QuoteRef>,
+    /// The words `quotes` copied, as a message going back in line holds
+    /// them: kept as they were, whatever became of the turns they came
+    /// from. None copies them now.
+    pub quoted: Option<String>,
     /// The most tokens, of what `budget_counts` names, this turn may
     /// spend; none is bounded only by the bot's own budget.
     pub budget_counts: Counts,
@@ -6509,6 +6513,8 @@ impl Database {
                                     })?,
                                 None => Vec::new(),
                             },
+                            // What they copied: a retry names the turns.
+                            quoted: None,
                             budget_tokens: r.get::<_, Option<i64>>(12)?.map(|n| n as u64),
                             budget_counts: Counts::from_stored(
                                 r.get::<_, Option<String>>(17)?.as_deref(),
@@ -6552,6 +6558,8 @@ impl Database {
                 origin,
                 person,
                 quotes,
+                // The copy `quotes` names, kept as it was.
+                quoted: _,
                 budget_tokens,
                 budget_counts,
                 images: _,
@@ -6637,7 +6645,10 @@ impl Database {
         if let Some(level) = &options.effort {
             bot.family()?.check_effort(level)?;
         }
-        let quotes = self.quote(&options.quotes, prompt.len())?;
+        let quotes = match &options.quoted {
+            Some(quoted) => Some(quoted.clone()),
+            None => self.quote(&options.quotes, prompt.len())?,
+        };
         let attach = options.delivery == Delivery::Attach;
         // An attached message runs on no model of its own: it joins
         // whichever call the bot makes next.
@@ -10547,7 +10558,8 @@ impl Database {
             let limits = std::mem::take(&mut self.pending_limits);
             let begun = self.begin(
                 &bot.name,
-                &format!("again-{steer}"),
+                // A key no client's request can hold: theirs are names.
+                &format!("again:{steer}"),
                 &prompt,
                 false,
                 &options,
@@ -10604,17 +10616,21 @@ impl Database {
                     r.get(5)?,
                 ))
             })?;
-        // The turns it quoted, as a retry names them: its words copy theirs
-        // again.
-        let quotes = match quotes {
-            Some(json) => (serde_json::from_str::<Vec<Value>>(&json)?.into_iter())
-                .filter(|quote| quote["nested"] != true)
-                .map(|quote| {
-                    serde_json::from_value(json!({"bot":quote["bot"],"turn":quote["turn"],
-                        "reply":quote["reply"] == true}))
-                })
-                .collect::<serde_json::Result<_>>()?,
-            None => Vec::new(),
+        // The turns it quoted, as a retry names them, with the words it
+        // copied, read from its own item: those turns may be gone by now.
+        let (quotes, quoted) = match quotes {
+            Some(json) => {
+                let copied = quoted(&self.conn, Some(&json), Self::QUOTED_BYTES)?;
+                let named = (copied.iter())
+                    .filter(|quote| quote["nested"] != true)
+                    .map(|quote| {
+                        serde_json::from_value(json!({"bot":quote["bot"],"turn":quote["turn"],
+                            "reply":quote["reply"] == true}))
+                    })
+                    .collect::<serde_json::Result<_>>()?;
+                (named, Some(serde_json::to_string(&copied)?))
+            }
+            None => (Vec::new(), None),
         };
         Ok(Some((
             prompt,
@@ -10625,6 +10641,7 @@ impl Database {
                 origin,
                 person,
                 quotes,
+                quoted,
                 images,
                 ..TurnOptions::default()
             },

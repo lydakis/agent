@@ -166,6 +166,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         origin: None,
         person: None,
         quotes: Vec::new(),
+        quoted: None,
         budget_tokens: None,
         budget_counts: Default::default(),
         images: Vec::new(),
@@ -6002,6 +6003,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         origin: None,
         person: None,
         quotes: Vec::new(),
+        quoted: None,
         budget_tokens: None,
         budget_counts: Default::default(),
         images: Vec::new(),
@@ -6138,6 +6140,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         origin: None,
         person: None,
         quotes: Vec::new(),
+        quoted: None,
         budget_tokens: None,
         budget_counts: Default::default(),
         images: Vec::new(),
@@ -7693,6 +7696,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 origin: None,
                 person: None,
                 quotes: Vec::new(),
+                quoted: None,
                 budget_tokens: None,
                 budget_counts: Default::default(),
                 images: Vec::new(),
@@ -17797,6 +17801,73 @@ fn messages_that_joined_a_declined_request_go_back_in_line_as_sent() {
     db.finish(first, None).unwrap();
     let (accepted, _) = db.start(second, allow_provider).unwrap();
     assert_eq!(accepted["data"]["from"]["bot"], "Bob");
+}
+
+/// A message sent again keeps the words it quoted, though the turn it
+/// quoted is gone by then.
+#[test]
+fn a_message_sent_again_keeps_what_it_quoted() {
+    let mut db = db();
+    for bot in ["Bob", "Carol"] {
+        db.create(bot, Some("/synthetic"), binding()).unwrap();
+    }
+    let bob = db
+        .begin(
+            "Bob",
+            "b1",
+            "the plan is to ship on friday",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(bob, vec![assistant("noted")], &[], None).unwrap();
+    db.finish(bob, None).unwrap();
+    let turn = db
+        .begin(
+            "Carol",
+            "c1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        quotes: vec![quote("Bob", bob, false)],
+        ..TurnOptions::default()
+    };
+    db.begin("Carol", "p1", "see this", true, &steer, allow_provider)
+        .unwrap();
+    db.drop_reply(turn, &json!({"limit":"max_tokens","output_tokens":7}), true)
+        .unwrap();
+    db.absorb(
+        turn,
+        None,
+        8 << 20,
+        4096,
+        ContextUsage::default(),
+        false,
+        true,
+    )
+    .unwrap();
+    db.delete_bot("Bob").unwrap();
+    let refused = Error::new("provider_refusal").facts(json!({"category":"cyber"}));
+    db.finish(turn, Some(&refused)).unwrap();
+    let again = (db.turns("Carol", turn, None, 8, false).unwrap()["turns"].as_array())
+        .unwrap()
+        .iter()
+        .find(|t| t["status"] == "ready")
+        .cloned()
+        .expect("the message did not go back in line");
+    assert_eq!(again["prompt_preview"], "see this");
+    db.start(again["turn"].as_i64().unwrap(), allow_provider)
+        .unwrap();
+    let opened = stored(&mut db, "Carol").last().unwrap().to_string();
+    assert!(opened.contains("the plan is to ship on friday"), "{opened}");
 }
 
 #[test]
