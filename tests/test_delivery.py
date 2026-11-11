@@ -830,11 +830,10 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(poll(client, 'Bob', first)['result']['status'], 'interrupted')
         self.assertEqual(client.finished(second)['data']['status'], 'completed')
         # The steer joins the first turn if it reached a boundary before the
-        # restart (that outcome is in the bot's events, not this client's
-        # stream), the next turn at its first boundary, or runs alone.
-        before = [e['data'] for e in self.events(client, 'Bob')
-                  if e['event'] == 'turn_finished' and e['turn'] == third]
-        outcome = before[0] if before else client.finished(third)['data']
+        # restart, the next turn at its first boundary, or runs alone. The
+        # store says which, whether it ended before the restart or after.
+        handle = f'Bob/{third}'
+        outcome = client.request('wait', handles=[handle], timeout_ms=5000)['result']['results'][handle]
         text = poll(client, 'Bob', second)['result']['text']
         if outcome['status'] == 'taken' and outcome['turn'] == first:
             self.assertEqual(text, 'reply:second')
