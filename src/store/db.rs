@@ -13353,16 +13353,18 @@ impl Database {
         // What the messages older than the kept turns that ended in line,
         // withdrawn or failed with no turn, said of themselves. Only events
         // in line are read: those of messages still waiting, of ones the
-        // kept turns took in, and of these.
+        // kept turns took in, and of these. The message this pass ends keeps
+        // its ending until it is published, as the protected turn does.
         let ended: Vec<i64> = tx
             .prepare_cached(
                 "SELECT e.id FROM events e JOIN messages m ON m.id=e.message
                  WHERE e.bot=?1 AND e.turn IS NULL AND e.message IS NOT NULL AND e.message<?2
+                   AND e.message IS NOT ?4
                    AND m.turn IS NULL AND m.status IN ('withdrawn','failed')
                  ORDER BY e.id LIMIT ?3",
             )?
             .query_map(
-                params![name, floor, limit.map(|l| l as i64).unwrap_or(-1)],
+                params![name, floor, limit.map(|l| l as i64).unwrap_or(-1), protect],
                 |r| r.get(0),
             )?
             .collect::<rusqlite::Result<_>>()?;

@@ -20000,3 +20000,49 @@ fn a_message_for_the_turn_wakes_a_verdict_park() {
     assert_eq!(db.steered_park("Bob").unwrap(), Some((turn, sent.turn)));
     assert!(matches!(db.wake("Bob", turn, false).unwrap(), Wake::Resume));
 }
+
+#[test]
+fn retention_keeps_the_ending_of_the_message_it_ends() {
+    let mut db = db();
+    let mut kept = binding();
+    kept.settings.keep_turns = Some(1);
+    db.create("Bob", Some("/synthetic"), kept).unwrap();
+    // A note for another folder waits through turns that cannot take it.
+    let elsewhere = TurnOptions {
+        delivery: Delivery::Attach,
+        workspace: Some("/elsewhere".into()),
+        ..TurnOptions::default()
+    };
+    let note = db
+        .begin("Bob", "n", "fyi", true, &elsewhere, allow_provider)
+        .unwrap()
+        .turn;
+    converse(&mut db, "Bob", 2);
+    let status = |db: &Database| -> Value {
+        db.messages("Bob", 0, None, 16, false).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["message"] == note)
+            .unwrap()["status"]
+            .clone()
+    };
+    assert_eq!(status(&db), "attached");
+    // Withdrawn, its ending is still there to publish.
+    db.end_queued(note, &Error::new("cancelled")).unwrap();
+    db.retain("Bob", Some(note)).unwrap();
+    let ended = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["message"] == note && e["event"] == "message_ended");
+    assert!(ended, "the ending of the message being ended stays");
+    // A later pass takes it with the turns before the ones kept.
+    db.retain("Bob", None).unwrap();
+    let left = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["message"] == note);
+    assert!(!left);
+}
