@@ -115,7 +115,7 @@ pub fn announce(bot: &str, resume: Vec<String>) {
     });
 }
 
-/// Tell Herdr the bot's state, as `status_report` names it: `working`,
+/// Tell Herdr the bot's state, as `App::tab_status` names it: `working`,
 /// `blocked` (on the person's approval), `asking` (on their answer), `idle`, `done` or `error` (both ready for
 /// input), or `clear` as Sonny quits. In the background, so Herdr never
 /// slows Sonny down, except for the last, which Sonny waits on briefly.
