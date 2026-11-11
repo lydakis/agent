@@ -1781,8 +1781,14 @@ impl Session {
                 let call = data["call_id"].as_str().unwrap_or("").to_owned();
                 let key = (turn, call.clone());
                 let lifted = event["event"] == "lifted_ended";
+                if !lifted && state.lifted.contains(&key) {
+                    return;
+                }
+                // Its approval is decided: a call of a later turn under the
+                // same id is put to the person afresh.
+                let prompted = asked_key(turn, &call, "");
+                state.asked.retain(|asked| !asked.starts_with(&prompted));
                 match lifted {
-                    false if state.lifted.contains(&key) => return,
                     // Allowed, one its client answers waits on for that
                     // answer; any other runs as a background command,
                     // whose end this thread does not show.
@@ -1796,9 +1802,6 @@ impl Session {
                     true if !state.lifted.remove(&key) => return,
                     _ => {}
                 }
-                state
-                    .asked
-                    .retain(|asked| !asked.starts_with(&format!("{call}#")));
                 let Some((name, arguments)) = state.calls.remove(&key) else {
                     return;
                 };
@@ -2017,10 +2020,10 @@ impl Session {
             if (call["turn"].as_i64() != turn && !lifted) || !for_person(call) {
                 continue;
             }
-            let key = format!(
-                "{}#{}",
+            let key = asked_key(
+                call["turn"].as_i64(),
                 call["call_id"].as_str().unwrap_or(""),
-                call["request"]
+                &call["request"].to_string(),
             );
             if !self.state.lock().await.asked.insert(key) {
                 continue;
@@ -2438,7 +2441,7 @@ async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Va
     // Not delivered: the call is put to the person again once the thread
     // follows its bot again.
     if !sent {
-        let key = format!("{id}#{}", call["request"]);
+        let key = asked_key(call["turn"].as_i64(), id, &call["request"].to_string());
         session.state.lock().await.asked.remove(&key);
     }
 }
@@ -2911,9 +2914,28 @@ async fn whole_arguments(client: &Client, bot: &str, id: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// What marks call `call` of `turn`'s approval request `request` as put
+/// to the person, and, with no request, every request of that call: a
+/// later turn's call of the same id is its own.
+fn asked_key(turn: Option<i64>, call: &str, request: &str) -> String {
+    let turn = turn.map_or(String::new(), |turn| turn.to_string());
+    format!("{turn}/{call}#{request}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_later_turns_call_of_the_same_id_is_asked_afresh() {
+        let older = asked_key(Some(3), "c1", "1");
+        let newer = asked_key(Some(4), "c1", "1");
+        assert_ne!(older, newer);
+        // Ending turn 3's call lets go of its marks alone.
+        assert!(older.starts_with(&asked_key(Some(3), "c1", "")));
+        assert!(!newer.starts_with(&asked_key(Some(3), "c1", "")));
+        assert!(!asked_key(Some(3), "c10", "1").starts_with(&asked_key(Some(3), "c1", "")));
+    }
 
     #[test]
     fn a_model_shows_by_the_name_its_provider_lists() {
