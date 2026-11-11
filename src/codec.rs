@@ -240,6 +240,28 @@ impl Family {
         };
         Ok(serde_json::to_vec(&item)?)
     }
+    /// The pictures among a user item's `content`, as [`Family::image`]
+    /// wrote them: what a prompt was sent with, read back from its item.
+    pub fn images_in(self, content: &[Value]) -> Vec<Image> {
+        content
+            .iter()
+            .filter_map(|part| match self {
+                Family::Responses if part["type"] == "input_image" => {
+                    let url = part["image_url"].as_str()?.strip_prefix("data:")?;
+                    let (media_type, data) = url.split_once(";base64,")?;
+                    Some(Image {
+                        media_type: media_type.to_owned(),
+                        data: data.to_owned(),
+                    })
+                }
+                Family::Anthropic if part["type"] == "image" => Some(Image {
+                    media_type: part["source"]["media_type"].as_str()?.to_owned(),
+                    data: part["source"]["data"].as_str()?.to_owned(),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
     fn image(self, image: &Image) -> Value {
         match self {
             Family::Responses => json!({"type":"input_image",

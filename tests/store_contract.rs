@@ -17633,6 +17633,173 @@ fn a_declined_prompt_is_noted_as_the_model_is_sent_it() {
 }
 
 #[test]
+fn messages_that_joined_a_declined_request_go_back_in_line_as_sent() {
+    let mut db = db();
+    for bot in ["Bob", "Carol"] {
+        db.create(bot, Some("/synthetic"), binding()).unwrap();
+    }
+    let bob = db
+        .begin(
+            "Bob",
+            "b1",
+            "delegate",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let turn = db
+        .begin(
+            "Carol",
+            "c1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let words = "please look at the logs instead of the tests, and say what you find there";
+    let picture = agent_runtime::codec::Image {
+        media_type: "image/png".into(),
+        data: "iVBORw0KGgo=".into(),
+    };
+    // A person's steer with a picture, another agent's, a note attached
+    // by an app, and the daemon's own fact for this turn alone.
+    let person = TurnOptions {
+        delivery: Delivery::Steer,
+        person: Some("pat".into()),
+        images: vec![picture.clone()],
+        ..TurnOptions::default()
+    };
+    db.begin("Carol", "p1", words, true, &person, allow_provider)
+        .unwrap();
+    let agent = TurnOptions {
+        delivery: Delivery::Steer,
+        from: Some(("Bob".into(), bob)),
+        ..TurnOptions::default()
+    };
+    db.begin(
+        "Carol",
+        "b2",
+        "also check the deploy notes, they changed today",
+        true,
+        &agent,
+        allow_provider,
+    )
+    .unwrap();
+    let note = TurnOptions {
+        delivery: Delivery::Attach,
+        origin: Some("tasks".into()),
+        ..TurnOptions::default()
+    };
+    db.begin(
+        "Carol",
+        "n1",
+        "a task finished its review a while ago",
+        true,
+        &note,
+        allow_provider,
+    )
+    .unwrap();
+    db.drop_reply(turn, &json!({"limit":"max_tokens","output_tokens":7}), true)
+        .unwrap();
+    db.absorb(
+        turn,
+        None,
+        8 << 20,
+        4096,
+        ContextUsage::default(),
+        false,
+        true,
+    )
+    .unwrap();
+    let joined: Vec<i64> = db.events("Carol", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event"] == "steered")
+        .map(|e| e["data"]["node"].as_i64().unwrap())
+        .collect();
+    assert_eq!(joined.len(), 4);
+    let refused = Error::new("provider_refusal").facts(json!({"category":"cyber"}));
+    db.finish(turn, Some(&refused)).unwrap();
+    // The person's and the agent's messages are in line again, as sent,
+    // each its own message, in the order they came; neither the note nor
+    // the fact goes again.
+    let listed: Vec<Value> = db.turns("Carol", turn, None, 8, false).unwrap()["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["status"] != "steered")
+        .cloned()
+        .collect();
+    let again: Vec<Value> = listed
+        .iter()
+        .map(|t| json!([t["prompt_preview"], t["status"], t["delivery"], t["effort"]]))
+        .collect();
+    assert_eq!(
+        again,
+        [
+            json!([words, "ready", "queue", null]),
+            json!([
+                "also check the deploy notes, they changed today",
+                "queued",
+                "queue",
+                null
+            ])
+        ]
+    );
+    let first = listed[0]["turn"].as_i64().unwrap();
+    let second = listed[1]["turn"].as_i64().unwrap();
+    let (accepted, _) = db.start(first, allow_provider).unwrap();
+    assert_eq!(accepted["data"]["person"], "pat");
+    // In the declined turn the model is told each went again; the note
+    // and the fact are left out as before. The next turn opens on the
+    // person's words, with who wrote them and the picture.
+    let sent = stored(&mut db, "Carol");
+    let texts: Vec<String> = sent
+        .iter()
+        .map(|item| {
+            item["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .trim_end()
+                .to_owned()
+        })
+        .collect();
+    let why =
+        "the provider's safety classifier declined the request that carried it (category: cyber)";
+    // The longest wording that fits each, as for any declined item.
+    assert_eq!(
+        texts[1..3],
+        [
+            format!("[A message here is left out and sent again after this turn: {why}.]"),
+            "[Left out; sent again after this turn.]".to_owned()
+        ]
+    );
+    assert!(
+        texts[3..5]
+            .iter()
+            .all(|text| text.to_lowercase().contains("left out")),
+        "{texts:?}"
+    );
+    let opened = sent.last().unwrap();
+    assert_eq!(opened["content"][0]["text"], words);
+    assert_eq!(opened["content"][1]["text"], "[Written by pat.]");
+    assert_eq!(
+        opened["content"][2]["image_url"],
+        format!("data:image/png;base64,{}", picture.data)
+    );
+    db.append(first, vec![assistant("looked")], &[], None)
+        .unwrap();
+    db.finish(first, None).unwrap();
+    let (accepted, _) = db.start(second, allow_provider).unwrap();
+    assert_eq!(accepted["data"]["from"]["bot"], "Bob");
+}
+
+#[test]
 fn a_cut_reply_s_note_reaches_its_turn_past_a_steer_that_waits_for_its_own() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
