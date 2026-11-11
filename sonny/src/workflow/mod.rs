@@ -524,26 +524,39 @@ fn read_plan(dir: &Path) -> Result<Plan, String> {
 /// whether it came from an earlier run, and the output tokens this run's
 /// own agents spent.
 fn answers_of(dir: &Path) -> HashMap<String, Answer> {
-    journal_of(dir).0
+    journal_of(dir).answers
 }
 
 /// A call's recorded value, whether an earlier run gave it, and the
 /// output tokens it cost this run.
 type Answer = (Value, bool, u64);
 
-/// Also whether the journal's last line was cut short, so the next line
-/// written starts on a line of its own.
-fn journal_of(dir: &Path) -> (HashMap<String, Answer>, u64, bool) {
-    let mut answers = HashMap::new();
-    let mut spent = 0;
+/// What the journal of a run records.
+#[derive(Default)]
+struct Journal {
+    answers: HashMap<String, Answer>,
+    /// Output tokens the run's own agents spent.
+    spent: u64,
+    /// Whether its last line was cut short, so the next line written
+    /// starts on a line of its own.
+    cut: bool,
+    /// Whether the run was told to stop.
+    stopped: bool,
+}
+
+fn journal_of(dir: &Path) -> Journal {
+    let mut journal = Journal::default();
     // Each line is read on its own, from bytes: a line a crash cut short,
     // even inside a character, costs only that line.
     let bytes = std::fs::read(dir.join("events.jsonl")).unwrap_or_default();
-    let cut = bytes.last().is_some_and(|last| *last != b'\n');
+    journal.cut = bytes.last().is_some_and(|last| *last != b'\n');
     for line in bytes.split(|byte| *byte == b'\n') {
         let Ok(mut entry) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
+        if entry["t"] == "stop" {
+            journal.stopped = true;
+        }
         if entry["t"] != "agent" {
             continue;
         }
@@ -552,13 +565,13 @@ fn journal_of(dir: &Path) -> (HashMap<String, Answer>, u64, bool) {
             true => 0,
             false => entry["output_tokens"].as_u64().unwrap_or(0),
         };
-        spent += tokens;
-        answers.insert(
+        journal.spent += tokens;
+        journal.answers.insert(
             str_of(&entry["key"]),
             (entry["value"].take(), earlier, tokens),
         );
     }
-    (answers, spent, cut)
+    journal
 }
 
 /// The run kept in `dir`, read to go on.
@@ -566,7 +579,12 @@ fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
     let plan = read_plan(dir)?;
     let source = read_file(&dir.join("script.js"))?;
     let script = script::read(&source)?;
-    let (answers, spent, cut) = journal_of(dir);
+    let Journal {
+        answers,
+        spent,
+        cut,
+        stopped,
+    } = journal_of(dir);
     let mut journal = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -580,7 +598,8 @@ fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
         dir: dir.to_owned(),
         store: store.to_owned(),
         socket: socket.to_owned(),
-        stopping: AtomicBool::new(false),
+        // A stop the run was told of before the host went away still holds.
+        stopping: AtomicBool::new(stopped),
         halt: Notify::new(),
         answers: Mutex::new(answers),
         spent: AtomicU64::new(spent),
@@ -661,6 +680,9 @@ async fn stop(client: &Client, caller: &str, id: &str) -> Result<String, String>
     if run.plan.caller != caller && !lead {
         return Err(format!("run {id} is {}'s to stop", run.plan.caller));
     }
+    // Kept before it is acknowledged, so a host that goes away before
+    // the run ends still ends it stopped.
+    run.note(json!({"t": "stop", "at_ms": now_ms()}));
     run.stopping.store(true, Ordering::SeqCst);
     run.halt.notify_waiters();
     let stopped = run.interrupt(client).await;
@@ -1631,8 +1653,13 @@ mod tests {
         bytes.extend_from_slice("{\"t\": \"agent\", \"key\": \"k4\", \"value\": \"é".as_bytes());
         bytes.pop();
         std::fs::write(dir.join("events.jsonl"), bytes).unwrap();
-        let (answers, spent, cut) = journal_of(&dir);
-        assert!(cut);
+        let Journal {
+            answers,
+            spent,
+            cut,
+            stopped,
+        } = journal_of(&dir);
+        assert!(cut && !stopped);
         assert_eq!(spent, 10);
         assert_eq!(answers["k1"], (json!("x"), false, 7));
         assert_eq!(answers["k2"], (Value::Null, false, 3));
@@ -1647,7 +1674,7 @@ mod tests {
             "max_agents": 1000, "at_once": 4}))
         .unwrap();
         make(&next, &plan, "export const meta = {}", Some(&dir)).unwrap();
-        let (answers, spent, _) = journal_of(&next);
+        let Journal { answers, spent, .. } = journal_of(&next);
         assert_eq!(spent, 0);
         assert_eq!(answers.len(), 2);
         assert!(
@@ -1656,6 +1683,15 @@ mod tests {
                 .all(|(value, earlier, tokens)| !value.is_null() && *earlier && *tokens == 0)
         );
         assert_eq!(read_plan(&next).unwrap().id, "next");
+        // A stop it was told of holds when it is read again; a run resumed
+        // from it starts unstopped.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("events.jsonl"))
+            .unwrap();
+        file.write_all(b"\n{\"t\": \"stop\"}\n").unwrap();
+        assert!(journal_of(&dir).stopped);
+        assert!(!journal_of(&next).stopped);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
