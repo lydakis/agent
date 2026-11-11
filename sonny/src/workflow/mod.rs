@@ -161,6 +161,9 @@ struct Run {
     live: Mutex<HashMap<String, i64>>,
     /// Workers given a worktree, cleaned up once the run ends.
     trees: Mutex<BTreeSet<String>>,
+    /// Held while a worktree is made, which a cancelled call does not
+    /// stop: the run's end waits for every one.
+    making: Arc<tokio::sync::RwLock<()>>,
     /// Instructions composed, by folder and profile: once a run.
     told: Mutex<HashMap<(PathBuf, Option<String>), Told>>,
     journal: Mutex<Option<std::fs::File>>,
@@ -580,6 +583,7 @@ fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
             &plan.workspace,
             &format!("{}.{WORKER}{}-", plan.project, plan.id),
         )),
+        making: Arc::default(),
         told: Mutex::default(),
         journal: Mutex::new(journal),
         plan,
@@ -1003,18 +1007,24 @@ impl Attempt {
             != Some("danger-full-access");
         let dir = match asked.worktree {
             true => {
+                // Known before it is made, and made to its end, so a call
+                // cancelled meanwhile still leaves it to the run's end.
+                self.run.trees.lock().unwrap().insert(worker.to_owned());
+                let making = Arc::clone(&self.run.making).read_owned().await;
                 let (here, name) = (plan.workspace.clone(), worker.to_owned());
                 let made = tokio::task::spawn_blocking(move || {
-                    crate::task::worker_tree(&here, &name, confine)
+                    let made = crate::task::worker_tree(&here, &name, confine);
+                    drop(making);
+                    made
                 })
                 .await
                 .map_err(|e| Trouble::Thrown(e.to_string()))?;
                 match made {
-                    Ok(dir) => {
-                        self.run.trees.lock().unwrap().insert(worker.to_owned());
-                        dir
+                    Ok(dir) => dir,
+                    Err(why) => {
+                        self.run.trees.lock().unwrap().remove(worker);
+                        return failed(format!("no worktree: {why}"));
                     }
-                    Err(why) => return failed(format!("no worktree: {why}")),
                 }
             }
             false => plan.workspace.clone(),
@@ -1280,6 +1290,8 @@ async fn halted(run: &Run) {
 /// its caller.
 async fn finish(run: &Run, ended: script::Ended, attempt: Option<&Attempt>) {
     let plan = &run.plan;
+    // Every worktree being made is made, and known, before any is taken.
+    drop(run.making.write().await);
     // What still runs is the run's no longer: a call it did not await,
     // or one whose wait a lost connection left, on a new connection.
     match attempt {
