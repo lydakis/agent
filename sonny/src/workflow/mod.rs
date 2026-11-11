@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, Semaphore};
@@ -809,6 +809,8 @@ struct Attempt {
     /// Workers a lost connection left running, each holding one of
     /// `slots` until its call reaches it again.
     survivors: Mutex<HashSet<String>>,
+    /// The slots held back for survivors, given back as their calls end.
+    owed: AtomicUsize,
     /// How many calls of each key came before, this go.
     seen: Mutex<HashMap<String, usize>>,
     calls: AtomicU64,
@@ -822,13 +824,14 @@ struct Attempt {
 /// A call's place among a run's `at_once`.
 enum Slot<'a> {
     Taken(#[allow(dead_code)] tokio::sync::SemaphorePermit<'a>),
-    /// A survivor's, given back to the run when its call ends.
-    Held(&'a Semaphore),
+    /// A survivor's, given back to the run when its call ends if the run
+    /// held one back for it.
+    Held(&'a Semaphore, bool),
 }
 
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
-        if let Slot::Held(slots) = self {
+        if let Slot::Held(slots, true) = self {
             slots.add_permits(1);
         }
     }
@@ -971,21 +974,48 @@ impl script::Host for Attempt {
         // still running from before has its slot already.
         let survived = self.survivors.lock().unwrap().remove(&worker);
         let _slot = match survived {
-            true => Slot::Held(&self.slots),
+            // Never more given back than were held back: at most `at_once`.
+            true => Slot::Held(
+                &self.slots,
+                (self
+                    .owed
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)))
+                .is_ok(),
+            ),
             false => Slot::Taken(self.slots.acquire().await.map_err(|e| e.to_string())?),
         };
         if run.stopping() {
             return Err("the workflow is stopping".into());
         }
-        // A worker submitted before is taken up again, spent or not: no
-        // new work starts for it.
-        if !survived
-            && let Some(total) = run.plan.budget
+        // A worker the daemon has a turn for is taken up again, spent or
+        // not: no new work starts for it. One whose submission never
+        // reached the daemon is new work.
+        if let Some(total) = run.plan.budget
             && run.spent.load(Ordering::SeqCst) >= total
         {
-            return Err(format!(
-                "this run's budget of {total} output tokens is spent"
-            ));
+            let started = match survived {
+                false => false,
+                true => match (self.client)
+                    .request("turns", json!({"bot": worker, "limit": 1}))
+                    .await
+                {
+                    Ok(page) => page["turns"].as_array().is_some_and(|t| !t.is_empty()),
+                    Err(error) if lost(&error) => {
+                        self.lost.store(true, Ordering::SeqCst);
+                        run.halt.notify_waiters();
+                        return Err(
+                            "the daemon's connection was lost; the run picks up where it was"
+                                .into(),
+                        );
+                    }
+                    Err(_) => false,
+                },
+            };
+            if !started {
+                return Err(format!(
+                    "this run's budget of {total} output tokens is spent"
+                ));
+            }
         }
         match self.work(&worker, &key, &prompt, &asked).await {
             Ok((value, turn, tokens, error)) => {
@@ -1329,6 +1359,7 @@ async fn drive(run: Arc<Run>) {
             run: Arc::clone(&run),
             client: client.clone(),
             slots: Semaphore::new(run.plan.at_once.saturating_sub(survivors.len())),
+            owed: AtomicUsize::new(survivors.len().min(run.plan.at_once)),
             survivors: Mutex::new(survivors),
             seen: Mutex::default(),
             calls: AtomicU64::new(0),
