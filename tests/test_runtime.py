@@ -1984,8 +1984,8 @@ class RuntimeTests(ModelFixture):
             ended = client.receive(lambda m: m.get('event') == 'lifted_ended')
             self.assertEqual(ended['data']['outcome'], 'allowed')
             told = client.receive(lambda m: m.get('event') == 'queued' and m['data'].get('origin') == 'background')
-            self.assertEqual(client.finished(told['turn'])['data']['status'], 'completed')
-            reply = poll(client, bot, told['turn'])['result']['text']
+            self.assertEqual(client.finished(told['message'])['data']['status'], 'completed')
+            reply = poll(client, bot, told['message'])['result']['text']
             self.assertIn(lifted['handle'], reply)
             self.assertIn('hi', reply)
             # A call still waiting is the agent's to stop: its request goes,
