@@ -45,7 +45,8 @@ fn most(hard: libc::rlim_t) -> libc::rlim_t {
     };
     match read == 0 && most > 0 {
         true => hard.min(most as libc::rlim_t),
-        false => hard.min(libc::OPEN_MAX as libc::rlim_t),
+        // OPEN_MAX in <sys/syslimits.h>, which libc does not export.
+        false => hard.min(10240),
     }
 }
 

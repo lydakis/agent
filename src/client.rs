@@ -1074,10 +1074,12 @@ impl Start {
                 None => Error::with("env_file_invalid", error),
             })?;
         // A key the file sets names its provider as one this agent's
-        // environment sets would; an empty value there unsets it.
-        let providers = match options.providers.is_empty() {
-            false => options.providers.clone(),
-            true => environment_providers(
+        // environment sets would; an empty value there unsets it. Only a
+        // `--provider` stands as given; providers inferred from this
+        // agent's environment are inferred again with the file over it.
+        let providers = match options.providers_explicit {
+            true => options.providers.clone(),
+            false => environment_providers(
                 &|name| match environment.iter().rev().find(|(key, _)| key == name) {
                     Some((_, value)) => Some(value.clone()),
                     None => std::env::var(name).ok(),

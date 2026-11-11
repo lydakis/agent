@@ -1750,9 +1750,11 @@ class CliTests(ModelFixture):
         (home/'.agent').mkdir(parents=True)
         env_file = home/'.agent'/'env'
         env_file.write_text('OPENAI_API_KEY=from-file\nEXTRA_SETTING=from-file\nUNSET_ME=\n'
+                            'ANTHROPIC_API_KEY=\n'
                             'export AGENT_SOCKET=/nowhere\nagent_store=/nowhere\n')
         env_file.chmod(0o600)
-        env = {**clean_env(), 'HOME': str(home), 'UNSET_ME': 'caller'}
+        # The caller's own key names a provider too, until the file unsets it.
+        env = {**clean_env(), 'HOME': str(home), 'UNSET_ME': 'caller', 'ANTHROPIC_API_KEY': 'caller'}
         store = self.path/'keys.db'
         started = subprocess.run([str(self.binary), 'start', '--store', str(store)], env=env,
                                  capture_output=True, text=True, timeout=20, cwd=self.path)
