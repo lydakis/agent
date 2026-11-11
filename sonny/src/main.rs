@@ -2597,7 +2597,7 @@ async fn run() -> Result<(), String> {
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     term::restore();
     let _ = disable_raw_mode();
-    status_report("clear", &name);
+    report_status("clear", &name);
     // `/switch NAME` or `/new`: this window becomes that agent's Sonny, as
     // if opened on it.
     if let (Ok(()), Some(other)) = (&result, app.switch_to.take()) {
@@ -2934,78 +2934,10 @@ pub fn side_copy(record: &Value) -> Option<&str> {
 /// How long `/status` waits, as it opens, for where the windows sit now.
 const PLACES_NOW: Duration = Duration::from_millis(500);
 
-/// What this window last said its agent is doing, and whether a question
-/// the agent put to the person is open here: the bot, the state, and the
-/// question.
-static REPORTED: std::sync::Mutex<Option<(String, String, bool)>> = std::sync::Mutex::new(None);
-
 /// Whether a lead's call of tool `name` marks the task it names done:
 /// `mark_done`, and `remove_task`, which marks it as it cleans up.
 fn resolves(name: &str) -> bool {
     name == resolved::TOOL || name == served::REMOVE
-}
-
-/// What the multiplexer is told: a question open says the agent needs the
-/// person (`asking`), as its tab, `/status` and the footer say
-/// ([`needs`]), whatever its turn does; a call waiting on their approval
-/// says so first (`blocked`), and a window closing says nothing more.
-fn shown_status(state: &str, asking: bool) -> &str {
-    match state {
-        "blocked" | "clear" => state,
-        _ if asking => "asking",
-        _ => state,
-    }
-}
-
-/// The agent's state, as its turns and calls go: said to the multiplexer
-/// with any question still open here.
-fn status_report(state: &str, bot: &str) {
-    let asking = match REPORTED.lock() {
-        Ok(mut reported) => {
-            let asking = (reported.as_ref()).is_some_and(|(of, _, asking)| of == bot && *asking);
-            *reported = Some((bot.to_owned(), state.to_owned(), asking));
-            asking
-        }
-        Err(_) => false,
-    };
-    report_status(shown_status(state, asking), bot);
-}
-
-/// Whether a question the agent put to the person is open in this window,
-/// as each frame finds: said to the multiplexer once it changes.
-fn status_asking(bot: &str, open: bool) {
-    let Some(state) = REPORTED
-        .lock()
-        .ok()
-        .and_then(|mut reported| asked_now(&mut reported, bot, open))
-    else {
-        return;
-    };
-    report_status(shown_status(&state, open), bot);
-}
-
-/// What to say again now that a question is `open` here or not: the
-/// agent's state last said, when that changes what the multiplexer is
-/// told. Nothing before the agent's state was first said, which says the
-/// question with it, nor once its window closed.
-fn asked_now(
-    reported: &mut Option<(String, String, bool)>,
-    bot: &str,
-    open: bool,
-) -> Option<String> {
-    match reported.as_mut() {
-        Some((of, state, asking)) if of == bot => {
-            if *asking == open {
-                return None;
-            }
-            *asking = open;
-            (!state.is_empty() && state != "clear").then(|| state.clone())
-        }
-        _ => {
-            *reported = Some((bot.to_owned(), String::new(), open));
-            None
-        }
-    }
 }
 
 /// Program status (OSC 7501), so a terminal or multiplexer that reads it
@@ -3836,6 +3768,11 @@ struct App {
     calls: HashMap<String, (String, Value)>,
     /// Calls waiting on the person, as `approvals` lists them.
     approvals: Vec<Value>,
+    /// How the agent's last turn ended, as it rests between turns: `idle`,
+    /// `done` or `error`; none until known.
+    rest: Option<&'static str>,
+    /// What the multiplexer was last told of the agent ([`App::tab_status`]).
+    told: Option<&'static str>,
     /// Calls of the bots below this window waiting on the person, as
     /// `approvals` lists them, each with its `bot`: its tasks', and those
     /// of the leads it follows and theirs. Answered here after its own.
@@ -5662,6 +5599,8 @@ impl App {
             }),
             calls: HashMap::new(),
             approvals: Vec::new(),
+            rest: None,
+            told: None,
             raised: Vec::new(),
             raised_read: Default::default(),
             calls_aside: Default::default(),
@@ -5873,7 +5812,6 @@ impl App {
         self.history().await;
         // A turn already running: its clock, and any call it waits on.
         if let Some(turn) = self.running.as_ref().map(|r| r.turn) {
-            status_report("working", &self.bot);
             if let Ok(page) = self
                 .client
                 .request(
@@ -5902,7 +5840,7 @@ impl App {
                 Ok(last) => last["status"] == "failed" && last["error"] != EMPTY,
                 Err(_) => false,
             };
-            status_report(if failed { "error" } else { "idle" }, &self.bot);
+            self.rest = Some(if failed { "error" } else { "idle" });
         }
         self.configure().await;
         self.tell_upgrades().await;
@@ -6941,7 +6879,6 @@ impl App {
                     effort: None,
                 });
                 self.turn_began().await;
-                status_report("working", &self.bot);
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
                 .await;
@@ -9558,7 +9495,6 @@ impl App {
                 if let Some(model) = data["model"].as_str() {
                     self.model = model.to_owned();
                 }
-                status_report("working", &self.bot);
                 // A turn the history drew still answers the message it
                 // drew, with what the bot reacted to it with so far.
                 if !drawn {
@@ -10111,15 +10047,12 @@ impl App {
                 if status == "completed" && !quiet && turn.is_some() && turn == self.yours {
                     self.suggest();
                 }
-                status_report(
-                    match status {
-                        _ if quiet => "idle",
-                        "completed" | "steered" => "done",
-                        "interrupted" => "idle",
-                        _ => "error",
-                    },
-                    &self.bot,
-                );
+                self.rest = Some(match status {
+                    _ if quiet => "idle",
+                    "completed" | "steered" => "done",
+                    "interrupted" => "idle",
+                    _ => "error",
+                });
                 self.configure().await;
                 // Only this view knows whether the turn said anything, so it
                 // rings for the end of every turn of its own; the project's
@@ -10829,7 +10762,6 @@ impl App {
             }
         }
         if !self.approvals.is_empty() {
-            status_report("blocked", &self.bot);
             // With a fleet, the lead's Sonny rings for every agent.
             if self.fleet.is_none() {
                 let what = format!("{} needs you", self.bot);
@@ -10995,9 +10927,6 @@ impl App {
         // the rest once these are answered.
         if self.approvals.is_empty() {
             self.approvals_for(call["turn"].as_i64()).await;
-        }
-        if self.approvals.is_empty() {
-            status_report("working", &self.bot);
         }
     }
 
@@ -14879,6 +14808,36 @@ impl App {
         self.commit(lines);
     }
 
+    /// What this window's tab says of its agent, from what the window
+    /// holds now, so the tab can never be left behind by a path that forgot
+    /// to say: a call waiting on the person's approval here (`blocked`),
+    /// else a question of the agent's own open here (`asking`; its tasks'
+    /// are theirs), else a turn running (`working`), else how its last
+    /// turn ended. An approval or a question answered in another window
+    /// clears here as the daemon says so, and the tab with it.
+    fn tab_status(&self) -> Option<&'static str> {
+        if !self.approvals.is_empty() {
+            Some("blocked")
+        } else if self.asks.iter().any(|ask| ask.task.is_none()) {
+            Some("asking")
+        } else if self.running.is_some() {
+            Some("working")
+        } else {
+            self.rest
+        }
+    }
+
+    /// The tab told the agent's state once it changes, as each frame finds.
+    fn tell_status(&mut self) {
+        let status = self.tab_status();
+        if status != self.told
+            && let Some(status) = status
+        {
+            self.told = Some(status);
+            report_status(status, &self.bot);
+        }
+    }
+
     /// A frame drawn, the whole screen written again when it is stale
     /// (cleared first); every frame shown whole, or not written at all
     /// when it changes nothing ([`frames`]).
@@ -14897,9 +14856,7 @@ impl App {
         // A question open here holds this window's place in its lead's
         // multiplexer, as the person still has it to answer.
         used::asking(&self.bot, !self.asks.is_empty());
-        // Its tasks' questions are theirs: the multiplexer says so of them.
-        let own = self.asks.iter().any(|ask| ask.task.is_none());
-        status_asking(&self.bot, own);
+        self.tell_status();
         self.show_asked();
         self.margin_back();
         // /status beside the conversation, gone once the pane is.
@@ -16802,38 +16759,6 @@ mod tests {
             .backend()
             .0
             .assert_buffer_lines(["drawn   ", "        "]);
-    }
-
-    #[test]
-    fn a_question_open_says_the_agent_needs_you_to_its_multiplexer() {
-        // As its tab, `/status` and the footer say: an approval waiting
-        // says so first, and a closing window says nothing more.
-        assert_eq!(shown_status("done", true), "asking");
-        assert_eq!(shown_status("idle", true), "asking");
-        assert_eq!(shown_status("working", true), "asking");
-        assert_eq!(shown_status("error", true), "asking");
-        assert_eq!(shown_status("blocked", true), "blocked");
-        assert_eq!(shown_status("clear", true), "clear");
-        assert_eq!(shown_status("done", false), "done");
-        // A question found open before anything was said waits for the
-        // state, which says it.
-        let mut reported = None;
-        assert_eq!(asked_now(&mut reported, "shop.a", true), None);
-        // The turn ended on the question: said again once it opens and
-        // once it closes, and not with every frame between.
-        reported = Some(("shop.a".into(), "done".into(), false));
-        assert_eq!(
-            asked_now(&mut reported, "shop.a", true).as_deref(),
-            Some("done")
-        );
-        assert_eq!(asked_now(&mut reported, "shop.a", true), None);
-        assert_eq!(
-            asked_now(&mut reported, "shop.a", false).as_deref(),
-            Some("done")
-        );
-        // A closed window says nothing more.
-        reported = Some(("shop.a".into(), "clear".into(), false));
-        assert_eq!(asked_now(&mut reported, "shop.a", true), None);
     }
 
     /// [`lineage_of`] as it was: each bot's line of makers walked afresh.
@@ -23022,6 +22947,61 @@ mod tests {
         ));
         assert_eq!(fleet.doing["calc.fix"], "working");
         assert_eq!(app.agents(), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn the_tab_says_working_again_once_an_approval_is_answered_elsewhere() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let decided = Arc::new(AtomicBool::new(false));
+        let answered = decided.clone();
+        let client = daemon_answering(move |asked| match asked["op"].as_str().unwrap_or("") {
+            "approvals" if !answered.load(Ordering::SeqCst) => json!({"approvals": [
+                {"bot": "calc.fix", "turn": 4, "call_id": "c1", "gates": ["manual"]},
+            ]}),
+            "approvals" => json!({"approvals": []}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "calc.fix".into();
+        app.rest = Some("idle");
+        app.tell_status();
+        assert_eq!(app.told, Some("idle"));
+        app.running = Some(Running {
+            turn: 4,
+            started: Instant::now(),
+            phase: "Working".into(),
+            note: false,
+            effort: None,
+        });
+        app.tell_status();
+        assert_eq!(app.told, Some("working"));
+        let event = |kind: &str| json!({"event": kind, "bot": "calc.fix", "turn": 4, "data": {"call_id": "c1"}});
+        app.daemon(event("approval_requested")).await;
+        app.tell_status();
+        assert_eq!(app.told, Some("blocked"));
+        // Answered in the lead's window, not this one: the daemon says it
+        // was decided, and the tab says working again.
+        decided.store(true, Ordering::SeqCst);
+        app.daemon(event("step_decided")).await;
+        app.tell_status();
+        assert_eq!(app.told, Some("working"));
+        // A question of its own open here says it needs the person; its
+        // turn's end, once the question closes, says how it ended.
+        app.asks.push(
+            asks::call(
+                &asks::id(4, "q1"),
+                &json!({"question": "Ship it?", "options": [{"label": "Yes"}]}),
+            )
+            .unwrap(),
+        );
+        app.tell_status();
+        assert_eq!(app.told, Some("asking"));
+        app.asks.clear();
+        app.running = None;
+        app.rest = Some("done");
+        app.tell_status();
+        assert_eq!(app.told, Some("done"));
     }
 
     /// The leads a lead follows by name, and theirs in turn, each once:
