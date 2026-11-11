@@ -220,17 +220,24 @@ impl Tiers {
 
 /// The models each kind of endpoint serves faster than standard, by exact
 /// model id: never read from a model's name, so a model not here serves
-/// standard only until the person names it in `--speeds`.
+/// standard only until the person names it in `--speeds`. Each list claims
+/// only what its endpoint and sign-in are documented to serve.
 /// - The Claude API's fast mode: Fable 5.2, Mythos 5.2 and Opus 5.5, and
 ///   Opus 5 and Opus 4.8 in research preview, under the beta every Claude
 ///   API request names (platform.claude.com fast-mode guide, read
 ///   2026-11-10). Bedrock serves Claude at standard speed only.
-/// - OpenAI, on a key or the ChatGPT plan: priority on every model Codex's
-///   bundled catalog gives it (openai/codex 551fc71, models.json),
-///   ultrafast on GPT-6.1 Sol and GPT-6 Astra (OpenAI's pricing page).
-/// - Bedrock: ultrafast on GPT-6.1 Sol and GPT-6 Astra on Mantle and their
-///   `us.` and `global.` runtime profiles, no priority, as Codex's Bedrock
-///   catalog lists them (model-provider/src/amazon_bedrock/catalog.rs).
+/// - OpenAI on an API key: priority on every model Codex's bundled catalog
+///   gives it (openai/codex 551fc71, models.json), ultrafast on GPT-6.1 Sol
+///   and GPT-6 Astra (OpenAI's pricing page).
+/// - The ChatGPT sign-in: what Codex's bundled catalog lists for it,
+///   priority on those models and no ultrafast (openai/codex 5228d94,
+///   models.json); Codex learns any more from the plan's own model listing.
+/// - Bedrock: ultrafast on GPT-6.1 Sol and GPT-6 Astra alone, never
+///   priority, through their `us.` and `global.` profiles, which Codex's
+///   Bedrock runtime catalog lists (model-provider/src/amazon_bedrock/
+///   catalog.rs), and under their bare ids on Mantle in us-east-1 only,
+///   the one region Bedrock documents ultrafast in, though Codex's Mantle
+///   catalog claims them in every Mantle region.
 const CLAUDE_API: [(&str, Tiers); 5] = [
     ("claude-fable-5-2", Tiers::FAST),
     ("claude-mythos-5-2", Tiers::FAST),
@@ -249,7 +256,26 @@ const OPENAI: [(&str, Tiers); 9] = [
     ("gpt-5.6-luna", Tiers::FAST),
     ("gpt-5.5", Tiers::FAST),
 ];
-const BEDROCK_OPENAI: [(&str, Tiers); 6] = [
+const CHATGPT: [(&str, Tiers); 9] = [
+    ("gpt-6.1-sol", Tiers::FAST),
+    ("gpt-6-astra", Tiers::FAST),
+    ("gpt-6.1-terra", Tiers::FAST),
+    ("gpt-6-sol", Tiers::FAST),
+    ("gpt-6-luna", Tiers::FAST),
+    ("gpt-5.6-sol", Tiers::FAST),
+    ("gpt-5.6-terra", Tiers::FAST),
+    ("gpt-5.6-luna", Tiers::FAST),
+    ("gpt-5.5", Tiers::FAST),
+];
+/// Bedrock's cross-region profiles, in any region.
+const BEDROCK_PROFILES: [(&str, Tiers); 4] = [
+    ("us.openai.gpt-6.1-sol", Tiers::ULTRAFAST),
+    ("global.openai.gpt-6.1-sol", Tiers::ULTRAFAST),
+    ("us.openai.gpt-6-astra", Tiers::ULTRAFAST),
+    ("global.openai.gpt-6-astra", Tiers::ULTRAFAST),
+];
+/// Bedrock Mantle in us-east-1: the profiles and the bare ids.
+const BEDROCK_MANTLE_US_EAST_1: [(&str, Tiers); 6] = [
     ("openai.gpt-6.1-sol", Tiers::ULTRAFAST),
     ("us.openai.gpt-6.1-sol", Tiers::ULTRAFAST),
     ("global.openai.gpt-6.1-sol", Tiers::ULTRAFAST),
@@ -374,6 +400,9 @@ pub struct Provider {
     cache_hour: bool,
     /// A faster tier than standard, sent to the models that serve it.
     speed: Option<Speed>,
+    /// The models this endpoint, in its region and on its sign-in, serves
+    /// faster than standard.
+    catalog: &'static [(&'static str, Tiers)],
     /// Responses over WebSocket, one connection per bot, instead of HTTP.
     sockets: Option<Arc<Sockets>>,
     /// Bedrock signs every request with SigV4 instead of sending a key.
@@ -645,7 +674,19 @@ impl Provider {
         url.set_path(&format!("{}/{route}", url.path().trim_end_matches('/')));
         let endpoint = aws::endpoint(&url);
         let bedrock = endpoint.is_some();
-        let mantle = endpoint.is_some_and(|(_, service)| service == "bedrock-mantle");
+        let mantle = endpoint
+            .as_ref()
+            .is_some_and(|(_, service)| *service == "bedrock-mantle");
+        let at = endpoint
+            .as_ref()
+            .map(|(region, service)| (region.as_str(), *service));
+        let catalog: &'static [(&'static str, Tiers)] = match (family, at) {
+            (Family::Anthropic, None) => &CLAUDE_API,
+            (Family::Anthropic, Some(_)) => &[],
+            (Family::Responses, None) => &OPENAI,
+            (Family::Responses, Some(("us-east-1", "bedrock-mantle"))) => &BEDROCK_MANTLE_US_EAST_1,
+            (Family::Responses, Some(_)) => &BEDROCK_PROFILES,
+        };
         Ok(Self {
             transport,
             pools: Arc::new(pace::Pools::default()),
@@ -657,6 +698,7 @@ impl Provider {
             stall_timeout: STALL_TIMEOUT,
             cache_hour: false,
             speed: None,
+            catalog,
             sockets: None,
             aws: None,
             bedrock,
@@ -761,16 +803,6 @@ impl Provider {
         }
     }
 
-    /// The models this kind of endpoint serves faster than standard.
-    fn catalog(&self) -> &'static [(&'static str, Tiers)] {
-        match (self.family, self.bedrock) {
-            (Family::Anthropic, false) => &CLAUDE_API,
-            (Family::Anthropic, true) => &[],
-            (Family::Responses, false) => &OPENAI,
-            (Family::Responses, true) => &BEDROCK_OPENAI,
-        }
-    }
-
     /// The tiers `model` serves here: the person's `--speeds` for its path
     /// when one matches, else the catalog's, else none.
     pub fn tiers(&self, model: &str) -> Tiers {
@@ -780,7 +812,7 @@ impl Provider {
         {
             return tiers;
         }
-        (self.catalog().iter())
+        (self.catalog.iter())
             .find(|(id, _)| *id == model)
             .map_or(Tiers::NONE, |(_, tiers)| *tiers)
     }
@@ -789,7 +821,7 @@ impl Provider {
     /// announces them; the person's `--speeds` are announced beside.
     pub fn speeds(&self) -> Value {
         Value::Object(
-            (self.catalog().iter())
+            (self.catalog.iter())
                 .map(|(model, tiers)| ((*model).to_owned(), json!(tiers.names())))
                 .collect(),
         )
@@ -799,6 +831,54 @@ impl Provider {
     /// model serves it; standard, which sends none, otherwise.
     pub fn speed_for(&self, model: &str) -> Option<Speed> {
         self.speed.filter(|speed| self.tiers(model).serves(*speed))
+    }
+
+    /// The value `speed` is sent as: Claude's `speed`, or OpenAI's
+    /// `service_tier`, where fast is the priority tier, by the name every
+    /// model that has one takes.
+    fn tier(&self, speed: Speed) -> &'static str {
+        match (self.family, speed) {
+            (Family::Responses, Speed::Fast) => "priority",
+            _ => speed.name(),
+        }
+    }
+
+    /// A call refused for the tier it asked for, as the provider says when
+    /// its 400 names the field or the value sent: a typed error naming the
+    /// provider, model, region and speed, so the person can pick another.
+    /// Never retried at standard and never run there in its place.
+    fn speed_refused(&self, model: &str, asked: Speed, error: Error) -> Error {
+        let Some(said) = error.detail.as_deref() else {
+            return error;
+        };
+        if asked == Speed::Standard || error.code != "provider_http_400" {
+            return error;
+        }
+        let tier = self.tier(asked);
+        let lower = said.to_ascii_lowercase();
+        let names = ["service_tier", "service tier", "speed"]
+            .iter()
+            .any(|field| lower.contains(field))
+            || [format!("'{tier}'"), format!("\"{tier}\"")]
+                .iter()
+                .any(|value| lower.contains(value.as_str()));
+        if !names {
+            return error;
+        }
+        let provider = match &self.set {
+            Some((name, ..)) => name.to_string(),
+            None => self.url.host_str().unwrap_or_default().to_owned(),
+        };
+        let region = aws::endpoint(&self.url).map(|(region, _)| region);
+        let at = region
+            .as_deref()
+            .map_or(String::new(), |region| format!(" in {region}"));
+        let speed = asked.name();
+        Error::with(
+            "provider_speed_refused",
+            format!("{provider} refused {speed} for {model}{at}: {said}"),
+        )
+        .facts(json!({"provider": provider, "model": model, "region": region, "speed": speed}))
     }
 
     /// Ask for `speed` on every call to a model that serves it; standard
@@ -837,6 +917,7 @@ impl Provider {
             return fail("invalid_provider_account");
         }
         self.login = Some(login);
+        self.catalog = &CHATGPT;
         Ok(self)
     }
 
@@ -1027,12 +1108,7 @@ impl Provider {
                             "schema":schema,"strict":true}})
                     }),
                     prompt_cache_key: request.cache_key,
-                    // Fast is OpenAI's priority tier, by the name every
-                    // model that has one takes.
-                    service_tier: self.speed_for(request.model).map(|speed| match speed {
-                        Speed::Ultrafast => "ultrafast",
-                        _ => "priority",
-                    }),
+                    service_tier: self.speed_for(request.model).map(|speed| self.tier(speed)),
                 })?,
                 &b",\"input\":["[..],
             ),
@@ -1086,7 +1162,7 @@ impl Provider {
                         (!config.is_empty()).then_some(Value::Object(config))
                     },
                     fallback_credit_token: request.fallback_credit.filter(|_| !self.bedrock),
-                    speed: self.speed_for(request.model).map(Speed::name),
+                    speed: self.speed_for(request.model).map(|speed| self.tier(speed)),
                 })?,
                 &b",\"messages\":["[..],
             ),
@@ -1162,7 +1238,8 @@ impl Provider {
     {
         *report = Report::default();
         let mut session = None;
-        let asked = self.speed_for(request.model).unwrap_or(Speed::Standard);
+        let model = request.model;
+        let asked = self.speed_for(model).unwrap_or(Speed::Standard);
         let result = self
             .complete_inner(request, delta, report, &mut session)
             .await
@@ -1179,7 +1256,7 @@ impl Provider {
             .as_ref()
             .map(|s| s.token.as_str())
             .or(self.key.as_deref());
-        result.map_err(|error| sanitize_error(error, key))
+        result.map_err(|error| sanitize_error(self.speed_refused(model, asked, error), key))
     }
 
     async fn complete_inner<F, Fut>(
@@ -4225,6 +4302,179 @@ mod tests {
             encoded(&other, "us.openai.gpt-6.1-sol")["service_tier"],
             "ultrafast"
         );
+    }
+
+    /// Bedrock claims ultrafast where it is documented alone: the `us.` and
+    /// `global.` profiles in any region, the bare ids on Mantle in
+    /// us-east-1 only. An API key and the ChatGPT sign-in each have their
+    /// own list: the sign-in's is Codex's, priority and no ultrafast.
+    #[test]
+    fn each_endpoint_region_and_sign_in_claims_only_what_it_serves() {
+        let transport = Transport::new(64, 1).unwrap();
+        let tiers = |url: &str, model: &str| {
+            Provider::new(transport.clone(), Family::Responses, url, None)
+                .unwrap()
+                .tiers(model)
+        };
+        let (sol, astra) = ("openai.gpt-6.1-sol", "openai.gpt-6-astra");
+        let mantle = "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
+        assert_eq!(tiers(mantle, sol), Tiers::ULTRAFAST);
+        assert_eq!(tiers(mantle, astra), Tiers::ULTRAFAST);
+        assert_eq!(tiers(mantle, "us.openai.gpt-6.1-sol"), Tiers::ULTRAFAST);
+        for elsewhere in [
+            "https://bedrock-mantle.us-west-2.api.aws/openai/v1",
+            "https://bedrock-mantle.eu-west-1.api.aws/openai/v1",
+            "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1",
+            "https://bedrock-runtime.eu-west-1.amazonaws.com/openai/v1",
+        ] {
+            assert_eq!(tiers(elsewhere, sol), Tiers::NONE, "{elsewhere}");
+            assert_eq!(tiers(elsewhere, astra), Tiers::NONE, "{elsewhere}");
+            assert_eq!(tiers(elsewhere, "us.openai.gpt-6.1-sol"), Tiers::ULTRAFAST);
+            assert_eq!(
+                tiers(elsewhere, "global.openai.gpt-6-astra"),
+                Tiers::ULTRAFAST
+            );
+        }
+
+        let dir = login::tests::temp("chatgpt-tiers");
+        let path = dir.join("chatgpt.json");
+        login::tests::save(&path, "token");
+        let url = "https://chatgpt.com/backend-api/codex";
+        let key = tiers(url, "gpt-6.1-sol");
+        let chatgpt = Provider::new(transport.clone(), Family::Responses, url, None)
+            .unwrap()
+            .with_login(Arc::new(login::Login::open(&path, None).unwrap()))
+            .unwrap();
+        assert_eq!(key, Tiers::BOTH);
+        assert_eq!(chatgpt.tiers("gpt-6.1-sol"), Tiers::FAST);
+        assert_eq!(chatgpt.tiers("gpt-6-astra"), Tiers::FAST);
+        assert_eq!(chatgpt.tiers("gpt-5.5"), Tiers::FAST);
+        assert_eq!(chatgpt.speeds()["gpt-6.1-sol"], json!(["fast"]));
+        let ultra = chatgpt.shaped(None, false, Some(Speed::Ultrafast)).unwrap();
+        assert_eq!(ultra.speed_for("gpt-6.1-sol"), None);
+        let fast = chatgpt.shaped(None, false, Some(Speed::Fast)).unwrap();
+        assert_eq!(fast.speed_for("gpt-6.1-sol"), Some(Speed::Fast));
+        // The person can still claim it for their plan.
+        let speeds = Arc::new(Speeds::parse(["chatgpt/gpt-6.1-sol=fast,ultrafast"]).unwrap());
+        let set = ultra
+            .into_owned()
+            .with_models("chatgpt", Arc::default(), speeds);
+        assert_eq!(set.speed_for("gpt-6.1-sol"), Some(Speed::Ultrafast));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A 400 that names the tier sent fails as `provider_speed_refused`,
+    /// naming the provider, model, region and speed; any other 400 stays
+    /// what it was, and nothing is retried at standard.
+    #[tokio::test]
+    async fn a_refused_speed_is_a_typed_error_naming_where_and_what() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                let body = r#"{"error":{"message":"Invalid value: 'ultrafast'. Supported values are: 'auto', 'default', 'flex', and 'priority'.","type":"invalid_request_error","param":"service_tier","code":"invalid_value"}}"#;
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let speeds = Arc::new(Speeds::parse(["gateway/*=ultrafast"]).unwrap());
+        let provider = Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None)
+            .unwrap()
+            .with_models("gateway", Arc::default(), speeds)
+            .shaped(None, false, Some(Speed::Ultrafast))
+            .unwrap()
+            .into_owned();
+        let tools = none();
+        let request = Request {
+            model: "gpt-6.1-sol",
+            instructions: "i",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            output_schema: None,
+            web_search: false,
+            fallback_credit: None,
+            cache_key: None,
+            items: Items::empty(),
+            chain: None,
+            route: None,
+            sent: None,
+        };
+        let error = provider
+            .complete(request, |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_speed_refused");
+        let detail = error.detail.as_deref().unwrap();
+        assert!(
+            detail.starts_with("gateway refused ultrafast for gpt-6.1-sol: Invalid value"),
+            "{detail}"
+        );
+        assert_eq!(
+            Value::Object(*error.facts.unwrap()),
+            json!({"provider":"gateway","model":"gpt-6.1-sol","region":null,"speed":"ultrafast"})
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // Bedrock names its region; a 400 about anything else, or one at
+        // standard, stays the provider's own.
+        let mantle = Provider::new(
+            Transport::new(0, 1).unwrap(),
+            Family::Responses,
+            "https://bedrock-mantle.eu-west-1.api.aws/openai/v1",
+            None,
+        )
+        .unwrap()
+        .with_models("bedrock", Arc::default(), Arc::default());
+        let refused = |detail: &str| Error::with("provider_http_400", detail);
+        let said = "Invalid value: 'ultrafast'.";
+        let typed = mantle.speed_refused("openai.gpt-6.1-sol", Speed::Ultrafast, refused(said));
+        assert_eq!(typed.code, "provider_speed_refused");
+        assert_eq!(
+            typed.detail.as_deref(),
+            Some(
+                "bedrock refused ultrafast for openai.gpt-6.1-sol in eu-west-1: Invalid value: 'ultrafast'."
+            )
+        );
+        assert_eq!(typed.facts.unwrap()["region"], "eu-west-1");
+        let other = mantle.speed_refused("m", Speed::Ultrafast, refused("Invalid input."));
+        assert_eq!(other.code, "provider_http_400");
+        let standard = mantle.speed_refused("m", Speed::Standard, refused(said));
+        assert_eq!(standard.code, "provider_http_400");
+        let server = Error::with("provider_http_500", said);
+        assert_eq!(
+            mantle.speed_refused("m", Speed::Ultrafast, server).code,
+            "provider_http_500"
+        );
+        // Claude names its own field, sent as `fast`.
+        let claude = Provider::new(
+            Transport::new(0, 1).unwrap(),
+            Family::Anthropic,
+            "https://api.anthropic.com/v1",
+            None,
+        )
+        .unwrap();
+        let typed = claude.speed_refused(
+            "claude-opus-5",
+            Speed::Fast,
+            refused("speed: fast mode is not available for this model"),
+        );
+        assert_eq!(typed.code, "provider_speed_refused");
+        assert_eq!(typed.facts.unwrap()["provider"], "api.anthropic.com");
     }
 
     #[test]
