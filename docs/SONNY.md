@@ -955,7 +955,11 @@ its call's key, a hash of its prompt and options (not its label or phase)
 with how many such calls came before, so asking again gets the same bot and
 turn. A run whose host stopped is picked up when the next starts, and one
 whose connection went on the next connection, by running its script again
-with every recorded call answered from the journal. `resume_from_run_id`
+with every recorded call answered from the journal at once, as Claude
+Code's resume answers them: a script that acts on which of its calls
+finished first may take another path then, and the calls it newly makes
+are new work, while the turns of calls it no longer makes are interrupted
+at the run's end. `resume_from_run_id`
 starts a new run with an earlier run's answers, so only calls that changed
 cost model calls. `stop` interrupts a run's workers; it ends as stopped.
 

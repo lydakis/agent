@@ -731,13 +731,13 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             }
             // Done as `mark_done` marks it, by this call: the mark is a fact
             // the windows show, kept with no window open.
-            let (store, _) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
+            let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
             let call = std::env::var("AGENT_CALL").unwrap_or_default();
             crate::task::remove(
                 &line.folder,
                 &task,
                 arguments["discard"] == true,
-                (&store, &call),
+                (&store, &socket, &call),
             )
             .map_err(|e| ("task_not_removed", e))
         }
@@ -1772,6 +1772,42 @@ fn outside(item: &Value) -> bool {
 
 /// One call answered by `sonny tool NAME`, run as the calling agent's shell
 /// would run it, and stopped when the call's time is up.
+/// `bot`'s turn `turn`, as the daemon lists it, or null when it has none.
+pub async fn running_turn(client: &Client, bot: &str, turn: i64) -> Result<Value, String> {
+    let page = client
+        .request(
+            "turns",
+            json!({"bot": bot, "after": turn - 1, "before": turn + 1, "limit": 1}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((page["turns"].get(0).filter(|t| t["turn"] == turn))
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+/// The folder, model and effort the turn `running` runs with: as it
+/// started, which a bot's own change for a later turn, or the turn's own
+/// choice, makes other than `record`'s. Without the turn, `record`'s.
+pub fn as_running(running: &Value, record: &Value) -> (String, String, Option<String>) {
+    let workspace = (running["workspace"].as_str())
+        .or(record["workspace"].as_str())
+        .unwrap_or("/");
+    let model = match running["model"].as_str() {
+        Some(model) => model.to_owned(),
+        None => format!(
+            "{}/{}",
+            str_of(&record["provider"]),
+            str_of(&record["model"])
+        ),
+    };
+    let effort = match running.is_null() {
+        false => running["effort"].as_str(),
+        true => record["effort"].as_str(),
+    };
+    (workspace.to_owned(), model, effort.map(str::to_owned))
+}
+
 async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: &Path) -> Answer {
     let bot = call["bot"].as_str().unwrap_or_default();
     let page = client
@@ -1809,34 +1845,14 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     if name != AUTOMATIONS {
         unreviewed(client, bot, &record["bot_id"], name).await?;
     }
+    let turn = call["turn"].as_i64().unwrap_or(0);
     // As the calling turn runs, which keeps its folder and model when the
     // bot's own change for a turn after it.
-    let turn = call["turn"].as_i64().unwrap_or(0);
-    let page = client
-        .request(
-            "turns",
-            json!({"bot": bot, "after": turn - 1, "before": turn + 1, "limit": 1}),
-        )
+    let running = running_turn(client, bot, turn)
         .await
-        .map_err(|e| ("caller_unknown", e.to_string()))?;
-    let running = page["turns"].get(0).filter(|t| t["turn"] == turn);
-    let of = |key: &str| running.map_or(&Value::Null, |t| &t[key]);
-    let workspace = of("workspace")
-        .as_str()
-        .or(record["workspace"].as_str())
-        .unwrap_or("/");
-    let model = match of("model").as_str() {
-        Some(model) => model.to_owned(),
-        None => format!(
-            "{}/{}",
-            str_of(&record["provider"]),
-            str_of(&record["model"])
-        ),
-    };
-    let effort = match running {
-        Some(_) => of("effort").as_str(),
-        None => record["effort"].as_str(),
-    };
+        .map_err(|e| ("caller_unknown", e))?;
+    let (workspace, model, effort) = as_running(&running, record);
+    let (workspace, effort) = (workspace.as_str(), effort.as_deref());
     let mut command = tokio::process::Command::new(me);
     command
         .arg("tool")
@@ -1870,7 +1886,7 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     // cleanup is the automation's, whichever run's agent started it, so a
     // run that carries on one cut short changes it as its own.
     if call["name"] == MEMORY
-        && of("request_id")
+        && running["request_id"]
             .as_str()
             .is_some_and(|r| r.starts_with(crate::trigger::SENT_PREFIX))
         && let (Some(store_id), Ok(places), Some(id)) = (

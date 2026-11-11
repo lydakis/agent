@@ -278,7 +278,14 @@ pub async fn call(
         STARTING.fetch_add(1, Ordering::SeqCst);
         Seat
     };
-    let workspace = PathBuf::from(str_of(&record["workspace"]));
+    // As the calling turn runs: its folder, model and effort, which a
+    // choice for that turn alone may make other than the bot's own.
+    let turn = call["turn"].as_i64().unwrap_or(0);
+    let running = crate::served::running_turn(client, &bot, turn)
+        .await
+        .map_err(|e| ("caller_unknown", e))?;
+    let (workspace, model, effort) = crate::served::as_running(&running, &record);
+    let workspace = PathBuf::from(workspace);
     let (project, roles) = line_of(client, &record).await;
     let source = source_of(arguments, &workspace, &roles).map_err(refused)?;
     let script = script::read(&source).map_err(refused)?;
@@ -311,16 +318,12 @@ pub async fn call(
         id: id.clone(),
         caller: bot.clone(),
         caller_id: record["bot_id"].as_i64().unwrap_or(0),
-        turn: call["turn"].as_i64().unwrap_or(0),
+        turn,
         project,
         roles,
         workspace,
-        model: format!(
-            "{}/{}",
-            str_of(&record["provider"]),
-            str_of(&record["model"])
-        ),
-        effort: record["effort"].as_str().map(str::to_owned),
+        model,
+        effort,
         mode: crate::approvals::mode(&record)
             .unwrap_or_else(crate::approvals::default)
             .to_owned(),
@@ -768,6 +771,25 @@ impl Run {
             }
         }
         (live.len(), heard)
+    }
+
+    /// The output tokens of every turn of the workers whose calls were
+    /// never answered, which no answer has counted: once interrupted, what
+    /// each turn spent.
+    async fn unanswered(&self, client: &Client) -> u64 {
+        let workers: Vec<String> = self.live.lock().unwrap().keys().cloned().collect();
+        let mut spent = 0;
+        for bot in workers {
+            if let Ok(page) = client
+                .request("turns", json!({"bot": bot, "newest": true, "limit": 16}))
+                .await
+            {
+                spent += (page["turns"].as_array().into_iter().flatten())
+                    .filter_map(|turn| turn["output_tokens"].as_u64())
+                    .sum::<u64>();
+            }
+        }
+        spent
     }
 
     /// What a worker in `dir`, as profile `role`, is told: composed once a
@@ -1444,15 +1466,23 @@ async fn finish(run: &Run, ended: script::Ended, attempt: Option<&Attempt>) {
         None => run.live.lock().unwrap().is_empty(),
     };
     let mut wait = AGAIN;
+    let mut spoke = None;
     while !heard {
         if let Ok((client, _events)) = Client::connect(&run.socket).await {
             heard = run.interrupt(&client).await.1;
+            spoke = Some(client);
             if heard {
                 break;
             }
         }
         tokio::time::sleep(wait).await;
         wait = (wait * 2).min(Duration::from_secs(60));
+    }
+    // What the calls never answered spent all the same.
+    let client = attempt.map(|a| &*a.client).or(spoke.as_deref());
+    if let Some(client) = client {
+        let unanswered = run.unanswered(client).await;
+        run.spent.fetch_add(unanswered, Ordering::SeqCst);
     }
     let (status, result, error) = match ended {
         script::Ended::Returned(value) => ("completed", value, None),
@@ -1462,20 +1492,24 @@ async fn finish(run: &Run, ended: script::Ended, attempt: Option<&Attempt>) {
     let count =
         |of: fn(&Attempt) -> &AtomicU64| attempt.map_or(0, |a| of(a).load(Ordering::SeqCst));
     let trees: Vec<String> = run.trees.lock().unwrap().iter().cloned().collect();
-    let (store, here) = (run.store.clone(), plan.workspace.clone());
+    let (store, socket, here) = (
+        run.store.clone(),
+        run.socket.clone(),
+        plan.workspace.clone(),
+    );
     let kept = tokio::task::spawn_blocking(move || {
         // What stays: a branch with work on it, or a worktree not taken
         // away, and why.
         (trees.iter())
-            .filter_map(
-                |tree| match crate::task::remove(&here, tree, false, (&store, "")) {
+            .filter_map(|tree| {
+                match crate::task::remove(&here, tree, false, (&store, &socket, "")) {
                     Ok(said) => said.contains("is kept").then_some(said),
                     Err(why) => Some(match crate::task::worktree_of(&here, tree) {
                         Some(path) => format!("{why} (at {})", path.display()),
                         None => why,
                     }),
-                },
-            )
+                }
+            })
             .collect::<Vec<_>>()
     })
     .await

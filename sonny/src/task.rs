@@ -1678,12 +1678,13 @@ fn shell_quote(path: &Path) -> String {
 /// agent and its history stay: only the person deletes those, by hand. A
 /// task still working is left as it is. For a task no longer there, removes
 /// the folder it left. Says what was done and what was kept; the mark is
-/// kept beside `store`, made by the call `call`.
+/// kept beside `store`, made by the call `call`, and the daemon asked is
+/// the one at `store` and `socket`.
 pub fn remove(
     here: &Path,
     name: &str,
     discard: bool,
-    (store, call): (&Path, &str),
+    (store, socket, call): (&Path, &Path, &str),
 ) -> Result<String, String> {
     let agent = crate::agent_bin_or_missing()?;
     let branch = format!("agent/{name}");
@@ -1761,14 +1762,14 @@ pub fn remove(
     kept()?;
     // Its newest turns while it is there: one not finished, running or
     // waiting to, keeps the task as it is.
-    let bot = listing(&agent, name)?;
+    let bot = listing(&agent, (store, socket), name)?;
     // The turn the daemon says runs, however many messages steered into it
     // since, each a turn of its own already ended.
     if let Some(running) = bot.as_ref().and_then(|bot| bot["running_turn"].as_i64()) {
         return Err(busy(name, running));
     }
     let turns = match bot {
-        Some(_) => Some(turns_of(&agent, name)?),
+        Some(_) => Some(turns_of(&agent, (store, socket), name)?),
         None => None,
     };
     if let Some(turn) = (turns.iter().flatten()).find(|turn| turn["finished_ms"].is_null()) {
@@ -1835,10 +1836,17 @@ fn capitalized(word: &str) -> String {
     })
 }
 
-/// The newest turns of `name`, as `agent turns` lists them, newest first.
-fn turns_of(agent: &Path, name: &str) -> Result<Vec<Value>, String> {
+/// The newest turns of `name`, as `agent turns` at `daemon` lists them,
+/// newest first.
+fn turns_of(
+    agent: &Path,
+    (store, socket): (&Path, &Path),
+    name: &str,
+) -> Result<Vec<Value>, String> {
     let output = std::process::Command::new(agent)
         .args(["turns", "--bot", name, "--newest", "--limit", "16"])
+        .env("AGENT_STORE", store)
+        .env("AGENT_SOCKET", socket)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("running {}: {e}", agent.display()))?;
@@ -1849,10 +1857,16 @@ fn turns_of(agent: &Path, name: &str) -> Result<Vec<Value>, String> {
     }
 }
 
-/// `name` as `agent ls` lists it, none when it is not there.
-fn listing(agent: &Path, name: &str) -> Result<Option<Value>, String> {
+/// `name` as `agent ls` at `daemon` lists it, none when it is not there.
+fn listing(
+    agent: &Path,
+    (store, socket): (&Path, &Path),
+    name: &str,
+) -> Result<Option<Value>, String> {
     let output = Command::new(agent)
         .args(["ls", "--name", name])
+        .env("AGENT_STORE", store)
+        .env("AGENT_SOCKET", socket)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("running {}: {e}", agent.display()))?;
