@@ -54,6 +54,7 @@
 //!             #[cfg(feature = "bracketed-paste")]
 //!             Event::Paste(data) => println!("{:?}", data),
 //!             Event::Resize(width, height) => println!("New size {}x{}", width, height),
+//!             Event::Reply(reply) => println!("{:?}", reply),
 //!         }
 //!     }
 //!     execute!(
@@ -100,6 +101,7 @@
 //!                 #[cfg(feature = "bracketed-paste")]
 //!                 Event::Paste(data) => println!("Pasted {:?}", data),
 //!                 Event::Resize(width, height) => println!("New size {}x{}", width, height),
+//!                 Event::Reply(reply) => println!("{:?}", reply),
 //!             }
 //!         } else {
 //!             // Timeout expired and no `Event` is available
@@ -545,7 +547,6 @@ impl Command for PopKeyboardEnhancementFlags {
 /// Represents an event.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "derive-more", derive(IsVariant))]
-#[cfg_attr(not(feature = "bracketed-paste"), derive(Copy))]
 #[derive(Debug, PartialOrd, PartialEq, Eq, Clone, Hash)]
 pub enum Event {
     /// The terminal gained focus
@@ -563,6 +564,11 @@ pub enum Event {
     /// An resize event with new dimensions after resize (columns, rows).
     /// **Note** that resize events can occur in batches.
     Resize(u16, u16),
+    /// A terminal's answer that crossterm does not read itself, as it came:
+    /// an OSC answer (`ESC ] Ps ; … BEL` or `… ESC \`), as to a colour
+    /// query, or a `CSI ? … n` report, as the colour scheme a terminal
+    /// reports once asked to (mode 2031). Unix only.
+    Reply(String),
 }
 
 impl Event {

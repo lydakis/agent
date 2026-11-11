@@ -56,7 +56,11 @@ heap-profile = ["dep:dhat"]
 tokio = { version = "1", features = ["test-util", "macros", "rt"] }
 
 [workspace]
-members = ["client", "sonny"]
+members = ["client", "sonny", "vendor/crossterm"]
+
+# crossterm with one patch Sonny needs (vendor/crossterm/README.md).
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }
 
 [workspace.lints.clippy]
 # Every unsafe block says why it is sound, in a `// SAFETY:` comment.

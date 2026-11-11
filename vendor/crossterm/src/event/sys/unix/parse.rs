@@ -23,6 +23,34 @@ fn could_not_parse_event_error() -> io::Error {
     io::Error::new(io::ErrorKind::Other, "Could not parse an event.")
 }
 
+/// The longest OSC answer waited for: a colour's is under 40 bytes.
+const OSC_MAX: usize = 1024;
+
+fn reply(buffer: &[u8]) -> Event {
+    Event::Reply(String::from_utf8_lossy(buffer).into_owned())
+}
+
+/// An OSC answer, `ESC ] Ps ; … BEL` or `… ESC \`, as a terminal sends to
+/// a query (a colour's, OSC 10, 11 or 4): the program reads it. Its number
+/// comes first; anything else after `ESC ]` is no answer and is dropped.
+fn parse_osc(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    debug_assert!(buffer.starts_with(b"\x1B]"));
+    let body = &buffer[2..];
+    let number = body.iter().take_while(|b| b.is_ascii_digit()).count();
+    match body.get(number) {
+        None => return Ok(None),
+        Some(b';') if number > 0 => {}
+        Some(_) => return Err(could_not_parse_event_error()),
+    }
+    if buffer.ends_with(b"\x07") || buffer.ends_with(b"\x1B\\") {
+        return Ok(Some(InternalEvent::Event(reply(buffer))));
+    }
+    if buffer.len() > OSC_MAX {
+        return Err(could_not_parse_event_error());
+    }
+    Ok(None)
+}
+
 pub(crate) fn parse_event(
     buffer: &[u8],
     input_available: bool,
@@ -74,6 +102,7 @@ pub(crate) fn parse_event(
                         }
                     }
                     b'[' => parse_csi(buffer),
+                    b']' => parse_osc(buffer),
                     b'\x1B' => Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))),
                     _ => parse_event(&buffer[1..], input_available).map(|event_option| {
                         event_option.map(|event| {
@@ -180,6 +209,11 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
         b'?' => match buffer[buffer.len() - 1] {
             b'u' => return parse_csi_keyboard_enhancement_flags(buffer),
             b'c' => return parse_csi_primary_device_attributes(buffer),
+            // A report, as the colour scheme (mode 2031): the program reads it.
+            b'n' => Some(reply(buffer)),
+            // Any other final byte still ends the sequence: waiting on would
+            // swallow every key after it (as upstream's #1106).
+            0x40..=0x7E => return Err(could_not_parse_event_error()),
             _ => None,
         },
         b'0'..=b'9' => {
@@ -863,6 +897,49 @@ pub(crate) fn parse_utf8_char(buffer: &[u8]) -> io::Result<Option<char>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_osc_answers_and_reports_are_replies() {
+        let reply = |s: &str| Some(InternalEvent::Event(Event::Reply(s.to_string())));
+        for answer in [
+            "\x1B]11;rgb:1e1e/1e1e/2e2e\x1B\\",
+            "\x1B]10;rgb:cd/d6/f4\x07",
+            "\x1B]4;1;rgb:f3f3/8b8b/a8a8\x1B\\",
+            "\x1B[?997;1n",
+            "\x1B[?997;2n",
+        ] {
+            assert_eq!(
+                parse_event(answer.as_bytes(), false).unwrap(),
+                reply(answer)
+            );
+        }
+        // Not yet whole: wait for the rest.
+        for part in [
+            "\x1B]",
+            "\x1B]11",
+            "\x1B]11;rgb:1e1e/",
+            "\x1B]11;rgb:1e\x1B",
+        ] {
+            assert_eq!(
+                parse_event(part.as_bytes(), true).unwrap(),
+                None,
+                "{part:?}"
+            );
+        }
+        // No answer's number: dropped, never held.
+        assert!(parse_event(b"\x1B]x", true).is_err());
+        assert!(parse_event(b"\x1B];", true).is_err());
+        let endless = format!("\x1B]11;{}", "f".repeat(OSC_MAX));
+        assert!(parse_event(endless.as_bytes(), true).is_err());
+    }
+
+    #[test]
+    fn test_unknown_finished_csi_question_sequences_end() {
+        // DECRPM's answer, which nothing here reads: it ends, and a key
+        // after it is read as one (it used to wait for a `u` or `c`).
+        assert!(parse_event(b"\x1B[?2027;2$y", false).is_err());
+        assert_eq!(parse_event(b"\x1B[?2027;2$", true).unwrap(), None);
+    }
+
     use crate::event::{KeyEventState, KeyModifiers, MouseButton, MouseEvent};
 
     use super::*;
