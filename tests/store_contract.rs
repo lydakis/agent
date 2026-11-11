@@ -19212,6 +19212,109 @@ fn schema_90_turns_become_messages_each_with_its_number() {
 /// answers what was said just before it was taken: an attached message
 /// sent before a steer may be taken in after it.
 #[test]
+fn schema_90_names_a_pruned_message_s_node_only_where_its_words_are_clear() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-schema90-order-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let attach = TurnOptions {
+        delivery: Delivery::Attach,
+        ..TurnOptions::default()
+    };
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    let (run, attached, steered, twins) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let run = db
+            .begin(
+                "Bob",
+                "r",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        // The turn takes the steer before the message attached ahead of it,
+        // then two steers with the same words together.
+        let attached = (db.begin("Bob", "a", "by the way", true, &attach, allow_provider))
+            .unwrap()
+            .turn;
+        let steered = (db.begin("Bob", "s", "stop", true, &steer, allow_provider))
+            .unwrap()
+            .turn;
+        let usage = ContextUsage::default();
+        db.append(run, vec![assistant("one")], &[], None).unwrap();
+        db.absorb(run, None, 8 << 20, 4096, usage, false, false)
+            .unwrap();
+        db.append(run, vec![assistant("two")], &[], None).unwrap();
+        db.absorb(run, None, 8 << 20, 4096, usage, false, true)
+            .unwrap();
+        let mut twins = Vec::new();
+        for key in ["t1", "t2"] {
+            twins.push(
+                (db.begin("Bob", key, "again", true, &steer, allow_provider))
+                    .unwrap()
+                    .turn,
+            );
+        }
+        db.append(run, vec![assistant("three")], &[], None).unwrap();
+        db.absorb(run, None, 8 << 20, 4096, usage, false, true)
+            .unwrap();
+        db.append(run, vec![assistant("done")], &[], None).unwrap();
+        db.finish(run, None).unwrap();
+        (run, attached, steered, twins)
+    };
+    let node_of = |conn: &Connection, id: i64| -> Option<i64> {
+        conn.query_row("SELECT node FROM messages WHERE id=?", [id], |r| r.get(0))
+            .unwrap()
+    };
+    let before = Connection::open(&path).unwrap();
+    let nodes: Vec<Option<i64>> = [attached, steered]
+        .iter()
+        .map(|id| node_of(&before, *id))
+        .collect();
+    assert!(nodes.iter().all(Option::is_some));
+    // The steer's node comes before the attached message's.
+    assert!(nodes[1] < nodes[0]);
+    drop(before);
+    // As schema 90 kept them, with every message's events pruned.
+    Connection::open(&path)
+        .unwrap()
+        .older(&format!(
+            "DELETE FROM events WHERE turn IN ({a},{s},{t1},{t2})
+                OR json_extract(data,'$.steer') IN ({a},{s},{t1},{t2});",
+            a = attached,
+            s = steered,
+            t1 = twins[0],
+            t2 = twins[1]
+        ))
+        .unwrap();
+    Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    // Each message whose words only one prompt has gets that prompt's node,
+    // whatever order the turn took them in.
+    assert_eq!(node_of(&conn, attached), nodes[0]);
+    assert_eq!(node_of(&conn, steered), nodes[1]);
+    // Two with the same words could be either: neither is named.
+    for twin in &twins {
+        let (status, turn): (String, Option<i64>) = conn
+            .query_row("SELECT status,turn FROM messages WHERE id=?", [twin], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((status.as_str(), turn), ("taken", Some(run)));
+        assert_eq!(node_of(&conn, *twin), None);
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn prompts_follow_the_order_a_turn_took_its_messages_in() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();

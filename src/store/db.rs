@@ -16198,8 +16198,12 @@ fn migrate_messages(conn: &Connection) -> Result<()> {
                 WHERE c.finished_ms IS NULL OR c.finished_ms>=messages.taken_ms)
             WHERE status='taken' AND turn IS NULL;",
     )?;
-    // The nodes of old steers that kept none, matched by their words in
-    // the one turn that took them: its prompts after its own, in order.
+    // The nodes of old steers that kept none, matched by their words among
+    // the prompts the one turn that took them kept after its own. A turn
+    // can take its messages out of the order they were sent in, so the
+    // match is by words alone, and only where it is clear: words that one
+    // unmatched prompt and one unmatched message of that turn share. Where
+    // two could match, neither is named rather than guess.
     let mut turns = conn.prepare(
         "SELECT DISTINCT turn FROM messages WHERE status='taken' AND node IS NULL
             AND turn IS NOT NULL AND turn<>id ORDER BY turn",
@@ -16222,7 +16226,7 @@ fn migrate_messages(conn: &Connection) -> Result<()> {
         let (Some(first), Some(end)) = (first, end) else {
             continue;
         };
-        // Its prompts, newest first, then put oldest first.
+        // Its prompts.
         let mut prompts: Vec<(i64, String, i64)> = Vec::new();
         let mut at = Some(end);
         while let Some(node) = at.filter(|node| *node != first) {
@@ -16245,30 +16249,38 @@ fn migrate_messages(conn: &Connection) -> Result<()> {
             }
             at = parent;
         }
-        prompts.reverse();
         let claimed: std::collections::HashSet<i64> = conn
             .prepare("SELECT node FROM messages WHERE turn=? AND node IS NOT NULL")?
             .query_map([turn], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        prompts.retain(|(node, ..)| !claimed.contains(node));
-        let steers: Vec<(i64, String)> = conn
-            .prepare(
-                "SELECT id,text FROM messages WHERE turn=? AND id<>turn AND node IS NULL ORDER BY id",
-            )?
-            .query_map([turn], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        let mut from = 0;
+        // Words -> (unmatched prompts, unmatched messages) that have them.
+        let mut words: HashMap<(String, i64), (Vec<i64>, Vec<i64>)> = HashMap::new();
+        for (node, opening, chars) in prompts {
+            if !claimed.contains(&node) {
+                words.entry((opening, chars)).or_default().0.push(node);
+            }
+        }
+        let steers = conn
+            .prepare("SELECT id,text FROM messages WHERE turn=? AND id<>turn AND node IS NULL")?
+            .query_map([turn], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         for (steer, text) in steers {
-            let chars = text.chars().count() as i64;
-            let opening: String = text.chars().take(Database::OPENING_CHARS).collect();
-            let found = (prompts[from..].iter())
-                .position(|(_, kept, count)| *count == chars && *kept == opening);
-            if let Some(found) = found {
+            let key = (
+                text.chars().take(Database::OPENING_CHARS).collect(),
+                text.chars().count() as i64,
+            );
+            if let Some(entry) = words.get_mut(&key) {
+                entry.1.push(steer);
+            }
+        }
+        for (nodes, steers) in words.into_values() {
+            if let ([node], [steer]) = (&nodes[..], &steers[..]) {
                 conn.execute(
                     "UPDATE messages SET node=? WHERE id=?",
-                    params![prompts[from + found].0, steer],
+                    params![node, steer],
                 )?;
-                from += found + 1;
             }
         }
     }
