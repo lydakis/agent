@@ -96,7 +96,8 @@ pub fn tool() -> Option<Value> {
                 "type": "object",
                 "properties": {
                     "script": {"type": "string", "minLength": 1,
-                        "description": "The script, starting with export const meta."},
+                        "description": "The script, starting with export const meta. \
+                            Saved with the run: write no file for it."},
                     "script_path": {"type": "string", "minLength": 1,
                         "description": "A script file to run instead."},
                     "name": {"type": "string", "minLength": 1,
@@ -1742,7 +1743,18 @@ fn told(plan: &Plan, ended: &Value, dir: &Path) -> String {
             Value::String(text) => text.clone(),
             other => serde_json::to_string_pretty(other).unwrap_or_default(),
         };
-        said.push_str(&format!("Result:\n{}\n\n", cut(&result, TOLD_BYTES)));
+        // A result too long to read here is told by its shape, not cut in
+        // the middle of a value: the whole is in result.json.
+        match (result.len() <= TOLD_BYTES / 2, &ended["result"]) {
+            (true, _) | (false, Value::String(_)) => {
+                said.push_str(&format!("Result:\n{}\n\n", cut(&result, TOLD_BYTES)));
+            }
+            (false, value) => said.push_str(&format!(
+                "Result ({} bytes, its outline):\n{}\n",
+                result.len(),
+                cut(&outline(value), TOLD_BYTES / 2)
+            )),
+        }
     }
     // What stays, within its share; the rest is in result.json.
     let kept: Vec<&Value> = ended["kept"].as_array().into_iter().flatten().collect();
@@ -1767,6 +1779,44 @@ fn told(plan: &Plan, ended: &Value, dir: &Path) -> String {
         dir.join("script.js").display()
     ));
     said
+}
+
+/// A result's shape, a line a top-level key or item: short values as they
+/// are, the rest by their size.
+fn outline(value: &Value) -> String {
+    const SHORT: usize = 160;
+    let brief = |value: &Value| match value {
+        Value::Array(items) => format!("[{} items]", items.len()),
+        Value::Object(fields) => {
+            let keys: Vec<&str> = fields.keys().map(String::as_str).take(8).collect();
+            let more = match fields.len() > keys.len() {
+                true => ", …",
+                false => "",
+            };
+            format!("{{{}{more}}}", keys.join(", "))
+        }
+        Value::String(text) if text.len() > SHORT => {
+            let mut at = SHORT;
+            while !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            format!("{:?}… ({} bytes)", &text[..at], text.len())
+        }
+        short => short.to_string(),
+    };
+    match value {
+        Value::Object(fields) => (fields.iter())
+            .map(|(key, value)| format!("{key}: {}\n", brief(value)))
+            .collect(),
+        Value::Array(items) => {
+            let mut said = format!("[{} items], the first:\n", items.len());
+            for item in items.iter().take(3) {
+                said.push_str(&format!("{}\n", brief(item)));
+            }
+            said
+        }
+        other => format!("{}\n", brief(other)),
+    }
 }
 
 /// `text` within `most` bytes: its start and its end, with how much was
@@ -1987,6 +2037,24 @@ mod tests {
             "{said}"
         );
         assert!(!said.contains("Result:"), "{said}");
+        // A long result is told by its outline, never cut mid-value.
+        let checks: Vec<Value> = (0..200)
+            .map(|n| json!({"finding": format!("bug {n} in a long description"), "real": true}))
+            .collect();
+        let long = json!({"status": "completed", "ended_ms": 0, "kept": [],
+            "result": {"found": 200, "checks": checks, "note": "x".repeat(400),
+                "by_file": {"a.rs": 3, "b.rs": 4}}});
+        let said = told(&plan, &long, Path::new("/runs/r1"));
+        assert!(
+            said.contains(
+                "its outline):\nby_file: {a.rs, b.rs}\nchecks: [200 items]\nfound: 200\nnote: \"xxx"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("… (400 bytes)") && !said.contains("left out"),
+            "{said}"
+        );
         let kept: Vec<String> = (0..1000)
             .map(|n| format!("shop.wf-r1-{n:040}'s worktree has uncommitted changes"))
             .collect();

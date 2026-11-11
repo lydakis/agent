@@ -933,8 +933,10 @@ tool ([workflow/](../sonny/src/workflow/)) takes a JavaScript plan in
 Claude Code's dynamic workflow language, name for name, and runs it in the
 tool host, in the QuickJS `exec` uses, on a connection of its own. The call
 returns at once with the run's id; the caller hears back once, when the run
-ends, in a message queued with origin `workflow`. The workflow skill is the
-language's reference.
+ends, in a message queued with origin `workflow`: how it ended, its agents
+and tokens, and its result, or the result's outline (each top-level key with
+a short value or its size) when it is over 4 KiB, with where the whole is.
+The workflow skill is the language's reference.
 
 Each `agent()` call makes a worker, `PROJECT.wf-RUN-KEY`: a bot the caller
 made, in its folder (a worktree of it with `isolation: 'worktree'`, taken

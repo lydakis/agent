@@ -129,14 +129,22 @@ return results.flat().filter(Boolean)
 
 Scale to the ask: "find any bugs" is a few finders and one check each;
 "audit this thoroughly" is more finders, three to five refuters, and a
-synthesis.
+synthesis. A check only removes: what no finder brings up is lost, so when
+missing something matters most, give each piece two finders with different
+lenses before adding refuters.
+
+Return what you need to act on: the kept items and the counts (found,
+checked, dropped), not every step's working set. A large result reaches you
+only as its outline.
 
 ## Running it
 
-Call `workflow` with `script` (or `script_path`, or `name` for a saved one
-in `.agents/workflows/NAME.js`, the project's or `~/.agents/workflows/`),
-`args` when the script reads them, and `budget_tokens` when the person gave
-one. It returns at once with the run's id and where its script is saved.
+Call `workflow` with the script inline as `script`: it is saved with the
+run, so write no script file in the person's folder. `script_path` runs a
+file already there, and `name` a saved one in `.agents/workflows/NAME.js`
+(the project's or `~/.agents/workflows/`), which you write only when the
+person asks for a workflow to keep. Pass `args` when the script reads
+them, and `budget_tokens` when the person gave one. It returns at once with the run's id and where its script is saved.
 Carry on, or end your turn: the run's one message wakes you when it ends,
 with its result, how many agents ran and failed, and where the whole result
 and each agent's value are.
@@ -147,5 +155,7 @@ did not change are answered from that run without a model call, and the
 rest run. The same script with the same args costs nothing. Call `workflow`
 with `stop` and a run's id to end it early; you still hear how it ended.
 
+The result is your agents' word. When the person asked for checked
+answers, spot-check what it claims against the source before you report it.
 Before you explain an empty or odd result, read the run's `events.jsonl`: it
 records each agent's value, and why one was null.
