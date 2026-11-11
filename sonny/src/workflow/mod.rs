@@ -563,7 +563,6 @@ fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
         .open(dir.join("events.jsonl"))
         .ok();
     Ok(Arc::new(Run {
-        plan,
         script,
         dir: dir.to_owned(),
         store: store.to_owned(),
@@ -573,9 +572,14 @@ fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
         answers: Mutex::new(answers),
         spent: AtomicU64::new(spent),
         live: Mutex::default(),
-        trees: Mutex::default(),
+        // Its workers' worktrees, which its answers no longer make.
+        trees: Mutex::new(crate::task::worker_trees(
+            &plan.workspace,
+            &format!("{}.{WORKER}{}-", plan.project, plan.id),
+        )),
         told: Mutex::default(),
         journal: Mutex::new(journal),
+        plan,
     }))
 }
 
@@ -598,14 +602,7 @@ pub fn resume(store: PathBuf, socket: PathBuf) {
                 if result["told"] == false
                     && let Ok(plan) = read_plan(&path)
                 {
-                    let socket = socket.clone();
-                    tokio::spawn(async move {
-                        if tell(&plan, &result, &path, &socket).await {
-                            let mut result = result;
-                            result["told"] = json!(true);
-                            let _ = keep_result(&path, &result);
-                        }
-                    });
+                    deliver(plan, result, path, socket.clone());
                 }
             }
             // Unended, or its ending never written whole: run again.
@@ -1257,24 +1254,39 @@ async fn finish(run: &Run, ended: script::Ended, attempt: Option<&Attempt>) {
     let trees: Vec<String> = run.trees.lock().unwrap().iter().cloned().collect();
     let (store, here) = (run.store.clone(), plan.workspace.clone());
     let kept = tokio::task::spawn_blocking(move || {
-        trees
-            .iter()
-            .filter_map(|tree| crate::task::remove(&here, tree, false, (&store, "")).ok())
-            .filter(|said| said.contains("is kept"))
+        // What stays: a branch with work on it, or a worktree not taken
+        // away, and why.
+        (trees.iter())
+            .filter_map(
+                |tree| match crate::task::remove(&here, tree, false, (&store, "")) {
+                    Ok(said) => said.contains("is kept").then_some(said),
+                    Err(why) => Some(match crate::task::worktree_of(&here, tree) {
+                        Some(path) => format!("{why} (at {})", path.display()),
+                        None => why,
+                    }),
+                },
+            )
             .collect::<Vec<_>>()
     })
     .await
     .unwrap_or_default();
-    let mut ended = json!({"status": status, "result": result, "error": error,
+    let ended = json!({"status": status, "result": result, "error": error,
         "agents": count(|a| &a.calls), "nulls": count(|a| &a.nulls),
         "reused": count(|a| &a.reused), "output_tokens": run.spent.load(Ordering::SeqCst),
         "kept": kept, "ended_ms": now_ms(), "told": false});
     run.note(json!({"t": "end", "status": status, "error": error, "at_ms": now_ms()}));
     let _ = keep_result(&run.dir, &ended);
-    if tell(plan, &ended, &run.dir, &run.socket).await {
+    deliver(plan.clone(), ended, run.dir.clone(), run.socket.clone());
+}
+
+/// Tell `plan`'s caller how its run ended, trying until the daemon takes
+/// it, then mark it told.
+fn deliver(plan: Plan, mut ended: Value, dir: PathBuf, socket: PathBuf) {
+    tokio::spawn(async move {
+        tell(&plan, &ended, &dir, &socket).await;
         ended["told"] = json!(true);
-        let _ = keep_result(&run.dir, &ended);
-    }
+        let _ = keep_result(&dir, &ended);
+    });
 }
 
 /// Write how the run in `dir` ended, whole or not at all: a host stopped
@@ -1286,12 +1298,14 @@ fn keep_result(dir: &Path, ended: &Value) -> std::io::Result<()> {
 }
 
 /// Tell `plan`'s caller how its run ended, once, as a message from the
-/// workflow queued for its next turn: whether it was told.
-async fn tell(plan: &Plan, ended: &Value, dir: &Path, socket: &Path) -> bool {
+/// workflow queued for its next turn, waiting out a daemon that is away.
+async fn tell(plan: &Plan, ended: &Value, dir: &Path, socket: &Path) {
     let message = told(plan, ended, dir);
-    for _ in 0..30 {
+    let mut wait = AGAIN;
+    loop {
         let Ok((client, _events)) = Client::connect(socket).await else {
-            tokio::time::sleep(AGAIN).await;
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(Duration::from_secs(60));
             continue;
         };
         let sent = client
@@ -1304,13 +1318,14 @@ async fn tell(plan: &Plan, ended: &Value, dir: &Path, socket: &Path) -> bool {
             .await;
         client.close().await;
         match sent {
-            Ok(_) => return true,
-            Err(error) if lost(&error) => tokio::time::sleep(AGAIN).await,
-            // The caller is gone: no one to tell, and none to tell again.
-            Err(_) => return true,
+            Err(error) if lost(&error) => {
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(60));
+            }
+            // Told, or the caller is gone: no one to tell again.
+            _ => return,
         }
     }
-    false
 }
 
 /// The message a run's caller is sent at its end.

@@ -102,8 +102,24 @@ fn nullable(mut property: Value) -> Value {
 /// `value`, a reply to [`strict`]'s `schema`, with the nulls it gives the
 /// properties `schema` does not require left out, at every depth.
 pub fn loosen(value: Value, schema: &Value) -> Value {
+    loosen_in(value, schema, schema)
+}
+
+/// [`loosen`] within `root`, whose `$defs` a local `$ref` names.
+fn loosen_in(value: Value, schema: &Value, root: &Value) -> Value {
+    let schema = resolve(schema, root);
     match value {
         Value::Object(fields) => {
+            // Of a choice, the branch whose properties name all it gives.
+            let chosen = (["anyOf", "oneOf"].iter())
+                .flat_map(|key| schema[*key].as_array().into_iter().flatten())
+                .map(|branch| resolve(branch, root))
+                .find(|branch| {
+                    branch["properties"]
+                        .as_object()
+                        .is_some_and(|p| fields.keys().all(|name| p.contains_key(name)))
+                });
+            let schema = chosen.unwrap_or(schema);
             let required: Vec<&str> = (schema["required"].as_array().into_iter().flatten())
                 .filter_map(Value::as_str)
                 .collect();
@@ -117,11 +133,9 @@ pub fn loosen(value: Value, schema: &Value) -> Value {
                             && !required.contains(&name.as_str()))
                     })
                     .map(|(name, value)| {
-                        let inner = properties
-                            .and_then(|p| p.get(&name))
-                            .cloned()
-                            .unwrap_or(Value::Null);
-                        (name, loosen(value, &inner))
+                        let inner = (properties.and_then(|p| p.get(&name))).unwrap_or(&Value::Null);
+                        let value = loosen_in(value, inner, root);
+                        (name, value)
                     })
                     .collect(),
             )
@@ -129,11 +143,26 @@ pub fn loosen(value: Value, schema: &Value) -> Value {
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
-                .map(|item| loosen(item, &schema["items"]))
+                .map(|item| loosen_in(item, &schema["items"], root))
                 .collect(),
         ),
         other => other,
     }
+}
+
+/// `schema`, or what its local `$ref` names in `root`, followed a few
+/// times at most.
+fn resolve<'a>(mut schema: &'a Value, root: &'a Value) -> &'a Value {
+    for _ in 0..16 {
+        match schema["$ref"].as_str().and_then(|r| r.strip_prefix('#')) {
+            Some(pointer) => match root.pointer(pointer) {
+                Some(named) => schema = named,
+                None => break,
+            },
+            None => break,
+        }
+    }
+    schema
 }
 
 /// Whether `property` takes null: typed so, or untyped.
@@ -187,6 +216,22 @@ pub fn parse(text: &str, schema: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_referenced_or_chosen_object_loses_its_optional_nulls_too() {
+        let schema = json!({"type": "object",
+            "$defs": {"r": {"type": "object", "properties": {"note": {"type": "string"},
+                "n": {"type": "integer"}}, "required": ["n"]}},
+            "properties": {
+                "result": {"$ref": "#/$defs/r"},
+                "either": {"anyOf": [{"type": "string"}, {"$ref": "#/$defs/r"}]}},
+            "required": ["result", "either"]});
+        let reply = json!({"result": {"note": null, "n": 1}, "either": {"note": null, "n": 2}});
+        assert_eq!(
+            loosen(reply, &schema),
+            json!({"result": {"n": 1}, "either": {"n": 2}})
+        );
+    }
 
     #[test]
     fn optional_properties_go_as_nullable_and_come_back_left_out() {

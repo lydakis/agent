@@ -530,9 +530,20 @@ fn branch_of(here: &Path, name: &str) -> Option<String> {
     Some(branch)
 }
 
+/// The tasks whose names start `prefix` with a branch checked out in the
+/// repository at `here`.
+pub(crate) fn worker_trees(here: &Path, prefix: &str) -> std::collections::BTreeSet<String> {
+    let list = git(here, &["worktree", "list", "--porcelain"]).unwrap_or_default();
+    (list.lines())
+        .filter_map(|line| line.strip_prefix("branch refs/heads/agent/"))
+        .filter(|name| name.starts_with(prefix))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Where the task `name`'s branch is checked out, in the repository at
 /// `here`.
-fn worktree_of(here: &Path, name: &str) -> Option<PathBuf> {
+pub(crate) fn worktree_of(here: &Path, name: &str) -> Option<PathBuf> {
     let list = git(here, &["worktree", "list", "--porcelain"]).ok()?;
     let branch = format!("branch refs/heads/agent/{name}");
     (list.split("\n\n"))
