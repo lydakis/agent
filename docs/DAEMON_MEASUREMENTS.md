@@ -8346,13 +8346,13 @@ standard, which is what nearly every call is.
 No turn, store or socket path changes: the store and socket locks wait only
 in a daemon started with `--await-owner` (a replacement), the env file is
 read only by an `agent` that starts a daemon, and `stats` reads its open
-files off the run loop. The one per-command change: a daemon that raised its
-soft open-file limit at start hands each command it runs the limit it found,
-through a `pre_exec` hook, which makes Rust start that command by fork and
-exec rather than posix_spawn. Linux sandboxed commands already start that
-way (bubblewrap's descriptors), so they pay nothing more; unsandboxed ones
-and every macOS command do. Where the limit was not raised (soft already at
-hard, as on CI runners) nothing changes.
+files off the run loop. The daemon raises its soft open-file limit at start
+and the commands it runs inherit the raised one. Handing each command the
+limit the daemon found was measured and not kept: it needs a `pre_exec`
+hook, which makes Rust start the command by fork and exec rather than
+posix_spawn (which has no way to set a limit, on Linux or macOS). Linux
+sandboxed commands already start that way (bubblewrap's descriptors);
+unsandboxed ones and every macOS command would have paid.
 
 Same release binary, 4-CPU Linux container, one turn of 200 `true` shell
 calls in one model response, three alternating rounds, total ms:
@@ -8364,4 +8364,5 @@ calls in one model response, three alternating rounds, total ms:
 
 About 0.35 ms more per unsandboxed command for a daemon of this size; a
 standalone spawn loop puts fork's extra at 0.6 ms for a 15 MiB process and
-1 ms for 30 MiB, against a command's own start (a shell) of a few ms.
+1 ms for 30 MiB, against a command's own start (a shell) of a few ms. With
+no hook, commands start exactly as before this change.

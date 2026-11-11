@@ -2,14 +2,10 @@
 //! pipe, terminal and store connection is one, so a daemon started where
 //! the soft limit is low (a systemd unit's 1024, a Mac's 256) runs out
 //! long before the system would let it. At start the daemon raises its
-//! soft limit to the hard one, as Go's runtime does for every program, and
-//! each command it starts gets the soft limit back as the daemon found it,
-//! so a program that only expects a usual limit (one using `select`, or
-//! closing every descriptor up to the limit) sees one.
-use std::sync::OnceLock;
-
-/// The soft limit the daemon found, kept only when it raised it.
-static FOUND: OnceLock<libc::rlimit> = OnceLock::new();
+//! soft limit to the hard one, as Go's runtime, Node and the JVM do.
+//! Commands it starts inherit the raised limit: handing them the old one
+//! back takes a hook between fork and exec, which costs every command
+//! posix_spawn's speed, and posix_spawn has no way to set a limit.
 
 /// Raise this process's soft limit on open files to its hard limit (on
 /// macOS, to the most one process may open, which a higher soft limit is
@@ -30,9 +26,7 @@ pub fn raise() {
         rlim_max: limit.rlim_max,
     };
     // SAFETY: a valid pointer to an rlimit this function owns.
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
-        let _ = FOUND.set(limit);
-    }
+    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) };
 }
 
 #[cfg(target_os = "macos")]
@@ -58,26 +52,6 @@ fn most(hard: libc::rlim_t) -> libc::rlim_t {
 #[cfg(not(target_os = "macos"))]
 fn most(hard: libc::rlim_t) -> libc::rlim_t {
     hard
-}
-
-/// Give a command the daemon starts the soft limit the daemon found. Only
-/// when it raised it: the hook makes the command start by fork and exec
-/// rather than posix_spawn, which costs about a millisecond more for a
-/// daemon of a few tens of megabytes, and is paid only where the limit
-/// moved. A command already started by fork pays nothing more.
-pub fn restore(command: &mut std::process::Command) {
-    use std::os::unix::process::CommandExt;
-    let Some(found) = FOUND.get().copied() else {
-        return;
-    };
-    // SAFETY: setrlimit is async-signal-safe and takes a value the closure
-    // owns. Lowering a soft limit cannot fail; a command runs either way.
-    unsafe {
-        command.pre_exec(move || {
-            libc::setrlimit(libc::RLIMIT_NOFILE, &found);
-            Ok(())
-        });
-    }
 }
 
 /// The open files of this process and its soft limit, for `stats`.

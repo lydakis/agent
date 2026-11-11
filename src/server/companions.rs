@@ -360,7 +360,6 @@ impl Run {
         if let Some(cwd) = &self.spec.cwd {
             command.current_dir(cwd);
         }
-        agent_runtime::open_files::restore(command.as_std_mut());
         command
             .spawn()
             .map_err(|e| format!("{}: {e}", self.spec.command))

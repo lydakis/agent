@@ -2896,7 +2896,6 @@ fn sh(
         process.env("AGENT_SOCKET", own);
     }
     process.current_dir(workspace);
-    crate::open_files::restore(process.as_std_mut());
     Ok(process)
 }
 

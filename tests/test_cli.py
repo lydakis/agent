@@ -52,7 +52,7 @@ class SocketAndCliTests(ModelFixture):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result
 
-    def test_a_daemon_raises_its_open_file_limit_and_its_commands_get_the_one_it_found(self):
+    def test_a_daemon_raises_its_open_file_limit_and_its_commands_inherit_it(self):
         import resource
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         if hard != resource.RLIM_INFINITY and hard <= 256:
@@ -63,9 +63,9 @@ class SocketAndCliTests(ModelFixture):
                                 env=clean_env(), capture_output=True, text=True, timeout=30,
                                 cwd=self.path, preexec_fn=low)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.path/'limit').read_text().strip(), '256')
         files = json.loads(self.agent('stats', '--store', str(self.store)).stdout)['files']
         self.assertGreater(files['limit'], 256)
+        self.assertEqual((self.path/'limit').read_text().strip(), str(files['limit']))
         if sys.platform != 'darwin':
             self.assertEqual(files['limit'], hard)
         self.assertGreater(files['open'], 3)

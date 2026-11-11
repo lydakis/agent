@@ -442,7 +442,7 @@ its `files` says how many files the daemon holds open against its limit,
 so a leak (a count that grows while idle) is told from a busy peak. The
 daemon raises its soft limit on open files to the hard one as it starts
 (on macOS, to the most a process may open), as Go's runtime does, and
-each command it runs gets the limit back as the daemon found it;
+the commands it runs inherit the raised limit;
 `turns`, `rm`, `prune`, `approvals`, and `answer` may restart it only for an
 existing store (`store_not_found` otherwise). These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an
