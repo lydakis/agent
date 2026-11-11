@@ -74,6 +74,7 @@ fn named_in(dir: &Path, program: &Path, name: &str) -> std::io::Result<PathBuf> 
     }
     std::fs::create_dir_all(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    sweep(dir);
     let partial = |of: &str| dir.join(format!(".{of}.{}.partial", std::process::id()));
     let made = partial(name);
     let _ = std::fs::remove_file(&made);
@@ -94,6 +95,41 @@ fn named_in(dir: &Path, program: &Path, name: &str) -> std::io::Result<PathBuf> 
     // as it was.
     std::fs::rename(&made, &link)?;
     Ok(link)
+}
+
+/// Remove what a process left half made in `dir` when it ended between
+/// making a name and moving it in place, `.NAME.PID.partial`: a copy is a
+/// whole program. Only a process that is gone leaves one; this one's own
+/// are its to finish. Read only when a name is made, so at most once a
+/// program change.
+fn sweep(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let me = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid = (name.to_str())
+            .and_then(|name| name.strip_prefix('.')?.strip_suffix(".partial"))
+            .and_then(|made| made.rsplit_once('.')?.1.parse::<u32>().ok());
+        if let Some(pid) = pid
+            && pid != me
+            && !alive(pid)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Whether process `pid` exists, as far as this user can tell.
+fn alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only checks that the process exists.
+    pid > 0
+        && (unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
 /// `program` copied to `to`, runnable by its owner only, with `program`'s
@@ -181,6 +217,34 @@ mod tests {
             .filter(|name| name.ends_with(".partial"))
             .collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn what_a_process_that_is_gone_left_half_made_goes_when_a_name_is_made() {
+        let home = temp();
+        let names = home.as_path().join("names");
+        std::fs::create_dir_all(&names).unwrap();
+        // A process that is gone: a child that has exited and been reaped.
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let gone = (gone.id(), gone.wait().unwrap()).0;
+        let left = [
+            format!(".{LOOKOUT}.{gone}.partial"),
+            format!(".copy-sonny.{gone}.partial"),
+        ];
+        // One a running process is making, and a file that is no partial.
+        let running = format!(".{TOOL_HOST}.1.partial");
+        let kept = [running.as_str(), ".copy-sonny", "notes.partial"];
+        for name in left.iter().map(String::as_str).chain(kept) {
+            std::fs::write(names.join(name), "x").unwrap();
+        }
+        let sonny = program(home.as_path(), "sonny", "#!/bin/sh\necho one\n");
+        named_in(&names, &sonny, LOOKOUT).unwrap();
+        for name in &left {
+            assert!(!names.join(name).exists(), "{name}");
+        }
+        for name in kept {
+            assert!(names.join(name).exists(), "{name}");
+        }
     }
 
     #[test]

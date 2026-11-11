@@ -559,6 +559,7 @@ async fn resolve(argv: &[String]) -> Result<Keys> {
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
+    crate::open_files::restore(command.as_std_mut());
     let output = tokio::time::timeout_at(deadline, command.output())
         .await
         .map_err(|_| unavailable("aws configure export-credentials timed out".into()))?

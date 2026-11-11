@@ -1,8 +1,11 @@
 //! `~/.agent/env`: provider keys kept out of shell profiles, as `KEY=VALUE`
-//! lines readable only by their owner. A client such as Sonny adds them
-//! over the environment it starts a daemon with; neither the CLI nor the
-//! daemon reads the file. Providers are not set here: Sonny passes over an
-//! `AGENT_PROVIDER` in it, since `~/.agent/config.toml` is where they live.
+//! lines readable only by their owner. The `agent` CLI adds them over the
+//! environment of a daemon it starts, and only then, so every starter
+//! (Sonny, an automation's check, a script, cron) gives the daemon the same
+//! keys; a command the daemon answers never reads the file, and the daemon
+//! never does. As Codex keeps `~/.codex/.env` from setting `CODEX_` names,
+//! names starting `AGENT_` (any case) are passed over: they are Agent's own
+//! settings, and providers live in `~/.agent/config.toml`.
 use std::path::{Path, PathBuf};
 
 /// Keys, not documents: bounds the read that starts every daemon.
@@ -86,10 +89,30 @@ pub fn read(path: &Path) -> Result<Vec<(String, String)>, String> {
     Ok(environment)
 }
 
+/// Whether `key` is one of Agent's own names, which the file never sets.
+pub fn refused(key: &str) -> bool {
+    key.get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AGENT_"))
+}
+
+/// What a daemon the CLI starts gets over the CLI's environment: the file's
+/// assignments but Agent's own names ([`refused`]), an empty value
+/// unsetting its name.
+pub fn for_daemon() -> Result<Vec<(String, String)>, String> {
+    let Some(file) = path() else {
+        return Ok(Vec::new());
+    };
+    let mut pairs = read(&file)?;
+    pairs.retain(|(key, _)| !refused(key));
+    Ok(pairs)
+}
+
 /// What a program Sonny starts sees as `name`: the file's value over this
-/// process's own, as it is applied to them, an empty one unsetting it.
+/// process's own, as it is applied to them, an empty one unsetting it;
+/// this process's own alone for one of Agent's names ([`refused`]).
 pub fn var(name: &str) -> Option<String> {
     let kept = path()
+        .filter(|_| !refused(name))
         .and_then(|file| read(&file).ok())
         .and_then(|pairs| pairs.into_iter().rev().find(|(key, _)| key == name));
     match kept {
@@ -221,6 +244,16 @@ mod tests {
                 .starts_with("env_file_permissions: ")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_s_own_names_are_never_taken_from_the_file() {
+        for name in ["AGENT_PROVIDER", "agent_bin", "Agent_Store"] {
+            assert!(refused(name), "{name}");
+        }
+        for name in ["AGENT", "AGENTS_KEY", "MY_AGENT_KEY", "OPENAI_API_KEY", ""] {
+            assert!(!refused(name), "{name}");
+        }
     }
 
     #[test]

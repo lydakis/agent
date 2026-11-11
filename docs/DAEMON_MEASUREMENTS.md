@@ -8340,3 +8340,28 @@ and the gate warned on no row: every move is inside the runner's spread,
 in both directions (lone submit CPU read +12% on a change that added
 nothing to a submit in the screen before this one). The benches run at
 standard, which is what nearly every call is.
+
+## Daemon start after upgrades, keys from `~/.agent/env`, open-file limit
+
+No turn, store or socket path changes: the store and socket locks wait only
+in a daemon started with `--await-owner` (a replacement), the env file is
+read only by an `agent` that starts a daemon, and `stats` reads its open
+files off the run loop. The one per-command change: a daemon that raised its
+soft open-file limit at start hands each command it runs the limit it found,
+through a `pre_exec` hook, which makes Rust start that command by fork and
+exec rather than posix_spawn. Linux sandboxed commands already start that
+way (bubblewrap's descriptors), so they pay nothing more; unsandboxed ones
+and every macOS command do. Where the limit was not raised (soft already at
+hard, as on CI runners) nothing changes.
+
+Same release binary, 4-CPU Linux container, one turn of 200 `true` shell
+calls in one model response, three alternating rounds, total ms:
+
+| Daemon started with | Round 1 | Round 2 | Round 3 |
+| --- | ---: | ---: | ---: |
+| soft = hard (no hook, posix_spawn) | 152 | 168 | 177 |
+| soft 1024, raised to 20000 (hook, fork) | 221 | 291 | 233 |
+
+About 0.35 ms more per unsandboxed command for a daemon of this size; a
+standalone spawn loop puts fork's extra at 0.6 ms for a 15 MiB process and
+1 ms for 30 MiB, against a command's own start (a shell) of a few ms.

@@ -422,8 +422,13 @@ that may start the daemon (not with `--no-spawn`, and not from inside a bot's
 turn, where `AGENT_BOT_ID` is set, since that turn is one it would wait on):
 it is asked to shut down with a 2-minute grace, so running turns park at their
 next boundary while none starts, or sent SIGTERM when it refuses that request, as daemons
-before 0.6.0 do; once it exits, this `agent`'s daemon starts on the same
-socket and upgrades the store, and the command goes to it. The commands on
+before 0.6.0 do. This `agent`'s daemon starts at once (`serve --await-owner`)
+and waits on the store and socket the older one holds: the kernel hands them
+over the moment it exits, so a daemon anything else starts meanwhile (a
+window of the older build that lost its connection) is refused
+`store_already_owned`, its detail naming the daemon that holds the store
+(`an older daemon (protocol N, pid P) holds this store`). The new daemon
+upgrades the store, and the command goes to it. The commands on
 running bots that never start a daemon where none runs (`ls`, `wait`,
 `follow`, `fork`, `interrupt`) replace an older one the same way, with the
 provider their environment names, when it listens on their store's own socket
@@ -433,6 +438,11 @@ nothing was sent: from inside a bot's turn, with `--no-spawn`, with no provider
 to start a new one, or on a socket that is not the store's own. Sonny
 starts the daemon this way, so opening it after an upgrade replaces the old
 daemon, and it says so first. `stats` starts it as `start` does, so it answers on a fresh install;
+its `files` says how many files the daemon holds open against its limit,
+so a leak (a count that grows while idle) is told from a busy peak. The
+daemon raises its soft limit on open files to the hard one as it starts
+(on macOS, to the most a process may open), as Go's runtime does, and
+each command it runs gets the limit back as the daemon found it;
 `turns`, `rm`, `prune`, `approvals`, and `answer` may restart it only for an
 existing store (`store_not_found` otherwise). These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an
@@ -445,6 +455,13 @@ separated by whitespace), else `provider` in `~/.agent/config.toml` (the
 same), else the providers whose key variable is set; a
 running daemon is not checked against either. With none of them, starting
 fails with `provider_required`.
+A daemon `agent` starts gets the `KEY=VALUE` lines of `~/.agent/env` over
+`agent`'s own environment (an empty value unsets the name), so it has the
+same keys whoever starts it: Sonny, an automation's check, a script or cron.
+The file is read only then, never for a command a running daemon answers.
+As Codex keeps `~/.codex/.env` from setting `CODEX_` names, names starting
+`AGENT_` (any case) are passed over: they are Agent's own settings. A key
+there names its provider as one in the environment would.
 Providers taken from the config file (no `--provider`, no `AGENT_PROVIDER`)
 follow it while the daemon runs (`serve --provider-config`): the kernel
 tells the daemon when the file changes (inotify, kqueue; nothing runs in
