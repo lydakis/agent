@@ -1384,6 +1384,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
             Some(2000),
             Vec::new(),
             None,
+            None,
             done,
         )
         .await
@@ -1442,6 +1443,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
             Some(0),
             Vec::new(),
             None,
+            None,
             done,
         )
         .await
@@ -1463,6 +1465,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
             cwd.clone(),
             None,
             Vec::new(),
+            None,
             None,
             done,
         )
@@ -1497,6 +1500,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
             Some(0),
             Vec::new(),
             None,
+            None,
             done,
         )
         .await
@@ -1529,6 +1533,7 @@ async fn a_terminal_takes_typed_input_and_reports_its_end() {
             cwd.clone(),
             Some(0),
             Vec::new(),
+            None,
             None,
             done,
         )
@@ -1577,6 +1582,7 @@ async fn terminals_hold_a_lasting_permit_and_end_their_whole_session() {
             cwd.clone(),
             Some(1000),
             Vec::new(),
+            None,
             None,
             done,
         );
@@ -1651,6 +1657,7 @@ async fn terminals_hold_a_lasting_permit_and_end_their_whole_session() {
                 cwd.clone(),
                 Some(0),
                 Vec::new(),
+                None,
                 None,
                 done,
             )

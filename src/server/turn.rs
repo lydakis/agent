@@ -4524,6 +4524,7 @@ impl Turn {
                         Some(yield_ms),
                         environment.to_vec(),
                         sandbox,
+                        None,
                         sender,
                     );
                     match self.run_tool(start, None).await? {
@@ -5993,10 +5994,12 @@ impl Lifts {
                             None,
                             environment,
                             sandbox,
+                            Some(cord.clone()),
                             sender,
                         )
                         .await;
-                    // A pull while it opened found no terminal to end.
+                    // A pull after it started, before it was registered,
+                    // found no terminal to end.
                     if cord.pulled() {
                         registry.end_terminal(process);
                     }
