@@ -753,7 +753,12 @@ struct State {
     part: u32,
     /// The words of this part sent as they streamed.
     streamed: String,
-    calls: HashMap<String, (String, Value)>,
+    /// The calls shown running, by turn and call: a later turn may use a
+    /// lifted call's id again.
+    calls: HashMap<(Option<i64>, String), (String, Value)>,
+    /// The calls a message lifted from their turn, which end later, as
+    /// `lifted_ended` says: kept past their turn's end.
+    lifted: HashSet<(Option<i64>, String)>,
     /// Calls put to the person, by call and request, and the lead's
     /// questions, by ask.
     asked: HashSet<String>,
@@ -787,6 +792,14 @@ struct State {
 
 /// How many of the bot's latest replies a client may react to.
 const REPLIES: usize = 64;
+
+impl State {
+    /// A turn's calls are over with it, but for those a message lifted.
+    fn end_calls(&mut self) {
+        let lifted = &self.lifted;
+        self.calls.retain(|call, _| lifted.contains(call));
+    }
+}
 
 struct Bound {
     bot: String,
@@ -891,14 +904,25 @@ impl Session {
             .map_err(|e| e.to_string())?;
         // Calls started before this thread came and not done yet: a task a
         // lead is starting still opens its thread when it is done.
-        let mut started = HashMap::new();
+        let (mut started, mut lifted) = (HashMap::new(), HashSet::new());
         let cursor = live(&mut events, |event| {
-            let call = event["data"]["call_id"].as_str().unwrap_or("").to_owned();
+            let data = &event["data"];
+            let call = (
+                event["turn"].as_i64(),
+                data["call_id"].as_str().unwrap_or("").to_owned(),
+            );
             match event["event"].as_str() {
                 Some("tool_started") => {
-                    started.insert(call, (event["turn"].as_i64(), event["data"].clone()));
+                    started.insert(call, data.clone());
                 }
-                Some("tool_completed") => {
+                Some("call_lifted") if started.contains_key(&call) => {
+                    lifted.insert(call);
+                }
+                Some("tool_completed") if !lifted.contains(&call) => {
+                    started.remove(&call);
+                }
+                Some("lifted_ended") if data["waits_for"] != "answer" => {
+                    lifted.remove(&call);
                     started.remove(&call);
                 }
                 _ => {}
@@ -920,14 +944,15 @@ impl Session {
         );
         let effort = record["effort"].as_str().map(str::to_owned);
         let mut calls = HashMap::new();
-        for (turn, data) in started.into_values() {
-            if running.is_some() && turn == running {
+        for (key, data) in started {
+            if (running.is_some() && key.0 == running) || lifted.contains(&key) {
                 let (call, name, arguments) = started_call(&client, &bot, &data).await;
                 if name != reactions::TOOL && name != plan::TOOL {
-                    calls.insert(call, (name, arguments));
+                    calls.insert((key.0, call), (name, arguments));
                 }
             }
         }
+        lifted.retain(|call| calls.contains_key(call));
         let pinned = t3::Pinned {
             bot: bot.clone(),
             bot_id,
@@ -947,6 +972,7 @@ impl Session {
             }
             state.running = running;
             state.calls = calls;
+            state.lifted = lifted;
             state.cursor = cursor;
             // A task keeps the model its lead gave it, whatever T3 Code
             // picked for the thread it opened.
@@ -995,9 +1021,9 @@ impl Session {
         };
         let handle = tokio::spawn(async move {
             if let Some((client, bot, turn)) = &waiting {
-                if turn.is_some() {
-                    follower.approvals(&agent, client, bot, *turn).await;
-                }
+                // With no turn running too: calls a message lifted wait
+                // past theirs.
+                follower.approvals(&agent, client, bot, *turn).await;
                 if agent.forms.load(Ordering::Relaxed) {
                     follower.questions(&agent, client, bot).await;
                 }
@@ -1608,13 +1634,11 @@ impl Session {
                 {
                     agent.out.answer(&prompt, json!({"stopReason": "end_turn"}));
                 }
-                state.calls.clear();
+                state.end_calls();
             }
             state.running = running;
         }
-        if running.is_some() {
-            self.approvals(agent, &client, &bot, running).await;
-        }
+        self.approvals(agent, &client, &bot, running).await;
         Ok(events)
     }
 
@@ -1638,7 +1662,7 @@ impl Session {
                 if state.running != turn {
                     state.part = 0;
                     state.streamed.clear();
-                    state.calls.clear();
+                    state.end_calls();
                 }
                 state.running = turn;
                 let ours = match &mut state.prompt {
@@ -1742,19 +1766,57 @@ impl Session {
                     );
                     return;
                 }
-                out.update(id, tool_call(&call, &name, &arguments));
-                state.calls.insert(call, (name, arguments));
+                out.update(id, tool_call(&shown_id(turn, &call), &name, &arguments));
+                state.calls.insert((turn, call), (name, arguments));
             }
-            "tool_completed" => {
+            // A call a message lifted goes on in the background: its
+            // turn's answer to it is its handle, and it ends later.
+            "call_lifted" => {
+                let key = (turn, data["call_id"].as_str().unwrap_or("").to_owned());
+                if state.calls.contains_key(&key) {
+                    state.lifted.insert(key);
+                }
+            }
+            "tool_completed" | "lifted_ended" => {
                 let call = data["call_id"].as_str().unwrap_or("").to_owned();
-                state
-                    .asked
-                    .retain(|asked| !asked.starts_with(&format!("{call}#")));
-                let Some((name, arguments)) = state.calls.remove(&call) else {
+                let key = (turn, call.clone());
+                let lifted = event["event"] == "lifted_ended";
+                if !lifted && state.lifted.contains(&key) {
+                    return;
+                }
+                // Its approval is decided: a call of a later turn under the
+                // same id is put to the person afresh.
+                let prompted = asked_key(turn, &call, "");
+                state.asked.retain(|asked| !asked.starts_with(&prompted));
+                match lifted {
+                    // Allowed, one its client answers waits on for that
+                    // answer; any other runs as a background command,
+                    // whose end this thread does not show.
+                    true if data["waits_for"] == "answer" => return,
+                    true if data["outcome"] == "allowed" => {
+                        if state.lifted.remove(&key) {
+                            state.calls.remove(&key);
+                        }
+                        return;
+                    }
+                    true if !state.lifted.remove(&key) => return,
+                    _ => {}
+                }
+                let Some((name, arguments)) = state.calls.remove(&key) else {
                     return;
                 };
+                // The client knows the call by its turn too: a later turn's
+                // call of the same id is another.
+                let shown_call = shown_id(turn, &call);
                 let (mut shown, mut failed) = (String::new(), data["failed"] == true);
-                if let Some(node) = data["node"].as_i64()
+                if lifted {
+                    let result = &data["result"];
+                    shown = (result["answer"].as_str())
+                        .or(result["output"].as_str())
+                        .or(result["detail"].as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                } else if let Some(node) = data["node"].as_i64()
                     && let Some(item) = items(&client, &bot, &[node])
                         .await
                         .into_iter()
@@ -1769,7 +1831,7 @@ impl Session {
                 let status = if failed { "failed" } else { "completed" };
                 out.update(
                     id,
-                    json!({"sessionUpdate": "tool_call_update", "toolCallId": call,
+                    json!({"sessionUpdate": "tool_call_update", "toolCallId": shown_call,
                     "status": status, "content": [text_content(&cut(&shown))]}),
                 );
                 // A question the lead put, taken: put to the person as a
@@ -1782,7 +1844,7 @@ impl Session {
                     && !ask.options.is_empty()
                     && state.asked.insert(ask.id.clone())
                 {
-                    let asked = out.asking("elicitation/create", form(id, &ask, Some(&call)));
+                    let asked = out.asking("elicitation/create", form(id, &ask, Some(&shown_call)));
                     let lead = (bot, state.bound.as_ref().and_then(|b| b.bot_id));
                     let (agent, session) = (agent.clone(), self.id.clone());
                     tokio::spawn(async move { elicit(asked, &agent, &session, lead, &ask).await });
@@ -1802,7 +1864,7 @@ impl Session {
                     let session = lead_session(&task, bot_id, client.store());
                     out.update(
                         id,
-                        json!({"sessionUpdate": "tool_call_update", "toolCallId": call,
+                        json!({"sessionUpdate": "tool_call_update", "toolCallId": shown_call,
                         "_meta": {"task": {"sessionId": session, "title": task,
                         "cwd": record["workspace"]}}}),
                     );
@@ -1835,7 +1897,8 @@ impl Session {
                                     thread: &thread,
                                 };
                                 let session = &session_id;
-                                open_task(&opener, session, &client, &at, &arguments, &call).await;
+                                let call = &shown_call;
+                                open_task(&opener, session, &client, &at, &arguments, call).await;
                             });
                             // The person's prompt waits for its tasks' threads,
                             // not for ever: one still opening opens on its own.
@@ -1881,7 +1944,7 @@ impl Session {
                     return;
                 }
                 state.running = None;
-                state.calls.clear();
+                state.end_calls();
                 let reason = match data["status"].as_str().unwrap_or("") {
                     "interrupted" | "cancelled" => "cancelled",
                     _ => "end_turn",
@@ -1923,9 +1986,10 @@ impl Session {
         }
     }
 
-    /// The calls of `turn` waiting for the person, each put to them once:
-    /// the gate it waits on is the person's (`ask`), or the judge handed
-    /// it over (`auto`).
+    /// The calls of `turn` waiting for the person, and those a message
+    /// lifted past their turn (listed with a handle, as their steps are),
+    /// each put to them once: the gate it waits on is the person's
+    /// (`ask`), or the judge handed it over (`auto`).
     async fn approvals(
         &self,
         agent: &Arc<Agent>,
@@ -1956,13 +2020,14 @@ impl Session {
             }
         }
         for call in &listed {
-            if call["turn"].as_i64() != turn || !for_person(call) {
+            let lifted = call["handle"].is_string();
+            if (call["turn"].as_i64() != turn && !lifted) || !for_person(call) {
                 continue;
             }
-            let key = format!(
-                "{}#{}",
+            let key = asked_key(
+                call["turn"].as_i64(),
                 call["call_id"].as_str().unwrap_or(""),
-                call["request"]
+                &call["request"].to_string(),
             );
             if !self.state.lock().await.asked.insert(key) {
                 continue;
@@ -2317,7 +2382,8 @@ async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Va
             .ok()
             .and_then(|read| agent_client::approver::call_arguments(&read["items"][0]["item"], id)),
     };
-    let mut update = tool_call(id, name, arguments.as_ref().unwrap_or(&Value::Null));
+    let shown = shown_id(call["turn"].as_i64(), id);
+    let mut update = tool_call(&shown, name, arguments.as_ref().unwrap_or(&Value::Null));
     if let Value::Object(fields) = &mut update {
         fields.remove("sessionUpdate");
     }
@@ -2380,7 +2446,7 @@ async fn ask(agent: &Agent, session: &str, client: &Client, bot: &str, call: &Va
     // Not delivered: the call is put to the person again once the thread
     // follows its bot again.
     if !sent {
-        let key = format!("{id}#{}", call["request"]);
+        let key = asked_key(call["turn"].as_i64(), id, &call["request"].to_string());
         session.state.lock().await.asked.remove(&key);
     }
 }
@@ -2696,6 +2762,16 @@ fn words(prompt: &Value) -> (String, Vec<Value>) {
     (text, images)
 }
 
+/// The id a client knows call `call` of `turn` by: a later turn may use
+/// the same call id, so the turn is part of it. The daemon is asked by the
+/// call's own id.
+fn shown_id(turn: Option<i64>, call: &str) -> String {
+    match turn {
+        Some(turn) => format!("{turn}/{call}"),
+        None => call.to_owned(),
+    }
+}
+
 /// The update that shows a call: what it does, in a few words.
 fn tool_call(call: &str, name: &str, arguments: &Value) -> Value {
     let path = arguments["path"].as_str();
@@ -2853,9 +2929,28 @@ async fn whole_arguments(client: &Client, bot: &str, id: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// What marks call `call` of `turn`'s approval request `request` as put
+/// to the person, and, with no request, every request of that call: a
+/// later turn's call of the same id is its own.
+fn asked_key(turn: Option<i64>, call: &str, request: &str) -> String {
+    let turn = turn.map_or(String::new(), |turn| turn.to_string());
+    format!("{turn}/{call}#{request}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_later_turns_call_of_the_same_id_is_asked_afresh() {
+        let older = asked_key(Some(3), "c1", "1");
+        let newer = asked_key(Some(4), "c1", "1");
+        assert_ne!(older, newer);
+        // Ending turn 3's call lets go of its marks alone.
+        assert!(older.starts_with(&asked_key(Some(3), "c1", "")));
+        assert!(!newer.starts_with(&asked_key(Some(3), "c1", "")));
+        assert!(!asked_key(Some(3), "c10", "1").starts_with(&asked_key(Some(3), "c1", "")));
+    }
 
     #[test]
     fn a_model_shows_by_the_name_its_provider_lists() {

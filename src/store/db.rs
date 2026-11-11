@@ -29,6 +29,31 @@ const HISTORY_PAGE_BYTES: usize = 256 * 1024;
 /// steer's: a message's pictures may be 5 MiB once decoded.
 const STEER_BATCH_PICTURE_BYTES: usize = 8 * 1024 * 1024;
 
+/// One bot's calls waiting on a verdict: its running turn's, and those a
+/// message lifted to the background with the steps their clients ask for,
+/// found through the bot's own running commands, never another bot's.
+/// A step carries its lifted call's handle, in the running turn as after.
+const BOT_APPROVALS: &str = "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,
+       COALESCE(a.process,(SELECT n.process FROM answers n WHERE n.turn=a.turn AND n.call_id=a.step_of))
+     FROM bots b JOIN approvals a ON a.turn=b.running_turn
+     WHERE a.id>?1 AND a.id<=?4 AND b.name=?2
+     UNION ALL
+     SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,a.process
+     FROM processes p
+     JOIN approvals a INDEXED BY approvals_lifted ON a.process=p.id
+     JOIN bots b ON b.name=p.bot
+     WHERE p.bot=?2 AND p.status='running' AND a.id>?1 AND a.id<=?4
+       AND a.turn IS NOT b.running_turn
+     UNION ALL
+     SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,n.process
+     FROM processes p
+     JOIN answers n INDEXED BY answers_lifted ON n.process=p.id
+     JOIN approvals a INDEXED BY approvals_steps ON a.turn=n.turn AND a.step_of=n.call_id
+     JOIN bots b ON b.name=p.bot
+     WHERE p.bot=?2 AND p.status='running' AND a.id>?1 AND a.id<=?4
+       AND a.turn IS NOT b.running_turn
+     ORDER BY 1 LIMIT ?3";
+
 /// How a bot's newest turn that counts ended: one that ran, or one that
 /// failed before it started. A message steered into a running turn, one
 /// riding the next call, and one cancelled while it waited in line never
@@ -1183,10 +1208,15 @@ impl Delivery {
 /// index, which holds only what is untold in the whole store, keyed by
 /// bot and id: the first ?2 in order, read where they sit and no further,
 /// never through the bot's history or other bots' commands. Only how each
-/// ended (the fields of `ended_as`), never its output.
+/// ended (the fields of `ended_as`), never a command's output; a lifted
+/// call's output comes as its first page, and one whose result is its
+/// tool's own fields comes as those, without its pictures.
 const UNTOLD: &str = "SELECT p.id,p.result->'$.exit_code',p.result->'$.success',
      p.result->'$.timed_out',p.result->'$.signal',p.result->'$.wall_time_ms',
-     p.result->'$.error',substr(p.result->>'$.detail',1,97)
+     p.result->'$.error',substr(p.result->>'$.detail',1,97),substr(p.result->>'$.answer',1,2049),
+     CASE WHEN p.call IS NOT NULL THEN substr(COALESCE(p.result->>'$.output',
+      CASE WHEN p.result->'$.exit_code' IS NULL AND p.result->'$.error' IS NULL
+       AND p.result->'$.answer' IS NULL THEN json_remove(p.result,'$.parts') END),1,2049) END
      FROM processes p INDEXED BY processes_untold
      WHERE p.bot=?1 AND p.told IS NULL AND p.delivered IS NULL AND p.status<>'running'
      ORDER BY p.id LIMIT ?2";
@@ -1203,7 +1233,7 @@ pub const BACKGROUND_ORIGIN: &str = "background";
 pub const LIMIT_ORIGIN: &str = "limit";
 /// The fields of a result that say how its command ended, in the order
 /// `UNTOLD` reads them.
-const ENDED: [&str; 7] = [
+const ENDED: [&str; 9] = [
     "exit_code",
     "success",
     "timed_out",
@@ -1211,9 +1241,12 @@ const ENDED: [&str; 7] = [
     "wall_time_ms",
     "error",
     "detail",
+    "answer",
+    "output",
 ];
 /// How a background command ended, as its bot is told: its result without
-/// the output, which a `wait` on its handle reads.
+/// the output, which a `wait` on its handle reads. A call a message lifted
+/// had its result awaited in its turn, so the first page of it comes too.
 fn ended_as(result: &Value) -> Value {
     let mut ended = serde_json::Map::new();
     for key in ENDED {
@@ -1221,16 +1254,19 @@ fn ended_as(result: &Value) -> Value {
             ended.insert(key.to_owned(), value.clone());
         }
     }
-    // Why it failed, in a line: the rest is the handle's.
-    if let Some(Value::String(detail)) = ended.get_mut("detail")
-        && detail.len() > 96
-    {
-        let cut = (0..=96)
-            .rev()
-            .find(|&i| detail.is_char_boundary(i))
-            .unwrap_or(0);
-        detail.truncate(cut);
-        detail.push('…');
+    // Why it failed, in a line, and a lifted call's answer or output, up
+    // to a page: the rest is the handle's.
+    for (key, most) in [("detail", 96), ("answer", 2048), ("output", 2048)] {
+        if let Some(Value::String(text)) = ended.get_mut(key)
+            && text.len() > most
+        {
+            let cut = (0..=most)
+                .rev()
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(0);
+            text.truncate(cut);
+            text.push('…');
+        }
     }
     Value::Object(ended)
 }
@@ -1529,6 +1565,9 @@ struct Request {
     /// The answered call this is a step of, put to its gates by the
     /// call's client: decided apart from the turn, which never waits on it.
     step_of: Option<String>,
+    /// The background command a message lifted the call to: it waits on
+    /// past its turn, and its verdict goes to that command.
+    process: Option<i64>,
 }
 impl Request {
     /// Who decided the call in the audit trail: whoever denied it, else a
@@ -1693,6 +1732,9 @@ pub struct Stepped {
     pub step: Step,
     pub notify: Option<Arc<Notify>>,
     pub wake: bool,
+    /// The background command of the lifted call whose time runs again
+    /// now that its step is decided: its caller checks it.
+    pub lifted: Option<i64>,
 }
 /// What an answered call has, read on the storage worker.
 pub enum CallAnswer {
@@ -1705,6 +1747,36 @@ pub enum CallAnswer {
         notify: Arc<Notify>,
         expires_ms: Option<u64>,
     },
+}
+/// What a call a message lifted comes to, as [`Database::lifted_check`]
+/// finds it.
+pub enum Lifted {
+    /// Still waiting on its verdict or answer, until its time runs out at
+    /// `Some(at)`.
+    Waiting(Option<u64>),
+    /// Ended: its result is its command's, and `ready` when the turn that
+    /// tells its bot is ready for a slot.
+    Ended { result: Value, ready: bool },
+    /// Every gate allowed it: the caller runs it as its command.
+    Run(Box<LiftedRun>),
+    /// Nothing waits on it any more.
+    Gone,
+}
+/// A lifted call its gates allowed, with what running it needs: its bot
+/// as it is now, and its turn's folder, model and effort: the turn's own,
+/// else the bot's as that turn ran, kept when the bot's changed since.
+pub struct LiftedRun {
+    pub process: i64,
+    pub turn: i64,
+    pub call: ToolCall,
+    pub bot: Bot,
+    pub workspace: Option<String>,
+    pub model: String,
+    pub effort: Option<String>,
+    /// What the command rules made of it as its round was announced.
+    pub ruling: Option<String>,
+    /// Whether it runs in its bot's sandbox.
+    pub confined: bool,
 }
 /// A gate's decision on a call, from a client's `answer`.
 pub struct Decision<'a> {
@@ -1727,6 +1799,9 @@ pub struct Answered {
     pub reply: Value,
     pub notify: Option<Arc<Notify>>,
     pub resume: bool,
+    /// The background command of a call a message lifted that this may
+    /// have decided or answered: its caller checks it.
+    pub lifted: Option<i64>,
 }
 /// The fields of a stored item that say which calls it plans, in either
 /// encoding: a Responses `function_call` or `custom_tool_call`, or an Anthropic message's
@@ -2416,7 +2491,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 90;
+    pub const SCHEMA: i32 = 91;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2661,7 +2736,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, name TEXT NOT NULL, node INTEGER NOT NULL, request INTEGER NOT NULL,
                 announced_ms INTEGER NOT NULL, gates TEXT NOT NULL, verdicts TEXT, arguments TEXT NOT NULL, asked TEXT,
-                step_of TEXT);
+                step_of TEXT, process INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS approvals_call ON approvals(turn,call_id);
             CREATE INDEX IF NOT EXISTS approvals_steps ON approvals(turn,step_of) WHERE step_of IS NOT NULL;
             CREATE TABLE IF NOT EXISTS approval_tags(approval INTEGER NOT NULL REFERENCES approvals(id) ON DELETE CASCADE,
@@ -2670,12 +2745,13 @@ impl Database {
             CREATE TABLE IF NOT EXISTS answers(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, tag TEXT NOT NULL, name TEXT NOT NULL, arguments TEXT NOT NULL,
                 expires_ms INTEGER NOT NULL, output TEXT, failed INTEGER NOT NULL DEFAULT 0, paused_ms INTEGER,
-                parts TEXT, taken_ms INTEGER);
+                parts TEXT, taken_ms INTEGER, process INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS answers_call ON answers(turn,call_id);
             CREATE INDEX IF NOT EXISTS answers_waiting ON answers(tag,id) WHERE output IS NULL;
             CREATE INDEX IF NOT EXISTS answers_paused ON answers(turn) WHERE paused_ms IS NOT NULL;
             CREATE TABLE IF NOT EXISTS processes(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
-                call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER, told INTEGER, bot TEXT);
+                call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER, told INTEGER, bot TEXT,
+                call TEXT);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
             CREATE INDEX IF NOT EXISTS processes_untold ON processes(bot,id)
                 WHERE told IS NULL AND delivered IS NULL AND status<>'running';
@@ -2702,6 +2778,9 @@ impl Database {
             CREATE INDEX IF NOT EXISTS turns_ready ON turns(id) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS turns_ready_bot ON turns(bot) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
+            CREATE INDEX IF NOT EXISTS approvals_lifted ON approvals(process) WHERE process IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS processes_bot_running ON processes(bot,id) WHERE status='running';
+            CREATE INDEX IF NOT EXISTS answers_lifted ON answers(process) WHERE process IS NOT NULL;
             CREATE INDEX IF NOT EXISTS bots_deleting ON bots(name) WHERE status='deleting';
             CREATE INDEX IF NOT EXISTS bots_running ON bots(name) WHERE running_turn IS NOT NULL;
             CREATE INDEX IF NOT EXISTS bots_maker ON bots(created_by_id, name) WHERE created_by_id IS NOT NULL;
@@ -2711,9 +2790,13 @@ impl Database {
         }
         tx.commit()?;
         // Background command ownership is lost across daemon restart. This
-        // does not prove the OS process stopped; never reuse its handle.
+        // does not prove the OS process stopped; never reuse its handle. A
+        // call a message lifted, still waiting on its verdict or answer, is
+        // a row and nothing running: it waits on.
         conn.execute(
-            "UPDATE processes SET status='lost',result=? WHERE status='running'",
+            "UPDATE processes SET status='lost',result=? WHERE status='running'
+             AND id NOT IN (SELECT process FROM approvals INDEXED BY approvals_lifted WHERE process IS NOT NULL)
+             AND id NOT IN (SELECT process FROM answers INDEXED BY answers_lifted WHERE process IS NOT NULL)",
             [json!({"error":"process_lost"}).to_string()],
         )?;
         // A step lives only as long as the `approve_step` waiting on it,
@@ -3039,17 +3122,17 @@ impl Database {
             .unwrap_or(false))
     }
 
-    /// The bot's turn parked on a `wait` while a steer waits for it, with
-    /// the newest queued steer: the steer wakes it, and its handles are
-    /// reported pending. A verdict or a closed pool is not the bot's own
-    /// wait, so neither is woken.
+    /// The bot's turn parked on a wait of its own while a steer waits for
+    /// it, with the newest queued steer: the steer wakes it. A `wait`'s
+    /// handles are reported pending; a call waiting on its verdict or its
+    /// client's answer is lifted to the background. The daemon's load gate
+    /// or a closed pool is not the bot's own wait, so neither is woken.
     pub fn steered_park(&self, name: &str) -> Result<Option<(i64, i64)>> {
         let parked: Option<i64> = self
             .conn
             .prepare_cached(
                 "SELECT t.id FROM bots b JOIN turns t ON t.id=b.running_turn
                  WHERE b.name=? AND b.status='waiting' AND t.status='waiting'
-                 AND json_extract(t.waiting,'$.approval') IS NOT 1
                  AND json_extract(t.waiting,'$.load') IS NOT 1
                  AND json_extract(t.waiting,'$.paced_since_ms') IS NULL",
             )?
@@ -7552,6 +7635,7 @@ impl Database {
                     verdicts: Vec::new(),
                     asked: Vec::new(),
                     step_of: None,
+                    process: None,
                 };
                 judged.push(pending_call(
                     &bot.name,
@@ -8038,21 +8122,25 @@ impl Database {
         let row = self
             .conn
             .prepare_cached(
-                "SELECT id,request,announced_ms,gates,verdicts,asked,step_of FROM approvals WHERE turn=? AND call_id=?",
+                "SELECT id,request,announced_ms,gates,verdicts,asked,step_of,process FROM approvals WHERE turn=? AND call_id=?",
             )?
             .query_row(params![turn, call_id], |r| {
                 Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, String>(3)?,
+                    (
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                    ),
                     r.get::<_, Option<String>>(4)?,
                     r.get::<_, Option<String>>(5)?,
                     r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
                 ))
             })
             .optional()?;
-        let Some((id, request, announced_ms, gates, verdicts, asked, step_of)) = row else {
+        let Some(((id, request, announced_ms, gates), verdicts, asked, step_of, process)) = row
+        else {
             return Ok(None);
         };
         let mut request = Request {
@@ -8069,6 +8157,7 @@ impl Database {
                 .transpose()?
                 .unwrap_or_default(),
             step_of,
+            process,
         };
         if let Some(held) = self
             .live
@@ -8566,18 +8655,19 @@ impl Database {
         let Some((_, status)) = owner.filter(|(owner, _)| owner == bot) else {
             return fail("turn_not_found");
         };
-        let call: Option<(bool, Option<String>, i64, bool)> = self
+        type Call = (bool, Option<String>, i64, bool, Option<i64>);
+        let call: Option<Call> = self
             .conn
             .prepare_cached(
-                "SELECT a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL FROM answers a
-                 LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
+                "SELECT a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL,a.process
+                 FROM answers a LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
                  WHERE a.turn=? AND a.call_id=?",
             )?
             .query_row(params![turn, call_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })
             .optional()?;
-        let Some((stored, tool, expires_ms, paused)) = call else {
+        let Some((stored, tool, expires_ms, paused, process)) = call else {
             if !matches!(status.as_str(), "running" | "waiting") {
                 return Err(Error::with(
                     "stale_turn",
@@ -8593,7 +8683,8 @@ impl Database {
         if stored || held {
             return fail("call_already_answered");
         }
-        if tool.as_deref() != Some("executing") {
+        // A call a message lifted is answered with its handle, and waits on.
+        if tool.as_deref() != Some("executing") && process.is_none() {
             return fail_with("no_pending_call", "the call ended unanswered");
         }
         // Out of time is unserved, whenever the turn gets to say so. A step
@@ -8606,6 +8697,27 @@ impl Database {
             self.end_steps(turn, call_id)?;
         }
         let reply = json!({"bot":bot,"turn":turn,"call_id":call_id});
+        // A lifted call's answer is its command's, which the caller's check
+        // records.
+        if process.is_some() {
+            self.conn
+                .prepare_cached(
+                    "UPDATE answers SET output=?,failed=?,parts=? WHERE turn=? AND call_id=?",
+                )?
+                .execute(params![
+                    outcome.output,
+                    outcome.failed,
+                    stored_parts(&outcome.parts)?,
+                    turn,
+                    call_id
+                ])?;
+            return Ok(Answered {
+                reply,
+                notify: None,
+                resume: false,
+                lifted: process,
+            });
+        }
         match status.as_str() {
             "running" => {
                 self.keep_live(turn);
@@ -8615,6 +8727,7 @@ impl Database {
                     reply,
                     notify: Some(live.notify.clone()),
                     resume: false,
+                    lifted: None,
                 })
             }
             "waiting" => {
@@ -8636,6 +8749,7 @@ impl Database {
                     reply,
                     notify: None,
                     resume,
+                    lifted: None,
                 })
             }
             _ => Err(Error::with(
@@ -8669,26 +8783,34 @@ impl Database {
         facts: audit::Facts,
         now_ms: u64,
     ) -> Result<Stepped> {
-        self.step_turn(name, turn)?;
-        let bot = self.active(turn)?;
-        let call: Option<(String, bool, Option<String>, i64, bool)> = self
+        self.step_turn(name, turn, Some(call_id))?;
+        let bot = self.call_bot(turn, call_id)?;
+        let call: Option<(String, bool, Option<String>, i64, bool, bool)> = self
             .conn
             .prepare_cached(
-                "SELECT a.name,a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL
+                "SELECT a.name,a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL,
+                    a.process IS NOT NULL
                  FROM answers a LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
                  WHERE a.turn=? AND a.call_id=?",
             )?
             .query_row(params![turn, call_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })
             .optional()?;
-        let Some((parent, answered, status, expires_ms, paused)) = call else {
+        let Some((parent, answered, status, expires_ms, paused, lifted)) = call else {
             return fail("no_pending_call");
         };
         if answered {
             return fail("call_already_answered");
         }
-        if status.as_deref() != Some("executing") {
+        if status.as_deref() != Some("executing") && !lifted {
             return fail_with("no_pending_call", "the call ended unanswered");
         }
         if !paused && now_ms >= expires_ms.max(0) as u64 {
@@ -8731,6 +8853,7 @@ impl Database {
                 step: Step::Decided(json!({"call_id":id,"decision":"allow","approvals":[]})),
                 notify: None,
                 wake: false,
+                lifted: None,
             });
         }
         // Whole: a step's arguments are bounded when asked, and it has no
@@ -8771,6 +8894,7 @@ impl Database {
             verdicts: Vec::new(),
             asked: Vec::new(),
             step_of: Some(call_id.to_owned()),
+            process: None,
         };
         let expires_ms = request.expires_ms();
         let judged = pending_call(
@@ -8794,6 +8918,7 @@ impl Database {
             },
             notify: None,
             wake: false,
+            lifted: None,
         })
     }
     /// Where an announced step stands: decided once every gate allowed it,
@@ -8814,7 +8939,7 @@ impl Database {
         now_ms: u64,
         held: bool,
     ) -> Result<Stepped> {
-        self.step_turn(name, turn)?;
+        self.step_turn(name, turn, step_parent(id))?;
         let Some(request) = self.request(turn, id)? else {
             return fail("no_pending_step");
         };
@@ -8843,6 +8968,7 @@ impl Database {
                     },
                     notify: None,
                     wake: false,
+                    lifted: None,
                 });
             }
             (true, None, request.approvals(), None, false)
@@ -8874,9 +9000,10 @@ impl Database {
                 },
                 notify: None,
                 wake: false,
+                lifted: None,
             });
         };
-        let mut bot = self.active(turn)?;
+        let mut bot = self.call_bot(turn, step_parent(id).unwrap_or(id))?;
         let tx = self.conn.savepoint()?;
         let tags: Vec<&str> = request.gates.iter().map(|g| g.tag.as_str()).collect();
         match (&counted, allow) {
@@ -8912,7 +9039,7 @@ impl Database {
             allow,
         )?;
         tx.commit()?;
-        Ok(self.stepped(&bot, turn, &request, resumed, data))
+        self.stepped(&bot, turn, &request, resumed, data)
     }
     /// Drop a step its client stopped waiting for: it is denied as never
     /// reviewed, so it counts toward no breaker.
@@ -8923,11 +9050,11 @@ impl Database {
         id: &str,
         now_ms: u64,
     ) -> Result<Stepped> {
-        self.step_turn(name, turn)?;
+        self.step_turn(name, turn, step_parent(id))?;
         let Some(request) = self.request(turn, id)? else {
             return fail("no_pending_step");
         };
-        let bot = self.active(turn)?;
+        let bot = self.call_bot(turn, step_parent(id).unwrap_or(id))?;
         let data = json!({"call_id":id,"decision":"deny","reason":"its client stopped waiting",
             "approvals":request.approvals()});
         let tx = self.conn.savepoint()?;
@@ -8942,7 +9069,7 @@ impl Database {
             false,
         )?;
         tx.commit()?;
-        Ok(self.stepped(&bot, turn, &request, resumed, data))
+        self.stepped(&bot, turn, &request, resumed, data)
     }
     /// Record how a step its gates allowed ended once its client ran it,
     /// so a judge of a later call sees it among the turn's calls as done.
@@ -8955,7 +9082,7 @@ impl Database {
         step: &str,
         failed: bool,
     ) -> Result<Value> {
-        self.step_turn(name, turn)?;
+        self.step_turn(name, turn, Some(call_id))?;
         let id = format!("{call_id}/{step}");
         // The step's row in the audit trail, written after its call's own:
         // read from the newest back to that.
@@ -9044,7 +9171,8 @@ impl Database {
     }
     /// The bot's turn a step names, while a call of it can still be
     /// answered.
-    fn step_turn(&self, name: &str, turn: i64) -> Result<()> {
+    /// A call a message lifted, `call_id`, can be answered past its turn.
+    fn step_turn(&self, name: &str, turn: i64, call_id: Option<&str>) -> Result<()> {
         let status: Option<String> = self
             .conn
             .query_row(
@@ -9056,6 +9184,7 @@ impl Database {
         match status {
             None => fail("turn_not_found"),
             Some(status) if matches!(status.as_str(), "running" | "waiting" | "paced") => Ok(()),
+            Some(_) if call_id.map_or(Ok(false), |call| self.lifted_call(turn, call))? => Ok(()),
             Some(status) => Err(
                 Error::with("stale_turn", format!("turn {turn} is {status}"))
                     .facts(json!({"status":status})),
@@ -9072,27 +9201,46 @@ impl Database {
         request: &Request,
         resumed: bool,
         decided: Value,
-    ) -> Stepped {
+    ) -> Result<Stepped> {
         self.approvals -= 1;
         self.unstep(request.id, false);
-        let status = bot.status.as_str();
-        Stepped {
+        // A call a message lifted waits on as its command, not its turn.
+        let lifted: Option<i64> = match &request.step_of {
+            Some(parent) => self
+                .conn
+                .prepare_cached(
+                    "SELECT process FROM answers WHERE turn=? AND call_id=? AND process IS NOT NULL",
+                )?
+                .query_row(params![turn, parent], |r| r.get(0))
+                .optional()?,
+            None => None,
+        };
+        let status = match lifted {
+            Some(_) => "lifted",
+            None => bot.status.as_str(),
+        };
+        Ok(Stepped {
             step: Step::Decided(decided),
             notify: (resumed && status == "running")
                 .then(|| self.live.entry(turn).or_default().notify.clone()),
             wake: resumed && status == "waiting",
-        }
+            lifted: lifted.filter(|_| resumed),
+        })
     }
     /// End every step still waiting for a call being answered: each one is
     /// denied, and its `approve_step` woken to say so. The call's time
     /// needs no restart, since the call is done.
     fn end_steps(&mut self, turn: i64, call_id: &str) -> Result<()> {
+        let bot = self.call_bot(turn, call_id)?;
+        self.end_steps_of(&bot, turn, call_id, "the call was answered first")
+    }
+    /// [`Database::end_steps`] for `bot`'s call, denied for `reason`.
+    fn end_steps_of(&mut self, bot: &Bot, turn: i64, call_id: &str, reason: &str) -> Result<()> {
         let ids: Vec<(i64, String)> = self
             .conn
             .prepare_cached("SELECT id,call_id FROM approvals WHERE turn=? AND step_of=?")?
             .query_map(params![turn, call_id], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        let bot = self.active(turn)?;
         let tx = self.conn.savepoint()?;
         let now_ms = epoch_ms().max(0) as u64;
         for (approval, id) in &ids {
@@ -9104,7 +9252,7 @@ impl Database {
                 .query_row([approval], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             audit_step(
                 &tx,
-                &bot,
+                bot,
                 turn,
                 call_id,
                 id,
@@ -9116,7 +9264,7 @@ impl Database {
                 now_ms,
             )?;
             let data = json!({"call_id":id,"step_of":call_id,"name":name,"decision":"deny",
-                "reason":"the call was answered first","approvals":[]});
+                "reason":reason,"approvals":[]});
             event(&tx, &bot.name, Some(turn), "step_decided", data)?;
         }
         tx.prepare_cached("UPDATE answers SET paused_ms=NULL WHERE turn=? AND call_id=?")?
@@ -9142,20 +9290,29 @@ impl Database {
         let Some((_, status)) = owner.filter(|(owner, _)| owner == bot) else {
             return fail("turn_not_found");
         };
-        // Answered, its tool's status, when it expires, paused, when taken.
-        type Waiting = (bool, Option<String>, i64, bool, Option<i64>);
+        // Answered, its tool's status, when it expires, paused, when taken,
+        // and whether a message lifted it.
+        type Waiting = (bool, Option<String>, i64, bool, Option<i64>, bool);
         let call: Option<Waiting> = self
             .conn
             .prepare_cached(
-                "SELECT a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL,a.taken_ms
+                "SELECT a.output IS NOT NULL,t.status,a.expires_ms,a.paused_ms IS NOT NULL,a.taken_ms,
+                    a.process IS NOT NULL
                  FROM answers a LEFT JOIN tools t ON t.turn=a.turn AND t.call_id=a.call_id
                  WHERE a.turn=? AND a.call_id=?",
             )?
             .query_row(params![turn, call_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })
             .optional()?;
-        let Some((stored, tool, expires_ms, paused, taken_ms)) = call else {
+        let Some((stored, tool, expires_ms, paused, taken_ms, lifted)) = call else {
             if !matches!(status.as_str(), "running" | "waiting") {
                 return Err(Error::with(
                     "stale_turn",
@@ -9171,7 +9328,7 @@ impl Database {
         if stored || held {
             return fail("call_already_answered");
         }
-        if tool.as_deref() != Some("executing") {
+        if tool.as_deref() != Some("executing") && !lifted {
             return fail_with("no_pending_call", "the call ended unanswered");
         }
         if !paused && now_ms >= expires_ms.max(0) as u64 {
@@ -9197,10 +9354,11 @@ impl Database {
             return fail_with("invalid_page", "limit must be 1 to 256 and after 0 or more");
         }
         let mut statement = self.conn.prepare_cached(
-            "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.arguments,a.expires_ms,a.taken_ms FROM answers a
+            "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.arguments,a.expires_ms,a.taken_ms,a.process FROM answers a
              JOIN turns t ON t.id=a.turn JOIN tools l ON l.turn=a.turn AND l.call_id=a.call_id
-             WHERE a.tag=? AND a.id>? AND a.output IS NULL AND l.status='executing'
-               AND t.status IN ('running','waiting') ORDER BY a.id LIMIT ?",
+             WHERE a.tag=? AND a.id>? AND a.output IS NULL
+               AND (a.process IS NOT NULL OR (l.status='executing' AND t.status IN ('running','waiting')))
+             ORDER BY a.id LIMIT ?",
         )?;
         let mut listed = Vec::new();
         let (mut bytes, mut last, mut more, mut scanned) = (0, after, false, 0);
@@ -9218,10 +9376,14 @@ impl Database {
                 continue;
             }
             let arguments: String = r.get(5)?;
-            let entry = json!({"bot":r.get::<_, String>(1)?,"turn":turn,"call_id":call_id,
+            let mut entry = json!({"bot":r.get::<_, String>(1)?,"turn":turn,"call_id":call_id,
                 "name":r.get::<_, String>(4)?,
                 "arguments":serde_json::from_str::<Value>(&arguments).unwrap_or(Value::Null),
                 "expires_ms":r.get::<_, i64>(6)?,"taken_ms":r.get::<_, Option<i64>>(7)?});
+            // One a message lifted waits on past its turn, as its handle.
+            if let Some(process) = r.get::<_, Option<i64>>(8)? {
+                entry["handle"] = format!("proc:{process}").into();
+            }
             let size = crate::output::encoded_len(&entry)? + 1;
             if listed.len() == limit || (!listed.is_empty() && bytes + size > 256 * 1024) {
                 more = true;
@@ -9251,13 +9413,32 @@ impl Database {
         let Some((_, status)) = owner.filter(|(owner, _)| owner == answer.bot) else {
             return fail("turn_not_found");
         };
-        if !matches!(status.as_str(), "running" | "waiting" | "paced") {
+        // A call a message lifted waits on past its turn, and so do the
+        // steps its client asks for.
+        let request = self.request(answer.turn, answer.call_id)?;
+        let lifted = |request: &Request| -> Result<bool> {
+            if request.process.is_some() {
+                return Ok(true);
+            }
+            let Some(of) = &request.step_of else {
+                return Ok(false);
+            };
+            Ok(self
+                .conn
+                .prepare_cached(
+                    "SELECT 1 FROM answers WHERE turn=? AND call_id=? AND process IS NOT NULL",
+                )?
+                .exists(params![answer.turn, of])?)
+        };
+        if !matches!(status.as_str(), "running" | "waiting" | "paced")
+            && !request.as_ref().map(lifted).transpose()?.unwrap_or(false)
+        {
             return Err(
                 Error::with("stale_turn", format!("turn {} is {status}", answer.turn))
                     .facts(json!({"status":status})),
             );
         }
-        let Some(request) = self.request(answer.turn, answer.call_id)? else {
+        let Some(request) = request else {
             return fail("no_pending_approval");
         };
         if answer.request < request.request {
@@ -9343,7 +9524,7 @@ impl Database {
             Some(answer.turn),
             "approval_asked",
             json!({"call_id":answer.call_id,"request":request.request,"tag":tag,
-                "reason":asked.reason,"by":asked.by}),
+                "reason":asked.reason,"by":asked.by,"step_of":request.step_of}),
         )?;
         tx.commit()?;
         Ok(Answered {
@@ -9351,6 +9532,7 @@ impl Database {
                 "request":request.request,"tag":tag,"decision":"ask","pending":[tag]}),
             notify: None,
             resume: false,
+            lifted: None,
         })
     }
     /// Record one gate's verdict on the current request of a planned call.
@@ -9395,9 +9577,10 @@ impl Database {
                 reply,
                 notify: None,
                 resume: false,
+                lifted: None,
             });
         }
-        if status == "running" {
+        if status == "running" && request.process.is_none() {
             self.keep_live(answer.turn);
             let live = self.live.entry(answer.turn).or_default();
             let tags = live.answered.entry(request.id).or_default();
@@ -9415,6 +9598,7 @@ impl Database {
                 reply,
                 notify: Some(live.notify.clone()),
                 resume: false,
+                lifted: None,
             });
         }
         let tx = self.conn.savepoint()?;
@@ -9426,6 +9610,7 @@ impl Database {
         untag_answered(&tx, request.id, std::slice::from_ref(&verdict))?;
         tx.commit()?;
         let resume = status == "waiting"
+            && request.process.is_none()
             && request.decided()
             && self
                 .waiting(answer.turn)?
@@ -9434,6 +9619,7 @@ impl Database {
             reply,
             notify: None,
             resume,
+            lifted: request.process.filter(|_| request.decided()),
         })
     }
     /// Planned calls still waiting on a gate, in announcement order, each
@@ -9476,7 +9662,8 @@ impl Database {
                     "SELECT approval,turn FROM approval_tags WHERE tag=?1 AND approval>?2 AND approval<=?3 ORDER BY approval",
                 )?;
                 let mut call = self.conn.prepare_cached(
-                    "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of
+                    "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,
+                       COALESCE(a.process,(SELECT n.process FROM answers n WHERE n.turn=a.turn AND n.call_id=a.step_of))
                      FROM approvals a JOIN turns t ON t.id=a.turn JOIN bots b ON b.name=t.bot WHERE a.id=?",
                 )?;
                 let mut rows = ids.query(params![tag, after, through])?;
@@ -9502,17 +9689,17 @@ impl Database {
                     }
                 }
             }
-            // Only a bot's running turn has calls waiting, so one bot's
-            // listing starts from that turn instead of scanning every bot's.
+            // Only a bot's running turn and the calls a message lifted to
+            // the background (with the steps their clients ask for, listed
+            // under their call's handle) have calls waiting, so one bot's
+            // listing reads those, through its own running commands,
+            // instead of scanning every bot's.
             _ => {
                 let mut statement = match bot {
-                    Some(_) => self.conn.prepare_cached(
-                        "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of
-                         FROM bots b JOIN approvals a ON a.turn=b.running_turn
-                         WHERE a.id>?1 AND a.id<=?4 AND b.name=?2 ORDER BY a.id LIMIT ?3",
-                    )?,
+                    Some(_) => self.conn.prepare_cached(BOT_APPROVALS)?,
                     None => self.conn.prepare_cached(
-                        "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of
+                        "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials,a.asked,a.step_of,
+                                COALESCE(a.process,(SELECT n.process FROM answers n WHERE n.turn=a.turn AND n.call_id=a.step_of))
                          FROM approvals a JOIN turns t ON t.id=a.turn JOIN bots b ON b.name=t.bot
                          WHERE a.id>?1 AND a.id<=?4 ORDER BY a.id LIMIT ?3",
                     )?,
@@ -9551,6 +9738,7 @@ impl Database {
                 .transpose()?
                 .unwrap_or_default(),
             step_of: r.get(13)?,
+            process: r.get(14)?,
         };
         if let Some(held) = self
             .live
@@ -10366,16 +10554,29 @@ impl Database {
                 params![waiting.paced_elapsed_ms(), turn],
             )?;
         }
+        // A call a message lifted waits on past its turn, as its background
+        // command, with the steps its client asks about.
+        let lifted: Vec<i64> = tx
+            .prepare_cached(
+                "SELECT a.id FROM approvals a WHERE a.turn=?1 AND a.step_of IN
+                 (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL)",
+            )?
+            .query_map([turn], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         let unstarted = match bot.gates.is_empty() {
             true => 0,
-            false => tx.execute("DELETE FROM approvals WHERE turn=?", [turn])? as i64,
+            false => tx.execute(
+                "DELETE FROM approvals WHERE turn=?1 AND process IS NULL AND (step_of IS NULL
+                 OR step_of NOT IN (SELECT call_id FROM answers WHERE turn=?1 AND process IS NOT NULL))",
+                [turn],
+            )? as i64,
         };
         // Each step still waiting is gone with its turn: its `approve_step`
         // is told to find so.
         let ended: Vec<i64> = self
             .steps
             .iter()
-            .filter(|(_, of)| **of == turn)
+            .filter(|(id, of)| **of == turn && !lifted.contains(id))
             .map(|(id, _)| *id)
             .collect();
         // As `unstep` does, with the turn's savepoint open.
@@ -10385,7 +10586,10 @@ impl Database {
             self.stepped.push(id);
         }
         if bot.declared.iter().any(|tool| tool.answered_by.is_some()) {
-            tx.execute("DELETE FROM answers WHERE turn=?", [turn])?;
+            tx.execute(
+                "DELETE FROM answers WHERE turn=? AND process IS NULL",
+                [turn],
+            )?;
         }
         // Interrupted, by cause: a client's interrupt, the daemon shutting
         // down or paused around the turn, a daemon that died with it
@@ -11047,6 +11251,15 @@ impl Database {
             .query_row(params![name, turn], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
         let now = epoch_ms().max(0) as u64;
+        // A message that joins the turn lifts the call it waits on, as it
+        // lifts a `wait`: the turn resumes to take it.
+        if parked
+            .as_ref()
+            .is_some_and(|(_, status, _)| status == "waiting")
+            && self.joining_steer(name)?
+        {
+            return Ok(Wake::Resume);
+        }
         // Parked on an answer: the answer, its deadline, or a later gated
         // call's lapse resumes it.
         if let Some((_, _, Some(call_id))) = parked {
@@ -11084,8 +11297,11 @@ impl Database {
             .optional()?;
         Ok(match parked {
             None => Wake::Stale,
-            // Parked on a verdict: an answer that decided the call, or the
-            // round's first lapse, resumes it.
+            // Parked on a verdict: an answer that decided the call, the
+            // round's first lapse, or a message joining it resumes it.
+            Some((Some(true), status)) if status == "waiting" && self.joining_steer(name)? => {
+                Wake::Resume
+            }
             Some((Some(true), _)) => {
                 let Some(waiting) = self.waiting(turn)? else {
                     return Ok(Wake::Resume);
@@ -11115,7 +11331,7 @@ impl Database {
         // lapses, so its row is not decoded.
         let mut statement = self.conn.prepare_cached(
             "SELECT turn,call_id,request,announced_ms,gates,verdicts,id FROM approvals
-             WHERE turn=? AND step_of IS NULL AND instr(gates,'\"expire_ms\"')>0",
+             WHERE turn=? AND step_of IS NULL AND process IS NULL AND instr(gates,'\"expire_ms\"')>0",
         )?;
         let mut rows = statement.query([turn])?;
         let mut lapse: Option<u64> = None;
@@ -11132,7 +11348,8 @@ impl Database {
         let mut statement = self.conn.prepare_cached(
             "SELECT a.turn,a.call_id,a.request,a.announced_ms,a.gates,a.verdicts,a.id
              FROM turns t JOIN approvals a ON a.turn=t.id
-             WHERE t.status='waiting' AND a.step_of IS NULL AND instr(a.gates,'\"expire_ms\"')>0",
+             WHERE t.status='waiting' AND a.step_of IS NULL AND a.process IS NULL
+               AND instr(a.gates,'\"expire_ms\"')>0",
         )?;
         let mut rows = statement.query([])?;
         let mut lapses = HashMap::new();
@@ -11163,6 +11380,7 @@ impl Database {
                 .unwrap_or_default(),
             asked: Vec::new(),
             step_of: None,
+            process: None,
         };
         if let Some(held) = self
             .live
@@ -11324,26 +11542,35 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
     /// The outcome and its overflow become visible in one transaction.
+    /// `failed` is whoever ran it saying the call failed, never read back
+    /// from the result's fields.
     pub fn process_finish(
         &mut self,
         id: i64,
         result: &Value,
+        failed: bool,
         artifacts: &[(&str, Vec<u8>)],
         files: &[(&str, String)],
     ) -> Result<()> {
         let tx = self.conn.savepoint()?;
-        if tx.execute(
-            "UPDATE processes SET status='finished',result=? WHERE id=? AND status='running'",
-            params![result.to_string(), id],
-        )? != 1
-        {
+        let ended: Option<(i64, String, bool)> = tx
+            .prepare_cached(
+                "UPDATE processes SET status='finished',result=? WHERE id=? AND status='running'
+                 RETURNING turn,call_id,call IS NOT NULL",
+            )?
+            .query_row(params![result.to_string(), id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        let Some((turn, call_id, lifted)) = ended else {
             return fail("invalid_process_state");
+        };
+        // A call a message lifted ran as this command: its row in the
+        // audit trail ends with it.
+        if lifted {
+            lifted_audit(&tx, turn, &call_id, failed)?;
         }
         if !artifacts.is_empty() || !files.is_empty() {
-            let (turn, call_id): (i64, String) =
-                tx.query_row("SELECT turn,call_id FROM processes WHERE id=?", [id], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })?;
             for (stream, data) in artifacts {
                 artifact::put(&tx, turn, &call_id, stream, data)?;
             }
@@ -11392,7 +11619,7 @@ impl Database {
                 for (n, key) in ENDED.iter().enumerate() {
                     let field: Option<String> = r.get(n + 1)?;
                     if let Some(field) = field {
-                        let value = if *key == "detail" {
+                        let value = if matches!(*key, "detail" | "answer" | "output") {
                             Value::String(field)
                         } else {
                             serde_json::from_str(&field).unwrap_or(Value::Null)
@@ -11521,9 +11748,14 @@ impl Database {
         }
         Ok(())
     }
+    /// How many commands run now: a call a message lifted that still
+    /// waits for its verdict or its client's answer runs nothing here, and
+    /// outlives a restart, so it is not one.
     pub fn running_processes(&self) -> Result<i64> {
         Ok(self.conn.query_row(
-            "SELECT count(*) FROM processes WHERE status='running'",
+            "SELECT count(*) FROM processes p WHERE p.status='running'
+             AND NOT EXISTS (SELECT 1 FROM approvals a WHERE a.process=p.id)
+             AND NOT EXISTS (SELECT 1 FROM answers w WHERE w.process=p.id)",
             [],
             |r| r.get(0),
         )?)
@@ -11539,6 +11771,462 @@ impl Database {
             )
             .optional()?
             .is_some())
+    }
+    /// Lift `call_id` of the running `turn`, waiting on its verdict or on
+    /// its client's answer, off the turn a message joins: the call becomes
+    /// background command `proc:N`, which waits on past the turn, and its
+    /// call is answered with that handle, in one commit. Verdicts the worker
+    /// holds for it are written with it. `None` when it is decided or
+    /// answered already, or its time ran out: the turn takes it as it is.
+    pub fn lift(
+        &mut self,
+        turn: i64,
+        call_id: &str,
+        call: Option<&ToolCall>,
+        now_ms: u64,
+    ) -> Result<Option<(i64, Option<u64>)>> {
+        let bot = self.active(turn)?;
+        if (self.live.get(&turn)).is_some_and(|live| live.answers.contains_key(call_id)) {
+            return Ok(None);
+        }
+        let request = self.request(turn, call_id)?;
+        let (waits_for, lapse) = match &request {
+            Some(request)
+                if request.decided() || request.expires_ms().is_some_and(|at| now_ms >= at) =>
+            {
+                return Ok(None);
+            }
+            Some(request) => ("approval", request.expires_ms()),
+            None => {
+                let answer: Option<(bool, i64, bool)> = self
+                    .conn
+                    .prepare_cached(
+                        "SELECT output IS NULL,expires_ms,paused_ms IS NOT NULL FROM answers
+                         WHERE turn=? AND call_id=?",
+                    )?
+                    .query_row(params![turn, call_id], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .optional()?;
+                match answer {
+                    Some((true, expires_ms, paused))
+                        if paused || now_ms < expires_ms.max(0) as u64 =>
+                    {
+                        ("answer", (!paused).then_some(expires_ms.max(0) as u64))
+                    }
+                    Some(_) => return Ok(None),
+                    None => return fail("invalid_tool_state"),
+                }
+            }
+        };
+        let handle_of = |process: i64| format!("proc:{process}");
+        // The result commits with the lift: the handle answers the call.
+        self.conn.execute_batch("SAVEPOINT lift")?;
+        let lifted = (|| -> Result<i64> {
+            // A call waiting on its gates runs once they allow it, so its
+            // command keeps it.
+            let kept = match (&request, call) {
+                (Some(_), Some(call)) => Some(serde_json::to_string(call)?),
+                (Some(_), None) => return fail("invalid_tool_state"),
+                (None, _) => None,
+            };
+            self.conn
+                .prepare_cached(
+                    "INSERT INTO processes(turn,bot,call_id,status,call) VALUES (?,?,?,'running',?)",
+                )?
+                .execute(params![turn, bot.name, call_id, kept])?;
+            let process = self.conn.last_insert_rowid();
+            if let Some(request) = &request {
+                let held: Vec<Verdict> = (self.live.get(&turn))
+                    .and_then(|live| live.verdicts.get(call_id))
+                    .cloned()
+                    .unwrap_or_default();
+                self.conn
+                    .prepare_cached("UPDATE approvals SET verdicts=?,process=? WHERE id=?")?
+                    .execute(params![
+                        serde_json::to_string(&request.verdicts)?,
+                        process,
+                        request.id
+                    ])?;
+                untag_answered(&self.conn, request.id, &held)?;
+                // Planned, it starts only once its gates allow it: until
+                // then its call is answered with the handle.
+                if self.conn.execute(
+                    "UPDATE tools SET status='executing' WHERE turn=? AND call_id=? AND status='planned'",
+                    params![turn, call_id],
+                )? != 1
+                {
+                    return fail("invalid_tool_state");
+                }
+            } else {
+                self.conn
+                    .prepare_cached("UPDATE answers SET process=? WHERE turn=? AND call_id=?")?
+                    .execute(params![process, turn, call_id])?;
+            }
+            event(
+                &self.conn,
+                &bot.name,
+                Some(turn),
+                "call_lifted",
+                json!({"call_id":call_id,"handle":handle_of(process),"waits_for":waits_for}),
+            )?;
+            // The call's row in the audit trail ends with the command, not
+            // with the handle that answers it now.
+            let audit: Option<i64> = self
+                .conn
+                .prepare_cached("SELECT audit FROM tools WHERE turn=? AND call_id=?")?
+                .query_row(params![turn, call_id], |r| r.get(0))?;
+            self.conn
+                .prepare_cached("UPDATE tools SET audit=NULL WHERE turn=? AND call_id=?")?
+                .execute(params![turn, call_id])?;
+            let outcome = Outcome::text(
+                json!({"handle":handle_of(process),"background":true,"steered":true,
+                    "waits_for":waits_for})
+                .to_string(),
+            );
+            self.tool_finish(turn, call_id, &outcome)?;
+            self.conn
+                .prepare_cached("UPDATE tools SET audit=? WHERE turn=? AND call_id=?")?
+                .execute(params![audit, turn, call_id])?;
+            Ok(process)
+        })();
+        match lifted {
+            Ok(process) => {
+                self.conn.execute_batch("RELEASE lift")?;
+                if let (Some(request), Some(live)) = (&request, self.live_changed(turn)) {
+                    live.verdicts.remove(call_id);
+                    live.answered.remove(&request.id);
+                }
+                Ok(Some((process, lapse)))
+            }
+            Err(error) => {
+                self.conn.execute_batch("ROLLBACK TO lift; RELEASE lift")?;
+                Err(error)
+            }
+        }
+    }
+    /// Where the call a message lifted to background command `process`
+    /// stands, and what follows: still waiting, until when; ended, its
+    /// verdict or answer, or its time running out, recorded as the
+    /// command's result and told to its bot once at rest; allowed by every
+    /// gate, for the caller to run as that command; or nothing waiting on
+    /// it any more. While the daemon is `held`, a call its gates allow
+    /// waits on, as a turn's would, to be checked again once work resumes.
+    pub fn lifted_check(&mut self, process: i64, now_ms: u64, held: bool) -> Result<Lifted> {
+        let approval: Option<(i64, String)> = self
+            .conn
+            .prepare_cached(
+                "SELECT turn,call_id FROM approvals INDEXED BY approvals_lifted
+                 WHERE process=? AND step_of IS NULL",
+            )?
+            .query_row([process], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        if let Some((turn, call_id)) = approval {
+            return self.lifted_verdict(process, turn, &call_id, now_ms, held);
+        }
+        #[allow(clippy::type_complexity)]
+        let answer: Option<(
+            i64,
+            String,
+            String,
+            i64,
+            Option<String>,
+            bool,
+            bool,
+            Option<String>,
+        )> = self
+            .conn
+            .prepare_cached(
+                "SELECT turn,call_id,tag,expires_ms,output,failed,paused_ms IS NOT NULL,parts
+                 FROM answers INDEXED BY answers_lifted WHERE process=?",
+            )?
+            .query_row([process], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            })
+            .optional()?;
+        let Some((turn, call_id, tag, expires_ms, output, failed, paused, parts)) = answer else {
+            return Ok(Lifted::Gone);
+        };
+        let (result, failed, outcome) = match output {
+            Some(output) => {
+                // Its pictures go with its words, for a `wait` on its
+                // handle to hand the model.
+                let mut answer = lifted_answer(&output, failed);
+                if let Some(parts) = parts {
+                    answer["parts"] = serde_json::from_str(&parts)?;
+                }
+                (answer, failed, "answered")
+            }
+            None if !paused && now_ms >= expires_ms.max(0) as u64 => (
+                json!({"error":"tool_unserved","detail":format!("no answer from {tag} in time")}),
+                true,
+                "unserved",
+            ),
+            None => {
+                return Ok(Lifted::Waiting(
+                    (!paused).then_some(expires_ms.max(0) as u64),
+                ));
+            }
+        };
+        let bot = self.call_bot(turn, &call_id)?;
+        self.end_steps_of(&bot, turn, &call_id, "the call was answered first")?;
+        let tx = self.conn.savepoint()?;
+        tx.prepare_cached("DELETE FROM answers WHERE turn=? AND call_id=?")?
+            .execute(params![turn, call_id])?;
+        lifted_ended(&tx, process, &result, failed, outcome)?;
+        tx.commit()?;
+        let ready = self.tell_finished(&bot.name)?;
+        Ok(Lifted::Ended { result, ready })
+    }
+    /// [`Database::lifted_check`] of a call waiting on its gates, decided as
+    /// `approval_start` decides a turn's.
+    fn lifted_verdict(
+        &mut self,
+        process: i64,
+        turn: i64,
+        call_id: &str,
+        now_ms: u64,
+        held: bool,
+    ) -> Result<Lifted> {
+        let request = self
+            .request(turn, call_id)?
+            .ok_or(Error::new("invalid_tool_state"))?;
+        let (name, stored): (String, String) = self
+            .conn
+            .prepare_cached("SELECT bot,call FROM processes WHERE id=?")?
+            .query_row([process], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let call: ToolCall = serde_json::from_str(&stored)?;
+        let mut bot = self.inspect(&name)?;
+        let lapse = request.expires_ms();
+        let denial = request
+            .denial()
+            .filter(|d| lapse.is_none_or(|at| (d.at_ms.max(0) as u64) < at))
+            .cloned();
+        let (result, outcome) = if let Some(denial) = denial {
+            let tx = self.conn.savepoint()?;
+            if !denial.unreviewed {
+                count_denials(&tx, &mut bot, turn, &[denial.tag.as_str()], true)?;
+            }
+            audit_call(
+                &tx,
+                &bot,
+                turn,
+                &call,
+                false,
+                request.approved(false),
+                "denied",
+            )?;
+            tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
+                .execute([request.id])?;
+            let result = json!({"error":"approval_denied","detail":denial.reason});
+            lifted_ended(&tx, process, &result, true, "denied")?;
+            tx.commit()?;
+            (result, "denied")
+        } else if request.unanswered().next().is_none() {
+            // Nothing new starts while the daemon is paused or stopping.
+            if held {
+                return Ok(Lifted::Waiting(None));
+            }
+            // The turn's own model and effort, else the bot's as it was
+            // while the turn ran (kept when the bot's changed since), else
+            // the bot's now, as `turns` reads them.
+            let context: (Option<String>, String, Option<String>, Option<String>) = self
+                .conn
+                .prepare_cached(
+                    "SELECT t.workspace,COALESCE(t.model,t.bot_model,?3),
+                            COALESCE(t.reasoning,CASE WHEN t.bot_model IS NULL THEN ?4 ELSE t.bot_reasoning END),
+                            l.ruling
+                     FROM turns t LEFT JOIN tools l ON l.turn=t.id AND l.call_id=?1 WHERE t.id=?2",
+                )?
+                .query_row(
+                    params![
+                        call_id,
+                        turn,
+                        format!("{}/{}", bot.provider, bot.model),
+                        bot.effort
+                    ],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?;
+            let (workspace, model, effort, ruling) = context;
+            let workspace = workspace.or_else(|| bot.workspace.clone());
+            let ruled = ruling.as_deref().map(Ruling::read);
+            // Where its row in the audit trail says it runs, as a turn
+            // judges it for a call its gates allowed.
+            let confined = workspace.as_deref().is_some_and(|workspace| {
+                bot.sandboxed()
+                    && crate::sandbox::confinable(&call.name)
+                    && bot.confines(&call, std::path::Path::new(workspace))
+                    && !matches!(ruled, Some(Ok(Ruling::Allow)))
+            });
+            let in_sandbox = confined || (bot.sandboxed() && call.name == "read");
+            let tx = self.conn.savepoint()?;
+            let row = audit_call(
+                &tx,
+                &bot,
+                turn,
+                &call,
+                in_sandbox,
+                request.approved(true),
+                "unknown",
+            )?;
+            tx.prepare_cached("UPDATE tools SET audit=? WHERE turn=? AND call_id=?")?
+                .execute(params![row, turn, call_id])?;
+            tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
+                .execute([request.id])?;
+            let tags: Vec<&str> = request.gates.iter().map(|g| g.tag.as_str()).collect();
+            count_denials(&tx, &mut bot, turn, &tags, false)?;
+            // A call its client answers waits on that answer now, as the
+            // same command.
+            ask(&tx, &bot, turn, &call, &mut started(&call))?;
+            let answered: Option<i64> = tx
+                .prepare_cached(
+                    "UPDATE answers SET process=?1 WHERE turn=?2 AND call_id=?3 RETURNING expires_ms",
+                )?
+                .query_row(params![process, turn, call_id], |r| r.get(0))
+                .optional()?;
+            // Its wait ends, allowed, and it starts as its command: its
+            // turn has no call starting, so no `tool_started` says so. One
+            // its client answers waits on, and ends with that answer.
+            let mut data = json!({"call_id":call_id,"handle":format!("proc:{process}"),
+                "outcome":"allowed","approvals":request.approvals()});
+            if answered.is_some() {
+                data["waits_for"] = "answer".into();
+            }
+            event(&tx, &bot.name, Some(turn), "lifted_ended", data)?;
+            tx.commit()?;
+            self.approvals -= 1;
+            if let Some(expires_ms) = answered {
+                return Ok(Lifted::Waiting(Some(expires_ms.max(0) as u64)));
+            }
+            return Ok(Lifted::Run(Box::new(LiftedRun {
+                process,
+                turn,
+                call,
+                bot,
+                workspace,
+                model,
+                effort,
+                ruling,
+                confined,
+            })));
+        } else if lapse.is_some_and(|at| now_ms >= at) {
+            // No approver answered in time: denied by no one, with the
+            // daemon's fixed reason, as a turn's call is.
+            let tx = self.conn.savepoint()?;
+            audit_call(&tx, &bot, turn, &call, false, "nobody", "denied")?;
+            tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
+                .execute([request.id])?;
+            let result = json!({"error":"approval_expired","detail":"not reviewed: no verdict"});
+            lifted_ended(&tx, process, &result, true, "expired")?;
+            tx.commit()?;
+            (result, "expired")
+        } else {
+            return Ok(Lifted::Waiting(lapse));
+        };
+        let _ = outcome;
+        self.approvals -= 1;
+        let ready = self.tell_finished(&bot.name)?;
+        Ok(Lifted::Ended { result, ready })
+    }
+    /// Stop the call a message lifted to background command `process`, of
+    /// `bot`'s, while it waits: its request for a verdict or its client's
+    /// answer goes, and the command ends as stopped, never run. `None` when
+    /// it waits on neither: it runs, or it ended.
+    pub fn lifted_stop(&mut self, bot: &str, process: i64) -> Result<Option<Lifted>> {
+        let waiting: Option<(i64, String, Option<i64>, bool)> = self
+            .conn
+            .prepare_cached(
+                "SELECT p.turn,p.call_id,a.id,w.process IS NOT NULL FROM processes p
+                 LEFT JOIN approvals a ON a.process=p.id AND a.step_of IS NULL
+                 LEFT JOIN answers w ON w.process=p.id
+                 WHERE p.id=? AND p.bot=? AND p.status='running'",
+            )?
+            .query_row(params![process, bot], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .optional()?;
+        let Some((turn, call_id, approval, answering)) = waiting else {
+            return Ok(None);
+        };
+        // Whether it may have run, so the agent knows whether a retry
+        // repeats it: only one still waiting for its verdict surely did
+        // not. Its client may run one it answers without taking it first.
+        let (detail, outcome, ran) = match (approval, answering) {
+            (Some(_), _) => (
+                "stopped before it ran: its request for approval was withdrawn",
+                "withdrawn",
+                false,
+            ),
+            (None, true) => (
+                "stopped while it waited for its answer: its client may have done part of it",
+                "stopped",
+                true,
+            ),
+            (None, false) => return Ok(None),
+        };
+        if answering {
+            let owner = self.call_bot(turn, &call_id)?;
+            self.end_steps_of(&owner, turn, &call_id, "the call was stopped")?;
+        }
+        let result = json!({"error":"stopped","detail":detail,"ran":ran});
+        let tx = self.conn.savepoint()?;
+        if let Some(approval) = approval {
+            tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
+                .execute([approval])?;
+        }
+        tx.prepare_cached("DELETE FROM answers WHERE turn=? AND call_id=?")?
+            .execute(params![turn, call_id])?;
+        lifted_ended(&tx, process, &result, true, outcome)?;
+        tx.commit()?;
+        if approval.is_some() {
+            self.approvals -= 1;
+        }
+        let ready = self.tell_finished(bot)?;
+        Ok(Some(Lifted::Ended { result, ready }))
+    }
+    /// Every call a message lifted that still waits, by its command: for
+    /// the daemon to schedule each one's time again as it starts, and to
+    /// check them all once work resumes.
+    pub fn lifted_waiting(&self) -> Result<Vec<i64>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT process FROM approvals INDEXED BY approvals_lifted WHERE process IS NOT NULL
+             UNION SELECT process FROM answers INDEXED BY answers_lifted WHERE process IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+    /// The bot a call of `turn` belongs to: its turn's, while that turn
+    /// runs or waits, or, for a call a message lifted, its bot as it is
+    /// now, whatever turn it runs.
+    fn call_bot(&self, turn: i64, call_id: &str) -> Result<Bot> {
+        match self.active(turn) {
+            Err(error) if error.code == "stale_turn" && self.lifted_call(turn, call_id)? => {
+                let name: String =
+                    self.conn
+                        .query_row("SELECT bot FROM turns WHERE id=?", [turn], |r| r.get(0))?;
+                self.inspect(&name)
+            }
+            found => found,
+        }
+    }
+    /// Whether `call_id` of `turn` is a call its client answers that a
+    /// message lifted, still waiting for that answer.
+    fn lifted_call(&self, turn: i64, call_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT 1 FROM answers WHERE turn=? AND call_id=? AND process IS NOT NULL",
+            )?
+            .exists(params![turn, call_id])?)
     }
     /// `None` for an unknown id; otherwise the status and any recorded result.
     pub fn process_result(&self, id: i64) -> Result<Option<(String, Option<Value>)>> {
@@ -12490,8 +13178,14 @@ impl Database {
                 .execute([turn])?;
             tx.prepare_cached("DELETE FROM processes WHERE turn=? AND status!='running'")?
                 .execute([turn])?;
-            tx.prepare_cached("DELETE FROM tools WHERE turn=?")?
-                .execute([turn])?;
+            // A running command's call stays until it ends: a lifted one's
+            // client still lists and answers it, and its row in the audit
+            // trail ends with it.
+            tx.prepare_cached(
+                "DELETE FROM tools WHERE turn=?1 AND call_id NOT IN
+                 (SELECT call_id FROM processes WHERE turn=?1 AND status='running')",
+            )?
+            .execute([turn])?;
             let last: Option<i64> = tx
                 .prepare_cached("SELECT MAX(id) FROM events WHERE turn=?")?
                 .query_row([turn], |r| r.get(0))?;
@@ -13682,6 +14376,15 @@ fn count_denials(
 ) -> Result<()> {
     let mut changed = false;
     for tag in tags {
+        // A later turn's counts are its own: a verdict on an earlier
+        // turn's call, which a message lifted, leaves them be.
+        if bot
+            .denials
+            .get(*tag)
+            .is_some_and(|counts| counts.turn > turn)
+        {
+            continue;
+        }
         if denied {
             let counts = bot.denials.entry((*tag).to_owned()).or_default();
             if counts.turn != turn {
@@ -13747,7 +14450,7 @@ fn reannounce(tx: &Connection, bot: &Bot, turn: i64, failed: &str) -> Result<Opt
     let rows: Vec<(i64, String, String, i64, i64, String, String)> = tx
         .prepare_cached(
             "SELECT id,call_id,name,node,request,gates,arguments FROM approvals
-             WHERE turn=? AND step_of IS NULL ORDER BY id",
+             WHERE turn=? AND step_of IS NULL AND process IS NULL ORDER BY id",
         )?
         .query_map([turn], |r| {
             Ok((
@@ -13798,6 +14501,7 @@ fn reannounce(tx: &Connection, bot: &Bot, turn: i64, failed: &str) -> Result<Opt
             verdicts: Vec::new(),
             asked: Vec::new(),
             step_of: None,
+            process: None,
         };
         judged.push(pending_call(
             &bot.name,
@@ -13865,6 +14569,11 @@ fn pending_call(
     }
     if let Some(parent) = &request.step_of {
         entry["step_of"] = json!(parent);
+    }
+    // Lifted by a message: the call's turn went on, and the call waits on
+    // as this background command, which its verdict runs or ends.
+    if let Some(process) = request.process {
+        entry["handle"] = json!(format!("proc:{process}"));
     }
     // The previews stored when the call was planned; a step's facts for
     // the audit trail wait beside them, the trail's alone.
@@ -13998,6 +14707,60 @@ fn close_unanswered(
         entries.push(entry(cursor, &bot.name, Some(turn), "tool_completed", data));
     }
     Ok((head, entries))
+}
+/// The call a step's id, `CALL/STEP`, is a step of.
+fn step_parent(id: &str) -> Option<&str> {
+    id.rsplit_once('/').map(|(call, _)| call)
+}
+/// End the call a message lifted to background command `process`: its
+/// result is recorded, the call's row in the audit trail ends with it, and
+/// its wait's end is an event, `outcome` saying how.
+fn lifted_ended(
+    tx: &Connection,
+    process: i64,
+    result: &Value,
+    failed: bool,
+    outcome: &str,
+) -> Result<()> {
+    let (bot, turn, call_id): (String, i64, String) = tx
+        .prepare_cached(
+            "UPDATE processes SET status='finished',result=? WHERE id=? AND status='running'
+             RETURNING bot,turn,call_id",
+        )?
+        .query_row(params![result.to_string(), process], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()?
+        .ok_or(Error::new("invalid_process_state"))?;
+    lifted_audit(tx, turn, &call_id, failed)?;
+    event(
+        tx,
+        &bot,
+        Some(turn),
+        "lifted_ended",
+        json!({"call_id":call_id,"handle":format!("proc:{process}"),"outcome":outcome,
+            "failed":failed,"result":ended_as(result)}),
+    )?;
+    Ok(())
+}
+/// End a lifted call's row in the audit trail, if it has one still open.
+fn lifted_audit(tx: &Connection, turn: i64, call_id: &str, failed: bool) -> Result<()> {
+    let row: Option<Option<i64>> = tx
+        .prepare_cached("SELECT audit FROM tools WHERE turn=? AND call_id=?")?
+        .query_row(params![turn, call_id], |r| r.get(0))
+        .optional()?;
+    if let Some(Some(row)) = row {
+        audit::finish(tx, row, epoch_ms(), failed)?;
+    }
+    Ok(())
+}
+/// A lifted call's answer as its command's result: its client's words,
+/// which its bot is told, marked when its client said the call failed.
+fn lifted_answer(output: &str, failed: bool) -> Value {
+    match failed {
+        true => json!({"answer":output,"failed":true}),
+        false => json!({"answer":output}),
+    }
 }
 /// Write the verdicts the worker holds for a turn into their requests, in
 /// the commit that parks the turn.
@@ -15817,6 +16580,28 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              ALTER TABLE turn_models_speed RENAME TO turn_models;",
         )?;
     }
+    // Schema 91: a call a message lifted waits on as a background command,
+    // `process`, past its turn's end; the command keeps the call, which its
+    // verdict runs.
+    if from < 91 {
+        for (table, column) in [
+            ("approvals", "process INTEGER"),
+            ("answers", "process INTEGER"),
+            ("processes", "call TEXT"),
+        ] {
+            let name = column.split_once(' ').map_or(column, |(name, _)| name);
+            // A table made later at this open is made with the column.
+            let (made, has): (bool, bool) = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1),
+                    EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+                params![table, name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if made && !has {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column};"))?;
+            }
+        }
+    }
     Ok(())
 }
 /// 87 -> 88: each bot's status, from the turns it has.
@@ -16517,6 +17302,31 @@ impl Database {
 mod tests {
     use super::*;
 
+    #[test]
+    fn one_bots_approvals_read_only_its_own_running_commands() {
+        let db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();
+        let plan: Vec<String> = (db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {BOT_APPROVALS}")))
+        .unwrap()
+        .query_map(params![0, "Bob", 64, i64::MAX], |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+        let lifted: Vec<&String> = (plan.iter())
+            .filter(|step| step.contains("processes_bot_running"))
+            .collect();
+        assert_eq!(lifted.len(), 2, "{plan:?}");
+        assert!(
+            lifted.iter().all(|step| step.contains("(bot=?)")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|step| !step.starts_with("SCAN") || step.contains("processes_bot_running")),
+            "never through every bot's calls: {plan:?}"
+        );
+    }
     #[test]
     fn finding_what_to_tell_reads_only_the_untold() {
         let db = Database::initialize(Connection::open_in_memory().unwrap()).unwrap();

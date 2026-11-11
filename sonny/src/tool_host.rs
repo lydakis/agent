@@ -24,7 +24,12 @@ const GONE_AFTER: Duration = Duration::from_secs(30);
 
 /// The events that tell the host a call waits, or that a turn whose calls
 /// it runs ended. The calls themselves it reads from the daemon.
-const KINDS: [&str; 2] = ["tool_started", "turn_finished"];
+const KINDS: [&str; 4] = [
+    "tool_started",
+    "turn_finished",
+    "call_lifted",
+    "lifted_ended",
+];
 
 /// How often the host's place in the stream is saved, when it moved: every
 /// tool call of every agent moves it, so saving each would write a file a

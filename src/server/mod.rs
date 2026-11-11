@@ -2138,6 +2138,13 @@ pub async fn run(config: Configuration) -> Result<()> {
     service.plan_expiry(Duration::ZERO).await?;
     // So are attached messages that waited out a stop delivered.
     service.plan_lapses().await?;
+    // Calls a message lifted wait on: each one's time goes on the
+    // schedule, and one decided while no daemon ran goes on now.
+    let lifted = service
+        .store
+        .read("lifted_waiting", |db| db.lifted_waiting())
+        .await?;
+    service.check_lifted(lifted);
     // A start may follow the fix of what held turns (a key, a provider,
     // the config): every held turn is tried again at once.
     service.retry_held(None).await?;
@@ -2293,6 +2300,8 @@ pub async fn run(config: Configuration) -> Result<()> {
                 () = service.handles.due() => {
                     let due = service.handles.take_due(handles::now_ms());
                     service.check_steps(due, false);
+                    let lifted = service.handles.take_lifted();
+                    service.check_lifted(lifted);
                 }
                 Some(checked) = service.step_checks.join_next(), if !service.step_checks.is_empty() => {
                     service.steps_checked(checked.map_err(|_| Error::new("step_check_failed"))?);
@@ -2498,8 +2507,10 @@ pub async fn run(config: Configuration) -> Result<()> {
     while service.tails.running.join_next().await.is_some() {}
     // Terminals and background commands end with the daemon, and record
     // how on their handles, so no result task keeps the store open below.
-    service.registry.end_terminals();
+    // Stopping is said first: a terminal starting now either sees it and
+    // ends, or was registered before and ends here.
     service.registry.end_background();
+    service.registry.end_terminals();
     // Every completion is committed. Allow publication to drain before
     // releasing waiters. Background result tasks may still own Store clones,
     // keeping the stream open even after the service is dropped.
@@ -3378,7 +3389,7 @@ impl Service {
     /// lapse on the schedule, and a decided one has its `approve_step`
     /// answered, unless its client left.
     fn steps_checked(&mut self, checked: Vec<(i64, Result<Stepped>)>) {
-        let mut again = Vec::new();
+        let (mut again, mut lifted) = (Vec::new(), Vec::new());
         for (approval, stepped) in checked {
             let Some(stepping) = self.stepping.get_mut(&approval) else {
                 continue;
@@ -3399,6 +3410,11 @@ impl Service {
                     continue;
                 }
                 Ok(stepped) => {
+                    // A lifted call's time runs again: its check
+                    // schedules it.
+                    if let Some(process) = stepped.lifted {
+                        lifted.push(process);
+                    }
                     Ok(
                         settle_step(&self.handles, &stepping.bot, stepping.turn, stepped)
                             .expect("a decided step"),
@@ -3418,6 +3434,18 @@ impl Service {
             }
         }
         self.check_steps(again, false);
+        self.check_lifted(lifted);
+    }
+    /// Check the calls a message lifted, by their commands: see
+    /// [`turn::Lifts::check`].
+    fn check_lifted(&self, processes: Vec<i64>) {
+        let lifts = turn::Lifts {
+            store: self.store.clone(),
+            registry: self.registry.clone(),
+            handles: self.handles.clone(),
+            failures: self.background_failures.clone(),
+        };
+        lifts.check(processes, self.held().is_some());
     }
     /// Drop the steps a closed session's client put.
     fn abandon_steps(&mut self, session: u64) {
@@ -4664,6 +4692,11 @@ impl Service {
                     self.ready_hint = true;
                     let waiting: Vec<i64> = self.stepping.keys().copied().collect();
                     self.check_steps(waiting, false);
+                    // So do the lifted calls allowed meanwhile.
+                    let waiting = (self.store)
+                        .read("lifted_waiting", |db| db.lifted_waiting())
+                        .await?;
+                    self.check_lifted(waiting);
                     self.notices.push(
                         json!({"event": "resumed", "pause": lifted, "by": by, "durable": false}),
                     );
@@ -4839,6 +4872,7 @@ impl Service {
                 if answered.resume {
                     self.handles.wake(bot, turn);
                 }
+                self.check_lifted(answered.lifted.into_iter().collect());
                 Ok(answered.reply)
             }
             Command::ToolResult {
@@ -4948,6 +4982,7 @@ impl Service {
                 if answered.resume {
                     self.handles.wake(bot, turn);
                 }
+                self.check_lifted(answered.lifted.into_iter().collect());
                 Ok(answered.reply)
             }
             Command::ApproveStep {
@@ -9289,7 +9324,7 @@ mod tests {
         let (done, running) = store
             .call(move |db| {
                 let done = db.process_start(turn, "shell-1")?;
-                db.process_finish(done, &json!({"exit_code":0}), &[], &[])?;
+                db.process_finish(done, &json!({"exit_code":0}), false, &[], &[])?;
                 Ok((done, db.process_start(turn, "shell-2")?))
             })
             .await

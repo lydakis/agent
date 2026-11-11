@@ -3,7 +3,9 @@
 //! runs one, for a REPL or a program that prompts. A terminal lives until
 //! its command exits or is killed, across turns, and reports its end on its
 //! proc handle as a background command does.
-use super::{Credentials, DRAIN_PAUSE, MAX_YIELD_MS, Outcome, PREVIEW_BYTES, Registry, sh};
+use super::{
+    Cord, Credentials, DRAIN_PAUSE, MAX_YIELD_MS, Outcome, PREVIEW_BYTES, Registry, Stopper, sh,
+};
 use crate::{Error, Result, fail_with, sandbox::Policy};
 use serde_json::{Value, json};
 use std::{
@@ -382,8 +384,12 @@ fn open() -> Result<(OwnedFd, OwnedFd)> {
 
 impl Registry {
     /// Start `command` in a terminal of `owner`'s, recorded as proc
-    /// `handle`, and return what it writes within `yield_ms`. Its end goes
-    /// to `done`, as a background command's result does.
+    /// `handle`, and return what it writes within `yield_ms`; with none,
+    /// return at once and leave its output for the next read. Its end goes
+    /// to `done`, as a background command's result does. Started for a
+    /// call a message lifted, with its `cord` and `stopper`: a pull or a
+    /// kill by its handle while it waited for a slot or its sandbox means
+    /// it never starts, and one as it starts ends it.
     #[allow(clippy::too_many_arguments)]
     pub async fn terminal(
         &self,
@@ -391,11 +397,13 @@ impl Registry {
         handle: i64,
         command: String,
         workspace: PathBuf,
-        yield_ms: u64,
+        yield_ms: Option<u64>,
         environment: Vec<(String, String)>,
         sandbox: Option<Arc<Policy>>,
+        lifted: Option<(Cord, Stopper)>,
         done: oneshot::Sender<Result<Outcome>>,
     ) -> Result<Outcome> {
+        let mut lifted = lifted;
         let started = async {
             // The bot's least recently used terminal past its share ends
             // first. Only when every lasting slot is taken does the start
@@ -410,6 +418,17 @@ impl Registry {
                 (Err(error), None) => return Err(error),
             };
             let held = crate::sandbox::hold_for(sandbox.as_deref()).await;
+            // Nothing awaits between this and the spawn, so a pull or a
+            // kill either came before and it never starts, or comes after
+            // and finds it.
+            if let Some((cord, stopper)) = &mut lifted {
+                cord.check()?;
+                stopper.check()?;
+            }
+            // Nor does one the daemon's stop came before.
+            if *self.stopping.borrow() {
+                return Err(super::not_started_by_shutdown());
+            }
             let (master, slave) = open()?;
             let mut process = sh(
                 &command,
@@ -474,6 +493,13 @@ impl Registry {
             terminals.insert(handle, terminal.clone());
             pruned
         };
+        // A kill by its handle finds it registered from here: one that
+        // came as it started ends it now. So does the daemon's stop, which
+        // ends the registered terminals once it says it is stopping.
+        let killed = lifted.is_some_and(|(_, stopper)| stopper.hand_over());
+        if killed || *self.stopping.borrow() {
+            terminal.kill();
+        }
         if let Some(pruned) = pruned {
             pruned.kill();
         }
@@ -576,8 +602,20 @@ impl Registry {
                 let _ = done.send(Ok(last));
             });
         }
+        let Some(yield_ms) = yield_ms else {
+            return Ok(report(Some(handle), String::new(), 0, None));
+        };
         terminal.settle(yield_ms).await;
         Ok(terminal.take(self, handle))
+    }
+
+    /// End terminal `handle`, as a pull of the cord does; its end is told
+    /// on its handle. Whether there was one to end.
+    pub fn end_terminal(&self, handle: i64) -> bool {
+        let terminal = (self.terminals.lock().unwrap_or_else(|e| e.into_inner()))
+            .get(&handle)
+            .cloned();
+        terminal.map(|terminal| terminal.kill()).is_some()
     }
 
     /// Let terminal `handle` go once its handle's result is recorded; it
@@ -826,6 +864,126 @@ mod tests {
     /// recorded, so a parked poll that wakes in between reads its end
     /// instead of finding it gone.
     #[tokio::test]
+    async fn a_terminal_a_pull_came_before_never_starts() {
+        use super::Registry;
+        let registry = Registry::new("echo").unwrap();
+        let cord = registry.cord();
+        registry.end_running();
+        let mark = std::env::temp_dir().join(format!("pulled-{}", std::process::id()));
+        let (done, ended) = tokio::sync::oneshot::channel();
+        let refused = registry
+            .terminal(
+                1,
+                8,
+                format!("touch {}", mark.display()),
+                std::env::temp_dir(),
+                None,
+                Vec::new(),
+                None,
+                Some((cord, registry.stopper(8))),
+                done,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "daemon_paused");
+        assert_eq!(ended.await.unwrap().unwrap_err().code, "daemon_paused");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!mark.exists());
+    }
+
+    #[tokio::test]
+    async fn a_terminal_its_agent_killed_before_it_started_never_starts() {
+        use super::Registry;
+        let registry = Registry::new("echo").unwrap();
+        let stopper = registry.stopper(9);
+        // Killed by its handle while it was readied: the kill finds it.
+        assert!(registry.stop(9));
+        let mark = std::env::temp_dir().join(format!("killed-{}", std::process::id()));
+        let (done, ended) = tokio::sync::oneshot::channel();
+        let refused = registry
+            .terminal(
+                1,
+                9,
+                format!("touch {}", mark.display()),
+                std::env::temp_dir(),
+                None,
+                Vec::new(),
+                None,
+                Some((registry.cord(), stopper)),
+                done,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "stopped");
+        assert!(
+            refused
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("did not run"),
+            "{refused:?}"
+        );
+        assert_eq!(ended.await.unwrap().unwrap_err().code, "stopped");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!mark.exists());
+        assert!(!registry.stop(9), "nothing is left to kill");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_the_daemons_stop_came_before_never_starts() {
+        use super::Registry;
+        let registry = Registry::new("echo").unwrap();
+        registry.end_background();
+        let mark = std::env::temp_dir().join(format!("stopping-{}", std::process::id()));
+        let (done, ended) = tokio::sync::oneshot::channel();
+        let refused = registry
+            .terminal(
+                1,
+                12,
+                format!("touch {}", mark.display()),
+                std::env::temp_dir(),
+                None,
+                Vec::new(),
+                None,
+                Some((registry.cord(), registry.stopper(12))),
+                done,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "daemon_shutdown");
+        assert_eq!(ended.await.unwrap().unwrap_err().code, "daemon_shutdown");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!mark.exists());
+    }
+
+    #[tokio::test]
+    async fn a_started_lifted_terminal_is_killed_by_its_handle_as_a_terminal() {
+        use super::Registry;
+        let registry = Registry::new("echo").unwrap();
+        let (done, _ended) = tokio::sync::oneshot::channel();
+        registry
+            .terminal(
+                1,
+                10,
+                "sleep 30".into(),
+                std::env::temp_dir(),
+                None,
+                Vec::new(),
+                None,
+                Some((registry.cord(), registry.stopper(10))),
+                done,
+            )
+            .await
+            .unwrap();
+        // Handed over once registered: a kill by its handle goes to the
+        // terminal, not to its place among background commands.
+        assert!(!registry.stop(10));
+        assert!(registry.terminals.lock().unwrap().contains_key(&10));
+        // Which a kill that missed its place finds, and ends.
+        assert!(registry.end_terminal(10));
+    }
+
+    #[tokio::test]
     async fn an_ended_terminal_reports_its_end_until_its_result_is_recorded() {
         use super::Registry;
         let registry = Registry::new("echo").unwrap();
@@ -836,8 +994,9 @@ mod tests {
                 7,
                 "printf hi; exit 3".into(),
                 std::env::temp_dir(),
-                5_000,
+                Some(5_000),
                 Vec::new(),
+                None,
                 None,
                 done,
             )

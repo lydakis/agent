@@ -147,7 +147,9 @@ tries its held turns at once.
   a blocking call and never cancels one: a turn parked on `wait` resumes at
   once with its unresolved handles pending (still valid) and `steered: true`,
   and a foreground `shell` command still running 250 ms after the steer
-  moves to the background and returns its `proc:` handle. `queue`
+  moves to the background and returns its `proc:` handle, as does a call
+  waiting for its approval or its client's answer, which waits on past the
+  turn and reports back as a background command does. `queue`
   deliveries leave both alone.
   A steer with an explicit workspace or model that differs from the running
   turn stays queued and runs separately with those choices.
