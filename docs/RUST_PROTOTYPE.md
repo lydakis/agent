@@ -3338,7 +3338,10 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   `{"handle","stopped":true,"ran":BOOL}`: an answered call is `ran: true`
   once its client took it, as it may have done part of it, and its
   stopped result says the same; the same kill ends any background
-  command. The expiry keeps its meaning, on the run loop's one schedule.
+  command. An allowed call can be killed from the moment its approval is
+  taken: one killed while it is readied (its sandbox, a slot) never
+  starts, its result `stopped` saying it did not run. Its audit row ends
+  `failed` as whoever ran it said, not as its result's fields read. The expiry keeps its meaning, on the run loop's one schedule.
   Waits the agent did not start (a provider's pacing, a pause, a shutdown,
   the load gate) keep the message for later, and an `attach` never lifts.
 - **Expiry.** With `approve_expire_ms`, a call still without that gate's

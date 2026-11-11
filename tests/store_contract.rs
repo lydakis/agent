@@ -8070,6 +8070,7 @@ fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
     db.process_finish(
         process,
         &json!({"stdout":"large"}),
+        false,
         &[("stdout", b"synthetic output".to_vec())],
         &[],
     )
@@ -9117,7 +9118,7 @@ fn completion_retention_passes_turns_whose_processes_still_run() {
     assert_eq!(db.prune_except("Bob", 1, None).unwrap()["events"], 0);
     assert_eq!(db.running_processes().unwrap(), piece as i64);
     // A process that ends makes its turn prunable again.
-    db.process_finish(processes[0], &json!({"stdout":"done"}), &[], &[])
+    db.process_finish(processes[0], &json!({"stdout":"done"}), false, &[], &[])
         .unwrap();
     // Once Bob has been told of it.
     hear_out(&mut db, "Bob");
@@ -9344,6 +9345,7 @@ fn retention_keeps_running_processes_until_their_results_commit() {
     db.process_finish(
         process,
         &json!({"stdout":"done"}),
+        false,
         &[("stdout", b"full output".to_vec())],
         &[],
     )
@@ -16053,7 +16055,8 @@ fn an_expired_fork_still_running_a_command_holds_back_no_other() {
         db.expired(i64::MAX, 1).unwrap(),
         vec![("idle".to_owned(), idle.bot_id)]
     );
-    db.process_finish(process, &json!({}), &[], &[]).unwrap();
+    db.process_finish(process, &json!({}), false, &[], &[])
+        .unwrap();
     assert_eq!(db.expired(i64::MAX, 16).unwrap().len(), 2);
 }
 
@@ -17228,19 +17231,26 @@ fn a_background_command_no_wait_collected_is_told_once_its_bot_rests() {
     let late = db.process_start(first, "shell-2").unwrap();
     let during = db.process_start(first, "shell-3").unwrap();
     // While its turn runs, an end waits for the turn's end.
-    db.process_finish(waited, &json!({"stdout":"ok","exit_code":0}), &[], &[])
-        .unwrap();
+    db.process_finish(
+        waited,
+        &json!({"stdout":"ok","exit_code":0}),
+        false,
+        &[],
+        &[],
+    )
+    .unwrap();
     assert!(!db.tell_finished("Bob").unwrap());
     // A wait handed this one over; a write showed the bot this one's end.
     let node = db.inspect("Bob").unwrap().head.unwrap();
     db.delivered(node, &[waited]).unwrap();
     db.saw_end(seen).unwrap();
-    db.process_finish(seen, &json!({"output":"$ ","exit_code":0}), &[], &[])
+    db.process_finish(seen, &json!({"output":"$ ","exit_code":0}), false, &[], &[])
         .unwrap();
     db.process_finish(
         during,
         &json!({"stdout":"x".repeat(9000),"stderr":"","exit_code":0,
         "success":true,"wall_time_ms":40}),
+        false,
         &[],
         &[],
     )
@@ -17264,6 +17274,7 @@ fn a_background_command_no_wait_collected_is_told_once_its_bot_rests() {
     db.process_finish(
         late,
         &json!({"error":"daemon_paused","detail":"stopped"}),
+        true,
         &[],
         &[],
     )
@@ -17311,7 +17322,7 @@ fn a_bot_whose_client_collects_results_itself_is_never_told() {
     quiet.settings.quiet_background = true;
     db.create("Carol", Some("/synthetic"), quiet).unwrap();
     let process = started_in_background(&mut db, "Carol", "c1");
-    db.process_finish(process, &json!({"exit_code":0}), &[], &[])
+    db.process_finish(process, &json!({"exit_code":0}), false, &[], &[])
         .unwrap();
     assert!(!db.tell_finished("Carol").unwrap());
     started_in_background(&mut db, "Carol", "c2");
@@ -17333,7 +17344,7 @@ fn submissions_filling_the_pending_bounds_hold_back_no_note() {
         .unwrap();
     let refused = db.begin("Eve", "e2", "more", false, &queue, allow_provider);
     assert_eq!(refused.unwrap_err().code, "pending_limit");
-    db.process_finish(process, &json!({"exit_code":1}), &[], &[])
+    db.process_finish(process, &json!({"exit_code":1}), false, &[], &[])
         .unwrap();
     assert!(db.tell_finished("Bob").unwrap(), "told past the bound");
 }
@@ -17362,6 +17373,7 @@ fn notes_of_many_ended_commands_each_fit_the_bots_context() {
         db.process_finish(
             *id,
             &json!({"error":"process_lost","detail":long}),
+            true,
             &[],
             &[],
         )
@@ -17403,7 +17415,7 @@ fn retention_keeps_what_a_note_still_to_run_tells_of() {
     ))
     .unwrap()
     .turn;
-    db.process_finish(process, &json!({"exit_code":0}), &[], &[])
+    db.process_finish(process, &json!({"exit_code":0}), false, &[], &[])
         .unwrap();
     db.finish(next, None).unwrap();
     db.retain("Dan", Some(next)).unwrap();
@@ -17441,8 +17453,14 @@ fn retention_keeps_ended_commands_a_later_note_is_still_to_tell() {
     .turn;
     let long = "why ".repeat(100);
     for id in [first, second] {
-        db.process_finish(id, &json!({"error":"process_lost","detail":long}), &[], &[])
-            .unwrap();
+        db.process_finish(
+            id,
+            &json!({"error":"process_lost","detail":long}),
+            true,
+            &[],
+            &[],
+        )
+        .unwrap();
     }
     db.finish(third, None).unwrap();
     db.retain("Gus", Some(third)).unwrap();
@@ -17484,7 +17502,7 @@ fn schema_76_tells_no_bot_of_commands_that_ended_before() {
             .turn;
         let ended = db.process_start(turn, "shell-1").unwrap();
         let running = db.process_start(turn, "shell-2").unwrap();
-        db.process_finish(ended, &json!({"exit_code":0}), &[], &[])
+        db.process_finish(ended, &json!({"exit_code":0}), false, &[], &[])
             .unwrap();
         (ended, running)
     };
@@ -19034,9 +19052,16 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
     assert_eq!(withdrawn["ran"], false);
     assert!(allow(&mut db, turn, "s3").is_err());
     assert!(db.lifted_waiting().unwrap().is_empty());
-    // The run's end is its command's, and its row in the trail ends too.
-    db.process_finish(p1, &json!({"exit_code":0,"success":true}), &[], &[])
-        .unwrap();
+    // The run's end is its command's, and its row in the trail ends too,
+    // failed as whoever ran it said, though no field of its result says so.
+    db.process_finish(
+        p1,
+        &json!({"url":"https://example.test/","status":404,"text":"gone"}),
+        true,
+        &[],
+        &[],
+    )
+    .unwrap();
     assert!(db.lifted_waiting().unwrap().is_empty());
     assert_eq!(
         db.approvals(Some("Bob"), None, 0, None, 64).unwrap()["approvals"],
@@ -19053,7 +19078,7 @@ fn a_lifted_call_waits_on_past_its_turn_and_its_verdict_runs_or_ends_it() {
             )
         })
         .collect();
-    assert!(outcomes.contains(&("s1", "completed")), "{outcomes:?}");
+    assert!(outcomes.contains(&("s1", "failed")), "{outcomes:?}");
     assert!(outcomes.contains(&("s2", "denied")), "{outcomes:?}");
 }
 

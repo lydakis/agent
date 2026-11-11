@@ -11538,10 +11538,13 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
     /// The outcome and its overflow become visible in one transaction.
+    /// `failed` is whoever ran it saying the call failed, never read back
+    /// from the result's fields.
     pub fn process_finish(
         &mut self,
         id: i64,
         result: &Value,
+        failed: bool,
         artifacts: &[(&str, Vec<u8>)],
         files: &[(&str, String)],
     ) -> Result<()> {
@@ -11561,9 +11564,6 @@ impl Database {
         // A call a message lifted ran as this command: its row in the
         // audit trail ends with it.
         if lifted {
-            let failed = result.get("error").is_some()
-                || result["failed"] == true
-                || result["success"] == false;
             lifted_audit(&tx, turn, &call_id, failed)?;
         }
         if !artifacts.is_empty() || !files.is_empty() {

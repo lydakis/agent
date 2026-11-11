@@ -2400,7 +2400,7 @@ impl Registry {
     #[allow(clippy::too_many_arguments)]
     pub fn background(
         &self,
-        id: i64,
+        stopper: Stopper,
         command: String,
         workspace: PathBuf,
         timeout_ms: u64,
@@ -2413,7 +2413,7 @@ impl Registry {
         let mut queued = queued;
         let mut stopping = self.stopping.subscribe();
         let mut pulls = self.pulls.subscribe();
-        let (stop, listed) = self.stoppable(id);
+        let Stopper { stop, listed } = stopper;
         tokio::spawn(async move {
             let _listed = listed;
             let result = async {
@@ -2465,29 +2465,30 @@ impl Registry {
         });
     }
 
-    /// What stops background command `id` when its agent kills it, and
-    /// what takes it off the list once dropped, however its run ends.
-    fn stoppable(&self, id: i64) -> (tokio::sync::oneshot::Receiver<()>, Stoppable) {
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        self.stops.lock().unwrap().insert(id, stop);
+    /// What stops background command `id` when its agent kills it, from
+    /// now until it is dropped, however its run ends: taken before the
+    /// command is readied, so a kill while it is finds it.
+    pub fn stopper(&self, id: i64) -> Stopper {
+        let (sender, stop) = tokio::sync::oneshot::channel();
+        self.stops.lock().unwrap().insert(id, sender);
         let listed = Stoppable {
             stops: self.stops.clone(),
             id,
         };
-        (stopped, listed)
+        Stopper { stop, listed }
     }
 
-    /// `run`, a command a steer moved to the background as `id`, ended
-    /// when its agent kills it, as one started there is.
+    /// `run`, a command a steer moved to the background, ended when its
+    /// agent kills it by `stopper`'s handle, as one started there is.
     pub fn until_stopped<F>(
         &self,
-        id: i64,
+        stopper: Stopper,
         run: F,
     ) -> impl Future<Output = Result<Outcome>> + use<F>
     where
         F: Future<Output = Result<Outcome>>,
     {
-        let (stop, listed) = self.stoppable(id);
+        let Stopper { stop, listed } = stopper;
         async move {
             let _listed = listed;
             tokio::select! {
@@ -2544,6 +2545,40 @@ fn stopped_by_agent() -> Error {
         "stopped",
         "its agent killed this command before it finished, so it may have had effects",
     )
+}
+
+/// How a command its agent killed before it started answers.
+fn stopped_before_start() -> Error {
+    Error::with(
+        "stopped",
+        "its agent killed this command before it started, so it did not run",
+    )
+}
+
+/// What lets its agent kill a background command by its handle.
+pub struct Stopper {
+    stop: tokio::sync::oneshot::Receiver<()>,
+    listed: Stoppable,
+}
+
+impl Stopper {
+    /// Refuse a start its agent killed before.
+    pub fn check(&mut self) -> Result<()> {
+        match self.stop.try_recv() {
+            Ok(()) => Err(stopped_before_start()),
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Give up the place once the command can be killed another way:
+    /// whether a kill came first, which the caller then carries out. A
+    /// kill after finds the other way, or no place and says so.
+    pub fn hand_over(self) -> bool {
+        let Stopper { mut stop, listed } = self;
+        drop(listed);
+        stop.close();
+        stop.try_recv().is_ok()
+    }
 }
 
 /// A background command's place among those its agent can kill, given
@@ -3375,7 +3410,7 @@ mod tests {
         let running = tokio::spawn(
             registry
                 .cord()
-                .until_pulled(registry.until_stopped(7, std::future::pending())),
+                .until_pulled(registry.until_stopped(registry.stopper(7), std::future::pending())),
         );
         tokio::task::yield_now().await;
         assert!(registry.stops.lock().unwrap().contains_key(&7));

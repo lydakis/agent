@@ -23,7 +23,7 @@ use agent_runtime::{
         ElisionPlan, Gated, Halt, Halted, Lifted, LiftedRun, Limit, Settings, Slot, Spend, Store,
         Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, unserved,
     },
-    tools::{Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry},
+    tools::{Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Stopper},
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -5711,7 +5711,7 @@ impl Turn {
             .await?;
         let (sender, receiver) = oneshot::channel();
         self.registry.background(
-            id,
+            self.registry.stopper(id),
             command,
             workspace,
             timeout_ms,
@@ -5748,7 +5748,7 @@ impl Turn {
         let (sender, receiver) = oneshot::channel();
         let run = self
             .registry
-            .until_stopped(id, self.registry.until_pulled(run));
+            .until_stopped(self.registry.stopper(id), self.registry.until_pulled(run));
         // Counted as the process it is now, not as a foreground command too.
         place.lift();
         tokio::spawn(async move {
@@ -5816,26 +5816,31 @@ impl Lifts {
     }
 
     async fn check_one(&self, process: i64, held: bool, cord: &Cord) -> Result<()> {
-        let found = self
+        let registry = self.registry.clone();
+        let (found, stopper) = self
             .store
             .op("lifted_check", move |db| {
-                db.lifted_check(process, now_ms(), held)
+                let found = db.lifted_check(process, now_ms(), held)?;
+                // Its agent can kill one allowed to run by its handle from
+                // the job that took its approval: a stop is a later job.
+                let stopper = matches!(found, Lifted::Run(_)).then(|| registry.stopper(process));
+                Ok((found, stopper))
             })
             .await?;
-        match found {
-            Lifted::Waiting(at) => self.handles.lifted_lapses(process, at),
-            Lifted::Ended { result, ready } => {
+        match (found, stopper) {
+            (Lifted::Waiting(at), _) => self.handles.lifted_lapses(process, at),
+            (Lifted::Ended { result, ready }, _) => {
                 self.handles.lifted_lapses(process, None);
                 self.handles.process_finished(process, result);
                 if ready {
                     self.handles.turn_ready();
                 }
             }
-            Lifted::Run(run) => {
+            (Lifted::Run(run), Some(stopper)) => {
                 self.handles.lifted_lapses(process, None);
-                self.run(*run, cord.clone()).await;
+                self.run(*run, cord.clone(), stopper).await;
             }
-            Lifted::Gone => self.handles.lifted_lapses(process, None),
+            (Lifted::Run(_) | Lifted::Gone, _) => self.handles.lifted_lapses(process, None),
         }
         Ok(())
     }
@@ -5845,8 +5850,10 @@ impl Lifts {
     /// their environment. A command runs in the background, its end told
     /// as any background command's is; any other call's result is the
     /// command's. A call that reads or changes its turn's own state has no
-    /// turn to run in, and says so.
-    async fn run(&self, run: LiftedRun, cord: Cord) {
+    /// turn to run in, and says so. Its agent kills it by its handle
+    /// through `stopper` until its command can be killed another way.
+    async fn run(&self, run: LiftedRun, cord: Cord, stopper: Stopper) {
+        let mut stopper = stopper;
         let LiftedRun {
             process,
             turn,
@@ -5944,8 +5951,13 @@ impl Lifts {
             }
             _ => None,
         };
-        // A pause that came while it was readied stops it before it starts.
-        let prepared = prepared.and_then(|prepared| cord.check().map(|()| prepared));
+        // A pause or a kill that came while it was readied stops it before
+        // it starts.
+        let prepared = prepared.and_then(|prepared| {
+            cord.check()?;
+            stopper.check()?;
+            Ok(prepared)
+        });
         let terminal = matches!(prepared, Ok(Prepared::Terminal { .. }));
         self.collect(
             &bot.name,
@@ -5964,7 +5976,7 @@ impl Lifts {
                 ..
             }) => match self.registry.queue() {
                 Ok(queued) => self.registry.background(
-                    process,
+                    stopper,
                     command,
                     Prepared::folder(&workspace, workdir.as_deref()),
                     timeout_ms,
@@ -5994,7 +6006,7 @@ impl Lifts {
                             None,
                             environment,
                             sandbox,
-                            Some(cord.clone()),
+                            Some((cord.clone(), stopper)),
                             sender,
                         )
                         .await;
@@ -6018,7 +6030,7 @@ impl Lifts {
                 );
                 tokio::spawn(async move {
                     let typed = cord.until_pulled(registry.until_stopped(
-                        process,
+                        stopper,
                         registry.write_stdin(bot.bot_id, handle, &chars, yield_ms, kill, sandbox),
                     ));
                     let typed = match typed.await {
@@ -6061,7 +6073,7 @@ impl Lifts {
                 tokio::spawn(async move {
                     let ran = cord
                         .until_pulled(registry.until_stopped(
-                            process,
+                            stopper,
                             registry.execute(prepared, &workspace, &environment, sandbox),
                         ))
                         .await;
@@ -6098,8 +6110,10 @@ impl Lifts {
         );
         tokio::spawn(async move {
             let result = receiver.await.unwrap_or_else(|_| fail("process_lost"));
-            let (value, artifacts, files) = match result {
+            // Whether it failed, as whoever ran it said.
+            let (value, failed, artifacts, files) = match result {
                 Ok(outcome) => {
+                    let failed = outcome.failed;
                     let outcome = match outputs {
                         Some(outputs) if !outcome.artifacts.is_empty() => {
                             outputs.keep(outcome, turn, &call_id_for_refs).await
@@ -6117,10 +6131,11 @@ impl Lifts {
                             .await
                             .unwrap_or_else(|_| json!({"error":"process_lost"})),
                     };
-                    (value, artifacts, files)
+                    (value, failed, artifacts, files)
                 }
                 Err(error) => (
                     json!({"error":error.code,"detail":error.detail}),
+                    true,
                     Vec::new(),
                     Files::default(),
                 ),
@@ -6131,7 +6146,7 @@ impl Lifts {
             // turn running hears at that turn's end, unless a wait takes it.
             match store
                 .op("process_finish", move |db| {
-                    db.process_finish(id, &value, &artifacts, &files)?;
+                    db.process_finish(id, &value, failed, &artifacts, &files)?;
                     files.recorded();
                     Ok((value, db.tell_finished(&bot)?))
                 })

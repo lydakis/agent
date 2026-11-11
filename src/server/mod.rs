@@ -9322,7 +9322,7 @@ mod tests {
         let (done, running) = store
             .call(move |db| {
                 let done = db.process_start(turn, "shell-1")?;
-                db.process_finish(done, &json!({"exit_code":0}), &[], &[])?;
+                db.process_finish(done, &json!({"exit_code":0}), false, &[], &[])?;
                 Ok((done, db.process_start(turn, "shell-2")?))
             })
             .await
