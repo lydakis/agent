@@ -542,6 +542,8 @@ struct Journal {
     cut: bool,
     /// Whether the run was told to stop.
     stopped: bool,
+    /// The workers it submitted to.
+    submitted: HashSet<String>,
 }
 
 fn journal_of(dir: &Path) -> Journal {
@@ -554,8 +556,12 @@ fn journal_of(dir: &Path) -> Journal {
         let Ok(mut entry) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
-        if entry["t"] == "stop" {
-            journal.stopped = true;
+        match entry["t"].as_str() {
+            Some("stop") => journal.stopped = true,
+            Some("submit") => {
+                journal.submitted.insert(str_of(&entry["worker"]));
+            }
+            _ => {}
         }
         if entry["t"] != "agent" {
             continue;
@@ -584,7 +590,16 @@ fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
         spent,
         cut,
         stopped,
+        submitted,
     } = journal_of(dir);
+    // Workers it submitted to and has no answer from may still run: known,
+    // so a stop or end interrupts them and a replay takes them up again.
+    let worker = |key: &String| format!("{}.{WORKER}{}-{key}", plan.project, plan.id);
+    let answered: HashSet<String> = answers.keys().map(worker).collect();
+    let live: HashMap<String, i64> = (submitted.into_iter())
+        .filter(|bot| !answered.contains(bot))
+        .map(|bot| (bot, SUBMITTED))
+        .collect();
     let mut journal = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -603,7 +618,7 @@ fn load(dir: &Path, store: &Path, socket: &Path) -> Result<Arc<Run>, String> {
         halt: Notify::new(),
         answers: Mutex::new(answers),
         spent: AtomicU64::new(spent),
-        live: Mutex::default(),
+        live: Mutex::new(live),
         // Its workers' worktrees, which its answers no longer make.
         trees: Mutex::new(crate::task::worker_trees(
             &plan.workspace,
@@ -1172,6 +1187,8 @@ impl Attempt {
             }
         };
         live(Some(SUBMITTED));
+        self.run
+            .note(json!({"t": "submit", "worker": worker, "at_ms": now_ms()}));
         let submitted = match self.client.request("submit", submit).await {
             Ok(submitted) => submitted,
             Err(error) if lost(&error) => return Err(Trouble::Lost),
@@ -1658,6 +1675,7 @@ mod tests {
             spent,
             cut,
             stopped,
+            ..
         } = journal_of(&dir);
         assert!(cut && !stopped);
         assert_eq!(spent, 10);
@@ -1673,7 +1691,8 @@ mod tests {
             "budget": null, "meta": {}, "resumed_from": "x", "started_ms": 0,
             "max_agents": 1000, "at_once": 4}))
         .unwrap();
-        make(&next, &plan, "export const meta = {}", Some(&dir)).unwrap();
+        let source = "export const meta = {name: 'next', description: 'x'}\nreturn 1\n";
+        make(&next, &plan, source, Some(&dir)).unwrap();
         let Journal { answers, spent, .. } = journal_of(&next);
         assert_eq!(spent, 0);
         assert_eq!(answers.len(), 2);
@@ -1692,6 +1711,26 @@ mod tests {
         file.write_all(b"\n{\"t\": \"stop\"}\n").unwrap();
         assert!(journal_of(&dir).stopped);
         assert!(!journal_of(&next).stopped);
+        // Loaded again, a stopped run is stopping, and knows the workers it
+        // submitted to that have not answered, to interrupt them.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(next.join("events.jsonl"))
+            .unwrap();
+        let more = [
+            json!({"t": "submit", "worker": "shop.wf-next-k1"}),
+            json!({"t": "submit", "worker": "shop.wf-next-k9"}),
+            json!({"t": "stop"}),
+        ];
+        for line in more {
+            file.write_all(format!("{line}\n").as_bytes()).unwrap();
+        }
+        let run = load(&next, &dir, &dir.join("socket")).unwrap();
+        assert!(run.stopping());
+        assert_eq!(
+            *run.live.lock().unwrap(),
+            HashMap::from([("shop.wf-next-k9".to_owned(), SUBMITTED)])
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
