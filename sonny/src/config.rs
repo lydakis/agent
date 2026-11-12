@@ -148,6 +148,12 @@ pub const SETTINGS: &[Setting] = &[
         default: "false",
     },
     Setting {
+        key: "sonny.project_colors",
+        about: "experimental: in a window that follows other leads, a reply about one followed project wears its color; /colors toggles it in one window",
+        values: SWITCH,
+        default: "false",
+    },
+    Setting {
         key: "sonny.text_width",
         about: "the widest the conversation is written, in columns, however wide the window, the pane beside it taking the rest; 0 for the window's whole width, shared half and half with an open pane",
         values: &[],

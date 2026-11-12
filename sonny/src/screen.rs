@@ -112,6 +112,9 @@ pub enum Mark {
     /// wrapped narrower than it was written, as [`Screen::push_hanging`]
     /// gives one: a bar down a card's side goes on down its rows.
     Hangs(Line<'static>),
+    /// A project's bar down the row's first column, in the color at this
+    /// slot ([`crate::look::bar`]), however it is wrapped.
+    Bar(u8),
 }
 
 /// A row on the screen: one of the conversation's rows, or the part of
@@ -129,6 +132,8 @@ struct Shown {
     first: bool,
     /// Its row's buttons, on the first of its rows.
     buttons: Buttons,
+    /// Its row's project bar.
+    bar: Option<u8>,
 }
 
 /// A line of the conversation, its wrapped rows joined again, so it can
@@ -143,6 +148,8 @@ struct Row {
     buttons: Buttons,
     /// It is a message's first row.
     opens: bool,
+    /// The project bar down its first column, by slot.
+    bar: Option<u8>,
 }
 
 impl Row {
@@ -154,6 +161,7 @@ impl Row {
             tag: None,
             buttons: Vec::new(),
             opens: false,
+            bar: None,
         }
     }
 
@@ -164,6 +172,7 @@ impl Row {
             Mark::Buttons(buttons) => self.buttons = buttons,
             Mark::Opens => self.opens = true,
             Mark::Hangs(rest) => self.rest = Some(rest),
+            Mark::Bar(slot) => self.bar = Some(slot),
         }
     }
 }
@@ -668,6 +677,8 @@ impl Screen {
                 let mut row = Row::new(line);
                 row.tag = Some(tag);
                 row.buttons = buttons;
+                // Under a row that wears a project bar, it goes on.
+                row.bar = self.rows[at - 1].bar;
                 self.rows.insert(at, row);
                 self.grow_page(at - 1, 1);
             }
@@ -702,10 +713,13 @@ impl Screen {
             .position(|row| row.tag != Some(tag))
             .map_or(self.rows.len(), |n| first + n);
         let shown = self.shown_at(first);
+        // The rows in their place wear the project bar they wore.
+        let bar = self.rows[first].bar;
         let mut fresh = Screen::default();
         fresh.push_marked(lines, marks);
         for row in &mut fresh.rows {
             row.tag = Some(tag);
+            row.bar = row.bar.or(bar);
         }
         let grown = fresh.rows.len() as isize - (end - first) as isize;
         self.rows.splice(first..end, fresh.rows);
@@ -735,6 +749,12 @@ impl Screen {
         (self.rows.iter())
             .map(|row| crate::transcript::seen(&row.line))
             .collect()
+    }
+
+    /// Each row's project bar, by slot.
+    #[cfg(test)]
+    pub fn bars(&self) -> Vec<Option<u8>> {
+        self.rows.iter().map(|row| row.bar).collect()
     }
 
     /// Where each row's link goes, if it has one.
@@ -963,6 +983,7 @@ impl Screen {
             tag: None,
             buttons: Vec::new(),
             opens: false,
+            bar: None,
         });
         self.swap(0, rows.collect());
         self.pages.splice(0..1, pages);
@@ -1132,6 +1153,7 @@ impl Screen {
                     tag: None,
                     buttons: Vec::new(),
                     opens: false,
+                    bar: None,
                 }),
             );
             self.shown.splice(
@@ -1143,6 +1165,7 @@ impl Screen {
                     opens: 0,
                     first: true,
                     buttons: Vec::new(),
+                    bar: None,
                 }),
             );
             self.wrapped = self.wrapped + at.len() - rows;
@@ -1274,6 +1297,7 @@ impl Screen {
                 !span.content.is_empty() && span.content.chars().all(|c| c == '─')
             });
             let link = row.link.clone();
+            let bar = row.bar;
             let (rows, buttons) = match line.width() <= width || picture {
                 true => (vec![line], vec![row.buttons.clone()]),
                 false => {
@@ -1303,6 +1327,7 @@ impl Screen {
                     opens,
                     first,
                     buttons,
+                    bar,
                 });
             }
         }
@@ -1663,6 +1688,11 @@ impl Screen {
                 buf.set_style(row, Style::new().bg(bg));
             }
             buf.set_line(area.x, area.y + y as u16, &shown.line, area.width);
+            if let Some(slot) = shown.bar
+                && area.width > 0
+            {
+                crate::look::bar_cell(&mut buf[(area.x, area.y + y as u16)], slot);
+            }
         }
         let drawn = Rect {
             height: (bottom - top) as u16,
@@ -3820,6 +3850,25 @@ mod tests {
         ));
         assert_eq!(screen.texts(), ["before", "• Started a, b ▸", "after"]);
         assert!(!screen.replace_tagged(Tag::Group(2), Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn a_project_bar_stays_on_rows_drawn_again_and_rows_put_under() {
+        let mut screen = Screen::default();
+        screen.push_marked(
+            vec![Line::from("• Started a ▸"), Line::from("after")],
+            vec![
+                (0, Mark::Tag(Tag::Group(1))),
+                (0, Mark::Bar(2)),
+                (1, Mark::Tag(Tag::End(4))),
+            ],
+        );
+        let open = vec![Line::from("• Started a ▾"), Line::from("• Started a")];
+        assert!(screen.replace_tagged(Tag::Group(1), open, Vec::new()));
+        assert_eq!(screen.bars(), [Some(2), Some(2), None]);
+        assert!(screen.put_under(Tag::Group(1), Tag::Reactions(1), Some("   🎉".into())));
+        assert!(screen.put_under(Tag::End(4), Tag::Reactions(4), Some("   👍".into())));
+        assert_eq!(screen.bars(), [Some(2), Some(2), Some(2), None, None]);
     }
 
     #[test]

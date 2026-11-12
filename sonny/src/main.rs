@@ -22,6 +22,7 @@ mod budget;
 mod cache;
 mod calls;
 mod cmux;
+mod colors;
 mod commons;
 mod config;
 mod context;
@@ -2478,6 +2479,9 @@ async fn run() -> Result<(), String> {
     app.sounds.chime = settings.chime;
     app.verbose = settings.verbose;
     app.words_only = !settings.steps;
+    app.colors = settings.project_colors;
+    app.colors_set = settings.project_colors;
+    app.pinned = settings.project_color.clone();
     set_measure(settings.text_width);
     margin::set_limits(settings.margin_notes, settings.margin_note_lines);
     app.zen = zen::focus(app.reactions_key.as_deref());
@@ -3520,7 +3524,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
 /// open `/background`, `/forum` opens `/commons`, and `/settings` opens
 /// `/config`, unlisted.
-const COMMANDS: [(&str, &str); 29] = [
+const COMMANDS: [(&str, &str); 30] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -3571,6 +3575,10 @@ const COMMANDS: [(&str, &str); 29] = [
     (
         "/verbose",
         "Show every tool call, or only what moves the work on",
+    ),
+    (
+        "/colors",
+        "Color each reply by the followed project it is about (experimental)",
     ),
     ("/react", "React to one of the agent's replies"),
     ("/reply", "Answer one of the agent's replies, quoted"),
@@ -4201,6 +4209,23 @@ struct App {
     /// The running turn, or the newest, was started by something other
     /// than the person: another agent, a task's news, the lookout.
     elsewhere: bool,
+    /// Experimental: replies about one followed project are barred in its
+    /// color (`/colors`, `[sonny] project_colors`).
+    colors: bool,
+    /// `[sonny] project_colors` as last read: a change in `/config` sets
+    /// `colors` to it.
+    colors_set: bool,
+    /// The color each project pins, `[sonny.projects.NAME] color`.
+    pinned: BTreeMap<String, String>,
+    /// The followed projects and their colors' slots, as last read, and
+    /// when.
+    palette: Option<(Instant, Vec<(String, u8)>)>,
+    /// The project the running turn, or the newest, is about: the one
+    /// followed project whose agents woke it.
+    bar: Option<colors::Bar>,
+    /// The last row written wears the bar: a blank row after it does too,
+    /// so a reply's paragraphs are one bar, and two replies two.
+    barred: bool,
     /// The lead's instructions as composed now, sent once no turn runs.
     instruct: Option<String>,
     /// What Sonny's upgrade set beside the person's own edits, told to the
@@ -5878,6 +5903,12 @@ impl App {
             plan_told: None,
             zen: None,
             elsewhere: false,
+            colors: false,
+            colors_set: false,
+            pinned: BTreeMap::new(),
+            palette: None,
+            bar: None,
+            barred: false,
             instruct: None,
             upgrades: None,
             restored: None,
@@ -6763,6 +6794,8 @@ impl App {
         self.live = None;
         self.any_history = false;
         self.seen_node = 0;
+        self.bar = None;
+        self.barred = false;
         if let Some(newest) = newest {
             // What calls older than the oldest page returned stays its own.
             let unpaired = std::mem::take(&mut self.unpaired);
@@ -6915,12 +6948,17 @@ impl App {
         let starting = self.starting.take();
         let clustering = self.clustering.take();
         let stacked = self.stacked.take();
+        let bar = (self.bar.take(), std::mem::take(&mut self.barred));
         if paged.first {
             self.commit_welcome();
         }
         let unpaired = self
             .draw_nodes(&paged.nodes, &paged.turns, true, after, None)
             .await;
+        // The page's last rows wear what they were drawn with; the blank
+        // under them, none.
+        self.flush();
+        (self.bar, self.barred) = (None, false);
         let wrote = std::mem::replace(&mut self.any_history, any_history);
         self.rows_drawn = rows_drawn;
         self.bot_reactions = bot_reactions;
@@ -6937,6 +6975,7 @@ impl App {
         self.flush();
         let newer = self.newer.take().unwrap_or_default();
         let older = std::mem::replace(&mut self.screen, newer);
+        (self.bar, self.barred) = bar;
         (older, unpaired)
     }
 
@@ -8603,9 +8642,76 @@ impl App {
 
     /// The lines waiting written into the conversation, with their marks.
     fn flush(&mut self) {
-        let marks = std::mem::take(&mut self.marks);
-        self.screen
-            .push_marked(std::mem::take(&mut self.pending), marks);
+        let mut marks = std::mem::take(&mut self.marks);
+        let lines = std::mem::take(&mut self.pending);
+        if let Some(bar) = &self.bar {
+            colors::wear(&lines, &mut marks, bar, &mut self.barred);
+        }
+        self.screen.push_marked(lines, marks);
+    }
+
+    /// The followed projects and their colors' slots, read again at most
+    /// every few seconds: none unless project colors are on.
+    fn palette(&mut self) -> &[(String, u8)] {
+        if !self.colors {
+            return &[];
+        }
+        if self
+            .palette
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= FOLLOWED_EVERY)
+        {
+            let store = self.store();
+            let followed = followed_leads(&self.bot, |bot| lookout::subs::read(&store, bot));
+            let palette = colors::palette(&followed, &self.pinned);
+            self.palette = Some((Instant::now(), palette));
+        }
+        self.palette.as_ref().map_or(&[], |(_, palette)| palette)
+    }
+
+    /// A turn begins with the message that woke it (`text` from `from`),
+    /// none when nothing did: what was written before it keeps the bar it
+    /// was written with, and what follows wears the project's whose agents
+    /// alone sent it, if one followed project's did.
+    fn bar_turn(&mut self, woke: Option<(&str, Option<&str>)>) {
+        let names = match woke {
+            Some((text, from)) if transcript::relays(text, from) => {
+                transcript::relayed_names(text, from)
+            }
+            _ => Vec::new(),
+        };
+        let bar = match names.is_empty() {
+            true => None,
+            false => colors::about(&names, self.palette()),
+        }
+        .map(|(project, slot)| colors::Bar { project, slot });
+        // Rows waiting keep what they were written with: written now, but
+        // only where a bar comes or goes, so plain windows wait as ever.
+        if self.bar.is_some() || bar.is_some() {
+            self.flush();
+        }
+        self.bar = bar;
+        self.barred = false;
+    }
+
+    /// A message that joined the running turn (`text` from `from`): the
+    /// person's words, or another project's, end the bar.
+    fn bar_steered(&mut self, text: &str, from: Option<&str>) {
+        let Some(bar) = &self.bar else {
+            return;
+        };
+        let project = bar.project.clone();
+        let names = match transcript::relays(text, from) {
+            true => transcript::relayed_names(text, from),
+            false => Vec::new(),
+        };
+        let same = !names.is_empty()
+            && colors::about(&names, self.palette()).is_some_and(|(p, _)| p == project);
+        if !same {
+            self.flush();
+            self.bar = None;
+            self.barred = false;
+        }
     }
 
     /// The first of the last `count` lines waiting marked as a message's
@@ -9092,8 +9198,10 @@ impl App {
         let mut aside = !older && self.elsewhere;
         let mut began = std::collections::HashSet::new();
         // A page that starts inside a turn lacks its first message: in zen,
-        // the turn's own prompt says who started it.
-        if self.zen.is_some()
+        // the turn's own prompt says who started it, and with project
+        // colors whose project its rows are about.
+        let colored = !self.palette().is_empty();
+        if (self.zen.is_some() || colored)
             && let Some(&turn) = nodes.first().and_then(|node| turns.get(node))
             && let Ok(read) = (self.client)
                 .request(
@@ -9103,17 +9211,28 @@ impl App {
                 .await
             && let Some(prompts) = read["prompts"].as_array()
         {
-            let relays = |prompt: &Value| {
+            let said = |prompt: &Value| {
                 let from = transcript::sender(
                     prompt["from"]["bot"].as_str(),
                     prompt["origin"].as_str(),
                     prompt["person"].as_str(),
                 );
-                transcript::relays(prompt["text"].as_str().unwrap_or(""), from.as_deref())
+                (prompt["text"].as_str().unwrap_or("").to_owned(), from)
+            };
+            let relays = |prompt: &Value| {
+                let (text, from) = said(prompt);
+                transcript::relays(&text, from.as_deref())
             };
             // Started elsewhere, unless the person steered it: their words
             // make it theirs, wherever the page starts.
-            aside = prompts.first().is_some_and(relays) && prompts.iter().all(relays);
+            if self.zen.is_some() {
+                aside = prompts.first().is_some_and(relays) && prompts.iter().all(relays);
+            }
+            // Its first message, before the page, says what the turn is
+            // about; the steers the page holds say the rest.
+            if colored && let Some((text, from)) = prompts.first().map(said) {
+                self.bar_turn(Some((&text, from.as_deref())));
+            }
             began.insert(turn);
         }
         // A chunk read at a time, what it held let go before the next.
@@ -9147,10 +9266,15 @@ impl App {
                     (_, Some("user")) => {
                         let turn = turns.get(&node).copied();
                         let first = turn.is_none_or(|turn| began.insert(turn));
-                        match transcript::relays(&text(&item), item["from"].as_str()) {
+                        let (said, from) = (text(&item), item["from"].as_str());
+                        match transcript::relays(&said, from) {
                             false => aside = false,
                             true if first => aside = true,
                             true => {}
+                        }
+                        match first {
+                            true => self.bar_turn(Some((&said, from))),
+                            false => self.bar_steered(&said, from),
                         }
                         // The bot's reactions to the message before, as they
                         // were drawn live.
@@ -9474,7 +9598,25 @@ impl App {
                 markdown.rest(),
             ));
         }
-        rows
+        match &self.bar {
+            Some(bar) => self.bar_open(rows, bar.slot),
+            None => rows,
+        }
+    }
+
+    /// The reply's open rows wearing the bar at `slot` as they will once
+    /// written ([`colors::wear`]): from the first row not blank on.
+    fn bar_open(&self, rows: Vec<Line<'static>>, slot: u8) -> Vec<Line<'static>> {
+        let mut barred = self.barred;
+        (rows.into_iter())
+            .map(|mut row| {
+                barred = row.width() > 0 || barred;
+                if barred {
+                    colors::bar_line(&mut row, slot);
+                }
+                row
+            })
+            .collect()
     }
 
     /// The words' last lines, and a table they ended on, drawn and held
@@ -9695,9 +9837,18 @@ impl App {
                     self.answering = None;
                     self.elsewhere = from_lookout(data);
                 }
-                if !drawn
-                    && let Some(node) = data["node"].as_i64()
-                    && let Some(item) = self.items(&[node]).await.first()
+                let woke = match (drawn, data["node"].as_i64()) {
+                    (false, Some(node)) => self.items(&[node]).await.into_iter().next(),
+                    _ => None,
+                };
+                if !drawn {
+                    let woke = woke
+                        .as_ref()
+                        .map(|item| (text(item), item["from"].as_str()));
+                    self.bar_turn(woke.as_ref().map(|(said, from)| (said.as_str(), *from)));
+                }
+                if let Some(node) = data["node"].as_i64()
+                    && let Some(item) = &woke
                     && !self.note_closed(node, &text(item))
                     && !quiet_message(&text(item))
                 {
@@ -9729,6 +9880,7 @@ impl App {
                     if !transcript::relays(&text(item), item["from"].as_str()) {
                         self.elsewhere = false;
                     }
+                    self.bar_steered(&text(item), item["from"].as_str());
                     self.dated(node, item);
                     self.land(
                         node,
@@ -12563,6 +12715,16 @@ impl App {
                 self.words_only = !settings.steps;
                 self.repaint = true;
             }
+            // A new default for project colors, or a new pin, takes now.
+            if self.colors_set != settings.project_colors || self.pinned != settings.project_color {
+                if self.colors_set != settings.project_colors {
+                    self.colors = settings.project_colors;
+                }
+                self.colors_set = settings.project_colors;
+                self.pinned = settings.project_color;
+                self.palette = None;
+                self.repaint = true;
+            }
             if set_measure(settings.text_width) {
                 self.repaint = true;
                 self.stale = true;
@@ -13317,6 +13479,24 @@ impl App {
                     .to_owned()
                 }
                 Err(error) => error,
+            });
+            return;
+        }
+        if prompt == "/colors" {
+            self.input.clear();
+            self.colors = !self.colors;
+            self.palette = None;
+            // What is already drawn is drawn again with colors or without,
+            // once no turn runs.
+            self.repaint = true;
+            let followed = self.palette().len();
+            self.notice = Some(match (self.colors, followed) {
+                (false, _) => "project colors off".to_owned(),
+                (true, 0) => {
+                    "project colors on: this agent follows no other project's lead".to_owned()
+                }
+                (true, 1) => "project colors on, for the 1 project followed".to_owned(),
+                (true, n) => format!("project colors on, for the {n} projects followed"),
             });
             return;
         }
@@ -19346,6 +19526,138 @@ mod tests {
             _ => json!({}),
         })
         .await
+    }
+
+    /// The rows drawn, each with its project bar's slot.
+    fn barred(app: &mut App) -> Vec<(Option<u8>, String)> {
+        app.flush();
+        app.screen
+            .bars()
+            .into_iter()
+            .zip(app.screen.texts())
+            .collect()
+    }
+
+    /// `app` with project colors on, following shop's and calc's leads.
+    fn colored(app: &mut App) {
+        app.colors = true;
+        let palette = vec![("shop".to_owned(), 0), ("calc".to_owned(), 1)];
+        app.palette = Some((Instant::now(), palette));
+    }
+
+    #[tokio::test]
+    async fn with_colors_a_reply_a_followed_project_woke_wears_its_bar() {
+        let mut app = app(zen_daemon().await);
+        app.width = 100;
+        app.words_only = true;
+        colored(&mut app);
+        app.history().await;
+        let rows = barred(&mut app);
+        let at = |said: &str| {
+            (rows.iter())
+                .position(|(_, text)| text.contains(said))
+                .unwrap_or_else(|| panic!("{said} in {rows:?}"))
+        };
+        // The person's turns stay plain.
+        assert_eq!(rows[at("Fix the rounding")].0, None);
+        assert_eq!(rows[at("Rounding now")].0, None);
+        assert_eq!(rows[at("Pushed as")].0, None);
+        // A message from shop's agent, and calc's task news, each bar the
+        // reply they woke, with no name added; the gap above each stays
+        // bare, so two replies read as two.
+        let shop = at("Noted what shop.fix said.");
+        assert_eq!(rows[shop], (Some(0), "• Noted what shop.fix said.".into()));
+        assert_eq!(rows[shop - 1], (None, String::new()));
+        let calc = at("calc.neg is done.");
+        assert_eq!(rows[calc], (Some(1), "• calc.neg is done.".into()));
+        assert_eq!(rows[calc - 1], (None, String::new()));
+        // Off, nothing is barred.
+        let mut app = super::tests::app(zen_daemon().await);
+        app.width = 100;
+        app.words_only = true;
+        app.history().await;
+        let rows = barred(&mut app);
+        assert!(rows.iter().all(|(bar, _)| bar.is_none()), "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|(_, text)| text == "• Noted what shop.fix said.")
+        );
+    }
+
+    #[tokio::test]
+    async fn with_colors_a_page_starting_inside_a_turn_asks_what_it_is_about() {
+        // The page starts at shop.fix's turn's reply, its message before it.
+        let mut app = app(zen_daemon_from(6).await);
+        app.width = 100;
+        app.words_only = true;
+        colored(&mut app);
+        app.history().await;
+        let rows = barred(&mut app);
+        let noted = (rows.iter())
+            .find(|(_, text)| text.contains("Noted what shop.fix said."))
+            .unwrap_or_else(|| panic!("{rows:?}"));
+        assert_eq!(noted, &(Some(0), "• Noted what shop.fix said.".into()));
+    }
+
+    #[tokio::test]
+    async fn with_colors_a_live_reply_wears_the_bar_until_the_person_steers() {
+        let mut app = app(zen_daemon().await);
+        app.width = 100;
+        app.words_only = true;
+        colored(&mut app);
+        app.daemon(turn_event("accepted", 2, json!({"node": 5})))
+            .await;
+        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 2,
+            "text": "Looking at the build."}))
+            .await;
+        // Open, it wears the bar as it will once written.
+        let open = app.open_rows(80);
+        let first = open.iter().find(|row| row.width() > 0).unwrap();
+        assert_eq!(first.to_string(), "  Looking at the build.");
+        let lead = first.spans.iter().find(|span| !span.content.is_empty());
+        assert_eq!(lead.unwrap().style.bg, Some(look::bar(0)));
+        app.daemon(turn_event("message", 2, json!({"node": 6})))
+            .await;
+        // The person's words make the rest of the turn theirs: plain.
+        app.daemon(turn_event("steered", 2, json!({"node": 11})))
+            .await;
+        app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 2,
+            "text": "Pushing."}))
+            .await;
+        app.daemon(turn_event(
+            "turn_finished",
+            2,
+            json!({"status": "completed"}),
+        ))
+        .await;
+        let rows = barred(&mut app);
+        let bar = |said: &str| {
+            (rows.iter())
+                .find(|(_, text)| text.contains(said))
+                .unwrap_or_else(|| panic!("{said} in {rows:?}"))
+                .0
+        };
+        // Written, it is the message the daemon kept.
+        assert_eq!(bar("• Noted what shop.fix said."), Some(0));
+        assert_eq!(bar("Push it"), None);
+        assert_eq!(bar("Pushing."), None);
+    }
+
+    #[tokio::test]
+    async fn colors_toggle_in_the_window_and_draw_again() {
+        let mut app = app(zen_daemon().await);
+        app.input.set("/colors");
+        app.submit().await;
+        assert!(app.colors && app.repaint);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("project colors on: this agent follows no other project's lead")
+        );
+        app.repaint = false;
+        app.input.set("/colors");
+        app.submit().await;
+        assert!(!app.colors && app.repaint);
+        assert_eq!(app.notice.as_deref(), Some("project colors off"));
     }
 
     #[tokio::test]

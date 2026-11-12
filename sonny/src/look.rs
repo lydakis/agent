@@ -72,6 +72,18 @@ impl Look {
                 _ => cell.bg = quote(),
             }
         }
+        // A project's bar, as a quote's is: its color as the theme is now,
+        // or, with no color, the quote's mark.
+        if let Some(slot) = bar_slot(cell.bg) {
+            match self {
+                Look::Plain => {
+                    cell.set_symbol("▌");
+                    cell.bg = Color::Reset;
+                    cell.modifier.insert(Modifier::DIM);
+                }
+                _ => cell.bg = project(slot),
+            }
+        }
         // A hue on a muted row (the footer's branch, an agent's name) is a
         // short mark meant to read: dim over it falls under 3:1 in many
         // themes, so the hue is drawn as it is and the words round it
@@ -207,6 +219,130 @@ pub fn quote() -> Color {
         None if crate::term::light() => Color::Rgb(200, 200, 200),
         None => Color::Rgb(90, 90, 90),
     }
+}
+
+/// A project's bar as a cell holds it, a role as [`QUOTE`] is: one of
+/// six, by its place in [`agent_client::config::PROJECT_COLORS`], tinted
+/// [`project`] as each frame is finished.
+pub fn bar(slot: u8) -> Color {
+    Color::Rgb(4, 1, slot % HUES.len() as u8)
+}
+
+/// A row's first cell made the bar of the project at `slot`, where it is
+/// a blank or a plain bullet: a mark of its own (a call's colored dot, a
+/// card's side, `↳`) stays, the bar going on above and below it.
+pub fn bar_cell(cell: &mut Cell, slot: u8) {
+    if matches!(cell.symbol(), " " | "•") && matches!(cell.fg, Color::Reset) {
+        cell.set_symbol(" ");
+        cell.bg = bar(slot);
+    }
+}
+
+fn bar_slot(color: Color) -> Option<u8> {
+    match color {
+        Color::Rgb(4, 1, slot) if usize::from(slot) < HUES.len() => Some(slot),
+        _ => None,
+    }
+}
+
+/// The six project colors' hues, in OKLCH degrees, in
+/// [`agent_client::config::PROJECT_COLORS`]' order: halfway between the
+/// hues the terminal's six colors mean things in (red 29, yellow 95, green
+/// 142, cyan 195, blue 264, magenta 328), so a project never reads as an
+/// error, a warning or a link.
+const HUES: [f32; 6] = [168.0, 296.0, 62.0, 230.0, 118.0, 358.0];
+/// Their chroma: muted, as structure is, still told apart.
+const CHROMA: f32 = 0.12;
+/// What a bar reads at against the background: WCAG's 3:1 for what
+/// isn't text.
+const BAR: f32 = 3.0;
+
+/// The color of the project at `slot`, for the theme as it is now: its
+/// hue, from the background's side, at the first lightness that reads
+/// [`BAR`] against the background. Worked out once for each background.
+pub fn project(slot: u8) -> Color {
+    thread_local! {
+        static MADE: std::cell::Cell<Option<(Rgb, [Rgb; 6])>> = const { std::cell::Cell::new(None) };
+    }
+    let theme = crate::term::theme();
+    let (background, foreground) = match (theme.background, theme.foreground) {
+        (Some(background), Some(foreground)) => (background, foreground),
+        _ if crate::term::light() => ((255, 255, 255), (0, 0, 0)),
+        _ => ((0, 0, 0), (255, 255, 255)),
+    };
+    let colors = MADE.with(|made| match made.get() {
+        Some((on, colors)) if on == background => colors,
+        _ => {
+            let colors = HUES.map(|hue| hued(hue, foreground, background));
+            made.set(Some((background, colors)));
+            colors
+        }
+    });
+    let (r, g, b) = colors[usize::from(slot) % colors.len()];
+    Color::Rgb(r, g, b)
+}
+
+/// `hue` at the lightness nearest the background that reads [`BAR`]
+/// against it, its chroma eased into what sRGB shows; the foreground when
+/// none does.
+fn hued(hue: f32, foreground: Rgb, background: Rgb) -> Rgb {
+    let light = contrast(background, (0, 0, 0)) > contrast(foreground, (0, 0, 0));
+    for step in 0..=200 {
+        let lightness = match light {
+            true => 1.0 - step as f32 / 200.0,
+            false => step as f32 / 200.0,
+        };
+        let mut chroma = CHROMA;
+        let mut rgb = oklch(lightness, chroma, hue);
+        while rgb.is_none() && chroma > 0.01 {
+            chroma -= 0.005;
+            rgb = oklch(lightness, chroma, hue);
+        }
+        let rgb = rgb.unwrap_or_else(|| oklch_clipped(lightness, chroma, hue));
+        if contrast(rgb, background) >= BAR {
+            return rgb;
+        }
+    }
+    foreground
+}
+
+/// OKLCH to sRGB (Björn Ottosson's), none when it falls outside.
+fn oklch(lightness: f32, chroma: f32, hue: f32) -> Option<Rgb> {
+    let linear = oklch_linear(lightness, chroma, hue);
+    linear
+        .iter()
+        .all(|c| (-1e-4..=1.0 + 1e-4).contains(c))
+        .then(|| encode(linear))
+}
+
+fn oklch_clipped(lightness: f32, chroma: f32, hue: f32) -> Rgb {
+    encode(oklch_linear(lightness, chroma, hue))
+}
+
+fn oklch_linear(lightness: f32, chroma: f32, hue: f32) -> [f32; 3] {
+    let (a, b) = (
+        chroma * hue.to_radians().cos(),
+        chroma * hue.to_radians().sin(),
+    );
+    let l = (lightness + 0.396_337_78 * a + 0.215_803_76 * b).powi(3);
+    let m = (lightness - 0.105_561_346 * a - 0.063_854_17 * b).powi(3);
+    let s = (lightness - 0.089_484_18 * a - 1.291_485_5 * b).powi(3);
+    [
+        4.076_741_7 * l - 3.307_711_6 * m + 0.230_969_94 * s,
+        -1.268_438 * l + 2.609_757_4 * m - 0.341_319_38 * s,
+        -0.004_196_086_3 * l - 0.703_418_6 * m + 1.707_614_7 * s,
+    ]
+}
+
+fn encode([r, g, b]: [f32; 3]) -> Rgb {
+    let gamma = |c: f32| {
+        let c = match c <= 0.003_130_8 {
+            true => 12.92 * c,
+            false => 1.055 * c.max(0.0).powf(1.0 / 2.4) - 0.055,
+        };
+        (c * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    (gamma(r), gamma(g), gamma(b))
 }
 
 /// How faint structure reads against the background: below muted text's
@@ -380,5 +516,41 @@ mod tests {
         assert_eq!(buffer[(0, 0)].symbol(), "█");
         assert_eq!(buffer[(1, 0)].symbol(), "▃");
         assert_eq!(buffer[(2, 0)].fg, Color::Rgb(0, 0, 7));
+    }
+
+    #[test]
+    fn project_colors_read_as_bars_and_stay_apart_in_light_and_dark() {
+        for (foreground, background) in [
+            ((16, 15, 15), (255, 252, 240)),
+            ((206, 205, 195), (16, 15, 15)),
+            ((0, 0, 0), (255, 255, 255)),
+            ((255, 255, 255), (0, 0, 0)),
+        ] {
+            let colors = HUES.map(|hue| hued(hue, foreground, background));
+            for (n, color) in colors.iter().enumerate() {
+                assert!(contrast(*color, background) >= BAR, "{n} on {background:?}");
+                assert_ne!(*color, foreground, "{n} found no lightness");
+                for other in &colors[n + 1..] {
+                    assert_ne!(color, other);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_project_bar_is_its_color_or_without_color_the_quote_mark() {
+        assert_eq!(bar_slot(bar(5)), Some(5));
+        assert_eq!(bar_slot(bar(6)), Some(0));
+        assert_eq!(bar_slot(QUOTE), None);
+        let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 1, 1));
+        buffer[(0, 0)].set_bg(bar(2));
+        Look::Plain.finish(&mut buffer);
+        assert_eq!(buffer[(0, 0)].symbol(), "▌");
+        assert_eq!(buffer[(0, 0)].bg, Color::Reset);
+        let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 1, 1));
+        buffer[(0, 0)].set_bg(bar(2));
+        Look::Drawn.finish(&mut buffer);
+        assert_eq!(buffer[(0, 0)].bg, project(2));
+        assert!(bar_slot(buffer[(0, 0)].bg).is_none());
     }
 }
