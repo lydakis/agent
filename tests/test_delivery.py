@@ -401,103 +401,16 @@ class DeliveryTests(ModelFixture):
                                         compaction_instructions='x', compaction_model='nobody/model')['error'],
                          'provider_unavailable')
 
-    def test_carry_forward_note_is_pinned_versioned_and_inherited_by_forks(self):
-        client = self.client('echo,note')
-        client.request('create', bot='Bob', workspace=str(self.path))
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='note:Rule: end every file with the marker.')['result']['message']
-        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        completed = [e for e in self.events(client, 'Bob') if e['event'] == 'tool_completed'][-1]
-        version = completed['data']['note']
-        self.assertEqual(version, completed['data']['node'])
-        self.assertEqual(client.request('inspect', bot='Bob')['result']['note'], version)
-        self.assertEqual(json.loads(node_item(client, 'Bob', version)['result']['output']),
-                         {'bytes': 37, 'cleared': False})
-        # The next request carries the note ahead of the window, before the prompt.
-        second = client.request('submit', bot='Bob', request_id='2', prompt='hello')['result']['message']
-        self.assertEqual(client.finished(second)['data']['status'], 'completed')
-        while not self.model.requests.empty():
-            request = self.model.requests.get()
-        texts = [item['content'][0]['text'] for item in request['input'] if item.get('role') == 'user']
-        self.assertEqual(texts[0], f'[carry-forward note, version {version}]\nRule: end every file with the marker.')
-        self.assertEqual(texts[-1], 'hello')
-        checkpoint = client.request('inspect', bot='Bob')['result']['head']
-        # A rewrite is a new version; a fork at the earlier checkpoint keeps the old one.
-        third = client.request('submit', bot='Bob', request_id='3', prompt='note:Rule v2.')['result']['message']
-        client.finished(third)
-        later = client.request('inspect', bot='Bob')['result']['note']
-        self.assertGreater(later, version)
-        client.request('fork', source='Bob', checkpoint=checkpoint, bot='Early', workspace=str(self.path))
-        self.assertEqual(client.request('inspect', bot='Early')['result']['note'], version)
-        # Empty text clears it: the next request has no pinned note.
-        cleared = client.request('submit', bot='Bob', request_id='4', prompt='note:')['result']['message']
-        client.finished(cleared)
-        after = client.request('submit', bot='Bob', request_id='5', prompt='again')['result']['message']
-        client.finished(after)
-        while not self.model.requests.empty():
-            request = self.model.requests.get()
-        texts = [item['content'][0]['text'] for item in request['input'] if item.get('role') == 'user']
-        self.assertFalse(any(t.startswith('[carry-forward note') for t in texts))
-        # A bot without the tool cannot call it.
+    def test_the_daemon_has_no_note_tool(self):
+        # A bot cannot be given one, and a model that calls one is told it
+        # has no such tool.
+        client = self.client('echo')
+        self.assertEqual(client.request('create', bot='Noted', workspace=str(self.path),
+                                        tools=['echo', 'note'])['error'], 'unsupported_tool_set')
         client.request('create', bot='Plain', workspace=str(self.path), tools=['echo'])
         refused = client.request('submit', bot='Plain', request_id='1', prompt='note:x')['result']['message']
         self.assertEqual(client.finished(refused)['data']['status'], 'completed')
         self.assertEqual(json.loads(self.tool_output(client, 'Plain', 'note-1'))['error'], 'tool_not_available')
-
-    def test_a_steer_is_measured_against_a_note_written_in_the_same_round(self):
-        # The steer arrives while the model is asked; the model's answer
-        # writes a large carry-forward note. Beside that note the steer does
-        # not fit, though it would have beside the request that was sent.
-        client = self.client('echo,note', settings={'context_bytes': 8192})
-        client.request('create', bot='Bob', workspace=str(self.path), tools=['echo', 'note'])
-        self.model.note_text = 'N' * 3500
-        gate = threading.Event()
-        self.model.request_gates = queue.Queue()
-        self.model.request_gates.put(gate)
-        turn = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['message']
-        self.model.requests.get(timeout=5)
-        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:' + 'x' * 2000,
-                               delivery='steer', expected_turn=turn)['result']['message']
-        gate.set()
-        ended = client.finished(turn)
-        self.assertEqual(ended['data']['status'], 'completed', ended)
-        self.assertEqual(client.finished(steer)['data']['error'], 'stale_turn')
-        while not self.model.requests.empty():
-            request = self.model.requests.get()
-            self.assertLessEqual(len(json.dumps(request['input'], separators=(',', ':')).encode()) - 2, 8192)
-
-    def test_a_steer_with_no_room_beside_a_note_goes_in_once_the_note_is_cleared(self):
-        # The steer arrives while the model is asked; beside the bot's large
-        # note it does not fit at the next boundary. The model then clears
-        # the note, and the steer goes in at the boundary after that,
-        # before the answer, rather than failing when the turn ends.
-        client = self.client('echo,note', settings={'context_bytes': 8192})
-        client.request('create', bot='Bob', workspace=str(self.path), tools=['echo', 'note'])
-        self.model.note_text = 'N' * 3500
-        noted = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['message']
-        self.assertEqual(client.finished(noted)['data']['status'], 'completed')
-        del self.model.note_text
-        while not self.model.requests.empty():
-            self.model.requests.get()
-        self.model.call_script = [('echo', {'text': 'a'}), ('note', {'text': ''})]
-        gate = threading.Event()
-        self.model.request_gates = queue.Queue()
-        self.model.request_gates.put(gate)
-        turn = client.request('submit', bot='Bob', request_id='2', prompt='script')['result']['message']
-        self.model.requests.get(timeout=5)
-        correction = 'steer:' + 'x' * 2500
-        steer = client.request('submit', bot='Bob', request_id='s', prompt=correction,
-                               delivery='steer', expected_turn=turn)['result']['message']
-        gate.set()
-        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        outcome = client.finished(steer)['data']
-        self.assertEqual((outcome['status'], outcome.get('turn')), ('taken', turn), outcome)
-        requests = []
-        while not self.model.requests.empty():
-            requests.append(self.model.requests.get())
-        carries = [any(i.get('role') == 'user' and i['content'][0]['text'] == correction for i in r['input'])
-                   for r in requests]
-        # Asked after the echo without it, after the note is cleared with it.
-        self.assertEqual(carries, [False, True])
 
     def test_a_steer_is_admitted_beside_the_context_note_without_its_previews(self):
         # A long history leaves most turns out of view, and the context note

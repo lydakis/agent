@@ -64,7 +64,7 @@ its byte permit until writing finishes. That does not bound the aggregate
 cost of many observers. Dispatch also awaits storage reads, so a read can
 delay the service loop even when it writes nothing.
 
-Compaction summaries and carry-forward notes already exist in the store,
+Compaction summaries already exist in the store,
 versioned with history. There is no protocol read for their text. A local
 fork can inspect a completed checkpoint, but inherits its source's tools
 and consumes model allowance if asked to summarize. Those are later client
@@ -228,8 +228,8 @@ cross-store alias layer, or group-move subsystem is required to begin it.
 
 ### Observer features
 
-A `summary` read returns the compaction summary, covered turns, version,
-and carry-forward note selected for that bot's history. It spends no model
+A `summary` read returns the compaction summary, covered turns and
+version selected for that bot's history. It spends no model
 tokens and can be absent or stale. A client digest combines turn state,
 events, recent output, and usage, returning JSON by default.
 

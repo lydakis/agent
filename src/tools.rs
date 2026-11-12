@@ -42,8 +42,6 @@ pub const ARTIFACT_BYTES: usize = 1024 * 1024;
 /// Each end kept of a stream past `ARTIFACT_BYTES`, leaving room for the
 /// marker that counts the dropped middle.
 const KEPT_END: usize = (ARTIFACT_BYTES - 256) / 2;
-/// The carry-forward note a bot may keep ahead of its window.
-pub const NOTE_BYTES: usize = 8192;
 const FILE_BYTES: usize = 4 * 1024 * 1024;
 const WRITE_BYTES: usize = 1024 * 1024;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 120_000;
@@ -78,7 +76,6 @@ enum Tool {
     ApplyPatch,
     Wait,
     History,
-    Note,
     WebSearch,
     WebFetch,
     WriteStdin,
@@ -94,7 +91,6 @@ impl Tool {
             "apply_patch" => Tool::ApplyPatch,
             "wait" => Tool::Wait,
             "history" => Tool::History,
-            "note" => Tool::Note,
             "web_search" => Tool::WebSearch,
             "web_fetch" => Tool::WebFetch,
             "write_stdin" => Tool::WriteStdin,
@@ -111,7 +107,6 @@ impl Tool {
             Tool::ApplyPatch => "apply_patch",
             Tool::Wait => "wait",
             Tool::History => "history",
-            Tool::Note => "note",
             Tool::WebSearch => "web_search",
             Tool::WebFetch => "web_fetch",
             Tool::WriteStdin => "write_stdin",
@@ -166,11 +161,6 @@ impl Tool {
                 "tool":{"type":"string","minLength":1,"maxLength":512},"since_ms":{"type":"integer","minimum":0}},
                 "additionalProperties":false}},
                 "additionalProperties":false}),
-            ),
-            Tool::Note => (
-                "Write or replace your carry-forward note: text the runtime places ahead of the conversation window in every request, so it stays in view when earlier turns leave the window. Up to 8192 bytes and must fit the current context budget; an oversized write preserves the previous note. Empty text removes it. The note is versioned with the conversation and a fork inherits the version at its checkpoint.",
-                json!({"type":"object","properties":{"text":{"type":"string","maxLength":8192}},
-                "required":["text"],"additionalProperties":false}),
             ),
             // What a model is shown is its provider's: Codex's `web.run`,
             // or the provider's own hosted tool (see provider::Search).
@@ -1114,11 +1104,6 @@ pub enum Prepared {
     /// A client's declared tool, whose call that fits gets this result.
     /// Resolved by the runtime, never by the registry.
     Declared(String),
-    /// Recorded by the store with the call's result, so the note's version
-    /// is the node of that result and forks bind to it by position.
-    Note {
-        text: String,
-    },
     Read {
         source: ReadSource,
         offset: usize,
@@ -1257,8 +1242,6 @@ pub struct Outcome {
     /// What follows the output, in order: an image file read's picture, or
     /// the pictures, and the words between them, a client answered with.
     pub parts: Vec<crate::codec::Part>,
-    /// A carry-forward note to record with this result; empty text clears.
-    pub note: Option<String>,
     /// The call failed: an error, or a command that did not succeed. Set by
     /// whoever ran it, never read back from the output's text.
     pub failed: bool,
@@ -1288,7 +1271,6 @@ impl Outcome {
             artifacts: Vec::new(),
             files: Files::default(),
             parts: Vec::new(),
-            note: None,
             failed: false,
         }
     }
@@ -1310,9 +1292,9 @@ impl Registry {
     /// of them a bot may call is the bot's own, chosen at creation.
     pub fn all() -> Result<Self> {
         Self::new(if cfg!(unix) {
-            "echo,shell,read,write,edit,apply_patch,wait,history,note,web_search,web_fetch,write_stdin"
+            "echo,shell,read,write,edit,apply_patch,wait,history,web_search,web_fetch,write_stdin"
         } else {
-            "echo,read,write,edit,apply_patch,wait,history,note,web_search,web_fetch"
+            "echo,read,write,edit,apply_patch,wait,history,web_search,web_fetch"
         })
     }
     pub fn new(names: &str) -> Result<Self> {
@@ -1997,17 +1979,6 @@ impl Registry {
                     }
                 }
             }
-            Tool::Note => {
-                #[derive(serde::Deserialize)]
-                struct Note {
-                    text: String,
-                }
-                let args: Note = serde_json::from_str(args).map_err(invalid)?;
-                if args.text.len() > NOTE_BYTES {
-                    return fail("invalid_tool_arguments");
-                }
-                Prepared::Note { text: args.text }
-            }
             Tool::Wait => {
                 let args: Wait = serde_json::from_str(args).map_err(invalid)?;
                 if args.handles.is_empty()
@@ -2106,7 +2077,6 @@ impl Registry {
             Prepared::History { .. }
             | Prepared::HistorySearch { .. }
             | Prepared::HistoryAudit(_) => fail("history_requires_runtime"),
-            Prepared::Note { .. } => fail("note_requires_runtime"),
             Prepared::Declared(_) => fail("declared_requires_runtime"),
             Prepared::WebSearch(_) => fail("web_search_requires_runtime"),
             Prepared::WebFetch(url) => {
@@ -2272,7 +2242,6 @@ impl Registry {
             artifacts,
             files: Files::default(),
             parts: Vec::new(),
-            note: None,
             failed: !success,
         }
     }
@@ -2322,7 +2291,6 @@ impl Registry {
             artifacts,
             files: Files::default(),
             parts: Vec::new(),
-            note: None,
             failed: !success,
         }
     }

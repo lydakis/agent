@@ -796,7 +796,7 @@ impl Turn {
     }
 
     /// The bot's settings, with one cache lifetime for every request that
-    /// carries its pinned summary and note: the turn's model's, the
+    /// carries its pinned summary: the turn's model's, the
     /// summarizer's, which copies the turn's calls, and the fallback's,
     /// which answers them.
     fn with_one_lifetime(&self, record: &agent_runtime::store::Bot, model: &str) -> Settings {
@@ -4816,37 +4816,6 @@ impl Turn {
                         Err(error) => failure(error),
                     }
                 }
-                // Stored with the result: one commit records the note, its
-                // version node, and the tool outcome together.
-                Ok(Prepared::Note { text }) => {
-                    let outcome = Outcome {
-                        output: json!({"bytes":text.len(),"cleared":text.is_empty()}).to_string(),
-                        artifacts: Vec::new(),
-                        files: Files::default(),
-                        parts: Vec::new(),
-                        note: Some(text),
-                        failed: false,
-                    };
-                    // Clearing is always permitted. Nonempty notes must fit
-                    // before they become a mandatory prefix on future turns.
-                    if outcome.note.as_ref().is_some_and(|text| text.is_empty()) {
-                        outcome
-                    } else {
-                        let (bot, id, limit) =
-                            (self.bot.clone(), call.call_id.clone(), self.input_limit());
-                        match self
-                            .store
-                            .read("validate_note", move |db| {
-                                db.validate_note(&bot, turn, &id, &outcome, limit)?;
-                                Ok(outcome)
-                            })
-                            .await
-                        {
-                            Ok(outcome) => outcome,
-                            Err(error) => failure(error),
-                        }
-                    }
-                }
                 Ok(Prepared::Shell {
                     command,
                     timeout_ms,
@@ -6194,7 +6163,6 @@ impl Lifts {
             }
             Ok(
                 Prepared::Wait { .. }
-                | Prepared::Note { .. }
                 | Prepared::History { .. }
                 | Prepared::HistoryAudit(_)
                 | Prepared::HistorySearch { .. }
@@ -7456,7 +7424,6 @@ fn failure(error: Error) -> Outcome {
         artifacts: Vec::new(),
         files: Files::default(),
         parts: Vec::new(),
-        note: None,
         failed: true,
     }
 }

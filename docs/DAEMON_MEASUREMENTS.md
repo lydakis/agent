@@ -8607,3 +8607,51 @@ Store work per turn is the same on both sides, and the gate warned on no
 row. Every change is inside the run-to-run spread of earlier screens; the
 lifecycle row, which runs whole turns through the timed paths, is lower on
 head for CPU and level for latency and memory.
+
+## No carry-forward note (protocol 68, schema 96)
+
+The `note` tool and the pinned note are gone. What each path saves:
+
+- **A model call**: one tool schema fewer in every request that offered
+  `note`, and no pinned note item in the context prefix.
+- **The window state query**: one join fewer and two columns fewer per
+  row.
+- **A recorded call**: no note write at tool finish and no note field on
+  the event.
+- **The minimum context check**: no note bytes to add.
+
+Daemon and Sonny screen (`bench.perf_gate`), the Perf workflow's Linux
+runner, base main 987a276 against head cc89866, alternating rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 28.362 | 28.154 | -0.7% |
+| admission | burst submit p99, ms | 2.916 | 2.931 | +0.5% |
+| completion | release to terminal p99, ms | 8.191 | 8.035 | -1.9% |
+| footprint | idle RSS, MiB | 15.891 | 15.807 | -0.5% |
+| footprint | per idle bot, KiB | 1.816 | 1.816 | +0.0% |
+| footprint | RSS after a turn each, MiB | 29.48 | 27.754 | -5.9% |
+| footprint | CPU per turn, ms | 0.727 | 0.719 | -1.1% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 12.5 | 12.5 | +0.0% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 5.0 | 4.375 | -12.5% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 4.125 | 3.94 | -4.5% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 4.56 | 4.69 | +2.9% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 3094.5 | 2660.5 | -14.0% |
+| sonny | lookout note p95 at 100x10, ms | 2689.0 | 3185.0 | +18.4% |
+| sonny | quiet window CPU, ms/s | 0.79 | 0.96 | +21.5% |
+| sonny | quiet window reads, KiB/s | 0.25 | 0.25 | +0.0% |
+| sonny | quiet window requests, /s | 0.71 | 0.695 | -2.1% |
+| sonny | quiet window RSS, MiB | 24.2 | 24.05 | -0.6% |
+| sonny | sky replay CPU per 1k lines, ms | 9.69 | 9.855 | +1.7% |
+| sonny | sky replay RSS, MiB | 75.95 | 82.3 | +8.4% |
+| lifecycle | CPU, s | 0.38 | 0.37 | -2.6% |
+| lifecycle | p95 turn, ms | 698.841 | 654.826 | -6.3% |
+| lifecycle | peak RSS, MiB | 24.256 | 24.639 | +1.6% |
+
+Store work per turn is the same on both sides, and every daemon row is
+level or lower on head. The gate warned on two Sonny rows the change does
+not touch: Sonny's only change is one label in the transcript's match on
+tool names. The same lookout note p95 fell 14% at the other size in the
+same run, and quiet window CPU has swung by 16% and 33% on earlier screens
+with no Sonny change (above), so both are the runner's spread.

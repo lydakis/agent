@@ -584,7 +584,7 @@ fn print_flags(flags: &str) {
             ),
             "--approve" => (
                 "LIST",
-                "Tools whose calls need a verdict; default every tool but history, wait, note, echo, web_search",
+                "Tools whose calls need a verdict; default every tool but history, wait, echo, web_search",
             ),
             "--call" => ("ID", "The tool call to answer"),
             "--full" => ("", "Every call's whole arguments, not their preview"),

@@ -105,7 +105,6 @@ pub fn daemon_tool(name: &str) -> Option<(&'static str, &'static str)> {
         "write" | "edit" | "apply_patch" => ("file", "write"),
         "web_search" | "web_fetch" => ("web", "read"),
         "wait" | "history" | "echo" => ("agents", "read"),
-        "note" => ("agents", "write"),
         _ => return None,
     })
 }

@@ -158,7 +158,6 @@ def run_condition(binary, provider, family, url, key_env, env, model, condition,
                     cursors[name] = event['cursor']
                     if event['turn'] == turn and event['event'] == 'tool_started':
                         history += event['data']['name'] == 'history'
-                        results[name]['note_calls'] = results[name].get('note_calls', 0) + (event['data']['name'] == 'note')
                     if event['event'] == 'usage' and event['data'].get('purpose') == 'compaction':
                         for field in ('input_tokens', 'output_tokens', 'cached_input_tokens'):
                             key = 'compaction_' + field
@@ -214,7 +213,6 @@ def summarize(block):
             'final_honored_by_context': scores_by_context(b['final'] for b in bots if b['final']),
             'filler_honored_by_context': scores_by_context(f for b in bots for f in b['files']),
             'history_used_any_turn': f"{sum(1 for b in bots if b['history_calls'])}/{len(block['bots'])}",
-            'note_written_any_turn': f"{sum(1 for b in bots if b.get('note_calls'))}/{len(block['bots'])}",
             'compactions': sorted(len(b.get('compactions', [])) for b in bots),
             'final_missing_file': sum(1 for h in finals if h is None),
             'history_used_in_final': f"{sum(1 for b in bots if b['history_calls_final'])}/{len(block['bots'])}",
@@ -239,7 +237,7 @@ def main():
                              'small need less for the rule to leave the window')
     parser.add_argument('--binary', type=Path, default=Path('.local/target/release/agent'))
     parser.add_argument('--tools', default='shell,read,write,edit,history',
-                        help='the bots\' tool selection; add note to offer the carry-forward note')
+                        help='the bots\' tool selection')
     parser.add_argument('--compaction', action='store_true', help='create bots with the CLI default compaction text')
     parser.add_argument('--compact-at', type=int, default=None, help="each bot's compaction threshold, percent of its context budget")
     args = parser.parse_args()

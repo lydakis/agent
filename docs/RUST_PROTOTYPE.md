@@ -121,8 +121,7 @@ for starting a daemon: a running daemon is not checked against it, since every
 bot's shell inherits the daemon's environment. No other credential discovery happens. `--no-spawn` refuses to start a
 daemon. Default tools are `shell,write_stdin,read,write,wait,history` and the file editor
 the model's family is trained on, `apply_patch` (Responses) or `edit`, and
-`web_search` where the provider offers it, and `web_fetch`; `note`, the
-carry-forward note, is in the universe and chosen per bot.
+`web_search` where the provider offers it, and `web_fetch`.
 
 If concurrent clients race to start the daemon, losing `serve` processes exit
 75 for a store/socket ownership conflict. Their clients continue polling for
@@ -2435,8 +2434,8 @@ Stored history has no length limit. What a model sees per request is a
 context window: the newest whole turns of the bot's lineage that fit
 the full input allowance of `context_bytes` and `context_items`. Completion
 headroom can advance the compaction trigger; it does not reduce the hard input
-allowance. The allowance counts the encoded summary, retained prompts, carry-forward
-note, omission item, transcript items, and JSON separators. These are runtime
+allowance. The allowance counts the encoded summary, retained prompts,
+omission item, transcript items, and JSON separators. These are runtime
 conversation-byte/item bounds; system instructions, tool schemas, provider JSON
 framing, and model token limits are separate, not inferred from byte counts.
 A picture counts at its weight, not its size: four bytes for each token it is
@@ -2516,7 +2515,7 @@ contain at most 64 KiB of text. Optional `limit` (4–65,536 bytes) requests a
 smaller page.
 The runtime also limits the encoded tool result, including escaping and page
 metadata, to half the input-byte allowance remaining after the current turn
-and its mandatory prefix (summary, carry-forward note, and bare omission notice).
+and its mandatory prefix (summary and bare omission notice).
 Optional prompt previews do not consume this allowance; request fitting shrinks
 them only when needed to accommodate the result. Indexed turn totals and bounded
 prefix reads avoid constructing the context window or traversing omitted prompts
@@ -2721,7 +2720,7 @@ deleting the bot.
 ## Tools and validation scope
 
 The daemon registers `echo`, `shell`, `read`, `write`, `edit`, `apply_patch`,
-`wait`, `history`, `note`, `web_search`, `web_fetch` and `write_stdin`; each bot is created with the subset it may call (`run --tools`),
+`wait`, `history`, `web_search`, `web_fetch` and `write_stdin`; each bot is created with the subset it may call (`run --tools`),
 which is what its model is shown and what dispatch allows. The
 registry validates tool names and arguments before execution; a tool that fails
 (unknown tool, invalid arguments, missing file, ambiguous edit, output
@@ -3422,7 +3421,7 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   with that turn's model, effort and environment, its command rules as its
   round was announced: a shell command as a background one, a terminal
   under its handle, any other call's result as the command's; a call that
-  reads or changes its own turn (`wait`, `note`, `history`, `read` of a
+  reads or changes its own turn (`wait`, `history`, `read` of a
   result) fails `turn_ended`. `lifted_ended` `{call_id, handle, outcome}`
   marks the end of the wait: `allowed`, with `approvals` (and `waits_for:
   "answer"` for a call its client answers, which waits on for that answer),
@@ -3560,7 +3559,7 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
 
 The CLI turns a mode into a gate. `run --new --approval manual`, or
 `AGENT_APPROVAL=manual`, gates every tool of the new bot but `history`,
-`wait`, `note`, `echo` and `web_search`, tagged `manual`; `--approve LIST` picks the
+`wait`, `echo` and `web_search`, tagged `manual`; `--approve LIST` picks the
 tools instead, and `fork` takes both. `full`, the default, gates nothing.
 `auto` gates the same tools but `read`, tagged `auto`, with a 105 s
 expiry (the approver's 90 s review budget plus margin), and refuses with
@@ -4002,12 +4001,12 @@ about exact JSON wire size or allocator overhead.
 
 The request begins with one user item `[compaction summary, version N,
 covering turns A to B]` with the summary and verbatim prompts, the
-carry-forward note if any, the omission notice, then the window from the cut.
-Stable summary and note blocks precede the changing omission notice; Anthropic
+omission notice, then the window from the cut.
+The stable summary block precedes the changing omission notice; Anthropic
 gets explicit cache breakpoints on these blocks, alongside the existing system
 and automatic tail breakpoints (at most four in total). The summary prefix stays
-fixed until the next compaction; rewriting a carry-forward note or moving the
-window can still invalidate the later suffix. A summarizer failure leaves the
+fixed until the next compaction; moving the window can still invalidate the
+later suffix. A summarizer failure leaves the
 context view unchanged, preserves any billable usage, is kept as a durable
 `compaction_failed` event of the turn it ran in (or the turn it was started
 after) with its `error`, `detail` and the error's facts, and the turn
@@ -4080,24 +4079,10 @@ CLI ships a default compaction text for new bots and `--no-compaction`,
 `--compaction-instructions`, `--compaction-instructions-file`, and
 `--compaction-model` to change it. The daemon holds no such text.
 
-Nonempty note writes are checked against the encoded context envelope, including
-pinned summary metadata, the current turn, and the tool result. A write that cannot
-fit returns `note_context_limit` and preserves the previous note. Clearing the note
-always remains permitted. A provider output that already exceeds the current-turn
-limit can still fail that turn, but its rejected note cannot block later turns.
-
-`note` writes or replaces the bot's carry-forward note: up to 8 KiB of text
-the runtime places ahead of the conversation window in every request, so it
-stays in view when earlier turns leave the window. Empty text removes it.
-The note is recorded in the same commit as the tool's result and versioned
-by that result's node, so it belongs to the lineage like any item: a rewrite
-is a new version, a fork inherits the version that existed at its
-checkpoint, and deleting a bot frees only the versions on its exclusive
-suffix. The window shows it as one user item, `[carry-forward note, version
-N]` followed by the text, after the summary and before the context note
-and window's items, so it changes the request prefix only when the bot rewrites it. The
-daemon never writes a note itself and never tells the model to; whether
-the tool is offered is the client's choice at creation, like any tool.
+There is no carry-forward note. Schema 96 removed the `note` tool and the
+versions it kept, after models offered it never called it (docs/DAEMON_MEASUREMENTS.md,
+"The carry-forward note"). What a bot wrote with it stays in its `note`
+calls' arguments, in its history.
 
 `read` returns numbered lines with `offset`/`limit` paging and a 64 KiB result
 bound including paging notices (files up to 4 MiB). If the first requested line
@@ -4270,10 +4255,10 @@ trigger / 25% retained tail; changing them is a quality/cost decision, not a
 free speed improvement. Keeping more tail also means reaching the next trigger
 sooner. Byte percentages are runtime bounds, not estimates of model tokens.
 
-The current request order is stable tools/instructions, summary, carry-forward
-note, omission notice, and verbatim tail. Ordinary requests do not rewrite the
+The current request order is stable tools/instructions, summary, omission
+notice, and verbatim tail. Ordinary requests do not rewrite the
 summary, attach timestamps/fullness counters, or invent a new version. Forks
-restore the inherited context start. Anthropic summary and note blocks get
+restore the inherited context start. Anthropic summary blocks get
 explicit cache write points; system and automatic tail caching remain enabled.
 Responses gateways retain their current wire format. OpenAI's newer explicit
 cache controls need provider/model capability handling before being enabled
