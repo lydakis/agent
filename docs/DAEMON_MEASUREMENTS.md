@@ -8533,3 +8533,46 @@ MiB on head across the six runs, so the two ranges overlap. Lone submit
 CPU has spanned 31 to 43 ms on one binary in earlier screens. The
 lifecycle row, which runs whole turns, is lower on head for both CPU and
 memory.
+
+## Daemon stats: call timing, footprint, request holds (protocol 67, schema 94)
+
+Every answered call now carries `model_ms`, `first_token_ms` and
+`daemon_ms`, `stats` reports the daemon's process footprint and how long
+each kind of request held the service loop, and spend by model keeps its
+timed rounds. What each path pays:
+
+- **A provider call**: two `Instant` reads (the send and the start of
+  output, the latter once per call in the stream parser) and, on success,
+  five relaxed atomic adds for the `stats` totals.
+- **A turn's clock**: one `Instant` read where each round starts and after
+  each call returns, and one subtraction per call. No allocation.
+- **A request on the service loop**: one `Instant` read either side of
+  dispatch and an update of that op's entry in a map the loop alone
+  touches; the entry is allocated once per kind of request.
+- **A recorded call**: the same `turn_models` upsert and `turns` update as
+  before, with four and one more integer parameters. No new statement,
+  index or store job.
+- **`stats`**: the footprint is read off the loop (`getrusage`,
+  `/proc/self/status` or `proc_pidinfo`), beside the open-file count it
+  already read there.
+
+Daemon and Sonny screen (`bench.perf_gate`), the Perf workflow's Linux
+runner, base main e1fff4a against head 8122f35, alternating rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 37.008 | 36.259 | -2.0% |
+| admission | burst submit p99, ms | 4.368 | 4.396 | +0.6% |
+| completion | release to terminal p99, ms | 11.0 | 11.249 | +2.3% |
+| footprint | idle RSS, MiB | 15.928 | 16.275 | +2.2% |
+| footprint | per idle bot, KiB | 1.796 | 1.716 | -4.5% |
+| footprint | RSS after a turn each, MiB | 28.406 | 27.57 | -2.9% |
+| footprint | CPU per turn, ms | 1.001 | 1.002 | +0.1% |
+| lifecycle | CPU, s | 0.545 | 0.53 | -2.8% |
+| lifecycle | p95 turn, ms | 575.963 | 579.204 | +0.6% |
+| lifecycle | peak RSS, MiB | 23.938 | 23.975 | +0.2% |
+
+Store work per turn is the same on both sides, and the gate warned on no
+row. Every change is inside the run-to-run spread of earlier screens; the
+lifecycle row, which runs whole turns through the timed paths, is lower on
+head for CPU and level for latency and memory.
