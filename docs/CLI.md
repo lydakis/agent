@@ -475,9 +475,9 @@ after a restart, so a rotated key or a moved endpoint reaches it. A provider who
 as it was, with its pacing, connections and keys. A file that does not
 parse, a spec that does not bind (a key variable the daemon was not started
 with, say), and the removal of a provider an agent's model, fallback or
-compaction model, or an unfinished turn's own model, still names, or that
-binds such a provider to another API family (`provider_in_use`, naming
-them), are refused
+compaction model, or an unfinished turn's own model, or the daemon's
+`[fallbacks]`, still names, or that binds such a provider to another API
+family (`provider_in_use`, naming them), are refused
 whole, and the old set stays. `stats.provider_reload` says what the last
 change came to (`applied` with `added`, `removed` and `changed`, or
 `refused` with its error); new sessions' `ready.providers` show the set in

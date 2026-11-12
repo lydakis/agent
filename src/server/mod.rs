@@ -1968,6 +1968,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             again: false,
             refreshing: None,
             last: Value::Null,
+            fallbacks: config.fallbacks.clone(),
         })
     });
     let mut ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),

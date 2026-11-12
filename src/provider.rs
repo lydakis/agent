@@ -2120,6 +2120,16 @@ impl Fallbacks {
             false => self.find(path).map(String::as_str),
         }
     }
+    /// The entries whose fallback is on one of `providers`.
+    pub fn on(&self, providers: &[String]) -> serde_json::Map<String, Value> {
+        (self.0.iter())
+            .filter(|(_, model)| {
+                (model.split_once('/'))
+                    .is_some_and(|(provider, _)| providers.iter().any(|p| p == provider))
+            })
+            .map(|(pattern, model)| (pattern.clone(), json!(model)))
+            .collect()
+    }
     /// Each pattern and its fallback, as the daemon announces them.
     pub fn json(&self) -> Value {
         Value::Object(

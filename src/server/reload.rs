@@ -9,7 +9,11 @@
 //! set stays. Nothing runs between
 //! changes: the file is watched by the kernel (`file_watch`).
 use super::{Binder, ProviderSpec};
-use agent_runtime::{Error, Result, provider::Provider, store::Store};
+use agent_runtime::{
+    Error, Result,
+    provider::{Fallbacks, Provider},
+    store::Store,
+};
 use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
@@ -33,6 +37,9 @@ pub struct Reload {
     pub refreshing: Option<tokio::task::AbortHandle>,
     /// The last reload's outcome, for `stats`.
     pub last: Value,
+    /// The daemon's `[fallbacks]`, fixed until it restarts: a provider
+    /// one names stays in use.
+    pub fallbacks: Arc<Fallbacks>,
 }
 
 /// A new set of providers, built and checked, waiting to be swapped in.
@@ -78,8 +85,9 @@ impl Reload {
         self.building = true;
         let (config, binder) = (self.config.clone(), self.binder.clone());
         let (bound, bindings) = (self.specs.clone(), self.bindings.clone());
+        let fallbacks = self.fallbacks.clone();
         tokio::spawn(async move {
-            let built = build(config, binder, bound, bindings, current, store).await;
+            let built = build(config, binder, bound, bindings, current, store, &fallbacks).await;
             let _ = done.send(built);
         });
     }
@@ -114,6 +122,7 @@ async fn build(
     bindings: serde_json::Map<String, Value>,
     current: Arc<HashMap<String, Provider>>,
     store: Store,
+    fallbacks: &Fallbacks,
 ) -> Result<Option<Built>> {
     let config_for_read = config.clone();
     let specs = tokio::task::spawn_blocking(move || specs(&config_for_read))
@@ -200,6 +209,24 @@ async fn build(
     let mut unusable = removed.clone();
     unusable.extend(retyped);
     unusable.sort();
+    let named = fallbacks.on(&unusable);
+    if !named.is_empty() {
+        let shown: Vec<String> = (named.iter())
+            .map(|(pattern, model)| format!("{pattern} = {}", model.as_str().unwrap_or_default()))
+            .collect();
+        return Err(Error {
+            code: "provider_in_use".into(),
+            detail: Some(format!(
+                "the daemon's [fallbacks] send declined requests to {}: {}; change them and restart the daemon first",
+                unusable.join(", "),
+                shown.join(", "),
+            )),
+            facts: match json!({"providers": unusable, "fallbacks": named}) {
+                Value::Object(facts) => Some(Box::new(facts)),
+                _ => None,
+            },
+        });
+    }
     unused(&store, &unusable).await?;
     Ok(Some(Built {
         specs,
