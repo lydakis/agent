@@ -3631,7 +3631,7 @@ type Reads = (
 /// No mark when a history read failed, so the next count reads again.
 struct Counted {
     mark: Option<u64>,
-    read: Option<(status::Counts, Reads)>,
+    read: Option<((status::Counts, std::collections::HashSet<String>), Reads)>,
 }
 
 /// A mark of where the agents `pattern` names stand, as the daemon lists
@@ -4159,6 +4159,8 @@ struct App {
     /// How many of the project's agents each of `/status`'s groups lists,
     /// as its last read found: what the footer shows.
     counts: Option<status::Counts>,
+    /// The agents that read gave a row, which its counts count already.
+    status_bots: std::collections::HashSet<String>,
     /// The footer's own read of them, under way, and when the last began.
     counting: Option<tokio::task::JoinHandle<Option<Counted>>>,
     counted_at: Option<Instant>,
@@ -5072,11 +5074,13 @@ impl Fleet {
     }
 
     /// How many agents wait on the person here that `/status` lists no
-    /// row for: the leads followed and theirs, of other projects, and a
-    /// workflow's workers. Their questions are pinned in this window, so
-    /// its footer counts them beside `/status`'s own.
-    fn waiting_past_status(&self) -> usize {
+    /// row for (`listed`): the leads followed and theirs, of other
+    /// projects, and a workflow's workers. Their questions are pinned in
+    /// this window, so its footer counts them beside `/status`'s own. A
+    /// lead followed in the same folder has its own row, counted there.
+    fn waiting_past_status(&self, listed: &std::collections::HashSet<String>) -> usize {
         (self.needs.waiting())
+            .filter(|bot| !listed.contains(*bot))
             .filter(|bot| {
                 self.raised.contains(*bot)
                     || (workflow::worker_project(bot).is_some() && self.below(bot))
@@ -5857,6 +5861,7 @@ impl App {
             references: HashMap::new(),
             references_read: None,
             counts: None,
+            status_bots: std::collections::HashSet::new(),
             counting: None,
             counted_at: None,
             counted_mark: None,
@@ -8725,8 +8730,9 @@ impl App {
             && let Ok(Some(counted)) = job.await
         {
             self.counted_mark = counted.mark;
-            if let Some((counts, (latest, seen))) = counted.read {
+            if let Some(((counts, bots), (latest, seen))) = counted.read {
                 self.counts = Some(counts);
+                self.status_bots = bots;
                 self.status_read = latest;
                 self.asks_seen = seen;
             }
@@ -8772,7 +8778,10 @@ impl App {
             woken.notify_one();
             Some(Counted {
                 mark: read.whole.then_some(mark),
-                read: Some((status::counts(&read.rows), (latest, seen))),
+                read: Some((
+                    (status::counts(&read.rows), status::bots(&read.rows)),
+                    (latest, seen),
+                )),
             })
         }));
     }
@@ -10776,6 +10785,7 @@ impl App {
         )
         .await?;
         self.counts = Some(status::counts(&read.rows));
+        self.status_bots = status::bots(&read.rows);
         // The windows' names and the footer say what this read, as it is
         // newer than what they had. A running agent's question is read
         // from its last few items here, so its events keep theirs.
@@ -16232,7 +16242,8 @@ impl App {
         let counts = self.counts.unwrap_or_default();
         // And those whose questions this window shows that `/status` has
         // no row for: other projects' agents under the leads it follows.
-        let past = (self.fleet.as_ref()).map_or(0, Fleet::waiting_past_status);
+        let past =
+            (self.fleet.as_ref()).map_or(0, |fleet| fleet.waiting_past_status(&self.status_bots));
         let (working, waiting) = (counts.working, counts.needs_you + past);
         // Something new to answer beats the count a few times, reversed,
         // then it holds still (F12).
@@ -24559,17 +24570,22 @@ mod tests {
         let (client, events) = daemon_with_events(json!({}), |_| json!({})).await;
         let mut fleet = Fleet::in_memory(client.clone(), events, "home", "home.lead");
         fleet.raised.insert("shop.fix".into());
+        // A lead followed in the same folder: `/status` gives it a row.
+        fleet.raised.insert("home.lead.billing".into());
         let ask = |bot: &str| {
             json!({"event": "tool_started", "bot": bot, "turn": 3,
                 "data": {"name": "ask", "call_id": "q1"}})
         };
         fleet.needs.event(&ask("shop.fix"));
         fleet.needs.event(&ask("home.wf-1a2b3c4d-k1"));
+        fleet.needs.event(&ask("home.lead.billing"));
         // One the person no longer waits on here counts for nothing.
         fleet.needs.event(&ask("elsewhere.fix"));
         let mut app = app(client);
         app.bot = "home.lead".into();
         app.fleet = Some(fleet);
+        // Its row is the one `/status` counted, so it counts once.
+        app.status_bots = ["home.lead.billing".to_owned()].into();
         app.counts = Some(status::Counts {
             needs_you: 1,
             idle: 2,

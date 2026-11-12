@@ -304,6 +304,11 @@ fn tally(listed: &[&Row]) -> Counts {
     }
 }
 
+/// The agents `rows` lists, by their own names.
+pub fn bots(rows: &[Row]) -> std::collections::HashSet<String> {
+    rows.iter().map(|row| row.bot.clone()).collect()
+}
+
 /// See [`Card`].
 pub fn card(
     project: &str,
