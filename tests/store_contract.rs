@@ -12659,6 +12659,34 @@ fn a_turns_end_says_when_its_last_summary_did_not_apply() {
     // One recorded after its turn ended, by a summary started as it
     // ended, is that turn's event too.
     db.compaction_failed("Bob", turn, refused.clone()).unwrap();
+
+    // The bot keeps its newest refusal apart from the events retention
+    // prunes; a later failure of another kind lets it go.
+    let last = db
+        .begin(
+            "Bob",
+            "3",
+            "more",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(last, vec![assistant("done")], &[], None).unwrap();
+    db.finish(last, None).unwrap();
+    db.prune("Bob", 1).unwrap();
+    let left = db.events("Bob", 0, 100).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event"] == "compaction_failed")
+        .count();
+    assert_eq!(left, 0);
+    assert_eq!(db.refused_summary("Bob").unwrap(), Some(refused));
+    let other = json!({"error":"compaction_not_smaller","detail":"no smaller"});
+    db.compaction_failed("Bob", turn, other).unwrap();
+    assert_eq!(db.refused_summary("Bob").unwrap(), None);
 }
 
 #[test]

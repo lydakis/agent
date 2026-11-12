@@ -8537,10 +8537,11 @@ memory.
 ## Compaction failures kept with their turn (schema 94)
 
 A turn's end now reads its last compaction outcome, which is one probe of
-`events(turn, kind, id)`. A summary that is due first checks the bot's last
-refused summary, which is one probe of the new partial index
-`events_compaction_failed`. That index holds failure rows only, so no other
-event write touches it.
+`events(turn, kind, id)`. A summary that is due first reads the bot's last
+refused summary from its own row (`bots.refused_summary`, a primary-key
+read). Only a failed summary writes that column, so no other write touches
+it. The screen below ran while that check was a partial index on `events`;
+the row read that replaced it does less work.
 
 The Perf workflow's daemon screen (`bench.perf_gate`) compared this head
 against main on the CI runner:

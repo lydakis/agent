@@ -3986,8 +3986,10 @@ refused (`provider_refusal`) goes to the bot's fallback model, on the same
 request, as a refused turn's request does; refused there too, or with no
 fallback, the failure names the summary it would have extended (`base`),
 the summarizer's model and instructions (`setup`) and the `fallback_model`
-it had, and no summary is asked for unasked while the bot has those same
-three and its view fits: each would be billed and refused again. A
+it had. The bot keeps its newest refusal on its own row, so retention
+pruning the turn's events does not forget it, and no summary is asked for
+unasked while the bot has those same three and its view fits: each would
+be billed and refused again. A
 `compact` request, a view that no longer fits, a new summary, summarizer
 or fallback tries again. A `compact` request with nothing
 since the last summary fails `compaction_nothing_new`; the window's own overflow handling still bounds stored items. A

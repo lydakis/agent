@@ -2734,7 +2734,7 @@ impl Database {
                 budget_counts TEXT, depth INTEGER NOT NULL DEFAULT 0,
                 started_ms INTEGER, waiting_on TEXT, last_turn INTEGER, last_status TEXT,
                 last_started_ms INTEGER, last_finished_ms INTEGER, last_error TEXT,
-                configure_pending TEXT);
+                configure_pending TEXT, refused_summary TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -2846,8 +2846,6 @@ impl Database {
             CREATE INDEX IF NOT EXISTS events_bot_cursor ON events(bot,id);
             CREATE INDEX IF NOT EXISTS events_turn_kind_cursor ON events(turn,kind,id);
             CREATE INDEX IF NOT EXISTS events_kind_cursor ON events(kind,id);
-            CREATE INDEX IF NOT EXISTS events_compaction_failed ON events(bot,id)
-                WHERE kind='compaction_failed';
             CREATE INDEX IF NOT EXISTS events_message ON events(message) WHERE message IS NOT NULL;
             CREATE INDEX IF NOT EXISTS events_in_line ON events(bot,message)
                 WHERE turn IS NULL AND message IS NOT NULL;
@@ -8021,26 +8019,29 @@ impl Database {
             .conn
             .prepare_cached("SELECT running_turn FROM bots WHERE name=?")?
             .query_row([bot], |r| r.get(0))?;
+        // The bot keeps its newest failure if it was a refusal, apart from
+        // events that retention prunes, so pruning never asks again for a
+        // summary that would be refused again.
+        let refused = (data["error"] == "provider_refusal").then(|| data.to_string());
         let tx = self.conn.savepoint()?;
         event(&tx, bot, Some(turn), "compaction_failed", data)?;
+        tx.prepare_cached("UPDATE bots SET refused_summary=? WHERE name=?")?
+            .execute(params![refused, bot])?;
         if running != Some(turn) {
             retain_late(&tx, turn, bot)?;
         }
         tx.commit()?;
         Ok(())
     }
-    /// The data of the bot's newest `compaction_failed` event, if any.
-    /// Its own partial index holds only failures, by bot, so this is one
-    /// probe whatever other bots have failed.
-    pub fn last_compaction_failed(&self, bot: &str) -> Result<Option<Value>> {
+    /// The data of the bot's newest failed summary when that was a
+    /// refusal: one read of the bot's row.
+    pub fn refused_summary(&self, bot: &str) -> Result<Option<Value>> {
         let data: Option<String> = self
             .conn
-            .prepare_cached(
-                "SELECT data FROM events INDEXED BY events_compaction_failed
-                 WHERE kind='compaction_failed' AND bot=? ORDER BY id DESC LIMIT 1",
-            )?
+            .prepare_cached("SELECT refused_summary FROM bots WHERE name=?")?
             .query_row([bot], |r| r.get(0))
-            .optional()?;
+            .optional()?
+            .flatten();
         Ok(data.map(|data| serde_json::from_str(&data)).transpose()?)
     }
     /// A retry of a summary made after `turn` ended, as that turn's event.
@@ -17026,14 +17027,18 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             conn.execute_batch("ALTER TABLE turns ADD COLUMN error TEXT;")?;
         }
     }
+    // Schema 94: a bot keeps its newest failed summary when that was a
+    // refusal, apart from the events retention prunes. Earlier stores kept
+    // none, so a refused summary may be asked for once more.
     if from < 94 {
-        // 93 -> 94: a bot's last failed summary is found without walking
-        // other bots' failures. Only failures are in it, so writes of other
-        // events never touch it.
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS events_compaction_failed ON events(bot,id)
-                 WHERE kind='compaction_failed';",
+        let has: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='refused_summary')",
+            [],
+            |r| r.get(0),
         )?;
+        if !has {
+            conn.execute_batch("ALTER TABLE bots ADD COLUMN refused_summary TEXT;")?;
+        }
     }
 
     Ok(())

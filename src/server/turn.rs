@@ -2628,15 +2628,12 @@ impl Turn {
         let bot = self.bot.clone();
         let Some(failed) = self
             .store
-            .read("compaction_refused", move |db| {
-                db.last_compaction_failed(&bot)
-            })
+            .read("compaction_refused", move |db| db.refused_summary(&bot))
             .await?
         else {
             return Ok(false);
         };
-        Ok(failed["error"] == "provider_refusal"
-            && failed["base"] == json!(record.compaction)
+        Ok(failed["base"] == json!(record.compaction)
             && failed["setup"] == json!(record.summary_setup())
             && failed["fallback_model"] == json!(record.fallback))
     }
