@@ -1272,6 +1272,13 @@ impl Turn {
         if fits && !requested && now_ms() < accounting.summary_retry_at {
             return Ok(Compaction::Skipped);
         }
+        // Nor is one the summarizer refused on the summary the bot has now,
+        // and the fallback it has now, while the view fits: each would be
+        // billed and refused again. A client's request, a view that no
+        // longer fits, a new summary, summarizer or fallback tries again.
+        if fits && !requested && self.refused_before(record).await? {
+            return Ok(Compaction::Skipped);
+        }
         let _held = Held::from_now(&self.side.summary_ms);
         // Beside the call, a summary holds a copy's call and a request of
         // its own against the round limit. One a client asked for goes
@@ -1297,7 +1304,7 @@ impl Turn {
                 &mut spent,
                 tools,
                 (keep, keep_items),
-                false,
+                (false, requested),
                 sent,
             )
             .await?;
@@ -1506,6 +1513,9 @@ impl Turn {
         let Some(last) = LastCall::of(sent, true) else {
             return Ok(());
         };
+        if self.refused_before(record).await? {
+            return Ok(());
+        }
         let Some(share) = self
             .summary_bound(record, now.usage().bytes.max(sent.usage().bytes), tools)
             .filter(|share| record.left().holds(*share))
@@ -1609,7 +1619,7 @@ impl Turn {
                                 &mut accounting,
                                 &tools,
                                 keeps,
-                                false,
+                                (false, false),
                                 Some(sent),
                             )
                             .await
@@ -2014,7 +2024,7 @@ impl Turn {
     ) -> Result<Compaction> {
         let _held = Held::from_now(&self.side.summary_ms);
         match self
-            .plan(record, turn, accounting, tools, keeps, again, sent)
+            .plan(record, turn, accounting, tools, keeps, (again, false), sent)
             .await?
         {
             Some(mut planned) => {
@@ -2060,7 +2070,7 @@ impl Turn {
         accounting: &mut Accounting,
         tools: &serde_json::value::RawValue,
         (keep, keep_items): (i64, i64),
-        again: bool,
+        (again, asked): (bool, bool),
         sent: Option<Sent<'_>>,
     ) -> Result<Option<Planned<'_>>> {
         let limit = self.input_limit();
@@ -2074,6 +2084,16 @@ impl Turn {
             .await
         {
             Ok(Some(plan)) => plan,
+            // A summary a client asked for, with nothing new since the
+            // last one, did not apply either.
+            Ok(None) if asked => {
+                let error = Error::with(
+                    "compaction_nothing_new",
+                    "the history holds nothing since the last summary to summarize",
+                );
+                self.compaction_failed(turn, &error).await?;
+                return Ok(None);
+            }
             Ok(None) => return Ok(None),
             Err(error) if error.code == "compaction_span_limit" => {
                 self.compaction_failed(turn, &error).await?;
@@ -2095,17 +2115,11 @@ impl Turn {
                 }
             }
             found => {
-                let (error, detail) = match found {
-                    None => ("provider_unavailable", name),
-                    Some(_) => ("provider_family_mismatch", reference.as_str()),
+                let error = match found {
+                    None => Error::with("provider_unavailable", name),
+                    Some(_) => Error::with("provider_family_mismatch", reference.as_str()),
                 };
-                self.hub
-                    .live(
-                        &self.bot,
-                        json!({"event":"compaction_failed","bot":self.bot,"turn":turn,"durable":false,
-                            "error":error,"detail":detail}),
-                    )
-                    .await?;
+                self.compaction_failed(turn, &error).await?;
                 return Ok(None);
             }
         };
@@ -2274,15 +2288,18 @@ impl Turn {
                         false => Err(error),
                     };
                 }
-                Err(error) => {
+                Err(mut error) => {
                     accounting.copied = None;
-                    self.hub
-                        .live(
-                            &self.bot,
-                            json!({"event":"compaction_failed","bot":self.bot,"turn":turn,"durable":false,
-                                "error":error.code,"detail":error.detail}),
-                        )
-                        .await?;
+                    // A refusal names the summary it would have extended, the
+                    // summarizer's setup and the fallback it went to, if any,
+                    // so the next summary is asked for only once one changes.
+                    if error.code == "provider_refusal" {
+                        let facts = error.facts.get_or_insert_default();
+                        facts.insert("base".into(), json!(record.compaction));
+                        facts.insert("setup".into(), json!(record.summary_setup()));
+                        facts.insert("fallback_model".into(), json!(record.fallback));
+                    }
+                    self.compaction_failed(turn, &error).await?;
                     return Ok(Summary::Skipped);
                 }
             };
@@ -2328,14 +2345,10 @@ impl Turn {
             if smaller {
                 plan.summary_bytes = (plan.summary_bytes / 2).max(1);
             }
-            self.hub
-                .live(
-                    &self.bot,
-                    json!({"event":"compaction_failed","bot":self.bot,"turn":turn,"durable":false,
-                        "error":invalid.code,"detail":invalid.detail,"fallback":true,
-                        "summary_bytes":plan.summary_bytes}),
-                )
-                .await?;
+            // Kept as any failure is, saying a request of its own follows.
+            let invalid =
+                invalid.facts(json!({"fallback":true,"summary_bytes":plan.summary_bytes}));
+            self.compaction_failed(turn, &invalid).await?;
         };
         let mut request = choice.event();
         request["beside"] = accounting.beside.into();
@@ -2646,13 +2659,39 @@ impl Turn {
             .await
     }
 
+    /// Whether the bot's newest failed summary was refused on the summary
+    /// it has now, by the summarizer it has now (model and instructions)
+    /// and with the fallback it has now: a summary is then not asked for
+    /// unless it must be.
+    async fn refused_before(&self, record: &agent_runtime::store::Bot) -> Result<bool> {
+        let bot = self.bot.clone();
+        let Some(failed) = self
+            .store
+            .read("compaction_refused", move |db| db.refused_summary(&bot))
+            .await?
+        else {
+            return Ok(false);
+        };
+        Ok(failed["base"] == json!(record.compaction)
+            && failed["setup"] == json!(record.summary_setup())
+            && failed["fallback_model"] == json!(record.fallback))
+    }
+
+    /// A summary that did not apply, kept as `turn`'s event, with the
+    /// error's facts: the turn's `turn_finished` says so when it was the
+    /// turn's last summary.
     async fn compaction_failed(&self, turn: i64, error: &Error) -> Result<()> {
-        self.hub
-            .live(
-                &self.bot,
-                json!({"event":"compaction_failed","bot":self.bot,
-            "turn":turn,"durable":false,"error":error.code,"detail":error.detail}),
-            )
+        let mut data = json!({"error":error.code,"detail":error.detail});
+        if let (Some(data), Some(facts)) = (data.as_object_mut(), error.facts.as_deref()) {
+            for (key, value) in facts {
+                data.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+        let bot = self.bot.clone();
+        self.store
+            .op("compaction_failed", move |db| {
+                db.compaction_failed(&bot, turn, data)
+            })
             .await
     }
 
@@ -4021,12 +4060,13 @@ impl Turn {
                     }
                     let credit = credit.and_then(|token| token.as_str().map(str::to_owned));
                     // A classifier declined: the bot's fallback model answers
-                    // this request, on the same body. The refusal's credit
+                    // this request, on the same body, a summary's as a
+                    // turn's, since a summary restates the work the
+                    // classifier read. The refusal's credit
                     // prices the retry as if it had run there all along,
                     // when it goes to the endpoint that declined it.
                     if fallback.is_none()
                         && error.code == "provider_refusal"
-                        && matches!(body, Body::Window(_))
                         && let Some(reference) = &record.fallback
                     {
                         let reference = reference.clone();
@@ -7455,7 +7495,8 @@ fn summarizer(record: &agent_runtime::store::Bot) -> String {
 /// A call another model may have answered on another provider binding: a
 /// summary, charged to the turn that needed it, or a refused request's
 /// fallback. Name both, as a server-side fallback names its attempts, so
-/// the call is priced at that model's rates.
+/// the call is priced at that model's rates. An attempt already named,
+/// as a fallback's is, keeps its provider.
 fn priced_at(
     mut usage: agent_runtime::provider::Usage,
     provider: &str,
@@ -7473,7 +7514,7 @@ fn priced_at(
         });
     }
     for attempt in &mut usage.models {
-        attempt.provider = Some(provider.to_owned());
+        attempt.provider.get_or_insert_with(|| provider.to_owned());
     }
     usage
 }

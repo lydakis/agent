@@ -53,6 +53,87 @@ class AnthropicCompactionTests(ModelFixture):
         self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
         self.assertFalse(any(m.get('event') == 'compaction_failed' for m in client.saved))
 
+    def refusing_client(self, **create):
+        """A bot whose summaries the classifier declines on its own model."""
+        self.model.refuse_summaries = {'synthetic-claude'}
+        client = Client(self.binary, self.path / 'state.sqlite', self.url,
+                        tools='echo,shell', provider='anthropic', family='anthropic',
+                        model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
+                        env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
+                        settings={'context_bytes': 8192, 'compact_at': 50})
+        self.addCleanup(client.close)
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
+                                               compaction_instructions='Summarize.', effort='low',
+                                               **create))
+        return client
+
+    def summaries(self):
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        return [r['model'] for r in requests if is_summary(r)]
+
+    def test_a_refused_summary_goes_to_the_fallback_model(self):
+        client = self.refusing_client(fallback='anthropic/synthetic-claude-2')
+        for n in range(7):
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'{n}:' + 'x' * 500)['result']['message']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # The same summary request, answered on the fallback model, as a
+        # turn's refused request is.
+        summaries = self.summaries()
+        self.assertEqual(summaries[:2], ['synthetic-claude', 'synthetic-claude-2'])
+        self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
+        retried = [m['data'] for m in client.saved if m.get('event') == 'retry']
+        self.assertIn(('provider_refusal', 'anthropic/synthetic-claude-2'),
+                      [(r['error'], r.get('fallback')) for r in retried])
+        self.assertFalse(any(m.get('event') == 'compaction_failed' for m in client.saved))
+
+    def test_a_refused_summary_is_kept_with_its_turn_and_not_asked_for_again_unasked(self):
+        client = self.refusing_client()
+        failed = None
+        for n in range(10):
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'{n}:' + 'x' * 500)['result']['message']
+            data = client.finished(turn)['data']
+            self.assertEqual(data['status'], 'completed')
+            failed = [m for m in client.saved if m.get('event') == 'compaction_failed']
+            if failed:
+                break
+        # Kept with the turn it ran in, whose end says it did not apply,
+        # with what the refusal said and what it was refused on.
+        [failure] = failed
+        self.assertEqual(failure['turn'], turn)
+        self.assertIn('cursor', failure)
+        self.assertEqual(data['compaction'], failure['data'])
+        self.assertEqual((data['compaction']['error'], data['compaction']['category'],
+                          data['compaction']['base'], data['compaction']['fallback_model']),
+                         ('provider_refusal', 'reasoning_extraction', None, None))
+        self.assertIsInstance(data['compaction']['setup'], int)
+        self.assertEqual(self.summaries(), ['synthetic-claude'])
+        # Unasked, it is not asked for again on the same summary and
+        # fallback while the view fits: each would be billed and refused.
+        for n in range(2):
+            turn = client.request('submit', bot='Bob', request_id=f'more{n}', prompt=f'more{n}')['result']['message']
+            self.assertNotIn('compaction', client.finished(turn)['data'])
+        self.assertEqual(self.summaries(), [])
+        # Asked for by name, it is tried in the next turn, which says so.
+        self.assertFalse(client.request('compact', bot='Bob')['result']['duplicate'])
+        turn = client.request('submit', bot='Bob', request_id='asked', prompt='after')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['compaction']['error'], 'provider_refusal')
+        self.assertEqual(self.summaries(), ['synthetic-claude'])
+        # New summary instructions are a summarizer that has not refused,
+        # so it is asked unasked, once.
+        client.request('configure', bot='Bob', compaction_instructions='Summarize again.')
+        for n in range(2):
+            turn = client.request('submit', bot='Bob', request_id=f'setup{n}', prompt=f'setup{n}')['result']['message']
+            client.finished(turn)
+        self.assertEqual(self.summaries(), ['synthetic-claude'])
+        # A fallback given since tries again, and answers.
+        client.request('configure', bot='Bob', fallback='anthropic/synthetic-claude-2')
+        turn = client.request('submit', bot='Bob', request_id='fallback', prompt='last')['result']['message']
+        self.assertNotIn('compaction', client.finished(turn)['data'])
+        self.assertEqual(self.summaries()[:2], ['synthetic-claude', 'synthetic-claude-2'])
+        self.assertIsNotNone(client.request('inspect', bot='Bob')['result']['compaction'])
+
     def test_an_hour_long_cache_pins_the_summary_for_an_hour_too(self):
         # A pinned block at five minutes ahead of the request's own hour
         # breakpoint is refused, so every turn after the first summary
@@ -193,7 +274,10 @@ class CompactionTests(ModelFixture):
                              'completed')
         # The last of these ends past the threshold and summarizes after it
         # reports. Let that summary land before counting the large turns'.
-        client.saved = [m for m in client.saved if m.get('event') != 'compacted']
+        # It may have landed already; earlier summaries made in turns are
+        # set aside so they are not taken for it.
+        client.saved = [m for m in client.saved if m.get('event') != 'compacted'
+                        or ((m.get('data') or {}).get('request') or {}).get('after_turn') is True]
         client.summarized('Bob')
         previous = client.request('inspect', bot='Bob')['result']['compaction']
         self.assertIsNotNone(previous)
@@ -212,7 +296,7 @@ class CompactionTests(ModelFixture):
         self.assertEqual(sum(is_summary(r) for r in requests), 5)
         self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':'), ensure_ascii=False).encode()) - 2
                             <= 4096 for r in requests))
-        self.assertFalse(any(m.get('event') == 'compaction_failed' and m.get('error') == 'compaction_context_limit'
+        self.assertFalse(any(m.get('event') == 'compaction_failed' and m['data']['error'] == 'compaction_context_limit'
                              for m in client.saved))
 
     def test_output_cap_advances_compaction_without_reducing_the_input_envelope(self):
@@ -248,7 +332,7 @@ class CompactionTests(ModelFixture):
             self.assertTrue(all('error' not in r and r['text'] for r in results), results)
             self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':'), ensure_ascii=False).encode()) - 2
                                 <= 4096 for r in requests))
-        self.assertFalse(any(m.get('event') == 'compaction_failed' and m.get('error') == 'compaction_context_limit'
+        self.assertFalse(any(m.get('event') == 'compaction_failed' and m['data']['error'] == 'compaction_context_limit'
                              for m in client.saved))
 
     def test_nonshrinking_summary_is_billed_without_installing_it(self):
@@ -262,7 +346,7 @@ class CompactionTests(ModelFixture):
         bot = client.request('inspect', bot='Bob')['result']
         self.assertIsNone(bot['compaction'])
         self.assertEqual(bot['tokens_used'], 440)  # three answers plus the rejected summary
-        self.assertTrue(any(m.get('event') == 'compaction_failed' and m.get('error') == 'compaction_not_smaller'
+        self.assertTrue(any(m.get('event') == 'compaction_failed' and m['data']['error'] == 'compaction_not_smaller'
                             for m in client.saved))
 
     def test_escaped_summary_cannot_exceed_the_encoded_prefix_budget(self):
@@ -276,7 +360,7 @@ class CompactionTests(ModelFixture):
         bot = client.request('inspect', bot='Bob')['result']
         self.assertIsNone(bot['compaction'])
         self.assertEqual(bot['tokens_used'], 440)
-        self.assertTrue(any(m.get('event') == 'compaction_failed' and m.get('error') == 'compaction_context_limit'
+        self.assertTrue(any(m.get('event') == 'compaction_failed' and m['data']['error'] == 'compaction_context_limit'
                             for m in client.saved))
 
     def test_small_items_trigger_compaction_below_the_byte_threshold(self):
@@ -493,7 +577,7 @@ class CompactionTests(ModelFixture):
         bot = client.request('inspect', bot='Bob')['result']
         self.assertEqual(bot['tokens_used'], 440)
         self.assertIsNone(bot['compaction'])
-        self.assertTrue(any(m.get('event') == 'compaction_failed' and m.get('error') == 'empty_summary'
+        self.assertTrue(any(m.get('event') == 'compaction_failed' and m['data']['error'] == 'empty_summary'
                             for m in client.saved))
 
     def test_forks_compact_shared_cuts_and_keep_their_own_summary(self):
@@ -1151,7 +1235,7 @@ class SummaryCopyTests(ModelFixture):
         self.assertIsNotNone(bot['compaction'])
         self.assertEqual(bot['tokens_used'], 550)  # three answers and both summaries
         failed = [m for m in client.saved if m.get('event') == 'compaction_failed']
-        self.assertEqual([(m['error'], m.get('fallback')) for m in failed], [('compaction_tool_call', True)])
+        self.assertEqual([(m['data']['error'], m['data'].get('fallback')) for m in failed], [('compaction_tool_call', True)])
         self.assertEqual(self.events(client, 'tool_started'), [])
         # The event names the request whose summary went in.
         compacted, = self.events(client, 'compacted')

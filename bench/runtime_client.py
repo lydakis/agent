@@ -133,7 +133,7 @@ class Client:
                 return False
             if message.get('event') == 'compaction_failed':
                 # One a request of its own follows is not the end of it.
-                return not message.get('fallback')
+                return message['data'].get('fallback') is not True
             request = (message.get('data') or {}).get('request') or {}
             return message.get('event') == 'compacted' and request.get('after_turn') is True
         message = self.receive(landed, timeout)
