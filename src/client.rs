@@ -1115,7 +1115,8 @@ impl Start {
 /// store, with the start flags this command was given over it (a
 /// `--provider` list replaces the pinned one whole).
 fn pinned(options: &Options) -> Result<agent_client::config::Pins> {
-    let mut pins = agent_client::config::read_pins(&options.store).map_err(config_error)?;
+    let mut pins =
+        agent_client::config::read_pins(&pinned_store(options)?).map_err(config_error)?;
     if options.providers_explicit {
         pins.provider = Some(options.providers.join(" "));
     }
@@ -1125,6 +1126,12 @@ fn pinned(options: &Options) -> Result<agent_client::config::Pins> {
         }
     }
     Ok(pins)
+}
+
+/// The store whose daemon `options` start, by its real path, as the daemon
+/// and its sandboxes name it: every name for one store shares its pins.
+fn pinned_store(options: &Options) -> Result<PathBuf> {
+    Ok(agent_client::socket::canonical_store(&options.store)?)
 }
 
 /// A config file's error as this agent's, its code kept.
@@ -1199,8 +1206,9 @@ fn spawn_daemon(
     // what was pinned goes over the person's `[daemon]` limits, worked out
     // for this machine.
     let given = options.providers_explicit || !options.daemon_flags.is_empty();
-    if given && agent_client::config::read_pins(&options.store).ok() != Some(start.pins.clone()) {
-        agent_client::config::write_pins(&options.store, &start.pins).map_err(config_error)?;
+    let store = pinned_store(options)?;
+    if given && agent_client::config::read_pins(&store).ok() != Some(start.pins.clone()) {
+        agent_client::config::write_pins(&store, &start.pins).map_err(config_error)?;
     }
     let mut limits = config()?.daemon;
     limits.extend(start.pins.daemon.clone());

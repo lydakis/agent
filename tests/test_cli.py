@@ -1253,10 +1253,31 @@ class SocketAndCliTests(ModelFixture):
         # though it is outside the bot's folder.
         self.assertEqual(ran.stdout.strip(), str(temp))
         self.assertTrue((temp / 'wrote').exists())
-        for refused in ('AGENT_STORE=x', 'TMPDIR=relative', 'NO-NAME=1', 'NOVALUE'):
+        for refused in (['AGENT_STORE=x'], ['TMPDIR=relative'], ['NO-NAME=1'], ['NOVALUE'], ['TMPDIR=/a', 'TMPDIR=/b']):
+            flags = [part for one in refused for part in ('--shell-set', one)]
             usage = self.agent('serve', '--store', str(self.path / 'other.sqlite'), '--provider', f'openai=responses,{self.url}',
-                               '--shell-set', refused, check=False)
+                               *flags, check=False)
             self.assertEqual(json.loads(usage.stderr)['error'], 'usage', refused)
+
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_bot_whose_folder_holds_the_store_cannot_write_its_pins(self):
+        daemon = SocketClient(self.binary, self.store, self.url, 'shell', env=clean_env())
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Writer', workspace=str(self.path), settings={'sandbox': 'workspace-write'})
+        pins = Path(f'{self.store}.daemon.toml')
+        write = 'printf \'provider = "x"\\n\' > state.sqlite.daemon.toml 2>/dev/null || echo kept'
+        for exists in (False, True):
+            if exists:
+                # What a sandbox kept from being made may still be its empty
+                # placeholder, which a start writing pins takes away too.
+                if pins.is_dir():
+                    pins.rmdir()
+                pins.write_text('provider = "openai"\n')
+            ran = subprocess.run([str(self.binary), 'sandbox', '--store', str(self.store), '--socket', str(daemon.socket_path),
+                                  '--bot', 'Writer', '--', '/bin/sh', '-c', write],
+                                 env=clean_env(), capture_output=True, text=True, timeout=30, cwd=self.path)
+            self.assertEqual((ran.returncode, ran.stdout), (0, 'kept\n'), ran.stderr)
+        self.assertEqual(pins.read_text(), 'provider = "openai"\n')
 
     @unittest.skipUnless(shutil.which('bwrap'), 'placeholders are bubblewrap\'s')
     def test_a_lent_sandbox_s_placeholders_stay_while_any_command_mounts_them(self):

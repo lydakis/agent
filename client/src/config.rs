@@ -331,7 +331,9 @@ pub struct Pins {
     pub daemon: BTreeMap<String, String>,
 }
 
-/// Where the start flags of the daemon of `store` are pinned.
+/// Where the start flags of the daemon of `store` are pinned: `store` as
+/// the daemon names it, by its real path, so every name for one store
+/// finds the same pins.
 pub fn pins_path(store: &Path) -> PathBuf {
     let mut path = store.as_os_str().to_owned();
     path.push(".daemon.toml");
@@ -342,6 +344,11 @@ pub fn pins_path(store: &Path) -> PathBuf {
 /// them. A file that does not read is refused by name, as `config.toml`.
 pub fn read_pins(store: &Path) -> Result<Pins, String> {
     let path = pins_path(store);
+    // Where none is pinned, a sandbox running now may hold an empty
+    // folder in its place, so no command of its makes one.
+    if is_placeholder(&path) {
+        return Ok(Pins::default());
+    }
     let text = match std::fs::read_to_string(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Pins::default()),
         Err(error) => return Err(format!("config_unreadable: {}: {error}", path.display())),
@@ -364,6 +371,13 @@ pub fn read_pins(store: &Path) -> Result<Pins, String> {
         provider: config.provider,
         daemon: config.daemon,
     })
+}
+
+/// Whether `path` is an empty folder: what a sandbox mounts over a file
+/// it keeps from being made.
+fn is_placeholder(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|found| found.is_dir())
+        && std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 /// Write `pins` beside `store`, the daemon's user's alone, whole or not
@@ -400,6 +414,9 @@ pub fn write_pins(store: &Path, pins: &Pins) -> Result<(), String> {
         .mode(0o600)
         .open(&aside)
         .and_then(|mut file| file.write_all(text.as_bytes()));
+    if is_placeholder(&path) {
+        let _ = std::fs::remove_dir(&path);
+    }
     if let Err(error) = written.and_then(|()| std::fs::rename(&aside, &path)) {
         let _ = std::fs::remove_file(&aside);
         return Err(unwritable(error));
@@ -2632,6 +2649,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("state.sqlite");
+        assert_eq!(read_pins(&store).unwrap(), Pins::default());
+        // A sandbox's placeholder where none is pinned pins nothing, and
+        // gives way to pins written.
+        std::fs::create_dir(pins_path(&store)).unwrap();
         assert_eq!(read_pins(&store).unwrap(), Pins::default());
         let pins = Pins {
             provider: Some("openai=responses,http://127.0.0.1:1/v1 \"odd\"".into()),
