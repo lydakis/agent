@@ -425,9 +425,9 @@ protocol, `start` still prints its ready line and then fails with
 one. An older one that names its pid is replaced instead, by every command
 that may start the daemon (not with `--no-spawn`, and not from inside a bot's
 turn, where `AGENT_BOT_ID` is set, since that turn is one it would wait on):
-it is asked to shut down with a 2-minute grace, so running turns park at their
-next boundary while none starts, or sent SIGTERM when it refuses that request, as daemons
-before 0.6.0 do. This `agent`'s daemon starts at once (`serve --await-owner`)
+it is asked to shut down at once, as `shutdown` without `--grace` asks, so
+its running turns park where they are and the new daemon continues them, or
+sent SIGTERM when it refuses that request, as daemons before 0.6.0 do. This `agent`'s daemon starts at once (`serve --await-owner`)
 and waits on the store and socket the older one holds: the kernel hands them
 over the moment it exits, so a daemon anything else starts meanwhile (a
 window of the older build that lost its connection) is refused

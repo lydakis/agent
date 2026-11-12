@@ -944,17 +944,12 @@ fn kept(error: Error, why: &str) -> Error {
     }
 }
 
-/// How long an older daemon may drain when this agent replaces it: nothing
-/// new starts on it, its running turns park at their next boundary, and
-/// what still runs then parks where it is (a daemon before protocol 36
-/// lets turns finish and ends the rest as interrupted). Kubernetes and
-/// systemd give a stopping service a bounded grace in the same way.
-const REPLACE_GRACE: Duration = Duration::from_secs(120);
-
 /// Replace the older daemon `error` found on this agent's socket with one
 /// of this agent's own, and connect to it. The older one is asked to stop
-/// once its running turns end or `REPLACE_GRACE` passes, and this agent's
-/// daemon starts at once, waiting on the store for it: the kernel hands
+/// now, as `shutdown` with no grace stops it: its running turns park where
+/// they are, their unanswered calls answered `daemon_shutdown`, and the new
+/// daemon continues them (a daemon before protocol 36 ends them
+/// interrupted). This agent's daemon starts at once, waiting on the store for it: the kernel hands
 /// the store over the moment the older one exits, so nothing else that
 /// starts a daemon then (a window of the older build that lost its
 /// connection) can take it in between. The store keeps every chat, and
@@ -965,10 +960,9 @@ fn replace_older(error: &Error, options: &Options, start: &Start) -> Result<Conn
         return Err(error.clone());
     };
     let socket = &options.socket;
-    let grace_ms = REPLACE_GRACE.as_millis() as u64;
     // Daemons since 0.6.0 take shutdown with a grace; an older one refuses
     // the field, or does not answer in time, and is sent SIGTERM, which
-    // every one honours.
+    // every one honors.
     let asked = match Connection::greeted_until(socket, Instant::now() + STARTUP_TIMEOUT) {
         // Another client replaced it first: its daemon is up or coming.
         Ok(again) if again.ready["pid"].as_u64() != Some(pid as u64) => {
@@ -980,7 +974,7 @@ fn replace_older(error: &Error, options: &Options, start: &Start) -> Result<Conn
             .get_ref()
             .set_read_timeout(Some(STARTUP_TIMEOUT))
             .map_err(Error::from)
-            .and_then(|()| older.request("shutdown", json!({"grace_ms": grace_ms}))),
+            .and_then(|()| older.request("shutdown", json!({"grace_ms": 0}))),
         Err(error) => Err(error),
     };
     if asked.is_err() {
@@ -988,9 +982,8 @@ fn replace_older(error: &Error, options: &Options, start: &Start) -> Result<Conn
     }
     // Its wait outlasts this one's, so it still takes the store when the
     // older daemon exits just as this agent stops waiting.
-    let draining = REPLACE_GRACE + SHUTDOWN_TIMEOUT;
-    let mut started = spawn_daemon(options, start, Some(draining + STARTUP_TIMEOUT))?;
-    await_exit_while(pid, draining, &mut started)?;
+    let mut started = spawn_daemon(options, start, Some(SHUTDOWN_TIMEOUT + STARTUP_TIMEOUT))?;
+    await_exit_while(pid, SHUTDOWN_TIMEOUT, &mut started)?;
     started.ready(options, Instant::now() + STARTUP_TIMEOUT)
 }
 

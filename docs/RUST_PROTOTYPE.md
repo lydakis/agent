@@ -1209,7 +1209,8 @@ wants to observe. `ready` carries the protocol version, and the CLI and
 `daemon_protocol_mismatch`: the daemon and its clients ship together, and
 none keeps an earlier protocol working. `agent start` and `agent run` never
 start a second daemon for the same socket: they refuse a newer one, and
-replace an older one once its running turns end (docs/CLI.md).
+replace an older one at once, its running turns continuing on the new one
+(docs/CLI.md).
 
 `agent shutdown` returns once the daemon process has exited, so a caller may
 copy or reopen the store: the daemon answers the request first, then parks
