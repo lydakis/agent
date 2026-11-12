@@ -11554,7 +11554,8 @@ impl Database {
     }
     /// A turn as a client's `wait` reports it: its outcome once finished,
     /// its view marked `pending` while it runs, or its view with
-    /// `turn_result_pruned` once retention removed how it ended.
+    /// `pruned` once retention removed how it ended. A failed turn keeps the
+    /// error its row saved; any other says `turn_result_pruned`.
     pub fn turn_answer(&self, name: &str, turn: i64) -> Result<Value> {
         let mut view = self.turn_view(name, turn)?;
         match self.outcome_of(view.clone(), turn) {
@@ -11564,8 +11565,11 @@ impl Database {
                 Ok(view)
             }
             Err(error) if error.code == "turn_result_pruned" => {
-                view["error"] = json!(error.code);
-                view["detail"] = json!("its outcome was pruned");
+                view["pruned"] = json!(true);
+                if view.get("error").is_none_or(Value::is_null) {
+                    view["error"] = json!(error.code);
+                    view["detail"] = json!("its outcome was pruned");
+                }
                 Ok(view)
             }
             Err(error) => Err(error),

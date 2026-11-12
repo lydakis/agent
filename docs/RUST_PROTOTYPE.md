@@ -2609,7 +2609,8 @@ deleted once idle:
   reply and the `reply` a `prompts` read of the next turn carries are
   unaffected too, and read it by key rather than searching events. Schema 70
   adds it, found for finished turns from the events retention had left. New `wait` calls for an expired
-  turn outcome return the turn's view with `error: turn_result_pruned`; they
+  turn outcome return the turn's view with `pruned: true` and, unless the
+  turn failed and its row kept that error, `error: turn_result_pruned`; they
   never report an empty success.
   On a pruning notice, `agent run` and `agent follow` reconcile their selected
   turn through a zero-timeout `wait`, so retries of expired turns exit with that error

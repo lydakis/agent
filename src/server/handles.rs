@@ -581,7 +581,7 @@ impl Handles {
                 {
                     Ok(answer) if answer["pending"] == true => None,
                     Ok(answer) => {
-                        let durable = answer["error"] != "turn_result_pruned";
+                        let durable = answer["pruned"] != true;
                         Some((answer, durable))
                     }
                     Err(error) => Some((failed(&error), false)),

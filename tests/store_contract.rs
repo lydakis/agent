@@ -17832,6 +17832,25 @@ fn a_request_declined_partway_through_its_answer_keeps_what_it_sent() {
     let done = &db.turns("Bob", 0, None, 8, false).unwrap()["turns"][1];
     assert_eq!(done["status"], "completed");
     assert!(done.get("error").is_none());
+    // Once retention takes its events, a waiter still reads how it failed,
+    // and a completed turn says its outcome was pruned.
+    converse(&mut db, "Bob", 9);
+    db.prune("Bob", 1).unwrap();
+    let pruned = db.turn_answer("Bob", turn).unwrap();
+    assert_eq!(
+        (&pruned["pruned"], &pruned["error"], &pruned["explanation"]),
+        (
+            &json!(true),
+            &json!("provider_refusal"),
+            &json!("Declined.")
+        )
+    );
+    let completed = done["turn"].as_i64().unwrap();
+    let pruned = db.turn_answer("Bob", completed).unwrap();
+    assert_eq!(
+        (&pruned["pruned"], &pruned["error"]),
+        (&json!(true), &json!("turn_result_pruned"))
+    );
     // Declined before its answer began: left out, and the row says so.
     let turn = db
         .begin(
