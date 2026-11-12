@@ -403,6 +403,9 @@ pub fn write_pins(store: &Path, pins: &Pins) -> Result<(), String> {
             text.push_str(&format!("{key} = {}\n", toml::Value::from(value.as_str())));
         }
     }
+    // Read back as every later start reads it: what would refuse them is
+    // refused now, and nothing is written.
+    parse(&text).map_err(|reason| format!("config_invalid: {}: {reason}", path.display()))?;
     let mut aside = path.as_os_str().to_owned();
     aside.push(format!(".{}", std::process::id()));
     let aside = PathBuf::from(aside);
@@ -2663,6 +2666,17 @@ mod tests {
             ]),
         };
         write_pins(&store, &pins).unwrap();
+        assert_eq!(read_pins(&store).unwrap(), pins);
+        // What a later start would refuse is never written.
+        let refused = Pins {
+            provider: None,
+            daemon: BTreeMap::from([("load".to_owned(), "2e0".to_owned())]),
+        };
+        assert!(
+            write_pins(&store, &refused)
+                .unwrap_err()
+                .contains("daemon.load")
+        );
         assert_eq!(read_pins(&store).unwrap(), pins);
         assert_eq!(daemon_key("--idle-exit"), Some("idle_exit"));
         assert_eq!(daemon_key("--max-active"), Some("active"));

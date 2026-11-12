@@ -398,14 +398,19 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--max-input-bytes"
                     | "--max-readers"
                     | "--max-depth" => {
-                        value.parse::<usize>().map_err(|_| {
+                        // Kept as the number it is, as a pin reads it.
+                        let count = value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
-                        options.daemon_flags.push((flag.to_owned(), value));
+                        options
+                            .daemon_flags
+                            .push((flag.to_owned(), count.to_string()));
                     }
                     "--max-load" => {
-                        crate::cli::load(&value)?;
-                        options.daemon_flags.push((flag.to_owned(), value));
+                        let load = crate::cli::load(&value)?;
+                        options
+                            .daemon_flags
+                            .push((flag.to_owned(), format!("{load}")));
                     }
                     "--stall-timeout" | "--idle-exit" => {
                         crate::cli::duration_secs(flag, &value)?;

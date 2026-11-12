@@ -712,8 +712,11 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
         // How the store's daemon starts, which every later start trusts
         // (its provider, and so where a withheld key is sent): kept, and
         // kept from being made.
+        // An empty folder there is another sandbox's placeholder: held as
+        // missing, so it stays while this command runs too.
         let pins = agent_client::config::pins_path(store);
         match std::fs::symlink_metadata(&pins) {
+            _ if placeholder(&pins) => missing.push(pins),
             Ok(found) if found.file_type().is_symlink() => return linked(&pins),
             Ok(_) => read_only.push(pins),
             Err(_) => missing.push(pins),

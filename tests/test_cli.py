@@ -683,9 +683,10 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(stats['active_limit'], 3)
         self.agent('shutdown', '--store', str(self.store))
         # Flags given again pin again, over what was pinned.
-        again = json.loads(self.agent('start', '--store', str(self.store), '--max-active', '5').stdout)
+        # A number pins as the file writes one, however the flag gave it.
+        again = json.loads(self.agent('start', '--store', str(self.store), '--max-active', '5', '--max-load', '2e0').stdout)
         self.assertEqual(again['limits']['active'], 5)
-        self.assertIn('[daemon]\nactive = "5"\nidle_exit = "0"\n', pins.read_text())
+        self.assertIn('[daemon]\nactive = "5"\nidle_exit = "0"\nload = "2"\n', pins.read_text())
         self.agent('shutdown', '--store', str(self.store))
         # A file that does not read is refused by name; nothing starts.
         pins.write_text('provider = "openai"\nmodel = "x"\n')
