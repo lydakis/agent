@@ -750,6 +750,7 @@ async fn serve(settings: Settings) -> Result<(), String> {
         resume: marks(&settings.store).0,
         replayed: None,
         replay: marks(&settings.store).1,
+        kept: told_marks(&settings.store),
         in_flight: HashMap::new(),
         telling: HashMap::new(),
         bouncing: HashMap::new(),
@@ -878,7 +879,11 @@ struct Service {
     /// The newest event seen live, and the newest saved beside the store:
     /// a lookout started again tells what came after it.
     cursor: Option<i64>,
-    saved: Option<(i64, i64)>,
+    /// What was saved there last, its subscribers' own marks too.
+    saved: Option<String>,
+    /// Each subscriber's own mark, as the last lookout kept it, until its
+    /// lookout is seated (`mark_told`).
+    kept: HashMap<String, i64>,
     /// Turns triggers' fires sent, by agent and turn, each with its
     /// trigger's generation: one that fails is told (`trigger::tell_failed`).
     fires: HashMap<(String, i64), String>,
@@ -1120,6 +1125,7 @@ impl Service {
         // Only a lookout with no cursor yet reads it all, once: one a lag
         // cuts short goes on from where it got to.
         self.resume = self.floor().or(self.resume);
+        self.mark_told();
         self.ended_unseen(&bots);
         // The listing is in `records` now: let it go rather than hold a
         // second copy of every bot for as long as the lookout watches.
@@ -1277,17 +1283,13 @@ impl Service {
                     // asked for its object; a bot made or deleted, to all.
                     let hearing = self.hearing(&event);
                     self.track(&event, !hearing.is_empty(), cursor);
-                    for name in &hearing {
-                        let Some(lookout) = self.lookouts.get_mut(name) else { continue };
-                        lookout.event(&event);
-                        // The oldest event whose news is not told yet: a
-                        // restart takes it up again from there.
-                        if live && let Some(at) = cursor
-                            && lookout.untold()
-                        {
-                            lookout.from.get_or_insert(at);
+                    // The replay is over: no subscriber's mark is ahead.
+                    if event["event"] == "follow_live" {
+                        for lookout in self.lookouts.values_mut() {
+                            lookout.caught_up();
                         }
                     }
+                    self.hand(&event, &hearing, cursor, live);
                     if let (Some("created" | "forked" | "deleted"), Some(bot)) =
                         (event["event"].as_str(), event["bot"].as_str())
                     {
@@ -1928,7 +1930,50 @@ impl Service {
     fn go_live(&mut self) {
         self.live = true;
         for lookout in self.lookouts.values_mut() {
-            lookout.updates.live = true;
+            // One whose own mark is ahead goes live once the stream passes it.
+            lookout.updates.live = lookout.told_to.is_none();
+        }
+    }
+
+    /// An event to each lookout that hears it. What comes at or before a
+    /// subscriber's own mark was told to it already: history to it, as the
+    /// replay is to all, though news to another whose mark is further back.
+    fn hand(&mut self, event: &Value, hearing: &[String], cursor: Option<i64>, live: bool) {
+        for name in hearing {
+            let Some(lookout) = self.lookouts.get_mut(name) else {
+                continue;
+            };
+            if lookout.told_before(cursor, live) {
+                lookout.event(event);
+                // Nothing in it is read again.
+                lookout.due.clear();
+                continue;
+            }
+            lookout.event(event);
+            // The oldest event whose news is not told yet: a restart takes
+            // it up again from there.
+            if live
+                && let Some(at) = cursor
+                && lookout.untold()
+            {
+                lookout.from.get_or_insert(at);
+            }
+        }
+    }
+
+    /// Each subscriber's own mark, from what its lookout holds now or what
+    /// the last lookout kept: up to it, its news was told. The stream
+    /// starts again before the oldest news any of them has not told, and
+    /// one whose news waits holds no other back: each hears as news only
+    /// what came after its own mark. A mark no further than where the
+    /// stream's news starts (`resume`) says nothing more. After `floor`,
+    /// which lets go of what was told since.
+    fn mark_told(&mut self) {
+        let kept = std::mem::take(&mut self.kept);
+        let resume = self.resume;
+        for (name, lookout) in &mut self.lookouts {
+            lookout.told_to = (lookout.mark(self.cursor).max(kept.get(name).copied()))
+                .filter(|mark| resume.is_none_or(|resume| *mark > resume));
         }
     }
 
@@ -1962,7 +2007,18 @@ impl Service {
             return;
         };
         let replay = self.replay_floor().map_or(cursor, |at| at.min(cursor));
-        if self.saved == Some((cursor, replay)) {
+        // Each subscriber's own mark, where it is past where the stream
+        // starts again: in steady state, none.
+        let mut told: Vec<(&String, i64)> = (self.lookouts.iter())
+            .filter_map(|(name, lookout)| Some((name, lookout.mark(self.cursor)?)))
+            .filter(|(_, mark)| *mark > cursor)
+            .collect();
+        told.sort_unstable();
+        let mut text = format!("{cursor} {replay}\n");
+        for (name, mark) in told {
+            text.push_str(&format!("{mark} {name}\n"));
+        }
+        if self.saved.as_ref() == Some(&text) {
             return;
         }
         // What the lookouts hold goes to disk first, the runs a note spent
@@ -1973,10 +2029,10 @@ impl Service {
         }
         let path = cursor_path(&self.store);
         let partial = path.with_extension(format!("cursor.{}.partial", std::process::id()));
-        self.saved = Some((cursor, replay));
+        self.saved = Some(text.clone());
         held::then(move |written| {
             if written {
-                let _ = write_moved(&partial, &path, &format!("{cursor} {replay}"));
+                let _ = write_moved(&partial, &path, &text);
             }
         });
     }
@@ -2001,6 +2057,18 @@ fn marks(store: &Path) -> (Option<i64>, Option<i64>) {
     let mut marks = text.split_whitespace().map(|mark| mark.parse().ok());
     let news = marks.next().flatten();
     (news, marks.next().flatten().or(news))
+}
+
+/// Each subscriber's own mark the last lookout kept, after its first
+/// line: up to it, that subscriber's news was told.
+fn told_marks(store: &Path) -> HashMap<String, i64> {
+    let text = std::fs::read_to_string(cursor_path(store)).unwrap_or_default();
+    (text.lines().skip(1))
+        .filter_map(|line| {
+            let (mark, name) = line.split_once(' ')?;
+            Some((name.to_owned(), mark.parse().ok()?))
+        })
+        .collect()
 }
 
 /// Where the newest event a lookout saw live is kept: beside the store.
@@ -2212,6 +2280,10 @@ struct Lookout {
     since: Option<Instant>,
     /// The cursor of the oldest event whose news is not told yet.
     from: Option<i64>,
+    /// Up to where its news was told, by the last lookout or before the
+    /// connection dropped, while the stream is still behind it: what
+    /// comes at or before it is history to this subscriber.
+    told_to: Option<i64>,
     /// What sources said that the subscriber is to hear, oldest first.
     heard: Vec<sources::Heard>,
     /// How many of those wait at most (`sonny.lookout_waiting`), 0 for no
@@ -2303,6 +2375,7 @@ impl Lookout {
             refused: None,
             since: None,
             from: None,
+            told_to: None,
             heard: Vec::new(),
             waiting: WAITING,
             unkept: Unkept::default(),
@@ -2797,6 +2870,39 @@ impl Lookout {
             if *count == 0 {
                 self.reading.remove(&started);
             }
+        }
+    }
+
+    /// Up to where its news was told, with the stream at `cursor`: just
+    /// before its oldest news not told yet, or where its mark still is.
+    /// Run after `Service::floor`, which lets go of a `from` told since.
+    fn mark(&self, cursor: Option<i64>) -> Option<i64> {
+        let own = match (cursor, self.from) {
+            (Some(at), Some(from)) => Some(at.min(from - 1)),
+            (at, _) => at,
+        };
+        own.max(self.told_to)
+    }
+
+    /// Whether an event at `at` comes at or before its mark: told already.
+    /// The first past it makes what it hears news again, once the stream
+    /// is `live`. One with no cursor is never replayed.
+    fn told_before(&mut self, at: Option<i64>, live: bool) -> bool {
+        let (Some(mark), Some(at)) = (self.told_to, at) else {
+            return false;
+        };
+        if at <= mark {
+            return true;
+        }
+        self.told_to = None;
+        self.updates.live = live;
+        false
+    }
+
+    /// The replay is over: nothing it hears now was told before.
+    fn caught_up(&mut self) {
+        if self.told_to.take().is_some() {
+            self.updates.live = true;
         }
     }
 
@@ -5275,6 +5381,7 @@ mod tests {
             live: true,
             cursor: None,
             saved: None,
+            kept: HashMap::new(),
             resume: None,
             replayed: None,
             replay: None,
@@ -5680,6 +5787,132 @@ mod tests {
         assert_eq!(marks(&store), (Some(90), Some(90)));
         std::fs::write(cursor_path(&store), "12").unwrap();
         assert_eq!(marks(&store), (Some(12), Some(12)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_restart_tells_each_subscriber_only_what_came_after_its_own_mark() {
+        let dir = std::env::temp_dir().join(format!("lookout-told-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        // Each lead and its task, seated, as a lookout starting holds them.
+        let lead = |lead: &str, task: &str| {
+            let mut lookout = Lookout::new(lead);
+            let project = lead.split('.').next().unwrap();
+            lookout.subs = vec![subs::Sub::lead(lead, project)];
+            lookout.lineage.insert(task.to_owned());
+            (lookout.updates).seat(&json!({"name": lead, "bot_id": 1, "status": "idle"}));
+            (lookout.updates).seat(&json!({"name": task, "bot_id": 2, "status": "idle",
+                "created_by": lead, "created_by_id": 1}));
+            let listed = lookout.updates.listed();
+            lookout.sync(&listed);
+            lookout
+        };
+        let at = |bot: &str, turn: i64, kind: &str, cursor: i64| {
+            let mut event = ev(bot, turn, kind, json!({"status": "completed"}));
+            event["cursor"] = json!(cursor);
+            event
+        };
+        let hearing = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        // calc.lead's news from event 50 waits untold; shop.lead was told
+        // everything up to 90.
+        let mut first = service(store.clone(), &[]);
+        let mut calc = lead("calc.lead", "calc.fix");
+        calc.due.push(said(5, PERSON, "use tabs"));
+        calc.from = Some(50);
+        first.lookouts.insert("calc.lead".into(), calc);
+        first
+            .lookouts
+            .insert("shop.lead".into(), lead("shop.lead", "shop.fix"));
+        first.cursor = Some(90);
+        first.save_cursor();
+        held::written();
+        // The stream starts again before calc.lead's news; shop.lead's own
+        // mark is kept beside it.
+        assert_eq!(marks(&store), (Some(49), Some(49)));
+        assert_eq!(
+            told_marks(&store),
+            HashMap::from([("shop.lead".to_owned(), 90)])
+        );
+        // Nothing waits: no mark of its own past where the stream starts.
+        first.lookouts.get_mut("calc.lead").unwrap().due.clear();
+        first.save_cursor();
+        held::written();
+        assert_eq!(marks(&store), (Some(90), Some(90)));
+        assert!(told_marks(&store).is_empty());
+        first
+            .lookouts
+            .get_mut("calc.lead")
+            .unwrap()
+            .due
+            .push(said(5, PERSON, "use tabs"));
+        first.lookouts.get_mut("calc.lead").unwrap().from = Some(50);
+        first.save_cursor();
+        held::written();
+
+        // The next lookout, as it starts.
+        let mut again = service(store.clone(), &[]);
+        again.live = false;
+        again.resume = marks(&store).0;
+        again.kept = told_marks(&store);
+        again
+            .lookouts
+            .insert("calc.lead".into(), lead("calc.lead", "calc.fix"));
+        again
+            .lookouts
+            .insert("shop.lead".into(), lead("shop.lead", "shop.fix"));
+        again.resume = again.floor().or(again.resume);
+        again.mark_told();
+        assert_eq!(again.resume, Some(49));
+        assert_eq!(again.lookouts["calc.lead"].told_to, None);
+        assert_eq!(again.lookouts["shop.lead"].told_to, Some(90));
+        again.go_live();
+        // A task's turn that ended between the two marks is news to the
+        // lead that never heard it, and history to the one told it.
+        for cursor in [60, 61] {
+            let kind = if cursor == 60 {
+                "accepted"
+            } else {
+                "turn_finished"
+            };
+            again.hand(
+                &at("calc.fix", 7, kind, cursor),
+                &hearing(&["calc.lead"]),
+                Some(cursor),
+                true,
+            );
+            again.hand(
+                &at("shop.fix", 3, kind, cursor),
+                &hearing(&["shop.lead"]),
+                Some(cursor),
+                true,
+            );
+        }
+        // The person's words and the turn's reply, to read.
+        assert_eq!(again.lookouts["calc.lead"].due.len(), 2);
+        assert_eq!(again.lookouts["calc.lead"].from, Some(60));
+        let shop = &again.lookouts["shop.lead"];
+        assert!(shop.due.is_empty() && !shop.untold() && !shop.updates.live);
+        // Its mark kept while the stream is behind it.
+        assert_eq!(again.lookouts["shop.lead"].mark(again.cursor), Some(90));
+        // Past its mark, what it hears is news again.
+        for (cursor, kind) in [(91, "accepted"), (92, "turn_finished")] {
+            again.hand(
+                &at("shop.fix", 4, kind, cursor),
+                &hearing(&["shop.lead"]),
+                Some(cursor),
+                true,
+            );
+        }
+        let shop = &again.lookouts["shop.lead"];
+        assert_eq!(shop.due.len(), 2);
+        assert!(shop.told_to.is_none() && shop.updates.live);
+        // The replay's end catches up any mark still ahead.
+        let calc = again.lookouts.get_mut("calc.lead").unwrap();
+        calc.told_to = Some(500);
+        calc.updates.live = false;
+        calc.caught_up();
+        assert!(calc.told_to.is_none() && calc.updates.live);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

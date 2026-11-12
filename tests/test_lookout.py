@@ -296,6 +296,48 @@ class LookoutTests(ModelFixture):
         self.assertEqual(told('the person wrote'), 1, notes)
         self.assertEqual(told(f'calc.fix/{long} completed'), 1, notes)
 
+    def test_a_restart_tells_no_lead_again_what_another_lead_still_waits_for(self):
+        # One lead's news waits on its digest; another's is told as it
+        # comes. Across a restart the second lead hears none of its news
+        # again, though the stream starts before the first one's.
+        self.make('calc.lead', 'calc.fix', 'shop.lead', 'shop.fix')
+        self.subscribe('calc.lead', 'calc')
+        folder = self.path / 'state.sqlite.lookout'
+        tasks = {'name': 'tasks', 'tasks_of': ['shop.lead'], 'bots': ['shop.*'], 'digest': '1h'}
+        (folder / 'shop.lead.json').write_text(json.dumps({'subscriptions': [tasks]}))
+        service = self.start()
+        time.sleep(1)
+
+        def ended(bot, request_id):
+            turn = self.daemon.request('submit', bot=bot, request_id=request_id, prompt='go',
+                                       origin='tasks')['result']['message']
+            self.assertEqual(self.daemon.finished(turn)['data']['status'], 'completed')
+            return turn
+
+        # The digest's first note goes at once; the next waits an hour.
+        first = ended('shop.fix', 's1')
+        self.assertIsNotNone(self.note_for('shop.lead', having=f'shop.fix/{first} completed'))
+        held = ended('shop.fix', 's2')
+        # Told one note at a time, after the news the other lead holds.
+        told = []
+        for request_id in ('c1', 'c2'):
+            turn = ended('calc.fix', request_id)
+            self.assertIsNotNone(self.note_for('calc.lead', having=f'calc.fix/{turn} completed'))
+            told.append(turn)
+        # Gone and back past a cursor save.
+        time.sleep(3)
+        service.kill()
+        service.wait(timeout=5)
+        self.start()
+        time.sleep(5)
+        notes = []
+        for message in self.daemon.request('messages', bot='calc.lead', after=0)['result']['messages']:
+            text = self.daemon.request('prompts', bot='calc.lead', turn=message['message'])['result']['prompts'][0]['text']
+            if text.startswith('Task updates: '):
+                notes.append(text)
+        for turn in told:
+            self.assertEqual(sum(f'calc.fix/{turn} completed' in note for note in notes), 1, notes)
+
     def test_a_bot_that_is_no_lead_hears_what_it_subscribed_to(self):
         # It subscribes with the tool Sonny gives it, which the tool host
         # answers, to its own file only.
