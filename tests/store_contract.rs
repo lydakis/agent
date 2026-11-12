@@ -12457,6 +12457,211 @@ fn fork_prompt_views_survive_source_deletion_and_reopen() {
 }
 
 #[test]
+fn a_compaction_keeps_the_persons_messages_steers_included_and_no_one_elses() {
+    // Planned whole, and walked as a catch-up in pieces.
+    for max_bytes in [1 << 20, 1200] {
+        let mut db = db();
+        db.create("Carol", Some("/synthetic"), binding()).unwrap();
+        let lookout = TurnOptions {
+            origin: Some("lookout".into()),
+            ..TurnOptions::default()
+        };
+        let steer = |options: &TurnOptions| TurnOptions {
+            delivery: Delivery::Steer,
+            ..options.clone()
+        };
+        let dana = TurnOptions {
+            person: Some("Dana".into()),
+            ..TurnOptions::default()
+        };
+        let person = TurnOptions::default();
+        // Each turn: who opened it, then who steered into it.
+        type Turn<'a> = (&'a str, &'a TurnOptions, &'a [(&'a str, &'a TurnOptions)]);
+        let turns: [Turn; 4] = [
+            (
+                "first ask",
+                &person,
+                &[
+                    ("steer one", &person),
+                    ("a note from the lookout", &lookout),
+                ],
+            ),
+            ("the lookout opens", &lookout, &[("Dana steers", &dana)]),
+            ("third ask", &person, &[]),
+            ("newest ask", &person, &[]),
+        ];
+        for (n, (opening, from, steers)) in turns.iter().enumerate() {
+            let turn = db
+                .begin(
+                    "Carol",
+                    &format!("t{n}"),
+                    opening,
+                    true,
+                    from,
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            for (k, (words, from)) in steers.iter().enumerate() {
+                db.begin(
+                    "Carol",
+                    &format!("s{n}.{k}"),
+                    words,
+                    true,
+                    &steer(from),
+                    allow_provider,
+                )
+                .unwrap();
+                db.absorb(
+                    turn,
+                    None,
+                    8 << 20,
+                    4096,
+                    ContextUsage::default(),
+                    false,
+                    true,
+                )
+                .unwrap();
+            }
+            db.append(turn, vec![assistant(&"answer ".repeat(20))], &[], None)
+                .unwrap();
+            db.finish(turn, None).unwrap();
+        }
+        let plan = compaction_plan(&db, "Carol", 1, max_bytes, 256)
+            .unwrap()
+            .unwrap();
+        let kept: Vec<(i64, &str)> = (plan.prompts.iter())
+            .map(|(ordinal, words)| (*ordinal, words.as_str()))
+            .collect();
+        let whole = [
+            (1, "first ask"),
+            (1, "steer one"),
+            (2, "Dana steers"),
+            (3, "third ask"),
+        ];
+        // A catch-up step may stop before the newest covered turn.
+        assert!(!kept.is_empty(), "{max_bytes}");
+        assert_eq!(kept, whole[..kept.len()], "{max_bytes}");
+    }
+}
+
+#[test]
+fn the_persons_newest_messages_are_kept_and_the_one_past_the_budget_is_cut() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let words = |n: usize| format!("{n} {}", "w".repeat(1800));
+    for n in 1..=20 {
+        let turn = db
+            .begin(
+                "Bob",
+                &n.to_string(),
+                &words(n),
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.finish(turn, None).unwrap();
+    }
+    let plan = compaction_plan(&db, "Bob", 1, i64::MAX, i64::MAX)
+        .unwrap()
+        .unwrap();
+    let entry = std::mem::size_of::<(i64, String)>();
+    let cost: usize = (plan.prompts.iter()).map(|(_, w)| entry + w.len()).sum();
+    assert!(cost <= Database::COMPACTION_PROMPTS_BYTES);
+    // Turns 1 to 19 are covered; the newest whole, in order, and the one
+    // before them cut to what was left.
+    let (first, rest) = plan.prompts.split_first().unwrap();
+    let whole: Vec<i64> = rest.iter().map(|(ordinal, _)| *ordinal).collect();
+    assert_eq!(whole, ((20 - rest.len() as i64)..20).collect::<Vec<_>>());
+    for (ordinal, kept) in rest {
+        assert_eq!(kept, &words(*ordinal as usize));
+    }
+    assert_eq!(first.0, 19 - rest.len() as i64);
+    assert!(
+        first.1.ends_with('…')
+            && words(first.0 as usize).starts_with(&first.1[..first.1.len() - 3])
+    );
+}
+
+#[test]
+fn a_turns_end_says_when_its_last_summary_did_not_apply() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let finished = |entries: Vec<Value>| -> Value {
+        (entries.into_iter())
+            .find(|e| e["event"] == "turn_finished")
+            .unwrap()["data"]
+            .clone()
+    };
+    let refused = json!({"error":"provider_refusal","detail":"category cyber","category":"cyber"});
+    let turn = db
+        .begin(
+            "Bob",
+            "1",
+            "go",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.compaction_failed("Bob", turn, refused.clone()).unwrap();
+    db.append(turn, vec![assistant(&"answer ".repeat(200))], &[], None)
+        .unwrap();
+    let data = finished(db.finish(turn, None).unwrap());
+    assert_eq!(data["status"], "completed");
+    assert_eq!(data["compaction"], refused);
+    // Kept as the turn's event, which outlives the live stream.
+    let kinds: Vec<Value> = db.events("Bob", 0, 100).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["turn"] == turn && e["event"] == "compaction_failed")
+        .map(|e| e["data"].clone())
+        .collect();
+    assert_eq!(kinds, std::slice::from_ref(&refused));
+    // A turn whose summary failed, then applied, says nothing.
+    let turn = db
+        .begin(
+            "Bob",
+            "2",
+            "again",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.compaction_failed("Bob", turn, refused.clone()).unwrap();
+    let plan = compaction_plan(&db, "Bob", 1, i64::MAX, i64::MAX)
+        .unwrap()
+        .unwrap();
+    db.compact(
+        "Bob",
+        &plan,
+        "summary",
+        None,
+        0,
+        agent_runtime::store::ContextUsage {
+            bytes: 1 << 20,
+            items: 4096,
+        },
+        Value::Null,
+    )
+    .unwrap();
+    assert!(
+        finished(db.finish(turn, None).unwrap())
+            .get("compaction")
+            .is_none()
+    );
+    // One recorded after its turn ended, by a summary started as it
+    // ended, is that turn's event too.
+    db.compaction_failed("Bob", turn, refused.clone()).unwrap();
+}
+
+#[test]
 fn compaction_prompt_metadata_stays_bounded_across_planning_and_merging() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
@@ -12509,7 +12714,12 @@ fn compaction_prompt_metadata_stays_bounded_across_planning_and_merging() {
             .compaction
             .unwrap();
         assert!(cost(&view.prompts) <= Database::COMPACTION_PROMPTS_BYTES);
-        assert_eq!(view.prompts.first().unwrap(), &(1, String::new()));
+        // The newest are kept, in order, and the oldest left to the summary.
+        let kept = view.prompts.len() as i64;
+        assert_eq!(
+            view.prompts.first().unwrap(),
+            &(n as i64 - kept + 1, String::new())
+        );
         assert_eq!(view.prompts.last().unwrap(), &(n as i64, String::new()));
         assert_eq!(view.covered, (1, n as i64));
         // The omitted excerpt is only a view; the original empty prompt is
@@ -14298,7 +14508,9 @@ fn a_cut_inside_the_running_turn_keeps_its_prompt_ahead_of_the_tail() {
         .unwrap()
         .to_owned();
     assert!(view.contains("covering turns 1 to 2]"));
-    assert!(view.contains("\n1: p1\n2: long task"));
+    // Turn two is summarized whole now, so its prompt joins the kept
+    // messages; while it was cut, the window carried it instead.
+    assert!(view.ends_with("\n1: p1\n2: long task"), "{view}");
 
     // A fork from between the two cuts in turn two binds the first, and
     // sees the prompt ahead of its cut as the source did.

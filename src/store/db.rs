@@ -1933,11 +1933,13 @@ impl From<i64> for Strip {
 pub struct CompactionView {
     pub version: i64,
     pub summary: String,
-    /// The covered turns' user prompts, verbatim within bounds: ordinal and text.
+    /// The person's newest messages in the covered turns, verbatim within
+    /// bounds: the ordinal of the turn each opened or joined, and its text.
     pub prompts: Vec<(i64, String)>,
     pub covered: (i64, i64),
     /// The last covered turn is covered only up to a cut inside it. Its
-    /// prompt goes whole ahead of the window, so the view does not repeat it.
+    /// prompt, and the person's messages that joined it, go whole ahead of
+    /// the window, so the view does not repeat them.
     pub partial: bool,
 }
 /// Where an elision moves a bot's floor: tool results with stubs through
@@ -1973,7 +1975,8 @@ pub struct CompactionPlan {
     pub sizes: Vec<u32>,
     /// What each node's pictures add to its length beyond their weight.
     pub pictured: Vec<i32>,
-    /// The covered turns' user prompts, bounded, oldest first.
+    /// The person's messages in the covered turns, newest kept, oldest
+    /// first: the ordinal of the turn each opened or joined, and its text.
     pub prompts: Vec<(i64, String)>,
     pub covered: (i64, i64),
     pub previous_summary: Option<String>,
@@ -2549,10 +2552,11 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 93;
-    /// Verbatim user prompts a compaction keeps: per-prompt text, and the
-    /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
-    /// space too, so the retained list cannot grow with conversation length.
+    pub const SCHEMA: i32 = 94;
+    /// The person's messages a compaction keeps verbatim, newest first:
+    /// per-message text, and the total text plus `(ordinal, String)` entry
+    /// metadata. Empty entries cost space too, so the retained list cannot
+    /// grow with conversation length.
     pub const COMPACTION_PROMPT_BYTES: usize = 2048;
     pub const COMPACTION_PROMPTS_BYTES: usize = 16 * 1024;
     /// How much of each prompt's text its opening keeps, in characters: as
@@ -2842,6 +2846,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS events_bot_cursor ON events(bot,id);
             CREATE INDEX IF NOT EXISTS events_turn_kind_cursor ON events(turn,kind,id);
             CREATE INDEX IF NOT EXISTS events_kind_cursor ON events(kind,id);
+            CREATE INDEX IF NOT EXISTS events_compaction_failed ON events(bot,id)
+                WHERE kind='compaction_failed';
             CREATE INDEX IF NOT EXISTS events_message ON events(message) WHERE message IS NOT NULL;
             CREATE INDEX IF NOT EXISTS events_in_line ON events(bot,message)
                 WHERE turn IS NULL AND message IS NOT NULL;
@@ -4781,8 +4787,10 @@ impl Database {
             })));
         }
         // A source bot's turn records may be deleted while its nodes survive
-        // in a fork. Prompt nodes' text comes from their openings, so the
-        // walk reads no item and returns bounded text to Rust.
+        // in a fork. The person's messages, turn prompts and steers alike,
+        // come from their openings, so the walk reads no item and returns
+        // bounded text to Rust; another agent's or an origin's go to the
+        // summary only.
         let mut statement = self.conn.prepare_cached(
             "WITH RECURSIVE chain(id,parent,total_bytes,turn_seq,total_thinking,pictured) AS (
                 SELECT id,parent,total_bytes-MIN(total_elided,?4),turn_seq,total_thinking,
@@ -4793,12 +4801,12 @@ impl Database {
                 FROM nodes n JOIN chain c ON n.id=c.parent
                 WHERE c.id IS NOT ?2)
              SELECT c.id,c.total_bytes,COALESCE(p.total_bytes-MIN(p.total_elided,?4),0),c.turn_seq,
-                CASE WHEN c.turn_seq IS NOT NULL THEN
-                    (SELECT substr(text,1,?3) FROM openings WHERE node=c.id) END,c.total_thinking,c.pictured
+                (SELECT substr(o.text,1,?3) FROM openings o WHERE o.node=c.id AND NOT EXISTS(
+                    SELECT 1 FROM senders s WHERE s.node=c.id AND (s.bot IS NOT NULL OR s.origin IS NOT NULL))),c.total_thinking,c.pictured
              FROM chain c LEFT JOIN nodes p ON p.id=c.parent ORDER BY c.id DESC",
         )?;
-        // Newest first: id, own total, parent's total, ordinal, prompt,
-        // thinking through it, and what its pictures add beyond their weight
+        // Newest first: id, own total, parent's total, ordinal of a turn's
+        // prompt, the person's words, thinking through it, and what its pictures add beyond their weight
         // as it is sent.
         type SpanRow = (i64, i64, i64, Option<i64>, Option<String>, i64, i64);
         let rows: Vec<SpanRow> = statement
@@ -4886,6 +4894,7 @@ impl Database {
         let mut plan = Self::span_plan(
             cut,
             span,
+            partial.map(|(_, turn)| turn),
             previous_summary,
             false,
             (max_bytes as usize / 3).min(64 * 1024),
@@ -4963,8 +4972,9 @@ impl Database {
                     n.turn_seq,c.id,c.turn_seq,c.k+1,n.total_thinking,CASE WHEN n.id<=?11 AND n.elided>0 THEN 0 ELSE n.pictured END
                 FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.id IS NOT ?2 AND c.k<?5)
              SELECT c.id,c.parent,c.depth,c.total_bytes,c.turn_seq,c.child,c.child_seq,
-                CASE WHEN c.turn_seq IS NOT NULL AND c.total_bytes-c.total_thinking<=?7 AND c.depth<=?8 THEN
-                    (SELECT substr(text,1,?6) FROM openings WHERE node=c.id) END,c.total_thinking,c.pictured
+                CASE WHEN c.total_bytes-c.total_thinking<=?7 AND c.depth<=?8 THEN
+                    (SELECT substr(o.text,1,?6) FROM openings o WHERE o.node=c.id AND NOT EXISTS(
+                    SELECT 1 FROM senders s WHERE s.node=c.id AND (s.bot IS NOT NULL OR s.origin IS NOT NULL))) END,c.total_thinking,c.pictured
              FROM chain c WHERE (c.total_bytes-c.total_thinking<=?7 AND c.depth<=?8)
                 OR c.k=?5 OR c.id IS ?2 OR c.parent IS NULL OR (?10 AND c.turn_seq IS NOT NULL)",
         )?;
@@ -5124,6 +5134,7 @@ impl Database {
         let mut plan = Self::span_plan(
             cut,
             span,
+            partial.map(|(_, turn)| turn),
             previous_summary,
             true,
             (max_bytes as usize / 3).min(64 * 1024),
@@ -5179,12 +5190,15 @@ impl Database {
             None => None,
         })
     }
-    /// A plan from the span's nodes, oldest first: id, own size, ordinal,
-    /// the prompt's bounded text for prompt nodes, and what its pictures
-    /// add beyond their weight.
+    /// A plan from the span's nodes, oldest first: id, own size, the
+    /// ordinal of a turn's prompt, the person's words for a message of
+    /// theirs, and what its pictures add beyond their weight. A message
+    /// that joined a turn is kept under that turn's ordinal: `partial`'s,
+    /// a turn a previous cut split, before the span's first prompt.
     fn span_plan<'a>(
         cut: i64,
         span: impl Iterator<Item = (i64, i64, Option<i64>, Option<&'a str>, i64)>,
+        partial: Option<i64>,
         previous_summary: Option<String>,
         catch_up: bool,
         summary_bytes: usize,
@@ -5193,14 +5207,21 @@ impl Database {
         let (mut ids, mut sizes, mut pictured, mut prompts) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut from, mut to) = (i64::MAX, 0);
-        for (id, size, seq, prompt, pictures) in span {
+        let mut ordinal = partial;
+        for (id, size, seq, words, pictures) in span {
             ids.push(id);
             sizes.push(size.clamp(0, u32::MAX as i64) as u32);
             pictured.push(pictures.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
-            if let (Some(seq), Some(prompt)) = (seq, prompt) {
+            if let Some(seq) = seq {
                 from = from.min(seq);
                 to = to.max(seq);
-                prompts.push((seq, bounded_prompt(prompt, Self::COMPACTION_PROMPT_BYTES)));
+                ordinal = Some(seq);
+            }
+            if let (Some(ordinal), Some(words)) = (ordinal, words) {
+                prompts.push((
+                    ordinal,
+                    bounded_prompt(words, Self::COMPACTION_PROMPT_BYTES),
+                ));
             }
         }
         bound_prompts(&mut prompts);
@@ -7990,6 +8011,37 @@ impl Database {
         let bot = self.active(turn)?;
         event(&self.conn, &bot.name, Some(turn), "retry", data)?;
         Ok(())
+    }
+    /// A summary that did not apply, as `turn`'s event: the turn it ran
+    /// in, or the one it was started after, which may have ended since.
+    /// Its turn's `turn_finished` says so when it was that turn's last
+    /// summary.
+    pub fn compaction_failed(&mut self, bot: &str, turn: i64, data: Value) -> Result<()> {
+        let running: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT running_turn FROM bots WHERE name=?")?
+            .query_row([bot], |r| r.get(0))?;
+        let tx = self.conn.savepoint()?;
+        event(&tx, bot, Some(turn), "compaction_failed", data)?;
+        if running != Some(turn) {
+            retain_late(&tx, turn, bot)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// The data of the bot's newest `compaction_failed` event, if any.
+    /// Its own partial index holds only failures, by bot, so this is one
+    /// probe whatever other bots have failed.
+    pub fn last_compaction_failed(&self, bot: &str) -> Result<Option<Value>> {
+        let data: Option<String> = self
+            .conn
+            .prepare_cached(
+                "SELECT data FROM events INDEXED BY events_compaction_failed
+                 WHERE kind='compaction_failed' AND bot=? ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row([bot], |r| r.get(0))
+            .optional()?;
+        Ok(data.map(|data| serde_json::from_str(&data)).transpose()?)
     }
     /// A retry of a summary made after `turn` ended, as that turn's event.
     pub fn retried_after(&mut self, turn: i64, data: Value) -> Result<()> {
@@ -10844,6 +10896,18 @@ impl Database {
         }
         if let Some(limit) = limit {
             data["limit"] = json!(limit);
+        }
+        // The turn's last summary did not apply: why, as it was recorded.
+        let failed: Option<String> = tx
+            .prepare_cached(
+                "SELECT CASE WHEN kind='compaction_failed' THEN data END FROM events
+                 WHERE turn=? AND kind IN ('compacted','compaction_failed') ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row([turn], |r| r.get(0))
+            .optional()?
+            .flatten();
+        if let Some(failed) = failed {
+            data["compaction"] = serde_json::from_str(&failed)?;
         }
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
@@ -16949,7 +17013,6 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
     if from < 92 {
         migrate_messages(conn)?;
     }
-
     // Schema 93: a turn that failed keeps how on its row, its error, detail
     // and facts as its `turn_finished` said. Earlier turns keep none: their
     // events say it while retention keeps them.
@@ -16962,6 +17025,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         if !has {
             conn.execute_batch("ALTER TABLE turns ADD COLUMN error TEXT;")?;
         }
+    }
+    if from < 94 {
+        // 93 -> 94: a bot's last failed summary is found without walking
+        // other bots' failures. Only failures are in it, so writes of other
+        // events never touch it.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS events_compaction_failed ON events(bot,id)
+                 WHERE kind='compaction_failed';",
+        )?;
     }
 
     Ok(())
@@ -17308,25 +17380,30 @@ fn migrate_absorbed_effort(conn: &Connection) -> Result<()> {
     }
     Ok(())
 }
-/// Keep the oldest and newest excerpts within the text/metadata budget.
-/// Locate the same middle range that repeated removals would discard, then
-/// drain once: trimming a large batch moves the retained suffix only once.
+/// Keep the person's newest messages within the text/metadata budget, as
+/// Codex keeps the user's newest messages through a compaction: newest
+/// first, whole while they fit, the next cut to what is left, and older
+/// ones left to the summary. One drain, at the front.
 fn bound_prompts(prompts: &mut Vec<(i64, String)>) {
-    let cost = |prompt: &(i64, String)| std::mem::size_of::<(i64, String)>() + prompt.1.len();
-    let mut total: usize = prompts.iter().map(cost).sum();
-    let (mut left, mut right) = (prompts.len() / 2, prompts.len() / 2);
-    while total > Database::COMPACTION_PROMPTS_BYTES && prompts.len() - (right - left) > 2 {
-        let middle = (prompts.len() - (right - left)) / 2;
-        let removed = if middle < left {
-            left -= 1;
-            left
-        } else {
-            right += 1;
-            right - 1
-        };
-        total -= cost(&prompts[removed]);
+    let entry = std::mem::size_of::<(i64, String)>();
+    let mut left = Database::COMPACTION_PROMPTS_BYTES;
+    let mut keep = prompts.len();
+    while keep > 0 {
+        let words = &mut prompts[keep - 1].1;
+        if entry + words.len() <= left {
+            left -= entry + words.len();
+            keep -= 1;
+            continue;
+        }
+        // The newest that does not fit whole keeps what fits, marked.
+        let room = left.saturating_sub(entry + '…'.len_utf8());
+        if room > 0 {
+            *words = bounded_prompt(words, room);
+            keep -= 1;
+        }
+        break;
     }
-    prompts.drain(left..right);
+    prompts.drain(..keep);
 }
 
 /// A prompt kept verbatim by a compaction, cut to `limit` bytes at a

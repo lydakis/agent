@@ -79,7 +79,12 @@ pub const DEFAULT_COMPACTION_INSTRUCTIONS: &str = "You are summarizing the earli
 with the summary in place of those turns. Any earlier summary is given first; merge it with the new turns, do not restart. \
 Write, in order: the goal; every rule, constraint, or preference the user stated, verbatim where wording matters; \
 what is done, in progress, and blocked; key decisions and why; files read or changed; open questions; next steps. \
-Keep exact names, paths, commands, values, and error text. Omit chatter, repeated tool output, and anything superseded. \
+Keep exact names, paths, commands, values, and error text. \
+Mark each decision as the user's (quote their words and give when they said them), an agent's plan the user has not agreed to, or your inference. \
+Give each statement of current state the time it was last checked. \
+For each open item, keep the id or source that would close it. \
+End with a list of what is not verified, for the agent to check before relying on it. \
+Omit chatter, repeated tool output, and anything superseded. \
 Reply with the summary only.";
 
 /// Where a new bot's tool outputs cut for the model go whole by default:

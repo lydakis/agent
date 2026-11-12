@@ -2,6 +2,7 @@
 import json
 import os
 import queue
+import re
 import threading
 import time
 import unittest
@@ -370,7 +371,13 @@ class DeliveryTests(ModelFixture):
                 and i['content'][0]['text'].startswith('[compaction summary')][0]['content'][0]['text']
         self.assertIn('A short synthetic summary.', text)
         self.assertIn('User messages from those turns, verbatim:', text)
-        self.assertIn('\n1: Task 1: 111', text)
+        # The person's newest messages are kept, as many as fit, oldest left
+        # to the summary: a run of turns ending at the newest covered.
+        newest = int(re.search(r'covering turns \d+ to (\d+)\]', text).group(1))
+        kept = [int(line.split(':')[0]) for line in text.split('verbatim:\n')[1].splitlines()]
+        self.assertEqual(kept, list(range(newest - len(kept) + 1, newest + 1)))
+        for n in kept:
+            self.assertIn(f'\n{n}: Task {n}: {str(n) * 3}', text)
         bob = client.request('inspect', bot='Bob')['result']
         # Later compactions stand for everything since the first: the newest
         # version is the bot's, and its coverage still starts at turn 1.
