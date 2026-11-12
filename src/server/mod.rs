@@ -1946,14 +1946,21 @@ pub async fn run(config: Configuration) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     // A TMPDIR the shells are given is their temporary folder: made now,
     // the daemon's user's alone as a folder it makes, and writable in their
-    // sandbox as /tmp is.
+    // sandbox as /tmp is. Made off the loop, which greets clients waiting
+    // on this start, wherever the folder is.
     if let Some((_, folder)) = (config.shell_set.iter()).find(|(name, _)| name == "TMPDIR") {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(folder)?;
-        agent_runtime::sandbox::shell_temporary(folder.into());
+        let folder = PathBuf::from(folder);
+        let made = folder.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(made)
+        })
+        .await
+        .map_err(|_| Error::new("sandbox_unavailable"))??;
+        agent_runtime::sandbox::shell_temporary(folder);
     }
     agent_runtime::sandbox::warm();
     let (sender, mut inbound) = session::channel_with(64, limits.input_bytes);
