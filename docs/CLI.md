@@ -467,6 +467,7 @@ already running daemon. Startup flags configure a newly started daemon, and
 pin it: a start given `--provider` or a limit (`--max-*`, `--stall-timeout`,
 `--idle-exit`) writes them to `~/.agent/pins/`, one file per store named
 by its real path with each `/` written `%2F` and each `%` written `%25`
+(`v1-HASH.toml` where that name would be too long, as for its socket)
 (`provider` and a `[daemon]` table in `config.toml`'s keys, the user's
 alone, where no sandboxed command writes), over what was pinned there,
 and every later start of that store,

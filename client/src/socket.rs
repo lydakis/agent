@@ -40,6 +40,19 @@ pub fn canonical_store(store: &Path) -> Result<PathBuf> {
     }
 }
 
+/// A name for the store at its real path `store` that fits anywhere a
+/// name of its own would be too long: versioned FNV-1a-128, deterministic
+/// across processes and Rust releases. A rendezvous identifier, not an
+/// authentication hash.
+pub fn store_hash(store: &Path) -> u128 {
+    let mut hash = 0x6c62272e07bb014262b821756295c58du128;
+    for byte in store.as_os_str().as_encoded_bytes() {
+        hash ^= u128::from(*byte);
+        hash = hash.wrapping_mul(0x0000000001000000000000000000013b);
+    }
+    hash
+}
+
 pub fn default_socket(store: &Path) -> Result<PathBuf> {
     let store = canonical_store(store)?;
     let mut adjacent = store.clone().into_os_string();
@@ -49,13 +62,7 @@ pub fn default_socket(store: &Path) -> Result<PathBuf> {
         return Ok(adjacent);
     }
 
-    // Versioned FNV-1a-128 gives deterministic path names across processes and
-    // Rust releases. This is a rendezvous identifier, not an authentication hash.
-    let mut hash = 0x6c62272e07bb014262b821756295c58du128;
-    for byte in store.as_os_str().as_encoded_bytes() {
-        hash ^= u128::from(*byte);
-        hash = hash.wrapping_mul(0x0000000001000000000000000000013b);
-    }
+    let hash = store_hash(&store);
     // Do not use TMPDIR: snapshot runners may set it to another long path.
     // SAFETY: geteuid takes no arguments and cannot fail.
     let uid = unsafe { libc::geteuid() };

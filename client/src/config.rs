@@ -337,11 +337,15 @@ pub struct Pins {
 
 /// Where the start flags of the daemon of `store` are pinned:
 /// `~/.agent/pins/` and the store's real path with each `/` written
-/// `%2F` and each `%` written `%25`, then `.toml`. `store` is named as the
-/// daemon names it, by its real path, so every name for one store finds
-/// the same pins. `None` with no home.
+/// `%2F` and each `%` written `%25`, then `.toml`; where that name is too
+/// long for a file system, `v1-HASH.toml`, as the store's socket is named
+/// when its own name is too long. `store` is named as the daemon names
+/// it, by its real path, so every name for one store finds the same pins.
+/// `None` with no home.
 pub fn pins_path(store: &Path) -> Option<PathBuf> {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    // Room under the usual 255 for the name a write stages it under.
+    const LONGEST: usize = 200;
     let mut name = Vec::new();
     for byte in store.as_os_str().as_bytes() {
         match byte {
@@ -351,11 +355,11 @@ pub fn pins_path(store: &Path) -> Option<PathBuf> {
         }
     }
     name.extend_from_slice(b".toml");
-    Some(
-        home()?
-            .join("pins")
-            .join(std::ffi::OsString::from_vec(name)),
-    )
+    if name.len() > LONGEST {
+        name = format!("v1-{:032x}.toml", crate::socket::store_hash(store)).into_bytes();
+    }
+    let pins = home()?.join("pins");
+    Some(pins.join(std::ffi::OsString::from_vec(name)))
 }
 
 /// The start flags pinned at `path`: none when nothing pinned them. A
@@ -2705,6 +2709,14 @@ mod tests {
         assert_eq!(
             named.file_name().unwrap(),
             "%2Fsrv%2Fa%25b%2Fstate.sqlite.toml"
+        );
+        // One too long for a file's name is named by its hash, as its
+        // socket is.
+        let deep = PathBuf::from(format!("/{}/state.sqlite", "d/".repeat(120)));
+        let hashed = pins_path(&deep).unwrap();
+        assert_eq!(
+            hashed.file_name().unwrap().to_str().unwrap(),
+            format!("v1-{:032x}.toml", crate::socket::store_hash(&deep))
         );
         let file = dir.join("pins").join("state.sqlite.toml");
         assert_eq!(read_pins(&file).unwrap(), Pins::default());
