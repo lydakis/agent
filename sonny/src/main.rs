@@ -4210,7 +4210,7 @@ struct App {
     /// than the person: another agent, a task's news, the lookout.
     elsewhere: bool,
     /// Experimental: replies about one followed project are barred in its
-    /// color and open with its name (`/colors`, `[sonny] project_colors`).
+    /// color (`/colors`, `[sonny] project_colors`).
     colors: bool,
     /// `[sonny] project_colors` as last read: a change in `/config` sets
     /// `colors` to it.
@@ -8643,9 +8643,9 @@ impl App {
     /// The lines waiting written into the conversation, with their marks.
     fn flush(&mut self) {
         let mut marks = std::mem::take(&mut self.marks);
-        let mut lines = std::mem::take(&mut self.pending);
-        if let Some(bar) = &mut self.bar {
-            colors::wear(&mut lines, &mut marks, bar, &mut self.barred);
+        let lines = std::mem::take(&mut self.pending);
+        if let Some(bar) = &self.bar {
+            colors::wear(&lines, &mut marks, bar, &mut self.barred);
         }
         self.screen.push_marked(lines, marks);
     }
@@ -8684,11 +8684,7 @@ impl App {
             true => None,
             false => colors::about(&names, self.palette()),
         }
-        .map(|(project, slot)| colors::Bar {
-            project,
-            slot,
-            named: false,
-        });
+        .map(|(project, slot)| colors::Bar { project, slot });
         // Rows waiting keep what they were written with: written now, but
         // only where a bar comes or goes, so plain windows wait as ever.
         if self.bar.is_some() || bar.is_some() {
@@ -9574,7 +9570,6 @@ impl App {
         if open.gap && !open.spilled && (!open.rows.is_empty() || !open.partial.is_empty()) {
             rows.push(Line::default());
         }
-        let opens = (!open.spilled).then_some(rows.len());
         // Held rows were wrapped for the width then: a narrower pane cuts
         // them again, as it does the history waiting to be written.
         for row in &open.rows {
@@ -9604,41 +9599,24 @@ impl App {
             ));
         }
         match &self.bar {
-            Some(bar) => self.bar_open(rows, bar, opens, width),
+            Some(bar) => self.bar_open(rows, bar.slot),
             None => rows,
         }
     }
 
-    /// The reply's open rows wearing `bar` as they will once written
-    /// ([`colors::wear`]): its first row, at `opens`, named when no row
-    /// of the turn was yet, and cut again to `width` for it.
-    fn bar_open(
-        &self,
-        rows: Vec<Line<'static>>,
-        bar: &colors::Bar,
-        opens: Option<usize>,
-        width: usize,
-    ) -> Vec<Line<'static>> {
+    /// The reply's open rows wearing the bar at `slot` as they will once
+    /// written ([`colors::wear`]): from the first row not blank on.
+    fn bar_open(&self, rows: Vec<Line<'static>>, slot: u8) -> Vec<Line<'static>> {
         let mut barred = self.barred;
-        let mut out = Vec::with_capacity(rows.len() + 1);
-        for (at, mut row) in rows.into_iter().enumerate() {
-            barred = row.width() > 0 || barred;
-            if !barred {
-                out.push(row);
-                continue;
-            }
-            let named =
-                !bar.named && opens == Some(at) && colors::name(&mut row, &bar.project).is_some();
-            let cut = match named && row.width() > width {
-                true => transcript::wrap(row, width, Span::raw(""), Span::raw("  ")),
-                false => vec![row],
-            };
-            for mut row in cut {
-                colors::bar_line(&mut row, bar.slot);
-                out.push(row);
-            }
-        }
-        out
+        (rows.into_iter())
+            .map(|mut row| {
+                barred = row.width() > 0 || barred;
+                if barred {
+                    colors::bar_line(&mut row, slot);
+                }
+                row
+            })
+            .collect()
     }
 
     /// The words' last lines, and a table they ended on, drawn and held
@@ -19568,7 +19546,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_colors_a_reply_a_followed_project_woke_wears_its_bar_and_name() {
+    async fn with_colors_a_reply_a_followed_project_woke_wears_its_bar() {
         let mut app = app(zen_daemon().await);
         app.width = 100;
         app.words_only = true;
@@ -19585,18 +19563,15 @@ mod tests {
         assert_eq!(rows[at("Rounding now")].0, None);
         assert_eq!(rows[at("Pushed as")].0, None);
         // A message from shop's agent, and calc's task news, each bar the
-        // reply they woke, which opens with the project's name; the gap
-        // above each stays bare, so two replies read as two.
+        // reply they woke, with no name added; the gap above each stays
+        // bare, so two replies read as two.
         let shop = at("Noted what shop.fix said.");
-        assert_eq!(
-            rows[shop],
-            (Some(0), "• shop · Noted what shop.fix said.".into())
-        );
+        assert_eq!(rows[shop], (Some(0), "• Noted what shop.fix said.".into()));
         assert_eq!(rows[shop - 1], (None, String::new()));
         let calc = at("calc.neg is done.");
-        assert_eq!(rows[calc], (Some(1), "• calc · calc.neg is done.".into()));
+        assert_eq!(rows[calc], (Some(1), "• calc.neg is done.".into()));
         assert_eq!(rows[calc - 1], (None, String::new()));
-        // Off, nothing is barred or named.
+        // Off, nothing is barred.
         let mut app = super::tests::app(zen_daemon().await);
         app.width = 100;
         app.words_only = true;
@@ -19621,10 +19596,7 @@ mod tests {
         let noted = (rows.iter())
             .find(|(_, text)| text.contains("Noted what shop.fix said."))
             .unwrap_or_else(|| panic!("{rows:?}"));
-        assert_eq!(
-            noted,
-            &(Some(0), "• shop · Noted what shop.fix said.".into())
-        );
+        assert_eq!(noted, &(Some(0), "• Noted what shop.fix said.".into()));
     }
 
     #[tokio::test]
@@ -19638,10 +19610,10 @@ mod tests {
         app.daemon(json!({"event": "text_delta", "bot": "b", "turn": 2,
             "text": "Looking at the build."}))
             .await;
-        // Open, it wears the bar and the name as it will once written.
+        // Open, it wears the bar as it will once written.
         let open = app.open_rows(80);
         let first = open.iter().find(|row| row.width() > 0).unwrap();
-        assert_eq!(first.to_string(), "  shop · Looking at the build.");
+        assert_eq!(first.to_string(), "  Looking at the build.");
         let lead = first.spans.iter().find(|span| !span.content.is_empty());
         assert_eq!(lead.unwrap().style.bg, Some(look::bar(0)));
         app.daemon(turn_event("message", 2, json!({"node": 6})))
@@ -19665,8 +19637,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{said} in {rows:?}"))
                 .0
         };
-        // Written, it is the message the daemon kept, named once.
-        assert_eq!(bar("• shop · Noted what shop.fix said."), Some(0));
+        // Written, it is the message the daemon kept.
+        assert_eq!(bar("• Noted what shop.fix said."), Some(0));
         assert_eq!(bar("Push it"), None);
         assert_eq!(bar("Pushing."), None);
     }

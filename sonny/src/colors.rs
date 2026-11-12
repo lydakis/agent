@@ -1,8 +1,8 @@
 //! Project colors, experimental (`/colors`, `[sonny] project_colors`): in
 //! a window that follows other projects' leads, a reply its agent writes
 //! because one followed project's agents woke it wears that project's
-//! color down its first column and opens with the project's name, so
-//! updates from several projects read apart as they interleave. The
+//! color down its first column, so back-to-back replies read as the same
+//! project's or not as updates from several projects interleave. The
 //! person's own turns, and those several projects woke at once, stay
 //! plain. Each followed project takes a color in the followed leads'
 //! order, sorted by name, up to six apart; `[sonny.projects.NAME] color`
@@ -10,18 +10,17 @@
 use std::collections::BTreeMap;
 
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
 };
 
 use crate::screen::Mark;
 
-/// The project the turn is about, and whether its name was written yet.
+/// The project the turn is about, and its color's slot.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Bar {
     pub project: String,
     pub slot: u8,
-    pub named: bool,
 }
 
 /// Each followed project, once, with its color's slot: those `pinned`
@@ -84,67 +83,15 @@ pub fn about(names: &[String], palette: &[(String, u8)]) -> Option<(String, u8)>
 
 /// `lines`, about to be written, worn with `bar`: every row from the
 /// first not blank on, a blank row only after one that wears it, so the
-/// gap above a reply stays bare and two replies read as two. The first
-/// row of the turn's first message (marked [`Mark::Opens`]) opens with
-/// the project's name. `barred` is whether the row before wore it.
-pub fn wear(
-    lines: &mut [Line<'static>],
-    marks: &mut Vec<(usize, Mark)>,
-    bar: &mut Bar,
-    barred: &mut bool,
-) {
-    let opens: Vec<usize> = (marks.iter())
-        .filter(|(_, mark)| *mark == Mark::Opens)
-        .map(|(at, _)| *at)
-        .collect();
-    for (at, line) in lines.iter_mut().enumerate() {
-        let blank = line.width() == 0;
-        *barred = !blank || *barred;
-        if !*barred {
-            continue;
+/// gap above a reply stays bare and two replies read as two. `barred` is
+/// whether the row before wore it.
+pub fn wear(lines: &[Line<'static>], marks: &mut Vec<(usize, Mark)>, bar: &Bar, barred: &mut bool) {
+    for (at, line) in lines.iter().enumerate() {
+        *barred = line.width() > 0 || *barred;
+        if *barred {
+            marks.push((at, Mark::Bar(bar.slot)));
         }
-        if !bar.named
-            && opens.contains(&at)
-            && let Some(hang) = name(line, &bar.project)
-        {
-            bar.named = true;
-            marks.push((at, Mark::Hangs(hang)));
-        }
-        marks.push((at, Mark::Bar(bar.slot)));
     }
-}
-
-/// `line`, a message's first row, opening with `project`'s name after its
-/// lead (`• `, or the blanks a heading starts with): the lead its rows
-/// past the first hang from, when it is wrapped, or none when it has no
-/// such lead.
-pub fn name(line: &mut Line<'static>, project: &str) -> Option<Line<'static>> {
-    let at = line
-        .spans
-        .iter()
-        .position(|span| !span.content.is_empty())?;
-    let span = &line.spans[at];
-    let lead = (span.content.char_indices().nth(2)).map_or(span.content.len(), |(i, _)| i);
-    let leading = &span.content[..lead];
-    if leading.chars().count() < 2 || !leading.chars().all(|c| c == ' ' || c == '•') {
-        return None;
-    }
-    let style = span.style;
-    let rest = span.content[lead..].to_owned();
-    let mut spans = vec![
-        Span::styled(span.content[..lead].to_owned(), style),
-        Span::styled(
-            project.to_owned(),
-            Style::new().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" · ", Style::new().add_modifier(Modifier::DIM)),
-    ];
-    if !rest.is_empty() {
-        spans.push(Span::styled(rest, style));
-    }
-    line.spans.splice(at..=at, spans);
-    let hang = crate::transcript::opens(line).unwrap_or(2);
-    Some(Line::from(" ".repeat(hang)))
 }
 
 /// `line` wearing the bar of the project at `slot` in its first column,
@@ -226,67 +173,45 @@ mod tests {
         lines.iter().map(|line| line.to_string()).collect()
     }
 
+    fn rows_barred(marks: &[(usize, Mark)], slot: u8) -> Vec<usize> {
+        (marks.iter())
+            .filter(|(_, mark)| *mark == Mark::Bar(slot))
+            .map(|(at, _)| *at)
+            .collect()
+    }
+
     #[test]
-    fn a_reply_wears_its_bar_from_its_first_row_to_its_last_its_name_first() {
-        let mut lines = vec![
+    fn a_reply_wears_its_bar_from_its_first_row_to_its_last_and_no_name() {
+        let lines = vec![
             Line::default(),
             Line::from("• The refunds task finished."),
             Line::default(),
             Line::from("  Two tests were flaky."),
         ];
         let mut marks = vec![(1, Mark::Opens)];
-        let mut bar = Bar {
+        let bar = Bar {
             project: "shop".into(),
             slot: 2,
-            named: false,
         };
         let mut barred = false;
-        wear(&mut lines, &mut marks, &mut bar, &mut barred);
+        wear(&lines, &mut marks, &bar, &mut barred);
         assert_eq!(
             texts(&lines),
             [
                 "",
-                "• shop · The refunds task finished.",
+                "• The refunds task finished.",
                 "",
                 "  Two tests were flaky."
             ]
         );
-        let barred_rows: Vec<usize> = (marks.iter())
-            .filter(|(_, mark)| *mark == Mark::Bar(2))
-            .map(|(at, _)| *at)
-            .collect();
         // The gap above is bare; the blank between its paragraphs is not.
-        assert_eq!(barred_rows, [1, 2, 3]);
-        assert!(bar.named && barred);
-        // Its next message in the same turn is not named again.
-        let mut more = vec![Line::default(), Line::from("• And CI is green.")];
-        let mut marks = vec![(1, Mark::Opens)];
-        wear(&mut more, &mut marks, &mut bar, &mut barred);
-        assert_eq!(texts(&more), ["", "• And CI is green."]);
-        assert_eq!(
-            marks
-                .iter()
-                .filter(|(_, m)| matches!(m, Mark::Bar(_)))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn a_name_goes_after_the_lead_and_a_heading_s_blanks_too() {
-        let mut line = Line::from("• Done.");
-        assert_eq!(name(&mut line, "shop"), Some(Line::from("  ")));
-        assert_eq!(line.to_string(), "• shop · Done.");
-        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
-        let mut heading = Line::from(vec![
-            Span::raw("  "),
-            Span::styled("Status", Style::new().add_modifier(Modifier::BOLD)),
-        ]);
-        assert!(name(&mut heading, "atlas").is_some());
-        assert_eq!(heading.to_string(), "  atlas · Status");
-        let mut relayed = Line::from("↳ 1 task update ▸");
-        assert_eq!(name(&mut relayed, "shop"), None);
-        assert_eq!(relayed.to_string(), "↳ 1 task update ▸");
+        assert_eq!(rows_barred(&marks, 2), [1, 2, 3]);
+        assert!(barred);
+        // Its next message in the same turn wears it on from the gap.
+        let more = vec![Line::default(), Line::from("• And CI is green.")];
+        let mut marks = Vec::new();
+        wear(&more, &mut marks, &bar, &mut barred);
+        assert_eq!(rows_barred(&marks, 2), [0, 1]);
     }
 
     #[test]

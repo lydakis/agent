@@ -1333,13 +1333,13 @@ has something on it, or is off the screen, no time shows.
 - `/colors` (experimental) colors a busy lead's window by project: when
   the lead follows other projects' leads, a reply it writes because one
   of those projects woke it wears that project's colored bar down its
-  left edge and opens with its name (`shop · The refunds task
-  finished…`); your own turns stay plain. Each followed project takes one
+  left edge, so you can tell whether back-to-back replies are about the
+  same project; your own turns stay plain. Each followed project takes one
   of six colors in the followed leads' order, `[sonny.projects.NAME]
   color = "jade"` pins one, and `[sonny] project_colors = true` turns it
   on in every window.
 
-  ![Project colors on: replies about atlas, shop and blog each wear their project's bar and open with its name; your own turns stay plain](../docs/sonny/project-colors-dark.png)
+  ![Project colors on: replies about atlas, shop and blog each wear their project's bar; your own turns stay plain](../docs/sonny/project-colors-dark.png)
 
   ![The same in a light theme](../docs/sonny/project-colors-light.png)
 

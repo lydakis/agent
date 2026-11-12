@@ -3856,17 +3856,14 @@ mod tests {
     fn a_project_bar_stays_on_rows_drawn_again_and_rows_put_under() {
         let mut screen = Screen::default();
         screen.push_marked(
-            vec![Line::from("• shop · Started a ▸"), Line::from("after")],
+            vec![Line::from("• Started a ▸"), Line::from("after")],
             vec![
                 (0, Mark::Tag(Tag::Group(1))),
                 (0, Mark::Bar(2)),
                 (1, Mark::Tag(Tag::End(4))),
             ],
         );
-        let open = vec![
-            Line::from("• shop · Started a ▾"),
-            Line::from("• Started a"),
-        ];
+        let open = vec![Line::from("• Started a ▾"), Line::from("• Started a")];
         assert!(screen.replace_tagged(Tag::Group(1), open, Vec::new()));
         assert_eq!(screen.bars(), [Some(2), Some(2), None]);
         assert!(screen.put_under(Tag::Group(1), Tag::Reactions(1), Some("   🎉".into())));

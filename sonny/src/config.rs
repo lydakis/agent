@@ -149,7 +149,7 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "sonny.project_colors",
-        about: "experimental: in a window that follows other leads, a reply about one followed project wears its color and opens with its name; /colors toggles it in one window",
+        about: "experimental: in a window that follows other leads, a reply about one followed project wears its color; /colors toggles it in one window",
         values: SWITCH,
         default: "false",
     },
