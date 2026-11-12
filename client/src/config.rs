@@ -73,7 +73,7 @@
 //! lookout_waiting = 4096        # events from sources that wait for one agent, 1024 by default; past it newer ones are not kept, and its next note says so; 0 no limit
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
-//! project_colors = true         # experimental: a superlead's reply about one followed project wears its color; /colors toggles it, off by default
+//! project_colors = true         # experimental: a lead's reply about one followed project wears its color; /colors toggles it, off by default
 //!
 //! [sonny.projects.shop]         # one project as Sonny shows it
 //! color = "jade"                # its color in /colors: jade, violet, orange, azure, lime or rose; by default from the followed leads' order
