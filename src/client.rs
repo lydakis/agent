@@ -1153,6 +1153,9 @@ struct Started {
     log: std::ffi::OsString,
     /// Where its output starts in the log other starts append to.
     from: u64,
+    /// The store and the start flags to pin for it once this daemon, not
+    /// one that took the store before it, answers.
+    pins: Option<(PathBuf, agent_client::config::Pins)>,
 }
 
 /// Start the daemon `options` name, with `start`; with `await_owner`, one
@@ -1210,10 +1213,15 @@ fn spawn_daemon(
     // flags last started it: those flags are pinned beside the store, and
     // what was pinned goes over the person's `[daemon]` limits, worked out
     // for this machine.
+    // They are pinned once this start's own daemon answers, so a start
+    // that loses the store to another's pins nothing; pins that would not
+    // read are refused before anything starts.
     let given = options.providers_explicit || !options.daemon_flags.is_empty();
     let store = pinned_store(options)?;
-    if given && agent_client::config::read_pins(&store).ok() != Some(start.pins.clone()) {
-        agent_client::config::write_pins(&store, &start.pins).map_err(config_error)?;
+    let pins = (given && agent_client::config::read_pins(&store).ok() != Some(start.pins.clone()))
+        .then(|| (store, start.pins.clone()));
+    if let Some((store, pins)) = &pins {
+        agent_client::config::check_pins(store, pins).map_err(config_error)?;
     }
     let mut limits = config()?.daemon;
     limits.extend(start.pins.daemon.clone());
@@ -1297,6 +1305,7 @@ fn spawn_daemon(
         child,
         log: log_path,
         from,
+        pins,
     })
 }
 
@@ -1312,7 +1321,7 @@ impl Started {
         };
         loop {
             match answering(options, deadline) {
-                Ok(Some(connection)) => return Ok(connection),
+                Ok(Some(connection)) => return self.pin(connection),
                 Ok(None) => {}
                 Err(error) => return Err(timed_out(&mut self, error)),
             }
@@ -1343,6 +1352,17 @@ impl Started {
                 Err(error) => return Err(timed_out(&mut self, error)),
             }
         }
+    }
+
+    /// `connection`, once the start flags are pinned if it reached this
+    /// start's own daemon.
+    fn pin(&self, connection: Connection) -> Result<Connection> {
+        if let Some((store, pins)) = &self.pins
+            && connection.ready["pid"].as_u64() == Some(u64::from(self.child.id()))
+        {
+            agent_client::config::write_pins(store, pins).map_err(config_error)?;
+        }
+        Ok(connection)
     }
 
     /// The error the child reported, once it has exited.

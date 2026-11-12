@@ -383,12 +383,9 @@ fn is_placeholder(path: &Path) -> bool {
         && std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
-/// Write `pins` beside `store`, the daemon's user's alone, whole or not
-/// at all: written aside, then renamed over the last.
-pub fn write_pins(store: &Path, pins: &Pins) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = pins_path(store);
+/// `pins` as the file holds them, once read back the way every later
+/// start reads them: what would refuse those starts is refused now.
+fn pins_text(path: &Path, pins: &Pins) -> Result<String, String> {
     let mut text = String::from(
         "# How this store's daemon starts, pinned by a start given flags, which\n\
          # pins again; every start reads it over ~/.agent/config.toml. Edit or\n\
@@ -406,20 +403,51 @@ pub fn write_pins(store: &Path, pins: &Pins) -> Result<(), String> {
             text.push_str(&format!("{key} = {}\n", toml::Value::from(value.as_str())));
         }
     }
-    // Read back as every later start reads it: what would refuse them is
-    // refused now, and nothing is written.
     parse(&text).map_err(|reason| format!("config_invalid: {}: {reason}", path.display()))?;
-    let mut aside = path.as_os_str().to_owned();
-    aside.push(format!(".{}", std::process::id()));
-    let aside = PathBuf::from(aside);
+    Ok(text)
+}
+
+/// Whether `pins` would be written for `store`: refused as `write_pins`
+/// would refuse them, with nothing written.
+pub fn check_pins(store: &Path, pins: &Pins) -> Result<(), String> {
+    pins_text(&pins_path(store), pins).map(drop)
+}
+
+/// Write `pins` beside `store`, the daemon's user's alone, whole or not
+/// at all: written aside, then renamed over the last.
+pub fn write_pins(store: &Path, pins: &Pins) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = pins_path(store);
+    let text = pins_text(&path, pins)?;
     let unwritable = |e: std::io::Error| format!("config_unwritable: {}: {e}", path.display());
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&aside)
-        .and_then(|mut file| file.write_all(text.as_bytes()));
+    // Made new, never opened: a name already there (a link a command put
+    // where the store's folder is writable to it) is passed over, never
+    // followed.
+    let mut made = None;
+    for n in 0..64 {
+        let mut aside = path.as_os_str().to_owned();
+        aside.push(format!(".{}.{n}", std::process::id()));
+        let aside = PathBuf::from(aside);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&aside)
+        {
+            Ok(file) => {
+                made = Some((aside, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(unwritable(error)),
+        }
+    }
+    let Some((aside, mut file)) = made else {
+        return Err(unwritable(std::io::ErrorKind::AlreadyExists.into()));
+    };
+    let written = file.write_all(text.as_bytes());
+    drop(file);
     if is_placeholder(&path) {
         let _ = std::fs::remove_dir(&path);
     }
@@ -2693,6 +2721,18 @@ mod tests {
                 .unwrap_err()
                 .contains("daemon.load")
         );
+        assert_eq!(read_pins(&store).unwrap(), pins);
+        assert!(check_pins(&store, &refused).is_err());
+        assert_eq!(check_pins(&store, &pins), Ok(()));
+        // A link where pins are written aside is passed over, never
+        // followed.
+        let target = dir.join("target");
+        std::fs::write(&target, "kept").unwrap();
+        let mut aside = pins_path(&store).into_os_string();
+        aside.push(format!(".{}.0", std::process::id()));
+        std::os::unix::fs::symlink(&target, &aside).unwrap();
+        write_pins(&store, &pins).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "kept");
         assert_eq!(read_pins(&store).unwrap(), pins);
         assert_eq!(daemon_key("--idle-exit"), Some("idle_exit"));
         assert_eq!(daemon_key("--max-active"), Some("active"));
