@@ -479,6 +479,25 @@ pub async fn accept(
     caller: Option<i64>,
     hub: Option<Hub>,
 ) {
+    accept_after(Vec::new(), listener, sender, next, caller, hub).await
+}
+
+/// [`accept`], taking up first the connections `waiting` holds, in the
+/// order they came: those [`starting`] kept while the daemon opened its
+/// store.
+pub async fn accept_after(
+    waiting: Vec<tokio::net::UnixStream>,
+    listener: tokio::net::UnixListener,
+    sender: Sender,
+    next: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    caller: Option<i64>,
+    hub: Option<Hub>,
+) {
+    for stream in waiting {
+        if !open(stream, &sender, &next, caller, hub.as_ref()).await {
+            return;
+        }
+    }
     loop {
         // An accept that fails (the process out of descriptors, a
         // connection gone before it was taken) leaves the listener as good
@@ -488,29 +507,92 @@ pub async fn accept(
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             continue;
         };
-        let id = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let peer = stream
-            .peer_cred()
-            .ok()
-            .and_then(|cred| cred.pid())
-            .and_then(|pid| u32::try_from(pid).ok());
-        let (read, write) = stream.into_split();
-        let output = Output::writer(write);
-        let renewals = hub.clone().map(|hub| (hub, output.clone()));
-        if sender
-            .send(Inbound::Open(id, output, caller, peer))
-            .await
-            .is_err()
-        {
+        if !open(stream, &sender, &next, caller, hub.as_ref()).await {
             break;
         }
-        tokio::spawn(socket_reader(
-            id,
-            BufReader::new(read),
-            sender.clone(),
-            renewals,
-        ));
     }
+}
+
+/// Make `stream` a session: the service is told it opened, and its lines
+/// are read. False once the service has gone.
+async fn open(
+    stream: tokio::net::UnixStream,
+    sender: &Sender,
+    next: &std::sync::atomic::AtomicU64,
+    caller: Option<i64>,
+    hub: Option<&Hub>,
+) -> bool {
+    let id = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let peer = stream
+        .peer_cred()
+        .ok()
+        .and_then(|cred| cred.pid())
+        .and_then(|pid| u32::try_from(pid).ok());
+    let (read, write) = stream.into_split();
+    let output = Output::writer(write);
+    let renewals = hub.cloned().map(|hub| (hub, output.clone()));
+    if sender
+        .send(Inbound::Open(id, output, caller, peer))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    tokio::spawn(socket_reader(
+        id,
+        BufReader::new(read),
+        sender.clone(),
+        renewals,
+    ));
+    true
+}
+
+/// How often a connection made while the daemon opens its store is told
+/// again that it starts: well inside the time a client waits for a line.
+pub const STARTING_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Until `ready` fires, tell each connection to `listener` that the daemon
+/// starts (`line`, a `starting` event), as it comes and every
+/// [`STARTING_EVERY`] after, so a client waits for the daemon's `ready`
+/// rather than taking a store being opened (upgraded, perhaps, for
+/// minutes) for no daemon and starting another, which could only lose the
+/// store to this one. Each write is one non-blocking call; a connection
+/// that cannot take a whole line has stopped reading or gone, and is
+/// dropped. What it kept goes back, in order, with the listener, for
+/// [`accept_after`].
+pub async fn starting(
+    listener: tokio::net::UnixListener,
+    line: Vec<u8>,
+    ready: tokio::sync::oneshot::Receiver<()>,
+) -> (tokio::net::UnixListener, Vec<tokio::net::UnixStream>) {
+    use std::io::Write;
+    let tell = |stream: &mut std::os::unix::net::UnixStream| matches!(stream.write(&line), Ok(written) if written == line.len());
+    let mut waiting: Vec<std::os::unix::net::UnixStream> = Vec::new();
+    let mut again =
+        tokio::time::interval_at(tokio::time::Instant::now() + STARTING_EVERY, STARTING_EVERY);
+    let mut ready = ready;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut ready => break,
+            accepted = listener.accept() => match accepted.and_then(|(stream, _)| stream.into_std()) {
+                // Kept as the system's own socket, non-blocking, until
+                // the daemon takes it up.
+                Ok(mut stream) => {
+                    if tell(&mut stream) {
+                        waiting.push(stream);
+                    }
+                }
+                // As `accept_after` does: the next after a moment.
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            },
+            _ = again.tick() => waiting.retain_mut(|stream| tell(stream)),
+        }
+    }
+    let waiting = (waiting.into_iter())
+        .filter_map(|stream| tokio::net::UnixStream::from_std(stream).ok())
+        .collect();
+    (listener, waiting)
 }
 
 /// The answer to `request` when it renews a lease under a valid id.

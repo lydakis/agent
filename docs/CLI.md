@@ -467,6 +467,10 @@ The file is read only then, never for a command a running daemon answers.
 As Codex keeps `~/.codex/.env` from setting `CODEX_` names, names starting
 `AGENT_` (any case) are passed over: they are Agent's own settings. A key
 there names its provider as one in the environment would.
+On a machine whose `/tmp` is small (a RAM disk, say), make a folder and
+put `TMPDIR=/that/folder` there: the daemon and every tool shell, which
+inherit its environment, then write temporary files there, and a sandboxed
+command may write it as it may `/tmp`.
 Providers taken from the config file (no `--provider`, no `AGENT_PROVIDER`)
 follow it while the daemon runs (`serve --provider-config`): the kernel
 tells the daemon when the file changes (inotify, kqueue; nothing runs in

@@ -676,7 +676,11 @@ impl Connection {
         }
         Ok(connection)
     }
-    fn read_ready(&mut self, deadline: Instant) -> Result<Value> {
+    /// The daemon's `ready` line, by `deadline`, or later for as long as
+    /// the daemon keeps saying it starts: a `starting` line, which a daemon
+    /// sends while it opens (and perhaps upgrades) its store, each one
+    /// giving it `STARTUP_TIMEOUT` more.
+    fn read_ready(&mut self, mut deadline: Instant) -> Result<Value> {
         let mut line = Vec::new();
         loop {
             // Recompute the remaining budget before each read, so partial
@@ -705,10 +709,16 @@ impl Connection {
             line.extend_from_slice(&bytes[..consumed]);
             self.reader.consume(consumed);
             if newline.is_some() {
+                let greeting: Value = serde_json::from_slice(&line)?;
+                if greeting["event"] == "starting" {
+                    deadline = deadline.max(Instant::now() + STARTUP_TIMEOUT);
+                    line.clear();
+                    continue;
+                }
                 // Keep read-ahead bytes in the same buffer. Normal requests and
                 // event streams may wait longer than the startup deadline.
                 self.reader.get_ref().set_read_timeout(None)?;
-                return Ok(serde_json::from_slice(&line)?);
+                return Ok(greeting);
             }
         }
     }
@@ -3858,6 +3868,45 @@ fn preview(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_daemon_that_says_it_starts_is_waited_for_past_the_first_deadline() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("agent-starting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("s.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..4 {
+                stream
+                    .write_all(b"{\"event\":\"starting\",\"protocol\":1,\"pid\":7}\n")
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            stream
+                .write_all(b"{\"event\":\"ready\",\"pid\":7}\n")
+                .unwrap();
+            stream
+        });
+        // Its ready line comes well after the first deadline: each
+        // `starting` gives it more time.
+        let connection =
+            Connection::greeted_until(&socket, Instant::now() + Duration::from_millis(200))
+                .unwrap();
+        assert_eq!(connection.ready, json!({"event": "ready", "pid": 7}));
+        drop(daemon.join().unwrap());
+        // One that says nothing is not waited for past it.
+        let listener = std::os::unix::net::UnixListener::bind(dir.join("quiet.sock")).unwrap();
+        let quiet = Connection::greeted_until(
+            &dir.join("quiet.sock"),
+            Instant::now() + Duration::from_millis(200),
+        );
+        assert_eq!(quiet.err().unwrap().code, "daemon_start_timeout");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_socket_named_bare_or_in_full_is_the_same_socket() {
