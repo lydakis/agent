@@ -2363,11 +2363,11 @@ async fn run() -> Result<(), String> {
     let (client, mut events) = match Client::connect(&options.socket).await {
         Ok(connected) => connected,
         Err(error) => {
-            // Starting replaces an older daemon once its running turns end,
-            // which can take a while; the screen is not up yet to say so.
+            // Starting replaces an older daemon, which takes a moment while
+            // the new one opens the store; the screen is not up yet to say so.
             if older_daemon(&error) {
                 eprintln!(
-                    "sonny: the running daemon is older than this Sonny; it stops once its running turns end (at most 2 minutes), then this one starts"
+                    "sonny: the running daemon is older than this Sonny; it stops now, and its running turns continue on this one as it starts"
                 );
             }
             connect(&options, Asking::AtStart).await?

@@ -1788,7 +1788,7 @@ class CliTests(ModelFixture):
                 if answer == 'replaced':
                     self.assertEqual(asked, [None])
                 else:
-                    self.assertEqual([(r['op'], r['grace_ms']) for r in asked], [('shutdown', 120000)])
+                    self.assertEqual([(r['op'], r['grace_ms']) for r in asked], [('shutdown', 0)])
                 self.assertEqual(daemon.wait(timeout=3), -15)
                 if command == 'ls':
                     # Its listing came from the new daemon.
@@ -1797,7 +1797,7 @@ class CliTests(ModelFixture):
                     self.assertEqual(json.loads(result.stdout)['protocol'], PROTOCOL)
 
     def test_a_replacing_daemon_waits_on_the_store_and_no_other_start_takes_it(self):
-        # An upgrade's new daemon starts while the older one drains and
+        # An upgrade's new daemon starts while the older one stops and
         # waits on the store and socket it holds, so a daemon another start
         # brings up meanwhile (an open window of the older build) is refused
         # and names who holds the store; the new one takes both the moment
