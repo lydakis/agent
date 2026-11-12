@@ -1971,7 +1971,10 @@ pub async fn run(config: Configuration) -> Result<()> {
             fallbacks: config.fallbacks.clone(),
         })
     });
-    let mut ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
+    // Its release beside its protocol: a caller that replaced a daemon sees
+    // which build answers, an upgrade's handover included.
+    let mut ready = json!({"event":"ready","version":env!("CARGO_PKG_VERSION"),
+        "protocol":agent_client::PROTOCOL,"pid":std::process::id(),
         "paused":paused,
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
         "limits":{"processes":limits.processes,"lasting":limits.lasting,"active":limits.active,"connecting":limits.connecting,
@@ -2581,6 +2584,10 @@ pub async fn run(config: Configuration) -> Result<()> {
 /// greets on `socket`: older or newer than this one, by protocol, and its
 /// pid, so whoever started this one can tell an upgrade's leftover from a
 /// start that raced it.
+/// How a sandboxed caller's request is refused when it would give a bot a
+/// folder the caller may not write itself, after the folder.
+pub const OUTSIDE_WRITABLE: &str = "is outside the folders this sandboxed bot may write";
+
 async fn owned_by(error: Error, socket: Option<&Path>) -> Error {
     use tokio::io::AsyncBufReadExt;
     let elsewhere = || Error::with(&error.code, "another process holds this store");
@@ -2884,10 +2891,7 @@ impl Service {
         .await
         .map_err(|_| Error::new("sandbox_unavailable"))??;
         match outside {
-            Some(folder) => fail_with(
-                "not_permitted",
-                format!("{folder} is outside the folders this sandboxed bot may write"),
-            ),
+            Some(folder) => fail_with("not_permitted", format!("{folder} {OUTSIDE_WRITABLE}")),
             None => Ok(()),
         }
     }

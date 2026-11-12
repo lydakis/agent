@@ -11,7 +11,10 @@ your folder, with your permissions. The script passes results between agents
 in code, and you hear back once, when it ends, in a message from the
 workflow. Use one to be thorough (cover many pieces in parallel), to be sure
 (independent checks before you commit to an answer), or for work too large
-for one conversation (a migration, an audit, a sweep).
+for one conversation (a migration, an audit, a sweep). The agents a workflow
+starts have none of the tools that start agents, on purpose, so a check that
+needs a new agent of its own (a trap on agent start, say) runs outside the
+workflow.
 
 Scout first, inline: list the files, scope the diff, find the sources. Then
 run a workflow over that list. For larger work, run several in turn, one per

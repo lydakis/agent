@@ -77,7 +77,57 @@ pub const STEPS: &[Step] = &[
         done: crate::git::no_snapshot_refs,
         retire: "0.11.0",
     },
+    // A message's handle is `BOT/N` since 0.9.3; facts and skills agents
+    // wrote before still name `turn:BOT/N`, the same number (0.9.4).
+    Step {
+        id: "message-handles",
+        text: include_str!("../upgrades/message-handles.md"),
+        done: message_handles_done,
+        retire: "0.11.0",
+    },
 ];
+
+/// Whether no fact in `~/.agents/memory` and no skill in `~/.agents/skills`
+/// still names a message in the form before 0.9.3, `turn:BOT/N`.
+fn message_handles_done() -> bool {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return true;
+    };
+    ["memory", "skills"]
+        .iter()
+        .all(|folder| !old_handle_under(&home.join(".agents").join(folder), 0))
+}
+
+/// Whether a Markdown file under `dir`, a few folders deep at most, names
+/// a `turn:BOT/N` handle.
+fn old_handle_under(dir: &Path, depth: usize) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => depth < 4 && old_handle_under(&path, depth + 1),
+            Ok(kind) if kind.is_file() => {
+                path.extension().is_some_and(|ext| ext == "md")
+                    && std::fs::read_to_string(&path).is_ok_and(|text| names_old_handle(&text))
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Whether `text` holds `turn:BOT/N`: `turn:`, a name with no space or
+/// slash, a slash, and a digit.
+fn names_old_handle(text: &str) -> bool {
+    text.match_indices("turn:").any(|(at, prefix)| {
+        let rest = &text[at + prefix.len()..];
+        let name = rest
+            .find(|c: char| c == '/' || c.is_whitespace())
+            .filter(|end| *end > 0 && rest[*end..].starts_with('/'));
+        name.is_some_and(|end| rest[end + 1..].starts_with(|c: char| c.is_ascii_digit()))
+    })
+}
 
 /// Whether `~/.agent/env` sets no `AGENT_JUDGE`, the reviewer's model
 /// before 0.8.0, which is `[reviewer] model` now.
@@ -315,6 +365,24 @@ mod tests {
         assert!(!no_judge_in(&file));
         std::fs::write(&file, "OPENAI_API_KEY=k\n").unwrap();
         assert!(no_judge_in(&file));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_handle_in_the_form_before_messages_had_numbers_is_found() {
+        assert!(names_old_handle("waited on turn:calc.fix/48 for it"));
+        assert!(names_old_handle("(turn:a/1)"));
+        assert!(!names_old_handle("calc.fix/48 and its turn: 3"));
+        assert!(!names_old_handle("turn:/4, turn: a/4, turn:a/b"));
+        let dir = std::env::temp_dir().join(format!("old-handles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("projects/one")).unwrap();
+        std::fs::write(dir.join("projects/one/fact.md"), "see calc/2").unwrap();
+        assert!(!old_handle_under(&dir, 0));
+        std::fs::write(dir.join("projects/one/note.txt"), "turn:calc/2").unwrap();
+        assert!(!old_handle_under(&dir, 0), "only Markdown is read");
+        std::fs::write(dir.join("projects/one/fact.md"), "see turn:calc/2").unwrap();
+        assert!(old_handle_under(&dir, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

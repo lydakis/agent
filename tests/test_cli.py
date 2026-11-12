@@ -896,6 +896,8 @@ class SocketAndCliTests(ModelFixture):
         # How a bot calls its model is its own setting, not the daemon's.
         self.assertFalse({'output_tokens', 'cache_ttl'} & set(ready['limits']))
         self.assertEqual(ready['limits']['connections'], -(-ready['limits']['active'] // 64))
+        # It names its release, so a caller sees which build answers.
+        self.assertEqual(ready['version'], re.search(r'^version = "(.+)"', (Path(__file__).parent.parent/'Cargo.toml').read_text(), re.M)[1])
 
     def test_burst_eviction_exits_client_and_replay_recovers_terminal_event(self):
         run = self.agent('run', *self.common, '--new', '--bot', 'Bob', 'burst', check=False, timeout=4)

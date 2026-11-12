@@ -1398,6 +1398,21 @@ fn made_by(
     }
 }
 
+/// A handle refused in its form before 0.9.3, `turn:BOT/N`, with the
+/// one it is now: the same number, since each turn kept its number as the
+/// message that opened it.
+fn ways_past_handle(handle: &str, mut error: Error) -> Error {
+    if let Some(now) = handle.strip_prefix("turn:") {
+        error.facts.get_or_insert_default().insert(
+            "hint".into(),
+            json!(format!(
+                "turn:BOT/N is the form before 0.9.3; the same message is {now} now"
+            )),
+        );
+    }
+    error
+}
+
 /// A `--quote`: `BOT/N`, a message as its handle names it, and `:reply`
 /// for the reply the turn that took it in ended with.
 fn quote(value: &str) -> Result<Value> {
@@ -1410,7 +1425,10 @@ fn quote(value: &str) -> Result<Value> {
         (!bot.is_empty() && !bot.contains(':')).then_some((bot, message))
     });
     let Some((bot, message)) = parsed else {
-        return fail_with("usage", "--quote needs BOT/N or BOT/N:reply");
+        return Err(ways_past_handle(
+            handle,
+            Error::with("usage", "--quote needs BOT/N or BOT/N:reply"),
+        ));
     };
     let mut quote = json!({"bot":bot,"message":message});
     if reply {
@@ -2312,14 +2330,33 @@ fn make_fork(
         // A keyed fork outlives its source: its resend is answered from the
         // fork, so it needs nothing from the source.
         Err(error) if error.code == "bot_not_found" && request_id.is_some() => {
-            return connection.request("fork", request);
+            return connection.request("fork", request).map_err(ways_past_reach);
         }
         state => state?,
     };
     if answered_by_auto(&state) {
         require_approver(connection)?;
     }
-    connection.request("fork", request)
+    connection.request("fork", request).map_err(ways_past_reach)
+}
+
+/// A sandboxed caller's fork refused for a folder it may not write, as a
+/// task's worktree is to its lead, with the ways past it as flags to copy.
+fn ways_past_reach(mut error: Error) -> Error {
+    let outside = error.code == "not_permitted"
+        && (error.detail.as_deref())
+            .is_some_and(|detail| detail.ends_with(crate::server::OUTSIDE_WRITABLE));
+    if outside {
+        error.facts.get_or_insert_default().insert(
+            "hint".into(),
+            json!(
+                "fork with --workspace FOLDER, a folder this bot may write, when every other \
+                 folder the source may write is this bot's too; or with --allow '' for a copy \
+                 that may call no tool, which writes nothing"
+            ),
+        );
+    }
+    error
 }
 
 fn interrupt(options: &Options) -> Result<i32> {
@@ -2401,10 +2438,17 @@ fn wait(options: &Options) -> Result<i32> {
         Some(bot) => vec![current_turn(&mut connection, bot, options.bot_id)?],
         None => options.positional.clone(),
     };
-    let result = connection.request(
-        "wait",
-        json!({"handles":handles,"timeout_ms":options.timeout_ms,"any":options.any}),
-    )?;
+    let result = connection
+        .request(
+            "wait",
+            json!({"handles":handles,"timeout_ms":options.timeout_ms,"any":options.any}),
+        )
+        .map_err(|error| match &error.detail {
+            Some(handle) if error.code == "invalid_handle" => {
+                ways_past_handle(&handle.clone(), error)
+            }
+            _ => error,
+        })?;
     print_json(&result, options.pretty)?;
     let clean = result["results"].as_object().is_some_and(|results| {
         let resolved = |v: &&Value| v.get("pending") != Some(&Value::Bool(true));
@@ -3849,6 +3893,36 @@ mod tests {
         };
         assert_eq!(Error::from(served).facts.unwrap()["lease_left_ms"], 900);
         assert!(Error::reported(&json!({"result":{}})).is_none());
+    }
+
+    #[test]
+    fn a_fork_outside_the_caller_s_folders_and_an_old_handle_name_their_way_past() {
+        let hint = |error: Error| error.facts.and_then(|facts| facts.get("hint").cloned());
+        let outside = Error::with(
+            "not_permitted",
+            format!("/w/task {}", crate::server::OUTSIDE_WRITABLE),
+        );
+        let hinted = hint(ways_past_reach(outside)).unwrap();
+        assert!(
+            hinted.as_str().unwrap().contains("--workspace FOLDER"),
+            "{hinted}"
+        );
+        assert!(hinted.as_str().unwrap().contains("--allow ''"), "{hinted}");
+        let other = Error::with(
+            "not_permitted",
+            "a sandboxed bot's commands may not start a line",
+        );
+        assert!(hint(ways_past_reach(other)).is_none());
+        let old = ways_past_handle(
+            "turn:calc/48",
+            Error::with("invalid_handle", "turn:calc/48"),
+        );
+        assert_eq!(
+            hint(old).unwrap(),
+            "turn:BOT/N is the form before 0.9.3; the same message is calc/48 now"
+        );
+        assert!(hint(ways_past_handle("calc", Error::new("invalid_handle"))).is_none());
+        assert!(quote("turn:calc/48").unwrap_err().facts.is_some());
     }
 
     #[test]
