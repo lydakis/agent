@@ -537,7 +537,9 @@ reaches every bot, old or new, once the daemon starts again; keys are
 A refused turn says how in `wait` and `turns`: the refusal's `category` and
 the provider's `explanation`, `provider_request_id` for a support case,
 `mid_stream` and `written_tokens` for how far the answer got, and
-`fallback`, the model it was sent to again or null.
+`fallback`, the model it was sent to again or null. A fallback it could not
+go to (a provider the daemon does not serve, or one of another API family)
+is named in `unused_fallback`, `{model, error}`.
 Other client commands require an already running daemon.
 
 `models` prints the models clients offer as JSON `[{id, note?}]`

@@ -1141,9 +1141,11 @@ class AnthropicRuntimeTests(unittest.TestCase):
 
     def test_the_daemon_s_fallbacks_reach_every_bot_that_names_none(self):
         client, model, path = self.start(
-            extra=('--fallbacks', 'anthropic/synthetic-claude=anthropic/synthetic-claude-2'))
+            extra=('--fallbacks', 'anthropic/synthetic-claude=anthropic/synthetic-claude-2',
+                   '--fallbacks', 'anthropic/synthetic-claude-3=gone/synthetic-model'))
         self.assertEqual(client.ready['fallbacks'],
-                         {'anthropic/synthetic-claude': 'anthropic/synthetic-claude-2'})
+                         {'anthropic/synthetic-claude': 'anthropic/synthetic-claude-2',
+                          'anthropic/synthetic-claude-3': 'gone/synthetic-model'})
         client.request('create', bot='Bob', workspace=str(path))
         self.assertIsNone(client.request('inspect', bot='Bob')['result'].get('fallback'))
         turn = client.request('submit', bot='Bob', request_id='f1', prompt='refuse:all')['result']['message']
@@ -1159,6 +1161,13 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(client.finished(turn)['data']['fallback'], 'anthropic/synthetic-claude-3')
         self.assertEqual([model.requests.get(timeout=1)['model'] for _ in range(2)],
                          ['synthetic-claude', 'synthetic-claude-3'])
+        # One on a provider the daemon does not serve is not tried, and says why.
+        client.request('create', bot='Gone', workspace=str(path), model='anthropic/synthetic-claude-3')
+        turn = client.request('submit', bot='Gone', request_id='g1', prompt='refuse:all')['result']['message']
+        finished = client.finished(turn)['data']
+        self.assertEqual((finished['fallback'], finished['unused_fallback']),
+                         (None, {'model': 'gone/synthetic-model', 'error': 'provider_unavailable'}))
+        self.assertEqual(model.requests.get(timeout=1)['model'], 'synthetic-claude-3')
         self.assertTrue(model.requests.empty())
 
     def test_a_refusal_midway_through_the_answer_keeps_what_was_sent(self):

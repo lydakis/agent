@@ -3789,6 +3789,8 @@ impl Turn {
             }),
             None => None,
         };
+        // A fallback the declined request could not go to, and why.
+        let mut unusable = None;
         let mut tool_calls = tool_calls;
         // A budget a failed attempt spent, said once its retry goes.
         let mut announce = None;
@@ -3959,6 +3961,13 @@ impl Turn {
                             pending: true,
                             ..to
                         });
+                        if fallback.is_none() {
+                            let code = match self.providers.get(split_model(&reference)?.0) {
+                                None => "provider_unavailable",
+                                Some(_) => "provider_family_mismatch",
+                            };
+                            unusable = Some(json!({"model": reference, "error": code}));
+                        }
                     }
                     error
                 }
@@ -4098,7 +4107,12 @@ impl Turn {
                     let tried = fallback
                         .as_ref()
                         .map(|to| format!("{}/{}", to.name, to.model));
-                    (error.facts.get_or_insert_default()).insert("fallback".into(), json!(tried));
+                    let facts = error.facts.get_or_insert_default();
+                    facts.insert("fallback".into(), json!(tried));
+                    // One it could not go to says so, not nothing.
+                    if let Some(unusable) = unusable.take() {
+                        facts.insert("unused_fallback".into(), unusable);
+                    }
                 }
                 return Err(error);
             }
