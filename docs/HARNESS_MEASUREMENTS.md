@@ -70,12 +70,24 @@ warm-up, so it uses one connection per agent instead of two, and it runs one
 | Claude Code | 5,225.5 | 23.82 | 192 ms | 1,655 ms | 32 of 32 |
 
 Agent is the only engine whose binary changed since 2026-11-01. Its top case
-fell from 30.4 to 26.6 MiB and from 0.75 to 0.24 CPU seconds, and its first
-chunk and turn p99 fell too. An interleaved A/B on the same host the same day
-(Agent only, medians of three) separates the releases: 0.9.0 25.5 MiB and
-0.34 s, 0.9.3 27.2 MiB and 0.30 s, main 27.6 MiB and 0.28 s. With the daemon
-idle, 0.9.0 to main is +0.8 MiB of clean code pages (the binary grew from
-20.8 to 22.1 MB) and +0.1 MiB of heap. Every engine reached every case's
+fell from 30.4 to 26.6 MiB and from 0.75 to 0.24 CPU seconds. The other
+engines moved by up to 16% between those screens with identical binaries
+([below](#run-to-run-drift-on-this-host)), so Agent's builds were also rerun
+side by side on this host the same day, interleaved, medians of three:
+
+| Agent build | 1 agent, 4 KiB | 8 agents, 64 KiB | 32 agents, 4 KiB | 32 agents, 64 KiB | CPU s, 32 agents, 64 KiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `70637f9` (the 2026-11-01 build) | 22.6 | 28.5 | 26.5 | 30.6 | 0.56 |
+| 0.9.0 | 17.2 | 24.2 | 22.3 | 26.8 | 0.32 |
+| main `987a276` | 18.3 | 24.9 | 23.7 | 28.8 | 0.29 |
+
+So the drop is the code, not the host: `70637f9` measures the same here as it
+did on 2026-11-01, and 0.9.0 is 4 to 5 MiB below it in every case. Agent's top
+case moves by about 2 MiB between runs (main read 26.6, 27.6 and 28.8 MiB in
+three runs that day), so the smaller cases separate builds more clearly. A
+second A/B that day put 0.9.3 within 0.5 MiB of main in every case. With the
+daemon idle, 0.9.0 to main is +0.8 MiB of clean code pages (the binary grew
+from 20.8 to 22.1 MB) and +0.1 MiB of heap. Every engine reached every case's
 concurrency this time, Codex and Claude Code included, and no run carries a
 quality warning.
 
@@ -103,7 +115,8 @@ Median observed CPU seconds by case:
 
 Every measured run completed all its turns with no invalid provider requests.
 Full ranges, ready times, connection counts and process counts are in the
-ignored captures under `.local/bench/h5/`, and the A/B under `.local/bench/m1/`.
+ignored captures under `.local/bench/h5/`, and the A/B runs under
+`.local/bench/m1/` and `.local/bench/m2/`.
 
 ### Run-to-run drift on this host
 
@@ -115,8 +128,9 @@ The other engines' binaries were identical between the two runs, yet their
 peak memory moved by 1 to 20%, while each run's three repeats agreed within a
 few percent. Between 2026-11-01 and this screen the other engines' binaries
 were again identical: Pi and opencode moved by 1 to 2%, Codex fell 14% and
-Claude Code 16%, and their CPU fell by 28 to 42%. Agent's change in this
-screen is larger than that drift and matches the same-day A/B.
+Claude Code 16%, and their CPU fell by 28 to 42%. Agent's own drift is
+smaller: `70637f9` measured 30.4 MiB on 2026-11-01 and 30.6 MiB rerun beside
+main on 2026-11-12.
 
 ## Observations
 
@@ -125,9 +139,9 @@ screen is larger than that drift and matches the same-day A/B.
   here does at that level. Its top case on this kind of host:
   22.1 MiB at `8ebbc44` (2026-09-23, before group commit), 28.7 MiB at
   `3a9f7df` (2026-10-28), 28.9 MiB at `2182b4a` (2026-10-30), 30.4 MiB at
-  `70637f9` (2026-11-01) and 26.6 MiB now. The drop since 2026-11-01 came
-  with 0.9.0; 0.9.1 to 0.9.3 added about 1.5 MiB back, nearly all of it
-  code pages.
+  `70637f9` (2026-11-01) and 26.6 MiB now. Rerun side by side, `70637f9`
+  is 4 to 5 MiB above 0.9.0 in every case; 0.9.1 to 0.9.3 added about 1 to
+  2 MiB back, nearly all of it code pages.
 - Pi 1.4.0, a library rather than a coding agent, stayed closest: about
   95 MiB of Node baseline plus 1 to 2 MiB per agent.
 - Codex 0.166.0 holds 32 streams at 32 agents in every case here, with three

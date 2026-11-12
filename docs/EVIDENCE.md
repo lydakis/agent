@@ -138,10 +138,11 @@ more turns is not here, because its work changes with its speed; it is under
   Codex 0.166.0 315 MiB and 6.8 s, opencode 1.19.5 854 MiB and 9.4 s, Claude
   Code 2.1.316 5,226 MiB and 23.8 s. Exploratory, not a ranking: the
   harnesses do unequal work. Every harness reached all 32 concurrent streams.
-  Agent fell from 30.4 MiB and 0.75 s in the 2026-11-01 screen (main
-  `70637f9`); the same day's interleaved A/B puts 0.9.0 at 25.5 MiB, 0.9.3 at
-  27.2 and main at 27.6, the gap being code pages of a larger binary. Linux
-  VM, main `987a276`, 2026-11-12.
+  Agent was 30.4 MiB and 0.75 s in the 2026-11-01 screen (main `70637f9`).
+  Rerun side by side the same day, `70637f9` measured 30.6 MiB, 0.9.0 26.8
+  and main 28.8 at the top case, and 22.6, 17.2 and 18.3 MiB at one agent:
+  0.9.0 cut 4 to 5 MiB, and main's extra over 0.9.0 is code pages of a larger
+  binary. Linux VM, main `987a276`, 2026-11-12.
   [Record](HARNESS_MEASUREMENTS.md).
 - **Pi Durable on the durable lifecycle.** 32 named conversations, three
   turns each, both engines syncing every commit (`synchronous=FULL`, which
