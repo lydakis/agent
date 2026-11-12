@@ -1,4 +1,5 @@
 """The agent command: daemon startup, run/follow/ls, peers, and socket rendezvous."""
+from contextlib import closing
 import fcntl
 import shutil
 import sys
@@ -181,6 +182,39 @@ class SocketAndCliTests(ModelFixture):
             status, = db.execute('SELECT status FROM turns WHERE id=?', (handle['message'],)).fetchone()
         self.assertNotIn(status, ('queued', 'ready', 'running'))
 
+    def test_shutdown_with_no_grace_ends_promptly_while_turns_stream_and_run_commands(self):
+        # A turn stalled mid-stream on the model, one waiting for its reply
+        # to begin, and two in a long command.
+        self.model.release_headers = threading.Event()
+        self.model.release_headers.set()
+        self.model.all_streaming = threading.Event()
+        self.addCleanup(self.model.all_streaming.set)
+        command = lambda line: 'calls:' + json.dumps([['shell', {'command': line, 'timeout_ms': 120000}]])
+        sleeping = lambda: subprocess.run(['pgrep', '-f', '^sleep 67$'], capture_output=True, text=True).stdout.split()
+        # One command deaf to SIGTERM, one that left a child holding its
+        # output open, as a test run's leaked processes do.
+        prompts = {'Streams': 'gate', 'Waits': 'wait',
+                   'Deaf': command("trap '' TERM; sleep 67; true"), 'Leaks': command('(sleep 67 &); sleep 67')}
+        for bot, prompt in prompts.items():
+            self.agent('run', *self.common, '--new', '--bot', bot, '--detach', prompt)
+        for _ in prompts:
+            self.model.requests.get(timeout=5)
+        deadline = time.monotonic() + 10
+        while len(sleeping()) != 3:
+            self.assertLess(time.monotonic() - deadline, 0, 'the commands did not start')
+            time.sleep(.05)
+        started = time.monotonic()
+        self.agent('shutdown', '--store', str(self.store))
+        # Well inside the model's stall and the commands' time, and far
+        # inside the client's own wait for the exit.
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertFalse(self.socket.exists())
+        self.assertEqual(sleeping(), [])
+        # Each turn waits for the next start, none ended or left running.
+        with closing(sqlite3.connect(self.store)) as db:
+            statuses = db.execute('SELECT status FROM turns').fetchall()
+        self.assertEqual(statuses, [('paced',)] * 4)
+
     def test_shutdown_grace_lets_the_running_turn_finish(self):
         self.model.release_headers = threading.Event()
         self.model.all_streaming = self.model.release_headers
@@ -239,6 +273,44 @@ class SocketAndCliTests(ModelFixture):
         extra = self.agent('start', '--store', str(self.store), 'now', check=False)
         self.assertEqual(extra.returncode, 2)
         self.assertIn('takes no positional arguments', extra.stderr)
+
+    def test_a_daemon_opening_its_store_says_it_starts_and_clients_wait_for_it(self):
+        # Another process writing the store holds its opening up, as a long
+        # upgrade would; the store is the daemon's all the same.
+        db = sqlite3.connect(self.store, isolation_level=None)
+        self.addCleanup(db.close)
+        db.execute('BEGIN EXCLUSIVE')
+        first = subprocess.Popen([*self.base, 'start', *self.common[:4]], env=clean_env(), cwd=self.path,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(first.kill)
+        deadline = time.monotonic() + 5
+        while not self.socket.exists():
+            self.assertLess(time.monotonic(), deadline, 'the daemon took no socket while it opened its store')
+            time.sleep(.02)
+        raw = socket.socket(socket.AF_UNIX)
+        self.addCleanup(raw.close)
+        raw.connect(str(self.socket))
+        raw.settimeout(5)
+        lines = raw.makefile('r')
+        self.addCleanup(lines.close)
+        told = json.loads(lines.readline())
+        self.assertEqual((told['event'], told['protocol']), ('starting', PROTOCOL))
+        # A command meanwhile waits for this daemon, rather than starting
+        # another that could only lose the store to it.
+        second = subprocess.Popen([*self.base, 'stats', *self.common[:4]], env=clean_env(), cwd=self.path,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(second.kill)
+        # Told again while it still opens, so a client's wait goes on.
+        self.assertEqual(json.loads(lines.readline()), told)
+        db.execute('ROLLBACK')
+        ready = json.loads(lines.readline())
+        self.assertEqual((ready['event'], ready['pid']), ('ready', told['pid']))
+        out, err = first.communicate(timeout=10)
+        self.assertEqual(first.returncode, 0, err)
+        self.assertEqual(json.loads(out)['pid'], told['pid'])
+        out, err = second.communicate(timeout=10)
+        self.assertEqual(second.returncode, 0, err)
+        self.assertIn('sessions', json.loads(out))
 
     def test_stats_and_wait_any_from_the_cli(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
@@ -594,6 +666,33 @@ class SocketAndCliTests(ModelFixture):
             refused = self.agent('stats', '--store', str(self.store), flag, value, check=False)
             self.assertEqual(refused.returncode, 2)
             self.assertIn(f'does not accept {flag}', refused.stderr)
+
+    def test_a_start_given_flags_pins_them_and_any_later_start_takes_them(self):
+        pins = Path(f'{self.store}.daemon.toml')
+        started = json.loads(self.agent('start', *self.common[:4], '--max-active', '3', '--idle-exit', '0').stdout)
+        self.assertEqual(started['limits']['active'], 3)
+        # Beside the store, its user's alone, in config.toml's keys.
+        self.assertEqual(pins.stat().st_mode & 0o777, 0o600)
+        text = pins.read_text()
+        self.assertIn(f'provider = "openai=responses,{self.url}"', text)
+        self.assertIn('[daemon]\nactive = "3"\nidle_exit = "0"\n', text)
+        self.agent('shutdown', '--store', str(self.store))
+        # A command that starts the daemon with no flags (a client waiting on
+        # a bot, a gate) starts it as its owner did, provider and all.
+        stats = json.loads(self.agent('stats', '--store', str(self.store)).stdout)
+        self.assertEqual(stats['active_limit'], 3)
+        self.agent('shutdown', '--store', str(self.store))
+        # Flags given again pin again, over what was pinned.
+        again = json.loads(self.agent('start', '--store', str(self.store), '--max-active', '5').stdout)
+        self.assertEqual(again['limits']['active'], 5)
+        self.assertIn('[daemon]\nactive = "5"\nidle_exit = "0"\n', pins.read_text())
+        self.agent('shutdown', '--store', str(self.store))
+        # A file that does not read is refused by name; nothing starts.
+        pins.write_text('provider = "openai"\nmodel = "x"\n')
+        refused = self.agent('stats', '--store', str(self.store), check=False)
+        self.assertEqual(json.loads(refused.stderr)['error'], 'config_invalid', refused.stderr)
+        self.assertIn('daemon.toml: unknown key model', refused.stderr)
+        self.assertFalse(self.socket.exists())
 
     def test_help_and_invalid_flags_do_not_start_a_daemon(self):
         for args in [('--help',), ('-h',), ('help', 'run')]+[(c, '--help') for c in

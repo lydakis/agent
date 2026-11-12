@@ -463,11 +463,20 @@ the commands it runs inherit the raised limit;
 `turns`, `rm`, `prune`, `approvals`, and `answer` may restart it only for an
 existing store (`store_not_found` otherwise). These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an
-already running daemon. Startup flags configure a newly started daemon. A
+already running daemon. Startup flags configure a newly started daemon, and
+pin it: a start given `--provider` or a limit (`--max-*`, `--stall-timeout`,
+`--idle-exit`) writes them beside the store, in `STORE.daemon.toml`
+(`provider` and a `[daemon]` table in `config.toml`'s keys, the user's
+alone), over what was pinned there, and every later start of that store,
+whoever asks for it (a client waiting on one of its bots, a gate, a window),
+reads them over `config.toml`. A scratch daemon started with its own limits
+starts again with them, never with the defaults; edit or delete the file to
+start it otherwise. A `[daemon]` key in `config.toml` (now `idle_exit` too)
+or the pins apply at the next start. A
 running daemon is never reconfigured: a stated startup flag it does not match
 fails the command with `daemon_configuration_mismatch` naming the difference.
 Comparison uses effective limits: `--idle-exit 0` means disabled.
-With no `--provider`, a started daemon takes `AGENT_PROVIDER` (the same specs,
+With no `--provider` and none pinned, a started daemon takes `AGENT_PROVIDER` (the same specs,
 separated by whitespace), else `provider` in `~/.agent/config.toml` (the
 same), else the providers whose key variable is set; a
 running daemon is not checked against either. With none of them, starting

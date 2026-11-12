@@ -13,11 +13,12 @@
 //! hold = "5d"                   # how long a new agent's turn waits on a cause you can fix before it fails, the default; "0" fails at once
 //! prices = "~/sheets/llm.toml"  # the price sheet /usage costs from, ~/.agent/prices.toml by default; see `prices`
 //!
-//! [daemon]                      # what the agent CLI starts the daemon with; restart it to apply
+//! [daemon]                      # what the agent CLI starts the daemon with; restart it to apply; STORE.daemon.toml pins a store's own
 //! processes = "cpus * 64"       # commands running at once, the default
 //! load = "cpus * 2"             # new commands wait while the load average is this, the default; 0 no gate
 //! input_bytes = "memory / 16"   # also lasting, active, connecting, pending, pending_bytes, readers
 //! stall_timeout = "10m"         # a provider stream with no content this long is retried, the default
+//! idle_exit = "30m"             # the daemon exits this long after its last client leaves with nothing running; "0", the default, never
 //! depth = 3                     # generations a new agent may be below the one that starts its line, 2 by default; 0 no end
 //!
 //! [fallbacks]                   # the model a declined request goes to, by model
@@ -300,8 +301,111 @@ pub fn machine() -> (f64, f64) {
 /// The `[daemon]` keys that are durations, as the `agent serve` flag each
 /// sets takes them, with the least and most it takes in milliseconds: none
 /// given is the daemon's own default.
-pub const DAEMON_DURATIONS: [(&str, &str, u64, u64); 1] =
-    [("stall_timeout", "--stall-timeout", 1000, 86_400_000)];
+pub const DAEMON_DURATIONS: [(&str, &str, u64, u64); 2] = [
+    ("stall_timeout", "--stall-timeout", 1000, 86_400_000),
+    // "0" never: a daemon with no clients left runs on.
+    ("idle_exit", "--idle-exit", 0, 31_536_000_000),
+];
+
+/// The `[daemon]` key the `agent serve` flag `flag` sets.
+pub fn daemon_key(flag: &str) -> Option<&'static str> {
+    (DAEMON_LIMITS.iter().map(|(key, known, _)| (*key, *known)))
+        .chain(
+            DAEMON_DURATIONS
+                .iter()
+                .map(|(key, known, ..)| (*key, *known)),
+        )
+        .find(|(_, known)| *known == flag)
+        .map(|(key, _)| key)
+}
+
+/// How a store's daemon starts, pinned beside the store in
+/// `STORE.daemon.toml` by a start given flags: its `provider` and its
+/// `[daemon]` limits, in `config.toml`'s keys. Every later start of the
+/// store, whoever asks for it (a client waiting on one of its bots, a
+/// gate, a window), reads them over `config.toml`, so it starts the way
+/// its owner started it; flags given again pin again.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Pins {
+    pub provider: Option<String>,
+    pub daemon: BTreeMap<String, String>,
+}
+
+/// Where the start flags of the daemon of `store` are pinned.
+pub fn pins_path(store: &Path) -> PathBuf {
+    let mut path = store.as_os_str().to_owned();
+    path.push(".daemon.toml");
+    PathBuf::from(path)
+}
+
+/// The start flags pinned for `store`'s daemon: none when nothing pinned
+/// them. A file that does not read is refused by name, as `config.toml`.
+pub fn read_pins(store: &Path) -> Result<Pins, String> {
+    let path = pins_path(store);
+    let text = match std::fs::read_to_string(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Pins::default()),
+        Err(error) => return Err(format!("config_unreadable: {}: {error}", path.display())),
+        Ok(text) => text,
+    };
+    let invalid = |reason: &str| format!("config_invalid: {}: {reason}", path.display());
+    let table: toml::Table = text
+        .parse()
+        .map_err(|e: toml::de::Error| invalid(e.message()))?;
+    if let Some(key) = table
+        .keys()
+        .find(|key| !matches!(key.as_str(), "provider" | "daemon"))
+    {
+        return Err(invalid(&format!(
+            "unknown key {key}; it pins provider and [daemon]"
+        )));
+    }
+    let config = parse(&text).map_err(|reason| invalid(&reason))?;
+    Ok(Pins {
+        provider: config.provider,
+        daemon: config.daemon,
+    })
+}
+
+/// Write `pins` beside `store`, the daemon's user's alone, whole or not
+/// at all: written aside, then renamed over the last.
+pub fn write_pins(store: &Path, pins: &Pins) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = pins_path(store);
+    let mut text = String::from(
+        "# How this store's daemon starts, pinned by a start given flags, which\n\
+         # pins again; every start reads it over ~/.agent/config.toml. Edit or\n\
+         # delete it to start the daemon otherwise; it applies at the next start.\n",
+    );
+    if let Some(provider) = &pins.provider {
+        text.push_str(&format!(
+            "provider = {}\n",
+            toml::Value::from(provider.as_str())
+        ));
+    }
+    if !pins.daemon.is_empty() {
+        text.push_str("\n[daemon]\n");
+        for (key, value) in &pins.daemon {
+            text.push_str(&format!("{key} = {}\n", toml::Value::from(value.as_str())));
+        }
+    }
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".{}", std::process::id()));
+    let aside = PathBuf::from(aside);
+    let unwritable = |e: std::io::Error| format!("config_unwritable: {}: {e}", path.display());
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&aside)
+        .and_then(|mut file| file.write_all(text.as_bytes()));
+    if let Err(error) = written.and_then(|()| std::fs::rename(&aside, &path)) {
+        let _ = std::fs::remove_file(&aside);
+        return Err(unwritable(error));
+    }
+    Ok(())
+}
 
 /// A `[daemon]` value worked out: a number, or `cpus` and `memory` (bytes)
 /// with numbers, `KiB` `MiB` `GiB`, `+ - * /`, parentheses, and
@@ -2520,6 +2624,37 @@ mod tests {
                 .unwrap_err()
                 .contains("daemon.processes")
         );
+    }
+
+    #[test]
+    fn pins_read_as_they_were_written_and_hold_only_provider_and_daemon() {
+        let dir = std::env::temp_dir().join(format!("agent-pins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("state.sqlite");
+        assert_eq!(read_pins(&store).unwrap(), Pins::default());
+        let pins = Pins {
+            provider: Some("openai=responses,http://127.0.0.1:1/v1 \"odd\"".into()),
+            daemon: BTreeMap::from([
+                ("active".to_owned(), "4".to_owned()),
+                ("idle_exit".to_owned(), "0".to_owned()),
+                ("stall_timeout".to_owned(), "30s".to_owned()),
+            ]),
+        };
+        write_pins(&store, &pins).unwrap();
+        assert_eq!(read_pins(&store).unwrap(), pins);
+        assert_eq!(daemon_key("--idle-exit"), Some("idle_exit"));
+        assert_eq!(daemon_key("--max-active"), Some("active"));
+        assert_eq!(daemon_key("--model"), None);
+        std::fs::write(pins_path(&store), "[sonny]\nchime = true\n").unwrap();
+        assert!(
+            read_pins(&store)
+                .unwrap_err()
+                .ends_with("unknown key sonny; it pins provider and [daemon]")
+        );
+        std::fs::write(pins_path(&store), "[daemon]\nidle_exit = \"10\"\n").unwrap();
+        assert!(read_pins(&store).unwrap_err().contains("daemon.idle_exit"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

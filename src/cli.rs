@@ -676,9 +676,9 @@ const DURATIONS: &[(&str, u64, u64, bool, &str)] = &[
     (
         "--idle-exit",
         0,
-        u64::MAX,
+        31_536_000_000,
         true,
-        "in whole seconds; 0 disables",
+        "in whole seconds, up to 365d; 0 disables",
     ),
     (
         "--await-owner",

@@ -611,7 +611,7 @@ impl Store {
         path: &Path,
         readers: usize,
     ) -> Result<(Self, mpsc::Receiver<Publication>)> {
-        Self::open_pooled(path, readers, READER_IDLE, None).await
+        Self::open_pooled(path, readers, READER_IDLE, None, None).await
     }
     /// `open_with`, waiting up to `wait` for the process that owns the
     /// store to let it go rather than refusing at once: a daemon started
@@ -623,13 +623,25 @@ impl Store {
         readers: usize,
         wait: std::time::Duration,
     ) -> Result<(Self, mpsc::Receiver<Publication>)> {
-        Self::open_pooled(path, readers, READER_IDLE, Some(wait)).await
+        Self::open_pooled(path, readers, READER_IDLE, Some(wait), None).await
+    }
+    /// `open_with`, or `open_awaiting` with a `wait`, telling `owned` the
+    /// moment the store is this process's, before its own opening (an
+    /// upgrade perhaps) begins: a daemon answers on its socket from then.
+    pub async fn open_owning(
+        path: &Path,
+        readers: usize,
+        wait: Option<std::time::Duration>,
+        owned: oneshot::Sender<()>,
+    ) -> Result<(Self, mpsc::Receiver<Publication>)> {
+        Self::open_pooled(path, readers, READER_IDLE, wait, Some(owned)).await
     }
     async fn open_pooled(
         path: &Path,
         readers: usize,
         idle: std::time::Duration,
         wait: Option<std::time::Duration>,
+        owned: Option<oneshot::Sender<()>>,
     ) -> Result<(Self, mpsc::Receiver<Publication>)> {
         let path = path.to_path_buf();
         let (sender, mut receiver) = mpsc::channel::<Box<dyn Job>>(GROUP_JOBS);
@@ -694,6 +706,9 @@ impl Store {
                     // A waiter that gave up lets the store go at once.
                     if locked.send(()).is_err() {
                         return crate::fail("store_already_owned");
+                    }
+                    if let Some(owned) = owned {
+                        let _ = owned.send(());
                     }
                     // SQLite WAL sidecars cannot safely follow hard-link aliases.
                     #[cfg(unix)]
@@ -1700,7 +1715,9 @@ mod tests {
         let path = scratch_path("readers");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let idle = std::time::Duration::from_millis(500);
-        let (store, _publications) = Store::open_pooled(&path, 4, idle, None).await.unwrap();
+        let (store, _publications) = Store::open_pooled(&path, 4, idle, None, None)
+            .await
+            .unwrap();
         let open = |store: &Store| store.stats()["readers"]["open"].as_u64().unwrap();
         // A quiet store holds one reader, with the whole cache budget.
         assert_eq!(open(&store), 1);
@@ -1776,7 +1793,9 @@ mod tests {
         let path = scratch_path("reader-shares");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let idle = std::time::Duration::from_millis(500);
-        let (store, _publications) = Store::open_pooled(&path, 4, idle, None).await.unwrap();
+        let (store, _publications) = Store::open_pooled(&path, 4, idle, None, None)
+            .await
+            .unwrap();
         let held = |store: &Store| store.stats()["readers"]["cache_kib"].as_u64().unwrap();
         let budget = READER_CACHE_KIB as u64;
         store.read("warm", |_| Ok(())).await.unwrap();

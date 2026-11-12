@@ -1863,12 +1863,31 @@ pub async fn run(config: Configuration) -> Result<()> {
     if providers.is_empty() {
         return fail("no_providers");
     }
-    let opened = match owner_until {
-        Some(until) => {
-            let wait = until.saturating_duration_since(tokio::time::Instant::now());
-            Store::open_awaiting(&config.store, limits.readers, wait).await
+    let wait =
+        owner_until.map(|until| until.saturating_duration_since(tokio::time::Instant::now()));
+    let (owned, owning) = tokio::sync::oneshot::channel();
+    let opening = Store::open_owning(&config.store, limits.readers, wait, owned);
+    tokio::pin!(opening);
+    // The socket is taken the moment the store is this daemon's, before the
+    // store's own opening, which an upgrade can make minutes long: a client
+    // that meets the daemon then is told it starts and waits for it, where
+    // finding none it would start another daemon, which could only lose the
+    // store to this one.
+    let mut early = None;
+    let opened = tokio::select! {
+        biased;
+        opened = &mut opening => opened,
+        Ok(()) = owning, if config.socket.is_some() => {
+            if let Some(socket) = &config.socket {
+                let (owner, listener) = socket::Owner::bind(socket, owner_until).await?;
+                let mut line = serde_json::to_vec(&json!({"event": "starting",
+                    "protocol": agent_client::PROTOCOL, "pid": std::process::id()}))?;
+                line.push(b'\n');
+                let (ready, readied) = tokio::sync::oneshot::channel();
+                early = Some((owner, ready, tokio::spawn(session::starting(listener, line, readied))));
+            }
+            opening.await
         }
-        None => Store::open_with(&config.store, limits.readers).await,
     };
     let (store, publications) = match opened {
         Err(error) if error.code == "store_already_owned" => {
@@ -2031,9 +2050,24 @@ pub async fn run(config: Configuration) -> Result<()> {
     let stdio_owner = config.socket.is_none();
     let mut socket_owner = None;
     if let Some(socket) = &config.socket {
-        let (owner, listener) = socket::Owner::bind(socket, owner_until).await?;
+        // Those told it starts are taken up first, in the order they came,
+        // each greeted with `ready` as any session is.
+        let (owner, listener, waiting) = match early.take() {
+            Some((owner, ready, greeter)) => {
+                let _ = ready.send(());
+                let (listener, waiting) = greeter
+                    .await
+                    .map_err(|_| Error::new("socket_greeter_failed"))?;
+                (owner, listener, waiting)
+            }
+            None => {
+                let (owner, listener) = socket::Owner::bind(socket, owner_until).await?;
+                (owner, listener, Vec::new())
+            }
+        };
         socket_owner = Some(owner);
-        tokio::spawn(session::accept(
+        tokio::spawn(session::accept_after(
+            waiting,
             listener,
             sender.clone(),
             sessions_next.clone(),

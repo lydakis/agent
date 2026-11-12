@@ -676,7 +676,11 @@ impl Connection {
         }
         Ok(connection)
     }
-    fn read_ready(&mut self, deadline: Instant) -> Result<Value> {
+    /// The daemon's `ready` line, by `deadline`, or later for as long as
+    /// the daemon keeps saying it starts: a `starting` line, which a daemon
+    /// sends while it opens (and perhaps upgrades) its store, each one
+    /// giving it `STARTUP_TIMEOUT` more.
+    fn read_ready(&mut self, mut deadline: Instant) -> Result<Value> {
         let mut line = Vec::new();
         loop {
             // Recompute the remaining budget before each read, so partial
@@ -705,10 +709,16 @@ impl Connection {
             line.extend_from_slice(&bytes[..consumed]);
             self.reader.consume(consumed);
             if newline.is_some() {
+                let greeting: Value = serde_json::from_slice(&line)?;
+                if greeting["event"] == "starting" {
+                    deadline = deadline.max(Instant::now() + STARTUP_TIMEOUT);
+                    line.clear();
+                    continue;
+                }
                 // Keep read-ahead bytes in the same buffer. Normal requests and
                 // event streams may wait longer than the startup deadline.
                 self.reader.get_ref().set_read_timeout(None)?;
-                return Ok(serde_json::from_slice(&line)?);
+                return Ok(greeting);
             }
         }
     }
@@ -1064,6 +1074,9 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
 struct Start {
     environment: Vec<(String, String)>,
     providers: Vec<String>,
+    /// How the store's daemon starts, pinned beside it, with this
+    /// command's own start flags over what was pinned before.
+    pins: agent_client::config::Pins,
 }
 
 impl Start {
@@ -1073,13 +1086,16 @@ impl Start {
                 Some((code, detail)) => Error::with(code, detail),
                 None => Error::with("env_file_invalid", error),
             })?;
+        let pins = pinned(options)?;
         // A key the file sets names its provider as one this agent's
         // environment sets would; an empty value there unsets it. Only a
-        // `--provider` stands as given; providers inferred from this
-        // agent's environment are inferred again with the file over it.
-        let providers = match options.providers_explicit {
-            true => options.providers.clone(),
-            false => environment_providers(
+        // `--provider`, or one pinned for the store, stands as given;
+        // providers inferred from this agent's environment are inferred
+        // again with the file over it.
+        let providers = match (options.providers_explicit, &pins.provider) {
+            (true, _) => options.providers.clone(),
+            (false, Some(pinned)) => pinned.split_whitespace().map(str::to_owned).collect(),
+            (false, None) => environment_providers(
                 &|name| match environment.iter().rev().find(|(key, _)| key == name) {
                     Some((_, value)) => Some(value.clone()),
                     None => std::env::var(name).ok(),
@@ -1090,7 +1106,32 @@ impl Start {
         Ok(Self {
             environment,
             providers,
+            pins,
         })
+    }
+}
+
+/// How the daemon of `options`' store starts: what is pinned beside the
+/// store, with the start flags this command was given over it (a
+/// `--provider` list replaces the pinned one whole).
+fn pinned(options: &Options) -> Result<agent_client::config::Pins> {
+    let mut pins = agent_client::config::read_pins(&options.store).map_err(config_error)?;
+    if options.providers_explicit {
+        pins.provider = Some(options.providers.join(" "));
+    }
+    for (flag, value) in &options.daemon_flags {
+        if let Some(key) = agent_client::config::daemon_key(flag) {
+            pins.daemon.insert(key.to_owned(), value.clone());
+        }
+    }
+    Ok(pins)
+}
+
+/// A config file's error as this agent's, its code kept.
+fn config_error(error: String) -> Error {
+    match error.split_once(": ") {
+        Some((code, detail)) => Error::with(code, detail),
+        None => Error::with("config_invalid", error),
     }
 }
 
@@ -1153,17 +1194,20 @@ fn spawn_daemon(
             .arg("--await-owner")
             .arg(format!("{}s", wait.as_secs()));
     }
-    for (flag, value) in &options.daemon_flags {
-        command.arg(flag).arg(value);
+    // Whoever starts it, the store's daemon starts the way a start given
+    // flags last started it: those flags are pinned beside the store, and
+    // what was pinned goes over the person's `[daemon]` limits, worked out
+    // for this machine.
+    let given = options.providers_explicit || !options.daemon_flags.is_empty();
+    if given && agent_client::config::read_pins(&options.store).ok() != Some(start.pins.clone()) {
+        agent_client::config::write_pins(&options.store, &start.pins).map_err(config_error)?;
     }
-    // The person's `[daemon]` limits, for this machine, where the command
-    // line set none.
-    let configured = agent_client::config::daemon_flags(&config()?.daemon)
+    let mut limits = config()?.daemon;
+    limits.extend(start.pins.daemon.clone());
+    let limits = agent_client::config::daemon_flags(&limits)
         .map_err(|error| Error::with("config_invalid", error))?;
-    for (flag, value) in configured {
-        if !options.daemon_flags.iter().any(|(given, _)| *given == flag) {
-            command.arg(flag).arg(value);
-        }
+    for (flag, value) in limits {
+        command.arg(flag).arg(value);
     }
     for name in agent_client::TERMINAL_PLACES {
         command.arg("--shell-exclude").arg(name);
@@ -1215,7 +1259,9 @@ fn spawn_daemon(
             .arg(format!("{pattern}={}", tiers.join(",")));
     }
     // Where the providers came from, so an edit there applies live.
-    if let Some(file) = agent_client::config::path().filter(|_| options.providers_from_config) {
+    if let Some(file) = agent_client::config::path()
+        .filter(|_| options.providers_from_config && start.pins.provider.is_none())
+    {
         command.arg("--provider-config").arg(file);
     }
     // Discovery's catalog, rewritten by every start of the home store's
@@ -3816,6 +3862,45 @@ fn preview(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_daemon_that_says_it_starts_is_waited_for_past_the_first_deadline() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("agent-starting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("s.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..4 {
+                stream
+                    .write_all(b"{\"event\":\"starting\",\"protocol\":1,\"pid\":7}\n")
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            stream
+                .write_all(b"{\"event\":\"ready\",\"pid\":7}\n")
+                .unwrap();
+            stream
+        });
+        // Its ready line comes well after the first deadline: each
+        // `starting` gives it more time.
+        let connection =
+            Connection::greeted_until(&socket, Instant::now() + Duration::from_millis(200))
+                .unwrap();
+        assert_eq!(connection.ready, json!({"event": "ready", "pid": 7}));
+        drop(daemon.join().unwrap());
+        // One that says nothing is not waited for past it.
+        let listener = std::os::unix::net::UnixListener::bind(dir.join("quiet.sock")).unwrap();
+        let quiet = Connection::greeted_until(
+            &dir.join("quiet.sock"),
+            Instant::now() + Duration::from_millis(200),
+        );
+        assert_eq!(quiet.err().unwrap().code, "daemon_start_timeout");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_socket_named_bare_or_in_full_is_the_same_socket() {
