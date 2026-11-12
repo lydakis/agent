@@ -727,6 +727,94 @@ enum Command {
         bot: Option<String>,
     },
 }
+/// How long the service loop held each kind of request: from its
+/// dispatch to its answer or its handoff to a reader, so a request that
+/// holds the loop, and every request queued behind it, shows by name.
+/// Each is a count, a sum, the slowest and a histogram over the store's
+/// latency buckets. Touched only by the loop; no lock, no allocation once
+/// an op has been seen.
+#[derive(Default)]
+struct Commands(HashMap<&'static str, Held>);
+#[derive(Default)]
+struct Held {
+    count: u64,
+    failed: u64,
+    held_ns: u64,
+    slowest_ns: u64,
+    held: [u64; agent_runtime::store::BUCKETS_US.len() + 1],
+}
+impl Commands {
+    fn count(&mut self, op: &'static str, since: std::time::Instant, result: &Result<Value>) {
+        let ns = since.elapsed().as_nanos() as u64;
+        let held = self.0.entry(op).or_default();
+        held.count += 1;
+        held.failed += u64::from(result.as_ref().is_err_and(|e| e.code != "deferred"));
+        held.held_ns += ns;
+        held.slowest_ns = held.slowest_ns.max(ns);
+        held.held[agent_runtime::store::bucket(ns)] += 1;
+    }
+    fn snapshot(&self) -> Value {
+        let ops: serde_json::Map<String, Value> = (self.0.iter())
+            .map(|(op, held)| {
+                let row = json!({"count": held.count, "failed": held.failed,
+                    "held_ms": held.held_ns / 1_000_000,
+                    "slowest_ms": held.slowest_ns / 1_000_000, "held": held.held});
+                ((*op).to_owned(), row)
+            })
+            .collect();
+        json!({"buckets_us": agent_runtime::store::BUCKETS_US, "ops": ops})
+    }
+}
+
+impl Command {
+    /// The request's `op`, as `stats` counts it.
+    fn op(&self) -> &'static str {
+        match self {
+            Command::Create { .. } => "create",
+            Command::Lend { .. } => "lend",
+            Command::Inspect { .. } => "inspect",
+            Command::Configure { .. } => "configure",
+            Command::Compact { .. } => "compact",
+            Command::Fork { .. } => "fork",
+            Command::Delete { .. } => "delete",
+            Command::Prune { .. } => "prune",
+            Command::Audit { .. } => "audit",
+            Command::AuditTrim { .. } => "audit_trim",
+            Command::Turns { .. } => "turns",
+            Command::Messages { .. } => "messages",
+            Command::Usage { .. } => "usage",
+            Command::Submit { .. } => "submit",
+            Command::Interrupt { .. } => "interrupt",
+            Command::Events { .. } => "events",
+            Command::HistoryNodes { .. } => "history_nodes",
+            Command::HistoryItems { .. } => "history_items",
+            Command::HistorySearch { .. } => "history_search",
+            Command::Prompts { .. } => "prompts",
+            Command::Artifact { .. } => "artifact",
+            Command::Follow { .. } => "follow",
+            Command::Wait { .. } => "wait",
+            Command::Answer { .. } => "answer",
+            Command::ToolResult { .. } => "tool_result",
+            Command::TakeCall { .. } => "take_call",
+            Command::ApproveStep { .. } => "approve_step",
+            Command::StepResult { .. } => "step_result",
+            Command::ToolCalls { .. } => "tool_calls",
+            Command::Approvals { .. } => "approvals",
+            Command::ServeApprovals { .. } => "serve_approvals",
+            Command::RenewApprovals { .. } => "renew_approvals",
+            Command::Companions { .. } => "companions",
+            Command::Stats => "stats",
+            Command::ProviderModels => "provider_models",
+            Command::Bots { .. } => "bots",
+            Command::Shutdown { .. } => "shutdown",
+            Command::Pause { .. } => "pause",
+            Command::Pauses { .. } => "pauses",
+            Command::Resume { .. } => "resume",
+            Command::Held { .. } => "held",
+            Command::RetryHeld { .. } => "retry_held",
+        }
+    }
+}
 /// The most agents a pause names as the ones it parked; it counts them all.
 const PAUSE_NAMES: usize = 64;
 /// The variable a Bedrock API key is read from, as the AWS tools name it.
@@ -1425,6 +1513,8 @@ struct Service {
     ready_hint: bool,
     /// Provider-reported tokens since this daemon started, for `stats`.
     tokens: Arc<turn::TokenTotals>,
+    /// How long the service loop held each kind of request, for `stats`.
+    commands: Commands,
     /// Turns parked on a rate-limited pool, by resume time, turns parked
     /// on a verdict, by when a gate lapses, and wake-ups the store lost, by
     /// when they are tried again. Each holds no task and no slot; the run
@@ -2127,6 +2217,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         // Queued turns that survived a restart start as capacity allows.
         ready_hint: true,
         tokens: Arc::default(),
+        commands: Commands::default(),
         wakes,
         steer_wakes,
         draining: Arc::default(),
@@ -2423,7 +2514,12 @@ pub async fn run(config: Configuration) -> Result<()> {
                                     };
                                     let result = match refused {
                                         Some(error) => Err(error),
-                                        None => service.dispatch(request.command, id, &output, request.id.clone(), bound).await,
+                                        None => {
+                                            let (op, held) = (request.command.op(), std::time::Instant::now());
+                                            let result = service.dispatch(request.command, id, &output, request.id.clone(), bound).await;
+                                            service.commands.count(op, held, &result);
+                                            result
+                                        }
                                     };
                                     // A session given a read waits for it before its next request.
                                     for session in service.lane.parked() { inbound.park(session); }
@@ -4782,11 +4878,15 @@ impl Service {
                     })
                     .await?;
                 let (waiters, retained) = self.handles.stats();
-                // A folder read, off the run loop.
-                let (open_files, file_limit) =
-                    tokio::task::spawn_blocking(agent_runtime::open_files::count)
-                        .await
-                        .unwrap_or_default();
+                // A folder read and the process's own record, off the run loop.
+                let ((open_files, file_limit), process) = tokio::task::spawn_blocking(|| {
+                    (
+                        agent_runtime::open_files::count(),
+                        agent_runtime::footprint::read(),
+                    )
+                })
+                .await
+                .unwrap_or_default();
                 let providers: serde_json::Map<String, Value> = self
                     .providers
                     .iter()
@@ -4829,6 +4929,9 @@ impl Service {
                     // What the daemon holds open against its limit, so a
                     // leak (growing while idle) is told from a busy peak.
                     "files": {"open": open_files, "limit": file_limit},
+                    // Its memory, threads and processor time.
+                    "process": process,
+                    "commands": self.commands.snapshot(),
                     "draining": self.draining(),
                     "paused": self.paused,
                 }))
@@ -6651,6 +6754,7 @@ mod tests {
             lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
+            commands: Commands::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: Arc::default(),
@@ -6868,6 +6972,7 @@ mod tests {
             lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
+            commands: Commands::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: Arc::default(),
@@ -7180,6 +7285,7 @@ mod tests {
             lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
+            commands: Commands::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: Arc::default(),
@@ -7425,6 +7531,7 @@ mod tests {
             lane: lane::Lane::new(2, deliver),
             ready_hint: false,
             tokens: Arc::default(),
+            commands: Commands::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: Arc::default(),

@@ -1,6 +1,7 @@
 pub mod codec;
 #[cfg(test)]
 mod doubling;
+pub mod footprint;
 pub mod open_files;
 pub mod output;
 pub mod provider;

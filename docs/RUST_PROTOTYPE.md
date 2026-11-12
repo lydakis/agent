@@ -321,14 +321,33 @@ in tokens on a model round's event, so a client can say how full the
 conversation is; `speed`, the tier that served the call, the provider's
 word where it gives one (Claude's `usage.speed`, OpenAI's `service_tier`,
 which can be the standard tier though a faster one was asked), else the
-tier the call asked for), and the store keeps running
+tier the call asked for; and on a turn's answered calls, protocol 67 and
+schema 94, what the call took: `model_ms` from its send to the end of the
+answer, `first_token_ms` from its send to the start of the model's first
+output item (OpenAI's `response.output_item.added`, Claude's
+`content_block_start`: reasoning counts as output), and `daemon_ms`, the
+daemon's own time before the send since the turn's segment began or its
+last call answered, less the calls it ran, the summaries that held the
+turn, pacing, and failed attempts with their waits; a summary's call counts
+only its own preparing), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
 `input_tokens`, `cached_input_tokens`). Both report `cache_hit`, the share of
 input tokens the provider served from its prompt cache, to three places; it
 is the number the context window's hysteresis exists to keep high, and
 `stats` reports the same totals and ratio for every turn since the daemon
-started, from three atomics and no storage read.
+started, from three atomics and no storage read, and with them (protocol 67)
+the timed calls' `timed_rounds`, `timed_output_tokens`, `model_ms`,
+`first_token_ms` and `daemon_ms`, from five more. `stats` also reports
+`process`, the daemon's own footprint read on demand off the run loop:
+`uptime_ms`, `cpu_user_ms` and `cpu_system_ms` (`getrusage`), `rss_bytes`
+and `threads` now (`/proc/self/status`, or `proc_pidinfo` on macOS) and
+`peak_rss_bytes`, each null where it cannot be read; and `commands`, how long
+the service loop held each kind of request, by its `op`, from dispatch to its
+answer or its handoff to a reader: `count`, `failed`, `held_ms`,
+`slowest_ms` and a `held` histogram over the store's `buckets_us`, which it
+reports beside them. One map entry per op the daemon has seen, touched only
+by the loop, so no lock.
 
 A budget counts one of two measures, named by `budget_counts`: `tokens`, the
 default, is the provider's usage, every call's input and output, the history
@@ -1636,7 +1655,12 @@ model at each `speed` that served it (`standard`, `fast` or `ultrafast`;
 protocol 63, schema 90),
 with its cache writes: a summary's or a fallback's tokens under the model
 that spent them, kept per turn as each call is recorded. Turns from before
-schema 90 kept no speed and count as `standard`. And `origins`, by the `origin` a client gave
+schema 90 kept no speed and count as `standard`. Each total, bot, origin and
+series row has `daemon_ms`, and the totals and each model row have what its
+timed calls took (protocol 67, schema 94): `timed_rounds`, their
+`timed_output_tokens`, `model_ms` and `first_token_ms` summed, so a client
+divides them for a model's output tokens per second and its time to first
+output; calls before schema 94 are untimed. And `origins`, by the `origin` a client gave
 the turn at `submit` (`null` for none), so a client can tell what its own
 features cost. With `bucket_ms` it adds `series`, one row for each bucket
 of that width from `since_ms` that has turns, at its `at_ms`; it needs a

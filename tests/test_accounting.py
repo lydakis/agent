@@ -213,7 +213,33 @@ class AccountingTests(ModelFixture):
         listed = client.request('bots')['result']['bots'][0]
         self.assertEqual((listed['input_tokens'], listed['cache_hit']), (200, 0.2))
         tokens = client.request('stats')['result']['tokens']
+        tokens = {key: tokens[key] for key in ('input_tokens', 'cached_input_tokens', 'output_tokens', 'cache_hit')}
         self.assertEqual(tokens, {'input_tokens': 200, 'cached_input_tokens': 40, 'output_tokens': 20, 'cache_hit': 0.2})
+
+    def test_calls_are_timed_and_stats_say_what_the_daemon_holds(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        # The model takes half a second before it answers.
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='slow')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        usage = next(e['data'] for e in events if e['event'] == 'usage')
+        took, began = usage['model_ms'], usage['first_token_ms']
+        self.assertTrue(500 <= began <= took < 5_000, usage)
+        # The daemon's own time before the send is far below the model's.
+        self.assertLess(usage.get('daemon_ms', 0), 500, usage)
+        model = client.request('usage')['result']['models'][0]
+        self.assertEqual((model['timed_rounds'], model['model_ms'], model['first_token_ms']), (1, took, began))
+        self.assertEqual(model['timed_output_tokens'], model['output_tokens'])
+        stats = client.request('stats')['result']
+        self.assertEqual((stats['tokens']['timed_rounds'], stats['tokens']['model_ms']), (1, took))
+        process = stats['process']
+        self.assertTrue(process['rss_bytes'] > 0 and process['threads'] >= 1, process)
+        self.assertTrue(process['cpu_user_ms'] >= 0 and process['uptime_ms'] > 0, process)
+        # Each kind of request, by how long it held the daemon.
+        submit = stats['commands']['ops']['submit']
+        self.assertEqual((submit['count'], submit['failed'], sum(submit['held'])), (1, 0, 1))
+        self.assertEqual(len(submit['held']), len(stats['commands']['buckets_us']) + 1)
 
     def test_a_cut_reply_s_usage_is_durable_and_the_spent_budget_wraps_its_turn_up(self):
         client = self.client('echo')
@@ -248,6 +274,7 @@ class AccountingTests(ModelFixture):
         self.assertEqual(next(e['data'] for e in events if e['event'] == 'turn_finished'), end)
         row = client.request('turns', bot='Bob')['result']['turns'][0]
         totals = client.request('stats')['result']['tokens']
+        totals = {key: totals[key] for key in ('input_tokens', 'cached_input_tokens', 'output_tokens', 'cache_hit')}
         self.assertEqual(totals, {'input_tokens': 200, 'cached_input_tokens': 80,
                                   'output_tokens': 20, 'cache_hit': 0.4})
         self.assertEqual({key: row[key] for key in totals}, totals)

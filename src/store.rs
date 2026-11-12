@@ -397,7 +397,8 @@ struct Groups {
     oldest: [u64; BUCKETS_US.len() + 1],
     slowest_oldest_ns: u64,
 }
-fn bucket(ns: u64) -> usize {
+/// The latency bucket of `ns`, among [`BUCKETS_US`].
+pub fn bucket(ns: u64) -> usize {
     let us = ns / 1_000;
     BUCKETS_US
         .iter()

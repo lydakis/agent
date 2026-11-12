@@ -1018,6 +1018,9 @@ has something on it, or is off the screen, no time shows.
   provider (two Bedrock regions', say) on one row. `d`, `w` and `m` show the last
   day, week or month, `a` every agent in the store, by project, and `c`
   hides the cached reads, so what the provider charges most for stands out.
+  Under the models, Speed says how fast each answered its calls: output
+  tokens a second from send to answer, and the time to its first output, on
+  average; and the daemon's own time before each call.
   A turn counts where it started. It reads again every minute.
 
   ![/usage in the pane](../docs/sonny/usage.gif)

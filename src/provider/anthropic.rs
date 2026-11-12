@@ -96,6 +96,8 @@ pub struct State {
     refusal: serde_json::Map<String, Value>,
     /// The request cached for an hour: see [`usage`].
     hour: bool,
+    /// When the model began its first content block: what it took to start.
+    first_output: Option<tokio::time::Instant>,
 }
 
 impl State {
@@ -125,6 +127,8 @@ impl State {
                 Ok(Frame::Quiet)
             }
             Some("content_block_start") => {
+                self.first_output
+                    .get_or_insert_with(tokio::time::Instant::now);
                 if event["index"].as_u64() != Some(self.blocks.len() as u64) {
                     return fail("invalid_content_index");
                 }
@@ -363,6 +367,10 @@ impl State {
                 .count();
         }
     }
+    /// When the model began its output, if it has.
+    pub fn first_output(&self) -> Option<tokio::time::Instant> {
+        self.first_output
+    }
     pub fn usage(&self) -> Option<Usage> {
         self.saw_usage.then(|| self.usage.clone())
     }
@@ -558,6 +566,8 @@ mod tests {
             ],
         );
         assert_eq!(deltas, ["think:plan", "text:run"]);
+        // Its output began with its first block.
+        assert!(state.first_output().is_some());
         let completion = state.finish().unwrap();
         let item: Value = serde_json::from_slice(&completion.items[0]).unwrap();
         assert_eq!(item["content"][0]["signature"], "sig");
@@ -576,6 +586,9 @@ mod tests {
                 models: Vec::new(),
                 served_model: "claude-test-20260926".to_owned(),
                 context_window: 0,
+                model_ms: 0,
+                first_token_ms: 0,
+                daemon_ms: 0,
                 speed: Some(super::Speed::Fast),
             })
         );
