@@ -738,17 +738,15 @@ struct Commands(HashMap<&'static str, Held>);
 #[derive(Default)]
 struct Held {
     count: u64,
-    failed: u64,
     held_ns: u64,
     slowest_ns: u64,
     held: [u64; agent_runtime::store::BUCKETS_US.len() + 1],
 }
 impl Commands {
-    fn count(&mut self, op: &'static str, since: std::time::Instant, result: &Result<Value>) {
+    fn count(&mut self, op: &'static str, since: std::time::Instant) {
         let ns = since.elapsed().as_nanos() as u64;
         let held = self.0.entry(op).or_default();
         held.count += 1;
-        held.failed += u64::from(result.as_ref().is_err_and(|e| e.code != "deferred"));
         held.held_ns += ns;
         held.slowest_ns = held.slowest_ns.max(ns);
         held.held[agent_runtime::store::bucket(ns)] += 1;
@@ -756,7 +754,7 @@ impl Commands {
     fn snapshot(&self) -> Value {
         let ops: serde_json::Map<String, Value> = (self.0.iter())
             .map(|(op, held)| {
-                let row = json!({"count": held.count, "failed": held.failed,
+                let row = json!({"count": held.count,
                     "held_ms": held.held_ns / 1_000_000,
                     "slowest_ms": held.slowest_ns / 1_000_000, "held": held.held});
                 ((*op).to_owned(), row)
@@ -2517,7 +2515,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                                         None => {
                                             let (op, held) = (request.command.op(), std::time::Instant::now());
                                             let result = service.dispatch(request.command, id, &output, request.id.clone(), bound).await;
-                                            service.commands.count(op, held, &result);
+                                            service.commands.count(op, held);
                                             result
                                         }
                                     };

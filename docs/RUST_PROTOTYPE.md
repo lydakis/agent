@@ -344,8 +344,8 @@ the timed calls' `timed_rounds`, `timed_output_tokens`, `model_ms`,
 and `threads` now (`/proc/self/status`, or `proc_pidinfo` on macOS) and
 `peak_rss_bytes`, each null where it cannot be read; and `commands`, how long
 the service loop held each kind of request, by its `op`, from dispatch to its
-answer or its handoff to a reader: `count`, `failed`, `held_ms`,
-`slowest_ms` and a `held` histogram over the store's `buckets_us`, which it
+answer or its handoff to a reader: `count`, `held_ms`, `slowest_ms`
+and a `held` histogram over the store's `buckets_us`, which it
 reports beside them. One map entry per op the daemon has seen, touched only
 by the loop, so no lock.
 

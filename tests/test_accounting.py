@@ -238,7 +238,7 @@ class AccountingTests(ModelFixture):
         self.assertTrue(process['cpu_user_ms'] >= 0 and process['uptime_ms'] > 0, process)
         # Each kind of request, by how long it held the daemon.
         submit = stats['commands']['ops']['submit']
-        self.assertEqual((submit['count'], submit['failed'], sum(submit['held'])), (1, 0, 1))
+        self.assertEqual((submit['count'], sum(submit['held'])), (1, 1))
         self.assertEqual(len(submit['held']), len(stats['commands']['buckets_us']) + 1)
 
     def test_a_cut_reply_s_usage_is_durable_and_the_spent_budget_wraps_its_turn_up(self):

@@ -719,6 +719,8 @@ mod tests {
         assert_eq!(usage.models[1].input_tokens, 13);
         // The answer the turn keeps came from the model fallen back to.
         assert_eq!(usage.served_model, "claude-opus-4-8");
+        // Its time goes with that model's output alone, as the store files it.
+        assert_eq!(usage.timed_output_tokens(), 7);
         // Cache writes stay with the attempt that made them.
         assert_eq!(usage.cache_write_tokens, 4);
         assert_eq!(usage.models[1].cache_write_tokens, 4);

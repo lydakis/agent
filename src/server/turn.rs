@@ -319,7 +319,7 @@ impl TokenTotals {
         if usage.model_ms > 0 {
             let times = [
                 1,
-                usage.output_tokens,
+                usage.timed_output_tokens(),
                 usage.model_ms,
                 usage.first_token_ms,
                 usage.daemon_ms,
@@ -3851,6 +3851,9 @@ impl Turn {
         // A budget a failed attempt spent, said once its retry goes.
         let mut announce = None;
         loop {
+            // This attempt's own time runs from here: its notices, its
+            // items (a summary's read the store) and its send.
+            let prepared = tokio::time::Instant::now();
             // A stopping daemon sends no request, first or retry, and the
             // turn parks as at a boundary.
             if self.stopping.load(Relaxed) {
@@ -3876,7 +3879,6 @@ impl Turn {
                 Body::Span(plan, stripped) => self.span_items(plan, stripped).await?,
             };
             accounting.begin(attempt > 0);
-            let prepared = tokio::time::Instant::now();
             // Deltas name their item past the last node the call sends, so
             // the numbers grow through the turn, and a call retried or
             // resumed streams its items again under the same ones.
