@@ -511,7 +511,9 @@ impl Usage {
     /// The output of the attempt that answered, which `model_ms` times:
     /// the last of `models` after a fallback, else the whole call's.
     pub fn timed_output_tokens(&self) -> u64 {
-        self.models.last().map_or(self.output_tokens, |m| m.output_tokens)
+        self.models
+            .last()
+            .map_or(self.output_tokens, |m| m.output_tokens)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
