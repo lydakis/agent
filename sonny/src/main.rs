@@ -9202,8 +9202,10 @@ impl App {
         let mut aside = !older && self.elsewhere;
         let mut began = std::collections::HashSet::new();
         // A page that starts inside a turn lacks its first message: in zen,
-        // the turn's own prompt says who started it.
-        if self.zen.is_some()
+        // the turn's own prompt says who started it, and with project
+        // colors whose project its rows are about.
+        let colored = !self.palette().is_empty();
+        if (self.zen.is_some() || colored)
             && let Some(&turn) = nodes.first().and_then(|node| turns.get(node))
             && let Ok(read) = (self.client)
                 .request(
@@ -9213,17 +9215,28 @@ impl App {
                 .await
             && let Some(prompts) = read["prompts"].as_array()
         {
-            let relays = |prompt: &Value| {
+            let said = |prompt: &Value| {
                 let from = transcript::sender(
                     prompt["from"]["bot"].as_str(),
                     prompt["origin"].as_str(),
                     prompt["person"].as_str(),
                 );
-                transcript::relays(prompt["text"].as_str().unwrap_or(""), from.as_deref())
+                (prompt["text"].as_str().unwrap_or("").to_owned(), from)
+            };
+            let relays = |prompt: &Value| {
+                let (text, from) = said(prompt);
+                transcript::relays(&text, from.as_deref())
             };
             // Started elsewhere, unless the person steered it: their words
             // make it theirs, wherever the page starts.
-            aside = prompts.first().is_some_and(relays) && prompts.iter().all(relays);
+            if self.zen.is_some() {
+                aside = prompts.first().is_some_and(relays) && prompts.iter().all(relays);
+            }
+            // Its first message, before the page, says what the turn is
+            // about; the steers the page holds say the rest.
+            if colored && let Some((text, from)) = prompts.first().map(said) {
+                self.bar_turn(Some((&text, from.as_deref())));
+            }
             began.insert(turn);
         }
         // A chunk read at a time, what it held let go before the next.
@@ -19593,6 +19606,24 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|(_, text)| text == "• Noted what shop.fix said.")
+        );
+    }
+
+    #[tokio::test]
+    async fn with_colors_a_page_starting_inside_a_turn_asks_what_it_is_about() {
+        // The page starts at shop.fix's turn's reply, its message before it.
+        let mut app = app(zen_daemon_from(6).await);
+        app.width = 100;
+        app.words_only = true;
+        colored(&mut app);
+        app.history().await;
+        let rows = barred(&mut app);
+        let noted = (rows.iter())
+            .find(|(_, text)| text.contains("Noted what shop.fix said."))
+            .unwrap_or_else(|| panic!("{rows:?}"));
+        assert_eq!(
+            noted,
+            &(Some(0), "• shop · Noted what shop.fix said.".into())
         );
     }
 

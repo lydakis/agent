@@ -677,6 +677,8 @@ impl Screen {
                 let mut row = Row::new(line);
                 row.tag = Some(tag);
                 row.buttons = buttons;
+                // Under a row that wears a project bar, it goes on.
+                row.bar = self.rows[at - 1].bar;
                 self.rows.insert(at, row);
                 self.grow_page(at - 1, 1);
             }
@@ -711,10 +713,13 @@ impl Screen {
             .position(|row| row.tag != Some(tag))
             .map_or(self.rows.len(), |n| first + n);
         let shown = self.shown_at(first);
+        // The rows in their place wear the project bar they wore.
+        let bar = self.rows[first].bar;
         let mut fresh = Screen::default();
         fresh.push_marked(lines, marks);
         for row in &mut fresh.rows {
             row.tag = Some(tag);
+            row.bar = row.bar.or(bar);
         }
         let grown = fresh.rows.len() as isize - (end - first) as isize;
         self.rows.splice(first..end, fresh.rows);
@@ -3845,6 +3850,28 @@ mod tests {
         ));
         assert_eq!(screen.texts(), ["before", "• Started a, b ▸", "after"]);
         assert!(!screen.replace_tagged(Tag::Group(2), Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn a_project_bar_stays_on_rows_drawn_again_and_rows_put_under() {
+        let mut screen = Screen::default();
+        screen.push_marked(
+            vec![Line::from("• shop · Started a ▸"), Line::from("after")],
+            vec![
+                (0, Mark::Tag(Tag::Group(1))),
+                (0, Mark::Bar(2)),
+                (1, Mark::Tag(Tag::End(4))),
+            ],
+        );
+        let open = vec![
+            Line::from("• shop · Started a ▾"),
+            Line::from("• Started a"),
+        ];
+        assert!(screen.replace_tagged(Tag::Group(1), open, Vec::new()));
+        assert_eq!(screen.bars(), [Some(2), Some(2), None]);
+        assert!(screen.put_under(Tag::Group(1), Tag::Reactions(1), Some("   🎉".into())));
+        assert!(screen.put_under(Tag::End(4), Tag::Reactions(4), Some("   👍".into())));
+        assert_eq!(screen.bars(), [Some(2), Some(2), Some(2), None, None]);
     }
 
     #[test]
