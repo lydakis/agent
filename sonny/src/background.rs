@@ -4,7 +4,7 @@
 //! for them (`lookout::subs`). From there a trigger is fired now or
 //! removed, and a subscription removed; the one Sonny writes for a lead
 //! stays, since its project opening writes it again. How many an agent
-//! has is the `↻` its footer and its `/status` row show. What failed comes
+//! has is the `↻` its `/status` row shows on `m`. What failed comes
 //! first, and is the `✗` beside it: a trigger whose fire failed, or whose
 //! fire went out and whose turn then failed, as when the machine was
 //! offline or a login expired, the daemon saying how the turn ended; and a
@@ -444,14 +444,6 @@ fn trigger_item(row: &Value, bots: Vec<String>) -> Item {
         episode,
         sources: Vec::new(),
     }
-}
-
-/// How many of `items` are for `bot`, Sonny's own left out.
-pub fn count(items: &[Item], bot: &str) -> usize {
-    items
-        .iter()
-        .filter(|item| !item.own && item.bots.iter().any(|b| b == bot))
-        .count()
 }
 
 /// Each source's icon, as `[sonny.sources.NAME] icon` gives it, the
@@ -965,10 +957,8 @@ mod tests {
             item(Kind::Subscription, "tasks", &["calc.lead"], true),
             item(Kind::Subscription, "prs", &["calc.lead"], false),
         ];
-        assert_eq!(count(&items, "calc.lead"), 3);
-        assert_eq!(count(&items, "calc.digest"), 1);
-        assert_eq!(count(&items, "calc.fix"), 0);
         let none = HashMap::new();
+        assert_eq!(fact(&items, "calc.fix", &none), "");
         assert_eq!(
             fact(&items, "calc.lead", &none),
             "↻ 2 automations, 1 follow"
@@ -1298,7 +1288,7 @@ mod tests {
                 .iter()
                 .all(|i| i.kind == Kind::Server && i.bots.is_empty())
         );
-        assert_eq!(count(&found, "calc.lead"), 0);
+        assert_eq!(super::fact(&found, "calc.lead", &HashMap::new()), "");
         assert_eq!(failures(&found).len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }

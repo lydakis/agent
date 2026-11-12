@@ -647,11 +647,12 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 'thinking-binding-controls-2026-08-01,fallback-credit-2026-07-01,'
                 'server-side-fallback-2026-07-01,fast-mode-2026-02-01')
             if 'fallback_credit_token' in request:
-                assert request['fallback_credit_token'] == 'credit-1' and request['model'] == 'synthetic-claude-2'
+                assert (request['fallback_credit_token'] == 'credit-1'
+                        and request['model'] in ('synthetic-claude-2', 'synthetic-claude-3'))
                 self.server.credits = getattr(self.server, 'credits', 0) + 1
             if 'thinking' in request:
                 assert request['thinking']['block_binding'] == {'prefix_mismatch_behavior': 'drop_block'}
-            assert request['model'] in ('synthetic-claude', 'synthetic-claude-2') and request['stream']
+            assert request['model'] in ('synthetic-claude', 'synthetic-claude-2', 'synthetic-claude-3') and request['stream']
             cache = getattr(self.server, 'cache_control', {'type': 'ephemeral'})
             for block in request.get('system', []):
                 assert block['text'] and block['cache_control'] == cache
@@ -810,7 +811,9 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 if last['content'][0]['content'].startswith('silent'):
                     blocks = []
                 elif last['content'][0]['content'].startswith('refuse:all'):
-                    # What a tool read sets the classifier off.
+                    # What a tool read sets the classifier off, before
+                    # the model writes anything.
+                    blocks = []
                     stop = 'refusal'
                     details = {'type': 'refusal', 'category': 'cyber', 'explanation': None}
                 else:
@@ -822,6 +825,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 if (isinstance(before, list) and before and before[0].get('type') == 'tool_result'
                         and str(before[0].get('content', '')).startswith('refuse:all')):
                     # A message steered in after what sets the classifier off.
+                    blocks = []
                     stop = 'refusal'
                     details = {'type': 'refusal', 'category': 'cyber', 'explanation': None}
                 elif user == 'think-only':
@@ -847,11 +851,15 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                                {'type': 'text', 'text': 'found'}]
                     stop = 'pause_turn'
                 elif user.startswith('refuse:') and (request['model'] == 'synthetic-claude'
-                                                     or user.startswith('refuse:all')):
-                    # A classifier declines mid-output: the partial is
+                                                     or user.startswith(('refuse:all', 'refuse:midway'))):
+                    # A classifier declines what was sent, or, midway,
+                    # what the model was writing: the partial is
                     # discarded, and the refusal names its category and,
                     # on the first model, a credit for the retry.
-                    blocks.append({'type': 'text', 'text': 'Partial '})
+                    if user.startswith('refuse:midway'):
+                        blocks.append({'type': 'text', 'text': 'Partial '})
+                    else:
+                        blocks = []
                     stop = 'refusal'
                     details = {'type': 'refusal', 'category': 'cyber', 'explanation': None}
                     if request['model'] == 'synthetic-claude':
@@ -1130,6 +1138,57 @@ class AnthropicRuntimeTests(unittest.TestCase):
         # A fallback is a known provider's model in the bot's family.
         self.assertEqual(client.request('create', bot='Bad', workspace=str(path),
                                         fallback='openai/x')['error'], 'provider_unavailable')
+
+    def test_the_daemon_s_fallbacks_reach_every_bot_that_names_none(self):
+        client, model, path = self.start(
+            extra=('--fallbacks', 'anthropic/synthetic-claude=anthropic/synthetic-claude-2',
+                   '--fallbacks', 'anthropic/synthetic-claude-3=gone/synthetic-model'))
+        self.assertEqual(client.ready['fallbacks'],
+                         {'anthropic/synthetic-claude': 'anthropic/synthetic-claude-2',
+                          'anthropic/synthetic-claude-3': 'gone/synthetic-model'})
+        client.request('create', bot='Bob', workspace=str(path))
+        self.assertIsNone(client.request('inspect', bot='Bob')['result'].get('fallback'))
+        turn = client.request('submit', bot='Bob', request_id='f1', prompt='refuse:all')['result']['message']
+        finished = client.finished(turn)['data']
+        self.assertEqual([model.requests.get(timeout=1)['model'] for _ in range(2)],
+                         ['synthetic-claude', 'synthetic-claude-2'])
+        # The failure names the model it was sent to again.
+        self.assertEqual((finished['error'], finished['fallback']),
+                         ('provider_refusal', 'anthropic/synthetic-claude-2'))
+        # A bot's own goes over the daemon's.
+        client.request('create', bot='Own', workspace=str(path), fallback='anthropic/synthetic-claude-3')
+        turn = client.request('submit', bot='Own', request_id='o1', prompt='refuse:all')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['fallback'], 'anthropic/synthetic-claude-3')
+        self.assertEqual([model.requests.get(timeout=1)['model'] for _ in range(2)],
+                         ['synthetic-claude', 'synthetic-claude-3'])
+        # One on a provider the daemon does not serve is not tried, and says why.
+        client.request('create', bot='Gone', workspace=str(path), model='anthropic/synthetic-claude-3')
+        turn = client.request('submit', bot='Gone', request_id='g1', prompt='refuse:all')['result']['message']
+        finished = client.finished(turn)['data']
+        self.assertEqual((finished['fallback'], finished['unused_fallback']),
+                         (None, {'model': 'gone/synthetic-model', 'error': 'provider_unavailable'}))
+        self.assertEqual(model.requests.get(timeout=1)['model'], 'synthetic-claude-3')
+        self.assertTrue(model.requests.empty())
+
+    def test_a_refusal_midway_through_the_answer_keeps_what_was_sent(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path))
+        words = 'refuse:midway ' + 'word ' * 40
+        turn = client.request('submit', bot='Bob', request_id='m1', prompt=words)['result']['message']
+        finished = client.finished(turn)['data']
+        self.assertEqual((finished['error'], finished['mid_stream'], finished['written_tokens'],
+                          finished['fallback']), ('provider_refusal', True, 7, None))
+        self.assertNotIn('left_out', finished)
+        # The turn's row says how it failed.
+        row = client.request('turns', bot='Bob')['result']['turns'][0]
+        self.assertEqual((row['error'], row['category'], row['mid_stream']),
+                         ('provider_refusal', 'cyber', True))
+        # The next request sends the prompt as it was.
+        turn = client.request('submit', bot='Bob', request_id='m2', prompt='hello')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        model.requests.get(timeout=1)
+        after = model.requests.get(timeout=1)
+        self.assertEqual(SENT.sub('', after['messages'][0]['content'][0]['text']), words)
 
     def test_configure_takes_every_setting_create_takes(self):
         client, model, path = self.start()

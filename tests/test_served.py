@@ -126,13 +126,13 @@ class ServedToolTests(ModelFixture):
         while not (asked := self.daemon.request('approvals', bot='calc.lead')['result']['approvals']):
             self.assertLess(time.monotonic(), deadline, 'no approval was asked')
             time.sleep(.05)
-        # While it waits, the person forbids what it does next and gives its
-        # model a fallback, which waits for it to be idle.
+        # While it waits, the person forbids what it does next and sets how
+        # long its parked calls hold, which waits for it to be idle.
         rules.write_text('prefix_rule(pattern=["cp"], decision="prompt")\n'
                          'prefix_rule(pattern=["mkdir"], decision="forbidden")\n')
-        (self.path / '.agent/config.toml').write_text('[fallbacks]\n"openai/synthetic-model" = "openai/other"\n')
+        (self.path / '.agent/config.toml').write_text('hold = "2d"\n')
         ruled('mkdir')
-        self.assertIsNone(self.daemon.request('inspect', bot='calc.lead')['result']['fallback'])
+        self.assertNotEqual(self.daemon.request('inspect', bot='calc.lead')['result']['settings']['hold_ms'], 172_800_000)
         [call] = asked
         self.daemon.request('answer', bot='calc.lead', turn=turn, call_id=call['call_id'], request=call['request'],
                             decision='allow', by='test')
@@ -141,8 +141,8 @@ class ServedToolTests(ModelFixture):
         self.assertFalse((self.path / 'made').exists())
         # Idle, it takes the rest.
         deadline = time.monotonic() + 20
-        while self.daemon.request('inspect', bot='calc.lead')['result']['fallback'] != 'openai/other':
-            self.assertLess(time.monotonic(), deadline, 'the fallback never reached the agent')
+        while self.daemon.request('inspect', bot='calc.lead')['result']['settings']['hold_ms'] != 172_800_000:
+            self.assertLess(time.monotonic(), deadline, 'the hold never reached the agent')
             time.sleep(.1)
 
     def test_a_lead_starts_a_task_in_a_worktree_of_its_own(self):

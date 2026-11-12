@@ -21,8 +21,8 @@
 //! idle_exit = "30m"             # the daemon exits this long after its last client leaves with nothing running; "0", the default, never
 //! depth = 3                     # generations a new agent may be below the one that starts its line, 2 by default; 0 no end
 //!
-//! [fallbacks]                   # the model a declined request goes to, by model
-//! "anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"
+//! [fallbacks]                   # the model a declined request goes to, for every agent that names none; restart the daemon to apply
+//! "anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"  # by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
 //!
 //! [context_windows]             # tokens a model's context holds, over its provider's listing; restart the daemon to apply
 //! "bedrock/*" = 400000          # by PROVIDER/MODEL, * and ? wildcards; the most specific pattern wins
@@ -150,9 +150,12 @@ pub struct Config {
     /// with it, in milliseconds, as the bot setting `hold_ms`; unset leaves
     /// the daemon's five days, and 0 fails at once.
     pub hold_ms: Option<u64>,
-    /// Each model's fallback, as `provider/model` in its family: a new
-    /// agent on that model that names none sends a request a safety
-    /// classifier declined to it, that request alone.
+    /// `[fallbacks]`: the fallback, as `provider/model` in its family, of
+    /// each model whose `PROVIDER/MODEL` path a pattern matches, `*` and
+    /// `?` wildcards, the most specific pattern winning: an agent on that
+    /// model that names none of its own sends a request a safety
+    /// classifier declined to it, that request alone. The agent CLI starts
+    /// the daemon with them, which gives them to every bot, old or new.
     pub fallbacks: BTreeMap<String, String>,
     /// `[context_windows]`: the context window, in tokens, of each model
     /// whose `PROVIDER/MODEL` path a pattern matches, `*` and `?` wildcards,
@@ -1571,9 +1574,22 @@ fn parse(text: &str) -> Result<Config, String> {
         }
         if name == "fallbacks" {
             let models = value.as_table().ok_or("fallbacks must be a table")?;
-            for (model, fallback) in models {
-                let fallback = string(&format!("fallbacks.{model}"), fallback)?;
-                config.fallbacks.insert(model.clone(), fallback);
+            for (pattern, fallback) in models {
+                let fallback = string(&format!("fallbacks.{pattern}"), fallback)?;
+                if !pattern.contains('/') || pattern.contains(char::is_whitespace) {
+                    return Err(format!(
+                        "fallbacks keys are PROVIDER/MODEL, * and ? wildcards, as \"anthropic/claude-opus-5*\", not {pattern:?}"
+                    ));
+                }
+                let named = fallback
+                    .split_once('/')
+                    .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty());
+                if !named || fallback.contains(['*', '?', '=']) {
+                    return Err(format!(
+                        "fallbacks.{pattern} is one PROVIDER/MODEL, as \"anthropic/claude-opus-4-8\", not {fallback:?}"
+                    ));
+                }
+                config.fallbacks.insert(pattern.clone(), fallback);
             }
             continue;
         }
@@ -2881,6 +2897,22 @@ mod tests {
         assert_eq!(fallbacks.get("a/big").map(String::as_str), Some("a/other"));
         assert!(parse("[fallbacks]\n\"a/big\" = 1\n").is_err());
         assert!(parse("fallbacks = \"a/other\"").is_err());
+        // Keys are model paths with wildcards, as the daemon takes them;
+        // each value is one model.
+        let wild =
+            parse("[fallbacks]\n\"anthropic/claude-opus-5*\" = \"anthropic/claude-opus-4-8\"\n");
+        assert!(
+            wild.unwrap()
+                .fallbacks
+                .contains_key("anthropic/claude-opus-5*")
+        );
+        for refused in [
+            "[fallbacks]\n\"big\" = \"a/other\"\n",
+            "[fallbacks]\n\"a/big\" = \"other\"\n",
+            "[fallbacks]\n\"a/big\" = \"a/*\"\n",
+        ] {
+            assert!(parse(refused).is_err(), "{refused}");
+        }
         let prices = sheet(
             "\"anthropic/*\" = { input = 3, output = 15 }\n\
              \"anthropic/claude-opus-5*\" = { input = 5, cached = 0.5, cache_write = 6.25, cache_write_1h = 10, output = 25 }\n",
