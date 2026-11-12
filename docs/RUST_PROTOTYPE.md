@@ -3941,9 +3941,13 @@ the share the summary may spend is held against the bot's caps, not the
 turn's, by every call of the bot's turns until it goes in or comes to
 nothing, so a turn running beside it cannot spend the same room.
 
-The result is recorded in one transaction: the summary, the covered turns'
-user prompts verbatim (each up to 2 KiB, with a 16 KiB budget for text plus
-entry metadata, the oldest and newest kept when there are more), and the cut, the prompt node the verbatim
+The result is recorded in one transaction: the summary, the person's own
+messages in the covered turns verbatim (a turn's prompt or a steer that
+joined one, each under the ordinal of its turn and up to 2 KiB, with a 16
+KiB budget for text plus entry metadata; newest first, as Codex keeps the
+user's messages, the newest that does not fit whole cut to what is left and
+older ones left to the summary; another agent's message and one with an
+origin, such as the lookout's, go to the summary only), and the cut, the prompt node the verbatim
 tail starts at, which becomes the context start. A compaction stands for
 everything since the first: its coverage starts at turn 1 and the kept
 prompts carry over. Its version is anchored to the head at which it was installed, separately
@@ -3961,8 +3965,7 @@ Each retained `(ordinal, String)` entry consumes its in-memory metadata size
 even when its text is empty. Planning and merging use the same budget, so
 repeated empty submissions cannot grow the prefix without bound. On 64-bit
 targets this permits at most 512 empty entries; text reduces that count.
-Trimming drains one middle range, preserving the oldest and newest excerpts
-without repeatedly shifting the retained suffix. The budget is not a claim
+Trimming drains the oldest once, at the front. The budget is not a claim
 about exact JSON wire size or allocator overhead.
 
 The request begins with one user item `[compaction summary, version N,
@@ -3973,9 +3976,23 @@ gets explicit cache breakpoints on these blocks, alongside the existing system
 and automatic tail breakpoints (at most four in total). The summary prefix stays
 fixed until the next compaction; rewriting a carry-forward note or moving the
 window can still invalidate the later suffix. A summarizer failure leaves the
-context view unchanged, preserves any billable usage, is reported as a live
-`compaction_failed` notification, and the turn continues with the window
-as it is; the window's own overflow handling still bounds stored items. A
+context view unchanged, preserves any billable usage, is kept as a durable
+`compaction_failed` event of the turn it ran in (or the turn it was started
+after) with its `error`, `detail` and the error's facts, and the turn
+continues with the window as it is. When the turn's last summary failed,
+its `turn_finished` says so under `compaction`, so `wait` and a `compact`
+request's next turn show that it did not apply. A summary the provider
+refused (`provider_refusal`) goes to the bot's fallback model, on the same
+request, as a refused turn's request does; refused there too, or with no
+fallback, the failure names the summary it would have extended (`base`),
+the summarizer's model and instructions (`setup`) and the `fallback_model`
+it had. The bot keeps its newest refusal on its own row, so retention
+pruning the turn's events does not forget it, and no summary is asked for
+unasked while the bot has those same three and its view fits: each would
+be billed and refused again. A
+`compact` request, a view that no longer fits, a new summary, summarizer
+or fallback tries again. A `compact` request with nothing
+since the last summary fails `compaction_nothing_new`; the window's own overflow handling still bounds stored items. A
 summarizer the daemon no longer serves (`provider_unavailable`), or serves
 in another family than the bot's stored items (`provider_family_mismatch`),
 is reported the same way without a request.
@@ -4005,8 +4022,10 @@ maximum summary size in UTF-8 bytes. Oversized summaries are rejected above a th
 or 64 KiB, whichever is smaller; a rejected one is asked for again, in a request
 of its own, at half the size it was asked for, for as long as each comes back
 shorter than the one before (each a billed round). At installation, verbatim prompt copies are further bounded so
-they fit alongside the encoded summary within half the byte envelope. A middle
-range is removed, retaining the oldest and newest excerpts when they fit. Original prompts remain available through history; installed
+they fit alongside the encoded summary within half the byte envelope. The oldest are
+removed first. A turn the cut splits is not listed: its prompt and the
+messages that joined it go whole ahead of the window, and join the list once a
+later summary covers that turn whole. Original prompts remain available through history; installed
 prefixes are unchanged until the next compaction. A replacement must reduce encoded bytes,
 not increase items, and leave enough room for the active turn with its pinned
 prefix; otherwise `compaction_not_smaller` or `compaction_context_limit` leaves

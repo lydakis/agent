@@ -8533,3 +8533,34 @@ MiB on head across the six runs, so the two ranges overlap. Lone submit
 CPU has spanned 31 to 43 ms on one binary in earlier screens. The
 lifecycle row, which runs whole turns, is lower on head for both CPU and
 memory.
+
+## Compaction failures kept with their turn (schema 94)
+
+A turn's end now reads its last compaction outcome, which is one probe of
+`events(turn, kind, id)`. A summary that is due first reads the bot's last
+refused summary from its own row (`bots.refused_summary`, a primary-key
+read). Only a failed summary writes that column, so no other write touches
+it. The screen below ran while that check was a partial index on `events`;
+the row read that replaced it does less work.
+
+The Perf workflow's daemon screen (`bench.perf_gate`) compared this head
+against main on the CI runner:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 28.598 | 27.61 | -3.5% |
+| admission | burst submit p99, ms | 2.99 | 2.976 | -0.5% |
+| completion | release to terminal p99, ms | 7.743 | 7.91 | +2.2% |
+| footprint | idle RSS, MiB | 15.941 | 15.918 | -0.1% |
+| footprint | per idle bot, KiB | 1.854 | 1.854 | +0.0% |
+| footprint | RSS after a turn each, MiB | 29.053 | 28.174 | -3.0% |
+| footprint | CPU per turn, ms | 0.706 | 0.707 | +0.2% |
+| lifecycle | CPU, s | 0.39 | 0.385 | -1.3% |
+| lifecycle | p95 turn, ms | 612.282 | 618.897 | +1.1% |
+| lifecycle | peak RSS, MiB | 24.217 | 23.855 | -1.5% |
+
+The gate's store-work check passed, and no daemon row warned. Every change
+is within the run-to-run spread of earlier screens. The one warning was a
+Sonny row this change does not touch: lookout CPU at 10x1 went from 6.25
+to 12.5 ms. That row is one or two samples of a 6.25 ms tick, and it showed
+the same doubling on an earlier head of this change.

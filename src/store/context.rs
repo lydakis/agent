@@ -76,8 +76,8 @@ impl Window {
 
 impl CompactionView {
     /// Retained prompts are a convenience copy; originals remain retrievable.
-    /// Bound the encoded summary block, trimming the middle as the global
-    /// prompt budget does, so oldest and newest excerpts survive when they fit.
+    /// Bound the encoded summary block, leaving out the oldest first as the
+    /// global prompt budget does, so the person's newest words survive.
     /// Count each prompt once instead of repeatedly encoding the entire prefix.
     pub(crate) fn bound_prompt_bytes(&mut self, family: Family, budget: usize) -> Result<()> {
         let mut prompts = std::mem::take(&mut self.prompts);
@@ -103,24 +103,18 @@ impl CompactionView {
             used += size;
             costs.push(size);
         }
-        let (mut left, mut right) = (prompts.len() / 2, prompts.len() / 2);
-        while used > budget && right - left < prompts.len() {
-            let middle = (prompts.len() - (right - left)) / 2;
-            let removed = if middle < left {
-                left -= 1;
-                left
-            } else {
-                right += 1;
-                right - 1
-            };
-            used -= costs[removed];
+        let mut oldest = 0;
+        while used > budget && oldest < prompts.len() {
+            used -= costs[oldest];
+            oldest += 1;
         }
-        prompts.drain(left..right);
+        prompts.drain(..oldest);
         self.prompts = prompts;
         Ok(())
     }
-    /// Whether the summary block lists a kept prompt: not the prompt of a
-    /// turn covered only in part, which the window carries whole.
+    /// Whether the summary block lists a kept message: not one of a turn
+    /// covered only in part, whose prompt and the person's messages that
+    /// joined it the window carries whole.
     fn shows(&self, ordinal: i64) -> bool {
         !(self.partial && ordinal == self.covered.1)
     }

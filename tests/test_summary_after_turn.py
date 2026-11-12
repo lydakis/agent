@@ -129,7 +129,7 @@ class SummaryAfterTurnTests(ModelFixture):
         changed = client.request('configure', bot='Bob', compaction_instructions='Summarize again.')
         self.assertIn('result', changed)
         failed = client.summarized('Bob', timeout=10)
-        self.assertEqual((failed['event'], failed['error']), ('compaction_failed', 'compaction_stale'))
+        self.assertEqual((failed['event'], failed['data']['error']), ('compaction_failed', 'compaction_stale'))
         self.assertIsNone(client.request('inspect', bot='Bob')['result']['compaction'])
         self.assertEqual(self.compacted(client), [])
 

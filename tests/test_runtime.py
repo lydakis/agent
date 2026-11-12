@@ -782,7 +782,12 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             details = None
             prompt = next((b['text'] for m in request['messages'] if m['role'] == 'user'
                            for b in m['content'] if b['type'] == 'text' and b['text'].startswith('long:')), '')
-            if prompt and not summary:
+            if summary and request['model'] in getattr(self.server, 'refuse_summaries', ()):
+                # A classifier declines a summary as it restates the work.
+                blocks.append({'type': 'text', 'text': 'Partial '})
+                stop = 'refusal'
+                details = {'type': 'refusal', 'category': 'reasoning_extraction', 'explanation': None}
+            elif prompt and not summary:
                 # The Messages form of the long task: shell rounds, then done.
                 start = max(n for n, m in enumerate(request['messages'])
                             if any(b['type'] == 'text' and b['text'] == prompt for b in m['content']))

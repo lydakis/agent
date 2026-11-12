@@ -1064,8 +1064,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
         for name, steer in steers.items():
             if 'message' in steer and name not in ends:
                 ends[name] = client.finished(steer['message'], timeout=60)['data']
-        # Failed summaries are reported live only.
-        failures = {name: [m.get('error') for m in client.saved
+        failures = {name: [m['data'].get('error') for m in client.saved
                            if m.get('event') == 'compaction_failed' and m.get('bot') == name] for name in names}
         # Where each sustained bot took in the correction: the steps it had
         # recorded by the time the daemon took the steer into its turn,
