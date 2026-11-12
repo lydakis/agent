@@ -458,54 +458,6 @@ pub fn companion_alerts(companions: &serde_json::Value, now_ms: u64, logs: &str)
         .collect()
 }
 
-/// How little room left, as a share of the whole, makes a temporary
-/// folder worth an alert: under a tenth of its bytes or of its inodes.
-const TEMP_LOW: f64 = 0.10;
-
-/// The temporary folders every agent's commands share (`stats`' `temp`)
-/// that are nearly full, in bytes or in inodes: when one runs out, every
-/// agent's commands fail to write a temporary file ("No space left on
-/// device"), even with space to spare when the inodes are what ran out.
-/// A file system that keeps no inode count says nothing of them.
-pub fn temp_alerts(temp: &serde_json::Value) -> Vec<Alert> {
-    let share = |free: &serde_json::Value, total: &serde_json::Value| {
-        let (free, total) = (free.as_u64()?, total.as_u64()?);
-        (total > 0 && free < total).then(|| free as f64 / total as f64)
-    };
-    let percent = |share: f64| (share * 100.0).floor() as u64;
-    (temp.as_array().into_iter().flatten())
-        .filter_map(|room| {
-            let path = room["path"].as_str().unwrap_or("the temporary folder");
-            let bytes = share(&room["bytes_free"], &room["bytes_total"]);
-            let inodes = share(&room["inodes_free"], &room["inodes_total"]);
-            let left = match (
-                bytes.filter(|s| *s < TEMP_LOW),
-                inodes.filter(|s| *s < TEMP_LOW),
-            ) {
-                (Some(bytes), Some(inodes)) => format!(
-                    "{}% of its space and {}% of its files left",
-                    percent(bytes),
-                    percent(inodes)
-                ),
-                (Some(bytes), None) => format!("{}% of its space left", percent(bytes)),
-                (None, Some(inodes)) => format!(
-                    "{}% of its files left ({} inodes)",
-                    percent(inodes),
-                    room["inodes_free"]
-                ),
-                (None, None) => return None,
-            };
-            Some(Alert {
-                said: format!("{} nearly full · {left}", crate::tilde(path)),
-                detail: "every agent's commands write temporary files there; clear what \
-                         is left over, or give tool shells a folder of their own with \
-                         TMPDIR in [shell_environment_policy] set and restart the daemon"
-                    .to_owned(),
-            })
-        })
-        .collect()
-}
-
 /// How `/status` names an agent whose turn is held, before the cause.
 pub const HELD: &str = "held: ";
 
@@ -764,32 +716,6 @@ mod tests {
             lines[1].to_string(),
             "  its log: ~/.agent/state.sqlite.companions/sonny-reviewer.log"
         );
-    }
-
-    #[test]
-    fn a_nearly_full_temporary_folder_is_an_alert_by_space_or_by_files() {
-        let room = |path: &str, bytes: (u64, u64), inodes: (u64, u64)| {
-            serde_json::json!({"path": path, "bytes_free": bytes.0, "bytes_total": bytes.1,
-                "inodes_free": inodes.0, "inodes_total": inodes.1})
-        };
-        let temp = serde_json::json!([
-            // Space to spare, files gone: what fails every write.
-            room("/tmp", (75, 100), (512, 100_000)),
-            room("/var/tmp", (5, 100), (90, 100)),
-            room("/fine", (50, 100), (50, 100)),
-            // No inode count kept, or as many as are free.
-            room("/btrfs", (50, 100), (0, 0)),
-            room("/apfs", (50, 100), (7, 7)),
-        ]);
-        let said: Vec<String> = temp_alerts(&temp).into_iter().map(|a| a.said).collect();
-        assert_eq!(
-            said,
-            [
-                "/tmp nearly full · 0% of its files left (512 inodes)",
-                "/var/tmp nearly full · 5% of its space left",
-            ]
-        );
-        assert!(temp_alerts(&serde_json::Value::Null).is_empty());
     }
 
     #[test]

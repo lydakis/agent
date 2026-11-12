@@ -2890,11 +2890,9 @@ class RuntimeTests(ModelFixture):
         shutdown()
         (self.path / '.agent').mkdir(exist_ok=True)
         (self.path / '.agent/config.toml').write_text(
-            '[shell_environment_policy]\nignore_default_excludes = false\nexclude = ["aws_*"]\n'
-            'set = { KEEP_ME = "set" }\n')
-        # A daemon started after takes the defaults and the listed names,
-        # and sets what `set` names over its own environment.
-        self.assertEqual(seen('Ann'), 'unset:unset:unset:set')
+            '[shell_environment_policy]\nignore_default_excludes = false\nexclude = ["aws_*"]\n')
+        # A daemon started after takes the defaults and the listed names.
+        self.assertEqual(seen('Ann'), 'unset:unset:unset:kept')
 
     def test_history_pages_recover_an_omitted_long_message(self):
         client = self.client(tools='echo,history', settings={'context_items': 6})

@@ -33,15 +33,6 @@ terminal it was started in (`TMUX`, `TMUX_PANE`, Rex's, Herdr's and cmux's
 places, `agent_client::TERMINAL_PLACES`), so a bot's command never lands in
 that terminal. A running daemon keeps the excludes it started with, and
 a variable a bot or caller sets with `--env` is still set.
-`serve --shell-set NAME=VALUE`, repeatable, sets a variable in every tool
-shell over the daemon's own, as Codex's `[shell_environment_policy] set`
-does, and a client that starts a daemon passes `set` from `config.toml`;
-what a bot or caller sets with `--env` still wins, and `AGENT_` names are
-the daemon's own. A `TMPDIR` set is an absolute folder, which the daemon
-makes (its user's alone) as it starts and lets a sandboxed command write as
-it lets `/tmp`: a machine whose `/tmp` is a small RAM disk gives its tool
-shells a temporary folder of their own this way. Every bot shares it, as
-every bot shares `/tmp`.
 
 A model's context window, which sets where its bots compact unless they set
 `--compact-tokens`, is what its provider lists, else the window Anthropic
@@ -450,36 +441,18 @@ to start a new one, or on a socket that is not the store's own. Sonny
 starts the daemon this way, so opening it after an upgrade replaces the old
 daemon, and it says so first. `stats` starts it as `start` does, so it answers on a fresh install;
 its `files` says how many files the daemon holds open against its limit,
-so a leak (a count that grows while idle) is told from a busy peak, and
-its `temp` the room left in each temporary folder a sandboxed command may
-write (the shells' `TMPDIR` first, then the daemon's, then `/tmp`, each
-file system once): `bytes_free` and `bytes_total`, `inodes_free` and
-`inodes_total`, read as `stats` answers. A file system can run out of
-inodes with space to spare; one that keeps no inode count reports none or
-as many free as in all. The
+so a leak (a count that grows while idle) is told from a busy peak. The
 daemon raises its soft limit on open files to the hard one as it starts
 (on macOS, to the most a process may open), as Go's runtime does, and
 the commands it runs inherit the raised limit;
 `turns`, `rm`, `prune`, `approvals`, and `answer` may restart it only for an
 existing store (`store_not_found` otherwise). These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an
-already running daemon. Startup flags configure a newly started daemon, and
-pin it: a start given `--provider` or a limit (`--max-*`, `--stall-timeout`,
-`--idle-exit`) writes them to `~/.agent/pins/`, one file per store named
-by its real path with each `/` written `%2F` and each `%` written `%25`
-(`v1-HASH.toml` where that name would be too long, as for its socket)
-(`provider` and a `[daemon]` table in `config.toml`'s keys, the user's
-alone, where no sandboxed command writes), over what was pinned there,
-and every later start of that store,
-whoever asks for it (a client waiting on one of its bots, a gate, a window),
-reads them over `config.toml`. A scratch daemon started with its own limits
-starts again with them, never with the defaults; edit or delete the file to
-start it otherwise. A `[daemon]` key in `config.toml` (now `idle_exit` too)
-or the pins apply at the next start. A
+already running daemon. Startup flags configure a newly started daemon. A
 running daemon is never reconfigured: a stated startup flag it does not match
 fails the command with `daemon_configuration_mismatch` naming the difference.
 Comparison uses effective limits: `--idle-exit 0` means disabled.
-With no `--provider` and none pinned, a started daemon takes `AGENT_PROVIDER` (the same specs,
+With no `--provider`, a started daemon takes `AGENT_PROVIDER` (the same specs,
 separated by whitespace), else `provider` in `~/.agent/config.toml` (the
 same), else the providers whose key variable is set; a
 running daemon is not checked against either. With none of them, starting
@@ -491,6 +464,10 @@ The file is read only then, never for a command a running daemon answers.
 As Codex keeps `~/.codex/.env` from setting `CODEX_` names, names starting
 `AGENT_` (any case) are passed over: they are Agent's own settings. A key
 there names its provider as one in the environment would.
+On a machine whose `/tmp` is small (a RAM disk, say), make a folder and
+put `TMPDIR=/that/folder` there: the daemon and every tool shell, which
+inherit its environment, then write temporary files there, and a sandboxed
+command may write it as it may `/tmp`.
 Providers taken from the config file (no `--provider`, no `AGENT_PROVIDER`)
 follow it while the daemon runs (`serve --provider-config`): the kernel
 tells the daemon when the file changes (inotify, kqueue; nothing runs in

@@ -245,7 +245,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --shell-set --redact-field --redact-block --protect --protect-existing --protect-path --wall --own-copy --context-window --speeds --fallbacks --models --provider-config --await-owner",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --own-copy --context-window --speeds --fallbacks --models --provider-config --await-owner",
         settings: "",
         startup: true,
     },
@@ -447,10 +447,6 @@ fn print_flags(flags: &str) {
             "--shell-exclude" => (
                 "PATTERN",
                 "Leave variables named like this (* and ? wildcards, any case) out of tool shells; repeatable; clients pass [shell_environment_policy] from ~/.agent/config.toml",
-            ),
-            "--shell-set" => (
-                "NAME=VALUE",
-                "Set this variable in every tool shell, over the daemon's own; what a bot or its caller sets still wins; a TMPDIR set is an absolute folder, made at start and writable in the sandbox as the shells' temporary folder; repeatable; clients pass [shell_environment_policy] set from ~/.agent/config.toml",
             ),
             "--redact-field" => (
                 "NAME",
@@ -680,9 +676,9 @@ const DURATIONS: &[(&str, u64, u64, bool, &str)] = &[
     (
         "--idle-exit",
         0,
-        31_536_000_000,
+        u64::MAX,
         true,
-        "in whole seconds, up to 365d; 0 disables",
+        "in whole seconds; 0 disables",
     ),
     (
         "--await-owner",
@@ -780,7 +776,6 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--unix-socket"
                     | "--env"
                     | "--shell-exclude"
-                    | "--shell-set"
                     | "--redact-field"
                     | "--redact-block"
                     | "--protect"

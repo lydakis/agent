@@ -197,94 +197,18 @@ fn writable_paths(mode: Mode, workspace: Option<&Path>, writable: &[String]) -> 
     }
 }
 
-/// The `TMPDIR` the daemon sets in its shells (Codex's
-/// `shell_environment_policy.set`), when it sets one.
-static SHELL_TEMPORARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
-/// Make `folder`, the `TMPDIR` the daemon sets in its shells, one of the
-/// temporary folders a sandboxed command may write, as `$TMPDIR` and
-/// `/tmp` are. Called once at start, before [`warm`].
-pub fn shell_temporary(folder: PathBuf) {
-    let _ = SHELL_TEMPORARY.set(folder);
-}
-
-/// The shells' `TMPDIR` when the daemon sets one, `$TMPDIR` and `/tmp`,
-/// each as named and by its real path, read once: what decides whether a
-/// call escapes must not change while a round runs.
+/// `$TMPDIR` and `/tmp`, each as named and by its real path, read once:
+/// what decides whether a call escapes must not change while a round runs.
 fn temporary() -> &'static [(PathBuf, PathBuf)] {
     static TEMPORARY: std::sync::OnceLock<Vec<(PathBuf, PathBuf)>> = std::sync::OnceLock::new();
     TEMPORARY.get_or_init(|| {
-        (SHELL_TEMPORARY.get().cloned().into_iter())
-            .chain(std::env::var_os("TMPDIR").map(PathBuf::from))
+        std::env::var_os("TMPDIR")
+            .map(PathBuf::from)
             .filter(|path| path.is_absolute())
+            .into_iter()
             .chain([PathBuf::from("/tmp")])
             .filter_map(|path| std::fs::canonicalize(&path).ok().map(|real| (path, real)))
             .collect()
-    })
-}
-
-/// The temporary folders a sandboxed command may write, as named, the
-/// shells' own first, each once by its real path: what `stats` reports
-/// the room of.
-pub fn temporary_folders() -> Vec<PathBuf> {
-    let mut folders: Vec<&(PathBuf, PathBuf)> = Vec::new();
-    for folder in temporary() {
-        if !folders.iter().any(|(_, real)| *real == folder.1) {
-            folders.push(folder);
-        }
-    }
-    folders
-        .into_iter()
-        .map(|(named, _)| named.clone())
-        .collect()
-}
-
-/// The room left on the file system holding a temporary folder: bytes an
-/// unprivileged process may still write and inodes it may still make,
-/// beside the totals. A file system that keeps no inode count (Btrfs, ZFS
-/// and APFS report none, or as many as are free) says so with equal
-/// figures or a zero total.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct Room {
-    pub path: PathBuf,
-    pub bytes_free: u64,
-    pub bytes_total: u64,
-    pub inodes_free: u64,
-    pub inodes_total: u64,
-}
-
-/// [`Room`] on each temporary folder a sandboxed command may write, read
-/// now: one `statvfs` each, so a caller runs it off the runtime thread.
-pub fn temporary_room() -> Vec<Room> {
-    temporary_folders()
-        .into_iter()
-        .filter_map(|path| {
-            room(&path).map(|mut room| {
-                room.path = path;
-                room
-            })
-        })
-        .collect()
-}
-
-fn room(path: &Path) -> Option<Room> {
-    use std::os::unix::ffi::OsStrExt;
-    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: a zeroed statvfs is valid; statvfs fills it.
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: a NUL-terminated path and a valid pointer to a statvfs this
-    // function owns.
-    if unsafe { libc::statvfs(name.as_ptr(), &mut stat) } != 0 {
-        return None;
-    }
-    let unit = stat.f_frsize as u64;
-    #[allow(clippy::unnecessary_cast)]
-    Some(Room {
-        path: PathBuf::new(),
-        bytes_free: (stat.f_bavail as u64).saturating_mul(unit),
-        bytes_total: (stat.f_blocks as u64).saturating_mul(unit),
-        inodes_free: stat.f_favail as u64,
-        inodes_total: stat.f_files as u64,
     })
 }
 

@@ -347,7 +347,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut await_owner = None;
     let mut stall_timeout = None;
     let mut shell_excludes = Vec::new();
-    let mut shell_set = Vec::new();
     let (mut redact_fields, mut redact_blocks) = (Vec::new(), Vec::new());
     let (mut protected, mut protected_existing) = (Vec::new(), Vec::new());
     let mut protected_paths = Vec::new();
@@ -371,15 +370,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                 return fail_with("usage", "--shell-exclude needs a name or pattern");
             }
             "--shell-exclude" => shell_excludes.push(value.clone()),
-            "--shell-set" => {
-                let (name, value) = server::shell_set(value)?;
-                // One value a name, as the config's table gives it: the
-                // folder made and kept writable is the one the shells get.
-                if shell_set.iter().any(|(set, _)| *set == name) {
-                    return fail_with("usage", format!("--shell-set names {name} twice"));
-                }
-                shell_set.push((name, value));
-            }
             "--redact-field" | "--redact-block" if value.trim().is_empty() => {
                 return fail_with("usage", format!("{flag} needs a name"));
             }
@@ -472,7 +462,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         idle_exit,
         await_owner,
         shell_excludes,
-        shell_set,
         redact_fields,
         redact_blocks,
         protected,

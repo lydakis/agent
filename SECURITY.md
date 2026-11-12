@@ -198,9 +198,7 @@ vulnerability, whether or not the code's own documentation agrees.
 - Other secrets in the daemon's environment reach a bot's shell unless
   `[shell_environment_policy]` in `config.toml` leaves them out: as in
   Codex, `*KEY*`, `*SECRET*` and `*TOKEN*` are withheld only with
-  `ignore_default_excludes = false`, and `exclude` names more; `set`
-  gives every shell a variable, and a `TMPDIR` set there is a folder a
-  sandboxed command may write, as `/tmp` is, shared by every bot. The
+  `ignore_default_excludes = false`, and `exclude` names more. The
   daemon's companions (Sonny's reviewer, lookout and tool host) inherit
   its environment whole, provider keys included.
 - A secret found while importing an MCP server goes to `~/.agent/env`,

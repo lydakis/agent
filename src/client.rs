@@ -398,19 +398,14 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--max-input-bytes"
                     | "--max-readers"
                     | "--max-depth" => {
-                        // Kept as the number it is, as a pin reads it.
-                        let count = value.parse::<usize>().map_err(|_| {
+                        value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
-                        options
-                            .daemon_flags
-                            .push((flag.to_owned(), count.to_string()));
+                        options.daemon_flags.push((flag.to_owned(), value));
                     }
                     "--max-load" => {
-                        let load = crate::cli::load(&value)?;
-                        options
-                            .daemon_flags
-                            .push((flag.to_owned(), format!("{load}")));
+                        crate::cli::load(&value)?;
+                        options.daemon_flags.push((flag.to_owned(), value));
                     }
                     "--stall-timeout" | "--idle-exit" => {
                         crate::cli::duration_secs(flag, &value)?;
@@ -1079,9 +1074,6 @@ fn connect_or_start(options: &Options) -> Result<Connection> {
 struct Start {
     environment: Vec<(String, String)>,
     providers: Vec<String>,
-    /// How the store's daemon starts, pinned beside it, with this
-    /// command's own start flags over what was pinned before.
-    pins: agent_client::config::Pins,
 }
 
 impl Start {
@@ -1091,16 +1083,13 @@ impl Start {
                 Some((code, detail)) => Error::with(code, detail),
                 None => Error::with("env_file_invalid", error),
             })?;
-        let pins = pinned(options)?;
         // A key the file sets names its provider as one this agent's
         // environment sets would; an empty value there unsets it. Only a
-        // `--provider`, or one pinned for the store, stands as given;
-        // providers inferred from this agent's environment are inferred
-        // again with the file over it.
-        let providers = match (options.providers_explicit, &pins.provider) {
-            (true, _) => options.providers.clone(),
-            (false, Some(pinned)) => pinned.split_whitespace().map(str::to_owned).collect(),
-            (false, None) => environment_providers(
+        // `--provider` stands as given; providers inferred from this
+        // agent's environment are inferred again with the file over it.
+        let providers = match options.providers_explicit {
+            true => options.providers.clone(),
+            false => environment_providers(
                 &|name| match environment.iter().rev().find(|(key, _)| key == name) {
                     Some((_, value)) => Some(value.clone()),
                     None => std::env::var(name).ok(),
@@ -1111,43 +1100,7 @@ impl Start {
         Ok(Self {
             environment,
             providers,
-            pins,
         })
-    }
-}
-
-/// How the daemon of `options`' store starts: what is pinned for the
-/// store, with the start flags this command was given over it (a
-/// `--provider` list replaces the pinned one whole).
-fn pinned(options: &Options) -> Result<agent_client::config::Pins> {
-    let mut pins = match pins_file(options)? {
-        Some(file) => agent_client::config::read_pins(&file).map_err(config_error)?,
-        None => agent_client::config::Pins::default(),
-    };
-    if options.providers_explicit {
-        pins.provider = Some(options.providers.join(" "));
-    }
-    for (flag, value) in &options.daemon_flags {
-        if let Some(key) = agent_client::config::daemon_key(flag) {
-            pins.daemon.insert(key.to_owned(), value.clone());
-        }
-    }
-    Ok(pins)
-}
-
-/// Where the start flags of `options`' store are pinned, by its real path
-/// as the daemon names it, so every name for one store shares its pins;
-/// none with no home to keep them in.
-fn pins_file(options: &Options) -> Result<Option<PathBuf>> {
-    let store = agent_client::socket::canonical_store(&options.store)?;
-    Ok(agent_client::config::pins_path(&store))
-}
-
-/// A config file's error as this agent's, its code kept.
-fn config_error(error: String) -> Error {
-    match error.split_once(": ") {
-        Some((code, detail)) => Error::with(code, detail),
-        None => Error::with("config_invalid", error),
     }
 }
 
@@ -1157,9 +1110,6 @@ struct Started {
     log: std::ffi::OsString,
     /// Where its output starts in the log other starts append to.
     from: u64,
-    /// The pins file and the start flags to pin there once this daemon, not
-    /// one that took the store before it, answers.
-    pins: Option<(PathBuf, agent_client::config::Pins)>,
 }
 
 /// Start the daemon `options` name, with `start`; with `await_owner`, one
@@ -1213,30 +1163,17 @@ fn spawn_daemon(
             .arg("--await-owner")
             .arg(format!("{}s", wait.as_secs()));
     }
-    // Whoever starts it, the store's daemon starts the way a start given
-    // flags last started it: those flags are pinned for the store, and
-    // what was pinned goes over the person's `[daemon]` limits, worked out
-    // for this machine.
-    // They are pinned once this start's own daemon answers, so a start
-    // that loses the store to another's pins nothing; pins that would not
-    // read are refused before anything starts.
-    let given = options.providers_explicit || !options.daemon_flags.is_empty();
-    let pins = match pins_file(options)? {
-        Some(file)
-            if given
-                && agent_client::config::read_pins(&file).ok().as_ref() != Some(&start.pins) =>
-        {
-            agent_client::config::check_pins(&file, &start.pins).map_err(config_error)?;
-            Some((file, start.pins.clone()))
-        }
-        _ => None,
-    };
-    let mut limits = config()?.daemon;
-    limits.extend(start.pins.daemon.clone());
-    let limits = agent_client::config::daemon_flags(&limits)
-        .map_err(|error| Error::with("config_invalid", error))?;
-    for (flag, value) in limits {
+    for (flag, value) in &options.daemon_flags {
         command.arg(flag).arg(value);
+    }
+    // The person's `[daemon]` limits, for this machine, where the command
+    // line set none.
+    let configured = agent_client::config::daemon_flags(&config()?.daemon)
+        .map_err(|error| Error::with("config_invalid", error))?;
+    for (flag, value) in configured {
+        if !options.daemon_flags.iter().any(|(given, _)| *given == flag) {
+            command.arg(flag).arg(value);
+        }
     }
     for name in agent_client::TERMINAL_PLACES {
         command.arg("--shell-exclude").arg(name);
@@ -1274,9 +1211,6 @@ fn spawn_daemon(
     for pattern in file.shell_environment_policy.excludes() {
         command.arg("--shell-exclude").arg(pattern);
     }
-    for (name, value) in &file.shell_environment_policy.set {
-        command.arg("--shell-set").arg(format!("{name}={value}"));
-    }
     for (pattern, tokens) in &file.context_windows {
         command
             .arg("--context-window")
@@ -1291,9 +1225,7 @@ fn spawn_daemon(
         command.arg("--fallbacks").arg(format!("{pattern}={model}"));
     }
     // Where the providers came from, so an edit there applies live.
-    if let Some(file) = agent_client::config::path()
-        .filter(|_| options.providers_from_config && start.pins.provider.is_none())
-    {
+    if let Some(file) = agent_client::config::path().filter(|_| options.providers_from_config) {
         command.arg("--provider-config").arg(file);
     }
     // Discovery's catalog, rewritten by every start of the home store's
@@ -1313,7 +1245,6 @@ fn spawn_daemon(
         child,
         log: log_path,
         from,
-        pins,
     })
 }
 
@@ -1329,7 +1260,7 @@ impl Started {
         };
         loop {
             match answering(options, deadline) {
-                Ok(Some(connection)) => return self.pin(connection),
+                Ok(Some(connection)) => return Ok(connection),
                 Ok(None) => {}
                 Err(error) => return Err(timed_out(&mut self, error)),
             }
@@ -1360,17 +1291,6 @@ impl Started {
                 Err(error) => return Err(timed_out(&mut self, error)),
             }
         }
-    }
-
-    /// `connection`, once the start flags are pinned if it reached this
-    /// start's own daemon.
-    fn pin(&self, connection: Connection) -> Result<Connection> {
-        if let Some((file, pins)) = &self.pins
-            && connection.ready["pid"].as_u64() == Some(u64::from(self.child.id()))
-        {
-            agent_client::config::write_pins(file, pins).map_err(config_error)?;
-        }
-        Ok(connection)
     }
 
     /// The error the child reported, once it has exited.

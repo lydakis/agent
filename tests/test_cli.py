@@ -46,8 +46,8 @@ class SocketAndCliTests(ModelFixture):
             subprocess.run([*self.base, 'shutdown', '--store', str(self.store)], env=clean_env(),
                            capture_output=True, timeout=35)
 
-    def agent(self, *args, check=True, timeout=30, stdin=None, env=None):
-        result = subprocess.run([*self.base, *args], env=env or clean_env(), capture_output=True, text=True,
+    def agent(self, *args, check=True, timeout=30, stdin=None):
+        result = subprocess.run([*self.base, *args], env=clean_env(), capture_output=True, text=True,
                                 timeout=timeout, cwd=self.path, input=stdin)
         if check:
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
@@ -667,40 +667,6 @@ class SocketAndCliTests(ModelFixture):
             self.assertEqual(refused.returncode, 2)
             self.assertIn(f'does not accept {flag}', refused.stderr)
 
-    def test_a_start_given_flags_pins_them_and_any_later_start_takes_them(self):
-        home = self.path / 'home'
-        env = {**clean_env(), 'HOME': str(home)}
-        agent = lambda *args, **kw: self.agent(*args, env=env, **kw)
-        # With the person's settings, named by the store's real path.
-        name = str(self.store.resolve()).replace('%', '%25').replace('/', '%2F')
-        pins = home / '.agent' / 'pins' / f'{name}.toml'
-        started = json.loads(agent('start', *self.common[:4], '--max-active', '3', '--idle-exit', '0').stdout)
-        self.assertEqual(started['limits']['active'], 3)
-        # The person's alone, in config.toml's keys.
-        self.assertEqual(pins.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(pins.parent.stat().st_mode & 0o777, 0o700)
-        text = pins.read_text()
-        self.assertIn(f'provider = "openai=responses,{self.url}"', text)
-        self.assertIn('[daemon]\nactive = "3"\nidle_exit = "0"\n', text)
-        agent('shutdown', '--store', str(self.store))
-        # A command that starts the daemon with no flags (a client waiting on
-        # a bot, a gate) starts it as its owner did, provider and all.
-        stats = json.loads(agent('stats', '--store', str(self.store)).stdout)
-        self.assertEqual(stats['active_limit'], 3)
-        agent('shutdown', '--store', str(self.store))
-        # Flags given again pin again, over what was pinned.
-        # A number pins as the file writes one, however the flag gave it.
-        again = json.loads(agent('start', '--store', str(self.store), '--max-active', '5', '--max-load', '2e0').stdout)
-        self.assertEqual(again['limits']['active'], 5)
-        self.assertIn('[daemon]\nactive = "5"\nidle_exit = "0"\nload = "2"\n', pins.read_text())
-        agent('shutdown', '--store', str(self.store))
-        # A file that does not read is refused by name; nothing starts.
-        pins.write_text('provider = "openai"\nmodel = "x"\n')
-        refused = agent('stats', '--store', str(self.store), check=False)
-        self.assertEqual(json.loads(refused.stderr)['error'], 'config_invalid', refused.stderr)
-        self.assertIn('.toml: unknown key model', refused.stderr)
-        self.assertFalse(self.socket.exists())
-
     def test_help_and_invalid_flags_do_not_start_a_daemon(self):
         for args in [('--help',), ('-h',), ('help', 'run')]+[(c, '--help') for c in
                 ('run', 'follow', 'fork', 'interrupt', 'ls', 'inspect', 'turns', 'wait', 'rm', 'prune', 'models', 'stats', 'shutdown', 'serve')]:
@@ -1239,34 +1205,6 @@ class SocketAndCliTests(ModelFixture):
         self.assertFalse((kept / 'x').exists())
 
     @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
-    def test_a_tmpdir_the_shells_are_set_is_their_temporary_folder(self):
-        work, temp = self.path / 'work', self.path / 'shell-temp'
-        work.mkdir()
-        daemon = SocketClient(self.binary, self.store, self.url, 'shell',
-                              extra=['--shell-set', f'TMPDIR={temp}'], env=clean_env())
-        self.addCleanup(daemon.close)
-        # Made as the daemon starts, its user's alone.
-        self.assertEqual(temp.stat().st_mode & 0o777, 0o700)
-        # Its room is the first `stats` reports.
-        room = daemon.request('stats')['result']['temp']
-        self.assertEqual(room[0]['path'], str(temp))
-        self.assertTrue(all(r['bytes_total'] > 0 and r['bytes_free'] <= r['bytes_total'] for r in room))
-        daemon.request('create', bot='Writer', workspace=str(work), settings={'sandbox': 'workspace-write'})
-        ran = subprocess.run([str(self.binary), 'sandbox', '--store', str(self.store), '--socket', str(daemon.socket_path),
-                              '--bot', 'Writer', '--', '/bin/sh', '-c', 'touch "$TMPDIR/wrote" && echo "$TMPDIR"'],
-                             env=clean_env(), capture_output=True, text=True, timeout=30, cwd=work)
-        self.assertEqual(ran.returncode, 0, ran.stderr)
-        # The bot's commands get it, and may write it from their sandbox,
-        # though it is outside the bot's folder.
-        self.assertEqual(ran.stdout.strip(), str(temp))
-        self.assertTrue((temp / 'wrote').exists())
-        for refused in (['AGENT_STORE=x'], ['TMPDIR=relative'], ['NO-NAME=1'], ['NOVALUE'], ['TMPDIR=/a', 'TMPDIR=/b']):
-            flags = [part for one in refused for part in ('--shell-set', one)]
-            usage = self.agent('serve', '--store', str(self.path / 'other.sqlite'), '--provider', f'openai=responses,{self.url}',
-                               *flags, check=False)
-            self.assertEqual(json.loads(usage.stderr)['error'], 'usage', refused)
-
-    @unittest.skipUnless(shutil.which('bwrap'), 'placeholders are bubblewrap\'s')
     def test_a_lent_sandbox_s_placeholders_stay_while_any_command_mounts_them(self):
         daemon = SocketClient(self.binary, self.store, self.url, 'shell', extra=['--protect', '.codex'], env=clean_env())
         self.addCleanup(daemon.close)

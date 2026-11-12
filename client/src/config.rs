@@ -13,12 +13,11 @@
 //! hold = "5d"                   # how long a new agent's turn waits on a cause you can fix before it fails, the default; "0" fails at once
 //! prices = "~/sheets/llm.toml"  # the price sheet /usage costs from, ~/.agent/prices.toml by default; see `prices`
 //!
-//! [daemon]                      # what the agent CLI starts the daemon with; restart it to apply; ~/.agent/pins/ pins a store's own
+//! [daemon]                      # what the agent CLI starts the daemon with; restart it to apply
 //! processes = "cpus * 64"       # commands running at once, the default
 //! load = "cpus * 2"             # new commands wait while the load average is this, the default; 0 no gate
 //! input_bytes = "memory / 16"   # also lasting, active, connecting, pending, pending_bytes, readers
 //! stall_timeout = "10m"         # a provider stream with no content this long is retried, the default
-//! idle_exit = "30m"             # the daemon exits this long after its last client leaves with nothing running; "0", the default, never
 //! depth = 3                     # generations a new agent may be below the one that starts its line, 2 by default; 0 no end
 //!
 //! [fallbacks]                   # the model a declined request goes to, for every agent that names none; restart the daemon to apply
@@ -37,10 +36,9 @@
 //! model = "openai/gpt-6-luna"   # the model that reviews calls in auto, `sonny reviewer`
 //! effort = "low"                # the reviewer's effort
 //!
-//! [shell_environment_policy]    # what tool shells leave out and set, as in Codex; restart the daemon to apply
+//! [shell_environment_policy]    # what tool shells leave out, as in Codex
 //! ignore_default_excludes = false  # also *KEY*, *SECRET* and *TOKEN*; true, the default, keeps them
 //! exclude = ["AWS_*"]           # names to leave out, * and ? wildcards, any case
-//! set = { TMPDIR = "/home/me/.agent/tmp" }  # set in every tool shell; a TMPDIR set is the shells' temp folder, made and writable in the sandbox
 //!
 //! [sonny]
 //! lead_effort = "medium"        # a new lead's effort
@@ -304,167 +302,8 @@ pub fn machine() -> (f64, f64) {
 /// The `[daemon]` keys that are durations, as the `agent serve` flag each
 /// sets takes them, with the least and most it takes in milliseconds: none
 /// given is the daemon's own default.
-pub const DAEMON_DURATIONS: [(&str, &str, u64, u64); 2] = [
-    ("stall_timeout", "--stall-timeout", 1000, 86_400_000),
-    // "0" never: a daemon with no clients left runs on.
-    ("idle_exit", "--idle-exit", 0, 31_536_000_000),
-];
-
-/// The `[daemon]` key the `agent serve` flag `flag` sets.
-pub fn daemon_key(flag: &str) -> Option<&'static str> {
-    (DAEMON_LIMITS.iter().map(|(key, known, _)| (*key, *known)))
-        .chain(
-            DAEMON_DURATIONS
-                .iter()
-                .map(|(key, known, ..)| (*key, *known)),
-        )
-        .find(|(_, known)| *known == flag)
-        .map(|(key, _)| key)
-}
-
-/// How a store's daemon starts, pinned for the store in `~/.agent/pins/`
-/// by a start given flags: its `provider` and its `[daemon]` limits, in
-/// `config.toml`'s keys. Every later start of the store, whoever asks for
-/// it (a client waiting on one of its bots, a gate, a window), reads them
-/// over `config.toml`, so it starts the way its owner started it; flags
-/// given again pin again. They are kept with the person's other settings,
-/// which no sandboxed command writes, wherever the store is.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Pins {
-    pub provider: Option<String>,
-    pub daemon: BTreeMap<String, String>,
-}
-
-/// Where the start flags of the daemon of `store` are pinned:
-/// `~/.agent/pins/` and the store's real path with each `/` written
-/// `%2F` and each `%` written `%25`, then `.toml`; where that name is too
-/// long for a file system, `v1-HASH.toml`, as the store's socket is named
-/// when its own name is too long. `store` is named as the daemon names
-/// it, by its real path, so every name for one store finds the same pins.
-/// `None` with no home.
-pub fn pins_path(store: &Path) -> Option<PathBuf> {
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    // Room under the usual 255 for the name a write stages it under.
-    const LONGEST: usize = 200;
-    let mut name = Vec::new();
-    for byte in store.as_os_str().as_bytes() {
-        match byte {
-            b'%' => name.extend_from_slice(b"%25"),
-            b'/' => name.extend_from_slice(b"%2F"),
-            _ => name.push(*byte),
-        }
-    }
-    name.extend_from_slice(b".toml");
-    if name.len() > LONGEST {
-        name = format!("v1-{:032x}.toml", crate::socket::store_hash(store)).into_bytes();
-    }
-    let pins = home()?.join("pins");
-    Some(pins.join(std::ffi::OsString::from_vec(name)))
-}
-
-/// The start flags pinned at `path`: none when nothing pinned them. A
-/// file that does not read is refused by name, as `config.toml`.
-pub fn read_pins(path: &Path) -> Result<Pins, String> {
-    let text = match std::fs::read_to_string(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Pins::default()),
-        Err(error) => return Err(format!("config_unreadable: {}: {error}", path.display())),
-        Ok(text) => text,
-    };
-    let invalid = |reason: &str| format!("config_invalid: {}: {reason}", path.display());
-    let table: toml::Table = text
-        .parse()
-        .map_err(|e: toml::de::Error| invalid(e.message()))?;
-    if let Some(key) = table
-        .keys()
-        .find(|key| !matches!(key.as_str(), "provider" | "daemon"))
-    {
-        return Err(invalid(&format!(
-            "unknown key {key}; it pins provider and [daemon]"
-        )));
-    }
-    let config = parse(&text).map_err(|reason| invalid(&reason))?;
-    Ok(Pins {
-        provider: config.provider,
-        daemon: config.daemon,
-    })
-}
-
-/// `pins` as the file holds them, once read back the way every later
-/// start reads them: what would refuse those starts is refused now.
-fn pins_text(path: &Path, pins: &Pins) -> Result<String, String> {
-    let mut text = String::from(
-        "# How this store's daemon starts, pinned by a start given flags, which\n\
-         # pins again; every start reads it over ~/.agent/config.toml. Edit or\n\
-         # delete it to start the daemon otherwise; it applies at the next start.\n",
-    );
-    if let Some(provider) = &pins.provider {
-        text.push_str(&format!(
-            "provider = {}\n",
-            toml::Value::from(provider.as_str())
-        ));
-    }
-    if !pins.daemon.is_empty() {
-        text.push_str("\n[daemon]\n");
-        for (key, value) in &pins.daemon {
-            text.push_str(&format!("{key} = {}\n", toml::Value::from(value.as_str())));
-        }
-    }
-    parse(&text).map_err(|reason| format!("config_invalid: {}: {reason}", path.display()))?;
-    Ok(text)
-}
-
-/// Whether `pins` would be written at `path`: refused as `write_pins`
-/// would refuse them, with nothing written.
-pub fn check_pins(path: &Path, pins: &Pins) -> Result<(), String> {
-    pins_text(path, pins).map(drop)
-}
-
-/// Write `pins` at `path`, the person's alone, whole or not at all:
-/// written aside, then renamed over the last.
-pub fn write_pins(path: &Path, pins: &Pins) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    let text = pins_text(path, pins)?;
-    let unwritable = |e: std::io::Error| format!("config_unwritable: {}: {e}", path.display());
-    if let Some(folder) = path.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(folder)
-            .map_err(unwritable)?;
-    }
-    // Made new, never opened: a name already there is passed over, never
-    // followed.
-    let mut made = None;
-    for n in 0..64 {
-        let mut aside = path.as_os_str().to_owned();
-        aside.push(format!(".{}.{n}", std::process::id()));
-        let aside = PathBuf::from(aside);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&aside)
-        {
-            Ok(file) => {
-                made = Some((aside, file));
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(unwritable(error)),
-        }
-    }
-    let Some((aside, mut file)) = made else {
-        return Err(unwritable(std::io::ErrorKind::AlreadyExists.into()));
-    };
-    let written = file.write_all(text.as_bytes());
-    drop(file);
-    if let Err(error) = written.and_then(|()| std::fs::rename(&aside, path)) {
-        let _ = std::fs::remove_file(&aside);
-        return Err(unwritable(error));
-    }
-    Ok(())
-}
+pub const DAEMON_DURATIONS: [(&str, &str, u64, u64); 1] =
+    [("stall_timeout", "--stall-timeout", 1000, 86_400_000)];
 
 /// A `[daemon]` value worked out: a number, or `cpus` and `memory` (bytes)
 /// with numbers, `KiB` `MiB` `GiB`, `+ - * /`, parentheses, and
@@ -620,10 +459,9 @@ pub fn daemon_flags(daemon: &BTreeMap<String, String>) -> Result<Vec<(String, St
 /// What Codex's default excludes leave out when they apply.
 pub const DEFAULT_EXCLUDES: [&str; 3] = ["*KEY*", "*SECRET*", "*TOKEN*"];
 
-/// Codex's `[shell_environment_policy]`: variables of the daemon's
+/// Codex's `[shell_environment_policy]` excludes: variables of the daemon's
 /// environment that no tool shell gets, past the provider keys it always
-/// withholds, and variables every tool shell gets. A daemon takes them
-/// when it starts.
+/// withholds. A daemon takes them when it starts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShellEnvironmentPolicy {
     /// False also leaves out `DEFAULT_EXCLUDES`; true, Codex's default,
@@ -631,11 +469,6 @@ pub struct ShellEnvironmentPolicy {
     pub ignore_default_excludes: bool,
     /// Names to leave out, with `*` and `?` wildcards, in any case.
     pub exclude: Vec<String>,
-    /// Codex's `set`: what every tool shell gets, over the daemon's own
-    /// environment; what a bot or its caller sets still wins. A `TMPDIR`
-    /// here is an absolute path, the folder the daemon makes and lets its
-    /// sandboxed shells write as their temporary folder.
-    pub set: BTreeMap<String, String>,
 }
 
 impl Default for ShellEnvironmentPolicy {
@@ -643,17 +476,8 @@ impl Default for ShellEnvironmentPolicy {
         ShellEnvironmentPolicy {
             ignore_default_excludes: true,
             exclude: Vec::new(),
-            set: BTreeMap::new(),
         }
     }
-}
-
-/// Whether `name` is one a shell can set: a letter or `_`, then letters,
-/// digits and `_`.
-fn shell_name(name: &str) -> bool {
-    name.len() <= 128
-        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 impl ShellEnvironmentPolicy {
@@ -1683,7 +1507,7 @@ fn parse(text: &str) -> Result<Config, String> {
         }
         let keys: &[&str] = match name.as_str() {
             "reviewer" => &["model", "effort"],
-            "shell_environment_policy" => &["ignore_default_excludes", "exclude", "set"],
+            "shell_environment_policy" => &["ignore_default_excludes", "exclude"],
             "sonny" => &[
                 "lead_effort",
                 "task_effort",
@@ -1770,36 +1594,6 @@ fn parse(text: &str) -> Result<Config, String> {
                     policy.ignore_default_excludes = value
                         .as_bool()
                         .ok_or_else(|| format!("{name}.{key} must be true or false"))?;
-                    continue;
-                }
-                if key == "set" {
-                    let table = value
-                        .as_table()
-                        .ok_or_else(|| format!("{name}.set must be a table of NAME = \"value\""))?;
-                    for (variable, value) in table {
-                        if !shell_name(variable) {
-                            return Err(format!(
-                                "{name}.set.{variable}: a name is a letter or _, then letters, digits and _"
-                            ));
-                        }
-                        // As a bot's own `env` may not: the daemon tells its
-                        // shells these itself.
-                        if variable.to_ascii_uppercase().starts_with("AGENT_") {
-                            return Err(format!(
-                                "{name}.set.{variable}: AGENT_ variables are the daemon's own"
-                            ));
-                        }
-                        let value = match value.as_str() {
-                            Some(value) if !value.contains('\0') => value,
-                            _ => return Err(format!("{name}.set.{variable} must be a string")),
-                        };
-                        if variable == "TMPDIR" && !std::path::Path::new(value).is_absolute() {
-                            return Err(format!(
-                                "{name}.set.TMPDIR must be an absolute path, not {value:?}"
-                            ));
-                        }
-                        policy.set.insert(variable.clone(), value.to_owned());
-                    }
                     continue;
                 }
                 let invalid = || format!("{name}.{key} must be a list of names");
@@ -2699,75 +2493,6 @@ mod tests {
     }
 
     #[test]
-    fn pins_read_as_they_were_written_and_hold_only_provider_and_daemon() {
-        let dir = std::env::temp_dir().join(format!("agent-pins-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // Named by the file's path, every `/` and `%` written out.
-        let named = pins_path(Path::new("/srv/a%b/state.sqlite")).unwrap();
-        assert_eq!(named.parent().unwrap().file_name().unwrap(), "pins");
-        assert_eq!(
-            named.file_name().unwrap(),
-            "%2Fsrv%2Fa%25b%2Fstate.sqlite.toml"
-        );
-        // One too long for a file's name is named by its hash, as its
-        // socket is.
-        let deep = PathBuf::from(format!("/{}/state.sqlite", "d/".repeat(120)));
-        let hashed = pins_path(&deep).unwrap();
-        assert_eq!(
-            hashed.file_name().unwrap().to_str().unwrap(),
-            format!("v1-{:032x}.toml", crate::socket::store_hash(&deep))
-        );
-        let file = dir.join("pins").join("state.sqlite.toml");
-        assert_eq!(read_pins(&file).unwrap(), Pins::default());
-        let pins = Pins {
-            provider: Some("openai=responses,http://127.0.0.1:1/v1 \"odd\"".into()),
-            daemon: BTreeMap::from([
-                ("active".to_owned(), "4".to_owned()),
-                ("idle_exit".to_owned(), "0".to_owned()),
-                ("stall_timeout".to_owned(), "30s".to_owned()),
-            ]),
-        };
-        write_pins(&file, &pins).unwrap();
-        assert_eq!(read_pins(&file).unwrap(), pins);
-        // What a later start would refuse is never written.
-        let refused = Pins {
-            provider: None,
-            daemon: BTreeMap::from([("load".to_owned(), "2e0".to_owned())]),
-        };
-        assert!(
-            write_pins(&file, &refused)
-                .unwrap_err()
-                .contains("daemon.load")
-        );
-        assert_eq!(read_pins(&file).unwrap(), pins);
-        assert!(check_pins(&file, &refused).is_err());
-        assert_eq!(check_pins(&file, &pins), Ok(()));
-        // A link where pins are written aside is passed over, never
-        // followed.
-        let target = dir.join("target");
-        std::fs::write(&target, "kept").unwrap();
-        let mut aside = file.clone().into_os_string();
-        aside.push(format!(".{}.0", std::process::id()));
-        std::os::unix::fs::symlink(&target, &aside).unwrap();
-        write_pins(&file, &pins).unwrap();
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "kept");
-        assert_eq!(read_pins(&file).unwrap(), pins);
-        assert_eq!(daemon_key("--idle-exit"), Some("idle_exit"));
-        assert_eq!(daemon_key("--max-active"), Some("active"));
-        assert_eq!(daemon_key("--model"), None);
-        std::fs::write(&file, "[sonny]\nchime = true\n").unwrap();
-        assert!(
-            read_pins(&file)
-                .unwrap_err()
-                .ends_with("unknown key sonny; it pins provider and [daemon]")
-        );
-        std::fs::write(&file, "[daemon]\nidle_exit = \"10\"\n").unwrap();
-        assert!(read_pins(&file).unwrap_err().contains("daemon.idle_exit"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn a_hold_is_the_daemon_s_unless_the_file_says_otherwise() {
         assert_eq!(Config::default().hold_ms, None);
         assert_eq!(parse("hold = \"2d\"").unwrap().hold_ms, Some(172_800_000));
@@ -3286,16 +3011,6 @@ mod tests {
             config.shell_environment_policy.excludes(),
             ["*KEY*", "*SECRET*", "*TOKEN*", "AWS_*"]
         );
-        let config =
-            parse("[shell_environment_policy]\nset = { TMPDIR = \"/big/tmp\", LANG = \"C\" }\n")
-                .unwrap();
-        assert_eq!(
-            config.shell_environment_policy.set,
-            BTreeMap::from([
-                ("LANG".to_owned(), "C".to_owned()),
-                ("TMPDIR".to_owned(), "/big/tmp".to_owned())
-            ])
-        );
         for (text, error) in [
             (
                 "[shell_environment_policy]\nexclude = \"AWS_*\"",
@@ -3312,26 +3027,6 @@ mod tests {
             (
                 "[shell_environment_policy]\ninherit = \"core\"",
                 "unknown key shell_environment_policy.inherit",
-            ),
-            (
-                "[shell_environment_policy]\nset = \"TMPDIR=/t\"",
-                "shell_environment_policy.set must be a table of NAME = \"value\"",
-            ),
-            (
-                "[shell_environment_policy]\nset = { \"A-B\" = \"1\" }",
-                "shell_environment_policy.set.A-B: a name is a letter or _, then letters, digits and _",
-            ),
-            (
-                "[shell_environment_policy]\nset = { agent_store = \"x\" }",
-                "shell_environment_policy.set.agent_store: AGENT_ variables are the daemon's own",
-            ),
-            (
-                "[shell_environment_policy]\nset = { N = 1 }",
-                "shell_environment_policy.set.N must be a string",
-            ),
-            (
-                "[shell_environment_policy]\nset = { TMPDIR = \"~/.agent/tmp\" }",
-                "shell_environment_policy.set.TMPDIR must be an absolute path, not \"~/.agent/tmp\"",
             ),
         ] {
             assert_eq!(parse(text).unwrap_err(), error, "{text}");
