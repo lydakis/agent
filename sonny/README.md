@@ -1338,6 +1338,12 @@ has something on it, or is off the screen, no time shows.
   of six colors in the followed leads' order, `[sonny.projects.NAME]
   color = "jade"` pins one, and `[sonny] project_colors = true` turns it
   on in every window.
+
+  ![Project colors on: replies about atlas, shop and blog each wear their project's bar and open with its name; your own turns stay plain](../docs/sonny/project-colors-dark.png)
+
+  ![The same in a light theme](../docs/sonny/project-colors-light.png)
+
+  ![With NO_COLOR, each bar is the quote's muted mark](../docs/sonny/project-colors-no-color.png)
 - Over SSH with no display and no `BROWSER`, what Sonny would open (a
   link, a file, the page) is copied instead, so it doesn't start on the
   remote machine's screen.
