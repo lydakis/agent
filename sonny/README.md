@@ -1330,6 +1330,14 @@ has something on it, or is off the screen, no time shows.
   HTML page in a browser; `/sound` turns the chime off or on; `/verbose`
   switches between the clean view and every tool call; `/quit`
   leaves the agents working.
+- `/colors` (experimental) colors a busy lead's window by project: when
+  the lead follows other projects' leads, a reply it writes because one
+  of those projects woke it wears that project's colored bar down its
+  left edge and opens with its name (`shop · The refunds task
+  finished…`); your own turns stay plain. Each followed project takes one
+  of six colors in the followed leads' order, `[sonny.projects.NAME]
+  color = "jade"` pins one, and `[sonny] project_colors = true` turns it
+  on in every window.
 - Over SSH with no display and no `BROWSER`, what Sonny would open (a
   link, a file, the page) is copied instead, so it doesn't start on the
   remote machine's screen.

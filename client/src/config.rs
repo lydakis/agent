@@ -73,6 +73,10 @@
 //! lookout_waiting = 4096        # events from sources that wait for one agent, 1024 by default; past it newer ones are not kept, and its next note says so; 0 no limit
 //! default_permissions = "strict"   # the /permissions row a new lead starts in, auto by default
 //! browser_confirm = ["eval"]    # agent-browser actions the agent's gate approves; eval, download, upload and state by default
+//! project_colors = true         # experimental: a superlead's reply about one followed project wears its color; /colors toggles it, off by default
+//!
+//! [sonny.projects.shop]         # one project as Sonny shows it
+//! color = "jade"                # its color in /colors: jade, violet, orange, azure, lime or rose; by default from the followed leads' order
 //!
 //! [sonny.permissions.strict]    # a /permissions row of the person's own, as Codex's profiles
 //! description = "Offline, commits ask"
@@ -654,6 +658,41 @@ pub struct Sonny {
     pub links: BTreeMap<String, Link>,
     /// The `workflow` tool, `[sonny.workflows]`.
     pub workflows: Workflows,
+    /// Experimental: whether a window that follows other leads opens with
+    /// project colors, its replies about one followed project barred in
+    /// that project's color; `/colors` toggles it there.
+    pub project_colors: bool,
+    /// The color each `[sonny.projects.NAME]` pins, one of
+    /// [`PROJECT_COLORS`], by project.
+    pub project_color: BTreeMap<String, String>,
+}
+
+/// The colors `/colors` hands followed projects, in the order it hands
+/// them out: six hues halfway between the terminal's six meanings.
+pub const PROJECT_COLORS: [&str; 6] = ["jade", "violet", "orange", "azure", "lime", "rose"];
+
+/// `[sonny.projects.NAME]` tables: the color each pins.
+fn projects(value: &toml::Value) -> Result<BTreeMap<String, String>, String> {
+    let table = (value.as_table()).ok_or("sonny.projects must be a table of projects")?;
+    let mut colors = BTreeMap::new();
+    for (project, value) in table {
+        let row = (value.as_table())
+            .ok_or_else(|| format!("sonny.projects.{project} must be a table"))?;
+        for (key, value) in row {
+            if key != "color" {
+                return Err(format!("unknown key sonny.projects.{project}.{key}"));
+            }
+            let color = string(&format!("sonny.projects.{project}.color"), value)?;
+            if !PROJECT_COLORS.contains(&color.as_str()) {
+                return Err(format!(
+                    "sonny.projects.{project}.color is {}, not {color}",
+                    PROJECT_COLORS.join(", ")
+                ));
+            }
+            colors.insert(project.clone(), color);
+        }
+    }
+    Ok(colors)
 }
 
 /// `[sonny.workflows]`: scripts an agent writes that run many fresh
@@ -847,6 +886,8 @@ impl Default for Sonny {
             browser_confirm: BROWSER_CONFIRM.map(str::to_owned).to_vec(),
             links: BTreeMap::new(),
             workflows: Workflows::default(),
+            project_colors: false,
+            project_color: BTreeMap::new(),
         }
     }
 }
@@ -1543,6 +1584,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "unsandboxed",
                 "default_permissions",
                 "browser_confirm",
+                "project_colors",
             ],
             _ => return Err(format!("unknown table [{name}]")),
         };
@@ -1577,6 +1619,10 @@ fn parse(text: &str) -> Result<Config, String> {
             }
             if (name.as_str(), key.as_str()) == ("sonny", "permissions") {
                 config.sonny.permissions = permissions(value)?;
+                continue;
+            }
+            if (name.as_str(), key.as_str()) == ("sonny", "projects") {
+                config.sonny.project_color = projects(value)?;
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "task_depth") {
@@ -1616,6 +1662,7 @@ fn parse(text: &str) -> Result<Config, String> {
                 "verbose" => Some(&mut config.sonny.verbose),
                 "start_at_boot" => Some(&mut config.sonny.start_at_boot),
                 "sky_haikus" => Some(&mut config.sonny.sky_haikus),
+                "project_colors" => Some(&mut config.sonny.project_colors),
                 _ => None,
             } {
                 // A count was 0.8's: the switch and the day's most are two
@@ -2375,6 +2422,19 @@ mod tests {
         let config = parse("[sonny.links.box]\nhost = \"box\"\ncalls = 2\n").unwrap();
         assert_eq!(config.sonny.links["box"].calls, Some(2));
         assert!(parse("[sonny.links.box]\nhost = \"box\"\ncalls = 0\n").is_err());
+    }
+
+    #[test]
+    fn project_colors_are_off_and_a_project_pins_one_of_the_six() {
+        let config = parse("").unwrap();
+        assert!(!config.sonny.project_colors && config.sonny.project_color.is_empty());
+        let config =
+            parse("[sonny]\nproject_colors = true\n[sonny.projects.shop]\ncolor = \"rose\"\n")
+                .unwrap();
+        assert!(config.sonny.project_colors);
+        assert_eq!(config.sonny.project_color["shop"], "rose");
+        assert!(parse("[sonny.projects.shop]\ncolor = \"red\"\n").is_err());
+        assert!(parse("[sonny.projects.shop]\ncolour = \"rose\"\n").is_err());
     }
 
     #[test]

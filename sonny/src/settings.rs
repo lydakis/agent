@@ -24,6 +24,11 @@ pub struct Settings {
     pub margin_notes: u64,
     /// The most lines a margin note runs to.
     pub margin_note_lines: u64,
+    /// Experimental: whether a window that follows other leads opens with
+    /// project colors on; `/colors` toggles them there.
+    pub project_colors: bool,
+    /// The color each project pins, by project.
+    pub project_color: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -59,6 +64,8 @@ impl Settings {
             agent_opens: sonny.agent_opens,
             margin_notes: sonny.margin_notes,
             margin_note_lines: sonny.margin_note_lines,
+            project_colors: sonny.project_colors,
+            project_color: sonny.project_color,
         }
     }
 
