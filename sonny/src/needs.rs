@@ -376,6 +376,16 @@ impl Needs {
         })
     }
 
+    /// Every agent that waits on the person, once each.
+    pub fn waiting(&self) -> impl Iterator<Item = &str> {
+        let asking = (self.asks.keys()).filter(|bot| !self.holds(bot));
+        (self.calls.iter())
+            .filter(|(_, calls)| !calls.is_empty())
+            .map(|(bot, _)| bot)
+            .chain(asking)
+            .map(String::as_str)
+    }
+
     /// The question each agent has open, whole, where it was read.
     pub fn asks(&self) -> impl Iterator<Item = (&str, &crate::asks::Ask)> {
         (self.asks.iter()).filter_map(|(bot, open)| Some((bot.as_str(), open.ask.as_ref()?)))

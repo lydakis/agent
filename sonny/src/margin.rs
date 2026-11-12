@@ -1436,12 +1436,11 @@ fn is_id(id: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// What runs for the agent, as the margin's first row says it.
+/// The agent, what of its background failed and its context, as the
+/// margin's first row says them.
 #[derive(Clone, Default)]
 pub struct Glance {
     pub name: String,
-    /// Triggers and subscriptions.
-    pub behind: usize,
     /// What of `/background` failed.
     pub failed: usize,
     pub context: Option<u64>,
@@ -1474,15 +1473,6 @@ impl Glance {
                 &mut spans,
                 text.clone(),
                 Span::raw(text).fg(Color::Red),
-                Some("background"),
-            );
-        }
-        if self.behind > 0 {
-            let text = format!("↻ {}", self.behind);
-            fact(
-                &mut spans,
-                text.clone(),
-                Span::raw(text),
                 Some("background"),
             );
         }
@@ -2222,7 +2212,7 @@ mod tests {
     }
 
     #[test]
-    fn the_glance_line_says_only_what_runs_and_each_fact_opens_its_view() {
+    fn the_glance_line_says_only_what_failed_and_the_context_and_failures_open_their_view() {
         let quiet = Glance {
             name: "calc".into(),
             ..Glance::default()
@@ -2230,39 +2220,38 @@ mod tests {
         assert_eq!(quiet.line().0.to_string(), " calc");
         let busy = Glance {
             name: "calc".into(),
-            behind: 3,
             failed: 0,
             context: Some(41_000),
             window: None,
         };
         let (line, buttons) = busy.line();
-        let text = line.to_string();
-        assert!(text.starts_with(" calc · ↻ 3 · "), "{text}");
+        assert!(line.to_string().starts_with(" calc · "), "{line}");
+        assert!(buttons.is_empty(), "the context opens nothing");
         let windowed = Glance {
             window: Some(1_000_000),
             ..busy.clone()
         };
         assert!(windowed.line().0.to_string().ends_with(" · 96% left"));
-        let urls: Vec<&str> = buttons.iter().map(|b| b.2.as_str()).collect();
-        assert_eq!(urls, ["sonny:background"]);
         let (failing, failed_buttons) = Glance {
             failed: 2,
             ..busy.clone()
         }
         .line();
+        let text = failing.to_string();
+        assert!(text.starts_with(" calc · ✗ 2 · "), "{text}");
         assert!(
-            failing.to_string().starts_with(" calc · ✗ 2 · ↻ 3 · "),
-            "{failing}"
+            !text.contains('↻'),
+            "what runs in the background goes unsaid"
         );
         assert_eq!(failing.spans[3].style.fg, Some(Color::Red));
-        assert_eq!(failed_buttons.len(), 2);
-        assert!(failed_buttons.iter().all(|b| b.2 == "sonny:background"));
+        let urls: Vec<&str> = failed_buttons.iter().map(|b| b.2.as_str()).collect();
+        assert_eq!(urls, ["sonny:background"]);
         let slice = |(from, to): (u16, u16)| -> String {
             text.chars()
                 .skip(from as usize)
                 .take((to - from) as usize)
                 .collect()
         };
-        assert_eq!(slice((buttons[0].0, buttons[0].1)), "↻ 3");
+        assert_eq!(slice((failed_buttons[0].0, failed_buttons[0].1)), "✗ 2");
     }
 }

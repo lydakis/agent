@@ -4330,9 +4330,9 @@ struct App {
     tasks_all_read: Option<Instant>,
     /// The width the tasks started were drawn at.
     tasks_width: usize,
-    /// How many triggers and subscriptions run for this agent, as the
-    /// footer's `↻` says, and when they were last counted.
-    behind: (usize, Option<Instant>),
+    /// When what runs for this agent in the background was last read, for
+    /// what of it failed.
+    behind_read: Option<Instant>,
     /// How many of what `/background` lists failed since the person last
     /// opened it, as the footer's `✗` says: a count of what is unread, as
     /// a notification badge is, cleared by looking.
@@ -5071,6 +5071,19 @@ impl Fleet {
             })
     }
 
+    /// How many agents wait on the person here that `/status` lists no
+    /// row for: the leads followed and theirs, of other projects, and a
+    /// workflow's workers. Their questions are pinned in this window, so
+    /// its footer counts them beside `/status`'s own.
+    fn waiting_past_status(&self) -> usize {
+        (self.needs.waiting())
+            .filter(|bot| {
+                self.raised.contains(*bot)
+                    || (workflow::worker_project(bot).is_some() && self.below(bot))
+            })
+            .count()
+    }
+
     /// `bot` as this window names it: a task by its short name, another
     /// project's lead by its project, any other bot by its own name.
     fn who(&self, bot: &str) -> String {
@@ -5767,7 +5780,7 @@ impl App {
             turn_model: None,
             pick: 0,
             watch: None,
-            behind: (0, None),
+            behind_read: None,
             failed: 0,
             failures: Default::default(),
             turns: HashMap::new(),
@@ -10670,8 +10683,7 @@ impl App {
     /// turns fires sent ended.
     async fn count_behind(&mut self) {
         if self
-            .behind
-            .1
+            .behind_read
             .is_some_and(|at| at.elapsed() < Duration::from_secs(10))
             || self.options.side.is_some()
         {
@@ -10703,7 +10715,7 @@ impl App {
             items.iter().filter_map(|i| i.handle.as_ref()).collect();
         self.turns.retain(|handle, _| fired.contains(handle));
         items.retain(|item| background::shown(&scope, item));
-        self.behind = (background::count(&items, &self.bot), Some(Instant::now()));
+        self.behind_read = Some(Instant::now());
         self.count_failures(background::failures(&items));
         if let Some(view) = (self.watch.as_mut()).and_then(|w| w.background.as_mut()) {
             view.set_turns(&self.turns);
@@ -11900,7 +11912,6 @@ impl App {
     fn glance(&self) -> margin::Glance {
         margin::Glance {
             name: self.bot.clone(),
-            behind: self.behind.0,
             failed: self.failed,
             context: self.context,
             window: self.window,
@@ -15003,14 +15014,15 @@ impl App {
     /// What this window's tab says of its agent, from what the window
     /// holds now, so the tab can never be left behind by a path that forgot
     /// to say: a call waiting on the person's approval here (`blocked`),
-    /// else a question of the agent's own open here (`asking`; its tasks'
-    /// are theirs), else a turn running (`working`), else how its last
-    /// turn ended. An approval or a question answered in another window
-    /// clears here as the daemon says so, and the tab with it.
+    /// else a question open here (`asking`), its own or one pinned from
+    /// its tasks or the leads it follows, as the person answers that here
+    /// too, else a turn running (`working`), else how its last turn ended.
+    /// An approval or a question answered in another window clears here as
+    /// the daemon says so, and the tab with it.
     fn tab_status(&self) -> Option<&'static str> {
         if !self.approvals.is_empty() {
             Some("blocked")
-        } else if self.asks.iter().any(|ask| ask.task.is_none()) {
+        } else if !self.asks.is_empty() {
             Some("asking")
         } else if self.running.is_some() {
             Some("working")
@@ -16218,7 +16230,10 @@ impl App {
         // them, each a mark as its rows draw it with its number: what
         // needs the person, what works, what rests, what is done.
         let counts = self.counts.unwrap_or_default();
-        let (working, waiting) = (counts.working, counts.needs_you);
+        // And those whose questions this window shows that `/status` has
+        // no row for: other projects' agents under the leads it follows.
+        let past = (self.fleet.as_ref()).map_or(0, Fleet::waiting_past_status);
+        let (working, waiting) = (counts.working, counts.needs_you + past);
         // Something new to answer beats the count a few times, reversed,
         // then it holds still (F12).
         let mut pulse = self.needs_pulse.get();
@@ -16273,20 +16288,12 @@ impl App {
             let forms = footer::count("●", Color::Cyan, working, true);
             items.push(Item::new(Slot::Working, forms).opens("status"));
         }
+        // At rest, they may be given work. What is done, and what runs in
+        // the background while healthy, ask nothing of the person: /status
+        // and /background list them.
         if counts.idle > 0 {
-            let forms = footer::count("✓", Color::Green, counts.idle, true);
+            let forms = footer::count(status::IDLE_MARK, Color::Green, counts.idle, true);
             items.push(Item::new(Slot::Idle, forms).opens("status"));
-        }
-        if counts.done > 0 {
-            let n = counts.done;
-            let forms = vec![vec![Span::raw(format!("✓ {n}")).dim()], Vec::new()];
-            items.push(Item::new(Slot::Done, forms).opens("status"));
-        }
-        // Something runs for it with no one typing: /background lists it.
-        if self.behind.0 > 0 && !glancing {
-            let n = self.behind.0;
-            let forms = vec![vec![Span::raw(format!("↻ {n}")).dim()], Vec::new()];
-            items.push(Item::new(Slot::Background, forms).opens("background"));
         }
         let notes = self.margin.notes().len();
         if notes > 0 && !glancing {
@@ -20958,11 +20965,10 @@ mod tests {
     async fn what_failed_in_the_background_is_red_left_of_what_runs() {
         let client = daemon_with(json!([])).await;
         let mut app = app(client);
-        app.behind = (2, Some(Instant::now()));
         app.failed = 1;
         let line = app.footer_line(140);
         let text = line.to_string();
-        assert!(text.contains("✗ 1  ↻ 2"), "{text}");
+        assert!(text.contains("✗ 1") && !text.contains('↻'), "{text}");
         // The mark red at full strength, the number muted.
         let mark = line.spans.iter().find(|s| s.content == "✗").unwrap();
         assert_eq!(mark.style.fg, Some(Color::Red));
@@ -22511,7 +22517,7 @@ mod tests {
         running.store(false, std::sync::atomic::Ordering::SeqCst);
         app.tasks_read = None;
         app.read_tasks().await;
-        assert_eq!(drawn(&mut app)[1], "  ✓ add  idle  Fix add");
+        assert_eq!(drawn(&mut app)[1], "  ○ add  idle  Fix add");
     }
 
     #[tokio::test]
@@ -22559,11 +22565,11 @@ mod tests {
         start(&mut app, "neg");
         let rows = drawn(&mut app);
         assert_eq!(rows[0], "• Started 2 tasks · click one to open it");
-        assert_eq!(rows[1], "  ○ add  starting  Fix add");
+        assert_eq!(rows[1], "  ◌ add  starting  Fix add");
         // What each does is read, and drawn where they are.
         app.read_tasks().await;
         let rows = drawn(&mut app);
-        assert_eq!(rows[1], "  ✓ add  idle     Fix add");
+        assert_eq!(rows[1], "  ○ add  idle     Fix add");
         assert_eq!(rows[2], "  ● neg  working  Fix neg");
         // A task the daemon could not read stays as it was; one it does not
         // have is removed.
@@ -23426,6 +23432,20 @@ mod tests {
         app.rest = Some("done");
         app.tell_status();
         assert_eq!(app.told, Some("done"));
+        // A question pinned here from another project's agent, under a
+        // lead this one follows, is answered here: the tab says so too.
+        let mut forwarded = asks::call(
+            &asks::id(9, "q2"),
+            &json!({"question": "Which region?", "options": [{"label": "eu"}]}),
+        )
+        .unwrap();
+        forwarded.task = Some(asks::Asker {
+            bot: "shop.fix".into(),
+            name: "shop fix".into(),
+        });
+        app.asks.push(forwarded);
+        app.tell_status();
+        assert_eq!(app.told, Some("asking"));
     }
 
     /// The leads a lead follows by name, and theirs in turn, each once:
@@ -24531,6 +24551,34 @@ mod tests {
         assert_eq!(fleet.doing["calc.new"], "idle");
     }
 
+    /// An outer lead's footer counts the questions its window shows from
+    /// other projects' agents, which `/status` has no row for, as it did
+    /// before its counts came from `/status`; and a workflow worker's.
+    #[tokio::test]
+    async fn the_footer_counts_questions_forwarded_from_leads_followed() {
+        let (client, events) = daemon_with_events(json!({}), |_| json!({})).await;
+        let mut fleet = Fleet::in_memory(client.clone(), events, "home", "home.lead");
+        fleet.raised.insert("shop.fix".into());
+        let ask = |bot: &str| {
+            json!({"event": "tool_started", "bot": bot, "turn": 3,
+                "data": {"name": "ask", "call_id": "q1"}})
+        };
+        fleet.needs.event(&ask("shop.fix"));
+        fleet.needs.event(&ask("home.wf-1a2b3c4d-k1"));
+        // One the person no longer waits on here counts for nothing.
+        fleet.needs.event(&ask("elsewhere.fix"));
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.fleet = Some(fleet);
+        app.counts = Some(status::Counts {
+            needs_you: 1,
+            idle: 2,
+            ..Default::default()
+        });
+        let text = app.footer(100).0.to_string();
+        assert!(text.contains("? 3  ○ 2"), "{text}");
+    }
+
     #[tokio::test]
     async fn the_footer_counts_what_needs_the_person_and_a_click_opens_status() {
         use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -24539,7 +24587,8 @@ mod tests {
         // Nothing counted before the agents were.
         let (line, opens) = app.footer(100);
         assert!(opens.is_empty() && !line.to_string().contains('●'));
-        // The four counts /status heads its page with, marks only.
+        // The counts /status heads its page with that ask something of
+        // the person or may: marks only, and done left to /status.
         app.counts = Some(status::Counts {
             needs_you: 2,
             working: 3,
@@ -24562,33 +24611,31 @@ mod tests {
             [
                 ("? 2".to_owned(), "status"),
                 ("● 3".to_owned(), "status"),
-                ("✓ 13".to_owned(), "status"),
-                ("✓ 4".to_owned(), "status"),
+                ("○ 13".to_owned(), "status"),
             ]
         );
         // The agent's name is the composer's to say, not the footer's.
-        assert!(text.ends_with("  ? 2  ● 3  ✓ 13  ✓ 4  "), "{text}");
+        assert!(text.ends_with("  ? 2  ● 3  ○ 13  "), "{text}");
         assert!(!text.contains(&app.bot), "{text}");
         assert_eq!(text.width(), 100);
-        // Narrow, done goes first, then idle; what needs the person stays.
-        let narrow = app.footer(44).0.to_string();
+        // Narrow, idle goes first; what needs the person stays.
+        let narrow = app.footer(30).0.to_string();
         assert!(
-            narrow.contains("? 2") && !narrow.contains("✓ 4"),
+            narrow.contains("? 2") && !narrow.contains("○ 13"),
             "{narrow}"
         );
         let counter = opens[0].0.clone();
         // Its marks and colors as /status's rows: yellow ? for what needs
-        // the person, cyan ● at work, green ✓ at rest, and done dim.
+        // the person, cyan ● at work, green ○ at rest; no ✓, as done
+        // asks nothing.
         let marks: Vec<_> = (line.spans.iter())
-            .filter(|span| ["?", "●", "✓"].contains(&&*span.content))
+            .filter(|span| ["?", "●", "○", "✓"].contains(&&*span.content))
             .map(|span| span.style.fg)
             .collect();
         assert_eq!(
             marks,
             [Some(Color::Yellow), Some(Color::Cyan), Some(Color::Green)]
         );
-        let done = (line.spans.iter()).find(|span| span.content == "✓ 4");
-        assert!(done.is_some_and(|span| span.style.add_modifier.contains(Modifier::DIM)));
         app.opens_at = vec![(
             20,
             10 + counter.start..10 + counter.end,
@@ -24937,21 +24984,14 @@ mod tests {
         app.place = place::Place {
             branch: Some("main".into()),
         };
-        let ask = asks::call(
-            "c1",
-            &json!({"question": "Merge?", "options": [
-            {"label": "Yes", "explanation": "e"}, {"label": "No", "explanation": "e"}]}),
-        );
-        app.asks = vec![ask.unwrap()];
-        let task = |name: &str| started::Task {
-            bot: format!("agent.{name}"),
-            name: name.into(),
-            brief: "b".into(),
-            state: "working".into(),
-        };
-        app.tasks.insert(0, vec![task("cart"), task("docs")]);
+        // The project's agents as /status counts them: done is not shown.
+        app.counts = Some(status::Counts {
+            needs_you: 1,
+            working: 2,
+            idle: 3,
+            done: 4,
+        });
         app.failed = 1;
-        app.behind = (3, Some(Instant::now()));
         for id in ["findings", "repro"] {
             let post = json!({"id": id, "title": id, "markdown": "x"});
             app.margin.apply(id, &post, None, None);

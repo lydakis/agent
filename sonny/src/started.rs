@@ -59,13 +59,13 @@ pub fn settled(state: &str) -> bool {
 /// A state's mark and its color.
 fn sign(state: &str) -> Span<'static> {
     match state {
-        IDLE => Span::raw("✓").fg(Color::Green),
+        IDLE => Span::raw(crate::status::IDLE_MARK).fg(Color::Green),
         DONE => Span::raw("✓").dim(),
         QUIET => Span::raw("✓").dim(),
         "failed" => Span::raw("✗").fg(Color::Red),
         "needs you" => Span::raw("?").fg(Color::Yellow).bold(),
         "stopped" | "removed" => Span::raw("■").dim(),
-        "starting" => Span::raw("○").dim(),
+        "starting" => Span::raw("◌").dim(),
         _ => Span::raw("●").fg(Color::Cyan),
     }
 }
