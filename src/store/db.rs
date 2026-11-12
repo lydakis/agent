@@ -2199,11 +2199,12 @@ const TURN_VIEW: &str = "m.id,m.bot,b.id,m.request_id,COALESCE(t.status,m.status
     json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
     json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
     json_extract(t.waiting,'$.halt'),json_extract(t.waiting,'$.load'),
-    json_extract(t.waiting,'$.blocked'),m.held,m.due_ms,COALESCE(t.work,0),t.limited,m.turn";
+    json_extract(t.waiting,'$.blocked'),m.held,m.due_ms,COALESCE(t.work,0),t.limited,m.turn,
+    t.error";
 /// Where `TURN_VIEW` reads: the message, its bot, and the turn it opened.
 const MESSAGE_FROM: &str = "messages m JOIN bots b ON b.name=m.bot LEFT JOIN turns t ON t.id=m.id";
 /// Columns `TURN_VIEW` takes, for queries that select more after it.
-const TURN_VIEW_COLUMNS: usize = 27;
+const TURN_VIEW_COLUMNS: usize = 28;
 /// A message's words, from `messages m` joined by `MESSAGE_NODE`: kept on
 /// the message, or once 4 KiB or more were taken in, read from its node.
 const MESSAGE_TEXT: &str = "CASE WHEN n.id IS NULL THEN m.text
@@ -2300,6 +2301,16 @@ fn turn_view(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     // limit, and keeps it only if it completes.
     if let Some(limit) = r.get::<_, Option<String>>(25)? {
         view["limit"] = json!(limit);
+    }
+    // A turn that failed says how: its error and detail, and the facts
+    // beside them, under the view's own names where they meet.
+    if let Some(failure) = r.get::<_, Option<String>>(27)?
+        && let Ok(Value::Object(failure)) = serde_json::from_str::<Value>(&failure)
+        && let Some(view) = view.as_object_mut()
+    {
+        for (key, value) in failure {
+            view.entry(key).or_insert(value);
+        }
     }
     Ok(view)
 }
@@ -2538,7 +2549,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 92;
+    pub const SCHEMA: i32 = 93;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -2771,7 +2782,8 @@ impl Database {
                 started_ms INTEGER NOT NULL, finished_ms INTEGER,
                 retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
                 summary_ms INTEGER NOT NULL DEFAULT 0, reply_node INTEGER,
-                work INTEGER NOT NULL DEFAULT 0, limited TEXT, drops INTEGER NOT NULL DEFAULT 0);
+                work INTEGER NOT NULL DEFAULT 0, limited TEXT, drops INTEGER NOT NULL DEFAULT 0,
+                error TEXT);
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started_ms ON turns(started_ms);
             CREATE TABLE IF NOT EXISTS turn_models(turn INTEGER NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
@@ -10615,9 +10627,14 @@ impl Database {
         let bot = self.active(turn)?;
         let waiting = self.waiting(turn)?;
         let code = error.map(|e| e.code.as_str());
+        // A request declined before the model wrote anything was declined
+        // for what it sent; one declined partway through its answer, for
+        // what the model was writing, so what it sent stays as it is.
+        let declined = code == Some("provider_refusal")
+            && !error.is_some_and(crate::provider::refused_mid_stream);
         // Messages that joined a request a safety classifier declined go
         // back in line, before the turn ends, so the next one takes them.
-        let requeued = match code == Some("provider_refusal") {
+        let requeued = match declined {
             true => self.requeue_declined(&bot, turn, error)?,
             false => Vec::new(),
         };
@@ -10711,31 +10728,15 @@ impl Database {
         } else {
             "completed"
         };
-        // The message it ended on is kept on the row, so a quote of the
-        // reply, and a `prompts` read of the turn after, find it once
-        // retention has dropped the turn's events.
-        // One that completed on a call a limit sent without tool calls ended
-        // at that limit, not failing; one that did not keeps no limit.
-        let finished = epoch_ms();
-        let mut started: Option<i64> = None;
-        let limit: Option<String> = tx
-            .prepare_cached(&format!(
-                "UPDATE turns SET status=?1,finished_ms=?2,reply_node={REPLY_NODE},
-                    limited=CASE WHEN ?1='completed' THEN limited END
-                  WHERE id=?3 RETURNING limited,started_ms"
-            ))?
-            .query_row(params![status, finished, turn], |r| {
-                started = r.get(1)?;
-                r.get(0)
-            })?;
-        // A request a safety classifier declined, and the bot's fallback
-        // too: what it added since the model last answered goes to later
-        // requests as notes in its place, since Anthropic says to remove it
-        // before going on; a message that went back in line says so. Each
+        // A request a safety classifier declined before the model began
+        // its answer, and the bot's fallback too: what it added since the
+        // model last answered goes to later requests as notes in its place,
+        // since Anthropic says to remove it before going on; a message that
+        // went back in line says so. Each
         // note is the size of what it replaces, so nothing counted for the
         // context changes, and the originals are kept beside them.
         let mut left_out = 0;
-        if code == Some("provider_refusal") {
+        if declined {
             let category = (error.and_then(|e| e.facts.as_ref()))
                 .and_then(|facts| facts.get("category"))
                 .and_then(Value::as_str);
@@ -10785,6 +10786,32 @@ impl Database {
                 }
             }
         }
+        let failure = error.map(|error| {
+            let mut failure = json!({"error":error.code,"detail":error.detail});
+            with_facts(&mut failure, Some(error));
+            if left_out > 0 {
+                failure["left_out"] = json!(left_out);
+            }
+            failure.to_string()
+        });
+        // The message it ended on is kept on the row, so a quote of the
+        // reply, and a `prompts` read of the turn after, find it once
+        // retention has dropped the turn's events; so is how it failed,
+        // its error, detail and facts, for `turns` and `wait` to show.
+        // One that completed on a call a limit sent without tool calls ended
+        // at that limit, not failing; one that did not keeps no limit.
+        let finished = epoch_ms();
+        let mut started: Option<i64> = None;
+        let limit: Option<String> = tx
+            .prepare_cached(&format!(
+                "UPDATE turns SET status=?1,finished_ms=?2,reply_node={REPLY_NODE},
+                    limited=CASE WHEN ?1='completed' THEN limited END,error=?4
+                  WHERE id=?3 RETURNING limited,started_ms"
+            ))?
+            .query_row(params![status, finished, turn, failure], |r| {
+                started = r.get(1)?;
+                r.get(0)
+            })?;
         // An expiring bot's clock starts again from this turn's end. It
         // says how its newest turn ended: this one, or a later message that
         // failed in line while this one ran.
@@ -16919,6 +16946,20 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         migrate_messages(conn)?;
     }
 
+    // Schema 93: a turn that failed keeps how on its row, its error, detail
+    // and facts as its `turn_finished` said. Earlier turns keep none: their
+    // events say it while retention keeps them.
+    if from < 93 {
+        let has: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='error')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has {
+            conn.execute_batch("ALTER TABLE turns ADD COLUMN error TEXT;")?;
+        }
+    }
+
     Ok(())
 }
 /// 91 -> 92: every turns row becomes a message with its number; the rows
@@ -17198,7 +17239,7 @@ fn migrate_bot_status(conn: &Connection) -> Result<()> {
             json_extract(t.waiting,'$.handles'),json_extract(t.waiting,'$.any'),
             json_extract(t.waiting,'$.deadline_ms'),json_extract(t.waiting,'$.answer'),
             json_extract(t.waiting,'$.halt'),json_extract(t.waiting,'$.load'),
-            json_extract(t.waiting,'$.blocked'),t.held,t.due_ms,0,NULL,t.id
+            json_extract(t.waiting,'$.blocked'),t.held,t.due_ms,0,NULL,t.id,NULL
          FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=?",
     )?;
     let mut update = conn.prepare("UPDATE bots SET waiting_on=? WHERE name=?")?;

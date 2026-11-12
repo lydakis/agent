@@ -964,6 +964,9 @@ pub struct Configuration {
     /// The tiers faster than standard the person says models serve, by
     /// model path, over the built-in catalog.
     pub speeds: Arc<agent_runtime::provider::Speeds>,
+    /// The model a declined request goes to, by the declined model's path,
+    /// for a bot that names none of its own.
+    pub fallbacks: Arc<agent_runtime::provider::Fallbacks>,
     /// Discovery's model catalog (`~/.agent/models.discovered`),
     /// rewritten from the providers' listings each time the daemon starts;
     /// none leaves it be.
@@ -1383,6 +1386,8 @@ struct Service {
     companions: companions::Companions,
     transport: Arc<Transport>,
     providers: Arc<HashMap<String, Provider>>,
+    /// The person's fallbacks by model, for bots that name none.
+    fallbacks: Arc<agent_runtime::provider::Fallbacks>,
     /// How providers are bound again when their config file changes.
     reload: Option<Box<reload::Reload>>,
     registry: Registry,
@@ -1978,6 +1983,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         "tools":registry.names(),"providers":bindings,
         "context_windows":config.context_windows.json(),
         "speeds":config.speeds.json(),
+        "fallbacks":config.fallbacks.json(),
         "durability":"sqlite_full","partial_text_durable":false});
     let mut sessions: HashMap<u64, Output> = HashMap::new();
     // The sandboxed bot each session on a bot's own socket answers as.
@@ -2100,6 +2106,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         identity,
         transport,
         providers: Arc::new(providers),
+        fallbacks: config.fallbacks.clone(),
         reload,
         registry,
         hub,
@@ -3681,6 +3688,7 @@ impl Service {
             store: self.store.clone(),
             identity: self.identity,
             providers: self.providers.clone(),
+            fallbacks: self.fallbacks.clone(),
             registry: self.registry.clone(),
             hub: self.hub.clone(),
             handles: self.handles.clone(),
@@ -6603,6 +6611,7 @@ mod tests {
             identity: 0,
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
+            fallbacks: Default::default(),
             reload: None,
             registry: Registry::new("wait").unwrap(),
             hub: Hub::default(),
@@ -6819,6 +6828,7 @@ mod tests {
             identity: 0,
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
+            fallbacks: Default::default(),
             reload: None,
             registry: Registry::new("wait").unwrap(),
             hub: Hub::default(),
@@ -7128,6 +7138,7 @@ mod tests {
             ),
             transport,
             providers: Arc::new(HashMap::from([("openai".to_owned(), provider)])),
+            fallbacks: Default::default(),
             reload: None,
             registry,
             hub: Hub::default(),
@@ -7383,6 +7394,7 @@ mod tests {
             ),
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
+            fallbacks: Default::default(),
             reload: None,
             registry: Registry::new("echo").unwrap(),
             hub: Hub::default(),

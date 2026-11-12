@@ -1279,7 +1279,7 @@ impl Attempt {
                 "declare": crate::declared::tools(crate::served::Role::WORKER),
                 "created_by": plan.caller, "created_by_id": plan.caller_id,
                 "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
-                "fallback": config.fallbacks.get(&model), "settings": settings,
+                "settings": settings,
                 "request_id": request});
             if let Err(error) = self.client.request("create", create).await {
                 if lost(&error) {

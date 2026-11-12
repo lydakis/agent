@@ -1211,6 +1211,9 @@ fn spawn_daemon(
             .arg("--speeds")
             .arg(format!("{pattern}={}", tiers.join(",")));
     }
+    for (pattern, model) in &file.fallbacks {
+        command.arg("--fallbacks").arg(format!("{pattern}={model}"));
+    }
     // Where the providers came from, so an edit there applies live.
     if let Some(file) = agent_client::config::path().filter(|_| options.providers_from_config) {
         command.arg("--provider-config").arg(file);
@@ -1939,11 +1942,9 @@ fn run(options: &Options) -> Result<i32> {
                 "a new bot needs a model: pass --model PROVIDER/MODEL, set AGENT_MODEL, or set model in ~/.agent/config.toml",
             ))?,
         };
-        // --fallback, else the person's for its model.
-        let fallback = match &options.fallback {
-            Some(fallback) => Some(fallback.clone()),
-            None => config()?.fallbacks.remove(&model),
-        };
+        // --fallback, else none: the daemon gives the person's for its
+        // model, also to a bot made before the entry was.
+        let fallback = options.fallback.clone();
         let instructions = composed_instructions(options, workspace, role.as_ref())?;
         let (created_by, created_by_id) = made_by(options, &mut connection)?;
         // --tools, else the role's, else the default set for its model.

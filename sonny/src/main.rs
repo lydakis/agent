@@ -2804,9 +2804,6 @@ pub(crate) fn made(
         settings.insert("rules".into(), json!(rules));
     }
     asked["settings"] = Value::Object(settings);
-    if let Some(fallback) = config.fallbacks.get(model) {
-        asked["fallback"] = json!(fallback);
-    }
     let tools: Vec<String> = tools.into_iter().map(String::from).collect();
     let tools = approvals::gateable(&tools, &declare);
     if let Value::Object(fields) = asked {

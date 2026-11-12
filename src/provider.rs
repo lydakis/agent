@@ -69,6 +69,24 @@ pub(crate) fn cut_short(detail: &str, output_tokens: u64, writing: Option<String
     Error::with("provider_incomplete", detail).facts(facts)
 }
 
+/// How far a declined request's answer had got: `mid_stream` once the
+/// model began a block or item of it, and `written_tokens`, the output the
+/// provider counted (not `output_tokens`, which a turn's own view counts).
+pub(crate) fn refused_at(
+    facts: &mut serde_json::Map<String, Value>,
+    begun: bool,
+    written_tokens: u64,
+) {
+    facts.insert("mid_stream".into(), json!(begun));
+    facts.insert("written_tokens".into(), json!(written_tokens));
+}
+
+/// Whether a declined request's answer had begun.
+pub fn refused_mid_stream(error: &Error) -> bool {
+    error.code == "provider_refusal"
+        && (error.facts.as_ref()).is_some_and(|facts| facts.get("mid_stream") == Some(&json!(true)))
+}
+
 /// Whether a reply was cut short by the model's own output cap, which a turn
 /// drops and goes on past.
 pub fn was_cut_short(error: &Error) -> bool {
@@ -1385,6 +1403,9 @@ impl Provider {
             }
         };
         drop(admission);
+        // The provider's name for this request, which its support asks
+        // for: kept with any failure it ends in.
+        let request_id = request_id(response.headers());
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let headers = response.headers().clone();
@@ -1431,13 +1452,16 @@ impl Provider {
             } else {
                 format!("provider_http_{status}")
             };
-            return Err(waits(
-                Error {
-                    code,
-                    detail: body.detail,
-                    facts: None,
-                },
-                &headers,
+            return Err(with_request(
+                waits(
+                    Error {
+                        code,
+                        detail: body.detail,
+                        facts: None,
+                    },
+                    &headers,
+                ),
+                request_id.as_ref(),
             ));
         }
         reservation.learn(response.headers(), limits);
@@ -1577,7 +1601,7 @@ impl Provider {
                 error.detail.as_deref().and_then(pace::named_delay),
             );
         }
-        result?;
+        result.map_err(|error| with_request(error, request_id.as_ref()))?;
         // Only a completed stream ends a refusal streak: a 200 can still end
         // in an in-stream rate limit.
         parser
@@ -1592,6 +1616,7 @@ impl Provider {
                     );
                 }
             })
+            .map_err(|error| with_request(error, request_id.as_ref()))
     }
 }
 
@@ -1837,6 +1862,30 @@ pub(crate) fn waits(mut error: Error, headers: &reqwest::header::HeaderMap) -> E
     error
 }
 
+/// The id a provider gives the request in its response's headers:
+/// Anthropic's `request-id`, OpenAI's `x-request-id`, Bedrock's
+/// `x-amzn-requestid`. Its value shares the response's buffer, so keeping
+/// it costs no copy until a failure names it.
+fn request_id(headers: &reqwest::header::HeaderMap) -> Option<reqwest::header::HeaderValue> {
+    ["request-id", "x-request-id", "x-amzn-requestid"]
+        .into_iter()
+        .find_map(|name| headers.get(name))
+        .cloned()
+}
+
+/// `error` with the provider's id for the request that ended in it, as
+/// Codex keeps `upstream_request_id`: the fact a support case asks for.
+/// Not `request_id`, which is a client's key for its submission.
+fn with_request(mut error: Error, id: Option<&reqwest::header::HeaderValue>) -> Error {
+    if let Some(id) = id.and_then(|id| id.to_str().ok()) {
+        error
+            .facts
+            .get_or_insert_default()
+            .insert("provider_request_id".into(), json!(id));
+    }
+    error
+}
+
 /// Whether a paced refusal is an overload rather than a rate limit.
 pub fn overload(code: &str) -> bool {
     matches!(code, "provider_overloaded" | "provider_http_529")
@@ -1963,6 +2012,12 @@ pub type Windows = ByModel<u64>;
 /// built-in catalog does not name, or to take a tier from one that does.
 pub type Speeds = ByModel<Tiers>;
 
+/// The model a request a safety classifier declined goes to, by the
+/// declined model's path, for a bot that names none of its own: a person's
+/// `[fallbacks]`, read by the daemon as it starts, so an entry reaches every
+/// bot, also one made before it.
+pub type Fallbacks = ByModel<String>;
+
 /// The least window a pattern may set: the least compaction threshold.
 pub const MIN_WINDOW: u64 = 1024;
 
@@ -2029,6 +2084,37 @@ impl Windows {
         Value::Object(
             (self.0.iter())
                 .map(|(pattern, tokens)| (pattern.clone(), (*tokens).into()))
+                .collect(),
+        )
+    }
+}
+
+impl Fallbacks {
+    /// `PATTERN=PROVIDER/MODEL`, each pattern once.
+    pub fn parse<'a>(specs: impl IntoIterator<Item = &'a str>) -> Result<Self> {
+        Self::parse_with(
+            specs,
+            "--fallbacks",
+            "PROVIDER/MODEL=PROVIDER/MODEL, * and ? wildcards in the first",
+            |model| {
+                let (provider, name) = model.split_once('/')?;
+                (!provider.is_empty() && !name.is_empty() && !model.contains(['*', '?']))
+                    .then(|| model.to_owned())
+            },
+        )
+    }
+    /// The fallback set for `path`, `PROVIDER/MODEL`.
+    pub fn get(&self, path: &str) -> Option<&str> {
+        match self.is_empty() {
+            true => None,
+            false => self.find(path).map(String::as_str),
+        }
+    }
+    /// Each pattern and its fallback, as the daemon announces them.
+    pub fn json(&self) -> Value {
+        Value::Object(
+            (self.0.iter())
+                .map(|(pattern, model)| (pattern.clone(), json!(model)))
                 .collect(),
         )
     }
@@ -3402,6 +3488,80 @@ mod tests {
         }
     }
 
+    /// The provider's id for a request is kept with the failure it ended
+    /// in: a refusal inside a 200's stream, and an HTTP error.
+    #[tokio::test]
+    async fn a_failure_keeps_the_provider_s_request_id() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let replies = [
+                concat!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n",
+                    "request-id: req_011\r\nconnection: close\r\n\r\n",
+                    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":",
+                    "{\"stop_reason\":\"refusal\",\"stop_details\":{\"type\":\"refusal\",",
+                    "\"category\":\"cyber\",\"explanation\":\"Declined.\"}},",
+                    "\"usage\":{\"output_tokens\":0}}\n\n",
+                    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                ),
+                concat!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n",
+                    "request-id: req_012\r\ncontent-length: 60\r\nconnection: close\r\n\r\n",
+                    "{\"type\":\"error\",\"error\":{\"message\":\"bad request body.\"}}",
+                ),
+            ];
+            for reply in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        let provider =
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None).unwrap();
+        let tools = none();
+        let mut errors = Vec::new();
+        for _ in 0..2 {
+            let request = Request {
+                model: "m",
+                instructions: "",
+                reasoning: None,
+                tools: &tools,
+                allow_tool_calls: true,
+                output_schema: None,
+                web_search: false,
+                fallback_credit: None,
+                cache_key: None,
+                items: Items::empty(),
+                chain: None,
+                route: None,
+                sent: None,
+            };
+            let error = provider
+                .complete(request, |_| async { Ok(()) })
+                .await
+                .unwrap_err();
+            errors.push(error);
+        }
+        assert_eq!(errors[0].code, "provider_refusal");
+        assert_eq!(
+            Value::Object(*errors[0].facts.clone().unwrap()),
+            json!({"category":"cyber","explanation":"Declined.","mid_stream":false,
+                "written_tokens":0,"provider_request_id":"req_011"})
+        );
+        assert_eq!(errors[1].code, "provider_http_400");
+        assert_eq!(
+            errors[1].facts.as_ref().unwrap()["provider_request_id"],
+            "req_012"
+        );
+    }
+
     #[test]
     fn an_error_body_keeps_a_top_level_detail() {
         let body = parse_error_body(br#"{"detail":"Unsupported region."}"#, true).unwrap();
@@ -4491,5 +4651,29 @@ mod tests {
             assert_eq!(Speeds::parse([wrong]).unwrap_err().code, "usage", "{wrong}");
         }
         assert!(Speeds::parse(["a/b=fast", "a/b=ultrafast"]).is_err());
+    }
+
+    #[test]
+    fn fallbacks_name_one_model_by_model_path() {
+        let fallbacks = Fallbacks::parse([
+            "anthropic/claude-opus-5*=anthropic/claude-opus-4-8",
+            "a/b=c/d",
+        ])
+        .unwrap();
+        assert_eq!(
+            fallbacks.get("anthropic/claude-opus-5-5"),
+            Some("anthropic/claude-opus-4-8")
+        );
+        assert_eq!(fallbacks.get("a/b"), Some("c/d"));
+        assert_eq!(fallbacks.get("a/c"), None);
+        assert_eq!(fallbacks.json()["a/b"], "c/d");
+        assert_eq!(Fallbacks::default().get("a/b"), None);
+        for wrong in ["a/b=c", "a/b=c/*", "ab=c/d", "a/b", "a/b=/d"] {
+            assert_eq!(
+                Fallbacks::parse([wrong]).unwrap_err().code,
+                "usage",
+                "{wrong}"
+            );
+        }
     }
 }

@@ -382,16 +382,13 @@ fn configured(record: &Value, given: &Given<'_>) -> Option<serde_json::Map<Strin
     {
         return None;
     }
-    let model = format!(
-        "{}/{}",
-        record["provider"].as_str()?,
-        record["model"].as_str()?
-    );
     let mut fields = serde_json::Map::new();
     let mut settings = serde_json::Map::new();
-    let fallback = given.config.fallbacks.get(&model);
-    if record["fallback"].as_str() != fallback.map(String::as_str) {
-        fields.insert("fallback".into(), json!(fallback));
+    // The daemon gives every agent that names no fallback the person's
+    // `[fallbacks]` entry for its model, so none of Sonny's names its own:
+    // one an older Sonny copied in goes, and the entry reaches it again.
+    if !record["fallback"].is_null() {
+        fields.insert("fallback".into(), Value::Null);
     }
     let hidden = record["settings"]["hide_senders"]
         .as_bool()
@@ -477,19 +474,21 @@ mod tests {
             configured(&agent(Value::Null, false), &given(&config)),
             None
         );
+        // The daemon gives the config's fallback, so the agent keeps none.
         config
             .fallbacks
             .insert("anthropic/claude".into(), "anthropic/other".into());
         config.hide_senders = true;
         assert_eq!(
             configured(&agent(Value::Null, false), &given(&config)).map(Value::Object),
-            Some(json!({"fallback": "anthropic/other", "settings": {"hide_senders": true}}))
+            Some(json!({"settings": {"hide_senders": true}}))
         );
+        assert_eq!(configured(&agent(Value::Null, true), &given(&config)), None);
+        // One an older Sonny copied in goes, whatever the config says.
         assert_eq!(
-            configured(&agent(json!("anthropic/other"), true), &given(&config)),
-            None
+            configured(&agent(json!("anthropic/other"), true), &given(&config)).map(Value::Object),
+            Some(json!({"fallback": null}))
         );
-        // Taken out of the config, it goes from the agent too.
         let config = agent_client::config::Config::default();
         assert_eq!(
             configured(&agent(json!("anthropic/other"), true), &given(&config)).map(Value::Object),
@@ -499,21 +498,19 @@ mod tests {
         // file that takes it back asks again, and one that matches it
         // asks nothing.
         let mut busy = agent(Value::Null, false);
-        busy["configure_pending"] =
-            json!({"fallback": "anthropic/other", "settings": {"hide_senders": true}});
+        busy["configure_pending"] = json!({"settings": {"hide_senders": true}});
         assert_eq!(
             configured(&busy, &given(&config)).map(Value::Object),
-            Some(json!({"fallback": null, "settings": {"hide_senders": null}}))
+            Some(json!({"settings": {"hide_senders": null}}))
         );
-        let mut config = agent_client::config::Config::default();
-        config
-            .fallbacks
-            .insert("anthropic/claude".into(), "anthropic/other".into());
-        config.hide_senders = true;
+        let mut config = agent_client::config::Config {
+            hide_senders: true,
+            ..Default::default()
+        };
         assert_eq!(configured(&busy, &given(&config)), None);
         // A hold reset kept for the turn's end, and then a hold of its own
         // in the file: the file's goes over the reset.
-        let mut held = agent(json!("anthropic/other"), true);
+        let mut held = agent(Value::Null, true);
         held["settings"]["hold_ms"] = json!(agent_client::HOLD_MS);
         held["configure_pending"] = json!({"settings": {"hold_ms": null}});
         config.hold_ms = Some(5);

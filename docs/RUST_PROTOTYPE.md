@@ -422,6 +422,12 @@ A turn reads the same wherever a client meets it. Its view is `bot`,
 `bot_id`, `turn`, `handle`, `request_id`, `status`, `waiting_on`,
 `input_tokens`, `cached_input_tokens`, `output_tokens`, `model_rounds`,
 `retries`, `paced_ms`, `started_ms` and `finished_ms`, all from the turn's row.
+A turn that failed or was interrupted also carries how, from its row (schema
+93): `error`, `detail` and the facts its `turn_finished` named beside them,
+such as a refusal's `category`, `explanation`, `provider_request_id`,
+`mid_stream`, `written_tokens`, `fallback` and `left_out`, each under the
+view's own name where the two meet, so `turns` shows it after retention drops
+the turn's events.
 `waiting_on` is what a parked turn waits for, as its `turn_waiting` or
 `turn_paced` event said (`call_id` and `approval`, `load` or `handles`, or
 `resume_at_ms`, null with `paused: true` for a turn the pull cord parked), and
@@ -891,9 +897,16 @@ same body, and only that request: the next goes to the bot's own model again,
 with the fallback's answer in its history. Other bots end the turn with
 `provider_refusal` as before, and so does a refusal the fallback repeats. It
 is a bot's choice because a fallback answers with a model the caller did not
-pick and bills at that model's rate. A client may name one for each model:
-the CLI and Sonny give a new bot that names none the person's entry for its
-model from `[fallbacks]` in `~/.agent/config.toml`.
+pick and bills at that model's rate. A bot that names none takes the
+daemon's: `serve --fallbacks PATTERN=PROVIDER/MODEL`, repeatable, by the
+turn's `PROVIDER/MODEL` path with `*` and `?` wildcards, the most specific
+pattern winning, as `--speeds` reads them, announced in `ready` as
+`fallbacks`. Clients pass the person's `[fallbacks]` from
+`~/.agent/config.toml`, so an entry reaches every bot, also one made before
+it, once the daemon starts again; neither the CLI nor Sonny copies one into a
+bot (Sonny takes back one an older Sonny copied in). A turn that ends in
+`provider_refusal` names the model the request was sent to again as
+`fallback`, or null when none was.
 
 The retry is published as a `retry` event with the refusal as its error and
 `fallback` naming the model, and the answer as a non-durable `model_fallback`
@@ -924,14 +937,28 @@ The protocol described here is from Anthropic's documentation, read
 and [Handle streaming refusals](https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/handle-streaming-refusals),
 which lists Bedrock. A refusal may follow partial output, which is discarded;
 its `stop_details` names a `category` (kept in the error's detail and facts)
-and may name a recommended model and a credit. The fallback's thinking blocks
+and an `explanation` (a fact, bounded as a detail is), and may name a
+recommended model and a credit. Every refusal says how far the answer got:
+`mid_stream`, whether the model had begun a block of it, and
+`written_tokens`, the output tokens the provider counted for it (not
+`output_tokens`, the turn's own count). Any failure that came with a
+response keeps the provider's id for the request as `provider_request_id`
+(Anthropic's `request-id`, OpenAI's `x-request-id`, Bedrock's
+`x-amzn-requestid` header; not `request_id`, the client's key), as Codex
+keeps `upstream_request_id`: the id a support case asks for. OpenAI's
+`cyber_policy` failure, which Codex ends the turn on (`CyberPolicy`), is a
+`provider_refusal` too, detail `category cyber`, its message the
+`explanation`; a model's own `refusal` content is one with its words. The fallback's thinking blocks
 are dropped by the API when the bot's model reads them back
 (`input_transformations` reason `model_binding_mismatch`), which is not
 counted as a binding drop; only `prefix_binding_mismatch` is. A live refusal
 was not reproduced, so the fallback path is covered by parser and
 synthetic-endpoint tests.
 
-A turn that ends with `provider_refusal` leaves what the declined request
+A request declined partway through the model's answer (`mid_stream`) was
+declined for what the model was writing, not for what was sent: a turn that
+ends so leaves its context as it is. A turn that ends with `provider_refusal`
+before the answer began leaves what the declined request
 added since the model last answered (the prompt, when it was the turn's first
 request, or the latest tool results and any steer) out of later requests, as
 Anthropic's [streaming refusals](https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/handle-streaming-refusals)

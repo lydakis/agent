@@ -264,6 +264,12 @@ impl State {
                             self.refusal.insert(key.to_owned(), json!(value));
                         }
                     }
+                    // The provider's words on why, for the person reading
+                    // the failure; bounded as a detail is.
+                    if let Some(why) = details["explanation"].as_str() {
+                        let why = crate::output::bounded(why.to_owned());
+                        self.refusal.insert("explanation".into(), json!(why));
+                    }
                 }
                 // Sent again after a server-side fallback.
                 self.dropped(&event["input_transformations"]);
@@ -398,10 +404,12 @@ impl State {
                     true => Error::new("provider_refusal"),
                     false => Error::with("provider_refusal", parts.join("; ")),
                 };
-                return Err(match self.refusal.is_empty() {
-                    true => error,
-                    false => error.facts(Value::Object(self.refusal)),
-                });
+                // Whether the model had begun its answer, which a classifier
+                // reading what it writes declines partway through.
+                let begun = (self.blocks.iter()).any(|block| !matches!(block, Block::Fallback(_)));
+                let mut refusal = self.refusal;
+                super::refused_at(&mut refusal, begun, self.usage.output_tokens);
+                return Err(error.facts(Value::Object(refusal)));
             }
             other => {
                 return fail_with(
@@ -760,7 +768,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(error.facts.unwrap()).unwrap(),
-            json!({"category":"cyber"})
+            json!({"category":"cyber","mid_stream":false,"written_tokens":0})
         );
         // The credit for a retry elsewhere is a fact, not part of the detail.
         let mut state = State::default();
@@ -775,9 +783,10 @@ mod tests {
         assert_eq!(error.detail.as_deref(), Some("category cyber"));
         assert_eq!(
             serde_json::to_value(error.facts.unwrap()).unwrap(),
-            json!({"category":"cyber","fallback_credit_token":"credit"})
+            json!({"category":"cyber","fallback_credit_token":"credit","mid_stream":false,
+                "written_tokens":0})
         );
-        // A refusal naming nothing has no facts.
+        // A refusal naming nothing says only how far the answer got.
         let mut state = State::default();
         feed(
             &mut state,
@@ -787,8 +796,25 @@ mod tests {
             ],
         );
         let error = state.finish().unwrap_err();
-        assert_eq!((error.detail, error.facts), (None, None));
-        // A chain that switched models and still declined names the switch.
+        assert_eq!(error.detail, None);
+        assert_eq!(
+            serde_json::to_value(error.facts.unwrap()).unwrap(),
+            json!({"mid_stream":false,"written_tokens":0})
+        );
+        // A chain that switched models and still declined names the switch;
+        // the switch alone is not output.
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-opus-4-8"}}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber"}},"usage":{"output_tokens":0}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        assert!(!super::super::refused_mid_stream(
+            &state.finish().unwrap_err()
+        ));
         let mut state = State::default();
         feed(
             &mut state,
@@ -801,6 +827,31 @@ mod tests {
         assert_eq!(
             state.finish().unwrap_err().detail.as_deref(),
             Some("fell back to claude-opus-4-8; category cyber")
+        );
+    }
+    #[test]
+    fn a_refusal_partway_through_the_answer_says_so_with_the_provider_s_words() {
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":9}}}"#,
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Earlier I"}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"reasoning_extraction","explanation":"The response was declined."}},"usage":{"output_tokens":412}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        let error = state.finish().unwrap_err();
+        assert!(super::super::refused_mid_stream(&error));
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("category reasoning_extraction")
+        );
+        assert_eq!(
+            serde_json::to_value(error.facts.unwrap()).unwrap(),
+            json!({"category":"reasoning_extraction","explanation":"The response was declined.",
+                "mid_stream":true,"written_tokens":412})
         );
     }
     #[test]

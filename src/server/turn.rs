@@ -195,6 +195,8 @@ pub struct Turn {
     /// The store's identity, for provider cache keys.
     pub identity: u128,
     pub providers: Arc<HashMap<String, Provider>>,
+    /// The person's fallbacks by model, for a bot that names none.
+    pub fallbacks: Arc<agent_runtime::provider::Fallbacks>,
     pub registry: Registry,
     pub hub: Hub,
     pub handles: Handles,
@@ -2704,6 +2706,11 @@ impl Turn {
         let (bot, turn) = (self.bot.clone(), self.turn);
         let mut record = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
         let context = self.store.op("context", move |db| db.context(turn)).await?;
+        // A bot that names no fallback takes the person's for this turn's
+        // model, as the daemon was started with.
+        if record.fallback.is_none() {
+            record.fallback = self.fallbacks.get(&context.model).map(str::to_owned);
+        }
         self.settings
             .get_or_init(|| self.with_one_lifetime(&record, &context.model));
         {
@@ -4084,6 +4091,14 @@ impl Turn {
                     accounting.call_fallback = fallback.as_ref().map(Fallback::parked);
                     accounting.hold(&error, record.settings.hold_ms());
                     return Ok(None);
+                }
+                // A refusal says the model it was sent to again, or none.
+                let mut error = error;
+                if error.code == "provider_refusal" {
+                    let tried = fallback
+                        .as_ref()
+                        .map(|to| format!("{}/{}", to.name, to.model));
+                    (error.facts.get_or_insert_default()).insert("fallback".into(), json!(tried));
                 }
                 return Err(error);
             }
@@ -7675,6 +7690,7 @@ mod tests {
             bot: "Bob".into(),
             turn,
             store: store.clone(),
+            fallbacks: Default::default(),
             providers: Arc::new(HashMap::from([(
                 "openai".into(),
                 Provider::new(
@@ -7862,6 +7878,7 @@ mod tests {
             bot: "Bob".into(),
             turn,
             store: store.clone(),
+            fallbacks: Default::default(),
             providers: Arc::new(HashMap::from([(
                 "openai".into(),
                 Provider::new(
@@ -8030,6 +8047,7 @@ mod tests {
             turn,
             store: store.clone(),
             providers: Arc::default(),
+            fallbacks: Default::default(),
             registry: registry.clone(),
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),
