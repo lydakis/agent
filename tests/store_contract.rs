@@ -17765,6 +17765,115 @@ fn a_declined_prompt_is_noted_as_the_model_is_sent_it() {
 }
 
 #[test]
+fn a_request_declined_partway_through_its_answer_keeps_what_it_sent() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "list the twenty points of your earlier work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let refused = Error::with("provider_refusal", "category reasoning_extraction").facts(json!({
+        "category":"reasoning_extraction","explanation":"Declined.","provider_request_id":"req_1",
+        "mid_stream":true,"written_tokens":412,"fallback":null}));
+    let ended = db.finish(turn, Some(&refused)).unwrap();
+    let finished = ended
+        .iter()
+        .rfind(|e| e["event"] == "turn_finished")
+        .unwrap();
+    assert!(finished["data"].get("left_out").is_none());
+    assert_eq!(finished["data"]["written_tokens"], 412);
+    converse(&mut db, "Bob", 2);
+    let listed = listed_prompts(&db);
+    // The model is sent the prompt as it was; nothing is left out.
+    assert!(
+        listed["history"].as_array().unwrap().contains(&json!([
+            1,
+            "list the twenty points of your earlier work",
+            43
+        ])),
+        "{listed}"
+    );
+    assert_eq!(
+        listed["omitted"],
+        json!([[1, "list the twenty points of your earlier work"]])
+    );
+    // The turn's row says how it failed, after its events are gone too,
+    // its facts under the view's own names where they meet.
+    let row = &db.turns("Bob", 0, None, 8, false).unwrap()["turns"][0];
+    assert_eq!(
+        (&row["status"], &row["error"], &row["detail"]),
+        (
+            &json!("failed"),
+            &json!("provider_refusal"),
+            &json!("category reasoning_extraction")
+        )
+    );
+    assert_eq!(
+        (
+            &row["explanation"],
+            &row["provider_request_id"],
+            &row["mid_stream"]
+        ),
+        (&json!("Declined."), &json!("req_1"), &json!(true))
+    );
+    assert_eq!(
+        (&row["written_tokens"], &row["fallback"]),
+        (&json!(412), &Value::Null)
+    );
+    assert_eq!(row["output_tokens"], 0);
+    // A turn that completes keeps no error.
+    let done = &db.turns("Bob", 0, None, 8, false).unwrap()["turns"][1];
+    assert_eq!(done["status"], "completed");
+    assert!(done.get("error").is_none());
+    // Once retention takes its events, a waiter still reads how it failed,
+    // and a completed turn says its outcome was pruned.
+    converse(&mut db, "Bob", 9);
+    db.prune("Bob", 1).unwrap();
+    let pruned = db.turn_answer("Bob", turn).unwrap();
+    assert_eq!(
+        (&pruned["pruned"], &pruned["error"], &pruned["explanation"]),
+        (
+            &json!(true),
+            &json!("provider_refusal"),
+            &json!("Declined.")
+        )
+    );
+    let completed = done["turn"].as_i64().unwrap();
+    let pruned = db.turn_answer("Bob", completed).unwrap();
+    assert_eq!(
+        (&pruned["pruned"], &pruned["error"]),
+        (&json!(true), &json!("turn_result_pruned"))
+    );
+    // Declined before its answer began: left out, and the row says so.
+    let turn = db
+        .begin(
+            "Bob",
+            "r3",
+            "something declined",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let before = Error::new("provider_refusal")
+        .facts(json!({"category":"cyber","mid_stream":false,"written_tokens":0}));
+    db.finish(turn, Some(&before)).unwrap();
+    let row = &db.turns("Bob", 0, None, 8, true).unwrap()["turns"][0];
+    assert_eq!(
+        (&row["error"], &row["left_out"]),
+        (&json!("provider_refusal"), &json!(1))
+    );
+}
+
+#[test]
 fn messages_that_joined_a_declined_request_go_back_in_line_as_sent() {
     let mut db = db();
     for bot in ["Bob", "Carol"] {

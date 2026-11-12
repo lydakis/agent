@@ -159,6 +159,22 @@ impl State {
         // the provider's, not the request's, and is retried as Codex
         // retries it (openai/codex e8e6a92, sse/responses_error.rs):
         // `slow_down` as a rate limit, an overload holding the pool.
+        // A policy classifier declined the request, which Codex ends the
+        // turn on (openai/codex d27e7c1, `CyberPolicy`): a refusal as
+        // Anthropic's are, its category and the provider's words on why.
+        if named(|code| code == "cyber_policy") {
+            let begun = self.writing.is_some() || !self.items.is_empty() || !self.text.is_empty();
+            let mut facts = serde_json::Map::new();
+            facts.insert("category".into(), "cyber".into());
+            if let Some(why) = detail {
+                facts.insert("explanation".into(), crate::output::bounded(why).into());
+            }
+            let tokens = self.usage.as_ref().map_or(0, |usage| usage.output_tokens);
+            super::refused_at(&mut facts, begun, tokens);
+            return Err(
+                Error::with("provider_refusal", "category cyber").facts(Value::Object(facts))
+            );
+        }
         let code = if named(super::quota) {
             "provider_quota_exhausted"
         } else if named(super::plan_unavailable) {
@@ -266,7 +282,18 @@ fn parse_completion_with_usage(
                     match content["type"].as_str() {
                         Some("output_text") => text
                             .push_str(content["text"].as_str().ok_or(Error::new("invalid_text"))?),
-                        Some("refusal") => return fail("provider_refusal"),
+                        // The model's own refusal, written whole: its
+                        // words are the reason.
+                        Some("refusal") => {
+                            let mut facts = serde_json::Map::new();
+                            if let Some(why) = content["refusal"].as_str() {
+                                let why = crate::output::bounded(why.to_owned());
+                                facts.insert("explanation".into(), why.into());
+                            }
+                            let tokens = reported.as_ref().map_or(0, |usage| usage.output_tokens);
+                            super::refused_at(&mut facts, true, tokens);
+                            return Err(Error::new("provider_refusal").facts(Value::Object(facts)));
+                        }
                         _ => return fail("unsupported_content"),
                     }
                 }
@@ -635,6 +662,43 @@ mod tests {
             let error = State::default().frame(frame.as_bytes()).unwrap_err();
             assert_eq!(error.code, code, "{frame}");
         }
+    }
+    #[test]
+    fn a_cyber_policy_failure_is_a_refusal_with_the_provider_s_words() {
+        let failed = r#"{"type":"response.failed","response":{"status":"failed",
+            "error":{"code":"cyber_policy","message":"This request was flagged."},
+            "usage":{"input_tokens":10,"output_tokens":120}}}"#
+            .replace('\n', "");
+        let mut state = State::default();
+        state
+            .frame(br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}"#)
+            .unwrap();
+        let error = state.frame(failed.as_bytes()).unwrap_err();
+        assert_eq!(error.code, "provider_refusal");
+        assert_eq!(error.detail.as_deref(), Some("category cyber"));
+        assert!(super::super::refused_mid_stream(&error));
+        assert_eq!(
+            serde_json::Value::Object(*error.facts.unwrap()),
+            serde_json::json!({"category":"cyber","explanation":"This request was flagged.",
+                "mid_stream":true,"written_tokens":120})
+        );
+        // The model's own refusal, written whole, says its words.
+        let refused = RawValue::from_string(r#"{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I can't help with that."}]}],"usage":{"input_tokens":4,"output_tokens":7}}"#.into()).unwrap();
+        let mut usage = None;
+        let error = parse_completion_with_usage(&refused, Vec::new(), "", &mut usage, &mut None)
+            .unwrap_err();
+        assert_eq!(
+            serde_json::Value::Object(*error.facts.unwrap()),
+            serde_json::json!({"explanation":"I can't help with that.","mid_stream":true,
+                "written_tokens":7})
+        );
+        // Before anything streamed, and as an `error` event.
+        let error = State::default()
+            .frame(br#"{"type":"error","code":"cyber_policy","message":"Flagged."}"#)
+            .unwrap_err();
+        assert_eq!(error.code, "provider_refusal");
+        assert!(!super::super::refused_mid_stream(&error));
+        assert_eq!(error.facts.unwrap()["explanation"], "Flagged.");
     }
     #[test]
     fn a_reply_cut_at_max_output_tokens_names_what_it_was_writing() {

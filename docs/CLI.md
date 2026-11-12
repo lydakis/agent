@@ -475,9 +475,9 @@ after a restart, so a rotated key or a moved endpoint reaches it. A provider who
 as it was, with its pacing, connections and keys. A file that does not
 parse, a spec that does not bind (a key variable the daemon was not started
 with, say), and the removal of a provider an agent's model, fallback or
-compaction model, or an unfinished turn's own model, still names, or that
-binds such a provider to another API family (`provider_in_use`, naming
-them), are refused
+compaction model, or an unfinished turn's own model, or the daemon's
+`[fallbacks]`, still names, or that binds such a provider to another API
+family (`provider_in_use`, naming them), are refused
 whole, and the old set stays. `stats.provider_reload` says what the last
 change came to (`applied` with `added`, `removed` and `changed`, or
 `refused` with its error); new sessions' `ready.providers` show the set in
@@ -522,15 +522,24 @@ existing bot keeps its own,
 so `--tools` while continuing one is a usage error.
 `run --fallback PROVIDER/MODEL` gives a new bot a model, in its family, that
 answers a request a safety classifier declined, that request alone; the next
-goes to the bot's own model. Without it the bot takes its model's entry in
-`[fallbacks]` in `~/.agent/config.toml`, if any (Sonny's agents follow
-that entry as it changes; a bot the CLI made keeps the one it took, and
-`configure` with `fallback` changes it):
+goes to the bot's own model. Without one of its own, a bot takes the entry
+for its turn's model in `[fallbacks]` in `~/.agent/config.toml`, if any,
+which the CLI starts the daemon with (`serve --fallbacks`), so an entry
+reaches every bot, old or new, once the daemon starts again; keys are
+`PROVIDER/MODEL` patterns with `*` and `?`, the most specific winning
+(`configure` with `fallback` gives a bot its own):
 
 ```toml
 [fallbacks]
-"anthropic/claude-opus-5-5" = "anthropic/claude-opus-4-8"
+"anthropic/claude-opus-5*" = "anthropic/claude-opus-4-8"
 ```
+
+A refused turn says how in `wait` and `turns`: the refusal's `category` and
+the provider's `explanation`, `provider_request_id` for a support case,
+`mid_stream` and `written_tokens` for how far the answer got, and
+`fallback`, the model it was sent to again or null. A fallback it could not
+go to (a provider the daemon does not serve, or one of another API family)
+is named in `unused_fallback`, `{model, error}`.
 Other client commands require an already running daemon.
 
 `models` prints the models clients offer as JSON `[{id, note?}]`

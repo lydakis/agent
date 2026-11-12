@@ -2108,6 +2108,34 @@ class ModelListTests(ModelFixture):
         self.assertEqual(changed['provider_reload']['changed'], ['second'])
         self.assertEqual(changed['provider_reload']['added'], [])
 
+    def test_a_provider_the_daemon_s_fallbacks_name_stays_through_an_edit(self):
+        config = self.home / '.agent' / 'config.toml'
+        config.parent.mkdir(exist_ok=True)
+        fallbacks = '[fallbacks]\n"openai/*" = "second/synthetic-model"\n'
+        config.write_text(f'provider = "openai=responses,{self.url} second=responses,{self.url}"\n{fallbacks}')
+        self.agent('stats', *self.store)
+
+        def stats():
+            with socket.socket(socket.AF_UNIX) as s:
+                s.connect(str(self.state) + '.sock')
+                lines = s.makefile('rw')
+                lines.readline()
+                lines.write(json.dumps({'id': 1, 'op': 'stats'}) + '\n')
+                lines.flush()
+                return next(m for m in map(json.loads, lines) if m.get('id') == 1)['result']
+
+        # No agent runs on second, but the daemon's [fallbacks] send to it.
+        config.write_text(f'provider = "openai=responses,{self.url}"\n{fallbacks}')
+        deadline = time.monotonic() + 20
+        while (stats()['provider_reload'] or {}).get('status') != 'refused':
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        refused = stats()
+        self.assertEqual(refused['provider_reload']['error'], 'provider_in_use')
+        self.assertEqual(refused['provider_reload']['facts'],
+                         {'providers': ['second'], 'fallbacks': {'openai/*': 'second/synthetic-model'}})
+        self.assertEqual(sorted(refused['providers']), ['openai', 'second'])
+
     def test_providers_given_on_the_command_line_are_not_reloaded(self):
         config = self.home / '.agent' / 'config.toml'
         config.parent.mkdir(exist_ok=True)

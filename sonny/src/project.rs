@@ -1085,7 +1085,6 @@ async fn create(
         effort: (config.sonny.lead_effort.clone()).or(effort.filter(|e| !e.is_empty())),
         web_search: config.web_search,
         web_search_off: config.web_search_off,
-        fallbacks: config.fallbacks,
         ..Default::default()
     };
     let made = make(client, dir, &role, &picks, bot).await?;
@@ -1169,7 +1168,6 @@ pub async fn add(caller: &str, arguments: &Value) -> Result<Value, String> {
     }
     picks.web_search = config.web_search;
     picks.web_search_off = config.web_search_off;
-    picks.fallbacks = config.fallbacks;
     let socket = std::env::var_os("AGENT_SOCKET")
         .map(PathBuf::from)
         .ok_or("AGENT_SOCKET is not set")?;

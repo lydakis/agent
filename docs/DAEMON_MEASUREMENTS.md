@@ -8493,3 +8493,43 @@ The first fallback counted every earlier run of the bot for each
 message. It now looks only at the last two runs to start, through a
 temporary index on `(bot, started_ms)`, and gives the same answers, ties
 included.
+
+## Refusal records, daemon fallbacks (protocol 66, schema 93)
+
+A failed turn now keeps its error on its `turns` row, a refusal keeps the
+provider's explanation and how far the answer got, and the daemon reads
+`[fallbacks]` at start. What each path pays:
+
+- **A provider call**: one header lookup when the response arrives, over
+  three names, and a clone of the value it finds (a few dozen bytes). It
+  joins the error's facts only when the call fails.
+- **A turn's start**: when the bot names no fallback, one pattern match
+  of the turn's model against the daemon's `[fallbacks]`. An empty table
+  answers before matching.
+- **A turn's end**: a completed turn writes the new `error` column as
+  NULL in the same `UPDATE` as before. A failed turn writes one bounded
+  JSON object there. No new statement, index or store job.
+- **A `turns` read**: one more column, parsed only when it is not NULL.
+
+Daemon screen (`bench.perf_gate`), 4-CPU Linux container, base main
+6a1dc03 against head 42e1e27, two alternating rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 37.894 | 39.799 | +5.0% |
+| admission | burst submit p99, ms | 4.498 | 4.684 | +4.1% |
+| completion | release to terminal p99, ms | 10.466 | 10.023 | -4.2% |
+| footprint | idle RSS, MiB | 15.855 | 16.014 | +1.0% |
+| footprint | per idle bot, KiB | 1.874 | 1.792 | -4.4% |
+| footprint | RSS after a turn each, MiB | 27.236 | 29.092 | +6.8% |
+| footprint | CPU per turn, ms | 0.919 | 0.89 | -3.2% |
+| lifecycle | CPU, s | 0.595 | 0.565 | -5.0% |
+| lifecycle | p95 turn, ms | 585.212 | 580.048 | -0.9% |
+| lifecycle | peak RSS, MiB | 24.068 | 23.623 | -1.9% |
+
+Store work counts are the same on both sides, and the gate warned on no
+row. RSS after a turn each was 26.6 to 28.7 MiB on main and 27.0 to 29.8
+MiB on head across the six runs, so the two ranges overlap. Lone submit
+CPU has spanned 31 to 43 ms on one binary in earlier screens. The
+lifecycle row, which runs whole turns, is lower on head for both CPU and
+memory.

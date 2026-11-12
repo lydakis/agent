@@ -245,7 +245,7 @@ const COMMANDS: &[Command] = &[
         name: "serve",
         about: "Run the daemon in the foreground; other commands start it for you",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --own-copy --context-window --speeds --models --provider-config --await-owner",
+        flags: "--shell-exclude --redact-field --redact-block --protect --protect-existing --protect-path --wall --own-copy --context-window --speeds --fallbacks --models --provider-config --await-owner",
         settings: "",
         startup: true,
     },
@@ -468,6 +468,10 @@ fn print_flags(flags: &str) {
                 "PATTERN=TIERS",
                 "The tiers faster than standard (fast, ultrafast, comma-separated, or none) each model whose PROVIDER/MODEL path matches PATTERN (* and ? wildcards) serves, over the built-in list; a bot's speed reaches only models that serve it, others run at standard; the most specific pattern wins; repeatable; clients pass [speeds] from ~/.agent/config.toml",
             ),
+            "--fallbacks" => (
+                "PATTERN=PROVIDER/MODEL",
+                "The model a request a safety classifier declined goes to, that request alone, for each bot that names none of its own whose turn's PROVIDER/MODEL path matches PATTERN (* and ? wildcards); the most specific pattern wins; repeatable; clients pass [fallbacks] from ~/.agent/config.toml",
+            ),
             "--provider-config" => (
                 "PATH",
                 "The config file the providers came from (its `provider`), watched: an edit binds the new set for turns that start after it, running turns finish on the old, and a set that fails to bind or drops a provider agents use is refused; clients pass ~/.agent/config.toml when no --provider or AGENT_PROVIDER names them",
@@ -568,7 +572,7 @@ fn print_flags(flags: &str) {
             ),
             "--fallback" => (
                 "PROVIDER/MODEL",
-                "A new bot's model for a request a safety classifier declined, that request alone; default none",
+                "A new bot's model for a request a safety classifier declined, that request alone, over the daemon's [fallbacks]; default none",
             ),
             "--grace" => (
                 "DURATION",
@@ -781,6 +785,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--own-copy"
                     | "--context-window"
                     | "--speeds"
+                    | "--fallbacks"
             )
         {
             return fail_with("usage", format!("{flag} may only be specified once"));
