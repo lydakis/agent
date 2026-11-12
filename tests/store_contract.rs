@@ -92,7 +92,6 @@ fn result(output: &str) -> Outcome {
         output: output.into(),
         artifacts: Vec::new(),
         parts: Vec::new(),
-        note: None,
         failed: false,
         files: Default::default(),
     }
@@ -5653,7 +5652,6 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
             ("stderr", "\"\né🙂".repeat(100_000).into_bytes()),
         ],
         parts: Vec::new(),
-        note: None,
         failed: false,
         files: Default::default(),
     };
@@ -12250,15 +12248,16 @@ fn the_context_note_lists_omitted_turns_newest_first_from_the_window_start() {
 }
 
 #[test]
-fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint() {
-    let mut db = db();
-    db.create("Bob", Some("/synthetic"), binding()).unwrap();
-    assert!(db.window("Bob", i64::MAX, i64::MAX).unwrap().is_none());
-    let noted = |db: &mut Database, n: usize, text: &str| -> i64 {
+fn schema_96_drops_the_carry_forward_note() {
+    let path = std::env::temp_dir().join(format!("agent-note-96-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
         let turn = db
             .begin(
                 "Bob",
-                &format!("n{n}"),
+                "1",
                 "work",
                 true,
                 &TurnOptions::default(),
@@ -12266,95 +12265,52 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
             )
             .unwrap()
             .turn;
-        let call = ToolCall {
-            custom: false,
-            name: "note".into(),
-            call_id: format!("note-{n}"),
-            arguments: json!({"text":text}).to_string(),
-        };
-        db.append(turn, vec![], std::slice::from_ref(&call), None)
-            .unwrap();
-        db.tool_start(turn, &call, false, false).unwrap();
-        let outcome = Outcome {
-            output: "{}".into(),
-            artifacts: Vec::new(),
-            parts: Vec::new(),
-            note: Some(text.to_owned()),
-            failed: false,
-            files: Default::default(),
-        };
-        let (_, entry) = db.tool_finish(turn, &call.call_id, &outcome).unwrap();
-        let version = entry["data"]["note"].as_i64().unwrap();
-        db.append(turn, vec![assistant("ok")], &[], None).unwrap();
+        db.append(turn, vec![assistant("done")], &[], None).unwrap();
         db.finish(turn, None).unwrap();
-        version
+    }
+    // The note as schema 95 kept it: a version on the bot's head node.
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+            previous INTEGER REFERENCES notes(node), text TEXT NOT NULL);
+         CREATE INDEX notes_previous ON notes(previous);
+         ALTER TABLE bots ADD COLUMN note INTEGER REFERENCES notes(node);
+         CREATE INDEX bots_note ON bots(note);
+         INSERT INTO notes SELECT head,NULL,'rule' FROM bots WHERE name='Bob';
+         UPDATE bots SET note=head WHERE name='Bob';
+         PRAGMA user_version=95;",
+    )
+    .unwrap();
+    let mut db = Database::initialize(conn).unwrap();
+    let left = |sql: &str| -> bool {
+        (Connection::open(&path).unwrap())
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap()
     };
-    let first = noted(&mut db, 1, "rule: end files with the marker");
-    assert_eq!(db.inspect("Bob").unwrap().note, Some(first));
-    assert_eq!(
-        db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap().note,
-        Some((first, "rule: end files with the marker".into()))
-    );
-    // A fork at the current head carries the note; one at an earlier
-    // checkpoint carries the version that existed there.
-    let checkpoint = db.inspect("Bob").unwrap().head.unwrap();
-    let second = noted(&mut db, 2, "rule, plus: tests must pass");
-    assert!(second > first);
-    assert_eq!(db.inspect("Bob").unwrap().note, Some(second));
-    db.fork(
-        "Bob",
-        "Early",
-        Fork {
-            checkpoint: Some(checkpoint),
-            workspace: Some("/synthetic"),
-            budget_tokens: None,
-            ..Fork::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(db.inspect("Early").unwrap().note, Some(first));
-    db.fork(
-        "Bob",
-        "Late",
-        Fork {
-            checkpoint: None,
-            workspace: Some("/synthetic"),
-            budget_tokens: None,
-            ..Fork::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(db.inspect("Late").unwrap().note, Some(second));
-    // Clearing is a version too: the window shows nothing, a fork before it still sees the note.
-    let cleared = noted(&mut db, 3, "");
-    assert_eq!(db.inspect("Bob").unwrap().note, Some(cleared));
-    assert_eq!(
-        db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap().note,
-        Some((cleared, String::new()))
-    );
-    // Deleting a fork frees its suffix; the shared prefix's notes stay for the others.
-    db.delete_bot("Late").unwrap();
-    assert_eq!(db.inspect("Early").unwrap().note, Some(first));
-    assert_eq!(
-        db.window("Early", i64::MAX, i64::MAX)
-            .unwrap()
-            .unwrap()
-            .note
-            .unwrap()
-            .0,
-        first
-    );
-    // Deleting the source frees its exclusive suffix, notes included, and leaves Early whole.
+    assert!(!left(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='note')"
+    ));
+    assert!(!left(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name IN ('notes','bots_note','notes_previous'))"
+    ));
+    // The bot goes on, and its whole lineage frees.
+    let turn = db
+        .begin(
+            "Bob",
+            "2",
+            "more",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(turn, vec![assistant("ok")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
     db.delete_bot("Bob").unwrap();
-    assert_eq!(
-        db.window("Early", i64::MAX, i64::MAX)
-            .unwrap()
-            .unwrap()
-            .note
-            .unwrap()
-            .0,
-        first
-    );
+    assert!(!left("SELECT EXISTS(SELECT 1 FROM nodes)"));
+    drop(db);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -13314,16 +13270,23 @@ fn merged_schema_preserves_stores_from_both_published_branches() {
             let conn = rusqlite::Connection::open(&path).unwrap();
             if lineage {
                 conn.older(
-                    "DROP INDEX bots_note; DROP INDEX bots_compaction;
-                    ALTER TABLE bots DROP COLUMN note;
+                    "DROP INDEX bots_compaction;
                     ALTER TABLE bots DROP COLUMN compaction;
                     ALTER TABLE bots DROP COLUMN compaction_instructions;
                     ALTER TABLE bots DROP COLUMN compaction_model;
-                    DROP TABLE compactions; DROP TABLE notes;
+                    DROP TABLE compactions;
                     PRAGMA user_version=23;",
                 )
                 .unwrap();
             } else {
+                // Schema 24 kept a carry-forward note, which schema 96 drops.
+                conn.execute_batch(
+                    "CREATE TABLE notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                        previous INTEGER REFERENCES notes(node), text TEXT NOT NULL);
+                    ALTER TABLE bots ADD COLUMN note INTEGER REFERENCES notes(node);
+                    CREATE INDEX bots_note ON bots(note);",
+                )
+                .unwrap();
                 conn.execute(
                     "INSERT INTO notes(node, text) VALUES (?, 'retained note')",
                     [head],
@@ -13354,10 +13317,6 @@ fn merged_schema_preserves_stores_from_both_published_branches() {
                 assert_eq!(
                     bot.compaction_instructions.as_deref(),
                     Some("preserve decisions")
-                );
-                assert_eq!(
-                    db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap().note,
-                    Some((head, "retained note".into()))
                 );
             }
             let fork = db.fork("Bob", "Fork", Fork::default()).unwrap().0;

@@ -5103,7 +5103,6 @@ impl Service {
                             artifacts: Vec::new(),
                             files: Default::default(),
                             parts: Vec::new(),
-                            note: None,
                             failed: true,
                         }
                     }

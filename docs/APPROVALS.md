@@ -413,8 +413,8 @@ own clock.
 | Mode | Gated tools | Who answers | Default |
 | --- | --- | --- | --- |
 | `full` | none | nobody; every allowed call runs | yes |
-| `auto` | every tool except `history`, `wait`, `note`, `echo`, `read` | the automatic approver | |
-| `manual` | every tool except `history`, `wait`, `note`, `echo` | a person, through the app or `agent answer`, or a program | |
+| `auto` | every tool except `history`, `wait`, `echo`, `read` | the automatic approver | |
+| `manual` | every tool except `history`, `wait`, `echo` | a person, through the app or `agent answer`, or a program | |
 
 - **Chosen per bot at creation.** `agent run --new --approval auto`, or
   `AGENT_APPROVAL=auto` in the environment, as `AGENT_MODEL` sets a model.

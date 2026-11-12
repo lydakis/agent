@@ -159,7 +159,7 @@ so only one instance runs at a time, and answers in layers:
    later, such as one a caller registers, is gated without anyone
    remembering to list it. The model sees any tool's name and
    arguments, built in or not.
-   `history`, `wait`, `note`, and `echo` touch only the bot's own store
+   `history`, `wait` and `echo` touch only the bot's own store
    records and stay ungated. In `auto`, since 2026-10-26, `read` is
    ungated too: a result is sent to the model provider in the next
    request, so reading `~/.ssh/id_ed25519` sends the key off the machine

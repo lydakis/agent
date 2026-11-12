@@ -396,7 +396,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             elif user.startswith('note:') and last.get('type') != 'function_call_output':
                 text = ''
                 output = [{'type': 'function_call', 'name': 'note', 'call_id': 'note-1',
-                           'arguments': json.dumps({'text': getattr(self.server, 'note_text', user[5:])})}]
+                           'arguments': json.dumps({'text': user[5:]})}]
             elif user.startswith('readart:'):
                 text = ''
                 reference, _, rest = user[8:].partition(' ')
@@ -496,7 +496,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             elif user.startswith('tool:'):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'echo-1',
-                           'arguments': json.dumps({'text': getattr(self.server, 'note_text', user[5:])})}]
+                           'arguments': json.dumps({'text': user[5:]})}]
             elif user == 'large-call-id':
                 text = ''
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'c' * 65536,

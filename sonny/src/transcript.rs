@@ -2672,7 +2672,7 @@ fn drawn(
             "Typed into",
             format!("{} {:?}", field("handle"), field("chars")),
         ),
-        "echo" | "note" => ("Noted", field("text")),
+        "echo" => ("Noted", field("text")),
         "exec" => ("Ran", scripted(output.unwrap_or(""))),
         _ => ("Called", format!("{name} {arguments}")),
     };

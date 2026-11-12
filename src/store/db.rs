@@ -137,8 +137,6 @@ pub struct Bot {
     /// no creator or made to start a line, its creator's and one for any
     /// other, and its source's for a fork its source made.
     pub depth: u64,
-    /// The node of the bot's current carry-forward note, if it wrote one.
-    pub note: Option<i64>,
     /// The node of the bot's current compaction, if any, and the client's
     /// compaction instructions and summarizer model; without instructions
     /// the bot never compacts.
@@ -1500,7 +1498,6 @@ pub fn unserved(detail: String) -> Outcome {
         artifacts: Vec::new(),
         files: Default::default(),
         parts: Vec::new(),
-        note: None,
         failed: true,
     }
 }
@@ -1873,8 +1870,6 @@ pub struct Window {
     /// Whether the bot may call the history tool, so the context note names
     /// it only when it can.
     pub history: bool,
-    /// The bot's carry-forward note: its version node and text.
-    pub note: Option<(i64, String)>,
     /// The bot's current compaction, if any.
     pub compaction: Option<CompactionView>,
     /// Tool results with ids up to this one that have stubs go as their
@@ -2564,7 +2559,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 95;
+    pub const SCHEMA: i32 = 96;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -2686,9 +2681,6 @@ impl Database {
             CREATE TABLE IF NOT EXISTS lineage(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 parent INTEGER, depth INTEGER NOT NULL, skip INTEGER, start INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
-            CREATE TABLE IF NOT EXISTS notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
-                previous INTEGER REFERENCES notes(node), text TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS notes_previous ON notes(previous);
             CREATE TABLE IF NOT EXISTS compactions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 previous INTEGER REFERENCES compactions(node), cut INTEGER NOT NULL REFERENCES nodes(id),
                 summary TEXT NOT NULL, prompts TEXT NOT NULL,
@@ -2729,7 +2721,6 @@ impl Database {
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 created_by TEXT,
                 created_by_id INTEGER,
-                note INTEGER REFERENCES notes(node),
                 compaction INTEGER REFERENCES compactions(node),
                 compaction_instructions TEXT, compaction_model TEXT,
                 cache_bot INTEGER, thinking_prefix INTEGER,
@@ -2748,7 +2739,6 @@ impl Database {
                 last_started_ms INTEGER, last_finished_ms INTEGER, last_error TEXT,
                 configure_pending TEXT, refused_summary TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
-            CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
             CREATE INDEX IF NOT EXISTS bots_elision ON bots(elision);
             CREATE INDEX IF NOT EXISTS bots_configure_pending ON bots(name)
@@ -3248,20 +3238,20 @@ impl Database {
             name: r.get(0)?,
             head: r.get(1)?,
             budget_tokens: r.get::<_, Option<i64>>(10)?.map(|b| b.max(0) as u64),
-            budget_counts: Counts::from_stored(r.get::<_, Option<String>>(43)?.as_deref()),
+            budget_counts: Counts::from_stored(r.get::<_, Option<String>>(42)?.as_deref()),
             tokens_used: r.get::<_, i64>(11)?.max(0) as u64,
             work: Work {
-                used: r.get::<_, i64>(41)?.max(0) as u64,
-                read: r.get(42)?,
+                used: r.get::<_, i64>(40)?.max(0) as u64,
+                read: r.get(41)?,
             },
             turn_budget: None,
             output_schema: None,
             workspace: r.get(2)?,
             status: r.get(3)?,
             running_turn: r.get(4)?,
-            started_ms: r.get(45)?,
-            waiting_on: raw_json(r, 46)?,
-            last: ended(r, 47)?,
+            started_ms: r.get(44)?,
+            waiting_on: raw_json(r, 45)?,
+            last: ended(r, 46)?,
             provider: r.get(5)?,
             family: r.get(6)?,
             model: r.get(7)?,
@@ -3269,7 +3259,7 @@ impl Database {
             effort: r.get(9)?,
             tools: split_tools(&r.get::<_, String>(12)?),
             allowed: r
-                .get::<_, Option<String>>(32)?
+                .get::<_, Option<String>>(31)?
                 .map(|joined| split_tools(&joined)),
             input_tokens: r.get::<_, i64>(13)?.max(0) as u64,
             cached_input_tokens: r.get::<_, i64>(14)?.max(0) as u64,
@@ -3277,22 +3267,21 @@ impl Database {
             bot_id: r.get(15)?,
             created_by: r.get(16)?,
             created_by_id: r.get(17)?,
-            depth: r.get::<_, i64>(44)?.max(0) as u64,
-            note: r.get(18)?,
-            compaction: r.get(19)?,
-            compaction_instructions: r.get(20)?,
-            compaction_model: r.get(21)?,
-            cache_bot: r.get(22)?,
-            thinking_prefix: r.get(23)?,
+            depth: r.get::<_, i64>(43)?.max(0) as u64,
+            compaction: r.get(18)?,
+            compaction_instructions: r.get(19)?,
+            compaction_model: r.get(20)?,
+            cache_bot: r.get(21)?,
+            thinking_prefix: r.get(22)?,
             thinking: Strip {
-                below: r.get(24)?,
-                from: r.get(27)?,
-                to: r.get(28)?,
+                below: r.get(23)?,
+                from: r.get(26)?,
+                to: r.get(27)?,
             },
-            thinking_elided: r.get(29)?,
-            fallback: r.get(25)?,
-            elision: r.get(26)?,
-            gates: match r.get::<_, Option<String>>(30)? {
+            thinking_elided: r.get(28)?,
+            fallback: r.get(24)?,
+            elision: r.get(25)?,
+            gates: match r.get::<_, Option<String>>(29)? {
                 None => Vec::new(),
                 Some(text) => serde_json::from_str(&text).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -3302,7 +3291,7 @@ impl Database {
                     )
                 })?,
             },
-            denials: match r.get::<_, Option<String>>(31)? {
+            denials: match r.get::<_, Option<String>>(30)? {
                 None => BTreeMap::new(),
                 Some(text) => serde_json::from_str(&text).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -3315,10 +3304,10 @@ impl Database {
             // A running turn's newest closed node is kept as it moves, from
             // the moment the turn starts.
             fork_point: match r.get::<_, Option<i64>>(4)? {
-                Some(_) => r.get(33)?,
+                Some(_) => r.get(32)?,
                 None => r.get(1)?,
             },
-            settings: match r.get::<_, Option<String>>(34)? {
+            settings: match r.get::<_, Option<String>>(33)? {
                 None => Settings::default(),
                 Some(text) => serde_json::from_str(&text).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -3328,16 +3317,16 @@ impl Database {
                     )
                 })?,
             },
-            expire_ms: r.get::<_, Option<i64>>(35)?.map(|ms| ms.max(0) as u64),
-            expires_at: r.get(36)?,
-            sent: match (r.get::<_, Option<i64>>(37)?, r.get::<_, Option<i64>>(38)?) {
+            expire_ms: r.get::<_, Option<i64>>(34)?.map(|ms| ms.max(0) as u64),
+            expires_at: r.get(35)?,
+            sent: match (r.get::<_, Option<i64>>(36)?, r.get::<_, Option<i64>>(37)?) {
                 (Some(bytes), Some(tokens)) if bytes > 0 && tokens > 0 => {
                     Some((bytes as u64, tokens as u64))
                 }
                 _ => None,
             },
-            compaction_requested: r.get::<_, i64>(39)? != 0,
-            configure_pending: match r.get::<_, Option<String>>(52)? {
+            compaction_requested: r.get::<_, i64>(38)? != 0,
+            configure_pending: match r.get::<_, Option<String>>(51)? {
                 None => None,
                 Some(text) => Some(serde_json::from_str(&text).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -3347,7 +3336,7 @@ impl Database {
                     )
                 })?),
             },
-            declared: match r.get::<_, Option<String>>(40)? {
+            declared: match r.get::<_, Option<String>>(39)? {
                 None => Vec::new(),
                 Some(text) => serde_json::from_str(&text).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -3359,7 +3348,7 @@ impl Database {
             },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,last_started_ms,last_finished_ms,last_error,configure_pending";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallback,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed,settings,expire_ms,expires_at,sent_bytes,sent_tokens,compact_asked,declared,work,work_read,budget_counts,depth,started_ms,waiting_on,last_turn,last_status,last_started_ms,last_finished_ms,last_error,configure_pending";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     /// Its id and depth, read in the same query.
@@ -4099,7 +4088,6 @@ impl Database {
             before: i64,
             unsummarized: super::ContextUsage,
             history: bool,
-            note: Option<(i64, String)>,
             compaction: Option<(i64, String, String, i64, i64)>,
             elided: i64,
             saved: i64,
@@ -4119,7 +4107,7 @@ impl Database {
                     COALESCE(h.total_bytes-MIN(h.total_elided,COALESCE(e.saved,f.total_elided,0)),0)
                         -COALESCE(cp.total_bytes-MIN(cp.total_elided,COALESCE(e.saved,f.total_elided,0)),0),
                     COALESCE(h.depth,0)-COALESCE(cp.depth,0),
-                    note.node,note.text,c.node,c.summary,c.prompts,c.covered_from,c.covered_to,
+                    c.node,c.summary,c.prompts,c.covered_from,c.covered_to,
                     instr(','||b.tools||',',',history,')>0,COALESCE(e.through,f.id,0),COALESCE(e.saved,f.total_elided,0),
                     c.pinned,pn.total_bytes-COALESCE(pp.total_bytes,0),pn.turn_seq,pn.depth,
                     c.cut IS b.context_start,pn.pictured,pn.pictures,pn.elided
@@ -4128,7 +4116,6 @@ impl Database {
              LEFT JOIN compactions c ON c.node=b.compaction LEFT JOIN nodes cut ON cut.id=c.cut
              LEFT JOIN nodes cp ON cp.id=cut.parent
              LEFT JOIN nodes pn ON pn.id=c.pinned LEFT JOIN nodes pp ON pp.id=pn.parent
-             LEFT JOIN notes note ON note.node=b.note
              LEFT JOIN elisions e ON e.node=b.elision AND ?2 IS NULL LEFT JOIN nodes f ON f.id=?2
              WHERE b.name=?1",
             )?
@@ -4145,34 +4132,30 @@ impl Database {
                         bytes: r.get::<_, i64>(7)? as usize,
                         items: r.get::<_, i64>(8)? as usize,
                     },
-                    history: r.get(16)?,
-                    note: r
-                        .get::<_, Option<i64>>(9)?
-                        .map(|id| -> rusqlite::Result<_> { Ok((id, r.get(10)?)) })
-                        .transpose()?,
+                    history: r.get(14)?,
                     compaction: r
-                        .get::<_, Option<i64>>(11)?
+                        .get::<_, Option<i64>>(9)?
                         .map(|id| -> rusqlite::Result<_> {
-                            Ok((id, r.get(12)?, r.get(13)?, r.get(14)?, r.get(15)?))
+                            Ok((id, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?))
                         })
                         .transpose()?,
-                    elided: r.get(17)?,
-                    saved: r.get(18)?,
+                    elided: r.get(15)?,
+                    saved: r.get(16)?,
                     pinned: r
-                        .get::<_, Option<i64>>(19)?
+                        .get::<_, Option<i64>>(17)?
                         .map(|id| -> rusqlite::Result<_> {
-                            let (size, pictured) = (r.get::<_, i64>(20)?, Pictured {
-                                count: r.get(25)?,
-                                extra: r.get(24)?,
+                            let (size, pictured) = (r.get::<_, i64>(18)?, Pictured {
+                                count: r.get(23)?,
+                                extra: r.get(22)?,
                             });
                             // Under the floor, a prompt with a stub goes as it.
-                            let (size, pictured) = match r.get::<_, i64>(26)? {
-                                elided if elided > 0 && id <= r.get::<_, i64>(17)? => {
+                            let (size, pictured) = match r.get::<_, i64>(24)? {
+                                elided if elided > 0 && id <= r.get::<_, i64>(15)? => {
                                     (size - elided, Pictured::default())
                                 }
                                 _ => (size, pictured),
                             };
-                            Ok((id, size, r.get(21)?, r.get(22)?, r.get(23)?, pictured))
+                            Ok((id, size, r.get(19)?, r.get(20)?, r.get(21)?, pictured))
                         })
                         .transpose()?,
                 })
@@ -4430,7 +4413,6 @@ impl Database {
                 start.depth - 1 - depth - pins.len() as i64
             }),
             history: state.history,
-            note: state.note,
             compaction,
             elided: state.elided,
             pictures: window.iter().map(|r| r.pictures).sum::<i64>()
@@ -5669,14 +5651,6 @@ impl Database {
                 in_turn -= 1;
             }
         }
-        let note: Option<(i64, String)> = self
-            .conn
-            .query_row(
-                "SELECT node,text FROM notes WHERE node=?",
-                [bot.note],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
         let listed = match pinned.map(|(prompt, _)| prompt).or(cut) {
             Some(start) if note_turns > 0 && omitted > 0 => {
                 self.omitted_turns(start, note_turns)?
@@ -5686,7 +5660,6 @@ impl Database {
         let prefix = super::context::context_prefix(
             bot.family()?,
             view,
-            note.as_ref(),
             omitted,
             turns,
             in_turn,
@@ -6014,55 +5987,16 @@ impl Database {
     /// the result when fitting the next request; admission never walks them
     /// or moves the bot's cached window start on the writer.
     pub fn history_usage(&self, name: &str, turn: i64) -> Result<(Family, super::ContextUsage)> {
-        self.minimum_context_usage(name, turn, None)
-    }
-
-    /// Check a proposed note against the next request before persisting it.
-    /// The result node becomes its version; reserve the maximum encoded ID
-    /// width without querying the global node allocator or taking a writer lock.
-    pub fn validate_note(
-        &self,
-        name: &str,
-        turn: i64,
-        call_id: &str,
-        outcome: &Outcome,
-        limit: super::ContextUsage,
-    ) -> Result<()> {
-        let note = (
-            i64::MAX,
-            outcome.note.clone().ok_or(Error::new("missing_note"))?,
-        );
-        let (family, mut used) = self.minimum_context_usage(name, turn, Some(&note))?;
-        used.bytes += family
-            .tool_result_item(call_id, false, &outcome.output)?
-            .len()
-            + 1;
-        used.items += 1;
-        if !used.fits(limit) {
-            return crate::fail_with(
-                "note_context_limit",
-                "the encoded note and current turn exceed the context budget; previous note unchanged",
-            );
-        }
-        Ok(())
-    }
-
-    fn minimum_context_usage(
-        &self,
-        name: &str,
-        turn: i64,
-        note_override: Option<&(i64, String)>,
-    ) -> Result<(Family, super::ContextUsage)> {
         let (family, bytes, items) = self.turn_usage(name, turn)?;
         // A compaction cut inside this turn also leaves out its messages
         // between the prompt and the cut.
-        let (omitted, turns, in_turn, history, note) = self
+        let (omitted, turns, in_turn, history) = self
             .conn
             .prepare_cached(
                 "SELECT s.depth-1,s.turn_seq-1,
                     COALESCE(cut.depth-1-s.depth-(SELECT COUNT(*) FROM pins WHERE compaction=c.node),0),
-                    instr(','||b.tools||',',',history,')>0,n.node,n.text
-             FROM bots b JOIN nodes s ON s.turn=?2 LEFT JOIN notes n ON n.node=b.note
+                    instr(','||b.tools||',',',history,')>0
+             FROM bots b JOIN nodes s ON s.turn=?2
              LEFT JOIN compactions c ON c.node=b.compaction AND c.pinned=s.id
              LEFT JOIN nodes cut ON cut.id=c.cut
              WHERE b.name=?1 AND b.running_turn=?2",
@@ -6073,15 +6007,11 @@ impl Database {
                     r.get::<_, i64>(1)?,
                     r.get::<_, i64>(2)?,
                     r.get::<_, bool>(3)?,
-                    r.get::<_, Option<i64>>(4)?
-                        .map(|id| -> rusqlite::Result<_> { Ok((id, r.get::<_, String>(5)?)) })
-                        .transpose()?,
                 ))
             })?;
         let prefix = super::context::context_prefix(
             family,
             self.compaction_view(name)?.as_ref(),
-            note_override.or(note.as_ref()),
             omitted,
             turns,
             in_turn,
@@ -8246,23 +8176,10 @@ impl Database {
              closed=CASE WHEN open_calls=1 THEN ?1 ELSE closed END WHERE name=?2",
             params![head, bot.name],
         )?;
-        if let Some(text) = &outcome.note {
-            // The result's node is the note's version: on this lineage by
-            // construction, so a fork binds to it by position.
-            tx.execute(
-                "INSERT INTO notes(node,previous,text) VALUES (?,?,?)",
-                params![head, bot.note, text],
-            )?;
-            tx.execute(
-                "UPDATE bots SET note=? WHERE name=?",
-                params![head, bot.name],
-            )?;
-        }
         let artifacts: Vec<&str> = (outcome.artifacts.iter().map(|(s, _)| *s))
             .chain(outcome.files.iter().map(|(s, _)| *s))
             .collect();
-        let mut data = json!({"call_id":call_id,"node":head,"artifacts":artifacts,
-            "note":outcome.note.as_ref().map(|_| head)});
+        let mut data = json!({"call_id":call_id,"node":head,"artifacts":artifacts});
         if outcome.failed {
             data["failed"] = json!(true);
         }
@@ -8702,7 +8619,6 @@ impl Database {
                     .map(|json| serde_json::from_str(&json))
                     .transpose()?
                     .unwrap_or_default(),
-                note: None,
                 failed,
             }),
             None if expires_ms.is_some_and(|at| now_ms >= at) => {
@@ -12722,19 +12638,8 @@ impl Database {
             )?;
             tx.prepare_cached("INSERT INTO checkpoints VALUES (?,?)")?
                 .execute(params![name, node])?;
-            // The newest note version at or before the checkpoint, along
-            // the source's version chain; ids grow along a lineage.
-            let mut version = parent.note;
-            while let Some(node_id) = version.filter(|v| *v > node) {
-                version =
-                    tx.query_row("SELECT previous FROM notes WHERE node=?", [node_id], |r| {
-                        r.get(0)
-                    })?;
-            }
-            tx.execute(
-                "UPDATE bots SET note=? WHERE name=?",
-                params![version, name],
-            )?;
+            // The newest compaction at or before the checkpoint, along the
+            // source's version chain; ids grow along a lineage.
             let mut version = parent.compaction;
             while let Some(node_id) = version.filter(|v| *v > node) {
                 version = tx.query_row(
@@ -13175,7 +13080,7 @@ impl Database {
             // any piece commits. RETURNING shares the existing indexed lookup
             // with the global watermark, without another query per piece.
             let pruned: i64 = tx.query_row(
-                "UPDATE bots SET status='deleting',context_start=NULL,note=NULL,compaction=NULL,elision=NULL,
+                "UPDATE bots SET status='deleting',context_start=NULL,compaction=NULL,elision=NULL,
                     pruned_cursor=MAX(pruned_cursor,
                         COALESCE((SELECT MAX(id) FROM events WHERE bot=?1),0))
                  WHERE name=?1 RETURNING pruned_cursor",
@@ -13241,9 +13146,8 @@ impl Database {
                 return Ok(out);
             }
             let referenced: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1 OR note=?1 OR compaction=?1 OR elision=?1))
+                "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1 OR compaction=?1 OR elision=?1))
                     OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1)
-                    OR EXISTS(SELECT 1 FROM notes WHERE previous=?1)
                     OR EXISTS(SELECT 1 FROM compactions WHERE previous=?1)
                     OR EXISTS(SELECT 1 FROM elisions WHERE previous=?1)",
                 params![id, name],
@@ -13255,7 +13159,6 @@ impl Database {
             let parent: Option<i64> =
                 tx.query_row("SELECT parent FROM nodes WHERE id=?", [id], |r| r.get(0))?;
             tx.execute("UPDATE bots SET head=? WHERE name=?", params![parent, name])?;
-            tx.execute("DELETE FROM notes WHERE node=?", [id])?;
             tx.execute("DELETE FROM pins WHERE compaction=?", [id])?;
             tx.execute("DELETE FROM compactions WHERE node=?", [id])?;
             tx.execute("DELETE FROM elisions WHERE node=?", [id])?;
@@ -17130,6 +17033,23 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
         }
     }
 
+    // Schema 96: bots keep no carry-forward note. What a bot wrote stays
+    // where it wrote it, in its `note` call's arguments.
+    if from < 96 {
+        let has: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='note')",
+            [],
+            |r| r.get(0),
+        )?;
+        if has {
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS bots_note;
+                 ALTER TABLE bots DROP COLUMN note;
+                 DROP TABLE IF EXISTS notes;",
+            )?;
+        }
+    }
+
     Ok(())
 }
 /// 91 -> 92: every turns row becomes a message with its number; the rows
@@ -17815,7 +17735,7 @@ fn declined_span(
         let shared: bool = conn
             .prepare_cached(
                 "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1
-                        OR note=?1 OR compaction=?1 OR elision=?1))
+                        OR compaction=?1 OR elision=?1))
                     OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1 AND id IS NOT ?3)",
             )?
             .query_row(params![id, name, child], |r| r.get(0))?;

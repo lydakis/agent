@@ -409,53 +409,6 @@ class CompactionTests(ModelFixture):
                             for r in requests))
         self.assertTrue(any('[context note]' in str(r['input']) for r in requests))
 
-    def test_oversized_note_preserves_previous_note_and_bot_remains_usable(self):
-        client = self.client(tools='note', settings={'context_bytes': 4096})
-        client.request('create', bot='Bob', workspace=str(self.path))
-        self.assertEqual(self.run_turn(client, 'Bob', 'seed', 'note:remember violet')['data']['status'], 'completed')
-        for n, note in enumerate(('x' * 5000, '\\' * 2100, 'n' * 2000)):
-            self.model.note_text = note
-            ended = self.run_turn(client, 'Bob', f'bad-{n}', 'note:replace')
-            if n == 2:
-                self.assertEqual(ended['data']['status'], 'completed')
-                self.assertTrue(any('note_context_limit' in str(r['input']) for r in self.requests()))
-            # The provider output itself can overflow this turn, but its note
-            # must not poison subsequent turns or replace the last good note.
-            self.requests()
-            self.assertEqual(self.run_turn(client, 'Bob', f'next-{n}', 'continue')['data']['status'], 'completed')
-            requests = self.requests()
-            self.assertTrue(any('remember violet' in str(r['input']) for r in requests))
-            with sqlite3.connect(self.path / 'state.sqlite') as db:
-                self.assertEqual(db.execute('select n.text from bots b join notes n on n.node=b.note where b.name=?',
-                                            ('Bob',)).fetchone()[0], 'remember violet')
-        del self.model.note_text
-        self.assertEqual(self.run_turn(client, 'Bob', 'clear', 'note:')['data']['status'], 'completed')
-
-    def test_pinned_note_counts_toward_compaction_and_request_room(self):
-        client = self.client(settings={'context_bytes': 4096, 'compact_at': 75})
-        self.create(client)
-        # Seed a durable note at an existing node, then reopen the daemon.
-        # Escaped note bytes count; transcript payloads remain small.
-        self.run_turn(client, 'Bob', 'seed', 'seed')
-        client.close()
-        db = sqlite3.connect(self.path / 'state.sqlite')
-        head = db.execute('select head from bots where name="Bob"').fetchone()[0]
-        db.execute('insert into notes(node,text) values (?,?)', (head, '"\n' * 550))
-        db.execute('update bots set note=? where name="Bob"', (head,))
-        db.commit()
-        db.close()
-        client = Client(self.binary, self.path / 'state.sqlite', self.url,
-                        settings={'context_bytes': 4096, 'compact_at': 75})
-        self.addCleanup(client.close)
-        self.requests()
-        for n in range(6):
-            self.assertEqual(self.run_turn(client, 'Bob', n, 'small')['data']['status'], 'completed')
-        requests = self.requests()
-        self.assertTrue(any(is_summary(r) for r in requests))
-        normal = [r for r in requests if not is_summary(r)]
-        self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':')).encode()) - 2 <= 4096
-                            for r in normal))
-
     def test_parked_summary_resumes_as_a_summary_after_restart(self):
         client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
         self.create(client)
@@ -1136,26 +1089,6 @@ class SummaryCopyTests(ModelFixture):
                           for c in compacted], [(False, 'copy', True), (True, 'own', True)])
         self.assertIsNone(self.model.routes[1])
         self.assertEqual(self.model.routes[first], 'route-2')
-
-    def test_a_summary_copies_what_the_call_sent_ahead_of_a_note_written_since(self):
-        client = self.start(tools='shell,note', budget=8192)
-        self.turn(client, 'a', 'first: ' + 'x' * 800)
-        note = 'n' * 1500
-        self.model.call_script = [('shell', {'command': 'seq 1 300'}), ('note', {'text': note}),
-                                  ('shell', {'command': 'seq 1 10'})]
-        self.turn(client, 'b', 'script')
-        requests = self.requests()
-        index, = self.copies(requests)
-        # The note went ahead of the view after the call that ran before
-        # it; the copy sends what that call sent, and the next call carries
-        # the note.
-        pinned = lambda r: [i['content'][0]['text'] for i in r['input']
-                            if i.get('role') == 'user' and i['content'][0]['text'].startswith('[carry-forward note')]
-        call = self.copied_call(requests, index)
-        own = next(r for r in requests[requests.index(call) + 1:] if not is_summary(r))
-        self.assertEqual(call['input'][-1]['call_id'], 'script-0')
-        self.assertEqual(pinned(requests[index]), [])
-        self.assertIn(note, pinned(own)[0])
 
     def test_a_summary_copies_the_view_from_before_the_stubs_of_its_boundary(self):
         client = self.client(tools='shell,read',

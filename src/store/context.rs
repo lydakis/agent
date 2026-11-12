@@ -29,8 +29,8 @@ pub struct ContextPrefix {
     /// Every prefix item includes its separating comma before the tail.
     pub bytes: bytes::Bytes,
     pub items: usize,
-    /// What cannot yield to the current turn: the summary, the note, and
-    /// the context note without its optional previews.
+    /// What cannot yield to the current turn: the summary and the
+    /// context note without its optional previews.
     pub required: ContextUsage,
 }
 
@@ -62,7 +62,6 @@ impl Window {
         context_prefix(
             self.family,
             self.compaction.as_ref(),
-            self.note.as_ref(),
             self.omitted_items,
             self.omitted_turns,
             self.omitted_in_turn,
@@ -82,7 +81,7 @@ impl CompactionView {
     pub(crate) fn bound_prompt_bytes(&mut self, family: Family, budget: usize) -> Result<()> {
         let mut prompts = std::mem::take(&mut self.prompts);
         // With the longer marker, so the bound holds at either lifetime.
-        let base = context_prefix(family, Some(self), None, 0, 0, 0, false, &[], 0, true)?
+        let base = context_prefix(family, Some(self), 0, 0, 0, false, &[], 0, true)?
             .bytes
             .len();
         if base > budget {
@@ -133,7 +132,6 @@ impl CompactionView {
 pub(crate) fn context_prefix(
     family: Family,
     compaction: Option<&CompactionView>,
-    note: Option<&(i64, String)>,
     omitted_items: i64,
     omitted_turns: i64,
     omitted_in_turn: i64,
@@ -168,13 +166,6 @@ pub(crate) fn context_prefix(
             }
         }
         push(pinned_item(family, &text, hour)?);
-    }
-    if let Some((version, text)) = note.filter(|(_, text)| !text.is_empty()) {
-        push(pinned_item(
-            family,
-            &format!("[carry-forward note, version {version}]\n{text}"),
-            hour,
-        )?);
     }
     let pinned_bytes = encoded.len();
     let mut required = ContextUsage {
@@ -758,7 +749,6 @@ mod tests {
         let note = |history| {
             let prefix = context_prefix(
                 Family::Responses,
-                None,
                 None,
                 6,
                 3,
