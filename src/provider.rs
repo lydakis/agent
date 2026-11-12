@@ -1414,7 +1414,8 @@ impl Provider {
                 && let (Some(login), Some(session)) = (&self.login, session.as_ref())
             {
                 reservation.settle(0);
-                return Err(login_refused(client, login, session, body.detail).await?);
+                let refused = login_refused(client, login, session, body.detail).await?;
+                return Err(with_request(refused, request_id.as_ref()));
             }
             // Expired or replaced AWS keys are re-resolved once, as a login is.
             if matches!(status, 401 | 403)
@@ -1422,9 +1423,12 @@ impl Provider {
                 && aws.reload(keys).await?
             {
                 reservation.settle(0);
-                return Err(Error::with(
-                    "provider_login_refreshed",
-                    body.detail.unwrap_or_else(|| format!("HTTP {status}")),
+                return Err(with_request(
+                    Error::with(
+                        "provider_login_refreshed",
+                        body.detail.unwrap_or_else(|| format!("HTTP {status}")),
+                    ),
+                    request_id.as_ref(),
                 ));
             }
             // A signature refused for its time is made again on the retry,
@@ -1434,9 +1438,12 @@ impl Provider {
                 && aws::clock_skewed(&headers, signed_at)
             {
                 reservation.settle(0);
-                return Err(Error::with(
-                    "provider_signature_expired",
-                    body.detail.unwrap_or_else(|| format!("HTTP {status}")),
+                return Err(with_request(
+                    Error::with(
+                        "provider_signature_expired",
+                        body.detail.unwrap_or_else(|| format!("HTTP {status}")),
+                    ),
+                    request_id.as_ref(),
                 ));
             }
             let quota = status == 429 && body.quota;
@@ -1493,9 +1500,12 @@ impl Provider {
                 Some(format!("HTTP {status}, content-type {content_type}")),
                 body,
             ];
-            return Err(Error::with(
-                "provider_expected_sse",
-                detail.into_iter().flatten().collect::<Vec<_>>().join(": "),
+            return Err(with_request(
+                Error::with(
+                    "provider_expected_sse",
+                    detail.into_iter().flatten().collect::<Vec<_>>().join(": "),
+                ),
+                request_id.as_ref(),
             ));
         }
         let mut stream = response.bytes_stream();
@@ -3489,7 +3499,8 @@ mod tests {
     }
 
     /// The provider's id for a request is kept with the failure it ended
-    /// in: a refusal inside a 200's stream, and an HTTP error.
+    /// in: a refusal inside a 200's stream, an HTTP error, and a 200 that
+    /// is not a stream.
     #[tokio::test]
     async fn a_failure_keeps_the_provider_s_request_id() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3511,6 +3522,10 @@ mod tests {
                     "request-id: req_012\r\ncontent-length: 60\r\nconnection: close\r\n\r\n",
                     "{\"type\":\"error\",\"error\":{\"message\":\"bad request body.\"}}",
                 ),
+                concat!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n",
+                    "x-request-id: req_013\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                ),
             ];
             for reply in replies {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -3527,7 +3542,7 @@ mod tests {
             Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None).unwrap();
         let tools = none();
         let mut errors = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             let request = Request {
                 model: "m",
                 instructions: "",
@@ -3559,6 +3574,12 @@ mod tests {
         assert_eq!(
             errors[1].facts.as_ref().unwrap()["provider_request_id"],
             "req_012"
+        );
+        // A gateway's 200 that is not a stream, by OpenAI's header name.
+        assert_eq!(errors[2].code, "provider_expected_sse");
+        assert_eq!(
+            errors[2].facts.as_ref().unwrap()["provider_request_id"],
+            "req_013"
         );
     }
 
