@@ -321,27 +321,26 @@ show a lightweight runtime, not coding-agent capacity at that scale.
 
 The same synthetic conversation work through five harnesses, 32 agents at once,
 each doing three turns that add 64 KiB of text and stream back 5 KiB
-([full screen](docs/HARNESS_MEASUREMENTS.md), 2026-11-01, 4-vCPU Linux VM,
-medians of three runs; Agent at main `70637f9`, every other harness at its
-newest release that day).
+([full screen](docs/HARNESS_MEASUREMENTS.md), 2026-11-12, 4-vCPU Linux VM,
+medians of three runs; Agent at main `987a276`, every other harness at the
+release pinned since 2026-11-01).
 
 | Harness | Peak memory | CPU time | Turn p99 |
 | --- | ---: | ---: | ---: |
-| Agent | 30 MiB | 0.8 s | 0.63 s |
-| Pi 1.4.0 | 155 MiB | 2.0 s | 0.75 s |
-| Codex 0.166.0 | 368 MiB | 9.3 s | 1.4 s* |
-| opencode 1.19.5 | 869 MiB | 13.8 s | 3.6 s |
-| Claude Code 2.1.316 | 6,257 MiB | 36.8 s | 2.4 s* |
+| Agent | 27 MiB | 0.2 s | 0.58 s |
+| Pi 1.4.0 | 156 MiB | 1.1 s | 0.67 s |
+| Codex 0.166.0 | 315 MiB | 6.8 s | 1.2 s |
+| opencode 1.19.5 | 854 MiB | 9.4 s | 2.5 s |
+| Claude Code 2.1.316 | 5,226 MiB | 23.8 s | 1.7 s |
 
 Read this as an exploratory screen, not a ranking. The harnesses do different
 amounts of work: Agent commits every turn to SQLite, opencode keeps its own
 store, and the others hold conversations in memory; no tools were called.
 Claude Code runs one process per agent, and its memory is summed across those
-processes. Turn time includes 0.5 s of scripted streaming.
-\* Codex reached 30 to 32 of the 32 concurrent streams on this machine, and
-Claude Code 26 to 28. On this shared VM the other harnesses' numbers drift by
-up to about 20% between screens with the same binaries, so compare harnesses
-within one screen, not across screens.
+processes. Turn time includes 0.5 s of scripted streaming. Every harness
+reached all 32 concurrent streams in this screen. On this shared VM the other
+harnesses' numbers drift by up to about 20% between screens with the same
+binaries, so compare harnesses within one screen, not across screens.
 
 The [performance tools](docs/BENCHMARKS.md) reproduce these runs against the
 same synthetic provider, and [docs/](docs) holds the design record and
