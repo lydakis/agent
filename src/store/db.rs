@@ -16044,6 +16044,16 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         }
     }
 
+    // The steps to schema 73 tell what to do by the columns they add: a
+    // store past them has each, or from schema 92 moved it to `messages`.
+    if from < 74 {
+        migrate_by_columns(conn, from)?;
+    }
+    migrate_since_73(conn, from)
+}
+
+/// The steps to schema 73, each run when the column it adds is missing.
+fn migrate_by_columns(conn: &Connection, from: i32) -> Result<()> {
     if !conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('compactions') WHERE name='cut')",
         [],
@@ -16705,6 +16715,11 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// The steps from schema 73 on, each by the schema it came in.
+fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
     // 73 -> 74: a turn the pull cord parked says so as its halt, beside the
     // daemon stopping, rather than with a flag of its own.
     if from < 74 {
