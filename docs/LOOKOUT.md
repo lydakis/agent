@@ -59,8 +59,11 @@ It keeps a cursor in `STORE.lookout.cursor`: the newest event it saw, or
 just before the oldest one whose news it has not told yet. A lookout that
 starts again, after a crash or a lost connection, takes what happened after
 that cursor as news, so a task that finished while no lookout ran, or whose
-news waited on a busy lead, still reaches its lead; news told already may
-be told again. Beside it, the file keeps where the stream starts again:
+news waited on a busy lead, still reaches its lead. One lead's news held
+back, as by a digest, holds no other lead back: the file also keeps each
+lead's own mark where it is past that cursor, up to which that lead was
+told, and what comes at or before a lead's mark is history to it, so it is
+not told again. Beside it, the file keeps where the stream starts again:
 just before the oldest turn still under way among the bots its followers
 watch, as a consumer commits its offset only up to its oldest record still
 in work. What came between is replayed as history, so who asked for a turn,
