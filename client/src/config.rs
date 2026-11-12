@@ -13,7 +13,7 @@
 //! hold = "5d"                   # how long a new agent's turn waits on a cause you can fix before it fails, the default; "0" fails at once
 //! prices = "~/sheets/llm.toml"  # the price sheet /usage costs from, ~/.agent/prices.toml by default; see `prices`
 //!
-//! [daemon]                      # what the agent CLI starts the daemon with; restart it to apply; STORE.daemon.toml pins a store's own
+//! [daemon]                      # what the agent CLI starts the daemon with; restart it to apply; ~/.agent/pins/ pins a store's own
 //! processes = "cpus * 64"       # commands running at once, the default
 //! load = "cpus * 2"             # new commands wait while the load average is this, the default; 0 no gate
 //! input_bytes = "memory / 16"   # also lasting, active, connecting, pending, pending_bytes, readers
@@ -322,37 +322,46 @@ pub fn daemon_key(flag: &str) -> Option<&'static str> {
         .map(|(key, _)| key)
 }
 
-/// How a store's daemon starts, pinned beside the store in
-/// `STORE.daemon.toml` by a start given flags: its `provider` and its
-/// `[daemon]` limits, in `config.toml`'s keys. Every later start of the
-/// store, whoever asks for it (a client waiting on one of its bots, a
-/// gate, a window), reads them over `config.toml`, so it starts the way
-/// its owner started it; flags given again pin again.
+/// How a store's daemon starts, pinned for the store in `~/.agent/pins/`
+/// by a start given flags: its `provider` and its `[daemon]` limits, in
+/// `config.toml`'s keys. Every later start of the store, whoever asks for
+/// it (a client waiting on one of its bots, a gate, a window), reads them
+/// over `config.toml`, so it starts the way its owner started it; flags
+/// given again pin again. They are kept with the person's other settings,
+/// which no sandboxed command writes, wherever the store is.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Pins {
     pub provider: Option<String>,
     pub daemon: BTreeMap<String, String>,
 }
 
-/// Where the start flags of the daemon of `store` are pinned: `store` as
-/// the daemon names it, by its real path, so every name for one store
-/// finds the same pins.
-pub fn pins_path(store: &Path) -> PathBuf {
-    let mut path = store.as_os_str().to_owned();
-    path.push(".daemon.toml");
-    PathBuf::from(path)
+/// Where the start flags of the daemon of `store` are pinned:
+/// `~/.agent/pins/` and the store's real path with each `/` written
+/// `%2F` and each `%` written `%25`, then `.toml`. `store` is named as the
+/// daemon names it, by its real path, so every name for one store finds
+/// the same pins. `None` with no home.
+pub fn pins_path(store: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let mut name = Vec::new();
+    for byte in store.as_os_str().as_bytes() {
+        match byte {
+            b'%' => name.extend_from_slice(b"%25"),
+            b'/' => name.extend_from_slice(b"%2F"),
+            _ => name.push(*byte),
+        }
+    }
+    name.extend_from_slice(b".toml");
+    Some(
+        home()?
+            .join("pins")
+            .join(std::ffi::OsString::from_vec(name)),
+    )
 }
 
-/// The start flags pinned for `store`'s daemon: none when nothing pinned
-/// them. A file that does not read is refused by name, as `config.toml`.
-pub fn read_pins(store: &Path) -> Result<Pins, String> {
-    let path = pins_path(store);
-    // Where none is pinned, a sandbox running now may hold an empty
-    // folder in its place, so no command of its makes one.
-    if is_placeholder(&path) {
-        return Ok(Pins::default());
-    }
-    let text = match std::fs::read_to_string(&path) {
+/// The start flags pinned at `path`: none when nothing pinned them. A
+/// file that does not read is refused by name, as `config.toml`.
+pub fn read_pins(path: &Path) -> Result<Pins, String> {
+    let text = match std::fs::read_to_string(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Pins::default()),
         Err(error) => return Err(format!("config_unreadable: {}: {error}", path.display())),
         Ok(text) => text,
@@ -374,13 +383,6 @@ pub fn read_pins(store: &Path) -> Result<Pins, String> {
         provider: config.provider,
         daemon: config.daemon,
     })
-}
-
-/// Whether `path` is an empty folder: what a sandbox mounts over a file
-/// it keeps from being made.
-fn is_placeholder(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|found| found.is_dir())
-        && std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 /// `pins` as the file holds them, once read back the way every later
@@ -407,22 +409,27 @@ fn pins_text(path: &Path, pins: &Pins) -> Result<String, String> {
     Ok(text)
 }
 
-/// Whether `pins` would be written for `store`: refused as `write_pins`
+/// Whether `pins` would be written at `path`: refused as `write_pins`
 /// would refuse them, with nothing written.
-pub fn check_pins(store: &Path, pins: &Pins) -> Result<(), String> {
-    pins_text(&pins_path(store), pins).map(drop)
+pub fn check_pins(path: &Path, pins: &Pins) -> Result<(), String> {
+    pins_text(path, pins).map(drop)
 }
 
-/// Write `pins` beside `store`, the daemon's user's alone, whole or not
-/// at all: written aside, then renamed over the last.
-pub fn write_pins(store: &Path, pins: &Pins) -> Result<(), String> {
+/// Write `pins` at `path`, the person's alone, whole or not at all:
+/// written aside, then renamed over the last.
+pub fn write_pins(path: &Path, pins: &Pins) -> Result<(), String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = pins_path(store);
-    let text = pins_text(&path, pins)?;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let text = pins_text(path, pins)?;
     let unwritable = |e: std::io::Error| format!("config_unwritable: {}: {e}", path.display());
-    // Made new, never opened: a name already there (a link a command put
-    // where the store's folder is writable to it) is passed over, never
+    if let Some(folder) = path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(folder)
+            .map_err(unwritable)?;
+    }
+    // Made new, never opened: a name already there is passed over, never
     // followed.
     let mut made = None;
     for n in 0..64 {
@@ -448,10 +455,7 @@ pub fn write_pins(store: &Path, pins: &Pins) -> Result<(), String> {
     };
     let written = file.write_all(text.as_bytes());
     drop(file);
-    if is_placeholder(&path) {
-        let _ = std::fs::remove_dir(&path);
-    }
-    if let Err(error) = written.and_then(|()| std::fs::rename(&aside, &path)) {
+    if let Err(error) = written.and_then(|()| std::fs::rename(&aside, path)) {
         let _ = std::fs::remove_file(&aside);
         return Err(unwritable(error));
     }
@@ -2695,12 +2699,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("agent-pins-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let store = dir.join("state.sqlite");
-        assert_eq!(read_pins(&store).unwrap(), Pins::default());
-        // A sandbox's placeholder where none is pinned pins nothing, and
-        // gives way to pins written.
-        std::fs::create_dir(pins_path(&store)).unwrap();
-        assert_eq!(read_pins(&store).unwrap(), Pins::default());
+        // Named by the file's path, every `/` and `%` written out.
+        let named = pins_path(Path::new("/srv/a%b/state.sqlite")).unwrap();
+        assert_eq!(named.parent().unwrap().file_name().unwrap(), "pins");
+        assert_eq!(
+            named.file_name().unwrap(),
+            "%2Fsrv%2Fa%25b%2Fstate.sqlite.toml"
+        );
+        let file = dir.join("pins").join("state.sqlite.toml");
+        assert_eq!(read_pins(&file).unwrap(), Pins::default());
         let pins = Pins {
             provider: Some("openai=responses,http://127.0.0.1:1/v1 \"odd\"".into()),
             daemon: BTreeMap::from([
@@ -2709,42 +2716,42 @@ mod tests {
                 ("stall_timeout".to_owned(), "30s".to_owned()),
             ]),
         };
-        write_pins(&store, &pins).unwrap();
-        assert_eq!(read_pins(&store).unwrap(), pins);
+        write_pins(&file, &pins).unwrap();
+        assert_eq!(read_pins(&file).unwrap(), pins);
         // What a later start would refuse is never written.
         let refused = Pins {
             provider: None,
             daemon: BTreeMap::from([("load".to_owned(), "2e0".to_owned())]),
         };
         assert!(
-            write_pins(&store, &refused)
+            write_pins(&file, &refused)
                 .unwrap_err()
                 .contains("daemon.load")
         );
-        assert_eq!(read_pins(&store).unwrap(), pins);
-        assert!(check_pins(&store, &refused).is_err());
-        assert_eq!(check_pins(&store, &pins), Ok(()));
+        assert_eq!(read_pins(&file).unwrap(), pins);
+        assert!(check_pins(&file, &refused).is_err());
+        assert_eq!(check_pins(&file, &pins), Ok(()));
         // A link where pins are written aside is passed over, never
         // followed.
         let target = dir.join("target");
         std::fs::write(&target, "kept").unwrap();
-        let mut aside = pins_path(&store).into_os_string();
+        let mut aside = file.clone().into_os_string();
         aside.push(format!(".{}.0", std::process::id()));
         std::os::unix::fs::symlink(&target, &aside).unwrap();
-        write_pins(&store, &pins).unwrap();
+        write_pins(&file, &pins).unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "kept");
-        assert_eq!(read_pins(&store).unwrap(), pins);
+        assert_eq!(read_pins(&file).unwrap(), pins);
         assert_eq!(daemon_key("--idle-exit"), Some("idle_exit"));
         assert_eq!(daemon_key("--max-active"), Some("active"));
         assert_eq!(daemon_key("--model"), None);
-        std::fs::write(pins_path(&store), "[sonny]\nchime = true\n").unwrap();
+        std::fs::write(&file, "[sonny]\nchime = true\n").unwrap();
         assert!(
-            read_pins(&store)
+            read_pins(&file)
                 .unwrap_err()
                 .ends_with("unknown key sonny; it pins provider and [daemon]")
         );
-        std::fs::write(pins_path(&store), "[daemon]\nidle_exit = \"10\"\n").unwrap();
-        assert!(read_pins(&store).unwrap_err().contains("daemon.idle_exit"));
+        std::fs::write(&file, "[daemon]\nidle_exit = \"10\"\n").unwrap();
+        assert!(read_pins(&file).unwrap_err().contains("daemon.idle_exit"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -465,9 +465,11 @@ existing store (`store_not_found` otherwise). These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an
 already running daemon. Startup flags configure a newly started daemon, and
 pin it: a start given `--provider` or a limit (`--max-*`, `--stall-timeout`,
-`--idle-exit`) writes them beside the store, in `STORE.daemon.toml`
+`--idle-exit`) writes them to `~/.agent/pins/`, one file per store named
+by its real path with each `/` written `%2F` and each `%` written `%25`
 (`provider` and a `[daemon]` table in `config.toml`'s keys, the user's
-alone), over what was pinned there, and every later start of that store,
+alone, where no sandboxed command writes), over what was pinned there,
+and every later start of that store,
 whoever asks for it (a client waiting on one of its bots, a gate, a window),
 reads them over `config.toml`. A scratch daemon started with its own limits
 starts again with them, never with the defaults; edit or delete the file to

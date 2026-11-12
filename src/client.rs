@@ -1116,12 +1116,14 @@ impl Start {
     }
 }
 
-/// How the daemon of `options`' store starts: what is pinned beside the
+/// How the daemon of `options`' store starts: what is pinned for the
 /// store, with the start flags this command was given over it (a
 /// `--provider` list replaces the pinned one whole).
 fn pinned(options: &Options) -> Result<agent_client::config::Pins> {
-    let mut pins =
-        agent_client::config::read_pins(&pinned_store(options)?).map_err(config_error)?;
+    let mut pins = match pins_file(options)? {
+        Some(file) => agent_client::config::read_pins(&file).map_err(config_error)?,
+        None => agent_client::config::Pins::default(),
+    };
     if options.providers_explicit {
         pins.provider = Some(options.providers.join(" "));
     }
@@ -1133,10 +1135,12 @@ fn pinned(options: &Options) -> Result<agent_client::config::Pins> {
     Ok(pins)
 }
 
-/// The store whose daemon `options` start, by its real path, as the daemon
-/// and its sandboxes name it: every name for one store shares its pins.
-fn pinned_store(options: &Options) -> Result<PathBuf> {
-    Ok(agent_client::socket::canonical_store(&options.store)?)
+/// Where the start flags of `options`' store are pinned, by its real path
+/// as the daemon names it, so every name for one store shares its pins;
+/// none with no home to keep them in.
+fn pins_file(options: &Options) -> Result<Option<PathBuf>> {
+    let store = agent_client::socket::canonical_store(&options.store)?;
+    Ok(agent_client::config::pins_path(&store))
 }
 
 /// A config file's error as this agent's, its code kept.
@@ -1153,7 +1157,7 @@ struct Started {
     log: std::ffi::OsString,
     /// Where its output starts in the log other starts append to.
     from: u64,
-    /// The store and the start flags to pin for it once this daemon, not
+    /// The pins file and the start flags to pin there once this daemon, not
     /// one that took the store before it, answers.
     pins: Option<(PathBuf, agent_client::config::Pins)>,
 }
@@ -1210,19 +1214,23 @@ fn spawn_daemon(
             .arg(format!("{}s", wait.as_secs()));
     }
     // Whoever starts it, the store's daemon starts the way a start given
-    // flags last started it: those flags are pinned beside the store, and
+    // flags last started it: those flags are pinned for the store, and
     // what was pinned goes over the person's `[daemon]` limits, worked out
     // for this machine.
     // They are pinned once this start's own daemon answers, so a start
     // that loses the store to another's pins nothing; pins that would not
     // read are refused before anything starts.
     let given = options.providers_explicit || !options.daemon_flags.is_empty();
-    let store = pinned_store(options)?;
-    let pins = (given && agent_client::config::read_pins(&store).ok() != Some(start.pins.clone()))
-        .then(|| (store, start.pins.clone()));
-    if let Some((store, pins)) = &pins {
-        agent_client::config::check_pins(store, pins).map_err(config_error)?;
-    }
+    let pins = match pins_file(options)? {
+        Some(file)
+            if given
+                && agent_client::config::read_pins(&file).ok().as_ref() != Some(&start.pins) =>
+        {
+            agent_client::config::check_pins(&file, &start.pins).map_err(config_error)?;
+            Some((file, start.pins.clone()))
+        }
+        _ => None,
+    };
     let mut limits = config()?.daemon;
     limits.extend(start.pins.daemon.clone());
     let limits = agent_client::config::daemon_flags(&limits)
@@ -1357,10 +1365,10 @@ impl Started {
     /// `connection`, once the start flags are pinned if it reached this
     /// start's own daemon.
     fn pin(&self, connection: Connection) -> Result<Connection> {
-        if let Some((store, pins)) = &self.pins
+        if let Some((file, pins)) = &self.pins
             && connection.ready["pid"].as_u64() == Some(u64::from(self.child.id()))
         {
-            agent_client::config::write_pins(store, pins).map_err(config_error)?;
+            agent_client::config::write_pins(file, pins).map_err(config_error)?;
         }
         Ok(connection)
     }

@@ -46,8 +46,8 @@ class SocketAndCliTests(ModelFixture):
             subprocess.run([*self.base, 'shutdown', '--store', str(self.store)], env=clean_env(),
                            capture_output=True, timeout=35)
 
-    def agent(self, *args, check=True, timeout=30, stdin=None):
-        result = subprocess.run([*self.base, *args], env=clean_env(), capture_output=True, text=True,
+    def agent(self, *args, check=True, timeout=30, stdin=None, env=None):
+        result = subprocess.run([*self.base, *args], env=env or clean_env(), capture_output=True, text=True,
                                 timeout=timeout, cwd=self.path, input=stdin)
         if check:
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
@@ -668,31 +668,37 @@ class SocketAndCliTests(ModelFixture):
             self.assertIn(f'does not accept {flag}', refused.stderr)
 
     def test_a_start_given_flags_pins_them_and_any_later_start_takes_them(self):
-        pins = Path(f'{self.store}.daemon.toml')
-        started = json.loads(self.agent('start', *self.common[:4], '--max-active', '3', '--idle-exit', '0').stdout)
+        home = self.path / 'home'
+        env = {**clean_env(), 'HOME': str(home)}
+        agent = lambda *args, **kw: self.agent(*args, env=env, **kw)
+        # With the person's settings, named by the store's real path.
+        name = str(self.store.resolve()).replace('%', '%25').replace('/', '%2F')
+        pins = home / '.agent' / 'pins' / f'{name}.toml'
+        started = json.loads(agent('start', *self.common[:4], '--max-active', '3', '--idle-exit', '0').stdout)
         self.assertEqual(started['limits']['active'], 3)
-        # Beside the store, its user's alone, in config.toml's keys.
+        # The person's alone, in config.toml's keys.
         self.assertEqual(pins.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(pins.parent.stat().st_mode & 0o777, 0o700)
         text = pins.read_text()
         self.assertIn(f'provider = "openai=responses,{self.url}"', text)
         self.assertIn('[daemon]\nactive = "3"\nidle_exit = "0"\n', text)
-        self.agent('shutdown', '--store', str(self.store))
+        agent('shutdown', '--store', str(self.store))
         # A command that starts the daemon with no flags (a client waiting on
         # a bot, a gate) starts it as its owner did, provider and all.
-        stats = json.loads(self.agent('stats', '--store', str(self.store)).stdout)
+        stats = json.loads(agent('stats', '--store', str(self.store)).stdout)
         self.assertEqual(stats['active_limit'], 3)
-        self.agent('shutdown', '--store', str(self.store))
+        agent('shutdown', '--store', str(self.store))
         # Flags given again pin again, over what was pinned.
         # A number pins as the file writes one, however the flag gave it.
-        again = json.loads(self.agent('start', '--store', str(self.store), '--max-active', '5', '--max-load', '2e0').stdout)
+        again = json.loads(agent('start', '--store', str(self.store), '--max-active', '5', '--max-load', '2e0').stdout)
         self.assertEqual(again['limits']['active'], 5)
         self.assertIn('[daemon]\nactive = "5"\nidle_exit = "0"\nload = "2"\n', pins.read_text())
-        self.agent('shutdown', '--store', str(self.store))
+        agent('shutdown', '--store', str(self.store))
         # A file that does not read is refused by name; nothing starts.
         pins.write_text('provider = "openai"\nmodel = "x"\n')
-        refused = self.agent('stats', '--store', str(self.store), check=False)
+        refused = agent('stats', '--store', str(self.store), check=False)
         self.assertEqual(json.loads(refused.stderr)['error'], 'config_invalid', refused.stderr)
-        self.assertIn('daemon.toml: unknown key model', refused.stderr)
+        self.assertIn('.toml: unknown key model', refused.stderr)
         self.assertFalse(self.socket.exists())
 
     def test_help_and_invalid_flags_do_not_start_a_daemon(self):
@@ -1259,26 +1265,6 @@ class SocketAndCliTests(ModelFixture):
             usage = self.agent('serve', '--store', str(self.path / 'other.sqlite'), '--provider', f'openai=responses,{self.url}',
                                *flags, check=False)
             self.assertEqual(json.loads(usage.stderr)['error'], 'usage', refused)
-
-    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
-    def test_a_bot_whose_folder_holds_the_store_cannot_write_its_pins(self):
-        daemon = SocketClient(self.binary, self.store, self.url, 'shell', env=clean_env())
-        self.addCleanup(daemon.close)
-        daemon.request('create', bot='Writer', workspace=str(self.path), settings={'sandbox': 'workspace-write'})
-        pins = Path(f'{self.store}.daemon.toml')
-        write = 'printf \'provider = "x"\\n\' > state.sqlite.daemon.toml 2>/dev/null || echo kept'
-        for exists in (False, True):
-            if exists:
-                # What a sandbox kept from being made may still be its empty
-                # placeholder, which a start writing pins takes away too.
-                if pins.is_dir():
-                    pins.rmdir()
-                pins.write_text('provider = "openai"\n')
-            ran = subprocess.run([str(self.binary), 'sandbox', '--store', str(self.store), '--socket', str(daemon.socket_path),
-                                  '--bot', 'Writer', '--', '/bin/sh', '-c', write],
-                                 env=clean_env(), capture_output=True, text=True, timeout=30, cwd=self.path)
-            self.assertEqual((ran.returncode, ran.stdout), (0, 'kept\n'), ran.stderr)
-        self.assertEqual(pins.read_text(), 'provider = "openai"\n')
 
     @unittest.skipUnless(shutil.which('bwrap'), 'placeholders are bubblewrap\'s')
     def test_a_lent_sandbox_s_placeholders_stay_while_any_command_mounts_them(self):
