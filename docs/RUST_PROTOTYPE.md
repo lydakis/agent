@@ -129,7 +129,14 @@ If concurrent clients race to start the daemon, losing `serve` processes exit
 the winner within the ten-second startup window, including during recovery.
 That single window starts before the first connection attempt and bounds both
 socket connection and the complete `ready` line, even if the listener keeps
-sending partial data. Other CLI commands also allow ten seconds to connect and
+sending partial data. A daemon listens from the moment its store is its own,
+before the store's own opening (an upgrade can make that minutes long): until
+it is ready, it greets each connection with
+`{"event":"starting","protocol":P,"pid":N}` as it comes and every two seconds
+after, then with `ready` as usual. Each `starting` line gives the client ten
+seconds more, so a command meeting a daemon that upgrades its store waits for
+it rather than taking it for none and starting another, which could only
+lose the store to it. Other CLI commands also allow ten seconds to connect and
 receive `ready`. Expiry returns `daemon_start_timeout`; after readiness, normal
 requests and event streams have no client read deadline.
 Other startup failures return immediately; contention is identified by exit
