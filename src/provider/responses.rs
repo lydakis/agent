@@ -38,6 +38,8 @@ pub struct State {
     usage: Option<Usage>,
     /// The completed response's id, for a socket's `previous_response_id`.
     id: Option<String>,
+    /// When the model began its first output item: what it took to start.
+    first_output: Option<tokio::time::Instant>,
 }
 
 impl State {
@@ -92,10 +94,15 @@ impl State {
             }
             // An item begins: a few bytes before its content streams.
             "response.output_item.added" => {
+                self.first_output
+                    .get_or_insert_with(tokio::time::Instant::now);
                 self.writing = event.item.and_then(|item| writing(item.get()));
                 Ok(Frame::Quiet)
             }
             "response.completed" => {
+                // Output that came only with the response came at its end.
+                self.first_output
+                    .get_or_insert_with(tokio::time::Instant::now);
                 let raw = event.response.ok_or(Error::new("missing_response"))?;
                 let streamed = std::mem::take(&mut self.items);
                 self.completion = Some(parse_completion_with_usage(
@@ -210,6 +217,10 @@ impl State {
         self.usage.clone()
     }
     /// The terminal event arrived; a socket reads no further for this call.
+    /// When the model began its output, if it has.
+    pub fn first_output(&self) -> Option<tokio::time::Instant> {
+        self.first_output
+    }
     pub fn done(&self) -> bool {
         self.completion.is_some()
     }
@@ -527,6 +538,16 @@ mod tests {
     #[test]
     fn reasoning_summaries_stream_and_usage_is_extracted() {
         let mut state = State::default();
+        // The response's start is not yet the model's output; its first
+        // item is.
+        state
+            .frame(br#"{"type":"response.created","response":{"id":"r1"}}"#)
+            .unwrap();
+        assert!(state.first_output().is_none());
+        state
+            .frame(br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}"#)
+            .unwrap();
+        assert!(state.first_output().is_some());
         let delta = state
             .frame(br#"{"type":"response.reasoning_summary_text.delta","delta":"hmm"}"#)
             .unwrap();
@@ -549,6 +570,9 @@ mod tests {
                 models: Vec::new(),
                 served_model: "gpt-test-2026-09-26".to_owned(),
                 context_window: 0,
+                model_ms: 0,
+                first_token_ms: 0,
+                daemon_ms: 0,
                 speed: Some(Speed::Standard),
             })
         );

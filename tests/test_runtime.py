@@ -1073,6 +1073,8 @@ class AnthropicRuntimeTests(unittest.TestCase):
         # Cache writes are recorded with the attempt that made them.
         usage[0].pop('sent_ms')
         usage[0].pop('context_window')
+        for key in ('model_ms', 'first_token_ms', 'daemon_ms'):
+            usage[0].pop(key, None)
         self.assertEqual(usage[0], {'input_tokens': 14, 'output_tokens': 11, 'cached_input_tokens': 2,
                                     'cache_write_tokens': 1, 'served_model': 'synthetic-fallback', 'models': [
             {'model': 'synthetic-claude', 'input_tokens': 7, 'output_tokens': 4, 'cached_input_tokens': 2},
@@ -1427,6 +1429,11 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(len(usage), 2)
         # Each call records when it was sent, in epoch milliseconds.
         sent = [u['data'].pop('sent_ms') for u in usage]
+        # And what each took, timed when it took a millisecond or more.
+        for u in usage:
+            took = u['data'].pop('model_ms', 0)
+            self.assertLessEqual(u['data'].pop('first_token_ms', 0), took)
+            u['data'].pop('daemon_ms', None)
         self.assertTrue(before - 1 <= sent[0] <= sent[1] <= after + 1, (before, sent, after))
         # The call names the dated model that answered, not only the one asked,
         # and the model's context window, for a client to say how full it is.

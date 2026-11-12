@@ -78,17 +78,30 @@ pub struct Spent {
     pub cost: f64,
     /// How many of the models in it the price sheet names no price for.
     pub unpriced: u64,
+    /// Its timed calls, their output, and their time from send to answer
+    /// and to the start of output; and the daemon's own time before calls.
+    pub timed: u64,
+    pub timed_output: u64,
+    pub model_ms: u64,
+    pub first_ms: u64,
+    pub daemon_ms: u64,
 }
 
 impl Spent {
     fn of(row: &Value) -> Self {
         let input = row["input_tokens"].as_u64().unwrap_or(0);
         let cached = row["cached_input_tokens"].as_u64().unwrap_or(0).min(input);
+        let count = |key: &str| row[key].as_u64().unwrap_or(0);
         Self {
-            turns: row["turns"].as_u64().unwrap_or(0),
-            output: row["output_tokens"].as_u64().unwrap_or(0),
+            turns: count("turns"),
+            output: count("output_tokens"),
             fresh: input - cached,
             cached,
+            timed: count("timed_rounds"),
+            timed_output: count("timed_output_tokens"),
+            model_ms: count("model_ms"),
+            first_ms: count("first_token_ms"),
+            daemon_ms: count("daemon_ms"),
             ..Self::default()
         }
     }
@@ -99,6 +112,11 @@ impl Spent {
         self.cached += other.cached;
         self.cost += other.cost;
         self.unpriced += other.unpriced;
+        self.timed += other.timed;
+        self.timed_output += other.timed_output;
+        self.model_ms += other.model_ms;
+        self.first_ms += other.first_ms;
+        self.daemon_ms += other.daemon_ms;
     }
     /// A model's `row`, priced from `prices` by its `PROVIDER/MODEL` at
     /// the speed that served it.
@@ -416,6 +434,7 @@ impl View {
         // the same model from one provider, as two Bedrock regions' or a
         // longer window's, are one row.
         self.sort(&mut models);
+        let speed = speeds(&models[..models.len().min(LISTED)], &total, width);
         if models.len() > LISTED {
             let mut more = Spent::default();
             let n = models.len() - LISTED;
@@ -426,6 +445,7 @@ impl View {
         }
         out.push(Line::default());
         out.extend(self.bars("By model", &models, &total, width, costs));
+        out.extend(speed);
         // What Sonny's own features started, by the origin it gave their
         // turns; one with none was a prompt, a person's or an agent's.
         // An automation's turns from before 0.8.0 say `trigger`: one row.
@@ -631,6 +651,59 @@ impl View {
 type Row = (String, String, Spent);
 
 /// `spent` onto the row with `name` and `detail`, or a new row.
+/// How fast each model answered its timed calls: its output tokens a
+/// second from send to answer, and its time to first output, on average;
+/// and the daemon's own time before each call. Nothing when no call in the
+/// window was timed.
+fn speeds(models: &[Row], total: &Spent, width: usize) -> Vec<Line<'static>> {
+    let timed: Vec<&Row> = (models.iter())
+        .filter(|(_, _, spent)| spent.timed > 0 && spent.model_ms > 0)
+        .collect();
+    if timed.is_empty() {
+        return Vec::new();
+    }
+    let figures = 30;
+    let name_width = (timed.iter().map(|(name, _, _)| name.width()))
+        .max()
+        .unwrap_or(0)
+        .clamp(6, 28)
+        .min(width.saturating_sub(figures + 2).max(6));
+    let mut out = vec![Line::default(), Line::from("Speed").bold()];
+    for (name, _, spent) in timed {
+        let per_second = spent.timed_output * 1000 / spent.model_ms;
+        out.push(Line::from(vec![
+            Span::raw(format!(
+                "{:<name_width$}  ",
+                crate::transcript::cut(name, name_width)
+            )),
+            Span::raw(format!("{per_second:>5} tok/s")),
+            Span::raw(format!(
+                "  {:>6} to first",
+                took(spent.first_ms / spent.timed)
+            ))
+            .dim(),
+        ]));
+    }
+    if let Some(each) = total.daemon_ms.checked_div(total.timed) {
+        out.push(Line::from(vec![
+            Span::raw(format!("{:<name_width$}  ", "daemon")),
+            Span::raw(format!("{:>11}", took(each))),
+            Span::raw("  before each call").dim(),
+        ]));
+    }
+    out
+}
+
+/// A time in milliseconds, in a few characters.
+fn took(ms: u64) -> String {
+    match ms {
+        0 => "<1 ms".to_owned(),
+        ms if ms < 1000 => format!("{ms} ms"),
+        ms if ms < 10_000 => format!("{:.1} s", ms as f64 / 1000.0),
+        ms => format!("{} s", ms / 1000),
+    }
+}
+
 fn add(rows: &mut Vec<Row>, name: String, detail: String, spent: Spent) {
     match (rows.iter_mut()).find(|(n, d, _)| *n == name && *d == detail) {
         Some((_, _, sum)) => sum.add(spent),
@@ -904,6 +977,49 @@ mod tests {
         // With room, the provider stays beside the model.
         let card = text(&view.card(100));
         assert!(card.contains("bedrock"), "{card}");
+    }
+
+    #[test]
+    fn each_model_says_how_fast_it_answered_and_the_daemon_its_own_time() {
+        let timed = |timed, timed_output, model_ms, first_ms| Spent {
+            output: timed_output,
+            timed,
+            timed_output,
+            model_ms,
+            first_ms,
+            ..Spent::default()
+        };
+        let rows: Vec<Row> = vec![
+            (
+                "Opus 5.5".into(),
+                "anthropic".into(),
+                timed(4, 6_000, 100_000, 5_600),
+            ),
+            (
+                "GPT-6 Sol · fast".into(),
+                "openai".into(),
+                timed(2, 3_000, 20_000, 1_200),
+            ),
+            // Calls from before the daemon timed them say nothing.
+            ("Haiku 5.5".into(), "anthropic".into(), timed(0, 0, 0, 0)),
+        ];
+        let total = Spent {
+            timed: 6,
+            daemon_ms: 54,
+            ..Spent::default()
+        };
+        let card = text(&speeds(&rows, &total, 80));
+        // In the order the models' spend lists them.
+        assert_eq!(
+            card.lines().skip(1).collect::<Vec<_>>(),
+            [
+                "Speed",
+                "Opus 5.5             60 tok/s   1.4 s to first",
+                "GPT-6 Sol · fast    150 tok/s  600 ms to first",
+                "daemon                   9 ms  before each call",
+            ]
+        );
+        assert!(speeds(&rows[2..], &total, 80).is_empty());
     }
 
     #[test]

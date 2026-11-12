@@ -490,11 +490,31 @@ pub struct Usage {
     /// the conversation is. Set by the turn that knows it; zero when unknown.
     #[serde(skip_serializing_if = "is_zero")]
     pub context_window: u64,
+    /// What the call took from its send to the end of the model's answer,
+    /// and to the start of its output, in milliseconds; and how long the
+    /// daemon itself took before the send, since the turn's work resumed or
+    /// the model's last answer in it, less the calls it ran and pacing.
+    /// Set by the turn that times them; zero when untimed.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub model_ms: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub first_token_ms: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub daemon_ms: u64,
     /// The tier that served the call: the one the provider says (Claude's
     /// `usage.speed`, OpenAI's `service_tier`), which can be standard
     /// though a faster one was asked, else the one the call asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<Speed>,
+}
+impl Usage {
+    /// The output of the attempt that answered, which `model_ms` times:
+    /// the last of `models` after a fallback, else the whole call's.
+    pub fn timed_output_tokens(&self) -> u64 {
+        self.models
+            .last()
+            .map_or(self.output_tokens, |m| m.output_tokens)
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelTokens {
@@ -615,15 +635,28 @@ pub struct Request<'a> {
 
 /// When a request was last sent: a socket continuation the server forgot is
 /// sent again in full, and that send is the one that reads the cache and
-/// is billed.
+/// is billed. And when the model began its output in answer to that send.
 #[derive(Debug, Default)]
-pub struct Sent(std::sync::Mutex<Option<tokio::time::Instant>>);
+pub struct Sent(std::sync::Mutex<(Option<tokio::time::Instant>, Option<tokio::time::Instant>)>);
 impl Sent {
     fn mark(&self) {
-        *self.0.lock().unwrap() = Some(tokio::time::Instant::now());
+        *self.0.lock().unwrap() = (Some(tokio::time::Instant::now()), None);
+    }
+    fn began(&self, at: Option<tokio::time::Instant>) {
+        self.0.lock().unwrap().1 = at;
     }
     pub fn get(&self) -> Option<tokio::time::Instant> {
-        *self.0.lock().unwrap()
+        self.0.lock().unwrap().0
+    }
+    /// What the model's answer to the last send took: in all, and until
+    /// its output began, if it did.
+    pub fn timing(&self) -> Option<(Duration, Option<Duration>)> {
+        let (sent, began) = *self.0.lock().unwrap();
+        let sent = sent?;
+        Some((
+            sent.elapsed(),
+            began.map(|at| at.saturating_duration_since(sent)),
+        ))
     }
 }
 
@@ -655,6 +688,12 @@ impl Parser {
         match self {
             Parser::Responses(state) => state.usage(),
             Parser::Anthropic(state) => state.usage(),
+        }
+    }
+    fn first_output(&self) -> Option<tokio::time::Instant> {
+        match self {
+            Parser::Responses(state) => state.first_output(),
+            Parser::Anthropic(state) => state.first_output(),
         }
     }
     fn finish(self) -> Result<Completion> {
@@ -1599,6 +1638,9 @@ impl Provider {
             result
         };
         report.usage = parser.usage();
+        if let Some(sent) = sent {
+            sent.began(parser.first_output());
+        }
         reservation.settle_usage(report.usage.as_ref(), estimate, self.family);
         // An overload or rate limit inside the stream tells the pool what
         // the same refusal before it would.
@@ -1790,6 +1832,9 @@ impl Provider {
             }
         };
         report.usage = parser.usage();
+        if let Some(sent) = sent {
+            sent.began(parser.first_output());
+        }
         let mut keep = bot.is_some();
         let completed = match outcome {
             Ok(()) => {

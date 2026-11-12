@@ -138,6 +138,7 @@ fn run() -> Result<i32> {
         SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
         // Before the runtime's threads: every one shares the limit.
         agent_runtime::open_files::raise();
+        agent_runtime::footprint::start();
         let config = configuration(&args[1..])?;
         runtime()?.block_on(server::run(config))?;
         Ok(0)

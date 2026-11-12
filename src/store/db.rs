@@ -2332,6 +2332,8 @@ struct Spent {
     input_tokens: i64,
     cached_input_tokens: i64,
     output_tokens: i64,
+    /// The daemon's own time before the turns' calls.
+    daemon_ms: i64,
 }
 impl Spent {
     fn add(&mut self, other: &Spent) {
@@ -2339,14 +2341,24 @@ impl Spent {
         self.input_tokens += other.input_tokens;
         self.cached_input_tokens += other.cached_input_tokens;
         self.output_tokens += other.output_tokens;
+        self.daemon_ms += other.daemon_ms;
     }
     fn tokens(&self) -> i64 {
         self.input_tokens + self.output_tokens
     }
     fn json(&self) -> Value {
         json!({"turns":self.turns,"input_tokens":self.input_tokens,
-            "cached_input_tokens":self.cached_input_tokens,"output_tokens":self.output_tokens})
+            "cached_input_tokens":self.cached_input_tokens,"output_tokens":self.output_tokens,
+            "daemon_ms":self.daemon_ms})
     }
+}
+/// What timed calls took, as `usage` reports it: how many, their output,
+/// and their time from send to answer and to the start of output.
+fn timing(row: &mut Value, [rounds, output, model_ms, first_token_ms]: [i64; 4]) {
+    row["timed_rounds"] = json!(rounds);
+    row["timed_output_tokens"] = json!(output);
+    row["model_ms"] = json!(model_ms);
+    row["first_token_ms"] = json!(first_token_ms);
 }
 /// The share of input tokens the provider served from its prompt cache,
 /// to three places; zero when nothing was sent.
@@ -2552,7 +2564,7 @@ impl Database {
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 94;
+    pub const SCHEMA: i32 = 95;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -2787,13 +2799,15 @@ impl Database {
                 retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
                 summary_ms INTEGER NOT NULL DEFAULT 0, reply_node INTEGER,
                 work INTEGER NOT NULL DEFAULT 0, limited TEXT, drops INTEGER NOT NULL DEFAULT 0,
-                error TEXT);
+                error TEXT, daemon_ms INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE INDEX IF NOT EXISTS turns_started_ms ON turns(started_ms);
             CREATE TABLE IF NOT EXISTS turn_models(turn INTEGER NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
                 model TEXT NOT NULL, speed TEXT NOT NULL DEFAULT 'standard', input_tokens INTEGER NOT NULL DEFAULT 0,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+                timed_rounds INTEGER NOT NULL DEFAULT 0, timed_output_tokens INTEGER NOT NULL DEFAULT 0,
+                model_ms INTEGER NOT NULL DEFAULT 0, first_token_ms INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(turn,model,speed)) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS retained_turns(turn INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
                 bot TEXT NOT NULL REFERENCES bots(name));
@@ -13991,7 +14005,7 @@ impl Database {
         let snapshot = self.conn.unchecked_transaction()?;
         let mut statement = snapshot.prepare_cached(&format!(
             "SELECT t.bot,b.id,(t.started_ms-?1)/?2,COUNT(*),SUM(t.input_tokens),
-                    SUM(t.cached_input_tokens),SUM(t.output_tokens),m.origin
+                    SUM(t.cached_input_tokens),SUM(t.output_tokens),m.origin,SUM(t.daemon_ms)
              FROM turns t JOIN bots b ON b.name=t.bot JOIN messages m ON m.id=t.id
              WHERE t.started_ms>=?1{glob} GROUP BY 1,3,8"
         ))?;
@@ -14012,6 +14026,7 @@ impl Database {
                 input_tokens: r.get(4)?,
                 cached_input_tokens: r.get(5)?,
                 output_tokens: r.get(6)?,
+                daemon_ms: r.get(8)?,
             };
             total.add(&spent);
             let bot = bots.entry(r.get(0)?).or_default();
@@ -14026,7 +14041,8 @@ impl Database {
         let mut statement = snapshot.prepare_cached(&format!(
             "SELECT m.model,COUNT(*),SUM(m.input_tokens),SUM(m.cached_input_tokens),
                     SUM(m.output_tokens),SUM(m.cache_write_tokens),SUM(m.cache_write_1h_tokens),
-                    m.speed
+                    m.speed,SUM(m.timed_rounds),SUM(m.timed_output_tokens),SUM(m.model_ms),
+                    SUM(m.first_token_ms)
              FROM turns t CROSS JOIN turn_models m ON m.turn=t.id
              WHERE t.started_ms>=?1{glob} GROUP BY 1,8"
         ))?;
@@ -14042,15 +14058,21 @@ impl Database {
         // Each model's spend at each speed, and its cache writes: 5-minute
         // and hour. The window's turns lead, each one's rows found by its
         // key.
-        let mut models: Vec<(String, Spent, i64, i64, String)> = Vec::new();
+        // And what its timed calls took: rounds, their output, the time
+        // from send to answer and to the start of output.
+        let mut models: Vec<(String, Spent, i64, i64, String, [i64; 4])> = Vec::new();
+        let mut timed = [0i64; 4];
         while let Some(r) = rows.next()? {
             let spent = Spent {
                 turns: r.get(1)?,
                 input_tokens: r.get(2)?,
                 cached_input_tokens: r.get(3)?,
                 output_tokens: r.get(4)?,
+                daemon_ms: 0,
             };
-            models.push((r.get(0)?, spent, r.get(5)?, r.get(6)?, r.get(7)?));
+            let times = [r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?];
+            (timed.iter_mut().zip(times)).for_each(|(sum, time)| *sum += time);
+            models.push((r.get(0)?, spent, r.get(5)?, r.get(6)?, r.get(7)?, times));
         }
         let mut bots: Vec<(String, i64, Spent)> = bots
             .into_iter()
@@ -14070,6 +14092,7 @@ impl Database {
         let mut origins: Vec<(Option<String>, Spent)> = origins.into_iter().collect();
         origins.sort_by(|a, b| b.1.tokens().cmp(&a.1.tokens()).then_with(|| a.0.cmp(&b.0)));
         let mut out = total.json();
+        timing(&mut out, timed);
         out["since_ms"] = json!(since_ms);
         out["bucket_ms"] = json!(bucket_ms);
         out["bots"] = bots
@@ -14091,12 +14114,17 @@ impl Database {
         };
         out["models"] = models
             .iter()
-            .map(|(model, spent, written, hourly, speed)| {
+            .map(|(model, spent, written, hourly, speed, times)| {
                 let mut row = spent.json();
                 row["model"] = json!(model);
                 row["speed"] = json!(speed);
                 row["cache_write_tokens"] = json!(written);
                 row["cache_write_1h_tokens"] = json!(hourly);
+                timing(&mut row, *times);
+                if let Some(row) = row.as_object_mut() {
+                    // The daemon's time is the turn's, not a model's.
+                    row.remove("daemon_ms");
+                }
                 row
             })
             .collect();
@@ -14366,13 +14394,14 @@ fn record_usage_for(
     spent_by_model(conn, turn, usage)?;
     conn.prepare_cached(
         "UPDATE turns SET input_tokens=input_tokens+?,output_tokens=output_tokens+?,
-             cached_input_tokens=cached_input_tokens+?,work=work+? WHERE id=?",
+             cached_input_tokens=cached_input_tokens+?,work=work+?,daemon_ms=daemon_ms+? WHERE id=?",
     )?
     .execute(params![
         usage.input_tokens as i64,
         usage.output_tokens as i64,
         usage.cached_input_tokens as i64,
         work as i64,
+        usage.daemon_ms as i64,
         turn
     ])?;
     conn.prepare_cached(
@@ -14394,15 +14423,18 @@ fn record_usage_for(
 /// served it: the turn's own model, unless the call names its attempts, as
 /// a summary, a refused request's fallback, or a provider-side fallback
 /// does. An attempt that names no provider binding ran on the turn's. One
-/// keyed upsert per model, in the transaction that records the call.
+/// keyed upsert per model, in the transaction that records the call. A
+/// timed call's time goes to the model that answered it: its own, or the
+/// last of its attempts.
 fn spent_by_model(conn: &Connection, turn: i64, usage: &Usage) -> Result<()> {
     let speed = usage.speed.map_or("standard", crate::provider::Speed::name);
     let mut upsert = conn.prepare_cached(
         "INSERT INTO turn_models(turn,model,speed,input_tokens,cached_input_tokens,
-             cache_write_tokens,cache_write_1h_tokens,output_tokens)
+             cache_write_tokens,cache_write_1h_tokens,output_tokens,
+             timed_rounds,timed_output_tokens,model_ms,first_token_ms)
          SELECT id,CASE WHEN ?3 IS NULL THEN model
                   ELSE COALESCE(?2,substr(model,1,instr(model,'/')-1))||'/'||?3 END,
-                ?9,?4,?5,?6,?7,?8
+                ?9,?4,?5,?6,?7,?8,?10>0,CASE WHEN ?10>0 THEN ?8 ELSE 0 END,?10,?11
          FROM (SELECT t.id,COALESCE(t.model,t.bot_model,b.provider||'/'||b.model) AS model
                FROM turns t JOIN bots b ON b.name=t.bot WHERE t.id=?1)
          WHERE true
@@ -14411,9 +14443,18 @@ fn spent_by_model(conn: &Connection, turn: i64, usage: &Usage) -> Result<()> {
              cached_input_tokens=cached_input_tokens+excluded.cached_input_tokens,
              cache_write_tokens=cache_write_tokens+excluded.cache_write_tokens,
              cache_write_1h_tokens=cache_write_1h_tokens+excluded.cache_write_1h_tokens,
-             output_tokens=output_tokens+excluded.output_tokens",
+             output_tokens=output_tokens+excluded.output_tokens,
+             timed_rounds=timed_rounds+excluded.timed_rounds,
+             timed_output_tokens=timed_output_tokens+excluded.timed_output_tokens,
+             model_ms=model_ms+excluded.model_ms,
+             first_token_ms=first_token_ms+excluded.first_token_ms",
     )?;
+    let timed = |last: bool| match last {
+        true => (usage.model_ms as i64, usage.first_token_ms as i64),
+        false => (0, 0),
+    };
     if usage.models.is_empty() {
+        let (model_ms, first_token_ms) = timed(true);
         upsert.execute(params![
             turn,
             None::<&str>,
@@ -14423,10 +14464,14 @@ fn spent_by_model(conn: &Connection, turn: i64, usage: &Usage) -> Result<()> {
             usage.cache_write_tokens as i64,
             usage.cache_write_1h_tokens as i64,
             usage.output_tokens as i64,
-            speed
+            speed,
+            model_ms,
+            first_token_ms
         ])?;
     }
-    for attempt in &usage.models {
+    let last = usage.models.len().saturating_sub(1);
+    for (at, attempt) in usage.models.iter().enumerate() {
+        let (model_ms, first_token_ms) = timed(at == last);
         upsert.execute(params![
             turn,
             attempt.provider.as_deref(),
@@ -14436,7 +14481,9 @@ fn spent_by_model(conn: &Connection, turn: i64, usage: &Usage) -> Result<()> {
             attempt.cache_write_tokens as i64,
             attempt.cache_write_1h_tokens as i64,
             attempt.output_tokens as i64,
-            speed
+            speed,
+            model_ms,
+            first_token_ms
         ])?;
     }
     Ok(())
@@ -17053,6 +17100,33 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
         )?;
         if !has {
             conn.execute_batch("ALTER TABLE bots ADD COLUMN refused_summary TEXT;")?;
+        }
+    }
+
+    // Schema 95: what each model's calls took, from send to answer and to
+    // the start of its output, over the rounds timed and their output; and
+    // the daemon's own time before a turn's calls.
+    if from < 95 {
+        for (table, column) in [
+            ("turn_models", "timed_rounds INTEGER NOT NULL DEFAULT 0"),
+            (
+                "turn_models",
+                "timed_output_tokens INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("turn_models", "model_ms INTEGER NOT NULL DEFAULT 0"),
+            ("turn_models", "first_token_ms INTEGER NOT NULL DEFAULT 0"),
+            ("turns", "daemon_ms INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let name = column.split_once(' ').map_or(column, |(name, _)| name);
+            let (made, has): (bool, bool) = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1),
+                    EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+                params![table, name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if made && !has {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column};"))?;
+            }
         }
     }
 

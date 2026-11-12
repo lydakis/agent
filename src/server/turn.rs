@@ -298,13 +298,17 @@ enum Ran<F, T = Outcome> {
     Lifted(std::pin::Pin<Box<F>>),
 }
 
-/// Provider-reported tokens across every turn since the daemon started:
-/// three relaxed atomics, no lock, no storage read for `stats`.
+/// Provider-reported tokens across every turn since the daemon started,
+/// and what the timed calls took: relaxed atomics, no lock, no storage
+/// read for `stats`.
 #[derive(Default)]
 pub struct TokenTotals {
     input: std::sync::atomic::AtomicU64,
     cached_input: std::sync::atomic::AtomicU64,
     output: std::sync::atomic::AtomicU64,
+    /// Timed calls, their output, and their model, first-output and
+    /// daemon time, as `usage` sums them.
+    timed: [std::sync::atomic::AtomicU64; 5],
 }
 impl TokenTotals {
     pub fn add(&self, usage: &agent_runtime::provider::Usage) {
@@ -312,6 +316,18 @@ impl TokenTotals {
         self.cached_input
             .fetch_add(usage.cached_input_tokens, Relaxed);
         self.output.fetch_add(usage.output_tokens, Relaxed);
+        if usage.model_ms > 0 {
+            let times = [
+                1,
+                usage.timed_output_tokens(),
+                usage.model_ms,
+                usage.first_token_ms,
+                usage.daemon_ms,
+            ];
+            for (total, time) in self.timed.iter().zip(times) {
+                total.fetch_add(time, Relaxed);
+            }
+        }
     }
     pub fn snapshot(&self) -> serde_json::Value {
         let (input, cached, output) = (
@@ -319,8 +335,12 @@ impl TokenTotals {
             self.cached_input.load(Relaxed),
             self.output.load(Relaxed),
         );
+        let [rounds, timed_output, model_ms, first_token_ms, daemon_ms] =
+            self.timed.each_ref().map(|total| total.load(Relaxed));
         json!({"input_tokens":input,"cached_input_tokens":cached,"output_tokens":output,
-            "cache_hit":agent_runtime::store::cache_hit(cached as i64, input as i64)})
+            "cache_hit":agent_runtime::store::cache_hit(cached as i64, input as i64),
+            "timed_rounds":rounds,"timed_output_tokens":timed_output,"model_ms":model_ms,
+            "first_token_ms":first_token_ms,"daemon_ms":daemon_ms})
     }
 }
 
@@ -387,6 +407,11 @@ struct Accounting {
     held_since: Option<u64>,
     /// The limit the call goes to without tool calls, if one does.
     limit: Option<Limit>,
+    /// The daemon's own clock toward the next call: since when it runs
+    /// (the segment's start, or the model's last answer), how long of
+    /// that went to the calls it ran, and what summaries had held the turn
+    /// when it began. A summary's own accounting keeps none.
+    since: Option<(tokio::time::Instant, std::time::Duration, u64)>,
 }
 impl Accounting {
     /// Park on a cause a person can fix: the call is tried again after the
@@ -414,6 +439,20 @@ impl Accounting {
     /// Until when a summary is not tried again, if later than now.
     fn summary_retry(&self) -> Option<u64> {
         Some(self.summary_retry_at).filter(|at| now_ms() < *at)
+    }
+    /// The daemon's clock runs again from now.
+    fn restart(&mut self, held_ms: u64) {
+        self.since = Some((
+            tokio::time::Instant::now(),
+            std::time::Duration::ZERO,
+            held_ms,
+        ));
+    }
+    /// Time from `started` went to calls the daemon ran, not to itself.
+    fn ran_calls(&mut self, started: tokio::time::Instant) {
+        if let Some((_, aside, _)) = &mut self.since {
+            *aside += started.elapsed();
+        }
     }
     fn begin(&mut self, retrying: bool) {
         (self.retries, self.paced_ms) = self.totals();
@@ -2742,6 +2781,7 @@ impl Turn {
         accounting: &mut Accounting,
         landed: &mut Option<Landed>,
     ) -> Result<Round> {
+        accounting.restart(self.side.summary_ms.load(Relaxed));
         let (bot, turn) = (self.bot.clone(), self.turn);
         let mut record = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
         let context = self.store.op("context", move |db| db.context(turn)).await?;
@@ -2990,6 +3030,7 @@ impl Turn {
                 // Calls that followed in the same model response, run as
                 // their round was announced, whatever the rules say now.
                 self.set_ruled(Some(Arc::new(waiting.rules())));
+                let ran = tokio::time::Instant::now();
                 let stop = self
                     .execute_calls(
                         waiting.pending.clone(),
@@ -3002,6 +3043,7 @@ impl Turn {
                         accounting.summary_retry(),
                     )
                     .await;
+                accounting.ran_calls(ran);
                 self.set_ruled(None);
                 if let Some(stop) = stop? {
                     return Ok(stop.round());
@@ -3630,6 +3672,7 @@ impl Turn {
                 return Ok(Round::Finished);
             }
             let summary_retry = accounting.summary_retry();
+            let ran = tokio::time::Instant::now();
             let stop = self
                 .execute_calls(
                     response.calls,
@@ -3641,8 +3684,9 @@ impl Turn {
                     accounting.route.get().map(String::as_str),
                     summary_retry,
                 )
-                .await?;
-            if let Some(stop) = stop {
+                .await;
+            accounting.ran_calls(ran);
+            if let Some(stop) = stop? {
                 return Ok(stop.round());
             }
             // A summary installed after the call replaced the view it sent.
@@ -3806,6 +3850,18 @@ impl Turn {
         let summary = !matches!(body, Body::Window(_));
         accounting.compaction = summary;
         let started = std::time::Instant::now();
+        // The daemon's own time before the turn's call: since its clock
+        // began, less the calls it ran and the summaries that held the
+        // turn. A summary's call counts its own preparing alone: the
+        // turn's next call counts the time around it.
+        let held_ms = self.side.summary_ms.load(Relaxed);
+        let before = (accounting.since).filter(|_| !summary).map_or(
+            std::time::Duration::ZERO,
+            |(since, aside, held)| {
+                let held = std::time::Duration::from_millis(held_ms.saturating_sub(held));
+                since.elapsed().saturating_sub(aside + held)
+            },
+        );
         let mut attempt = std::mem::take(&mut accounting.call_attempts);
         let prior_spent =
             std::time::Duration::from_millis(std::mem::take(&mut accounting.call_spent_ms));
@@ -3834,6 +3890,9 @@ impl Turn {
         // A budget a failed attempt spent, said once its retry goes.
         let mut announce = None;
         loop {
+            // This attempt's own time runs from here: its notices, its
+            // items (a summary's read the store) and its send.
+            let prepared = tokio::time::Instant::now();
             // A stopping daemon sends no request, first or retry, and the
             // turn parks as at a boundary.
             if self.stopping.load(Relaxed) {
@@ -3920,7 +3979,17 @@ impl Turn {
                     &mut accounting.report,
                 );
             let result = call.await;
+            // The daemon's clock runs again from the answer to the turn's
+            // own call, whatever it was.
+            if accounting.since.is_some() && !summary {
+                accounting.restart(self.side.summary_ms.load(Relaxed));
+            }
             let sent_ms = sent.get().map_or(0, epoch_ms);
+            // This attempt's own time up to its send, less its pacing.
+            let preparing = (sent.get())
+                .map(|at| at.saturating_duration_since(prepared))
+                .unwrap_or_default()
+                .saturating_sub(std::time::Duration::from_millis(accounting.report.paced_ms));
             let error = match result {
                 Ok(mut completion) => {
                     if let Some(to) = &fallback {
@@ -3933,6 +4002,11 @@ impl Turn {
                     if let Some(usage) = &mut completion.usage {
                         usage.sent_ms = sent_ms;
                         usage.context_window = self.window.get().copied().unwrap_or(0);
+                        if let Some((took, began)) = sent.timing() {
+                            usage.model_ms = took.as_millis() as u64;
+                            usage.first_token_ms = began.map_or(0, |b| b.as_millis() as u64);
+                            usage.daemon_ms = (before + preparing).as_millis() as u64;
+                        }
                         self.tokens.add(usage);
                     }
                     for (from, to) in &completion.fallbacks {
