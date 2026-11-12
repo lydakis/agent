@@ -134,14 +134,15 @@ more turns is not here, because its work changes with its speed; it is under
   Because every call should run, this says nothing about false allows.
   [Record](../sonny/REVIEWER.md#measured).
 - **Five harnesses, same synthetic work.** 32 agents, three turns each adding
-  64 KiB: Agent 30.4 MiB peak and 0.75 s CPU, Pi 1.4.0 155 MiB and 2.0 s,
-  Codex 0.166.0 368 MiB and 9.3 s, opencode 1.19.5 869 MiB and 13.8 s, Claude
-  Code 2.1.316 6,257 MiB and 36.8 s. Exploratory, not a ranking: the
-  harnesses do unequal work. Codex now reaches 30 to 32 of 32 concurrent
-  streams (0.153.1: 8 to 10, at 35.5 s CPU); Claude Code still reaches only
-  26 to 28. Agent is unchanged within host drift from the 2026-10-30 screen
-  (28.9 MiB, 0.65 s at `2182b4a`) after the 2026-10-31 daemon work. Linux VM,
-  main `70637f9`, 2026-11-01.
+  64 KiB: Agent 26.6 MiB peak and 0.24 s CPU, Pi 1.4.0 156 MiB and 1.1 s,
+  Codex 0.166.0 315 MiB and 6.8 s, opencode 1.19.5 854 MiB and 9.4 s, Claude
+  Code 2.1.316 5,226 MiB and 23.8 s. Exploratory, not a ranking: the
+  harnesses do unequal work. Every harness reached all 32 concurrent streams.
+  Agent was 30.4 MiB and 0.75 s in the 2026-11-01 screen (main `70637f9`).
+  Rerun side by side the same day, `70637f9` measured 30.6 MiB, 0.9.0 26.8
+  and main 28.8 at the top case, and 22.6, 17.2 and 18.3 MiB at one agent:
+  0.9.0 cut 4 to 5 MiB, and main's extra over 0.9.0 is code pages of a larger
+  binary. Linux VM, main `987a276`, 2026-11-12.
   [Record](HARNESS_MEASUREMENTS.md).
 - **Pi Durable on the durable lifecycle.** 32 named conversations, three
   turns each, both engines syncing every commit (`synchronous=FULL`, which
