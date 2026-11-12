@@ -143,19 +143,23 @@ pub fn pull_requests(text: &str) -> Vec<String> {
     found
 }
 
+/// The mark an agent at rest reads with: open, as it may be given work,
+/// where one marked done reads `✓`.
+pub const IDLE_MARK: &str = "○";
+
 /// The mark and colour a state reads with.
 pub fn mark(state: &str) -> Span<'static> {
     match state {
         "working" => Span::raw("● ").fg(Color::Cyan),
         "needs you" => Span::raw("? ").fg(Color::Yellow).bold(),
-        crate::started::IDLE | "completed" => Span::raw("✓ ").fg(Color::Green),
+        crate::started::IDLE | "completed" => Span::raw("○ ").fg(Color::Green),
         crate::started::DONE => Span::raw("✓ ").dim(),
         crate::started::QUIET => Span::raw("✓ ").dim(),
         "failed" => Span::raw("✗ ").fg(Color::Red),
         s if s.starts_with("waiting") || s == "queued" || s == "rate limited" => {
             Span::raw("◌ ").dim()
         }
-        _ => Span::raw("○ ").dim(),
+        _ => Span::raw("· ").dim(),
     }
 }
 
@@ -298,6 +302,11 @@ fn tally(listed: &[&Row]) -> Counts {
         idle: n(Group::Idle),
         done: n(Group::Done),
     }
+}
+
+/// The agents `rows` lists, by their own names.
+pub fn bots(rows: &[Row]) -> std::collections::HashSet<String> {
+    rows.iter().map(|row| row.bot.clone()).collect()
 }
 
 /// See [`Card`].
@@ -852,7 +861,7 @@ mod tests {
         let idle = card("calc", &rows, 80, &[Group::Idle], Details::Quiet, &[]);
         let lines = text(&idle);
         assert_eq!(lines[10].width(), 80);
-        assert!(lines[10].starts_with(" ✓ equal idle · took 42s "));
+        assert!(lines[10].starts_with(" ○ equal idle · took 42s "));
         assert!(lines[10].ends_with(" 2 reviews · o/r#9"), "{}", lines[10]);
         assert!(!lines[10].contains("tab 2") && !lines[10].contains('▲'));
         // More: what each tracks at its right.
@@ -876,7 +885,7 @@ mod tests {
         assert_eq!(lines[9], "Idle · 1 ▾");
         assert_eq!(
             lines[10],
-            " ✓ equal idle · took 42s          ▲ · 2 reviews · o/r#9 · ↻ 1 automation · tab 2"
+            " ○ equal idle · took 42s          ▲ · 2 reviews · o/r#9 · ↻ 1 automation · tab 2"
         );
         assert_eq!(lines[12], "Done · 1 ▸");
         assert_eq!(lines.len(), 13);
@@ -954,8 +963,8 @@ mod tests {
         let lines = text(&open);
         assert_eq!(lines[7], "   ▾ 4 helpers, 1 needs you, 1 working");
         assert_eq!(lines[8], "   ● review working · 42s");
-        assert_eq!(lines[9], "   ✓ tests idle · took 42s");
-        assert_eq!(lines[10], "   ✓ lint idle · took 42s");
+        assert_eq!(lines[9], "   ○ tests idle · took 42s");
+        assert_eq!(lines[10], "   ○ lint idle · took 42s");
         assert_eq!(lines[11], "   ? ask needs you · took 42s");
         let named: Vec<&str> = open.named.iter().map(|(_, b)| b.as_str()).collect();
         assert_eq!(

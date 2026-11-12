@@ -994,16 +994,15 @@ has something on it, or is off the screen, no time shows.
   when each runs, its message and what its last run did, and the
   lookout's follows, with how many checks each asked for in the last
   day. `↑`/`↓` picks one, `r` runs an automation now, and `d` pressed twice
-  removes it; the follow Sonny keeps for a lead's tasks stays. The
-  footer says `↻ 2` while the window's agent has any.
+  removes it; the follow Sonny keeps for a lead's tasks stays. What runs
+  there while healthy asks nothing of you, so the footer leaves it out.
   What failed is listed first, with a red `✗` and the error: an automation
   whose run failed (one that ended on it stays listed until `d` removes
   it), or whose run went out and whose turn then failed (as
   when the machine was offline or a login expired), and a server the
   nightly memory cleanup could not read. Your own agents' failures, such as
   the memory cleanup's, show in every window. The footer then says
-  `✗ 1` with a red `✗`, left of the `↻`, and a click on either opens
-  `/background`. An agent sees the same in its `automations` tool, whose rows
+  `✗ 1` with a red `✗`, and a click on it opens `/background`. An agent sees the same in its `automations` tool, whose rows
   say how the turn their last run sent ended. Automations and follows are
   what the agents' `automations` and `follows` tools make.
 
@@ -1726,9 +1725,8 @@ conversation.
 ![/co after /commons was run: /commons ranks first; /cms finds /commons with c, m and s in bold](../docs/sonny/slash-ranked-fuzzy.png)
 
 The pane's place, when nothing else is open there, is the margin. Its
-first row is a glance at what runs for the agent: a red `✗` for what
-failed in the background and `↻` for its automations and follows (a
-click on either opens `/background`), and its context, each
+first row is a glance at the agent: a red `✗` for what failed in the
+background (a click on it opens `/background`), and its context, each
 left out when there is nothing to say; the footer stops saying them while
 it shows. Under the composer, the footer counts the agents that need you
 and the other agents at work by their marks and numbers alone (`? 1  ● 2`),
@@ -1744,24 +1742,29 @@ you. `sonny status [AGENT] [--json]` prints the project
 `/status` shows, as text or JSON, for an agent's shell or a script: AGENT
 is a lead, a task or a project, and an agent's own shell defaults to it.
 The footer, the task tabs' names, `/status`, `sonny status`, the started
-roster and `/sky` agree; and next to the model the agent's profile when it runs one
+roster and `/sky` agree. An outer lead's footer also counts the agents
+of the leads it follows that wait on you, and a workflow's workers,
+which `/status` lists no row for, since their questions are pinned in
+its window and answered there; its tab says it needs you while any
+question is open in it, its own or one pinned from below. Next to the model the agent's profile when it runs one
 that isn't its seat's own (`lead` for a lead, `task` for a task). The left
 of the footer says what you talk to and where (the permissions mark, the
 model as pickers name it, its effort, the folder and its branch), and the
-right what wants you (needs you, failed, working, `↻`, `✎`, the
+right what wants you (needs you, failed, working, at rest, `✎`, the
 context). Its counts of the agents are the ones `/status` heads its
-groups with, marks and numbers only: `? 2  ● 3  ✓ 13  ✓ 4` needs you,
-working, at rest, and done, dim. The agent's name is left to the
+groups with, marks and numbers only: `? 2  ● 3  ○ 13` needs you,
+working, and at rest; what is done asks nothing of you, and `/status`
+counts it. The agent's name is left to the
 composer, which says it. When the window is too narrow for all of it,
 items give way in one order, as Powerline drops its lowest segments
-first: done and at rest first, words before marks, marks before whole
+first: at rest first, words before marks, marks before whole
 items, and what needs you never. `⏵⏵ full access` goes to `⏵⏵`, the folder to `~/D/agent` as fish
 shortens it and then to `agent`, until at 44 columns a busy lead reads
 `⏵⏵ GPT 6.1 Sol high   ? 1  ✗ 1  ● 2  37%`. The hues on it are only for
 what asks something of you: the `?`, the `✗`, the `●` and a context half
 used.
 
-![The footer at 100, 80, 60 and 44 columns: the /status counts as marks and numbers, done and at rest give way first, what needs you stays](../docs/sonny/footer-widths.png) Under the glance are the notes the agent keeps there with its `margin`
+![The footer at 100, 80, 60 and 44 columns: needs you, failed, working and at rest as marks and numbers, at rest giving way first, what needs you stays](../docs/sonny/footer-widths.png) Under the glance are the notes the agent keeps there with its `margin`
 tool: a diagram, a table of findings, a file it is discussing (kept fresh
 as the file changes), or a live view it updates while it works. Each
 note is pinned where the agent first put it: a quiet `✎ title · in the

@@ -30,10 +30,8 @@ pub enum Slot {
     Needs,
     Failed,
     Working,
-    /// The agents at rest, and those marked done: the first to go.
+    /// The agents at rest: the first to go.
     Idle,
-    Done,
-    Background,
     Notes,
     /// The context while under half of it is used: good to know.
     RoomyContext,
@@ -49,8 +47,7 @@ impl Slot {
 
 /// The order things give way: each step takes that item to its next
 /// form, and a step for an item absent or at its last form is passed.
-const LADDER: [Slot; 15] = [
-    Slot::Done,
+const LADDER: [Slot; 13] = [
     Slot::Idle,
     Slot::Folded,
     Slot::Access,
@@ -58,7 +55,6 @@ const LADDER: [Slot; 15] = [
     Slot::RoomyContext,
     Slot::Place,
     Slot::Notes,
-    Slot::Background,
     Slot::LowContext,
     Slot::Place,
     Slot::Profile,
@@ -270,7 +266,7 @@ mod tests {
             Item::new(Slot::Needs, count("?", Color::Yellow, 1, false)).opens("status"),
             Item::new(Slot::Failed, count("✗", Color::Red, 1, false)).opens("background"),
             Item::new(Slot::Working, count("●", Color::Cyan, 2, true)).opens("status"),
-            word(Slot::Background, &["↻ 3", ""]),
+            Item::new(Slot::Idle, count("○", Color::Green, 4, true)).opens("status"),
             word(Slot::Notes, &["✎ 2", ""]),
             Item::new(
                 Slot::LowContext,
@@ -292,11 +288,11 @@ mod tests {
         // The counts are their marks and numbers alone, at every width.
         assert_eq!(
             rows[0].trim(),
-            "⏵⏵ full access · GPT 6.1 Sol high · ~/Developer/agent on main  ? 1  ✗ 1  ● 2  ↻ 3  ✎ 2  37% left"
+            "⏵⏵ full access · GPT 6.1 Sol high · ~/Developer/agent on main  ? 1  ✗ 1  ● 2  ○ 4  ✎ 2  37% left"
         );
         assert_eq!(
             rows[1].trim(),
-            "⏵⏵ GPT 6.1 Sol high · ~/D/agent on main    ? 1  ✗ 1  ● 2  ↻ 3  ✎ 2  37% left"
+            "⏵⏵ GPT 6.1 Sol high · ~/D/agent on main         ? 1  ✗ 1  ● 2  ✎ 2  37% left"
         );
         assert_eq!(
             rows[2].trim(),
@@ -361,6 +357,7 @@ mod tests {
                 ("? 1".into(), "status"),
                 ("✗ 1".into(), "background"),
                 ("● 2".into(), "status"),
+                ("○ 4".into(), "status"),
             ]
         );
     }
