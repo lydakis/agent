@@ -2133,9 +2133,18 @@ pub fn install(
                     // repository made again at its path has another git
                     // folder. The scheduler is made to watch the one it is
                     // now, and to run it with the environment it is added
-                    // with now.
+                    // with now. Its calendar stays as it is: an `--every`
+                    // added again counts from another minute.
                     if watched(&text) != when.watch || !runs_with(&text, environment) {
-                        let want = definition(&there_app, &there, when, environment);
+                        let entries = Job::read(&text).map(|job| job.calendar);
+                        let when = When {
+                            text: when.text.clone(),
+                            entries: entries.unwrap_or_else(|| when.entries.clone()),
+                            not_before: when.not_before,
+                            at: when.at,
+                            watch: when.watch.clone(),
+                        };
+                        let want = definition(&there_app, &there, &when, environment);
                         swap(&path, Some(&text), &want, ring)?;
                     }
                     Ok(Some(there))
@@ -7643,8 +7652,11 @@ pub(crate) mod tests {
         assert_eq!(w.install(&again).unwrap(), Some(s.clone()));
         assert_eq!(w.fake.rings.get(), rings);
         assert_eq!(w.rows()[0]["last"]["outcome"], "skipped");
-        // Added again with another environment, its fires run with that one.
-        let when = every("1d", clock(2026, 9, 28, 9, 7)).unwrap();
+        // Added again with another environment, its fires run with that one,
+        // at the times it had, though `--every` counts from now.
+        let calendar = Job::read(&w.plist(&s.name)).unwrap().calendar;
+        let when = every("1d", clock(2026, 9, 28, 11, 42)).unwrap();
+        assert_ne!(when.entries, calendar);
         let path = [("PATH", "/opt/new/bin".to_owned())];
         let add = |environment: &[(&str, String)]| {
             install(
@@ -7658,10 +7670,12 @@ pub(crate) mod tests {
             )
         };
         assert_eq!(add(&path).unwrap(), Some(s.clone()));
+        let job = Job::read(&w.plist(&s.name)).unwrap();
         assert_eq!(
-            Job::read(&w.plist(&s.name)).unwrap().environment,
+            job.environment,
             [("PATH".to_owned(), "/opt/new/bin".to_owned())]
         );
+        assert_eq!(job.calendar, calendar);
         assert_eq!(w.fake.rings.get(), rings + 1);
         assert_eq!(add(&path).unwrap(), Some(s.clone()));
         assert_eq!(w.fake.rings.get(), rings + 1);
