@@ -789,10 +789,11 @@ class WaitTests(ModelFixture):
         client = self.client('echo,shell,wait')
         for bot in ('Bob', 'Carol'):
             client.request('create', bot=bot, workspace=str(self.path))
-        # The service looks for ready turns once as it starts and again as
-        # each turn ends, on its own loop and through the store. A look still
-        # to come when the lock below is taken would hold that loop, so it
-        # would read the admissions only after the failure: wait for each.
+        # The service looks for ready turns once as it starts, and after an
+        # end only when the end left a message ready, on its own loop and
+        # through the store. A look still to come when the lock below is
+        # taken would hold that loop, so it would read the admissions only
+        # after the failure: wait for the first.
         def looks(at_least):
             deadline = time.monotonic() + 10
             while True:
@@ -806,7 +807,8 @@ class WaitTests(ModelFixture):
         started = client.request('submit', bot='Bob', request_id='bg',
                                  prompt="bg:while [ ! -f release ]; do sleep .01; done; printf done > marker")['result']['message']
         self.assertEqual(client.finished(started)['data']['status'], 'completed')
-        looks(before + 1)
+        # Its end left nothing ready, so no look follows it.
+        self.assertEqual(looks(before), before)
         with sqlite3.connect(database) as db:
             db.execute("CREATE TRIGGER reject_completion BEFORE UPDATE OF result ON processes BEGIN "
                        "SELECT RAISE(ABORT, 'synthetic write failure'); END")
