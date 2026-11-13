@@ -743,9 +743,9 @@ const REST_TIME: Color = Color::DarkGray;
 const TIME_FIGURES: &str = "  a turn rounds  calls  tok/s";
 
 /// What some finished turns with timed calls took, from a `usage` row's
-/// `time`: their time from start to end, their model rounds, the tool
-/// calls that ran to their end and those calls' time, and their timed
-/// calls' output and time.
+/// `time`: their time from start to end, the tool calls that ran to their
+/// end and those calls' time, and their own timed model calls: how many,
+/// their output and their time.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Took {
     pub turns: u64,
@@ -763,7 +763,7 @@ impl Took {
         Self {
             turns: count("turns"),
             turn_ms: count("turn_ms"),
-            rounds: count("model_rounds"),
+            rounds: count("timed_rounds"),
             calls: count("tool_calls"),
             tool_ms: count("tool_ms"),
             model_ms: count("model_ms"),
