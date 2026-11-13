@@ -1656,8 +1656,9 @@ pub fn note(heard: &[Heard], more: usize, unkept: Option<&str>, joins: bool) -> 
         (true, false) => {
             "Act where something changes your work, then carry on with your turn.".to_owned()
         }
-        (false, _) => "Act where something changes your work, and tell the person, briefly, what \
-            they would want to hear. If nothing, end your turn with an empty reply."
+        (false, _) => "Act where something changes your work. Tell the person only what is worth \
+            interrupting them for, such as what only they can decide or news that changes their \
+            plans, and keep the rest for when they ask. If nothing, end your turn with an empty reply."
             .to_owned(),
     });
     lines.join("\n")
@@ -2097,8 +2098,9 @@ mod tests {
              - slack (for your all): \"lunch?\"\n\
              - 2 more waiting, in the notes after this one\n\
              - 5 more events from slack came 3 minutes ago, and they were not kept: 1024 were waiting for you already\n\
-             Act where something changes your work, and tell the person, briefly, what they would want to \
-             hear. If nothing, end your turn with an empty reply."
+             Act where something changes your work. Tell the person only what is worth interrupting \
+             them for, such as what only they can decide or news that changes their plans, and keep \
+             the rest for when they ask. If nothing, end your turn with an empty reply."
         );
         let mut topical = event("on it", Some("b.y"), false);
         topical.topic = Some("deploys".into());

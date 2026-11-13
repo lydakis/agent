@@ -601,7 +601,7 @@ The person asked for these in the task themselves, so they are theirs:
 - calc.ui: calc.ui/2 completed, asked by the person
 The words quoted below are the person's own, from the turns named.
 Lines marked > are a task's own words, not the person's.
-Each ended turn comes with what the task replied; read a turn with one wait call (timeout_ms 0) only when you need more of it, and act where something changes the work. Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply.
+Each ended turn comes with what the task replied; read a turn with one wait call (timeout_ms 0) only when you need more of it, and act where something changes the work. Tell the person only what is worth interrupting them for: the outcome of work you started for them, once, when it is done or has failed, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. Keep the rest for when they ask. If nothing, end your turn with an empty reply.
 
 [Sent by lookout.tasks.]
 
