@@ -359,7 +359,7 @@ fn usage() -> String {
      first time; --lead opens another of the folder's leads, --new-lead makes one. Its\n\
      tasks open beside it in Rex, Herdr or cmux, each in a git worktree of its own. Type /status\n\
      for the project's agents, /switch to open any agent, /new to start one.\n\
-     Agents start tasks, put windows and panes where the person looks, make projects\n\
+     Agents start tasks, put windows where the person looks, make projects\n\
      and follow agents in the lookout with tools Sonny gives them, which its tool host answers.\n\
      sonny memory ... and sonny automation ... are what ~/.agent/memory and ~/.agent/automation\n\
      run, which Sonny writes at each start.\n\
@@ -370,7 +370,7 @@ fn usage() -> String {
      on its own in the whole terminal; --center NAME puts an agent in the middle, and\n\
      --replay [WHEN] plays the past back from WHEN: 2h, 30m or 1d ago, or 02:10 (an hour ago).\n\
      sonny where [AGENT] prints the multiplexer and its workspace or session that AGENT's\n\
-     run_in_pane and show_agent calls act in now (AGENT is $AGENT_BOT in an agent's shell).\n\
+     show_agent calls act in now (AGENT is $AGENT_BOT in an agent's shell).\n\
      sonny lookout watches every lead on the daemon and tells it what happens in its\n\
      tasks; sonny tool-host answers its agents' calls of Sonny's tools. Sonny starts both.\n\
      sonny agent ARGS... runs Sonny's own `agent` with ARGS, whatever `agent` is on PATH.\n\
@@ -1411,35 +1411,6 @@ async fn makers(client: &Client, bot: &str) -> Vec<String> {
     chain
 }
 
-/// A `run_in_pane` call of `owner`'s: run a command it wants watched (a
-/// dev server, a long build) in `cwd`, in a block labelled `OWNER/NAME`,
-/// in a tab of its own, or with `split` on that side of the owner's own
-/// block, and say the block's ID. It closes with the owner's window.
-async fn run_in_pane(
-    owner: &str,
-    name: &str,
-    cwd: &std::path::Path,
-    command: &str,
-    split: Option<String>,
-) -> Result<Value, String> {
-    if name.is_empty() || name.contains('/') {
-        return Err("a name without /".into());
-    }
-    if let Some(side) = split.as_deref().filter(|side| !mux::SPLITS.contains(side)) {
-        return Err(format!(
-            "{side:?} is not a side: right, left, above, below or float"
-        ));
-    }
-    if !cwd.is_absolute() || !cwd.is_dir() {
-        return Err(format!("{} is not a folder", cwd.display()));
-    }
-    let (socket, project, chain) = agents_project(owner).await?;
-    let mut layout = mux::for_agent(&socket, &project, &chain, None)?;
-    let command = ["sh".to_owned(), "-c".to_owned(), command.to_owned()];
-    let block = layout.split(owner, name, cwd, &command, split.as_deref())?;
-    Ok(json!({"block": block, "label": format!("{owner}/{name}"), "in": layout.home()}))
-}
-
 /// The project a bot's name starts with: the longest start that names a
 /// lead, as `shop.web` for `shop.web.fix` when `shop.web.lead` is there;
 /// else the name up to its first dot.
@@ -2177,9 +2148,9 @@ fn sky_cli(args: &[String]) -> Result<(), String> {
 }
 
 /// `sonny where [AGENT]`: the multiplexer and the home in it that AGENT's
-/// `run_in_pane` and `show_agent` calls act in now, by the rule they
-/// follow ([`mux::aim`]), so an agent reads which terminal the person
-/// watches its work in, not one guessed from the skills it has.
+/// `show_agent` calls act in now, by the rule they follow ([`mux::aim`]),
+/// so an agent reads which terminal the person watches its work in, not
+/// one guessed from the skills it has.
 fn where_cli(args: &[String]) -> Result<(), String> {
     const USAGE: &str = "usage: sonny where [AGENT] [--store PATH] [--socket PATH]";
     let (mut store, mut socket, mut agent) = (None, None, None);
@@ -4798,11 +4769,9 @@ impl Naming {
         }
     }
 
-    /// Whether a block is the project's: a bot's, or a command one asked
-    /// for (`BOT/NAME`).
+    /// Whether a block is the project's: one of its bots'.
     fn owns(&self, label: &str) -> bool {
-        let bot = label.split_once('/').map_or(label, |(bot, _)| bot);
-        self.doing.contains_key(bot) || self.lineage.contains(bot)
+        self.doing.contains_key(label) || self.lineage.contains(label)
     }
 
     /// The name of a window holding the blocks labelled `labels`: after
@@ -22290,12 +22259,12 @@ mod tests {
         let names: Vec<&str> = (sent["declare"].as_array().into_iter().flatten())
             .filter_map(|tool| tool["name"].as_str())
             .collect();
-        assert!(names.contains(&"run_in_pane"), "{names:?}");
+        assert!(names.contains(&"start_task"), "{names:?}");
         assert!(
             sent["approve"]
                 .as_array()
                 .unwrap()
-                .contains(&json!("run_in_pane"))
+                .contains(&json!("start_task"))
         );
         assert_eq!(sent["approver"], "manual");
     }

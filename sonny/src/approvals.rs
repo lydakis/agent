@@ -1418,9 +1418,10 @@ mod tests {
 
     #[test]
     fn a_confined_agent_no_one_reviews_has_no_way_out_through_sonny() {
-        let run = crate::served::RUN;
+        let run = crate::served::START;
         let bot = |sandbox: Value, gates: Value| json!({"settings": {"sandbox": sandbox}, "gates": gates});
-        // Read only, no reviewer: a pane runs outside the sandbox, so no.
+        // Read only, no reviewer: a start runs the folder's setup outside
+        // the sandbox, so no.
         assert!(!may_run(&bot(json!("read-only"), json!([])), run));
         assert!(!may_run(&bot(json!("workspace-write"), json!([])), run));
         // A tool that stays inside still runs.
@@ -1564,7 +1565,7 @@ mod tests {
         // Of the tools its client declared, those that can drop work, run
         // something outside the sandbox or send words elsewhere wait for
         // the verdict too.
-        let panes = json!({"tools": ["shell", "read"], "declared": crate::declared::tools(crate::served::Role::LEAD),
+        let leads = json!({"tools": ["shell", "read"], "declared": crate::declared::tools(crate::served::Role::LEAD),
             "gates": [{"tag": "auto", "tools": ["shell"]}]});
         let mut waiting = json!([
             "shell",
@@ -1572,7 +1573,6 @@ mod tests {
             "remove_task",
             "new_project",
             "follows",
-            "run_in_pane",
             "automations",
             "workflow"
         ]);
@@ -1585,7 +1585,7 @@ mod tests {
             waiting.as_array_mut().unwrap().push(json!("desktop"));
         }
         assert_eq!(
-            regate(&panes, "auto", "lead", &mut Sandboxes::default()).unwrap()["approve"],
+            regate(&leads, "auto", "lead", &mut Sandboxes::default()).unwrap()["approve"],
             waiting
         );
     }

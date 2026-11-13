@@ -1,9 +1,9 @@
 //! Where a project's work is laid out: a terminal multiplexer the person
 //! watches (Rex, Herdr or cmux). Each project has a home there (a Rex
 //! session, a Herdr or cmux workspace), with a window per task and a block
-//! labelled with each bot's name, so it can be found again by that name; a command a bot asked for is labelled `BOT/NAME` and
-//! closes with its owner. `Layout` keeps what Sonny does there; a `Backend`
-//! says how, in its multiplexer's CLI.
+//! labelled with each bot's name, so it can be found again by that name.
+//! `Layout` keeps what Sonny does there; a `Backend` says how, in its
+//! multiplexer's CLI.
 use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Read, Write},
@@ -110,8 +110,7 @@ pub enum Placement {
 /// How many of a project's task windows a lead keeps open, as VS Code's
 /// `workbench.editor.limit` keeps editors: past `most`, opening one closes
 /// the window the person used least recently. A window whose task needs
-/// the person or failed, or that holds blocks its task asked for (a dev
-/// server it runs), is never closed for room, as VS Code keeps a dirty
+/// the person or failed is never closed for room, as VS Code keeps a dirty
 /// editor; with no other, the limit is passed. A window the person has
 /// not used yet is not one they used least recently: it opened on its
 /// own, as a VS Code editor never does, and closing it would take new
@@ -192,41 +191,22 @@ pub trait Backend: Send {
     fn rename_block(&self, block: &str, label: &str);
     fn rename_window(&self, window: &str, name: &str);
     /// A new window named `name` whose one block, labelled `label`, runs
-    /// `command`, leaving the person's focus where it is. `keep`: in `cwd`,
-    /// and left open once the command exits so it can be read; otherwise
-    /// it goes with the command. Returns the block's ID.
-    fn window(
-        &self,
-        label: &str,
-        name: &str,
-        cwd: &Path,
-        command: &[String],
-        keep: bool,
-    ) -> Result<String, String>;
+    /// `command`, leaving the person's focus where it is. The block goes
+    /// with the command. Returns the block's ID.
+    fn window(&self, label: &str, name: &str, command: &[String]) -> Result<String, String>;
     /// A new block beside `anchor`, on `side` (`right`, `left`, `above`,
-    /// `below`), as `window` makes one; `small` makes it the smaller part.
-    #[allow(clippy::too_many_arguments)]
+    /// `below`), as `window` makes one.
     fn split(
         &self,
         anchor: &str,
         side: &str,
-        small: bool,
         label: &str,
-        cwd: &Path,
         command: &[String],
-        keep: bool,
     ) -> Result<String, String>;
     /// A new block floating over `anchor`'s window, as `split` makes one.
     /// A multiplexer that cannot float one splits it on the right.
-    fn float(
-        &self,
-        anchor: &str,
-        label: &str,
-        cwd: &Path,
-        command: &[String],
-        keep: bool,
-    ) -> Result<String, String> {
-        self.split(anchor, "right", false, label, cwd, command, keep)
+    fn float(&self, anchor: &str, label: &str, command: &[String]) -> Result<String, String> {
+        self.split(anchor, "right", label, command)
     }
     /// Bring the block into view: its window made the one shown.
     fn focus(&self, block: &Block) -> Result<(), String>;
@@ -317,10 +297,9 @@ struct Following {
 }
 
 /// A project's home, as one of its Sonny windows found it in the
-/// person's terminal: kept so that an agent's `run_in_pane` and
-/// `show_agent` calls go there, to that multiplexer, instead of one
-/// guessed from where the lookout answering them runs, which is in
-/// neither.
+/// person's terminal: kept so that an agent's `show_agent` calls go
+/// there, to that multiplexer, instead of one guessed from where the
+/// lookout answering them runs, which is in neither.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Place {
     Herdr {
@@ -954,32 +933,26 @@ impl Layout {
             return Some(Vec::new());
         }
         let tasks = format!("{}.", room.project);
-        let owners: HashSet<&str> = (listed.iter())
-            .filter_map(|b| b.label.split_once('/').map(|(owner, _)| owner))
-            .collect();
         let task = |label: &str| {
             label.starts_with(&tasks)
-                && !label.contains('/')
                 && !crate::project::is_lead(label)
                 && room.mine.contains(label)
                 && label != bot
         };
         // Each window and its tasks; a task window holds this lead's tasks
-        // and the blocks they asked for alone (a task split beside its
-        // lead is the lead's).
+        // alone (a task split beside its lead is the lead's).
         let mut windows: Vec<(&str, Vec<&str>)> = Vec::new();
         let mut others: HashSet<&str> = HashSet::new();
         let tabs: Vec<String> = listed.iter().map(|block| self.backend.tab(block)).collect();
         for (block, tab) in listed.iter().zip(&tabs) {
-            let owner =
-                (block.label.split_once('/')).map_or(block.label.as_str(), |(owner, _)| owner);
-            if !task(owner) {
+            let label = block.label.as_str();
+            if !task(label) {
                 others.insert(tab);
                 continue;
             }
             match windows.iter_mut().find(|(window, _)| *window == tab) {
-                Some((_, labels)) => labels.push(owner),
-                None => windows.push((tab, vec![owner])),
+                Some((_, labels)) => labels.push(label),
+                None => windows.push((tab, vec![label])),
             }
         }
         windows.retain(|(window, _)| !others.contains(window));
@@ -993,9 +966,7 @@ impl Layout {
         }
         let (mut spare, mut unseen) = (Vec::<(SystemTime, Vec<&str>)>::new(), false);
         for (_, labels) in windows {
-            let holds = |label: &&str| {
-                room.keep.contains(*label) || owners.contains(label) || (room.held)(label)
-            };
+            let holds = |label: &&str| room.keep.contains(*label) || (room.held)(label);
             if labels.iter().any(holds) {
                 continue;
             }
@@ -1048,13 +1019,12 @@ impl Layout {
         for old in listed.iter().filter(|b| b.label == bot) {
             self.close_block(&old.id);
         }
-        let cwd = Path::new("/");
         let block = match (placement, anchor) {
             (Placement::Split { side, .. }, Some(anchor)) => match side.as_str() {
-                FLOAT => (self.backend).float(&anchor, bot, cwd, command, false)?,
-                side => (self.backend).split(&anchor, side, false, bot, cwd, command, false)?,
+                FLOAT => (self.backend).float(&anchor, bot, command)?,
+                side => (self.backend).split(&anchor, side, bot, command)?,
             },
-            _ => self.backend.window(bot, name, cwd, command, false)?,
+            _ => self.backend.window(bot, name, command)?,
         };
         self.forget();
         self.blocks.insert(bot.to_owned(), block);
@@ -1144,48 +1114,14 @@ impl Layout {
         }
     }
 
-    /// Run a command an agent asked for in a block labelled `OWNER/NAME`, so
-    /// the person can see whose it is and it closes with its owner's
-    /// window: on `side` of the owner's block, or in a window of its own
-    /// (named `name`) when there is no side or the owner has no block here.
-    /// One already labelled so is replaced. The block stays open once the
-    /// command exits, to be read. Returns the block's ID.
-    pub fn split(
-        &mut self,
-        owner: &str,
-        name: &str,
-        cwd: &Path,
-        command: &[String],
-        side: Option<&str>,
-    ) -> Result<String, String> {
-        let label = format!("{owner}/{name}");
-        let listed = self.listed();
-        for old in listed.iter().filter(|b| b.label == label) {
-            self.close_block(&old.id);
-        }
-        let anchor = listed.iter().find(|b| b.label == owner);
-        let block = match anchor.zip(side) {
-            Some((anchor, FLOAT)) => (self.backend).float(&anchor.id, &label, cwd, command, true),
-            Some((anchor, side)) => {
-                (self.backend).split(&anchor.id, side, true, &label, cwd, command, true)
-            }
-            None => self.backend.window(&label, name, cwd, command, true),
-        }?;
-        self.forget();
-        self.tidy();
-        Ok(block)
-    }
-
-    /// Close a task's block, and every block it asked for, as when it is
-    /// done or its bot is deleted.
+    /// Close a task's block, as when it is done or its bot is deleted.
     pub fn close(&mut self, bot: &str) {
         let known = self.blocks.remove(bot);
         self.used.remove(bot);
         self.set_aside(bot, false);
-        let owned = format!("{bot}/");
-        for block in self.listed().into_iter().filter(|b| {
-            b.label == bot || b.label.starts_with(&owned) || Some(&b.id) == known.as_ref()
-        }) {
+        for block in
+            (self.listed().into_iter()).filter(|b| b.label == bot || Some(&b.id) == known.as_ref())
+        {
             self.close_block(&block.id);
         }
     }
@@ -1724,25 +1660,15 @@ mod tests {
             }
         }
         fn rename_window(&self, _: &str, _: &str) {}
-        fn window(
-            &self,
-            label: &str,
-            name: &str,
-            _: &Path,
-            _: &[String],
-            _: bool,
-        ) -> Result<String, String> {
+        fn window(&self, label: &str, name: &str, _: &[String]) -> Result<String, String> {
             Ok(self.add(label, name))
         }
         fn split(
             &self,
             anchor: &str,
             _: &str,
-            _: bool,
             label: &str,
-            _: &Path,
             _: &[String],
-            _: bool,
         ) -> Result<String, String> {
             let window = (self.blocks.borrow().iter())
                 .find(|b| b.id == anchor)
@@ -1835,17 +1761,14 @@ mod tests {
         assert_eq!(open(&mut layout, "shop.a", &three, false), Shown::Aside);
         assert!(layout.aside("shop.a"));
         // ...until the person asks for it. What needs them keeps its
-        // window, and so does one running a block it asked for.
-        layout
-            .split("shop.b", "dev", Path::new("/"), &[], Some("right"))
-            .unwrap();
+        // window.
         assert_eq!(
-            open(&mut layout, "shop.a", &room(3, &["shop.d"]), true),
+            open(&mut layout, "shop.a", &room(3, &["shop.b", "shop.d"]), true),
             Shown::Opened(vec!["shop.c".into()])
         );
         assert!(!layout.aside("shop.a"));
         // With none to close, the room is passed rather than refused.
-        let full = room(2, &["shop.a", "shop.d"]);
+        let full = room(2, &["shop.a", "shop.b", "shop.d"]);
         assert_eq!(
             open(&mut layout, "shop.e", &full, false),
             Shown::Opened(vec![])
@@ -2646,7 +2569,7 @@ mod tests {
     }
 
     #[test]
-    fn a_task_has_one_block_wherever_it_is_put_and_its_commands_close_with_it() {
+    fn a_task_has_one_block_wherever_it_is_put() {
         let fake = Fake::default();
         let own = fake.add("zsh", "home");
         let fake = Fake {
@@ -2664,33 +2587,14 @@ mod tests {
             beside: "shop.lead".into(),
         };
         layout.place("shop.fix", "fix", &sonny, &split).unwrap();
-        layout
-            .split("shop.fix", "tests", Path::new("/w"), &sonny, Some("below"))
-            .unwrap();
-        layout
-            .split("shop.lead", "server", Path::new("/w"), &sonny, None)
-            .unwrap();
         assert_eq!(
             labels(&mut layout),
-            [
-                (
-                    "home".into(),
-                    vec![
-                        "shop.lead".into(),
-                        "shop.fix".into(),
-                        "shop.fix/tests".into()
-                    ]
-                ),
-                ("server".into(), vec!["shop.lead/server".into()]),
-            ]
+            [("home".into(), vec!["shop.lead".into(), "shop.fix".into()])]
         );
         layout.close("shop.fix");
         assert_eq!(
             labels(&mut layout),
-            [
-                ("home".into(), vec!["shop.lead".into()]),
-                ("server".into(), vec!["shop.lead/server".into()]),
-            ]
+            [("home".into(), vec!["shop.lead".into()])]
         );
     }
 
@@ -2725,26 +2629,10 @@ mod tests {
         layout.adopt_own("shop.lead");
         let sonny = ["sonny".to_owned()];
         layout.show("shop.fix", "fix", &sonny).unwrap();
-        layout
-            .split(
-                "shop.lead",
-                "server",
-                Path::new("/w"),
-                &sonny,
-                Some("right"),
-            )
-            .unwrap();
         layout.close("shop.fix");
         assert_eq!(
             labels(&mut layout),
-            [(
-                "work".into(),
-                vec![
-                    "editor".into(),
-                    "shop.lead".into(),
-                    "shop.lead/server".into()
-                ]
-            )]
+            [("work".into(), vec!["editor".into(), "shop.lead".into()])]
         );
     }
 }
