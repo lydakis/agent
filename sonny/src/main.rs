@@ -7214,6 +7214,19 @@ impl App {
             }
             self.approvals_for(self.running.as_ref().map(|r| r.turn))
                 .await;
+            // Answered while away, its verdict unheard: read from the audit
+            // trail, as a task's is.
+            let unheard: Vec<(String, i64, String)> = (self.written.iter())
+                .filter(|(key, written)| key.0 == self.bot && !written.heard)
+                .map(|(key, _)| key.clone())
+                .filter(|key| {
+                    !(self.approvals.iter()).any(|call| {
+                        call["call_id"].as_str() == Some(key.2.as_str())
+                            && call["turn"].as_i64().unwrap_or(-1) == key.1
+                    })
+                })
+                .collect();
+            self.verdicts_from_audit(unheard).await;
             // A daemon that restarted brings back its companions; one
             // started anew, as by another store's Sonny, gets them now.
             if let Err(error) = start_companions(&self.client).await {
@@ -15745,7 +15758,9 @@ impl App {
             let decided = match (row["approved"].as_str(), denied) {
                 (Some("person"), true) => transcript::Decided::Denied { you: true },
                 (Some("reviewer"), true) => transcript::Decided::Denied { you: false },
-                (Some("nobody"), true) => transcript::Decided::Lapsed,
+                // Refused by no one: timed out, or its caller stopped
+                // waiting, which the row does not tell apart.
+                (Some("nobody"), true) => transcript::Decided::Gone,
                 (Some("person"), false) => transcript::Decided::Allowed {
                     you: true,
                     kept: None,
@@ -24915,6 +24930,36 @@ mod tests {
             "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}),
         );
         app.approvals.clear();
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_refused_by_no_one_in_the_audit_trail_no_longer_waits() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            // Timed out or its caller stopped waiting: the row is the same.
+            Some("audit") => json!({"rows": [
+                {"bot": "b", "turn": 5, "call_id": "c2", "step": "open",
+                    "approved": "nobody", "outcome": "denied"}],
+                "next_before": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals
+            .push(json!({"turn": 5, "call_id": "c2/open", "name": "shell",
+            "gates": ["manual"], "arguments": {"command": "make deploy"}}));
+        app.show_asked();
+        app.flush();
+        app.approvals.clear();
+        app.verdicts_from_audit(vec![("b".into(), 5, "c2/open".into())])
+            .await;
         app.fold_written();
         app.flush();
         let texts = app.screen.texts();
