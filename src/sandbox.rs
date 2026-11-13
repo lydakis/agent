@@ -163,9 +163,23 @@ impl Policy {
     /// mounts and rules do. Symlinks in what exists of it are followed, as
     /// a write would follow them.
     pub fn can_write(&self, path: &Path) -> bool {
-        let Some(path) = real(path) else {
+        real(path).is_some_and(|path| self.writes(&path))
+    }
+
+    /// Whether a command in this sandbox may remove `path`, an absolute
+    /// path: the name itself in the folder that holds it, so a link is
+    /// judged where it lies, as removing it would remove it there, not by
+    /// what it points to.
+    pub fn can_remove(&self, path: &Path) -> bool {
+        let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
             return false;
         };
+        real(folder).is_some_and(|folder| self.writes(&folder.join(name)))
+    }
+
+    /// Whether the deepest root that holds `path`, a real path, lets it be
+    /// written.
+    fn writes(&self, path: &Path) -> bool {
         self.roots
             .iter()
             .rev()
@@ -2113,6 +2127,14 @@ mod tests {
         assert!(!policy.can_write(&git.join("commondir")));
         assert!(!policy.can_write(&git.join("worktrees/wt/commondir")));
         assert!(policy.can_write(&git.join("worktrees/wt/index.lock")));
+        // A link where git keeps what it runs is that place's to keep,
+        // wherever it points: it may not be removed.
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+        std::fs::write(base.join("hook.sh"), "").unwrap();
+        std::os::unix::fs::symlink("../../hook.sh", git.join("hooks/pre-commit")).unwrap();
+        assert!(policy.can_write(&git.join("hooks/pre-commit")));
+        assert!(!policy.can_remove(&git.join("hooks/pre-commit")));
+        assert!(policy.can_remove(&base.join("hook.sh")));
         // With per-worktree config on, whose files git reads wherever they
         // are made, none of it is written.
         std::fs::write(
