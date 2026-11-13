@@ -1709,14 +1709,19 @@ fn later(call: &Value, by: Duration) -> Value {
     call
 }
 
-/// The time a call has left before the daemon gives up on it.
+/// The time a call has left before the daemon gives up on it, less
+/// [`ANSWERING`]: a call run to its time limit (an `exec` script, a
+/// command) answers with what it did while the daemon still takes it.
 fn left(call: &Value) -> Duration {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     let expires = call["expires_ms"].as_u64().unwrap_or(now);
-    Duration::from_millis(expires.saturating_sub(now))
+    Duration::from_millis(expires.saturating_sub(now)).saturating_sub(ANSWERING)
 }
+
+/// The time kept back from a call's for its answer to reach the daemon.
+const ANSWERING: Duration = Duration::from_secs(2);
 
 /// Whether turn `turn` of `bot` has read outside content so far, so a fact
 /// it saves may carry words no person wrote, as Codex leaves out of memory
@@ -2039,6 +2044,19 @@ fn code(said: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_ends_before_the_daemon_gives_up_on_it() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let call = |expires: u64| json!({"expires_ms": expires});
+        let left = left(&call(now + 600_000));
+        assert!(left <= Duration::from_secs(598) && left > Duration::from_secs(590));
+        assert_eq!(super::left(&call(now + 1_000)), Duration::ZERO);
+        assert_eq!(super::left(&json!({})), Duration::ZERO);
+    }
 
     #[test]
     fn a_tool_sonny_no_longer_answers_is_told_the_ones_it_does() {
