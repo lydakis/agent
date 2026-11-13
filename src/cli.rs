@@ -482,7 +482,7 @@ fn print_flags(flags: &str) {
             ),
             "--wall" => (
                 "FOLDER",
-                "Keep every sandboxed command, the network on or not, from the Unix sockets in FOLDER, made private if missing; repeatable",
+                "Keep every sandboxed command, the network on or not, from connecting to the Unix sockets in FOLDER, made private (mode 700) if missing; a wall for sockets, not a way to hide files: on Linux the folder shows empty to a sandboxed command, on macOS its files stay readable, and the read tool, which the daemon answers outside any sandbox, reads them on both; repeatable",
             ),
             "--own-copy" => (
                 "FOLDER",
