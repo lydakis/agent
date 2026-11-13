@@ -201,14 +201,13 @@ impl Rex {
             .collect())
     }
 
-    /// The new block's ID from `split`'s, `run`'s or `window new`'s reply.
-    fn made(&self, args: &[&str]) -> Result<(String, Value), String> {
+    /// The new block's ID from `split`'s or `window new`'s reply.
+    fn made(&self, args: &[&str]) -> Result<String, String> {
         let made = self.call(args)?;
-        let block = made["block_ids"][0]
+        Ok(made["block_ids"][0]
             .as_str()
             .ok_or("rex: no block id in the reply")?
-            .to_owned();
-        Ok((block, made))
+            .to_owned())
     }
 }
 
@@ -241,42 +240,14 @@ impl Backend for Rex {
         let _ = self.call(&["window", "rename", window, name, "-s", &self.session]);
     }
 
-    fn window(
-        &self,
-        label: &str,
-        name: &str,
-        cwd: &Path,
-        command: &[String],
-        keep: bool,
-    ) -> Result<String, String> {
-        let cwd = cwd.to_string_lossy();
-        let session = self.session.as_str();
-        let mut args: Vec<&str> = match keep {
-            true => vec![
-                "run",
-                "-s",
-                session,
-                "-c",
-                &cwd,
-                "--label",
-                label,
-                "--keep-open",
-            ],
-            false => vec!["window", "new", "-s", session, name, "--shell=none"],
-        };
+    fn window(&self, label: &str, name: &str, command: &[String]) -> Result<String, String> {
+        let mut args = vec!["window", "new", "-s", &self.session, name, "--shell=none"];
         args.extend(["--focus=false", "--json", "--"]);
         args.extend(command.iter().map(String::as_str));
-        let (block, made) = self.made(&args)?;
-        match keep {
-            true => {
-                if let Some(window) = made["window_id"].as_str() {
-                    self.rename_window(window, name);
-                }
-            }
-            // `window new` names the window; the block is named after the
-            // bot, so it can be found, and anchored on, by that name.
-            false => self.rename_block(&block, label),
-        }
+        let block = self.made(&args)?;
+        // `window new` names the window; the block is named after the bot,
+        // so it can be found, and anchored on, by that name.
+        self.rename_block(&block, label);
         Ok(block)
     }
 
@@ -284,39 +255,21 @@ impl Backend for Rex {
         &self,
         anchor: &str,
         side: &str,
-        small: bool,
         label: &str,
-        cwd: &Path,
         command: &[String],
-        keep: bool,
     ) -> Result<String, String> {
-        let cwd = cwd.to_string_lossy();
         let mut args = vec!["split", "-b", anchor, "--split", side];
-        if small {
-            args.extend(["--ratio", "35"]);
-        }
-        args.extend(["-s", &self.session]);
-        match keep {
-            true => args.extend(["-c", &cwd, "--label", label, "--keep-open"]),
-            false => args.extend(["--label", label, "--shell=none"]),
-        }
+        args.extend(["-s", &self.session, "--label", label, "--shell=none"]);
         args.extend(["--focus=false", "--json", "--"]);
         args.extend(command.iter().map(String::as_str));
-        Ok(self.made(&args)?.0)
+        self.made(&args)
     }
 
     /// Split beside `anchor`, then floated over its window, as Rex floats
     /// a block only in its own window. Floating takes neither focus nor
     /// the active window; one Rex refuses stays split.
-    fn float(
-        &self,
-        anchor: &str,
-        label: &str,
-        cwd: &Path,
-        command: &[String],
-        keep: bool,
-    ) -> Result<String, String> {
-        let block = self.split(anchor, "right", false, label, cwd, command, keep)?;
+    fn float(&self, anchor: &str, label: &str, command: &[String]) -> Result<String, String> {
+        let block = self.split(anchor, "right", label, command)?;
         let float = serde_json::json!({"block_id": block, "bounds": FLOATING});
         let float = float.to_string();
         let _ = self.call(&[
@@ -559,49 +512,47 @@ if out is not None:
     }
 
     #[test]
-    fn a_command_floats_over_its_owners_window() {
+    fn an_agent_floats_over_the_window_it_is_put_beside() {
         let (bin, dir) = fake(
             "float",
             serde_json::json!({"01home": {"label": "graft", "blocks": [block("block:task", "graft.fix")]}}),
         );
         let rex = super::Rex::open(bin, None, "graft", false, None).unwrap();
         let mut rex = crate::mux::Layout::new(Box::new(rex));
-        let login = ["gh".into(), "auth".into(), "login".into()];
-        let made = rex.split(
-            "graft.fix",
-            "login",
-            Path::new("/work"),
-            &login,
-            Some("float"),
-        );
-        let made = made.unwrap();
+        let sonny = ["sonny".to_owned(), "--agent".into(), "graft.docs".into()];
+        let float = crate::mux::Placement::Split {
+            side: "float".into(),
+            beside: "graft.fix".into(),
+        };
+        rex.place("graft.docs", "docs", &sonny, &float).unwrap();
         let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
-        let calls: Vec<&str> = calls.lines().rev().take(2).collect();
-        // Split beside its owner, then floated, as Rex floats a block only
-        // in its own window.
+        let split = (calls.lines())
+            .position(|c| c.starts_with("split "))
+            .expect("split");
+        let calls: Vec<&str> = calls.lines().skip(split).take(2).collect();
+        // Split beside the window, then floated, as Rex floats a block
+        // only in its own window.
         assert!(
-            calls[1].starts_with("split -b block:task --split right")
-                && calls[1].contains("--label graft.fix/login --keep-open"),
+            calls[0].starts_with("split -b block:task --split right")
+                && calls[0].contains("--label graft.docs --shell=none"),
             "{calls:?}"
         );
-        let float = format!(
-            r#"api call -s 01home session.float_block {{"block_id":"{made}","bounds":[0.1,0.1,0.8,0.8]}}"#
+        assert!(
+            calls[1].starts_with(r#"api call -s 01home session.float_block {"block_id":"block:"#)
+                && calls[1].ends_with(r#""bounds":[0.1,0.1,0.8,0.8]}"#),
+            "{calls:?}"
         );
-        assert_eq!(calls[0], float);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn an_agent_runs_its_commands_in_its_leads_session_and_they_close_with_it() {
+    fn a_task_opens_in_its_leads_session_and_closes_there() {
         // The lead was opened in a session named for something else; a
         // session labelled with the project is a stray.
         let (bin, dir) = fake(
             "home",
             serde_json::json!({
-                "01home": {"label": "home", "blocks": [
-                    block("block:lead", "graft.lead"),
-                    block("block:task", "graft.fix"),
-                ]},
+                "01home": {"label": "home", "blocks": [block("block:lead", "graft.lead")]},
                 "01stray": {"label": "graft", "blocks": []},
             }),
         );
@@ -613,58 +564,23 @@ if out is not None:
         assert!(!rex.here);
         let mut rex = crate::mux::Layout::new(Box::new(rex));
 
-        let cwd = Path::new("/work");
-        let tests = rex.split(
-            "graft.fix",
-            "tests",
-            cwd,
-            &["cargo".into(), "test".into()],
-            Some("below"),
-        );
-        let tests = tests.unwrap();
+        let sonny = ["sonny".to_owned(), "--agent".into(), "graft.fix".into()];
+        let below = crate::mux::Placement::Split {
+            side: "below".into(),
+            beside: "graft.lead".into(),
+        };
+        rex.place("graft.fix", "fix", &sonny, &below).unwrap();
         let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
-        let split = calls.lines().last().unwrap();
+        let split = (calls.lines()).find(|c| c.starts_with("split ")).unwrap();
         assert!(
-            split.starts_with("split -b block:task --split below")
-                && split.contains("-s 01home -c /work --label graft.fix/tests --keep-open")
-                && split.ends_with("-- cargo test"),
+            split.starts_with("split -b block:lead --split below")
+                && split.contains("-s 01home --label graft.fix --shell=none")
+                && split.ends_with("-- sonny --agent graft.fix"),
             "{split}"
         );
-        // Run again by name, the old block makes way.
-        let again = rex.split(
-            "graft.fix",
-            "tests",
-            cwd,
-            &["cargo".into(), "test".into()],
-            Some("below"),
-        );
-        assert_ne!(again.unwrap(), tests);
-        rex.split(
-            "graft.fix",
-            "build",
-            cwd,
-            &["cargo".into(), "build".into()],
-            None,
-        )
-        .unwrap();
-        rex.split(
-            "graft.lead",
-            "server",
-            cwd,
-            &["serve".into()],
-            Some("below"),
-        )
-        .unwrap();
-        assert_eq!(
-            labels(&dir, "01home"),
-            [
-                "graft.lead",
-                "graft.fix",
-                "graft.fix/tests",
-                "graft.fix/build",
-                "graft.lead/server"
-            ]
-        );
+        // Placed again, the old block makes way.
+        rex.place("graft.fix", "fix", &sonny, &below).unwrap();
+        assert_eq!(labels(&dir, "01home"), ["graft.lead", "graft.fix"]);
         let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
         assert!(calls.lines().all(|c| !c.contains("01stray")));
         // A bare ID is looked up in the shell's own session, maybe another.
@@ -675,8 +591,9 @@ if out is not None:
                 .all(|c| c.ends_with("-s 01home"))
         );
 
-        // The task done, what it opened goes with it; the lead's stays.
+        // The task done, its block goes; the lead's stays.
         rex.close("graft.fix");
-        assert_eq!(labels(&dir, "01home"), ["graft.lead", "graft.lead/server"]);
+        assert_eq!(labels(&dir, "01home"), ["graft.lead"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

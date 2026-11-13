@@ -254,7 +254,7 @@ vulnerability, whether or not the code's own documentation agrees.
 
 Sonny's tool host answers some tools outside every agent's sandbox, since
 they are things the sandbox cannot do: triggers, memory, `start_task`,
-`run_in_pane`, `browser`, `exec` for MCP, subscriptions. Each that
+`browser`, `exec` for MCP, subscriptions. Each that
 can change something outside the agent's folder waits on the agent's
 approval gate as a call that leaves the sandbox would; `memory` and
 `show_agent` wait for none.

@@ -1,6 +1,6 @@
 //! The tools Sonny answers: what an agent asks of Sonny itself, such as a
-//! task started in a folder of its own or a pane put where the person
-//! looks, as declared tools whose calls wait for Sonny's answer rather than
+//! task started in a folder of its own or an agent's window put where the
+//! person looks, as declared tools whose calls wait for Sonny's answer rather than
 //! as commands in the agent's shell. The daemon holds each call for its
 //! answer, parking the turn after a moment, and gives up on it, typed
 //! `tool_unserved`, once its time runs out.
@@ -25,7 +25,6 @@ pub const TAG: &str = "sonny";
 pub const START: &str = "start_task";
 pub const REMOVE: &str = "remove_task";
 pub const SHOW: &str = "show_agent";
-pub const RUN: &str = "run_in_pane";
 pub const PROJECT: &str = "new_project";
 pub const FOLLOWS: &str = "follows";
 pub const AUTOMATIONS: &str = "automations";
@@ -38,18 +37,17 @@ pub const WORKFLOW: &str = crate::workflow::NAME;
 
 /// The tools whose calls wait for a verdict wherever the agent's other
 /// calls do: a start runs the folder's setup script and a new project its
-/// lead, outside the agent's sandbox as a pane's command is, a removal can
+/// lead, outside the agent's sandbox, a removal can
 /// drop work, a follow sends other bots' words to the follower's
 /// reviewer, an automation is a job that runs as the person, its `if`
 /// command outside any sandbox, a script calls MCP servers, which run
 /// as the person too, and so do the browser and the desktop. A workflow
 /// starts agents, as a start does.
-pub const GATED: [&str; 10] = [
+pub const GATED: [&str; 9] = [
     START,
     REMOVE,
     PROJECT,
     FOLLOWS,
-    RUN,
     AUTOMATIONS,
     EXEC,
     BROWSER,
@@ -114,7 +112,7 @@ pub fn tools(role: Role) -> Vec<Value> {
     if role.lead {
         tools.push(project());
     }
-    tools.extend([follows(), show(), run(), automations(), memory()]);
+    tools.extend([follows(), show(), automations(), memory()]);
     tools.extend(crate::workflow::tool());
     if crate::commons::on() {
         tools.push(commons());
@@ -548,36 +546,6 @@ fn show() -> Value {
     })
 }
 
-fn run() -> Value {
-    json!({
-        "name": RUN,
-        "description": "Run a command the person can watch in a pane of its own, labelled YOUR-NAME/NAME: one \
-            that runs longer than the shell tool allows, keeps running (a dev server, a watcher), or that the \
-            person wants to watch. It runs in your folder, or cwd, in the person's shell, which stays open after \
-            the command exits so its output can be read. Running the same name again replaces its pane. A tab \
-            is the default; a split puts it beside you, for something the person should see now, and float \
-            over your window, where the terminal can float it, for a quick look. A command that needs the \
-            person's own keyboard (a sign-in, a password prompt, ssh -t) goes to them through ask and its \
-            command instead. The result holds the pane's ID as block.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-                    "description": "What it is, such as dev-server or tests."},
-                "command": {"type": "string", "minLength": 1,
-                    "description": "The command line, as sh -c runs it. End it with a line you can wait \
-                        for, such as `cargo test; echo \"exited $?\"`, to know when it ends."},
-                "cwd": {"type": "string", "minLength": 1, "description": "Where it runs, absolute."},
-                "split": {"type": "string", "enum": SPLIT,
-                    "description": "Beside you, on this side, or float over your window."}
-            },
-            "required": ["name", "command"],
-            "additionalProperties": false
-        },
-        "answered_by": TAG
-    })
-}
-
 /// An answer: the call's result, or an error as the daemon carries it.
 type Answer = Result<String, (&'static str, String)>;
 
@@ -750,20 +718,6 @@ async fn called(name: &str, arguments: &Value) -> Answer {
         .await
         .map(|shown| shown.to_string())
         .map_err(|e| ("not_shown", e)),
-        RUN => {
-            let cwd = text("cwd").map_or(here, PathBuf::from);
-            let command = text("command").unwrap_or_default();
-            crate::run_in_pane(
-                &caller,
-                &text("name").unwrap_or_default(),
-                &cwd,
-                &command,
-                text("split"),
-            )
-            .await
-            .map(|opened| opened.to_string())
-            .map_err(|e| ("pane_not_opened", e))
-        }
         PROJECT => crate::project::add(&caller, arguments)
             .await
             .map(|made| made.to_string())
@@ -1857,7 +1811,7 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
         .filter(|record| record["name"] == bot)
         .ok_or(("caller_unknown", format!("{bot} is gone")))?;
     // A side chat forked with its agent's tools calls them as that agent:
-    // its tasks, panes and projects are the agent's, not the copy's.
+    // its tasks, windows and projects are the agent's, not the copy's.
     let caller = match crate::side_copy(record) {
         Some(source) => {
             let page = client
@@ -1980,8 +1934,8 @@ async fn answer(client: &Client, call: &Value, me: &Path, store: &Path, socket: 
     let output = tokio::time::timeout(left(call), child.wait_with_output())
         .await
         .map_err(|_| ("tool_unserved", "ran out of time".to_owned()))?;
-    // Answered: what it left running on purpose, as a pane's program or a
-    // lookout it started, runs on.
+    // Answered: what it left running on purpose, as a lookout it started,
+    // runs on.
     if let Some(group) = group {
         group.keep();
     }
@@ -2052,7 +2006,7 @@ pub fn stop() {
 
 /// The error codes `sonny tool` answers with, as static names.
 fn code(said: &str) -> &'static str {
-    const CODES: [&str; 23] = [
+    const CODES: [&str; 22] = [
         "not_in_folder",
         "no_caller",
         "invalid_arguments",
@@ -2061,7 +2015,6 @@ fn code(said: &str) -> &'static str {
         "tasks_exist",
         "task_not_removed",
         "not_shown",
-        "pane_not_opened",
         "project_not_made",
         "no_store",
         "follow_refused",
@@ -2104,7 +2057,7 @@ mod tests {
         // results are lost to a store that could not write.
         let client = crate::tests::daemon_answering(move |asked| match asked["op"].as_str() {
             Some("tool_calls") if tries.load(Ordering::SeqCst) < 3 => json!({
-                "calls": [{"bot": "b", "turn": 1, "call_id": "c1", "name": RUN}],
+                "calls": [{"bot": "b", "turn": 1, "call_id": "c1", "name": SHOW}],
                 "next_after": null}),
             Some("tool_calls") => json!({"calls": [], "next_after": null}),
             Some("tool_result") if tries.fetch_add(1, Ordering::SeqCst) < 2 => {
@@ -2656,7 +2609,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_confined_agent_no_one_reviews_is_refused_a_pane() {
+    async fn a_confined_agent_no_one_reviews_is_refused_a_task() {
         // The listing leaves the sandbox out; the bot's own record says it.
         let client = crate::tests::daemon_answering(|asked| match asked["op"].as_str() {
             Some("bots") => json!({"bots": [{"name": "calc", "bot_id": 7, "gates": []}]}),
@@ -2667,8 +2620,8 @@ mod tests {
             _ => json!({"error": {"code": "unexpected"}}),
         })
         .await;
-        let call = json!({"bot": "calc", "turn": 1, "name": RUN,
-            "arguments": {"command": "touch /tmp/x"}});
+        let call = json!({"bot": "calc", "turn": 1, "name": START,
+            "arguments": {"name": "fix", "brief": "Fix it."}});
         let none = Path::new("/nowhere");
         let refused = answer(&client, &call, none, none, none).await;
         assert_eq!(refused.map_err(|(code, _)| code), Err("escalation_refused"));
@@ -2724,7 +2677,7 @@ mod tests {
                 .filter(|name| name != EXEC && name != BROWSER && name != DESKTOP)
                 .collect()
         };
-        let every = [FOLLOWS, SHOW, RUN, AUTOMATIONS, MEMORY, WORKFLOW, COMMONS];
+        let every = [FOLLOWS, SHOW, AUTOMATIONS, MEMORY, WORKFLOW, COMMONS];
         // Every agent starts and removes tasks; the daemon bounds how deep.
         let mut task = vec![START, REMOVE];
         task.extend(every);

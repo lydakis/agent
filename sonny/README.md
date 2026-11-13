@@ -365,7 +365,7 @@ Each of a
 project's Sonny windows notes where it is in `~/.agent/sonny/places`, the
 agent it shows, and when the person last used it (a key, a click, a paste,
 or the window coming to the front). An agent acts in the terminal it is
-spoken to in: its `run_in_pane` and `show_agent` calls go where the open
+spoken to in: its `show_agent` calls go where the open
 window used last of those showing it is, that Herdr or cmux workspace or
 Rex session; a task no window shows goes where the agent that made it is
 spoken to; and only a lead's own window, or one in the same home, opens
@@ -389,8 +389,8 @@ recently, as each window's own Sonny saw you focus, type or click there
 (marked in `~/.agent/sonny/used/`). Only the lead's own tasks' windows
 count and close, as another lead of the folder keeps its own; tasks shown
 together in one window count once and close together. One that
-needs you (an approval, or a question open in it), failed, or holds a
-block its task asked for (a dev server) is never closed for room, as the
+needs you (an approval, or a question open in it) or failed is never
+closed for room, as the
 lead heard or as that window's own Sonny last said (kept in
 `~/.agent/sonny/held/`, so it holds across either one starting again);
 with no other, the limit is passed. A window you have not looked at yet is
@@ -408,15 +408,11 @@ multiplexer the machine has to `~/.agents/skills` (`rex-windows`,
 session its calls act in now, by the rule the tools follow: where the person
 last used a window of the agent's (or of the agent that made it), so a
 project open in Herdr and in cmux at once has its agents act in the one the
-person is typing in. With that, any agent can run a long command where
-the person can watch it, and read it back: the `run_in_pane` tool
-(`name`, `command`, `split` right, left, above, below or float) opens a block
-labelled `AGENT/NAME` in a tab of its own (or on that side of the agent's
-own block; `float`, in Rex, over the agent's window, for something
-looked at once and closed) and gives its ID. The `show_agent` tool (`agent`, `split`,
-`beside`) moves a task's window. Tabs are the default; the skills tell agents to split only
-to show the person something now, such as a server's or a tool's output, or
-an agent to watch beside them. Sessions are for leads, tabs and splits for
+person is typing in. The `show_agent` tool (`agent`, `split` right, left,
+above, below or float, `beside`) moves a task's window. Tabs are the
+default; the skills tell agents to split only to show the person an agent
+to watch beside them. Agents run their commands, long ones included, in
+the shell tool, never in a block of their own. Sessions are for leads, tabs and splits for
 their tasks: `show_agent` on `PROJECT.lead`, from another project's lead (one
 that leads the projects in its folder), opens that lead's Sonny in its own
 project's session or workspace (the one named for that project, made when
@@ -1351,8 +1347,8 @@ has something on it, or is off the screen, no time shows.
 Sonny declares its tools on the agents it opens and the leads it makes,
 which agents they make inherit: `react`, `ask`, `plan` (the plan the
 person sees, as a checklist), `margin` (notes beside the conversation),
-`mark_done`, `follows`, `show_agent` and
-`run_in_pane`, `start_task` and `remove_task`; a lead's own, which its
+`mark_done`, `follows`, `show_agent`, `start_task` and
+`remove_task`; a lead's own, which its
 tasks never take, is `new_project`. The daemon shows them to
 the model and records each call: `plan` and `mark_done` run nothing,
 and the rest wait for Sonny's answer, a `react` naming another agent kept

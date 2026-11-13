@@ -37,12 +37,11 @@ pub fn tools(role: Role) -> Vec<Value> {
 }
 
 /// `tool` with the kind its calls' rows in the agent's audit trail name:
-/// what it does, in the trail's words. Running a command in a pane is a
-/// command; memory is files; a script's calls are MCP's, and the browser
-/// and the desktop their own; the rest work with agents and the person.
+/// what it does, in the trail's words. Memory is files; a script's calls
+/// are MCP's, and the browser and the desktop their own; the rest work
+/// with agents and the person.
 fn kinded(mut tool: Value) -> Value {
     let kind = match tool["name"].as_str().unwrap_or_default() {
-        crate::served::RUN => "shell",
         crate::served::MEMORY => "file",
         crate::served::EXEC => "mcp",
         crate::served::BROWSER => "browser",
@@ -386,7 +385,7 @@ mod tests {
             }
         }
         let auto = json!({"gates": [{"tag": "auto", "tools": ["shell"]}]});
-        assert!(names(declare(&auto, a_lead()).unwrap()).contains(&"run_in_pane".to_owned()));
+        assert!(names(declare(&auto, a_lead()).unwrap()).contains(&"start_task".to_owned()));
         // A bot whose own tools leave no room keeps them as they are.
         let full: Vec<Value> = (0..30)
             .map(|n| {
@@ -429,7 +428,7 @@ mod tests {
         assert_eq!(refresh(&current), None);
         // A task under auto: its new tools are gated as the rest are.
         let mut old: Vec<Value> = tools(a_helper());
-        old.retain(|tool| tool["name"] != crate::served::RUN);
+        old.retain(|tool| tool["name"] != crate::served::FOLLOWS);
         let task = json!({"name": "calc.fix", "bot_id": 8, "created_by": "calc.lead",
             "tools": ["shell", "read"], "declared": old,
             "gates": [{"tag": "auto", "tools": ["shell"]}]});
@@ -439,7 +438,7 @@ mod tests {
         assert!(!names(&fields).contains(&crate::served::PROJECT.to_owned()));
         let approve = fields["approve"].as_array().unwrap();
         assert!(approve.iter().any(|tool| tool == "shell"));
-        assert!(approve.iter().any(|tool| tool == crate::served::RUN));
+        assert!(approve.iter().any(|tool| tool == crate::served::FOLLOWS));
     }
 
     #[test]
@@ -473,7 +472,7 @@ mod tests {
             "gates": [{"tag": "auto", "tools": ["shell"]}]});
         let fields = adopt(&auto).unwrap();
         let approve = fields["approve"].as_array().unwrap();
-        assert!(approve.iter().any(|tool| tool == crate::served::RUN));
+        assert!(approve.iter().any(|tool| tool == crate::served::FOLLOWS));
         // One that declares anything is left to refresh.
         assert_eq!(adopt(&json!({"declared": [{"name": "theirs"}]})), None);
     }
