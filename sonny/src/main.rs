@@ -2706,6 +2706,8 @@ struct Kept {
     read: Option<Instant>,
     /// This window asked to be closed.
     closing: bool,
+    /// A turn heard ending on reconnecting, with newer work running.
+    reopened: bool,
 }
 
 /// What a task window does once its task is done.
@@ -7134,7 +7136,11 @@ impl App {
                 let status = row["status"].as_str().unwrap_or("unknown");
                 let ended = json!({"event": "turn_finished", "bot": self.bot,
                     "turn": turn, "data": {"status": status, "error": row["error"]}});
+                // Newer work already runs: the task is open again, whatever
+                // the turn that ended left it.
+                self.kept.reopened = now.is_some();
                 self.daemon(ended).await;
+                self.kept.reopened = false;
             }
             if self.running.is_none()
                 && let Some(turn) = now
@@ -14473,7 +14479,7 @@ impl App {
     /// it, by itself or its lead, this window shows so and stays while the
     /// person uses it ([`Kept`]), or closes, settled once a turn.
     fn done_at(&mut self, turn: i64) {
-        if !self.task_window() || self.kept.settled == Some(turn) {
+        if !self.task_window() || self.kept.settled == Some(turn) || self.kept.reopened {
             return;
         }
         if !resolved::holds(resolved::read(&self.store(), &self.bot), Some(turn), false) {
@@ -25052,6 +25058,12 @@ mod tests {
         app.key(Event::FocusLost).await;
         assert!(!app.kept.closing && !app.kept.showing);
         app.running = None;
+        // A turn heard ending on reconnecting, newer work running already:
+        // nothing closes.
+        app.kept.reopened = true;
+        app.done_at(9);
+        assert!(!app.kept.closing && app.kept.settled != Some(9));
+        app.kept.reopened = false;
         // Opened on a task at rest: a mark it already had changes nothing,
         // one its lead makes after is heard.
         app.kept = Kept::default();
