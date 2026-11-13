@@ -330,6 +330,9 @@ approval gate as a call that leaves the sandbox would; `memory` and
 - `Cargo.lock` is committed and every release builds `--locked`.
   `rust-toolchain.toml` pins the toolchain. Workflow actions are pinned by
   commit SHA, and Dependabot keeps crates and actions current.
+- Cargo and Dependabot take a crate version only once it has been
+  published for three days (`.cargo/config.toml`, `.github/dependabot.yml`),
+  so a hijacked release is usually yanked before an update can pick it up.
 - A tag push runs a workflow that holds no secrets and does nothing;
   the release and Homebrew workflows run from `main`'s own definitions on
   its completion, verify the tag points to a commit on `main` and that
