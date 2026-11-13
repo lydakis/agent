@@ -717,6 +717,7 @@ fn root(path: &Path, daemon: &Daemon, others: &[known::Known]) -> Result<Root> {
     if let Some(store) = &daemon.store
         && store.starts_with(path)
     {
+        hold_journals(store);
         read_only.extend(store_files(store).filter(|file| file.exists()));
     }
     // A walled folder too: renamed, or a socket made in it, it would let
@@ -749,6 +750,11 @@ fn root(path: &Path, daemon: &Daemon, others: &[known::Known]) -> Result<Root> {
     // store would change what that daemon runs unsandboxed; renamed or
     // linked, the socket would be reached by another name.
     let others = (others.iter())
+        .inspect(|other| {
+            if other.store.starts_with(path) {
+                hold_journals(&other.store);
+            }
+        })
         .flat_map(|other| {
             let sockets =
                 (other.socket.iter()).flat_map(|socket| [socket.clone(), bots_folder(socket)]);
@@ -810,6 +816,28 @@ fn store_files(store: &Path) -> impl Iterator<Item = PathBuf> + '_ {
             file.push(suffix);
             PathBuf::from(file)
         })
+}
+
+/// SQLite's journals beside `store`, made empty where they are not there,
+/// on Linux, where a read-only mount needs something to mount: a missing
+/// one the command could make, a write-ahead log or a hot journal that
+/// SQLite would play into the store as it next opens it. Empty, each is
+/// what SQLite takes a missing one for. Made only beside a store that is
+/// there, and never over anything, a link included.
+fn hold_journals(store: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !cfg!(target_os = "linux") || !std::fs::metadata(store).is_ok_and(|meta| meta.is_file()) {
+        return;
+    }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut file = store.as_os_str().to_owned();
+        file.push(suffix);
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(PathBuf::from(file));
+    }
 }
 
 /// The folder a `.git` file names, by its real path.
@@ -2026,6 +2054,13 @@ mod tests {
             };
             assert!(has("--ro-bind", Path::new("/dev/null"), &socket));
             assert!(has("--ro-bind-try", &store, &store));
+            // Its journals, absent while it is stopped, are there to be
+            // kept, empty, so none can be made for SQLite to play back.
+            for journal in ["-wal", "-shm", "-journal"] {
+                let kept = work.join(format!("side.sqlite{journal}"));
+                assert_eq!(std::fs::read(&kept).unwrap(), b"", "{}", kept.display());
+                assert!(has("--ro-bind-try", &kept, &kept));
+            }
             assert!(
                 args.windows(2).any(
                     |w| w[0] == "--tmpfs" && w[1] == work.join("side.sock.d").to_string_lossy()
