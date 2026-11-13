@@ -9178,9 +9178,10 @@ daemon resumes the turn at once; one woken while its park is still
 landing resumes as soon as the park lands.
 A turn that is never woken comes back after 30 s, and the end of the ramp
 wakes every turn still parked on it. A call that is not a turn's own (a
-summary beside it, a search) cannot park: it takes its place in the same
-line and waits outside the gate, so the turns woken ahead of it come back
-through the gate for their places.
+search) cannot park: it takes its place in the same line and waits
+outside the gate, so the turns woken ahead of it come back through the
+gate for their places. A summary beside a turn's own call gives up on a
+full ramp, as on a closed pool, rather than wait behind its own turn.
 
 `bench.scale_screen` with `bench.streaming_model --tpm 300000
 --no-headers`, 45 s windows, 4-CPU Linux cloud box, waiting in the gate
@@ -9201,3 +9202,21 @@ Before the ramp, the same 256 bots ran 7.46 turns a second at 11.2 ms of
 CPU and 105 store jobs a turn. A woken turn's place sits idle while it
 resumes (a store round trip and its context read), which costs the 6% at
 256 bots; each park and resume is the added store work.
+
+The matched hot-path screen against main (the Perf workflow's four
+benches, base and head alternately, two rounds, same box) shows no store
+work added and every change inside run-to-run noise. Store jobs per turn
+in `bench.footprint` are 7.001 on both:
+
+| Bench | Measure | Main | Parked, woken | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 33.224 | 30.877 | -7.1% |
+| admission | burst submit p99, ms | 4.164 | 3.952 | -5.1% |
+| completion | release to terminal p99, ms | 10.771 | 11.56 | +7.3% |
+| footprint | idle RSS, MiB | 15.6 | 16.088 | +3.1% |
+| footprint | per idle bot, KiB | 1.934 | 1.93 | -0.2% |
+| footprint | RSS after a turn each, MiB | 30.855 | 31.262 | +1.3% |
+| footprint | CPU per turn, ms | 0.862 | 0.81 | -6.0% |
+| lifecycle | CPU, s | 0.475 | 0.485 | +2.1% |
+| lifecycle | p95 turn, ms | 576.866 | 578.123 | +0.2% |
+| lifecycle | peak RSS, MiB | 24.811 | 25.33 | +2.1% |
