@@ -15,6 +15,8 @@ use agent_client::files::real;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
+pub mod known;
+
 /// How a bot's commands are confined, by Codex's `sandbox_mode` names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -50,6 +52,13 @@ pub struct Root {
     /// their place would stop git. On Linux, removed when the command ends;
     /// elsewhere they are `missing`.
     pub left: Vec<PathBuf>,
+    /// Other daemons' stores and sockets inside the root, and the files
+    /// SQLite keeps beside each store: read-only while they are there, and
+    /// not to be made where they are not ([`known`]). On Linux one that is
+    /// gone by the time the command starts is skipped, as a daemon that
+    /// stops takes its socket and SQLite its journal.
+    #[serde(default)]
+    pub others: Vec<PathBuf>,
     /// On Linux, the lock files of its `missing` placeholders, made as the
     /// root is read, off the runtime thread, so a command built before its
     /// hold still has bubblewrap hold them ([`locks`]).
@@ -89,6 +98,12 @@ pub struct Policy {
     /// Folders whose Unix sockets its commands never reach, the network on
     /// or off, named or not ([`Daemon::walled`]).
     pub walled: Vec<PathBuf>,
+    /// The other daemons' sockets, which its commands never reach, the
+    /// network on or off, nor the folder of each one's bots' own sockets
+    /// beside it (`SOCKET.d`): each answers as the person, or as another
+    /// daemon's bot ([`known`]).
+    #[serde(default)]
+    pub daemons: Vec<PathBuf>,
     /// On Linux, each of [`Daemon::owned`] that is here, and the person's
     /// copy of it, bound read-only in its place: `(copy, place)`.
     #[serde(default)]
@@ -126,6 +141,15 @@ impl Policy {
         let mut paths = writable_paths(mode, workspace, writable);
         paths.sort_by_key(|path| (depth(path), path.clone()));
         paths.dedup();
+        let others = match &daemon.known {
+            Some(folder) => known::others(folder, daemon.store.as_deref()),
+            None => Default::default(),
+        };
+        let mut daemons: Vec<PathBuf> = (others.iter())
+            .filter_map(|other| other.socket.clone())
+            .filter(|socket| Some(socket) != daemon.socket.as_ref())
+            .collect();
+        daemons.dedup();
         let mut roots = Vec::new();
         for path in paths {
             // One gone since it was named is skipped, as Codex skips it:
@@ -136,7 +160,7 @@ impl Policy {
             {
                 continue;
             }
-            roots.push(root(&path, daemon)?);
+            roots.push(root(&path, daemon, &others)?);
         }
         Ok(Some(Policy {
             roots,
@@ -148,6 +172,7 @@ impl Policy {
             sockets: Vec::new(),
             walled: daemon.walled.clone(),
             owned: owned(&daemon.owned),
+            daemons,
         }))
     }
 
@@ -176,6 +201,7 @@ impl Policy {
                     .iter()
                     .chain(&root.missing)
                     .chain(&root.left)
+                    .chain(&root.others)
                     .any(|kept| path.starts_with(kept))
             })
     }
@@ -513,6 +539,10 @@ pub struct Daemon {
     /// overflow user's. Each is shown from a read-only copy the person
     /// owns (`--own-copy`). The client starting the daemon names them.
     pub owned: Vec<PathBuf>,
+    /// Where the person's daemons list themselves ([`known`]), whose
+    /// stores and sockets every root and policy keeps out of reach as it
+    /// does this daemon's own.
+    pub known: Option<PathBuf>,
 }
 
 /// A share in a bot's own socket, which listens while any share lives,
@@ -573,7 +603,7 @@ impl std::fmt::Debug for Capabilities {
 /// The root at `path`, with what stays read-only inside it: the protected
 /// folders at its top, a worktree's own git folder when it is inside the
 /// root, and the daemon's store and socket.
-fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
+fn root(path: &Path, daemon: &Daemon, others: &[known::Known]) -> Result<Root> {
     // A root is kept by its real path. One reached through a link now had
     // a link swapped in since, perhaps by a bot that may write the folder
     // above it, and would carry the sandbox wherever the link points.
@@ -613,6 +643,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             missing: Vec::new(),
             left: Vec::new(),
             locks: Vec::new(),
+            others: Vec::new(),
         });
     }
     let mut read_only = Vec::new();
@@ -714,6 +745,17 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
             read_only.push(kept.clone());
         }
     }
+    // Every other daemon's store and socket, as this one's: written, the
+    // store would change what that daemon runs unsandboxed; renamed or
+    // linked, the socket would be reached by another name.
+    let others = (others.iter())
+        .flat_map(|other| {
+            let sockets =
+                (other.socket.iter()).flat_map(|socket| [socket.clone(), bots_folder(socket)]);
+            store_files(&other.store).chain(sockets).collect::<Vec<_>>()
+        })
+        .filter(|kept| kept.starts_with(path) && kept != path)
+        .collect();
     let locks = match cfg!(target_os = "linux") {
         true => missing.iter().filter_map(|kept| made_lock(kept)).collect(),
         false => Vec::new(),
@@ -724,6 +766,7 @@ fn root(path: &Path, daemon: &Daemon) -> Result<Root> {
         missing,
         left,
         locks,
+        others,
     })
 }
 
@@ -749,6 +792,13 @@ fn linked(kept: &Path) -> Result<Root> {
             kept.display()
         ),
     )
+}
+
+/// The folder of the bots' own sockets of the daemon at `socket`, beside it.
+fn bots_folder(socket: &Path) -> PathBuf {
+    let mut folder = socket.as_os_str().to_owned();
+    folder.push(".d");
+    PathBuf::from(folder)
 }
 
 /// The store and the files SQLite and the daemon keep beside it.
@@ -826,7 +876,7 @@ pub fn command(
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{Policy, depth};
+    use super::{Policy, bots_folder, depth};
     use crate::{Error, Result};
     use std::path::{Path, PathBuf};
 
@@ -924,6 +974,11 @@ mod linux {
             for kept in kept {
                 args.extend(["--ro-bind".into(), path(kept), path(kept)]);
             }
+            // Another daemon's, while they are there: one gone since is
+            // skipped rather than stopping the command.
+            for kept in &root.others {
+                args.extend(["--ro-bind-try".into(), path(kept), path(kept)]);
+            }
             for missing in &root.missing {
                 args.extend([
                     "--perms".into(),
@@ -956,6 +1011,24 @@ mod linux {
                     }
                 }
                 None => args.extend(["--ro-bind".into(), "/dev/null".into(), path(socket)]),
+            }
+        }
+        // Nor any other daemon's socket, nor its bots' own sockets: each
+        // that is there now, as one that stopped took its socket with it.
+        for socket in &policy.daemons {
+            if std::fs::symlink_metadata(socket).is_ok() {
+                args.extend(["--ro-bind".into(), "/dev/null".into(), path(socket)]);
+            }
+            let folder = bots_folder(socket);
+            if folder.is_dir() {
+                args.extend([
+                    "--perms".into(),
+                    "555".into(),
+                    "--tmpfs".into(),
+                    path(&folder),
+                    "--remount-ro".into(),
+                    path(&folder),
+                ]);
             }
         }
         // A walled folder is out of sight, as Codex hides its app-server's
@@ -1718,7 +1791,12 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
                 })
         });
         let mut parts = vec![format!("(subpath (param \"{key}\"))")];
-        for kept in root.read_only.iter().chain(&root.missing) {
+        for kept in root
+            .read_only
+            .iter()
+            .chain(&root.missing)
+            .chain(&root.others)
+        {
             let kept_key = param(kept);
             // Both the path and what is under it: `subpath` alone would let
             // the folder itself be made.
@@ -1740,9 +1818,15 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
     let mut folders: Vec<&Path> = policy
         .roots
         .iter()
-        .flat_map(|root| root.read_only.iter().chain(&root.missing))
+        .flat_map(|root| {
+            root.read_only
+                .iter()
+                .chain(&root.missing)
+                .chain(&root.others)
+        })
         .chain(&policy.socket)
         .chain(&policy.walled)
+        .chain(&policy.daemons)
         .flat_map(|kept| kept.ancestors().skip(1))
         .filter(|folder| {
             policy
@@ -1811,6 +1895,16 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
              (deny file-link (subpath (param \"{key}\")))"
         ));
     }
+    // Nor any other daemon's, by any name, nor its bots' own sockets.
+    for socket in &policy.daemons {
+        for path in [socket.clone(), bots_folder(socket)] {
+            let key = param(&path);
+            sections.push(format!(
+                "(deny network-outbound (remote unix-socket (subpath (param \"{key}\"))))\n\
+                 (deny file-link (subpath (param \"{key}\")))"
+            ));
+        }
+    }
     if let Some(own) = &policy.capability {
         // Not another bot's, which would answer as its own bot.
         if let Some(folder) = own.parent() {
@@ -1862,6 +1956,99 @@ mod tests {
             protected_existing: agent_client::PROTECTED_EXISTING.map(String::from).to_vec(),
             ..Daemon::default()
         }
+    }
+
+    /// Another daemon of the person's, listed where daemons list
+    /// themselves, is kept as this one is: its store and the files beside
+    /// it read-only, its socket and its bots' sockets out of reach, the
+    /// network on or off, wherever an agent put them.
+    #[test]
+    fn every_other_daemon_s_store_and_socket_are_kept_as_its_own() {
+        let base =
+            std::env::temp_dir().join(format!("agent-sandbox-others-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("work/side.sock.d")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let work = base.join("work");
+        // A side daemon an agent started in the folder it works in.
+        let (store, socket) = (work.join("side.sqlite"), work.join("side.sock"));
+        std::fs::write(&store, "").unwrap();
+        std::fs::write(&socket, "").unwrap();
+        let folder = base.join("daemons");
+        let own = base.join("main.sqlite");
+        std::fs::write(&own, "").unwrap();
+        for (store, socket) in [(&own, base.join("main.sock")), (&store, socket.clone())] {
+            let listed = known::Known {
+                store: store.clone(),
+                socket: Some(socket),
+            };
+            known::record(&folder, &listed).unwrap();
+        }
+        let daemon = Daemon {
+            store: Some(own.clone()),
+            socket: Some(base.join("main.sock")),
+            known: Some(folder.clone()),
+            ..protecting()
+        };
+        let policy = Policy::new(Some(Mode::WorkspaceWrite), Some(&work), &[], true, &daemon)
+            .unwrap()
+            .unwrap();
+        // Its own daemon is not another.
+        assert_eq!(policy.daemons, std::slice::from_ref(&socket));
+        let root = policy.roots.iter().find(|root| root.path == work).unwrap();
+        for kept in [store.clone(), work.join("side.sqlite-wal"), socket.clone()] {
+            assert!(root.others.contains(&kept), "{}", kept.display());
+            assert!(!policy.can_write(&kept), "{}", kept.display());
+        }
+        assert!(policy.can_write(&work.join("notes.md")));
+        let (profile, params) = seatbelt(&policy);
+        let key = |path: &Path| {
+            let (key, _) = params.iter().find(|(_, named)| named == path).unwrap();
+            key.clone()
+        };
+        for hidden in [socket.clone(), work.join("side.sock.d")] {
+            let denied = format!(
+                "(deny network-outbound (remote unix-socket (subpath (param \"{}\"))))",
+                key(&hidden)
+            );
+            assert!(
+                profile.find(&denied).unwrap()
+                    > profile.find("(allow network-outbound)\n").unwrap()
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let args = linux::args(&policy, false);
+            let has = |a: &str, b: &Path, c: &Path| {
+                args.windows(3).any(|w| {
+                    w[0] == a && w[1] == b.to_string_lossy() && w[2] == c.to_string_lossy()
+                })
+            };
+            assert!(has("--ro-bind", Path::new("/dev/null"), &socket));
+            assert!(has("--ro-bind-try", &store, &store));
+            assert!(
+                args.windows(2).any(
+                    |w| w[0] == "--tmpfs" && w[1] == work.join("side.sock.d").to_string_lossy()
+                )
+            );
+            // A daemon that stopped took its socket: nothing to hide, and
+            // nothing made where it was, which a read-only root couldn't
+            // hold; what is kept only while there is skipped by bubblewrap.
+            std::fs::remove_file(&socket).unwrap();
+            std::fs::remove_dir(work.join("side.sock.d")).unwrap();
+            let args = linux::args(&policy, false);
+            assert!(
+                !args
+                    .windows(3)
+                    .any(|w| w[0] == "--ro-bind" && w[2] == socket.to_string_lossy())
+            );
+            assert!(
+                !args.windows(2).any(
+                    |w| w[0] == "--tmpfs" && w[1] == work.join("side.sock.d").to_string_lossy()
+                )
+            );
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// A bot whose folder holds the agent's home (Sonny opened in HOME)
@@ -2473,6 +2660,7 @@ mod tests {
                     missing: Vec::new(),
                     left: Vec::new(),
                     locks: Vec::new(),
+                    others: Vec::new(),
                     path: path.clone(),
                 }
             })
@@ -2487,6 +2675,7 @@ mod tests {
             sockets: Vec::new(),
             walled: Vec::new(),
             owned: Vec::new(),
+            daemons: Vec::new(),
         };
         let (profile, params) = seatbelt(&policy);
         let size = profile.len()
