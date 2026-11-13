@@ -1925,6 +1925,21 @@ when, so a live note never passes for a written one.
 
 ![A note of your own in the margin, filled from its blanks: follows 🛠 ci, tasks, release.json; the CI source's latest run, a release file's state, and the lead's task fix-avg with how long its turn took](../docs/sonny/margin-template-note.png)
 
+A source whose events name a `topic`, such as one per pull request, gives
+each topic's newest event as `.topics`, so a note can list where each one
+stands now, however long ago it last changed:
+
+```toml
+[sonny.notes.prs]
+title = "open pull requests"
+template = """
+{% for pr in source('prs').topics | rejectattr('fields.state', 'eq', 'merged') | sort(attribute='fields.number') %}- **#{{ pr.fields.number }}** {{ pr.fields.title }}
+  CI {{ pr.fields.ci }} · {{ pr.fields.review }}
+{% endfor %}"""
+```
+
+![A note of your own listing open pull requests from a source's topics: #41, #42 and #43 with their CI and review state, the merged #40 left out](../docs/sonny/margin-topics-note.png)
+
 Notes of
 your own go in your config as `[sonny.notes.NAME]`, a `template` and a
 `title`, and show over the agent's in every margin, with no buttons:
