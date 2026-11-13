@@ -91,6 +91,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         window_place: None,
         lead: project::Pick::Last,
         send: None,
+        draft: None,
+        reopened: false,
     };
     let agent = Arc::new(Agent {
         out: Arc::new(Out::default()),

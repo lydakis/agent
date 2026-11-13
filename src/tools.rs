@@ -42,6 +42,9 @@ pub const ARTIFACT_BYTES: usize = 1024 * 1024;
 /// Each end kept of a stream past `ARTIFACT_BYTES`, leaving room for the
 /// marker that counts the dropped middle.
 const KEPT_END: usize = (ARTIFACT_BYTES - 256) / 2;
+/// The most of one stream a file in a bot's outputs folder holds, written
+/// as the command runs: a sanity bound on one that writes without end.
+pub const SPILL_BYTES: u64 = 1 << 30;
 const FILE_BYTES: usize = 4 * 1024 * 1024;
 const WRITE_BYTES: usize = 1024 * 1024;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 120_000;
@@ -120,7 +123,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; each agent keeps at most as many as the daemon's process bound, and starting one past them kills the one it started or waited on least recently. With detach=true the command starts in its own session and a proc handle and its pid are returned at once; it outlives the turn and the daemon and runs until it exits, a pause, or kill=true on its handle. Its output is discarded unless the command redirects it to a file; its end comes as a background command's does. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, and retained whole in a file the result names under files, up to 1 GiB, or, where there is no such file, up to 1 MiB: past that, its first and last 512 KiB. The command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; each agent keeps at most as many as the daemon's process bound, and starting one past them kills the one it started or waited on least recently. With detach=true the command starts in its own session and a proc handle and its pid are returned at once; it outlives the turn and the daemon and runs until it exits, a pause, or kill=true on its handle. Its output is discarded unless the command redirects it to a file; its end comes as a background command's does. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "workdir":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_BACKGROUND_TIMEOUT_MS},
@@ -704,6 +707,9 @@ pub fn name_matches(pattern: &str, name: &str) -> bool {
     pattern[p..].iter().all(|c| *c == '*')
 }
 
+/// The most held back for whole credentials across a stream's cut.
+const CREDENTIAL_HOLD: usize = 64 * 1024;
+
 impl Credentials {
     pub fn set(&self, name: &str, value: &str) {
         if value.is_empty() {
@@ -775,6 +781,19 @@ impl Credentials {
     /// shows never ends inside a whole credential.
     pub fn unfinished(&self, text: &[u8]) -> usize {
         let set = self.current();
+        let open = open_field(text, &set.fields).value;
+        self.unfinished_after(&set, text, open, false)
+    }
+    /// How many of `text`'s last bytes could begin a credential that more
+    /// output would finish, the last `open` held besides. A whole
+    /// credential across the cut is shown at once, or, `exact`, held.
+    fn unfinished_after(
+        &self,
+        set: &CredentialSet,
+        text: &[u8],
+        open: usize,
+        exact: bool,
+    ) -> usize {
         let values = || {
             set.values
                 .iter()
@@ -788,10 +807,35 @@ impl Credentials {
             })
             .max()
             .unwrap_or(0)
-            .max(open_field(text, &set.fields).value);
-        // A whole credential across the cut, as one that ends with its own
-        // start, is shown whole.
-        let mut cut = text.len() - started;
+            .max(open);
+        // Exact, a whole credential across the cut is held with what
+        // follows it: the start held may finish a longer one, which
+        // whole-text redaction replaces first. Past `CREDENTIAL_HOLD` of
+        // such, as in a run of one that ends with its own start, and
+        // otherwise, it is shown whole, as one that ends with its own
+        // start is to a terminal at once.
+        let start = text.len() - started;
+        let mut cut = start;
+        while exact
+            && let Some(first) = values()
+                .filter_map(|value| {
+                    let from = (cut + 1).saturating_sub(value.len());
+                    let to = (cut + value.len() - 1).min(text.len());
+                    let window = text.get(from..to)?;
+                    let at = window.windows(value.len()).position(|w| w == value)?;
+                    Some(from + at)
+                })
+                .min()
+        {
+            cut = first;
+            if start - cut > CREDENTIAL_HOLD {
+                break;
+            }
+        }
+        if exact && start - cut <= CREDENTIAL_HOLD {
+            return text.len() - cut;
+        }
+        let mut cut = start;
         while let Some(end) = values()
             .filter_map(|value| {
                 let from = (cut + 1).saturating_sub(value.len());
@@ -830,6 +874,483 @@ impl Credentials {
     }
 }
 
+/// A stream redacted piece by piece exactly as [`Credentials::redact`]
+/// would redact it whole. Each of its passes runs as a stream in the same
+/// order: credentials, held back only while the end of what was read may
+/// begin one; then secret PEM blocks; then secret fields' values, each
+/// read byte by byte as `redact_blocks` and `redact_fields` read a whole
+/// text, so how the stream is cut never changes what they find. Only what
+/// may still be redacted is held, and a block or value too long to hold
+/// is dropped as it comes.
+pub struct Redacting {
+    credentials: Credentials,
+    /// Read and not yet past the credentials' pass.
+    held: Vec<u8>,
+    blocks: BlockStream,
+    fields: FieldStream,
+}
+
+impl Redacting {
+    pub fn new(credentials: Credentials) -> Self {
+        Redacting {
+            credentials,
+            held: Vec::new(),
+            blocks: BlockStream::default(),
+            fields: FieldStream::default(),
+        }
+    }
+
+    /// `bytes`, the stream's next, and what before them was held: as much
+    /// as can be told now, redacted.
+    pub fn feed(&mut self, bytes: &[u8]) -> String {
+        self.held.extend_from_slice(bytes);
+        let set = self.credentials.current();
+        // A character cut at the piece's end waits for the rest of it,
+        // whatever came before.
+        let whole = self.held.len() - unfinished_char(&self.held);
+        let kept = self
+            .credentials
+            .unfinished_after(&set, &self.held[..whole], 0, true)
+            .min(whole);
+        let rest = self.held.split_off(whole - kept);
+        let read = std::mem::replace(&mut self.held, rest);
+        self.pass(&set, read, false)
+    }
+
+    /// What is still held, at the stream's end, redacted.
+    pub fn finish(mut self) -> String {
+        let set = self.credentials.current();
+        let read = std::mem::take(&mut self.held);
+        self.pass(&set, read, true)
+    }
+
+    fn pass(&mut self, set: &CredentialSet, read: Vec<u8>, last: bool) -> String {
+        let mut text = String::from_utf8(read)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+        for credential in &set.values {
+            if text.contains(&credential.value) {
+                text = text.replace(&credential.value, REDACTED);
+            }
+        }
+        if !set.blocks.is_empty() || self.blocks.busy() {
+            text = self.blocks.feed(&text, &set.blocks, last);
+        }
+        if !set.fields.is_empty() || self.fields.busy() {
+            text = self.fields.feed(&text, &set.fields, last);
+        }
+        text
+    }
+}
+
+/// How many of `bytes`' last bytes begin a UTF-8 character that more
+/// bytes would finish.
+fn unfinished_char(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let lead = bytes[bytes.len() - back];
+        if lead & 0xC0 == 0x80 {
+            continue;
+        }
+        let needs = match lead {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => return 0,
+        };
+        let begun = std::str::from_utf8(&bytes[bytes.len() - back..])
+            .err()
+            .is_some_and(|error| error.error_len().is_none());
+        return if needs > back && begun { back } else { 0 };
+    }
+    0
+}
+
+/// `redact_blocks` as a stream: what it may still replace is held, and a
+/// secret block's body is dropped as it comes, up to its end.
+#[derive(Default)]
+struct BlockStream {
+    /// Read and not yet told: from a block's start, or the end of the
+    /// text that may begin one.
+    held: String,
+    /// Inside a secret block's body, dropped: its last bytes, which may
+    /// begin its end's marker.
+    body: Option<String>,
+}
+
+/// The most of a block's header held back for its end: far past any
+/// key's, so a header still open past it names nothing.
+const HEADER_HOLD: usize = 64 * 1024;
+
+impl BlockStream {
+    fn busy(&self) -> bool {
+        !self.held.is_empty() || self.body.is_some()
+    }
+
+    fn feed(&mut self, text: &str, blocks: &[String], last: bool) -> String {
+        const BEGIN: &str = "-----BEGIN ";
+        const END: &str = "-----END ";
+        let mut out = String::with_capacity(text.len());
+        let text = std::mem::take(&mut self.held) + text;
+        let bytes = text.as_bytes();
+        // Read on from `at`: nothing before it is moved again.
+        let mut at = 0;
+        loop {
+            if let Some(tail) = &mut self.body {
+                // The end's marker, maybe begun in the last text's end.
+                let mut probe = tail.as_bytes().to_vec();
+                probe.extend_from_slice(&bytes[at..(at + END.len() - 1).min(bytes.len())]);
+                let across = (probe.windows(END.len()))
+                    .position(|w| w == END.as_bytes())
+                    .map(|p| at + p + END.len() - tail.len());
+                let end = across.or_else(|| text[at..].find(END).map(|n| at + n + END.len()));
+                match end {
+                    Some(end) => {
+                        // As `redact_blocks` goes on: past the end's marker.
+                        out.push_str(REDACTED);
+                        out.push('\n');
+                        out.push_str(END);
+                        self.body = None;
+                        at = end;
+                        continue;
+                    }
+                    None if last => {
+                        // A key cut off by its stream's end is still a key.
+                        out.push_str(REDACTED);
+                        self.body = None;
+                    }
+                    None => {
+                        tail.push_str(&text[at..]);
+                        let keep = floor_char(tail, tail.len().saturating_sub(END.len() - 1));
+                        tail.drain(..keep);
+                    }
+                }
+                return out;
+            }
+            let Some(begin) = text[at..].find(BEGIN).map(|n| at + n) else {
+                // The end may begin a block's marker.
+                let keep = match last {
+                    true => 0,
+                    false => (1..BEGIN.len())
+                        .rev()
+                        .find(|&n| text.ends_with(&BEGIN[..n]))
+                        .unwrap_or(0),
+                };
+                let cut = (text.len() - keep).max(at);
+                out.push_str(&text[at..cut]);
+                self.held = text[cut..].to_owned();
+                return out;
+            };
+            out.push_str(&text[at..begin]);
+            at = begin;
+            let Some(dashes) = text[at + BEGIN.len()..]
+                .find("-----")
+                .map(|n| BEGIN.len() + n + 5)
+            else {
+                if last {
+                    // No header ends: `redact_blocks` stops here.
+                    out.push_str(&text[at..]);
+                    return out;
+                }
+                // No header ends after this block's start, nor so after any
+                // later one: past `HEADER_HOLD` they are no key's and are
+                // told as they are; the last such start is held.
+                let from = ceil_char(&text, text.len().saturating_sub(HEADER_HOLD)).max(at);
+                let held = match text[from..].find(BEGIN) {
+                    Some(n) => from + n,
+                    None => text.len(),
+                };
+                out.push_str(&text[at..held]);
+                self.held = text[held..].to_owned();
+                return out;
+            };
+            let header = match &bytes[at + dashes..] {
+                [b'\r', b'\n', ..] => dashes + 2,
+                [b'\n', ..] => dashes + 1,
+                [b'\r'] | [] if !last => {
+                    // The line's end may follow.
+                    self.held = text[at..].to_owned();
+                    return out;
+                }
+                _ => dashes,
+            };
+            let header = &text[at..at + header];
+            out.push_str(header);
+            at += header.len();
+            if blocks.iter().any(|block| header.contains(block.as_str())) {
+                self.body = Some(String::new());
+            }
+        }
+    }
+}
+
+/// The first char boundary of `text` at or after `at`.
+fn ceil_char(text: &str, mut at: usize) -> usize {
+    while !text.is_char_boundary(at) {
+        at += 1;
+    }
+    at
+}
+
+/// The last char boundary of `text` at or before `at`.
+fn floor_char(text: &str, mut at: usize) -> usize {
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// `redact_fields` as a stream, read byte by byte as it reads a whole
+/// text: all but a value that may be secret is told as it comes.
+#[derive(Default)]
+struct FieldStream {
+    state: FieldState,
+    /// Whether the last byte read was part of a word.
+    after_word: bool,
+}
+
+#[derive(Default)]
+enum FieldState {
+    /// Between words, or in a word that cannot be a field's name.
+    #[default]
+    Scan,
+    /// In a word: its length, the end of its key, as `field_key` makes
+    /// it, from the texts before this one, up to the longest field's, and
+    /// where it starts in this text.
+    Word {
+        length: usize,
+        key: Vec<u8>,
+        from: usize,
+    },
+    /// After a field's name: past its closing quote, if it had one, and
+    /// then past its separator.
+    Name { quoted: bool, separated: bool },
+    /// In a value: its quote, whether the last byte escaped the next, and
+    /// what of it is held until it is known to be secret or not.
+    Value {
+        quote: Option<u8>,
+        escaped: bool,
+        value: Value,
+    },
+}
+
+/// A value read so far.
+enum Value {
+    /// Not yet known to be secret.
+    Held(Held),
+    /// Told as redacted: the rest of it is dropped.
+    Secret,
+    /// Known not to be: told as it comes.
+    Shown,
+}
+
+/// A value's bytes held until it is known to be secret or not, and
+/// whether they hold a digit and a letter, kept as they come so each byte
+/// costs the same however long the value runs.
+#[derive(Default)]
+struct Held {
+    bytes: Vec<u8>,
+    digit: bool,
+    letter: bool,
+}
+
+impl Held {
+    fn push(&mut self, b: u8) {
+        self.bytes.push(b);
+        self.digit |= b.is_ascii_digit();
+        self.letter |= b.is_ascii_alphabetic();
+    }
+
+    /// Whether it is secret, as `redact_fields` judges a whole value: long
+    /// enough, mixing letters and digits, and not code.
+    fn secret(&self) -> bool {
+        self.bytes.len() >= SECRET_MIN
+            && self.digit
+            && self.letter
+            && !matches!(self.bytes[0], b'{' | b'[' | b'$')
+    }
+
+    /// Told whole at its end: redacted when it is secret.
+    fn tell(&mut self, out: &mut Vec<u8>) {
+        match self.secret() {
+            true => out.extend_from_slice(REDACTED.as_bytes()),
+            false => out.append(&mut self.bytes),
+        }
+    }
+}
+
+/// The most of a value held before it is known to be secret or not: one
+/// longer is told as redacted.
+const VALUE_HOLD: usize = 1 << 20;
+
+impl FieldStream {
+    fn busy(&self) -> bool {
+        !matches!(self.state, FieldState::Scan)
+    }
+
+    fn feed(&mut self, text: &str, fields: &[String], last: bool) -> String {
+        let shortest = fields.iter().map(String::len).min().unwrap_or(0);
+        let longest = fields.iter().map(String::len).max().unwrap_or(0);
+        let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(text.len());
+        // What is told as read runs from `mark`, copied out whole when a
+        // value is held or dropped, and at the end.
+        let mut mark = 0;
+        let mut at = 0;
+        while at < bytes.len() {
+            let b = bytes[at];
+            match &mut self.state {
+                FieldState::Scan => {
+                    if word(b) && !self.after_word {
+                        self.state = FieldState::Word {
+                            length: 0,
+                            key: Vec::new(),
+                            from: at,
+                        };
+                        continue;
+                    }
+                    // Runs of bytes that start no word pass at once.
+                    let mut end = at + 1;
+                    while end < bytes.len() && !word(bytes[end]) {
+                        end += 1;
+                    }
+                    if end > at + 1 || !word(b) {
+                        self.after_word = false;
+                        at = end;
+                        continue;
+                    }
+                    // A word byte after a word: the rest of that word.
+                }
+                FieldState::Word { length, key, from } => {
+                    let mut end = at;
+                    while end < bytes.len() && word(bytes[end]) {
+                        end += 1;
+                    }
+                    *length += end - at;
+                    if end == bytes.len() {
+                        // The word goes on into the next text: keep its
+                        // key's end.
+                        key.extend(
+                            (bytes[*from..end].iter())
+                                .filter(|&&b| b != b'_' && b != b'-')
+                                .map(u8::to_ascii_lowercase),
+                        );
+                        let cut = key.len().saturating_sub(longest);
+                        key.drain(..cut);
+                        *from = 0;
+                        self.after_word = true;
+                        at = end;
+                        continue;
+                    }
+                    let part = &bytes[*from..end];
+                    let named = *length >= shortest
+                        && fields.iter().any(|field| {
+                            let mut name = (part.iter().rev())
+                                .filter(|&&b| b != b'_' && b != b'-')
+                                .map(u8::to_ascii_lowercase)
+                                .chain(key.iter().rev().copied());
+                            field.bytes().rev().all(|b| name.next() == Some(b))
+                        });
+                    self.state = match named {
+                        true => FieldState::Name {
+                            quoted: false,
+                            separated: false,
+                        },
+                        false => FieldState::Scan,
+                    };
+                    self.after_word = true;
+                    at = end;
+                    continue;
+                }
+                FieldState::Name { quoted, separated } => {
+                    if !*separated {
+                        if !*quoted && matches!(b, b'"' | b'\'') || matches!(b, b' ' | b'\t') {
+                            *quoted = true;
+                        } else if matches!(b, b'=' | b':') {
+                            *separated = true;
+                        } else {
+                            // No separator: no field. The byte is read
+                            // again, after what came before it.
+                            self.state = FieldState::Scan;
+                            continue;
+                        }
+                    } else if !matches!(b, b' ' | b'\t') {
+                        let quote = matches!(b, b'"' | b'\'').then_some(b);
+                        self.state = FieldState::Value {
+                            quote,
+                            escaped: false,
+                            value: Value::Held(Held::default()),
+                        };
+                        if quote.is_none() {
+                            continue;
+                        }
+                    }
+                }
+                FieldState::Value {
+                    quote,
+                    escaped,
+                    value,
+                } => {
+                    let ends = !*escaped
+                        && match quote {
+                            Some(q) => b == *q || b == b'\n',
+                            None => {
+                                b.is_ascii_whitespace()
+                                    || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
+                            }
+                        };
+                    if ends {
+                        if let Value::Held(held) = value {
+                            held.tell(&mut out);
+                        }
+                        // The byte that ended it is read again.
+                        self.state = FieldState::Scan;
+                        continue;
+                    }
+                    *escaped = !*escaped && quote.is_some() && b == b'\\';
+                    match value {
+                        Value::Shown => {}
+                        Value::Secret => {
+                            mark = at + 1;
+                        }
+                        Value::Held(held) => {
+                            if held.bytes.is_empty() {
+                                out.extend_from_slice(&bytes[mark..at]);
+                            }
+                            held.push(b);
+                            mark = at + 1;
+                            if held.secret() {
+                                out.extend_from_slice(REDACTED.as_bytes());
+                                *value = Value::Secret;
+                            } else if matches!(held.bytes[0], b'{' | b'[' | b'$') {
+                                out.append(&mut held.bytes);
+                                *value = Value::Shown;
+                            } else if held.bytes.len() > VALUE_HOLD {
+                                out.extend_from_slice(REDACTED.as_bytes());
+                                *value = Value::Secret;
+                            }
+                        }
+                    }
+                }
+            }
+            self.after_word = word(b);
+            at += 1;
+        }
+        out.extend_from_slice(&bytes[mark..]);
+        if last {
+            if let FieldState::Value {
+                value: Value::Held(held),
+                ..
+            } = &mut self.state
+            {
+                held.tell(&mut out);
+            }
+            self.state = FieldState::Scan;
+        }
+        String::from_utf8(out)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+    }
+}
+
 const REDACTED: &str = "[REDACTED]";
 /// Shorter values are flags, placeholders and counts, not secrets; so are
 /// values without both letters and digits.
@@ -841,6 +1362,15 @@ fn field_key(name: &str) -> String {
         .filter(|c| *c != '_' && *c != '-')
         .map(|c| c.to_ascii_lowercase())
         .collect()
+}
+
+/// Whether `name`'s key, as `field_key` makes it, ends with `field`,
+/// without making it: `name` is a word, all ASCII.
+fn key_ends_with(name: &[u8], field: &str) -> bool {
+    let mut key = (name.iter().rev())
+        .filter(|&&b| b != b'_' && b != b'-')
+        .map(u8::to_ascii_lowercase);
+    field.bytes().rev().all(|b| key.next() == Some(b))
 }
 
 /// Replace the value after each of `fields` in `text`, printed as
@@ -865,8 +1395,10 @@ fn redact_fields(text: String, fields: &[String]) -> String {
         if i - start < shortest {
             continue;
         }
-        let name = field_key(&text[start..i]);
-        if !fields.iter().any(|field| name.ends_with(field.as_str())) {
+        if !fields
+            .iter()
+            .any(|field| key_ends_with(&bytes[start..i], field))
+        {
             continue;
         }
         // The name's closing quote, the separator, and the value's quote.
@@ -948,7 +1480,7 @@ fn open_field(text: &[u8], fields: &[String]) -> Open {
     const NAME_START: usize = 4;
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
     let tail = &text[text.len().saturating_sub(FIELD_HOLD)..];
-    let key = |name: &[u8]| field_key(&String::from_utf8_lossy(name));
+    let shortest = fields.iter().map(String::len).min().unwrap_or(0);
     let mut i = 0;
     while i < tail.len() {
         if !word(tail[i]) || (i > 0 && word(tail[i - 1])) {
@@ -959,8 +1491,13 @@ fn open_field(text: &[u8], fields: &[String]) -> Open {
         while i < tail.len() && word(tail[i]) {
             i += 1;
         }
-        let name = key(&tail[start..i]);
+        // A word shorter than every field cannot end with one; the last
+        // may still begin one.
+        if i - start < shortest && i < tail.len() {
+            continue;
+        }
         if i == tail.len() {
+            let name = field_key(&String::from_utf8_lossy(&tail[start..i]));
             // The last word: it may be the start of a field's name.
             // Bytes, not characters: a field's name may be any text.
             let begins = fields.iter().any(|field| {
@@ -968,9 +1505,15 @@ fn open_field(text: &[u8], fields: &[String]) -> Open {
                     .any(|n| name.as_bytes().ends_with(&field.as_bytes()[..n]))
             });
             let name = if begins { tail.len() - start } else { 0 };
-            return Open { name, value: 0 };
+            return Open {
+                name,
+                ..Open::default()
+            };
         }
-        if !fields.iter().any(|field| name.ends_with(field.as_str())) {
+        if !fields
+            .iter()
+            .any(|field| key_ends_with(&tail[start..i], field))
+        {
             continue;
         }
         // As `redact_fields` reads one: a quote, a separator, a quote.
@@ -983,7 +1526,10 @@ fn open_field(text: &[u8], fields: &[String]) -> Open {
         }
         let name = tail.len() - start;
         if j == tail.len() {
-            return Open { name, value: 0 };
+            return Open {
+                name,
+                ..Open::default()
+            };
         }
         if !matches!(tail[j], b'=' | b':') {
             continue;
@@ -996,18 +1542,32 @@ fn open_field(text: &[u8], fields: &[String]) -> Open {
         if quote.is_some() {
             j += 1;
         }
-        let ended = tail[j..].iter().any(|&b| match quote {
-            Some(q) => b == q || b == b'\n',
-            None => {
-                b.is_ascii_whitespace() || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
+        // Where its value ends, read as `redact_fields` reads it: an
+        // escaped quote is part of a quoted value.
+        let value = j;
+        while j < tail.len() {
+            let b = tail[j];
+            let ends = match quote {
+                Some(q) => b == q || b == b'\n',
+                None => {
+                    b.is_ascii_whitespace() || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
+                }
+            };
+            if ends {
+                break;
             }
-        });
-        if !ended {
-            return Open {
-                name,
-                value: tail.len() - j,
+            j = match (quote, b) {
+                (Some(_), b'\\') => j + 2,
+                _ => j + 1,
             };
         }
+        if j >= tail.len() {
+            return Open {
+                name,
+                value: tail.len() - value,
+            };
+        }
+        i = j;
     }
     Open::default()
 }
@@ -1212,6 +1772,23 @@ impl Files {
                 recorded: Default::default(),
             })
         }))
+    }
+    /// These and `other`'s, as one: the files removed together unless the
+    /// store records them.
+    pub fn join(self, other: Files) -> Files {
+        match (self.0, other.0) {
+            (None, files) | (files, None) => Files(files),
+            (Some(first), Some(second)) => {
+                let files = (first.files.iter().chain(&second.files).cloned()).collect();
+                // Their removal is the joined set's now.
+                for owned in [&first, &second] {
+                    owned
+                        .recorded
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Files::new(files)
+            }
+        }
     }
     /// The store's record names them now: they last as it does.
     pub fn recorded(&self) {
@@ -2168,6 +2745,7 @@ impl Registry {
                     sandbox,
                     self.place(),
                     tokio::sync::oneshot::channel().0,
+                    None,
                 )
                 .await
             }
@@ -2324,13 +2902,30 @@ impl Registry {
         elapsed: Duration,
     ) -> Outcome {
         let mut artifacts = Vec::new();
-        let mut preview = |name: &'static str, captured: Captured| {
-            let (bytes, dropped) = captured.finish();
+        let mut files = Files::default();
+        let mut preview = |name: &'static str, mut captured: Captured| {
+            let spilled = captured.spilled.take();
+            let total = captured.len() as u64 + captured.dropped;
+            let (bytes, dropped) = captured.finish(spilled.is_some());
             // Reuse the pipe buffer for ordinary UTF-8 output. Invalid
             // bytes still get the same lossy decoding as before.
             let text = String::from_utf8(bytes)
                 .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
             let mut text = self.redact(text);
+            // Written whole to a file as it ran: the file is the stream's
+            // retained copy, and the bytes here only what the model sees.
+            if let Some(spilled) = spilled {
+                let retained = match total.saturating_sub(spilled.saved) {
+                    0 => "the full output is retained".to_owned(),
+                    short => format!(
+                        "its first {} bytes are retained, and the {short} after them were not, past the {} GiB a retained stream holds",
+                        spilled.saved,
+                        SPILL_BYTES >> 30
+                    ),
+                };
+                files = std::mem::take(&mut files).join(spilled.files);
+                return truncated(&text, &retained);
+            }
             if text.len() <= PREVIEW_BYTES {
                 return text;
             }
@@ -2359,7 +2954,7 @@ impl Registry {
         Outcome {
             output: output.to_string(),
             artifacts,
-            files: Files::default(),
+            files,
             parts: Vec::new(),
             failed: !success,
         }
@@ -2396,10 +2991,11 @@ impl Registry {
         sandbox: Option<Arc<Policy>>,
         place: Place,
         started: tokio::sync::oneshot::Sender<()>,
+        spill: Option<Spill>,
     ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
         let registry = self.clone();
         async move {
-            let (stdout, stderr, exit, elapsed) = {
+            let (mut stdout, mut stderr, exit, elapsed) = {
                 // Held until the command and the sandbox around it are
                 // gone, and taken before the slot, so no slot waits on it.
                 // Both go before the output is redacted, so a result
@@ -2419,9 +3015,12 @@ impl Registry {
                     &registry,
                     &environment,
                     sandbox.as_deref(),
+                    spill.as_ref(),
                 )
                 .await?
             };
+            // The streams' files are finished with no process slot held.
+            tokio::join!(stdout.settle(), stderr.settle());
             let bytes = stdout.len() + stderr.len();
             registry
                 .off_runtime(bytes, move |registry| {
@@ -2450,6 +3049,7 @@ impl Registry {
         sandbox: Option<Arc<Policy>>,
         queued: Queued,
         done: tokio::sync::oneshot::Sender<Result<Outcome>>,
+        spill: Option<Spill>,
     ) {
         let registry = self.clone();
         let mut queued = queued;
@@ -2467,7 +3067,7 @@ impl Registry {
                 drop(queued);
                 // The slot and the sandbox's hold go once the command is
                 // done, before its output is redacted.
-                let (stdout, stderr, exit, elapsed) = {
+                let (mut stdout, mut stderr, exit, elapsed) = {
                     let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
                     let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                     shell(
@@ -2477,9 +3077,12 @@ impl Registry {
                         &registry,
                         &environment,
                         sandbox.as_deref(),
+                        spill.as_ref(),
                     )
                     .await?
                 };
+                // The streams' files are finished with no process slot held.
+                tokio::join!(stdout.settle(), stderr.settle());
                 let bytes = stdout.len() + stderr.len();
                 registry
                     .off_runtime(bytes, move |registry| {
@@ -2888,6 +3491,82 @@ pub fn page_lines(text: &str, offset: usize, limit: usize) -> Result<String> {
     page(text.lines(), offset, limit, PREVIEW_BYTES, false)
 }
 
+/// `page_lines` of a retained stream's file, read a line at a time up to
+/// the page and counted past it, so a file of a gigabyte is never held
+/// whole. None when it is gone or no longer a file; links are not followed.
+#[cfg(unix)]
+pub fn page_file(file: &str, offset: usize, limit: usize) -> Result<Option<String>> {
+    use std::io::BufRead;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(opened) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(file)
+    else {
+        return Ok(None);
+    };
+    let found = opened.metadata()?;
+    if !found.is_file() {
+        return Ok(None);
+    }
+    // One that is larger was not written here; one that grows after is
+    // read only as far as it was.
+    if found.len() > FILE_RETAINED_BYTES {
+        return fail("storage_error");
+    }
+    let mut reader =
+        std::io::BufReader::with_capacity(256 << 10, std::io::Read::take(opened, found.len()));
+    // The page's lines, as `str::lines` reads them; each kept to just past
+    // the page's bound, which is all `page` needs to refuse a longer one,
+    // and none kept once the page is full.
+    let first = offset - 1;
+    let (mut window, mut kept) = (Vec::<String>::new(), 0);
+    let (mut total, mut line, mut partial) = (0usize, Vec::new(), false);
+    let shown =
+        |total: usize, kept: usize| total >= first && total < first + limit && kept < PREVIEW_BYTES;
+    let ended =
+        |line: &mut Vec<u8>, total: &mut usize, kept: &mut usize, window: &mut Vec<String>| {
+            if shown(*total, *kept) {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                let text = String::from_utf8_lossy(line).into_owned();
+                *kept += text.len();
+                window.push(text);
+            }
+            line.clear();
+            *total += 1;
+        };
+    loop {
+        let read = reader.fill_buf()?;
+        if read.is_empty() {
+            break;
+        }
+        let (end, newline) = match read.iter().position(|&b| b == b'\n') {
+            Some(at) => (at, true),
+            None => (read.len(), false),
+        };
+        if shown(total, kept) {
+            let room = (PREVIEW_BYTES + 1).saturating_sub(line.len());
+            line.extend_from_slice(&read[..end.min(room)]);
+        }
+        reader.consume(end + usize::from(newline));
+        partial = !newline;
+        if newline {
+            ended(&mut line, &mut total, &mut kept, &mut window);
+        }
+    }
+    if partial {
+        ended(&mut line, &mut total, &mut kept, &mut window);
+    }
+    let lines = (0..total).map(|index| {
+        (index.checked_sub(first))
+            .and_then(|at| window.get(at))
+            .map_or("", String::as_str)
+    });
+    page(lines, offset, limit, PREVIEW_BYTES, false).map(Some)
+}
+
 /// The widest piece `page_pieces` numbers as a line.
 pub const PIECE_BYTES: usize = 4096;
 
@@ -3027,10 +3706,6 @@ fn boundary(text: &str, mut index: usize) -> usize {
 /// Head and tail of an oversized output, with the omission stated.
 /// `dropped` counts the bytes the retained text itself left out.
 fn truncate(text: &str, dropped: u64) -> String {
-    let half = PREVIEW_BYTES / 2;
-    let head = &text[..boundary(text, half)];
-    let tail_start = boundary(text, text.len() - half);
-    let omitted = text.len() - head.len() - (text.len() - tail_start);
     let retained = if dropped == 0 {
         "the full output is retained".to_owned()
     } else {
@@ -3038,6 +3713,21 @@ fn truncate(text: &str, dropped: u64) -> String {
             "{dropped} more past 1 MiB were not kept, and its first and last {KEPT_END} bytes are retained"
         )
     };
+    truncated(text, &retained)
+}
+
+/// Head and tail of an oversized output, saying what is `retained`. One
+/// that redaction left within a preview is shown whole, with the same word.
+fn truncated(text: &str, retained: &str) -> String {
+    if text.len() <= PREVIEW_BYTES {
+        return format!(
+            "{text}\n[... {retained}: see this result's artifacts and read them with the read tool ...]"
+        );
+    }
+    let half = PREVIEW_BYTES / 2;
+    let head = &text[..boundary(text, half)];
+    let tail_start = boundary(text, text.len() - half);
+    let omitted = text.len() - head.len() - (text.len() - tail_start);
     format!(
         "{head}\n[... {omitted} bytes omitted; {retained}: see this result's artifacts and read them with the read tool ...]\n{}",
         &text[tail_start..]
@@ -3096,14 +3786,152 @@ impl Registry {
 }
 
 /// What a stream wrote, bounded: all of it up to `ARTIFACT_BYTES`, past
-/// that its first and last `KEPT_END` bytes and a count of the rest.
+/// that its first and last `KEPT_END` bytes and a count of the rest. With
+/// a [`Spill`], a stream that passes the bound is written whole to a file
+/// as it is read, and these bytes are only what the model is shown.
 #[derive(Default)]
 struct Captured {
     head: Vec<u8>,
     tail: std::collections::VecDeque<u8>,
     dropped: u64,
+    /// Where the whole stream goes once it passes the bound, the stream's
+    /// name, and what redacts it there.
+    spill: Option<(Spill, &'static str, Credentials)>,
+    /// What writes it there, once it has passed.
+    writer: Option<Writer>,
+    /// How many of a command's streams are waiting for their writer to
+    /// take what they read: waiting on the disk, not on the pipe.
+    waiting: Arc<std::sync::atomic::AtomicUsize>,
+    /// The file that holds it, once its writer is done.
+    spilled: Option<Spilled>,
 }
+
+/// The most a retained stream's file holds: `SPILL_BYTES` of output, each
+/// invalid byte made at most three, as a stored copy's are.
+pub const FILE_RETAINED_BYTES: u64 = 3 * SPILL_BYTES;
+
+/// Where a command's streams go whole as it runs, once one passes
+/// `ARTIFACT_BYTES`: a file each, `FOLDER/NAME-STREAM`, in the bot's
+/// outputs folder. What a stream within the bound writes never reaches it.
+#[derive(Clone)]
+pub struct Spill {
+    pub folder: PathBuf,
+    pub name: String,
+    /// Whether the folder may hold them, asked on a blocking worker as a
+    /// stream first passes the bound: not while the bot's commands may
+    /// write there, since one could put a link there for the daemon.
+    pub usable: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+/// A stream's writer: what was read goes to it in pieces, written in
+/// batches on blocking workers, so the runtime's thread never waits on the
+/// disk. A full line of pieces makes the reader wait, and the command with
+/// it.
+struct Writer {
+    /// Closed once the writer stops taking more: at its bound, or failed.
+    pieces: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    /// Read and not yet taken by the writer: kept here while the reader
+    /// waits, so a wait cut short loses none of it.
+    pending: Option<Vec<u8>>,
+    done: tokio::task::JoinHandle<Option<Spilled>>,
+}
+
+impl Writer {
+    /// Hand the pending piece to the writer once it has room, counted in
+    /// `waiting` meanwhile. Cut short, the piece stays pending.
+    async fn hand(&mut self, waiting: &std::sync::atomic::AtomicUsize) {
+        use std::sync::atomic::Ordering;
+        struct Waiting<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let (Some(pieces), Some(_)) = (&self.pieces, &self.pending) else {
+            return;
+        };
+        waiting.fetch_add(1, Ordering::Relaxed);
+        let _waiting = Waiting(waiting);
+        let closed = match pieces.reserve().await {
+            Ok(room) => {
+                room.send(self.pending.take().unwrap_or_default());
+                false
+            }
+            Err(_) => true,
+        };
+        if closed {
+            self.pieces = None;
+            self.pending = None;
+        }
+    }
+}
+
+/// A stream written to its file: `saved` bytes of it, all of it unless
+/// it passed `SPILL_BYTES`.
+struct Spilled {
+    files: Files,
+    saved: u64,
+}
+
+/// Pieces of a stream waiting for its writer: a few reads' worth.
+const SPILL_PIECES: usize = 16;
+
 impl Captured {
+    fn spilling(
+        spill: Option<&Spill>,
+        stream: &'static str,
+        registry: &Registry,
+        waiting: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Captured {
+            spill: spill.map(|spill| (spill.clone(), stream, registry.credentials.clone())),
+            waiting: waiting.clone(),
+            ..Captured::default()
+        }
+    }
+
+    /// Hand `bytes`, just read, to the writer, starting it with all read
+    /// before when they take the stream past the bound.
+    async fn spill(&mut self, bytes: &[u8]) {
+        if self.writer.is_none() {
+            if self.len() + bytes.len() <= ARTIFACT_BYTES {
+                return;
+            }
+            let Some((spill, stream, credentials)) = self.spill.take() else {
+                return;
+            };
+            // Past the bound nothing was dropped yet: the head and tail are
+            // all of it so far.
+            let mut first = Vec::with_capacity(self.len());
+            first.extend_from_slice(&self.head);
+            first.extend(self.tail.iter());
+            let (pieces, received) = tokio::sync::mpsc::channel(SPILL_PIECES);
+            let done = tokio::spawn(spill_stream(spill, stream, credentials, first, received));
+            self.writer = Some(Writer {
+                pieces: Some(pieces),
+                pending: None,
+                done,
+            });
+        }
+        let Some(writer) = &mut self.writer else {
+            return;
+        };
+        if writer.pieces.is_some() {
+            writer.pending = Some(bytes.to_vec());
+            writer.hand(&self.waiting).await;
+        }
+    }
+
+    /// Wait for the writer, when the stream had one, to take what it was
+    /// still to be handed and finish its file.
+    async fn settle(&mut self) {
+        if let Some(mut writer) = self.writer.take() {
+            writer.hand(&self.waiting).await;
+            drop(writer.pieces);
+            self.spilled = writer.done.await.ok().flatten();
+        }
+    }
+
     fn len(&self) -> usize {
         self.head.len() + self.tail.len()
     }
@@ -3118,12 +3946,14 @@ impl Captured {
         }
     }
     /// The kept bytes, with a marker where the middle was dropped, and how
-    /// many bytes that was.
-    fn finish(self) -> (Vec<u8>, u64) {
+    /// many bytes that was. `filed` says the whole stream is in its file,
+    /// where the middle is.
+    fn finish(self, filed: bool) -> (Vec<u8>, u64) {
         let Captured {
             mut head,
             mut tail,
             mut dropped,
+            ..
         } = self;
         // Output after the last trim can leave a dropped tail long, short of
         // the room the marker needs.
@@ -3133,15 +3963,142 @@ impl Captured {
             dropped += cut as u64;
         }
         if dropped > 0 {
-            head.extend_from_slice(
-                format!(
+            let marker = match filed {
+                true => format!(
+                    "\n[... {dropped} bytes not shown here: they are in this stream's file ...]\n"
+                ),
+                false => format!(
                     "\n[... {dropped} bytes dropped: past 1 MiB only the first and last {KEPT_END} bytes of this stream are kept ...]\n"
-                )
-                .as_bytes(),
-            );
+                ),
+            };
+            head.extend_from_slice(marker.as_bytes());
         }
         head.extend(tail);
         (head, dropped)
+    }
+}
+
+/// Write a stream whole to its file in `spill`'s folder, redacted as it
+/// goes: `first`, then each piece as it comes, up to `SPILL_BYTES`. None
+/// when the folder may not hold it or a write fails, the file removed, and
+/// the stream's bounded copy is kept as before. The disk is used only on
+/// blocking workers, a batch of pieces at a time: none is held while the
+/// command writes nothing, so idle streams never fill the blocking pool.
+async fn spill_stream(
+    spill: Spill,
+    stream: &'static str,
+    credentials: Credentials,
+    first: Vec<u8>,
+    mut pieces: tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> Option<Spilled> {
+    let folder = spill.folder.clone();
+    let mut file =
+        tokio::task::spawn_blocking(move || SpillFile::open(&spill, stream, credentials))
+            .await
+            .ok()??;
+    let mut batch = vec![first];
+    loop {
+        let (back, full) = tokio::task::spawn_blocking(move || {
+            let full = file.write(&batch)?;
+            Some((file, full))
+        })
+        .await
+        .ok()??;
+        file = back;
+        if full {
+            break;
+        }
+        let Some(piece) = pieces.recv().await else {
+            break;
+        };
+        batch = vec![piece];
+        while batch.len() < SPILL_PIECES
+            && let Ok(piece) = pieces.try_recv()
+        {
+            batch.push(piece);
+        }
+    }
+    // Past the bound the reader stops sending once this end closes.
+    pieces.close();
+    let (path, saved) = tokio::task::spawn_blocking(move || file.close(&folder))
+        .await
+        .ok()??;
+    Some(Spilled {
+        files: Files::new(vec![(stream, path.to_str()?.to_owned())]),
+        saved,
+    })
+}
+
+/// A stream's file while it is written, used on blocking workers only.
+struct SpillFile {
+    path: PathBuf,
+    out: std::io::BufWriter<std::fs::File>,
+    redacting: Redacting,
+    saved: u64,
+}
+
+impl SpillFile {
+    fn open(spill: &Spill, stream: &'static str, credentials: Credentials) -> Option<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if !(spill.usable)() {
+            return None;
+        }
+        let path = spill.folder.join(format!("{}-{stream}", spill.name));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .ok()?;
+        Some(SpillFile {
+            path,
+            out: std::io::BufWriter::with_capacity(256 << 10, file),
+            redacting: Redacting::new(credentials),
+            saved: 0,
+        })
+    }
+
+    /// Write `batch`, redacted, up to `SPILL_BYTES`: whether that bound
+    /// was reached, or None, the file removed, when a write failed.
+    fn write(&mut self, batch: &[Vec<u8>]) -> Option<bool> {
+        use std::io::Write;
+        for bytes in batch {
+            let fits = (bytes.len() as u64).min(SPILL_BYTES - self.saved) as usize;
+            let told = self.redacting.feed(&bytes[..fits]);
+            if self.out.write_all(told.as_bytes()).is_err() {
+                let _ = std::fs::remove_file(&self.path);
+                return None;
+            }
+            self.saved += fits as u64;
+            if fits < bytes.len() {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
+    /// Finish the file, on disk with its name in `folder` before the store
+    /// records it: its path and how many bytes of the stream it holds.
+    fn close(self, folder: &Path) -> Option<(PathBuf, u64)> {
+        use std::io::Write;
+        let SpillFile {
+            path,
+            mut out,
+            redacting,
+            saved,
+        } = self;
+        let written = (|| {
+            out.write_all(redacting.finish().as_bytes())?;
+            out.flush()?;
+            out.get_ref().sync_all()?;
+            std::fs::File::open(folder)?.sync_all()
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        Some((path, saved))
     }
 }
 
@@ -3163,6 +4120,9 @@ async fn capture(pipe: &mut (impl AsyncRead + Unpin), captured: &mut Captured) -
         let read = pipe.read(&mut chunk).await?;
         if read == 0 {
             return Ok(());
+        }
+        if captured.spill.is_some() || captured.writer.is_some() {
+            captured.spill(&chunk[..read]).await;
         }
         captured.keep(&chunk[..read]);
         // Past the bound nothing more is shown, so a runaway writer is
@@ -3778,6 +4738,7 @@ async fn detach(
 const PIPES_END: Duration = Duration::from_millis(100);
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 async fn shell(
     command: &str,
     workspace: &Path,
@@ -3785,6 +4746,7 @@ async fn shell(
     registry: &Registry,
     environment: &[(String, String)],
     sandbox: Option<&Policy>,
+    spill: Option<&Spill>,
 ) -> Result<(Captured, Captured, Exit, Duration)> {
     use std::process::Stdio;
     use tokio::process::Child;
@@ -3825,7 +4787,11 @@ async fn shell(
         .stderr
         .take()
         .ok_or(Error::new("shell_pipe_failed"))?;
-    let (mut out, mut err) = (Captured::default(), Captured::default());
+    let waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (mut out, mut err) = (
+        Captured::spilling(spill, "stdout", registry, &waiting),
+        Captured::spilling(spill, "stderr", registry, &waiting),
+    );
     let status = {
         let reads = async {
             tokio::try_join!(
@@ -3867,13 +4833,25 @@ async fn shell(
         // What the group wrote before it ended is still in the pipes, and
         // is read whatever the wait: the bound is on their end alone, which
         // a process that left the group may hold off for as long as it runs.
-        if !read && let Ok(done) = tokio::time::timeout(PIPES_END, &mut reads).await {
-            done?;
+        // A stream waiting for its file to take what it read is waiting on
+        // the disk, not on its pipe, and is waited for.
+        while !read {
+            match tokio::time::timeout(PIPES_END, &mut reads).await {
+                Ok(done) => {
+                    done?;
+                    read = true;
+                }
+                Err(_) if waiting.load(std::sync::atomic::Ordering::Relaxed) > 0 => {}
+                Err(_) => break,
+            }
         }
         status
     };
     let exit = status.map_or(Exit::TimedOut, Exit::Status);
-    Ok((out, err, exit, started.elapsed()))
+    let elapsed = started.elapsed();
+    // A stream's file is finished by its caller, once the command's slot
+    // is given back: see `Captured::settle`.
+    Ok((out, err, exit, elapsed))
 }
 
 #[cfg(not(unix))]
@@ -3884,6 +4862,7 @@ async fn shell(
     _: &Registry,
     _: &[(String, String)],
     _: Option<&Policy>,
+    _: Option<&Spill>,
 ) -> Result<(Captured, Captured, Exit, Duration)> {
     fail("shell_platform_unsupported")
 }
@@ -4076,6 +5055,7 @@ mod tests {
                 None,
                 place,
                 started,
+                None,
             ));
             (run, running)
         };
@@ -4194,7 +5174,7 @@ mod tests {
         let mut whole = Captured::default();
         whole.head.extend(vec![b'h'; KEPT_END]);
         whole.keep(&vec![b't'; ARTIFACT_BYTES - KEPT_END]);
-        let (bytes, dropped) = whole.finish();
+        let (bytes, dropped) = whole.finish(false);
         assert_eq!((bytes.len(), dropped), (ARTIFACT_BYTES, 0));
 
         let mut over = Captured::default();
@@ -4203,7 +5183,7 @@ mod tests {
             over.keep(&vec![b'm'; 64 * 1024]);
         }
         over.keep(b"end");
-        let (bytes, dropped) = over.finish();
+        let (bytes, dropped) = over.finish(false);
         assert_eq!(dropped, (40 * 64 * 1024 + 3 - KEPT_END) as u64);
         assert!(bytes.len() <= ARTIFACT_BYTES);
         assert!(bytes.starts_with(b"hhhh"));
@@ -4332,6 +5312,7 @@ mod tests {
             None,
             registry.queue().unwrap(),
             sender,
+            None,
         );
         let _later: Vec<Stopper> = (2..=5)
             .map(|id| {
@@ -4386,6 +5367,7 @@ mod tests {
                 None,
                 registry.queue().unwrap(),
                 sender,
+                None,
             );
             async move {
                 let outcome = receiver.await.unwrap().unwrap();
@@ -4472,6 +5454,473 @@ mod tests {
         let error = run("gone").await.unwrap_err();
         assert_eq!(error.code, "path_not_found");
         assert!(error.detail.unwrap().contains("gone"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A stream redacted piece by piece reads as the whole redacted at
+    /// once, however it is cut: a credential, a secret field's value and a
+    /// secret PEM block that span pieces are still redacted.
+    #[test]
+    fn a_stream_redacted_in_pieces_reads_as_the_whole_redacted() {
+        let credentials = Credentials::default();
+        credentials.set("TOKEN", "tok3n-fake-fake-fake9");
+        let fields = ["password", "api_key", "SessionToken", "sesame"].map(String::from);
+        credentials.redact_also(&fields, &["PRIVATE KEY".to_owned()]);
+        let text = "start tok3n-fake-fake-fake9 é\npassword: fake8fake8fake8\n\
+            {\"api_key\": \"fake9fake9fake9x\", \"n\": 1}\nexport AWS_SESSION_TOKEN=abc123def456ghi\n\
+            -----BEGIN RSA PRIVATE KEY-----\nMIIEsecret\nAAAA\n-----END RSA PRIVATE KEY-----\n\
+            -----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n\
+            sesame=\"abc123def\\\"ghi456hidden789suffix\" shown\nend tok3n-fake-fake-fake9";
+        let whole = credentials.redact(text.to_owned());
+        assert!(!whole.contains("fake8") && !whole.contains("fake9") && !whole.contains("abc123"));
+        assert!(!whole.contains("hidden789") && whole.contains("shown"));
+        assert!(!whole.contains("secret") && whole.contains("MIIB"));
+        for size in 1..=text.len() {
+            let mut redacting = Redacting::new(credentials.clone());
+            let mut out = String::new();
+            for piece in text.as_bytes().chunks(size) {
+                out.push_str(&redacting.feed(piece));
+            }
+            out.push_str(&redacting.finish());
+            assert_eq!(out, whole, "in pieces of {size}");
+        }
+    }
+    /// Text cut anywhere reads as the whole: a character cut at a piece's
+    /// end is finished by the next, whatever invalid bytes came before.
+    #[test]
+    fn a_stream_cut_inside_a_character_reads_as_the_whole() {
+        let credentials = Credentials::default();
+        let text = b"before\xff after\xc3\xa9 end \xf0\x9f\x98\x80 \xe2\x82";
+        let whole = String::from_utf8_lossy(text).into_owned();
+        for size in 1..=text.len() {
+            let mut redacting = Redacting::new(credentials.clone());
+            let mut out = String::new();
+            for piece in text.chunks(size) {
+                out.push_str(&redacting.feed(piece));
+            }
+            out.push_str(&redacting.finish());
+            assert_eq!(out, whole, "in pieces of {size}");
+        }
+    }
+    /// Texts built from the pieces of secret fields, quotes, escapes, line
+    /// ends and long runs read the same redacted piece by piece as whole,
+    /// however they are cut.
+    #[test]
+    fn mixed_texts_redact_in_pieces_as_whole() {
+        let credentials = Credentials::default();
+        credentials.set("TOKEN", "tok3n-fake-fake-fake9");
+        credentials.set("LONG", "abc123def456");
+        credentials.set("SHORT", "Xabc123");
+        credentials.redact_also(
+            &["password".to_owned(), "api_key".to_owned()],
+            &["PRIVATE KEY".to_owned()],
+        );
+        let parts: [&str; 23] = [
+            "password=",
+            "\"api_key\": \"",
+            "password: '",
+            "\"",
+            "'",
+            "\\",
+            "\n",
+            " ",
+            ",",
+            "k7k7k7k7",
+            "é",
+            "word ",
+            "=",
+            "x",
+            "tok3n-fake-",
+            "fake-fake9",
+            "-----BEGIN RSA PRIVATE KEY-----\n",
+            "-----END RSA PRIVATE KEY-----",
+            "-----BEGIN ",
+            "CERTIFICATE-----\r\n",
+            "Xabc",
+            "123",
+            "def456",
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..100 {
+            let mut text = String::new();
+            for _ in 0..(next() % 40) {
+                match next() % 10 {
+                    0 => text.push_str(&"k7".repeat(1 + (next() % 4000) as usize)),
+                    1 => text.push_str(&"y".repeat((next() % 6000) as usize)),
+                    _ => text.push_str(parts[(next() % parts.len() as u64) as usize]),
+                }
+            }
+            let whole = credentials.redact(text.clone());
+            for size in [
+                1 + (next() % 7) as usize,
+                64 + (next() % 4096) as usize,
+                9000,
+            ] {
+                let mut redacting = Redacting::new(credentials.clone());
+                let mut out = String::new();
+                for piece in text.as_bytes().chunks(size) {
+                    out.push_str(&redacting.feed(piece));
+                }
+                out.push_str(&redacting.finish());
+                assert!(out == whole, "in pieces of {size}: {text:?}");
+            }
+        }
+    }
+    /// A credential that begins a longer one cut across pieces waits for
+    /// it: the longer is redacted first, as in the whole text.
+    #[test]
+    fn a_credential_inside_a_longer_one_cut_across_pieces_waits_for_it() {
+        let credentials = Credentials::default();
+        credentials.set("LONG", "abc123def456");
+        credentials.set("SHORT", "Xabc123");
+        for text in ["Xabc123def456", "Xabc123 then Xabc123def456 end"] {
+            let whole = credentials.redact(text.to_owned());
+            for size in 1..=text.len() {
+                let mut redacting = Redacting::new(credentials.clone());
+                let mut out = String::new();
+                for piece in text.as_bytes().chunks(size) {
+                    out.push_str(&redacting.feed(piece));
+                }
+                out.push_str(&redacting.finish());
+                assert_eq!(out, whole, "in pieces of {size}");
+            }
+        }
+    }
+    /// A long value of letters alone costs each byte the same: it is held
+    /// to its bound, then told as redacted.
+    #[test]
+    fn a_long_value_not_yet_secret_is_read_in_linear_time() {
+        let credentials = Credentials::default();
+        credentials.redact_also(&["password".to_owned()], &[]);
+        let text = format!("password={} after", "k".repeat(2 << 20));
+        let mut redacting = Redacting::new(credentials.clone());
+        let mut out = String::new();
+        for piece in text.as_bytes().chunks(64 << 10) {
+            out.push_str(&redacting.feed(piece));
+        }
+        out.push_str(&redacting.finish());
+        assert_eq!(out, "password=[REDACTED] after");
+    }
+    /// A piece handed to a stream's writer while it has no room stays
+    /// pending when the wait is cut short, and is handed once it has room;
+    /// the wait is counted as one on the disk meanwhile.
+    #[tokio::test]
+    async fn a_piece_waiting_for_its_writer_is_kept_when_the_wait_is_cut() {
+        use std::sync::atomic::Ordering;
+        let (pieces, mut received) = tokio::sync::mpsc::channel(1);
+        pieces.send(b"first".to_vec()).await.unwrap();
+        let mut writer = Writer {
+            pieces: Some(pieces),
+            pending: Some(b"second".to_vec()),
+            done: tokio::spawn(async { None }),
+        };
+        let waiting = std::sync::atomic::AtomicUsize::new(0);
+        {
+            let hand = writer.hand(&waiting);
+            tokio::pin!(hand);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut hand)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(waiting.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(waiting.load(Ordering::Relaxed), 0);
+        assert_eq!(writer.pending.as_deref(), Some(&b"second"[..]));
+        assert_eq!(received.recv().await.unwrap(), b"first");
+        writer.hand(&waiting).await;
+        assert_eq!(writer.pending, None);
+        assert_eq!(received.recv().await.unwrap(), b"second");
+    }
+    /// A secret field's value longer than the window a field is looked for
+    /// in is redacted whole however it is cut, as the whole text's is.
+    #[test]
+    fn a_long_secret_value_cut_across_pieces_is_redacted_whole() {
+        let credentials = Credentials::default();
+        credentials.redact_also(&["password".to_owned()], &[]);
+        let value: String = (0..100_000)
+            .map(|n| if n % 7 == 0 { '7' } else { 'k' })
+            .collect();
+        for text in [
+            format!("{}\npassword={value} after\nend", "x".repeat(1 << 20)),
+            format!("a \"password\": \"{value}\\\"{value}\", \"n\": 1\nend"),
+            format!(
+                "{}\npassword=\"{}\" after\nend",
+                "x".repeat(1 << 20),
+                "kkkkkkk7'k\\\"".repeat(10_000)
+            ),
+            format!(
+                "{}\npassword=\"{}\\\n{}kkkkkkk7suffix\" after\nend",
+                "x".repeat((1 << 20) - 6_000),
+                "kkkkkkk7".repeat(675),
+                "k".repeat(600)
+            ),
+        ] {
+            let whole = credentials.redact(text.clone());
+            assert!(!whole.contains("kkkkkkk7"), "whole");
+            for sizes in [vec![1 << 20, 64 << 10], vec![4096], vec![1000], vec![97]] {
+                let mut redacting = Redacting::new(credentials.clone());
+                let (mut out, mut at) = (String::new(), 0);
+                for size in sizes.iter().chain(std::iter::repeat(sizes.last().unwrap())) {
+                    if at >= text.len() {
+                        break;
+                    }
+                    let end = (at + size).min(text.len());
+                    out.push_str(&redacting.feed(&text.as_bytes()[at..end]));
+                    at = end;
+                }
+                out.push_str(&redacting.finish());
+                let differs = (out.bytes().zip(whole.bytes())).position(|(a, b)| a != b);
+                assert!(
+                    out == whole,
+                    "in pieces of {sizes:?}: {} vs {} bytes, from {differs:?}: {:?} vs {:?}",
+                    out.len(),
+                    whole.len(),
+                    String::from_utf8_lossy(
+                        &out.as_bytes()[differs.unwrap_or(0).saturating_sub(20)..]
+                    )
+                    .chars()
+                    .take(80)
+                    .collect::<String>(),
+                    String::from_utf8_lossy(
+                        &whole.as_bytes()[differs.unwrap_or(0).saturating_sub(20)..]
+                    )
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+                );
+            }
+        }
+    }
+    #[test]
+    fn joined_files_are_removed_together_unless_recorded() {
+        let dir = std::env::temp_dir().join(format!("agent-files-join-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, "x").unwrap();
+            path.to_str().unwrap().to_owned()
+        };
+        let (a, b) = (file("a"), file("b"));
+        let joined =
+            Files::new(vec![("stdout", a.clone())]).join(Files::new(vec![("stderr", b.clone())]));
+        assert_eq!(joined.len(), 2);
+        drop(joined);
+        assert!(!Path::new(&a).exists() && !Path::new(&b).exists());
+        let (c, d) = (file("c"), file("d"));
+        let joined =
+            Files::new(vec![("stdout", c.clone())]).join(Files::new(vec![("stderr", d.clone())]));
+        joined.recorded();
+        drop(joined);
+        assert!(Path::new(&c).exists() && Path::new(&d).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// A file's line pages read as a stored copy's, without holding it.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_pages_as_its_text_does() {
+        let dir = std::env::temp_dir().join(format!("agent-page-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out");
+        let long = "x".repeat(PREVIEW_BYTES);
+        let texts = [
+            String::new(),
+            "\n".to_owned(),
+            "one".to_owned(),
+            "one\r\ntwo\n\nfour".to_owned(),
+            (1..=3000)
+                .map(|n| format!("line {n} {}\n", "é".repeat(n % 40)))
+                .collect(),
+            format!("a\n{long}\nb\n"),
+        ];
+        for text in &texts {
+            std::fs::write(&file, text).unwrap();
+            let path = file.to_str().unwrap();
+            for (offset, limit) in [
+                (1, 1),
+                (1, 5000),
+                (2, 2),
+                (4, 1),
+                (1500, 10),
+                (2999, 5),
+                (4000, 3),
+            ] {
+                let want = page_lines(text, offset, limit).map_err(|error| error.code);
+                let got = page_file(path, offset, limit).map_err(|error| error.code);
+                assert_eq!(
+                    got,
+                    want.map(Some),
+                    "{offset} {limit} of {:?}",
+                    &text[..text.len().min(40)]
+                );
+            }
+        }
+        assert_eq!(
+            page_file(dir.join("gone").to_str().unwrap(), 1, 1).unwrap(),
+            None
+        );
+        // One larger than any retained file was not written here: refused
+        // without a read.
+        let large = dir.join("large");
+        std::fs::File::create(&large)
+            .unwrap()
+            .set_len(FILE_RETAINED_BYTES + 1)
+            .unwrap();
+        let refused = page_file(large.to_str().unwrap(), 1, 1).unwrap_err();
+        assert_eq!(refused.code, "storage_error");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// Many blocks in one piece read as the whole: each is passed once.
+    #[test]
+    fn many_blocks_in_one_piece_redact_as_whole() {
+        let credentials = Credentials::default();
+        credentials.redact_also(&[], &["PRIVATE KEY".to_owned()]);
+        let block = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n\
+            -----BEGIN PRIVATE KEY-----\nMIIEsecret\n-----END PRIVATE KEY-----\n";
+        let text = block.repeat((1 << 20) / block.len());
+        let whole = credentials.redact(text.clone());
+        assert!(!whole.contains("MIIEsecret"));
+        for size in [1 << 20, 64 << 10, 4099] {
+            let mut redacting = Redacting::new(credentials.clone());
+            let mut out = String::new();
+            for piece in text.as_bytes().chunks(size) {
+                out.push_str(&redacting.feed(piece));
+            }
+            out.push_str(&redacting.finish());
+            assert!(out == whole, "in pieces of {size}");
+        }
+    }
+    /// A stream past the bound goes whole to its file in the bot's outputs
+    /// folder as the command runs, redacted, every byte of its middle with
+    /// it; the result names the file and keeps no cut copy. A folder its
+    /// commands may write gets nothing, the cut copy kept as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stream_past_the_bound_goes_whole_to_its_file() {
+        let dir = std::env::temp_dir().join(format!("agent-spill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("outputs")).unwrap();
+        let registry = Registry::new("shell").unwrap();
+        registry.credentials.set("TOKEN", "tok3n-fake-fake-fake9");
+        // 3 MiB of numbered lines, a credential among them.
+        let command = "for i in $(seq 1 30000); do printf 'line %06d %0100d\\n' $i 0; \
+            [ $i = 15000 ] && echo tok3n-fake-fake-fake9; done; echo err >&2";
+        let spill = |usable: bool| Spill {
+            folder: dir.join("outputs"),
+            name: format!("7-call{usable}"),
+            usable: Arc::new(move || usable),
+        };
+        let run = |spill: Spill| {
+            registry.foreground(
+                command.into(),
+                dir.clone(),
+                Some(60_000),
+                Vec::new(),
+                None,
+                registry.place(),
+                tokio::sync::oneshot::channel().0,
+                Some(spill),
+            )
+        };
+        let outcome = run(spill(true)).await.unwrap();
+        assert!(
+            outcome.artifacts.is_empty(),
+            "{:?}",
+            outcome.artifacts.len()
+        );
+        let [(stream, file)] = &outcome.files[..] else {
+            panic!("{:?}", &outcome.files[..]);
+        };
+        assert_eq!(*stream, "stdout");
+        assert!(file.ends_with("outputs/7-calltrue-stdout"), "{file}");
+        let whole = std::fs::read_to_string(file).unwrap();
+        let lines: Vec<&str> = whole.lines().collect();
+        assert_eq!(lines.len(), 30001);
+        assert_eq!(lines[15000], "[REDACTED]");
+        assert!(
+            lines[..15000]
+                .iter()
+                .enumerate()
+                .all(|(n, line)| line.starts_with(&format!("line {:06} ", n + 1)))
+        );
+        assert!(!whole.contains("tok3n"));
+        let value: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
+        let shown = value["stdout"].as_str().unwrap();
+        assert!(
+            shown.contains("bytes omitted; the full output is retained"),
+            "{}",
+            &shown[..200]
+        );
+        assert!(shown.starts_with("line 000001"));
+        assert!(shown.ends_with(&format!("line 030000 {}\n", "0".repeat(100))));
+        assert_eq!(value["stderr"], "err\n");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Unrecorded, the file goes with its outcome.
+        let file = file.clone();
+        drop(outcome);
+        for _ in 0..100 {
+            if !Path::new(&file).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!Path::new(&file).exists());
+        // Redaction that leaves less than a preview shows it whole, the
+        // file still named.
+        registry
+            .credentials
+            .redact_also(&["sesame".to_owned()], &[]);
+        let secrets = "for i in $(seq 1 1200); do printf 'sesame=a%01000d\\n' $i; done";
+        let outcome = registry
+            .foreground(
+                secrets.into(),
+                dir.clone(),
+                Some(60_000),
+                Vec::new(),
+                None,
+                registry.place(),
+                tokio::sync::oneshot::channel().0,
+                Some(spill(true)),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
+        let shown = value["stdout"].as_str().unwrap();
+        assert!(shown.len() < PREVIEW_BYTES, "{}", shown.len());
+        assert!(shown.starts_with("sesame=[REDACTED]\n"), "{}", &shown[..60]);
+        assert!(shown.contains("bytes not shown here: they are in this stream's file"));
+        assert!(shown.ends_with("the full output is retained: see this result's artifacts and read them with the read tool ...]"));
+        let [(_, file)] = &outcome.files[..] else {
+            panic!("{:?}", &outcome.files[..]);
+        };
+        let whole = std::fs::read_to_string(file).unwrap();
+        assert_eq!(whole, "sesame=[REDACTED]\n".repeat(1200));
+        let file = file.clone();
+        drop(outcome);
+        for _ in 0..100 {
+            if !Path::new(&file).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // A folder the bot's commands may write holds nothing.
+        let outcome = run(spill(false)).await.unwrap();
+        assert!(outcome.files.is_empty());
+        assert_eq!(outcome.artifacts.len(), 1);
+        assert!(outcome.output.contains("more past 1 MiB were not kept"));
+        assert_eq!(std::fs::read_dir(dir.join("outputs")).unwrap().count(), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

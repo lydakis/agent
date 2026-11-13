@@ -110,6 +110,9 @@
 //! wants = "channel"             # a field of its events: the values follows' filters name are written for the command
 //! [sonny.sources.commons]       # Sonny's own source: the commons threads an agent posted in
 //! digest = "15m"                # the default; 0 at once. Takes digest and steer alone
+//! [sonny.notes.prs]             # a margin note of your own, over the agent's in every lead's margin
+//! title = "My PRs"              # its name by default
+//! template = "{{ source('prs').latest.text }}"  # Markdown with blanks Sonny keeps filled, as an agent's template note
 //! ```
 //!
 //! Each unset value is the model's own, or, for a task, its lead's.
@@ -651,6 +654,9 @@ pub struct Sonny {
     pub lookout_waiting: u64,
     /// What the lookout runs for news from outside, by name.
     pub sources: Vec<Source>,
+    /// The person's own margin notes, `[sonny.notes.NAME]`, shown over
+    /// the agent's in every lead's margin.
+    pub notes: Vec<Note>,
     /// The agent-browser action categories that the `browser` tool puts
     /// to the agent's gate before they run.
     pub browser_confirm: Vec<String>,
@@ -884,6 +890,7 @@ impl Default for Sonny {
             margin_note_lines: MARGIN_NOTE_LINES,
             agent_opens: AgentOpens::default(),
             sources: Vec::new(),
+            notes: Vec::new(),
             browser_confirm: BROWSER_CONFIRM.map(str::to_owned).to_vec(),
             links: BTreeMap::new(),
             workflows: Workflows::default(),
@@ -970,6 +977,49 @@ pub enum TaskTabs {
     #[default]
     Asked,
     Every,
+}
+
+/// A margin note of the person's own: Markdown with blanks Sonny fills
+/// and keeps current, as an agent's template note is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Note {
+    pub name: String,
+    /// Shown over it; unset, its name.
+    pub title: String,
+    pub template: String,
+}
+
+/// `[sonny.notes.NAME]` tables: each a `template`, and a `title`.
+fn notes(value: &toml::Value) -> Result<Vec<Note>, String> {
+    let table = (value.as_table()).ok_or("sonny.notes must be a table of notes")?;
+    let mut notes = Vec::new();
+    for (name, note) in table {
+        let key = |field: &str| format!("sonny.notes.{name}.{field}");
+        if name.is_empty()
+            || name.len() > 40
+            || !(name.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        {
+            return Err(format!(
+                "sonny.notes.{name}: a note's name is 1 to 40 of A-Z a-z 0-9 _ -"
+            ));
+        }
+        let fields =
+            (note.as_table()).ok_or_else(|| format!("sonny.notes.{name} must be a table"))?;
+        let (mut title, mut template) = (None, None);
+        for (field, value) in fields {
+            match field.as_str() {
+                "title" => title = Some(string(&key(field), value)?),
+                "template" => template = Some(string(&key(field), value)?),
+                _ => return Err(format!("unknown key {}", key(field))),
+            }
+        }
+        notes.push(Note {
+            name: name.clone(),
+            title: title.unwrap_or_else(|| name.clone()),
+            template: template.ok_or_else(|| format!("{} is missing", key("template")))?,
+        });
+    }
+    Ok(notes)
 }
 
 /// A command Sonny's lookout runs, whose every printed line is news for
@@ -1620,6 +1670,10 @@ fn parse(text: &str) -> Result<Config, String> {
             }
             if (name.as_str(), key.as_str()) == ("sonny", "workflows") {
                 config.sonny.workflows = workflows(value)?;
+                continue;
+            }
+            if (name.as_str(), key.as_str()) == ("sonny", "notes") {
+                config.sonny.notes = notes(value)?;
                 continue;
             }
             if (name.as_str(), key.as_str()) == ("sonny", "sources") {
@@ -3122,6 +3176,21 @@ mod tests {
         ] {
             assert!(span("k", bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn notes_are_named_templates() {
+        let config = parse(
+            "[sonny.notes.prs]\ntitle = \"My PRs\"\ntemplate = \"{{ source('prs').latest.text }}\"\n\n[sonny.notes.now]\ntemplate = \"x\"\n",
+        )
+        .unwrap();
+        let notes: Vec<(&str, &str)> = (config.sonny.notes.iter())
+            .map(|note| (note.name.as_str(), note.title.as_str()))
+            .collect();
+        assert_eq!(notes, [("now", "now"), ("prs", "My PRs")]);
+        assert!(parse("[sonny.notes.a]\ntitle = \"t\"\n").is_err());
+        assert!(parse("[sonny.notes.a]\ntemplate = \"t\"\nfile = \"x\"\n").is_err());
+        assert!(parse("[sonny.notes.\"a b\"]\ntemplate = \"t\"\n").is_err());
     }
 
     #[test]

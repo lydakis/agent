@@ -19,12 +19,14 @@ use agent_runtime::{
     rules::Ruling,
     sandbox::Policy,
     store::{
-        AfterTurn, Answer, Bot, CallAnswer, Charge, ContextPrefix, ContextUsage, Database,
-        DetachedRow, ElisionPlan, Gated, Halt, Halted, Lifted, LiftedRun, Limit, ProcessKind,
-        Settings, Slot, Spend, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window, listed_command,
-        unserved,
+        AfterTurn, Answer, ArtifactLines, Bot, CallAnswer, Charge, ContextPrefix, ContextUsage,
+        Database, DetachedRow, ElisionPlan, Gated, Halt, Halted, Lifted, LiftedRun, Limit,
+        ProcessKind, Settings, Slot, Spend, Store, Strip, TURN_VIEW_ACCOUNTING, Waiting, Window,
+        listed_command, unserved,
     },
-    tools::{Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Stopper},
+    tools::{
+        Cord, Files, Outcome, POLL_YIELD_MS, Place, Prepared, ReadSource, Registry, Spill, Stopper,
+    },
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -3061,7 +3063,7 @@ impl Turn {
         let tools = self.registry.encoded(
             provider.family(),
             provider.grammars(),
-            &record.tools,
+            &record.offered(),
             &record.declared,
             record.sandboxed(),
         )?;
@@ -4430,7 +4432,7 @@ impl Turn {
         route: Option<&str>,
         summary_retry_ms: Option<u64>,
     ) -> Result<Option<Stop>> {
-        let (turn, allowed) = (self.turn, record.callable());
+        let turn = self.turn;
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
             // Nor any tool: the calls not yet started are answered as not
@@ -4530,7 +4532,7 @@ impl Turn {
             let prepared = if let Some(tool) = record.declared(&call.name) {
                 agent_runtime::tools::check_declared(tool, &call.arguments)
                     .map(|()| Prepared::Declared(tool.result.clone()))
-            } else if allowed.iter().any(|name| name == &call.name) {
+            } else if record.calls(&call.name) {
                 self.registry.prepare(&call.name, &call.arguments)
             } else {
                 Err(Error::with("tool_not_available", call.name.as_str()))
@@ -4784,6 +4786,18 @@ impl Turn {
                             db.artifact_lines(&bot, owner, &ref_call, &stream, offset, limit)
                         })
                         .await;
+                    // A file, up to a gigabyte, is paged on a blocking
+                    // worker, read up to the page and counted past it.
+                    let text = match text {
+                        Ok(ArtifactLines::Page(page)) => Ok(page),
+                        Ok(ArtifactLines::File(file)) => tokio::task::spawn_blocking(move || {
+                            agent_runtime::tools::page_file(&file, offset, limit)
+                        })
+                        .await
+                        .unwrap_or_else(|_| fail("storage_error"))
+                        .and_then(|page| page.ok_or(Error::new("artifact_not_found"))),
+                        Err(error) => Err(error),
+                    };
                     match text {
                         Ok(page) => Outcome::text(self.registry.redact_text(page)),
                         Err(error) => failure(error),
@@ -4833,6 +4847,8 @@ impl Turn {
                     let place = self.registry.place();
                     // What lists it, should a steer move it to the background.
                     let listed = listed(&command);
+                    let spill = (self.outputs(record, workspace))
+                        .map(|outputs| outputs.spill(self.turn, &call.call_id));
                     let run = self.registry.foreground(
                         command,
                         Prepared::folder(workspace, workdir.as_deref()),
@@ -4841,6 +4857,7 @@ impl Turn {
                         sandbox,
                         place.clone(),
                         started,
+                        spill,
                     );
                     match self.run_tool(run, Some((&self.lift, running))).await? {
                         Ran::Done(Ok(outcome)) => {
@@ -4923,7 +4940,7 @@ impl Turn {
                 Ok(Ruling::None | Ruling::Allow)
             )
             || record.declared(&call.name).is_some()
-            || !record.callable().iter().any(|name| name == &call.name)
+            || !record.calls(&call.name)
             || (call.name == "shell" && record.sandboxed() && !record.confines(call, workspace))
         {
             return None;
@@ -5082,6 +5099,8 @@ impl Turn {
                 let (started, running) = oneshot::channel();
                 let place = self.registry.place();
                 let listed = listed(&command);
+                let spill = (self.outputs(record, workspace))
+                    .map(|outputs| outputs.spill(self.turn, &call_id));
                 let mut run = Box::pin(self.registry.foreground(
                     command,
                     Prepared::folder(workspace, workdir.as_deref()),
@@ -5090,6 +5109,7 @@ impl Turn {
                     sandbox,
                     place.clone(),
                     started,
+                    spill,
                 ));
                 let lifted = async {
                     // A run that ends before it starts wins the race below.
@@ -5319,7 +5339,7 @@ impl Turn {
     fn load_holds(&self, record: &Bot, call: &ToolCall, workspace: &std::path::Path) -> bool {
         if self.registry.admits()
             || record.declared(&call.name).is_some()
-            || !record.callable().iter().any(|name| name == &call.name)
+            || !record.calls(&call.name)
         {
             return false;
         }
@@ -5880,6 +5900,7 @@ impl Turn {
             })
             .await?;
         let (sender, receiver) = oneshot::channel();
+        let spill = (outputs.clone()).map(|outputs| outputs.spill(self.turn, call_id));
         self.registry.background(
             self.registry.stopper(id),
             owner,
@@ -5890,6 +5911,7 @@ impl Turn {
             sandbox,
             queued,
             sender,
+            spill,
         );
         self.collect(id, call_id, receiver, outputs, None);
         Ok(Outcome::text(
@@ -6159,7 +6181,7 @@ impl Lifts {
         let prepared = if let Some(tool) = bot.declared(&call.name) {
             agent_runtime::tools::check_declared(tool, &call.arguments)
                 .map(|()| Prepared::Declared(tool.result.clone()))
-        } else if bot.callable().iter().any(|name| name == &call.name) {
+        } else if bot.calls(&call.name) {
             self.registry.prepare(&call.name, &call.arguments)
         } else {
             Err(Error::with("tool_not_available", call.name.as_str()))
@@ -6212,6 +6234,7 @@ impl Lifts {
         });
         let terminal = matches!(prepared, Ok(Prepared::Terminal { .. }));
         let detached = matches!(prepared, Ok(Prepared::Detach { .. }));
+        let spill = (outputs.clone()).map(|outputs| outputs.spill(turn, &call.call_id));
         self.collect(
             &bot.name,
             turn,
@@ -6241,6 +6264,7 @@ impl Lifts {
                         sandbox,
                         queued,
                         sender,
+                        spill,
                     )
                 }
                 Err(error) => {
@@ -6658,7 +6682,7 @@ fn withhold_thinking(context: &Context, error: &Error) -> Option<Strip> {
 /// Whether the bot may search the web: its provider declares the search
 /// when it offers one, and a fork's allowed list narrows it as any tool.
 fn searches(record: &agent_runtime::store::Bot) -> bool {
-    record.callable().iter().any(|tool| tool == "web_search")
+    record.calls("web_search")
 }
 
 /// Whether a turn whose budget is spent makes one more call, without tool
@@ -6828,15 +6852,7 @@ impl Outputs {
         if outcome.artifacts.is_empty() {
             return outcome;
         }
-        let name: String = call_id
-            .chars()
-            .map(
-                |c| match c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                    true => c,
-                    false => '_',
-                },
-            )
-            .collect();
+        let name = file_name(call_id);
         let artifacts = std::mem::take(&mut outcome.artifacts);
         // A turn stopped while this runs drops what it returns, and the
         // files with it: no record will name them.
@@ -6881,9 +6897,20 @@ impl Outputs {
         // A task that failed took the data with it: the cut text stands alone.
         if let Ok(Kept { stored, files }) = kept {
             outcome.artifacts = stored;
-            outcome.files = files;
+            outcome.files = std::mem::take(&mut outcome.files).join(files);
         }
         outcome
+    }
+
+    /// Where a command's streams go whole as it runs, past the bound, as
+    /// `keep` would name their files: only while the bot's sandbox cannot
+    /// write the folder, as `keep` checks, there when one passes it.
+    fn spill(self, turn: i64, call_id: &str) -> Spill {
+        Spill {
+            folder: self.folder.clone(),
+            name: format!("{turn}-{}", file_name(call_id)),
+            usable: Arc::new(move || !self.exposed()),
+        }
     }
 
     /// Whether the bot's commands may write the folder, made first so the
@@ -6930,6 +6957,19 @@ impl Outputs {
             Err(_) => true,
         }
     }
+}
+
+/// A call's id as part of a file's name: letters, digits, `_` and `-`.
+fn file_name(call_id: &str) -> String {
+    call_id
+        .chars()
+        .map(
+            |c| match c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                true => c,
+                false => '_',
+            },
+        )
+        .collect()
 }
 
 /// A call's cut streams once kept: those the store keeps, and the files
@@ -8368,6 +8408,7 @@ mod tests {
             None,
             registry.place(),
             started,
+            None,
         ));
         running.await.unwrap();
         assert!(!registry.admits());

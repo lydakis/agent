@@ -343,8 +343,8 @@ start removes the temporary of a write that died before its rename: every
 write takes the lock, so none is under way.
 `~/.agent/automation` is written with its executable mode from the start. When
 Sonny starts from a new place, it writes its path into every definition
-(a Sonny in Homebrew's Cellar goes by its `opt` path, which an upgrade
-keeps).
+(a Sonny in Homebrew's Cellar goes by its `opt` path, and one the release
+tarball unpacked by `PREFIX/opt/sonny`, which an upgrade keeps).
 
 ### The scheduler
 
@@ -824,6 +824,64 @@ when none) and a resume from whoever resumed (the `resumed` notice's `by`),
 from the notices every session hears, and a pause already holding from
 `ready`; a replay has none, since the notices are not events.
 
+## Updating
+
+`sonny update` brings Sonny and its daemon to the latest release, the way
+`codex update` and `claude update` update theirs
+([update.rs](../sonny/src/update.rs)). It tells how Sonny was installed by
+where its program is, as Codex does:
+
+- Homebrew's `sonny` formula: `brew update`, which reads the tap again, then
+  `brew upgrade lydakis/agent/sonny lydakis/agent/agent` when either is
+  behind. The nightly formula is reinstalled when main has moved past the
+  commit it was built from (`git ls-remote`).
+- The release tarball, as install.sh unpacked it under `PREFIX/opt`: the
+  latest release's tarball is downloaded, checked against its published
+  sha256 and, when the GitHub CLI is signed in, against the release
+  workflow's build attestation, unpacked to
+  `PREFIX/opt/sonny-VERSION-linux-ARCH`, and `PREFIX/opt/sonny` and
+  `PREFIX/bin/sonny` are linked to it, each link made beside the old one
+  and moved over it. Earlier versions stay, as install.sh leaves them.
+  `--download` stops once it is unpacked and checked, switching nothing;
+  the next `sonny update` finds it there and links it.
+- Anything else (a checkout's build, `cargo install`) is left to how it was
+  built, and the rest below still runs for this build.
+
+Brew runs from `/`, as Codex runs its updater, so no project's own
+configuration takes part. One update runs at a time, under a lock on
+`~/.agent/sonny/update.lock` that names the process holding it, as Claude
+Code's updater does; and none runs from an agent's shell, since replacing
+the daemon waits on that agent's own turn.
+
+The old Sonny then runs the new one (`sonny update --installed VERSION`,
+which every later release keeps), which does the rest, since only it knows
+how: `agent start --replace` replaces the daemon running now with the
+new one's, whether or not the protocol changed (an upgrade that kept the
+protocol would otherwise leave the old daemon running), and even when it
+names the same version, as a nightly's next commit does: the old one
+stops at once, its running turns park and
+continue on the new one, and the new one waits on the store, so nothing
+started meanwhile takes it. Then the companions start on the new Sonny,
+and the scripts in `~/.agent`, every automation and the scheduler's job
+are written again by the path that outlives a release. A line says each
+step; the last is `Successfully updated from OLD to version NEW` (`to the
+newest build of VERSION` for a nightly), or `Sonny is up to date
+(VERSION)`, when the daemon is replaced only if it runs another release.
+
+![sonny update, from a release tarball install of 0.9.4 to 0.9.5](sonny/sonny-update.png)
+
+Each open window notes the program it started from. When it loses the
+daemon and the Sonny installed where it runs from is another program
+(`sonny update`, or `brew upgrade` and install.sh run by hand), it reopens
+on that one in place, in the same terminal, with its own arguments, on the
+same agent, and with what was typed in its composer back in it unsent,
+pasted pictures and all, as `/new` hands its first message on in a file; the reopened window says
+`Sonny was updated; this window reopened on VERSION`. A window that meets
+a newer daemon with no newer Sonny installed here still says `Sonny was
+upgraded; reopen this window` and starts nothing.
+
+![A window reopened on 0.9.5 by the update above, its unsent message still in the composer](sonny/update-reopened.png)
+
 ## Skills
 
 At each start Sonny writes the skills it ships into `~/.agents/skills`, where
@@ -1055,13 +1113,16 @@ script runs in QuickJS with no files, network or timers, at most 256 MB and
 10 minutes, four at once in the tool host and sixteen alive (more wait
 their turn), and returns
 at most 10,000 tokens, longer output keeping its start and end and saving
-the whole to a file; saved outputs are kept a week. A first
+the whole to a file, written as the script prints, up to 1 GB, the result
+saying when the file holds less and why (its owner's alone); saved outputs
+are kept a week. A first
 line such as
 `// @exec: {"max_output_tokens": 1000, "timeout_ms": 60000}` sets those.
 Its time counts from the call: waiting for a place and starting servers
 to list their tools spend it. What lives outside its 256 MB is bounded as
-it runs: its output past 1 MB keeps its first half and its latest, as
-Codex keeps a command's; eight of its calls are in flight at once, and a
+it runs: memory keeps only the output's budget, at most 1 MB, its first
+half and its latest, as Codex keeps a command's, while the file gets every
+byte; eight of its calls are in flight at once, and a
 result over 16 MB is refused, as rmcp refuses such a message. Two tools
 whose identifiers would be the same (`my-server` and `my_server`'s
 `search`) are neither on `tools`, the description saying why.

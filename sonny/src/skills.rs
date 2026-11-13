@@ -289,28 +289,51 @@ fn in_app_bundle(target: &Path) -> bool {
 }
 
 /// This Sonny, by the path that outlives an upgrade: Homebrew's `opt`
-/// link for a Sonny in its Cellar, which a scheduled fire still finds after
-/// the old version is cleaned up.
+/// link for a Sonny in its Cellar, and the release tarball's
+/// `PREFIX/opt/sonny` link for one install.sh or `sonny update` unpacked,
+/// which a scheduled fire still finds after the old version is gone.
 pub fn sonny_path() -> Option<PathBuf> {
     let me = crate::named::me().ok()?;
     Some(opt_path(&std::fs::canonicalize(&me).unwrap_or(me)))
 }
 
-/// `PREFIX/Cellar/NAME/VERSION/REST` as `PREFIX/opt/NAME/REST` when that
-/// leads to a file; any other path as it is.
+/// `PREFIX/Cellar/NAME/VERSION/REST` as `PREFIX/opt/NAME/REST`, and the
+/// release tarball's `PREFIX/opt/sonny-VERSION-linux-ARCH/REST` as
+/// `PREFIX/opt/sonny/REST`, when that leads to a file; any other path as
+/// it is.
 pub(crate) fn opt_path(exe: &Path) -> PathBuf {
     let parts: Vec<_> = exe.components().collect();
-    let found = parts
+    let cellar = parts
         .iter()
         .position(|part| part.as_os_str() == "Cellar")
         .filter(|at| at + 3 < parts.len());
-    let Some(at) = found else {
-        return exe.to_owned();
+    let opt = match cellar {
+        Some(at) => {
+            let mut opt: PathBuf = parts[..at].iter().collect();
+            opt.push("opt");
+            opt.push(parts[at + 1]);
+            opt.extend(&parts[at + 3..]);
+            opt
+        }
+        None => {
+            let unpacked = (parts.windows(2))
+                .position(|pair| {
+                    pair[0].as_os_str() == "opt"
+                        && pair[1]
+                            .as_os_str()
+                            .to_str()
+                            .is_some_and(|name| crate::update::release_of(name).is_some())
+                })
+                .filter(|at| at + 2 < parts.len());
+            let Some(at) = unpacked else {
+                return exe.to_owned();
+            };
+            let mut opt: PathBuf = parts[..=at].iter().collect();
+            opt.push("sonny");
+            opt.extend(&parts[at + 2..]);
+            opt
+        }
     };
-    let mut opt: PathBuf = parts[..at].iter().collect();
-    opt.push("opt");
-    opt.push(parts[at + 1]);
-    opt.extend(&parts[at + 3..]);
     if opt.is_file() { opt } else { exe.to_owned() }
 }
 
@@ -986,6 +1009,29 @@ mod tests {
             opt_path(Path::new("/usr/local/bin/sonny")),
             Path::new("/usr/local/bin/sonny")
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_sonny_the_release_tarball_unpacked_goes_by_its_opt_link() {
+        let root = std::env::temp_dir().join(format!("sonny-tarball-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let unpacked = root.join("opt/sonny-0.9.5-linux-x86_64/bin/sonny");
+        std::fs::create_dir_all(unpacked.parent().unwrap()).unwrap();
+        std::fs::write(&unpacked, "").unwrap();
+        // Without the link, the path itself.
+        assert_eq!(opt_path(&unpacked), unpacked);
+        std::os::unix::fs::symlink("sonny-0.9.5-linux-x86_64", root.join("opt/sonny")).unwrap();
+        assert_eq!(opt_path(&unpacked), root.join("opt/sonny/bin/sonny"));
+        // The daemon beside it, too, once there.
+        let agent = root.join("opt/sonny-0.9.5-linux-x86_64/libexec/agent");
+        assert_eq!(opt_path(&agent), agent);
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::write(&agent, "").unwrap();
+        assert_eq!(opt_path(&agent), root.join("opt/sonny/libexec/agent"));
+        // A folder that only starts like one is not.
+        let other = root.join("opt/sonny-tools/bin/sonny");
+        assert_eq!(opt_path(&other), other);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -33,6 +33,18 @@ your package manager. Make sure `~/.local/bin` is on your `PATH`.
 `PREFIX` changes the install location, `SONNY_VERSION` selects a release,
 and `SONNY_PACKAGES=0` skips package installation.
 
+### Updating
+
+```sh
+sonny update
+```
+
+This updates a Homebrew or installer install to the latest release (a
+nightly install to current `main`). It replaces the running daemon with the
+new one, and running turns continue on it. Open Sonny windows reopen on the
+new version and keep what you typed. See
+[docs/SONNY.md](../docs/SONNY.md#updating) for each step.
+
 ### Nightly builds
 
 Nightly builds Sonny and its matching daemon from current `main`:

@@ -3158,26 +3158,28 @@ pub(crate) fn error_json(message: &str) -> Value {
 /// trigger at this Sonny when it moved, and see that the scheduler runs
 /// this Sonny when there is anything for it.
 pub fn at_start() {
+    std::thread::spawn(refresh_now);
+}
+
+/// [`at_start`]'s work, done here and now: `sonny update` waits for it.
+pub fn refresh_now() {
     let (Ok(places), Some(sonny)) = (Places::home(), crate::skills::sonny_path()) else {
         return;
     };
-    std::thread::spawn(move || {
-        finish(&places);
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            let record = home.join(".agent/sonny/migrated");
-            crate::upgrade::once(&record, "scheduler-job", || {
-                let scheduler = Scheduler::here();
-                let let_go =
-                    |dir: &Path, label: &str| crate::scheduler::let_go(scheduler, dir, label);
-                let moved = migrate(&places, &home, scheduler, &ring, &let_go);
-                crate::scheduler::retire_old(crate::boot::OLD_LABEL);
-                crate::scheduler::retire_old(crate::home::OLD_LABEL);
-                moved
-            });
-        }
-        refresh(&places, &sonny);
-        crate::scheduler::at_start();
-    });
+    finish(&places);
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let record = home.join(".agent/sonny/migrated");
+        crate::upgrade::once(&record, "scheduler-job", || {
+            let scheduler = Scheduler::here();
+            let let_go = |dir: &Path, label: &str| crate::scheduler::let_go(scheduler, dir, label);
+            let moved = migrate(&places, &home, scheduler, &ring, &let_go);
+            crate::scheduler::retire_old(crate::boot::OLD_LABEL);
+            crate::scheduler::retire_old(crate::home::OLD_LABEL);
+            moved
+        });
+    }
+    refresh(&places, &sonny);
+    crate::scheduler::at_start();
 }
 
 /// The nightly memory cleanup is on by default: the first Sonny to open a

@@ -188,8 +188,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "start",
         about: "Start the store's daemon if none runs; prints its ready line",
-        usage: "start [OPTIONS]",
-        flags: "--pretty",
+        usage: "start [--replace] [OPTIONS]",
+        flags: "--pretty --replace",
         settings: "",
         startup: true,
     },
@@ -594,6 +594,10 @@ fn print_flags(flags: &str) {
                 "DURATION",
                 "Let running turns finish for up to this long, starting none; default 0",
             ),
+            "--replace" => (
+                "",
+                "Replace the daemon running now with this agent's own, as an upgrade replaces an older one: its running turns park and continue on the new one",
+            ),
             "--approval" => (
                 "MODE",
                 "A new bot's approval: full, manual, or auto; default AGENT_APPROVAL or full",
@@ -812,6 +816,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             flag,
             "--pretty"
                 | "--no-spawn"
+                | "--replace"
                 | "--new"
                 | "--detach"
                 | "--all"
