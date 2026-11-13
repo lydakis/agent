@@ -8655,3 +8655,34 @@ not touch: Sonny's only change is one label in the transcript's match on
 tool names. The same lookout note p95 fell 14% at the other size in the
 same run, and quiet window CPU has swung by 16% and 33% on earlier screens
 with no Sonny change (above), so both are the runner's spread.
+
+## No look for ready work after every end
+
+The service loop looked for a ready message (`next_ready`, a query on the
+store's writer) after every turn that ended and every slot that opened,
+and waited for the answer, though almost every end leaves nothing ready.
+At a thousand bots or more that wait was most of the loop's time, and
+every request queued behind it. Now the end's own store job says whether
+it promoted the bot's next message (one indexed lookup in a job it already
+runs), and the loop looks only then. A slot opening needs no look: the
+hint is cleared only when a look finds nothing, and stays set while a full
+daemon keeps ready work waiting.
+
+`bench.scale_screen` (new), 2,048 bots streaming back to back, 2.3 s calls
+with lengths spread by half either way, one firehose follower, 20 s
+windows, 4-CPU Linux cloud box, base main afe098f against head, three
+alternating rounds each:
+
+| Measure | Base | Head |
+| --- | ---: | ---: |
+| turns a second (ideal 890) | 826, 863, 870 | 881, 883, 886 |
+| `submit` answer p50, ms | 176.9, 24.0, 32.2 | 3.3, 3.5, 3.5 |
+| `submit` answer p95, ms | 396.8, 294.9, 299.6 | 26.2, 16.4, 11.8 |
+| turn p50, ms (ideal 2,300) | 2,475, 2,359, 2,345 | 2,319, 2,319, 2,308 |
+| daemon CPU per turn, ms | 1.48, 1.37, 1.38 | 1.35, 1.36, 1.36 |
+| store jobs per turn | 7.99, 8.11, 8.06 | 7.63, 7.55, 7.56 |
+| `next_ready` looks in the window | 7,104, 8,081, 7,856 | 0, 0, 0 |
+| loop time waiting on `next_ready` | 80%, 74%, 76% | 0% |
+
+The next ceiling is the store's single writer, at about 1.2 ms of wall
+time per turn (#900).
