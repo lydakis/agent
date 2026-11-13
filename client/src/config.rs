@@ -2395,13 +2395,13 @@ fn replace(path: &Path, text: &str) -> Result<(), String> {
             .create(dir)
             .map_err(|e| unwritable(&e))?;
     }
-    let staged = path.with_extension(format!("toml.{}", std::process::id()));
-    std::fs::write(&staged, text)
-        .and_then(|()| std::fs::rename(&staged, path))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&staged);
-            unwritable(&e)
-        })
+    // The file keeps the mode it has (a person's `0600` stays theirs
+    // alone); a new one is its owner's alone, as `~/.agent` is.
+    let mode = std::fs::metadata(path)
+        .map(|found| std::os::unix::fs::PermissionsExt::mode(&found.permissions()) & 0o777)
+        .unwrap_or(0o600);
+    crate::files::replace_mode(path, text.as_bytes(), mode)
+        .map_err(|e| format!("config_unwritable: {e}"))
 }
 
 #[cfg(test)]
@@ -3274,6 +3274,26 @@ mod tests {
                 .contains("unknown key colour")
         );
         assert_eq!(read(&file).unwrap(), config);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_keeps_the_file_s_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("agent-config-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("config.toml");
+        let mode = |file: &Path| std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
+        // A new one is its owner's alone.
+        write(&file, &[("model", Some("a/b".into()))]).unwrap();
+        assert_eq!(mode(&file), 0o600);
+        // One the person set keeps what they set.
+        for set in [0o640, 0o600] {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(set)).unwrap();
+            write(&file, &[("model", Some("c/d".into()))]).unwrap();
+            assert_eq!(mode(&file), set);
+        }
+        assert!(std::fs::read_to_string(&file).unwrap().contains("c/d"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
