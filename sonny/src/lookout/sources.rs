@@ -1660,9 +1660,11 @@ pub fn note(heard: &[Heard], more: usize, unkept: Option<&str>, joins: bool) -> 
         (true, false) => {
             "This joins your running turn; carry on with your turn after it.".to_owned()
         }
-        (false, _) => "The person sees neither this note nor your turn unless you reply. If nothing, \
+        (false, _) => {
+            "The person sees neither this note nor your turn unless you reply. If nothing, \
             end your turn with an empty reply."
-            .to_owned(),
+                .to_owned()
+        }
     });
     lines.join("\n")
 }
@@ -2125,9 +2127,7 @@ mod tests {
             None,
             true,
         );
-        assert!(
-            joins.ends_with("This joins your running turn; carry on with your turn after it.")
-        );
+        assert!(joins.ends_with("This joins your running turn; carry on with your turn after it."));
     }
 
     #[tokio::test]

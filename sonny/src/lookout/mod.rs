@@ -271,8 +271,9 @@ fn note(told: &updates::Told, steer: Option<&Steer>) -> String {
             "This joins your running turn because your follow {sub} says it steers; carry \
             on with your turn after it."
         ),
-        Some(Steer::News) => "This joins your running turn; carry on with your turn after it."
-            .to_owned(),
+        Some(Steer::News) => {
+            "This joins your running turn; carry on with your turn after it.".to_owned()
+        }
         None => "Each ended turn comes with what the task replied; read a turn with one \
             wait call (timeout_ms 0) only when you need more of it. The person sees neither \
             this note nor your turn unless you reply. If nothing, end your turn with an empty \
@@ -4048,9 +4049,10 @@ mod tests {
              Each ended turn comes with what the task replied; read a turn with one wait call (timeout_ms 0) only when you need more of it. The person sees neither this note nor your turn unless you reply. If nothing, end your turn with an empty reply."
         );
         // News joining a busy subscriber's turn, with nothing urgent in it.
-        assert!(note(&told, Some(&Steer::News)).ends_with(
-            "This joins your running turn; carry on with your turn after it."
-        ));
+        assert!(
+            note(&told, Some(&Steer::News))
+                .ends_with("This joins your running turn; carry on with your turn after it.")
+        );
     }
 
     #[test]
@@ -4377,7 +4379,8 @@ mod tests {
         let told = lookout.updates.take_at(now);
         let steered = note(&told, Some(&Steer::Rule("tasks".into())));
         assert!(
-            steered.contains("This joins your running turn because your follow tasks says it steers"),
+            steered
+                .contains("This joins your running turn because your follow tasks says it steers"),
             "{steered}"
         );
         // The person's own words still read as theirs.
@@ -6767,7 +6770,10 @@ mod tests {
         let submit = got.recv().await.unwrap();
         assert_eq!(submit["delivery"], "steer");
         let prompt = submit["prompt"].as_str().unwrap();
-        assert!(prompt.contains("carry on with your turn after it"), "{prompt}");
+        assert!(
+            prompt.contains("carry on with your turn after it"),
+            "{prompt}"
+        );
         lookout.answered(Answer::Sourced(Ok(())));
         // At rest: one note, with the lookout's origin, starting a turn.
         (lookout.updates).seat(&json!({"name": "calc.lead", "bot_id": 1, "status": "idle"}));
@@ -6806,7 +6812,10 @@ mod tests {
             prompt.contains(r#"(for your chat, as a steer): "prod is down""#),
             "{prompt}"
         );
-        assert!(prompt.contains("because something in it steers"), "{prompt}");
+        assert!(
+            prompt.contains("because something in it steers"),
+            "{prompt}"
+        );
         // A note stays under its bytes however the text escapes; the rest
         // waits for the next.
         let escaped = "\u{1}".repeat(sources::TEXT_CHARS);
