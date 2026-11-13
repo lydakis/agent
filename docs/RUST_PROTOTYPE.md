@@ -1699,7 +1699,19 @@ series row has `daemon_ms`, and the totals and each model row have what its
 timed calls took (protocol 67, schema 95): `timed_rounds`, their
 `timed_output_tokens`, `model_ms` and `first_token_ms` summed, so a client
 divides them for a model's output tokens per second and its time to first
-output; calls before schema 95 are untimed. And `origins`, by the `origin` a client gave
+output; calls before schema 95 are untimed. The totals, each bot row and
+`other_bots` have `time` (protocol 73, schema 98): what the window's finished
+turns with a timed call took, each turn once: `turns`, `turn_ms` from start to
+end, `tool_calls` (the calls that ran to their end in the turn) and `tool_ms`
+(their time, calls that ran together counted once, kept on the turn in the
+commit that ends each call), `paced_ms`, `summary_ms`, `daemon_ms`, and the
+turn's own timed model calls' `timed_rounds`, `timed_output_tokens`,
+`model_ms` and `first_token_ms` (the output of the attempt that answered),
+which leave out summaries: one the turn waited on is its `summary_ms`. The rest of `turn_ms` is what none of them records: waits on
+gates, failed attempts, a call's time before it was lifted to the background.
+Turns timed before schema 98 take their calls from the audit trail as the
+store migrates (a lifted call left out) and their timings from their models'
+rows, summaries included. And `origins`, by the `origin` a client gave
 the turn at `submit` (`null` for none), so a client can tell what its own
 features cost. With `bucket_ms` it adds `series`, one row for each bucket
 of that width from `since_ms` that has turns, at its `at_ms`; it needs a

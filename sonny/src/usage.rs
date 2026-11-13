@@ -446,6 +446,7 @@ impl View {
         out.push(Line::default());
         out.extend(self.bars("By model", &models, &total, width, costs));
         out.extend(speed);
+        out.extend(self.time(usage, width));
         // What Sonny's own features started, by the origin it gave their
         // turns; one with none was a prompt, a person's or an agent's.
         // An automation's turns from before 0.8.0 say `trigger`: one row.
@@ -633,6 +634,100 @@ impl View {
         out
     }
 
+    /// Where the finished turns' time went, by agent (or project): each
+    /// one's bar as long as its average turn, in the model's calls, its
+    /// tools and the rest, with its rounds and tool calls a turn and its
+    /// model's output a second. Nothing when no finished turn was timed.
+    fn time(&self, usage: &Value, width: usize) -> Vec<Line<'static>> {
+        let total = Took::of(&usage["time"]);
+        if total.turns == 0 {
+            return Vec::new();
+        }
+        let mut rows: Vec<(String, Took)> = Vec::new();
+        for bot in usage["bots"].as_array().into_iter().flatten() {
+            let name = bot["bot"].as_str().unwrap_or("?");
+            let name = match self.all {
+                true => name.split('.').next().unwrap_or(name).to_owned(),
+                false => self.scope.short(name),
+            };
+            let took = Took::of(&bot["time"]);
+            if took.turns == 0 {
+                continue;
+            }
+            match rows.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, sum)) => sum.add(took),
+                None => rows.push((name, took)),
+            }
+        }
+        rows.sort_by(|a, b| b.1.turn_ms.cmp(&a.1.turn_ms).then_with(|| a.0.cmp(&b.0)));
+        let hidden = rows.len().saturating_sub(LISTED);
+        let mut rest = Took::of(&usage["other_bots"]["time"]);
+        for (_, took) in rows.drain(rows.len() - hidden..) {
+            rest.add(took);
+        }
+        if rest.turns > 0 {
+            rows.push(("the rest".to_owned(), rest));
+        }
+        // A pane too narrow for every figure keeps only the turn's length.
+        let full = width >= 4 + 2 + 4 + TIME_FIGURES.len();
+        let shown = match full {
+            true => TIME_FIGURES,
+            false => &TIME_FIGURES[..8],
+        };
+        let figures = shown.len();
+        let name_width = (rows.iter().map(|(name, _)| name.width()))
+            .max()
+            .unwrap_or(0)
+            .clamp(4, 28)
+            .min(width.saturating_sub(figures + 6).max(4));
+        let room = width.saturating_sub(name_width + 2 + figures).clamp(4, 40);
+        let most = (rows.iter().map(|(_, took)| took.each()))
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let mut out = vec![
+            Line::default(),
+            Line::from(vec![
+                Span::raw(format!("{:<w$}", "Time", w = name_width + 2 + room)).bold(),
+                Span::raw(shown).dim(),
+            ]),
+        ];
+        for (name, took) in &rows {
+            let turns = took.turns.max(1) as f64;
+            let mut spans = vec![Span::raw(format!(
+                "{:<name_width$}  ",
+                crate::transcript::cut(name, name_width)
+            ))];
+            // Each part of its average turn: the parts summed over its
+            // turns, scaled as the turn is to the longest.
+            let parts = took
+                .parts()
+                .map(|(n, color)| (n / took.turns.max(1), color));
+            spans.extend(hbar(&parts, most, room));
+            spans.push(Span::raw(format!(" {:>7}", span(took.each()))));
+            if full {
+                spans.push(Span::raw(format!(" {:>6.1}", took.rounds as f64 / turns)));
+                spans.push(Span::raw(format!(" {:>6.1}", took.calls as f64 / turns)));
+                spans.push(match took.per_second() {
+                    Some(rate) => Span::raw(format!(" {rate:>6}")),
+                    None => Span::raw(format!(" {:>6}", "-")).dim(),
+                });
+            }
+            out.push(Line::from(spans));
+        }
+        let [(model, _), (tools, _), (rest, _)] = total.parts();
+        let all = total.turn_ms.max(1);
+        out.push(Line::from(vec![
+            Span::raw("█").fg(MODEL_TIME),
+            Span::raw(format!(" model {}%   ", model * 100 / all)),
+            Span::raw("█").fg(TOOL_TIME),
+            Span::raw(format!(" tools {}%   ", tools * 100 / all)),
+            Span::raw("█").fg(REST_TIME),
+            Span::raw(format!(" waiting and the rest {}%", rest * 100 / all)),
+        ]));
+        out
+    }
+
     /// The line under the card: the keys it takes.
     pub fn keys(&self) -> String {
         let scope = match self.all {
@@ -644,6 +739,84 @@ impl View {
             false => "c show cached",
         };
         format!("d/w/m period · {scope} · {cached} · esc close")
+    }
+}
+
+/// The colors of a turn's time: its model's calls, its tools, and the
+/// rest.
+const MODEL_TIME: Color = Color::Green;
+const TOOL_TIME: Color = Color::Yellow;
+const REST_TIME: Color = Color::DarkGray;
+/// The time section's columns after the bars.
+const TIME_FIGURES: &str = "  a turn rounds  calls  tok/s";
+
+/// What some finished turns with timed calls took, from a `usage` row's
+/// `time`: their time from start to end, the tool calls that ran to their
+/// end and those calls' time, and their own timed model calls: how many,
+/// their output and their time.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Took {
+    pub turns: u64,
+    pub turn_ms: u64,
+    pub rounds: u64,
+    pub calls: u64,
+    pub tool_ms: u64,
+    pub model_ms: u64,
+    pub output: u64,
+}
+
+impl Took {
+    fn of(row: &Value) -> Self {
+        let count = |key: &str| row[key].as_u64().unwrap_or(0);
+        Self {
+            turns: count("turns"),
+            turn_ms: count("turn_ms"),
+            rounds: count("timed_rounds"),
+            calls: count("tool_calls"),
+            tool_ms: count("tool_ms"),
+            model_ms: count("model_ms"),
+            output: count("timed_output_tokens"),
+        }
+    }
+    fn add(&mut self, other: Took) {
+        self.turns += other.turns;
+        self.turn_ms += other.turn_ms;
+        self.rounds += other.rounds;
+        self.calls += other.calls;
+        self.tool_ms += other.tool_ms;
+        self.model_ms += other.model_ms;
+        self.output += other.output;
+    }
+    /// Its average turn's time.
+    fn each(&self) -> u64 {
+        self.turn_ms / self.turns.max(1)
+    }
+    /// Its model's output tokens a second, from send to answer, as the
+    /// speed section counts them.
+    fn per_second(&self) -> Option<u64> {
+        (self.output * 1000).checked_div(self.model_ms)
+    }
+    /// Its time in the model's calls, in tools, and the rest: pacing,
+    /// summaries, the daemon's own time, gates waited on and failed
+    /// attempts. Each within what is left of the turns' time.
+    fn parts(&self) -> [(u64, Color); 3] {
+        let model = self.model_ms.min(self.turn_ms);
+        let tools = self.tool_ms.min(self.turn_ms - model);
+        [
+            (model, MODEL_TIME),
+            (tools, TOOL_TIME),
+            (self.turn_ms - model - tools, REST_TIME),
+        ]
+    }
+}
+
+/// A longer time in a few characters: as `took` under a minute, then
+/// minutes and seconds, then hours and minutes.
+fn span(ms: u64) -> String {
+    match ms / 1000 {
+        s if s < 60 => took(ms),
+        s if s < 3600 => format!("{}m {:02}s", s / 60, s % 60),
+        s => format!("{}h {:02}m", s / 3600, s / 60 % 60),
     }
 }
 
@@ -1020,6 +1193,77 @@ mod tests {
             ]
         );
         assert!(speeds(&rows[2..], &total, 80).is_empty());
+    }
+
+    #[test]
+    fn each_agent_says_where_its_turns_went() {
+        // Two agents' finished turns: one waits on its model, the other on
+        // its tools; the longer turn's bar is the longest.
+        let mut view = View::new(scope());
+        let (_, window) = view.query(1_800_000_000_000);
+        let time = |turns, turn_ms, rounds, calls, tool_ms, model_ms, output| {
+            json!({"turns": turns, "turn_ms": turn_ms, "model_rounds": rounds,
+                "tool_calls": calls, "tool_ms": tool_ms, "paced_ms": 0, "summary_ms": 0,
+                "daemon_ms": 0, "timed_rounds": rounds, "timed_output_tokens": output,
+                "model_ms": model_ms, "first_token_ms": 0})
+        };
+        view.loaded(
+            window,
+            Ok(json!({
+                "turns": 4, "input_tokens": 2000, "cached_input_tokens": 0, "output_tokens": 200,
+                "time": time(4, 100_000, 20, 16, 30_000, 62_000, 3_100),
+                "bots": [
+                    {"bot": "p.docs", "turns": 2, "input_tokens": 1000, "cached_input_tokens": 0,
+                     "output_tokens": 100, "time": time(2, 80_000, 18, 16, 30_000, 46_000, 1_400)},
+                    {"bot": "p.lead", "turns": 2, "input_tokens": 1000, "cached_input_tokens": 0,
+                     "output_tokens": 100, "time": time(2, 20_000, 2, 0, 0, 16_000, 1_700)},
+                ],
+                "other_bots": null, "models": [], "origins": [], "series": [],
+            })),
+            Vec::new(),
+        );
+        let lines = view.card(70);
+        let card = text(&lines);
+        let time: Vec<&str> = card
+            .lines()
+            .skip_while(|l| !l.starts_with("Time"))
+            .collect();
+        assert_eq!(time.len(), 4, "{card}");
+        assert!(time[0].ends_with("a turn rounds  calls  tok/s"), "{card}");
+        assert!(time[1].starts_with("docs"), "{card}");
+        assert!(time[1].ends_with(" 40 s    9.0    8.0     30"), "{card}");
+        assert!(time[2].ends_with(" 10 s    1.0    0.0    106"), "{card}");
+        assert_eq!(
+            time[3],
+            "█ model 62%   █ tools 30%   █ waiting and the rest 8%"
+        );
+        // The longer turn's bar is longer, and no row is wider than the card.
+        let filled = |row: &str| row.chars().filter(|c| "█▏▎▍▌▋▊▉".contains(*c)).count();
+        assert!(filled(time[1]) > 3 * filled(time[2]), "{card}");
+        for line in lines
+            .iter()
+            .filter(|l| text(std::slice::from_ref(l)).contains(" s "))
+        {
+            assert!(line.width() <= 70, "{card}");
+        }
+        // A narrow pane keeps each row on one line, with its turn's length.
+        for width in 30..=70 {
+            let narrow = view.card(width);
+            let card = text(&narrow);
+            let at = (narrow.iter())
+                .position(|l| text(std::slice::from_ref(l)).starts_with("Time"))
+                .unwrap();
+            let rows: Vec<&Line> = narrow[at..at + 3].iter().collect();
+            assert_eq!(rows.len(), 3, "{width}: {card}");
+            for line in rows {
+                let t = text(std::slice::from_ref(line));
+                assert!(line.width() <= width, "{width}: {card}");
+                assert!(t.starts_with("Time") || t.contains(" s"), "{width}: {card}");
+            }
+        }
+        assert_eq!(span(42_000), "42 s");
+        assert_eq!(span(72_000), "1m 12s");
+        assert_eq!(span(3_720_000), "1h 02m");
     }
 
     #[test]
