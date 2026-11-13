@@ -279,7 +279,14 @@ fn large_artifacts_remain_exact_after_reopen_and_background_completion() {
             },
         )
         .unwrap();
-        let process = db.process_start(turn, "background").unwrap();
+        let process = db
+            .process_start(
+                turn,
+                "background",
+                agent_runtime::store::ProcessKind::Background,
+                "",
+            )
+            .unwrap();
         db.process_finish(
             process,
             &serde_json::json!({"success":true}),

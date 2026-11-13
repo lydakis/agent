@@ -1486,7 +1486,8 @@ At each start Sonny writes what every agent leans on: the
 `memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
 in `~/.agents/skills` (replacing links the Agent app left there), and
 `~/.agent/memory` and `~/.agent/automation`, scripts that run this Sonny as
-`sonny memory ...` (facts saved for later agents, in `~/.agents/memory`)
+`sonny memory ...` (facts saved for later agents, in `~/.agents/memory`;
+a live fact's blanks are filled as it is read, as a template note's are)
 and `sonny automation ...` (jobs that wake an agent, which Sonny's scheduler
 runs), which other harnesses and scripts run too; Sonny's own agents use the
 `memory` and `automations` tools instead, which the tool host answers outside
@@ -1903,7 +1904,9 @@ is Markdown with blanks, as Jinja writes them (MiniJinja), that Sonny
 fills and fills again whenever what they read changes, with no call from
 the agent and nothing more in its history: `source('ci').latest.text`
 and `.events` (what one of your sources printed lately, newest first;
-`.up` and `.down_since` while the lookout says it is down),
+`.topics`, each topic's newest event however old, such as each pull
+request's last word, which the lookout keeps for 200 topics; `.up` and
+`.down_since` while the lookout says it is down),
 `file('state.json')` (a file in its folder, `| fromjson` making JSON
 fields of it), `tasks()` and `task('NAME')` (where its tasks stand, as
 `/status` reads them), `now()`, and `| ago` and `| time` for a time in
@@ -1921,6 +1924,21 @@ state.json`, a source by its icon), and a source that is down says since
 when, so a live note never passes for a written one.
 
 ![A note of your own in the margin, filled from its blanks: follows 🛠 ci, tasks, release.json; the CI source's latest run, a release file's state, and the lead's task fix-avg with how long its turn took](../docs/sonny/margin-template-note.png)
+
+A source whose events name a `topic`, such as one per pull request, gives
+each topic's newest event as `.topics`, so a note can list where each one
+stands now, however long ago it last changed:
+
+```toml
+[sonny.notes.prs]
+title = "open pull requests"
+template = """
+{% for pr in source('prs').topics | rejectattr('fields.state', 'eq', 'merged') | sort(attribute='fields.number') %}- **#{{ pr.fields.number }}** {{ pr.fields.title }}
+  CI {{ pr.fields.ci }} · {{ pr.fields.review }}
+{% endfor %}"""
+```
+
+![A note of your own listing open pull requests from a source's topics: #41, #42 and #43 with their CI and review state, the merged #40 left out](../docs/sonny/margin-topics-note.png)
 
 Notes of
 your own go in your config as `[sonny.notes.NAME]`, a `template` and a

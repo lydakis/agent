@@ -53,7 +53,7 @@ sandbox. For people, scripts and other harnesses, Sonny writes
 `sonny automation`:
 
 ```sh
-~/.agent/automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] -- MESSAGE
+~/.agent/automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--live] -- MESSAGE
   WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO
 ~/.agent/automation ls [--after NAME]
 ~/.agent/automation show NAME
@@ -82,6 +82,18 @@ removed once that went (or after a day idle). It has no shell because a
 sandboxed agent's commands still reach its daemon socket, which takes a
 message to another agent or a pause from a read-only agent too; so a dry run
 reads with the daemon's file tools and read-only MCP tools, not commands.
+
+**Live messages.** With `--live`, the message is a template, as a live
+memory fact's text is, filled as each run starts: `source('NAME')` (what
+one of your sources printed, its `.latest`, `.events` and each topic's
+newest in `.topics`), `file('PATH')` from the folder the automation was
+added in, `now()`, and `| ago` and `| time`. So a run starts with the data
+in its prompt instead of spending its first calls fetching it. `add` refuses
+(`invalid_automation`) a message that does not read as a template, names a
+source you have not set up, or calls `tasks()`, which a run outlives; a file
+not written yet fills on a later run. A run whose blanks do not fill gets
+the message as written and a line saying why, so the run still comes. What
+it filled to is at most 32 KiB. A shadow run fills the same way.
 
 **A broken `--if`.** A gate that cannot run, ends with anything but exit 0
 or 1, or runs past 60 s, fails the run, with the end of what it wrote to
@@ -468,7 +480,7 @@ Markdown file of at most 16 KiB with front matter (`name`, `description`,
 `verified`, `external` when it is so, and `confirmed` and `pushed_back`,
 how many times the person confirmed or pushed back on it, when not zero, as
 ExpeL's insights and ACE's playbook bullets keep helpful and harmful
-counts; a save that leaves a count out keeps it). The person's facts are in `~/.agents/memory`, a project's in
+counts; a save that leaves a count out keeps it), and `live` when it is so (below). The person's facts are in `~/.agents/memory`, a project's in
 `~/.agents/memory/projects/NAME`, outside the checkout, so its lead and every
 task's worktree share one copy whatever is committed (a task's worktree
 starts at the last commit, so an uncommitted AGENTS.md line never reaches
@@ -488,6 +500,24 @@ that a later agent may pick up, saved again as it moves; the cleanup
 retires one not saved in over three days, as Codex and Copilot drop
 memories by age, after keeping any lesson in it as a lasting fact. The
 daemon knows nothing of memory.
+
+A fact saved with `live` true (`--live true`) points at moving data
+instead of copying it, which is where memory goes stale fastest: its text
+and description are templates, with the same blanks as a template note in
+the margin ([template.rs](../sonny/src/template.rs)) bar the tasks, which a
+fact outlives. `read` gives the template as `text` and the fact as it
+fills now as `filled`, or why it does not as `unfilled`; a new agent's
+instructions take each live description filled once, as it is when the
+agent is made, one line of at most 300 bytes, and never filled again, so
+its prompt stays cached. A description that does not fill shows as
+written. A save is refused (`memory_template`) when its text or
+description does not read as a template, names a source the person has
+not set up, or reads the tasks; one that leaves `live` out keeps the mark
+the fact had, so the cleanup's rewording keeps it, and the cleanup keeps
+each blank as written. The fact's file never changes as its data does,
+so a change in the data is no memory news. Only Sonny fills: the daemon
+links no template engine, and an agent composed by `agent run --agents`
+reads a live description as it is written.
 
 Sonny's agents read and save memory with the `memory` tool, which Sonny's
 tool host answers outside the agent's sandbox, so a sandboxed agent still
@@ -1170,6 +1200,19 @@ names its kind (`memory` file, `exec` mcp, `browser`,
 `desktop`, the rest agents). `/audit` shows the trail: this agent's rows,
 newest first, `a` for every agent's, `t`, `p` and `w` to filter by kind,
 place and who approved, Enter to open a row's agent.
+
+`/ps` shows the commands the project's agents left running, as Codex's
+`/ps` shows its background terminals: each background command, terminal,
+detached service and call waiting on its approval, by agent and oldest first, with its
+agent, how long it has run, a detached one's pid and the start of its
+command, read from the daemon's `processes` every two seconds while it is
+open. `a` shows every agent's, Enter opens a row's agent, and `x` twice
+stops the picked one with all it started (`stop_process`), beside the
+window.
+
+![/ps in a project folder: its lead's detached docs server, with its pid, and a background test watcher](sonny/ps-folder.png)
+
+![/ps after a: every agent's commands, another project's worker first; x once on the docs server asks for a second x to stop it and all it started](sonny/ps-every-agent.png)
 
 ## Links
 

@@ -1332,11 +1332,13 @@ fn append(
 
 /// Append a memory index's head ([`crate::memory::head`]): an index holds
 /// every fact, and a new bot starts with the most needed and searches for
-/// the rest. Reads at most [`MEMORY_READ`] of it, enough for thousands of
+/// the rest, each live fact's description filled from `workspace` as it is
+/// now. Reads at most [`MEMORY_READ`] of it, enough for thousands of
 /// facts; past that, only those count toward the facts it leaves out.
 fn append_memory(
     text: &mut String,
     path: PathBuf,
+    workspace: &Path,
     reserve: usize,
 ) -> Result<Option<Source>, Failure> {
     let mut bytes = read_head(&path, MEMORY_READ)?;
@@ -1351,6 +1353,7 @@ fn append_memory(
         path: path.clone(),
         reason: e.utf8_error().to_string(),
     })?;
+    let index = crate::memory::filled_lines(&index, workspace);
     push(text, path, "\n\n", &crate::memory::head(&index), reserve)
 }
 
@@ -1506,9 +1509,8 @@ fn compose(
     for path in memory {
         let appended = match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => not_dangling(path),
-            _ => {
-                append_memory(&mut after, path.clone(), reserve).map(|index| indexes.extend(index))
-            }
+            _ => append_memory(&mut after, path.clone(), workspace, reserve)
+                .map(|index| indexes.extend(index)),
         };
         if let Err(failure) = appended {
             leave.out(failure)?;
