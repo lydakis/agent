@@ -2365,7 +2365,10 @@ mod tests {
         let (shown, said) = cut.rsplit_once('\n').unwrap();
         assert_eq!(shown.len(), FILLED);
         assert!(long.starts_with(shown));
-        assert_eq!(said, format!("[cut: it filled to {} bytes, {FILLED} shown]", long.len()));
+        assert_eq!(
+            said,
+            format!("[cut: it filled to {} bytes, {FILLED} shown]", long.len())
+        );
     }
 
     #[test]

@@ -1378,7 +1378,9 @@ fn trim(path: &Path, now_ms: u128) {
         let size = line.len() as u64 + 1;
         let read = serde_json::from_str::<Value>(line).ok();
         let at = read.as_ref().and_then(|kept| kept["at_ms"].as_u64());
-        let topic = read.as_ref().and_then(|kept| kept["topic"].as_str().map(str::to_owned));
+        let topic = read
+            .as_ref()
+            .and_then(|kept| kept["topic"].as_str().map(str::to_owned));
         lately = lately
             && kept.len() < RECENT_EVENTS
             && bytes + size <= RECENT_BYTES * 3 / 4
@@ -1894,7 +1896,12 @@ mod tests {
         add_lines(&file, &(lines.join("\n") + "\n"));
         trim(&file, now);
         let left: Vec<String> = (std::fs::read_to_string(&file).unwrap().lines())
-            .map(|line| serde_json::from_str::<Value>(line).unwrap()["text"].as_str().unwrap().to_owned())
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
             .collect();
         // The day's events, and #1's last word from before it, in order.
         assert_eq!(left, ["#1 green", "#2 merged", "#3 opened"]);

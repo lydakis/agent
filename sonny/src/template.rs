@@ -631,7 +631,10 @@ mod tests {
         let quoted = "{{ file('tasks().txt') }}{# {{ source('missing') }} #}{{ file('café(1).txt') }}\
             {{ \"}} source('x')\" }}{{ 'it\\'s tasks()' }}";
         assert_eq!(named(quoted), (vec![], false));
-        assert_eq!(named("{{ \"}}\" ~ source('typo') }}"), (vec!["typo".to_owned()], false));
+        assert_eq!(
+            named("{{ \"}}\" ~ source('typo') }}"),
+            (vec!["typo".to_owned()], false)
+        );
         assert_eq!(
             named("{{ x.task(1) }} {{- source( 'ci' ).latest -}}"),
             (vec!["ci".to_owned()], false)
@@ -679,7 +682,12 @@ mod tests {
                 "fields": {"state": state}, "at_ms": at * 1000, "seq": 1})
             .to_string()
         };
-        let prs = [pr(1, "open", 1), pr(2, "open", 2), pr(1, "green", 3), pr(2, "merged", 4)];
+        let prs = [
+            pr(1, "open", 1),
+            pr(2, "open", 2),
+            pr(1, "green", 3),
+            pr(2, "merged", 4),
+        ];
         std::fs::write(dir.join("ci.jsonl"), prs.join("\n") + "\n" + &log).unwrap();
         let (text, _) = render(
             "{% for pr in source('ci').topics if pr.fields.state != 'merged' %}{{ pr.text }} {% endfor %}\
