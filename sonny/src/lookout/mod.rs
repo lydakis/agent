@@ -263,23 +263,20 @@ fn note(told: &updates::Told, steer: Option<&Steer>) -> String {
     }
     lines.push(match steer {
         Some(Steer::Person) => {
-            "This cuts into your turn because the person wrote in a task: act on their \
-            words where they change what you or a task is doing, then carry on with your turn."
+            "This joins your running turn because the person wrote in a task; carry on \
+            with your turn after it."
                 .to_owned()
         }
         Some(Steer::Rule(sub)) => format!(
-            "This cuts into your turn because your follow {sub} says it steers: act on it \
-            where it changes what you or a task is doing, then carry on with your turn."
+            "This joins your running turn because your follow {sub} says it steers; carry \
+            on with your turn after it."
         ),
-        Some(Steer::News) => "This joins your turn as it runs: act on it where it changes \
-            what you or a task is doing, then carry on with your turn."
-            .to_owned(),
+        Some(Steer::News) => {
+            "This joins your running turn; carry on with your turn after it.".to_owned()
+        }
         None => "Each ended turn comes with what the task replied; read a turn with one \
-            wait call (timeout_ms 0) only when you need more of it, and act where something \
-            changes the work. Tell the person, briefly, what they would want to \
-            hear: the outcome of work you started for them, once, when it ends, not again \
-            when they write in that task; what only they can decide; and where their latest \
-            words contradict what they asked before. If nothing, end your turn with an empty \
+            wait call (timeout_ms 0) only when you need more of it. The person sees neither \
+            this note nor your turn unless you reply. If nothing, end your turn with an empty \
             reply."
             .to_owned(),
     });
@@ -4039,7 +4036,7 @@ mod tests {
              - calc.ui: calc.ui/2 completed\n\
              - 1 more tasks in the next note\n\
              The words quoted below are the person's own, from the turns named.\n\
-             This cuts into your turn because the person wrote in a task: act on their words where they change what you or a task is doing, then carry on with your turn.\n\
+             This joins your running turn because the person wrote in a task; carry on with your turn after it.\n\
              \n\
              Memory changed"
         );
@@ -4049,14 +4046,13 @@ mod tests {
             note(&told, None),
             "Task updates: what happened in your tasks since you last heard; the wait tool reads each turn by its handle.\n\
              - calc.docs: calc.docs/3 completed\n\
-             Each ended turn comes with what the task replied; read a turn with one wait call (timeout_ms 0) only when you need more of it, and act where something changes the work. \
-             Tell the person, briefly, what they would want to hear: the outcome of work you started for them, once, when it ends, not again when they write in that task; what only they can decide; and where their latest words contradict what they asked before. If nothing, end your turn with an empty reply."
+             Each ended turn comes with what the task replied; read a turn with one wait call (timeout_ms 0) only when you need more of it. The person sees neither this note nor your turn unless you reply. If nothing, end your turn with an empty reply."
         );
         // News joining a busy subscriber's turn, with nothing urgent in it.
-        assert!(note(&told, Some(&Steer::News)).ends_with(
-            "This joins your turn as it runs: act on it where it changes what you or a task is \
-             doing, then carry on with your turn."
-        ));
+        assert!(
+            note(&told, Some(&Steer::News))
+                .ends_with("This joins your running turn; carry on with your turn after it.")
+        );
     }
 
     #[test]
@@ -4383,7 +4379,8 @@ mod tests {
         let told = lookout.updates.take_at(now);
         let steered = note(&told, Some(&Steer::Rule("tasks".into())));
         assert!(
-            steered.contains("This cuts into your turn because your follow tasks says it steers"),
+            steered
+                .contains("This joins your running turn because your follow tasks says it steers"),
             "{steered}"
         );
         // The person's own words still read as theirs.
@@ -6773,7 +6770,10 @@ mod tests {
         let submit = got.recv().await.unwrap();
         assert_eq!(submit["delivery"], "steer");
         let prompt = submit["prompt"].as_str().unwrap();
-        assert!(prompt.contains("then carry on with your turn"), "{prompt}");
+        assert!(
+            prompt.contains("carry on with your turn after it"),
+            "{prompt}"
+        );
         lookout.answered(Answer::Sourced(Ok(())));
         // At rest: one note, with the lookout's origin, starting a turn.
         (lookout.updates).seat(&json!({"name": "calc.lead", "bot_id": 1, "status": "idle"}));
@@ -6812,7 +6812,10 @@ mod tests {
             prompt.contains(r#"(for your chat, as a steer): "prod is down""#),
             "{prompt}"
         );
-        assert!(prompt.contains("Handle what cannot wait"), "{prompt}");
+        assert!(
+            prompt.contains("because something in it steers"),
+            "{prompt}"
+        );
         // A note stays under its bytes however the text escapes; the rest
         // waits for the next.
         let escaped = "\u{1}".repeat(sources::TEXT_CHARS);

@@ -3974,7 +3974,7 @@ mod tests {
              - shop.web: shop.web/3, 2 messages in it since shop.web/1, from shop.fix, a trigger\n\
              - 1 more tasks in the next note\n\
              A quoted message is the person's own words.\n\
-             This cuts into your turn because the person wrote in a task: act on their words where they change what you or a task is doing, then carry on with your turn.";
+             This joins your running turn because the person wrote in a task; carry on with your turn after it.";
         assert_eq!(
             text(&super::prompt(note, 160, None).0),
             [
@@ -4096,7 +4096,7 @@ mod tests {
              - slack (for your chat): \"ship it\"\n\
              - 3 more waiting, in the notes after this one\n\
              - 40 more events from chat and ci came between 9 minutes ago and 1 minute ago, and they were not kept: 1024 were waiting for you already\n\
-             Act where something changes your work.";
+             The person sees neither this note nor your turn unless you reply.";
         assert_eq!(
             text(&super::prompt(note, 90, None).0),
             ["↳ From your sources · slack 2 · mail · +3 more · 40 not kept"]
