@@ -8981,6 +8981,50 @@ nothing to an idle bot. The index is partial: only a message the person
 wrote enters it, when its turn takes it, beside the message indexes that
 write already updates.
 
+## A terminal's reads redacted as one stream (#937)
+
+A terminal (`write_stdin`) now runs its reads through the same exact
+streaming redactor a retained output's file uses, instead of a hold scan
+plus a re-redaction of what the last read showed. What each path pays:
+
+- **A terminal read**: one linear pass over what was read (line ends,
+  credentials, PEM blocks, secret fields), holding only what may still be
+  redacted. Before, each read scanned for a hold, then redacted the text
+  together with the field opening shown before it.
+- **A terminal's state**: one `Credentials` handle (an `Arc`) and the
+  redactor's hold buffers, which are empty between values.
+- **The store**: nothing new.
+
+The terminal read path itself, 4,000 reads of 1 to 4 KiB of shell output
+(a directory listing and an `export` of a secret field), two credentials
+and four secret fields, release build, best of 7 on one machine:
+
+| Side | Time for 4,000 reads |
+| --- | ---: |
+| main (362029d) | 103.7 ms |
+| head | 44.8 ms |
+
+The Perf workflow's screen on 9e075d2, base against head:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 28.258 | 28.406 | +0.5% |
+| admission | burst submit p99, ms | 2.851 | 2.875 | +0.9% |
+| completion | release to terminal p99, ms | 8.039 | 8.564 | +6.5% |
+| footprint | idle RSS, MiB | 16.225 | 16.256 | +0.2% |
+| footprint | per idle bot, KiB | 1.966 | 1.924 | -2.1% |
+| footprint | RSS after a turn each, MiB | 34.078 | 36.199 | +6.2% |
+| footprint | CPU per turn, ms | 0.731 | 0.721 | -1.4% |
+| lifecycle | CPU, s | 0.385 | 0.385 | +0.0% |
+| lifecycle | p95 turn, ms | 662.753 | 615.985 | -7.1% |
+| lifecycle | peak RSS, MiB | 25.406 | 24.727 | -2.7% |
+
+Store work per turn is the same on both sides, and the gate passed. None
+of these benches opens a terminal, so none runs the changed path; the two
+rows past 5% (completion p99 at 0.5 ms, RSS after a turn each) are within
+the runner's spread on earlier screens, and lifecycle moves the other way.
+Sonny's rows are left out: no Sonny source changed.
+
 ## Tracked detached commands (protocol 72, schema 97)
 
 A detached command is a `proc:N` handle now, recorded with its pid and its
