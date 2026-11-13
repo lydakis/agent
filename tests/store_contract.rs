@@ -17365,12 +17365,16 @@ fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
         let timed = clocked_turn(&path, &mut db, 2_000, "2");
         let lifted = clocked_turn(&path, &mut db, 2_000, "3");
         // The third turn's read went to the background, as a lifted call
-        // does: its row ended with its process, not in its turn.
+        // does: its row ended with its process, not in its turn. Its
+        // command ran as a terminal does, with a process of its own that
+        // ended in the turn.
         let conn = Connection::open(&path).unwrap();
-        conn.execute(
-            "INSERT INTO processes(turn,call_id,status,bot,delivered,told) VALUES (?1,'r3','completed','Bob',1,1)",
-            [lifted],
-        )
+        conn.execute_batch(&format!(
+            "INSERT INTO processes(turn,call_id,status,bot,delivered,told)
+                 VALUES ({lifted},'r3','completed','Bob',1,1),({lifted},'s3','completed','Bob',1,1);
+             INSERT INTO events(bot,turn,kind,data)
+                 VALUES ('Bob',{lifted},'call_lifted','{{\"call_id\":\"r3\",\"handle\":\"proc:1\"}}');"
+        ))
         .unwrap();
         conn.execute(
             "UPDATE audit SET ms=ms+60000 WHERE turn=?1 AND call_id='r3'",
@@ -17395,7 +17399,7 @@ fn schema_98_clocks_the_timed_turns_from_the_audit_trail() {
     let usage = db.usage(None, 0, None, 64).unwrap();
     let time = &usage["time"];
     // Two calls together in the second turn, 1 s; the third turn's command
-    // alone, 1 s, its lifted read left out.
+    // alone, 1 s, its process notwithstanding; its lifted read left out.
     let tool_ms = time["tool_ms"].as_i64().unwrap();
     assert!((2_000..2_400).contains(&tool_ms), "{time}");
     assert_eq!(

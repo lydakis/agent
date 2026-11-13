@@ -17357,9 +17357,10 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
 }
 /// 97 -> 98: the tool calls and tool time of every turn with timed model
 /// calls, from its rows in the audit trail that ended, as a call ending in
-/// its turn counts them: a call lifted to the background is left out. The
-/// trail is in time order, so it is read from the first of those turns'
-/// starts on.
+/// its turn counts them: a call lifted to the background (its `call_lifted`
+/// event) is left out, a terminal's call with a process of its own is not.
+/// The trail is in time order, so it is read from the first of those
+/// turns' starts on.
 fn clock_timed_turns(conn: &Connection) -> Result<()> {
     let first: Option<i64> = conn.query_row(
         "SELECT MIN(started_ms) FROM turns WHERE timed_rounds>0",
@@ -17374,7 +17375,8 @@ fn clock_timed_turns(conn: &Connection) -> Result<()> {
     let mut rows = conn.prepare(
         "SELECT a.turn,a.at_ms,a.at_ms+a.ms FROM audit a
          WHERE a.id>=? AND a.step IS NULL AND a.ms IS NOT NULL
-             AND NOT EXISTS(SELECT 1 FROM processes p WHERE p.turn=a.turn AND p.call_id=a.call_id)
+             AND NOT EXISTS(SELECT 1 FROM events e WHERE e.turn=a.turn AND e.kind='call_lifted'
+                 AND e.data->>'$.call_id'=a.call_id)
          ORDER BY a.turn,a.at_ms",
     )?;
     let mut rows = rows.query([from])?;
