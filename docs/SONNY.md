@@ -53,7 +53,7 @@ sandbox. For people, scripts and other harnesses, Sonny writes
 `sonny automation`:
 
 ```sh
-~/.agent/automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] -- MESSAGE
+~/.agent/automation add [--name NAME] [WHEN] [--bot NAME | --start NAME --model PROVIDER/MODEL [--effort LEVEL]] [--reply-to BOT] [--if CMD] [--runs N] [--until 'YYYY-MM-DD HH:MM'] [--turn-budget-tokens N [--budget-counts work]] [--shadow] [--live] -- MESSAGE
   WHEN: --every 30m | --in 45m | --at 'YYYY-MM-DD HH:MM' | --cron 'MIN HOUR DAY MONTH WEEKDAY' | --file PATH | --commit REPO
 ~/.agent/automation ls [--after NAME]
 ~/.agent/automation show NAME
@@ -82,6 +82,18 @@ removed once that went (or after a day idle). It has no shell because a
 sandboxed agent's commands still reach its daemon socket, which takes a
 message to another agent or a pause from a read-only agent too; so a dry run
 reads with the daemon's file tools and read-only MCP tools, not commands.
+
+**Live messages.** With `--live`, the message is a template, as a live
+memory fact's text is, filled as each run starts: `source('NAME')` (what
+one of your sources printed, its `.latest`, `.events` and each topic's
+newest in `.topics`), `file('PATH')` from the folder the automation was
+added in, `now()`, and `| ago` and `| time`. So a run starts with the data
+in its prompt instead of spending its first calls fetching it. `add` refuses
+(`invalid_automation`) a message that does not read as a template, names a
+source you have not set up, or calls `tasks()`, which a run outlives; a file
+not written yet fills on a later run. A run whose blanks do not fill gets
+the message as written and a line saying why, so the run still comes. What
+it filled to is at most 32 KiB. A shadow run fills the same way.
 
 **A broken `--if`.** A gate that cannot run, ends with anything but exit 0
 or 1, or runs past 60 s, fails the run, with the end of what it wrote to

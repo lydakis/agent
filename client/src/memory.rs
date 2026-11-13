@@ -1001,8 +1001,10 @@ fn read(dir: &Path, folder: &Path, name: &str) -> Result<Value, String> {
     Ok(found)
 }
 
-/// `filled`, at most [`FILLED`] bytes and a line saying what it cut.
-fn cut_filled(mut filled: String) -> String {
+/// `filled`, at most [`FILLED`] bytes and a line saying what it cut: a
+/// live fact's fill as a read gives it, and an automation's live message
+/// as a fire sends it.
+pub fn cut_filled(mut filled: String) -> String {
     if filled.len() > FILLED {
         let total = filled.len();
         filled.truncate(filled.floor_char_boundary(FILLED));
