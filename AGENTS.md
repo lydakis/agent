@@ -79,7 +79,7 @@ it keeps these, and says in its PR how:
   A pool that knows no allowance ramps back after a refusal: one call, then
   one more for each answered, the window learned from the provider's answers.
 - Every provider error has a class: a rate limit (429, slow down) closes the
-  pool and parks; an overload (529, 503, overloaded) backs off its own call and
+  pool and parks; an overload (529, overloaded) backs off its own call and
   closes the pool only when it names a delay or overloads cluster; transient
   (5xx, stalls, connections) backs off and parks; the rest are final. A new
   error code gets a class and a test.

@@ -8991,9 +8991,8 @@ refusal when it knows no allowance: one call, one more for each answered,
 halved by a refusal while open, and growing by one a round past the half.
 It ends once the window passes 1,024. A 429 that names
 `ramp_limit_exceeded` (Anthropic's documented ramp limit) ramps a pool
-even when it knows its allowance. A 503 is now an overload, like 529, as
-the providers document it. A pool that reads headers paces by them, as
-before.
+even when it knows its allowance. A pool that reads headers paces by them,
+as before.
 
 `bench.scale_screen` with `bench.streaming_model --tpm 300000
 --no-headers`, 2.3 s calls, 45 s windows, 4-CPU Linux cloud box, before

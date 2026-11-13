@@ -1494,12 +1494,9 @@ impl Provider {
             if !quota {
                 reservation.learn(&headers, limits);
             }
-            // A 503 is the provider out of capacity (Bedrock says so of
-            // its own), an overload like a 529: retried alone unless they
-            // cluster, when the pool closes and ramps back.
             if status == 429 && body.ramp {
                 pace.ramp_limited(retry_after(&headers));
-            } else if matches!(status, 429 | 503 | 529) && !quota {
+            } else if matches!(status, 429 | 529) && !quota {
                 refused(&pace, status != 429, retry_after(&headers));
             }
             reservation.settle(0);
@@ -1987,17 +1984,17 @@ pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .or_else(|| number("retry-after").and_then(delay))
 }
 
-/// Tell the model's pool of a refusal a socket reported: a 429, 503 or 529
+/// Tell the model's pool of a refusal a socket reported: a 429 or 529
 /// status with its `retry-after`, as on HTTP, or an in-stream rate limit or
 /// overload with the delay it names.
 fn limit(pace: &pace::Pace, failure: &socket::Failure) {
-    if matches!(failure.status, Some(429 | 503 | 529)) || paced(&failure.error.code) {
+    if matches!(failure.status, Some(429 | 529)) || paced(&failure.error.code) {
         let after = failure
             .headers
             .as_deref()
             .and_then(retry_after)
             .or_else(|| failure.error.detail.as_deref().and_then(pace::named_delay));
-        let overload = matches!(failure.status, Some(503 | 529))
+        let overload = failure.status == Some(529)
             || (failure.status != Some(429) && overload(&failure.error.code));
         refused(pace, overload, after);
     }
