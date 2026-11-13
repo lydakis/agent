@@ -8875,6 +8875,112 @@ changed. The lookout's 10x1 row counts a handful of 6 ms ticks, so one
 tick is the 50%, and quiet window CPU has swung by 16% to 33% on earlier
 screens with no Sonny change. Both are the runner's spread.
 
+## Stats: waits for the loop, the loop's own work, runtime, hub and pacer counts
+
+`stats` now says where a busy daemon's time goes without a profiler: how
+long each request waited for the service loop before dispatch, how long
+each of the loop's own chores held it, how busy the async runtime was, what
+the event hub carried and dropped, and what each provider pool did to its
+calls (admitted, waited, parked, closed, overloads). What each path pays:
+
+- **A request**: the line's read time travels with it (one `Instant`
+  read); at dispatch, one subtraction and two adds into the op's entry.
+- **A loop chore**: one `Instant` read either side and an update of its
+  entry in a map the loop alone touches.
+- **An event**: two relaxed atomic adds (published, delivered) per
+  follower queue.
+- **A paced call**: three integer adds under the pool lock it already holds.
+- **`stats`**: tokio's own runtime counters, read with a few loads.
+
+`bench.scale_screen`, 2,048 bots streaming back to back, 2.3 s calls spread
+by half, 20 s windows, 4-CPU Linux cloud box, base (the next_ready fix)
+against head, alternating rounds:
+
+| Measure | Base | Head |
+| --- | ---: | ---: |
+| turns a second (ideal 890) | 886, 890 | 884, 888 |
+| `submit` answer p50, ms | 3.4, 3.0 | 3.3, 2.8 |
+| daemon CPU per turn, ms | 1.35, 1.33 | 1.35, 1.33 |
+| runtime thread CPU, % | 48.6, 47.6 | 48.4, 47.8 |
+
+No store job, statement or allocation per call is added.
+
+Daemon screen (`bench.perf_gate`'s benches), same 4-CPU box, base main
+a4febaf against head, two alternating rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 26.513 | 30.798 | +16.2% |
+| admission | burst submit p99, ms | 4.022 | 4.232 | +5.2% |
+| completion | release to terminal p99, ms | 9.571 | 9.432 | -1.5% |
+| footprint | idle RSS, MiB | 16.207 | 15.947 | -1.6% |
+| footprint | per idle bot, KiB | 1.788 | 1.788 | +0.0% |
+| footprint | RSS after a turn each, MiB | 31.719 | 30.82 | -2.8% |
+| footprint | CPU per turn, ms | 0.811 | 0.755 | -6.9% |
+| lifecycle | CPU, s | 0.455 | 0.42 | -7.7% |
+| lifecycle | p95 turn, ms | 582.53 | 578.291 | -0.7% |
+| lifecycle | peak RSS, MiB | 24.92 | 24.482 | -1.8% |
+
+Store work per turn is the same (`bench.footprint` 7.001 jobs a turn on
+both). The gate warned on no row: each side's runs overlap the other's.
+The lone submit row moved most, so three more alternating admission
+rounds ran: over all 25 runs a side, the 32 lone submits took a median of
+26.4 ms of daemon CPU on base (23.9 to 33.2) and 29.9 on head (24.1 to
+34.6), burst submits 12.0 against 13.0, and burst creates 5.3 against 5.7.
+Nothing the change adds runs long enough for that: a request pays one
+clock read on this box's vDSO `tsc` clock and three adds, and the measures
+of whole turns, which pay the same per request, fall on head (footprint
+CPU per turn, lifecycle CPU, and `bench.scale_screen` above). The
+difference most likely comes from the two builds' code layout, not the
+counting; this was not proven further.
+
+## Person's words in the reviewer (protocol 71)
+
+The `prompts` read takes a second budget, `persons`, for the person's own
+earlier words (`persons_each` bounds each message). The reviewer asks for
+it once a round, and once more for each agent that delegated the work.
+The listing reads ids and byte lengths through the partial index
+`messages_persons`, looks at most 256 rows, and loads a body only when it
+fits, so a read is bounded however long the conversation grows. Nothing on
+the turn path changes: a turn, a submit, and an end run the same store
+jobs as before.
+
+Daemon and Sonny screen (`bench.perf_gate`), the Perf workflow's Linux
+runner, base main a6dd08c against head 77fa056, alternating rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 37.855 | 36.942 | -2.4% |
+| admission | burst submit p99, ms | 4.294 | 4.364 | +1.6% |
+| completion | release to terminal p99, ms | 12.048 | 11.725 | -2.7% |
+| footprint | idle RSS, MiB | 15.992 | 16.154 | +1.0% |
+| footprint | per idle bot, KiB | 1.736 | 1.914 | +10.3% |
+| footprint | RSS after a turn each, MiB | 34.824 | 36.354 | +4.4% |
+| footprint | CPU per turn, ms | 1.019 | 1.032 | +1.2% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 18.75 | 12.5 | -33.3% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 5.625 | 5.0 | -11.1% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 4.94 | 5.0 | +1.2% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 5.685 | 5.56 | -2.2% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 2405.5 | 2438.5 | +1.4% |
+| sonny | lookout note p95 at 100x10, ms | 2442.5 | 2433.0 | -0.4% |
+| sonny | quiet window CPU, ms/s | 0.99 | 0.98 | -1.0% |
+| sonny | quiet window reads, KiB/s | 0.25 | 0.25 | +0.0% |
+| sonny | quiet window requests, /s | 0.71 | 0.705 | -0.7% |
+| sonny | quiet window RSS, MiB | 23.8 | 23.35 | -1.9% |
+| sonny | sky replay CPU per 1k lines, ms | 13.535 | 13.66 | +0.9% |
+| sonny | sky replay RSS, MiB | 78.9 | 74.25 | -5.9% |
+| lifecycle | CPU, s | 0.525 | 0.55 | +4.8% |
+| lifecycle | p95 turn, ms | 605.557 | 577.208 | -4.7% |
+| lifecycle | peak RSS, MiB | 24.525 | 23.994 | -2.2% |
+
+The gate passed with no warning, so store work per turn did not rise. The
+per idle bot row is a 0.18 KiB move on a 2 KiB figure, inside the 1.60 to
+2.04 KiB this row has shown on earlier screens (above); the change adds
+nothing to an idle bot. The index is partial: only a message the person
+wrote enters it, when its turn takes it, beside the message indexes that
+write already updates.
+
 ## A terminal's reads redacted as one stream (#937)
 
 A terminal (`write_stdin`) now runs its reads through the same exact

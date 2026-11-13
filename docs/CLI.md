@@ -480,7 +480,13 @@ the older daemon says why in its `daemon_protocol_mismatch` detail, and that
 nothing was sent: from inside a bot's turn, with `--no-spawn`, with no provider
 to start a new one, or on a socket that is not the store's own. Sonny
 starts the daemon this way, so opening it after an upgrade replaces the old
-daemon, and it says so first. `stats` starts it as `start` does, so it answers on a fresh install;
+daemon, and it says so first. `start --replace` replaces the daemon running
+now the same way whatever its version, so an upgrade that kept the protocol
+still runs the new build (`sonny update` runs it): it fails with
+`daemon_kept`, saying why, from inside a bot's turn, with `--no-spawn`, or with
+no provider to start a new one; a newer daemon is left running and refused
+with `daemon_protocol_mismatch`; with none running, it starts one as `start`
+does. `stats` starts it as `start` does, so it answers on a fresh install;
 its `files` says how many files the daemon holds open against its limit,
 so a leak (a count that grows while idle) is told from a busy peak, and
 its `temp` the room left in each temporary folder every agent's commands

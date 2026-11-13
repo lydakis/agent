@@ -524,6 +524,14 @@ enum Command {
         bot: String,
         turn: i64,
         bytes: Option<usize>,
+        /// Bytes of the person's own earlier words to the bot, listed
+        /// apart under `persons`; none listed when absent or 0.
+        #[serde(default)]
+        persons: usize,
+        /// The most bytes one of them may take, whole or left out; all
+        /// of `persons` when absent or 0.
+        #[serde(default)]
+        persons_each: usize,
     },
     /// One page of a retained tool output stream, by byte offset.
     Artifact {
@@ -729,10 +737,11 @@ enum Command {
 }
 /// How long the service loop held each kind of request: from its
 /// dispatch to its answer or its handoff to a reader, so a request that
-/// holds the loop, and every request queued behind it, shows by name.
-/// Each is a count, a sum, the slowest and a histogram over the store's
-/// latency buckets. Touched only by the loop; no lock, no allocation once
-/// an op has been seen.
+/// holds the loop, and every request queued behind it, shows by name; and
+/// how long each waited for the loop, from its line's read to its
+/// dispatch. Each is a count, sums, the slowest and histograms over the
+/// store's latency buckets. Touched only by the loop; no lock, no
+/// allocation once an op has been seen.
 #[derive(Default)]
 struct Commands(HashMap<&'static str, Held>);
 #[derive(Default)]
@@ -741,22 +750,40 @@ struct Held {
     held_ns: u64,
     slowest_ns: u64,
     held: [u64; agent_runtime::store::BUCKETS_US.len() + 1],
+    waited_ns: u64,
+    waited: [u64; agent_runtime::store::BUCKETS_US.len() + 1],
 }
 impl Commands {
-    fn count(&mut self, op: &'static str, since: std::time::Instant) {
+    /// A request dispatched at `since`, whose line was read at `read`;
+    /// the loop's own work (`Loop`) has no line and no wait.
+    fn count(
+        &mut self,
+        op: &'static str,
+        read: Option<std::time::Instant>,
+        since: std::time::Instant,
+    ) {
         let ns = since.elapsed().as_nanos() as u64;
         let held = self.0.entry(op).or_default();
         held.count += 1;
         held.held_ns += ns;
         held.slowest_ns = held.slowest_ns.max(ns);
         held.held[agent_runtime::store::bucket(ns)] += 1;
+        if let Some(read) = read {
+            let waited = since.saturating_duration_since(read).as_nanos() as u64;
+            held.waited_ns += waited;
+            held.waited[agent_runtime::store::bucket(waited)] += 1;
+        }
     }
-    fn snapshot(&self) -> Value {
+    fn snapshot(&self, waits: bool) -> Value {
         let ops: serde_json::Map<String, Value> = (self.0.iter())
             .map(|(op, held)| {
-                let row = json!({"count": held.count,
+                let mut row = json!({"count": held.count,
                     "held_ms": held.held_ns / 1_000_000,
                     "slowest_ms": held.slowest_ns / 1_000_000, "held": held.held});
+                if waits {
+                    row["waited_ms"] = json!(held.waited_ns / 1_000_000);
+                    row["waited"] = json!(held.waited);
+                }
                 ((*op).to_owned(), row)
             })
             .collect();
@@ -1513,6 +1540,7 @@ struct Service {
     tokens: Arc<turn::TokenTotals>,
     /// How long the service loop held each kind of request, for `stats`.
     commands: Commands,
+    chores: Commands,
     /// Turns parked on a rate-limited pool, by resume time, turns parked
     /// on a verdict, by when a gate lapses, and wake-ups the store lost, by
     /// when they are tried again. Each holds no task and no slot; the run
@@ -2270,6 +2298,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         ready_hint: true,
         tokens: Arc::default(),
         commands: Commands::default(),
+        chores: Commands::default(),
         wakes,
         steer_wakes,
         draining: Arc::default(),
@@ -2370,9 +2399,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                     }
                 }
                 Some(built) = reloaded.recv() => {
+                    let chore = std::time::Instant::now();
                     if let Some(bindings) = service.reloaded(built, &reloaded_sender, config.models.clone()).await? {
                         ready["providers"] = Value::Object(bindings);
                     }
+                    service.chores.count("reload", None, chore);
                 }
                 _ = service.retention.join_next(), if !service.retention.is_empty() => {}
                 // A paused daemon makes no calls: dropped, it comes to
@@ -2385,7 +2416,9 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = service.tails.running.join_next(), if !service.tails.running.is_empty() => {}
                 joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
                     let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
+                    let chore = std::time::Instant::now();
                     service.complete(bot, turn, task, exit).await?;
+                    service.chores.count("reap", None, chore);
                 }
                 _ = terminate.recv() => break,
                 _ = interrupt.recv() => break,
@@ -2405,13 +2438,17 @@ pub async fn run(config: Configuration) -> Result<()> {
                     }
                 }
                 Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
+                    let chore = std::time::Instant::now();
                     service.resume(bot, turn, false).await?;
+                    service.chores.count("resume", None, chore);
                 }
                 // One queued turn per iteration, so requests interleave with a
                 // long backlog; resumes hold no slot and are not starved because
                 // the branch choice is fair.
                 _ = std::future::ready(()), if service.ready_hint && ready_retry.is_none() && service.has_capacity() => {
+                    let chore = std::time::Instant::now();
                     service.dispatch_ready().await?;
+                    service.chores.count("start_ready", None, chore);
                 }
                 // A bot at rest told that its background command ended.
                 () = service.handles.readied() => {
@@ -2423,13 +2460,16 @@ pub async fn run(config: Configuration) -> Result<()> {
                 // Idle bots whose time ran out are deleted, here and not on a
                 // client's request, so a client that stopped leaves none.
                 _ = tokio::time::sleep_until(expiry.unwrap_or_else(tokio::time::Instant::now)), if expiry.is_some() && !service.draining() => {
+                    let chore = std::time::Instant::now();
                     service.expire().await?;
+                    service.chores.count("expire", None, chore);
                 }
                 // Attached messages that waited as long as they may go as
                 // steers. A drain leaves them for the next daemon.
                 _ = tokio::time::sleep_until(lapses.unwrap_or_else(tokio::time::Instant::now)), if lapses.is_some() && !service.draining() => {
                     // A store refusing writes leaves them attached and due,
                     // looked at again after a backoff, as ready turns are.
+                    let chore = std::time::Instant::now();
                     match service.lapse().await {
                         Err(error) if error.code == "storage_error" => {
                             let delay = service.storage_retry();
@@ -2437,9 +2477,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                         }
                         lapsed => lapsed?,
                     }
+                    service.chores.count("lapse", None, chore);
                 }
                 // Turns held in line on a cause are tried again.
                 _ = tokio::time::sleep_until(holds.unwrap_or_else(tokio::time::Instant::now)), if holds.is_some() && !service.draining() => {
+                    let chore = std::time::Instant::now();
                     match service.holds_due().await {
                         Err(error) if error.code == "storage_error" => {
                             let delay = service.storage_retry();
@@ -2447,6 +2489,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                         }
                         due => due?,
                     }
+                    service.chores.count("holds", None, chore);
                 }
                 // A parked turn's time comes due (a pool reopens, a gate lapses,
                 // a lost wake-up is retried): resume it like any parked turn,
@@ -2454,7 +2497,9 @@ pub async fn run(config: Configuration) -> Result<()> {
                 // reused) is dropped.
                 _ = tokio::time::sleep(wake_delay), if wake_due && service.has_capacity() => {
                     if let Some((bot, turn, due)) = service.wakes.pop() {
+                        let chore = std::time::Instant::now();
                         service.resume(bot, turn, due).await?;
+                        service.chores.count("wake", None, chore);
                     }
                 }
                 // A wait's deadline, or a step answered, ended or lapsing:
@@ -2470,8 +2515,10 @@ pub async fn run(config: Configuration) -> Result<()> {
                 }
                 // Queued admissions are answered as their commits land, in order.
                 _ = arrived(&mut service.admissions), if !service.admissions.is_empty() => {
+                    let chore = std::time::Instant::now();
                     let (session, output, id, result) = service.settled();
                     reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
+                    service.chores.count("admission", None, chore);
                 }
                 // A read answered: its session's next request may be taken.
                 Some((asker, sent)) = service.lane.next(), if !service.lane.is_empty() => {
@@ -2514,7 +2561,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                             if id == 0 && stdio_owner { break; }
                         }
                         // The line's credit goes back as this request is taken up.
-                        Inbound::Request(id, request, _credit) => {
+                        Inbound::Request(id, request, _credit, read) => {
                             let Some(output) = sessions.get(&id).cloned() else { continue };
                             // A bad id is refused like a malformed line, after the
                             // admissions queued before it.
@@ -2569,7 +2616,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                                         None => {
                                             let (op, held) = (request.command.op(), std::time::Instant::now());
                                             let result = service.dispatch(request.command, id, &output, request.id.clone(), bound).await;
-                                            service.commands.count(op, held);
+                                            service.commands.count(op, Some(read), held);
                                             result
                                         }
                                     };
@@ -2789,6 +2836,28 @@ fn validate_provider(
         );
     }
     Ok(())
+}
+
+/// The async runtime that runs the service loop and every turn: how long
+/// its threads were busy rather than parked, how often they parked, and
+/// the tasks alive and waiting in its shared queue. Kept by tokio as it
+/// runs; reading them costs a few loads.
+fn runtime_stats() -> Value {
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let workers = metrics.num_workers();
+    let (busy, parks) = (0..workers).fold((Duration::ZERO, 0), |(busy, parks), worker| {
+        (
+            busy + metrics.worker_total_busy_duration(worker),
+            parks + metrics.worker_park_count(worker),
+        )
+    });
+    json!({
+        "workers": workers,
+        "busy_ms": busy.as_millis() as u64,
+        "parks": parks,
+        "alive_tasks": metrics.num_alive_tasks(),
+        "queued_tasks": metrics.global_queue_depth(),
+    })
 }
 
 /// What a turn's task came to once its end, if it ended, committed.
@@ -5027,7 +5096,15 @@ impl Service {
                     // The room left in the temporary folders every agent's
                     // commands share; inodes can run out with space to spare.
                     "temp": temp,
-                    "commands": self.commands.snapshot(),
+                    "runtime": runtime_stats(),
+                    // Events published and delivered to followers, and
+                    // followers dropped for falling behind.
+                    "hub": self.hub.stats(),
+                    "commands": self.commands.snapshot(true),
+                    // The loop's own work between requests: reaping
+                    // turns, starting ready ones, resuming parked ones,
+                    // answering queued admissions, and its timers.
+                    "loop": self.chores.snapshot(false),
                     "draining": self.draining(),
                     "paused": self.paused,
                 }))
@@ -5669,11 +5746,23 @@ impl Service {
                     .await
                 })
             }
-            Command::Prompts { bot, turn, bytes } => {
+            Command::Prompts {
+                bot,
+                turn,
+                bytes,
+                persons,
+                persons_each,
+            } => {
                 let reader = store.reader();
                 self.observe(session, output, id, async move {
                     (reader.read("prompts", move |db| {
-                        db.prompts(&bot, turn, bytes.unwrap_or(64 * 1024))
+                        db.prompts_and_persons(
+                            &bot,
+                            turn,
+                            bytes.unwrap_or(64 * 1024),
+                            persons,
+                            persons_each,
+                        )
                     }))
                     .await
                 })
@@ -6898,6 +6987,7 @@ mod tests {
             ready_hint: false,
             tokens: Arc::default(),
             commands: Commands::default(),
+            chores: Commands::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: Arc::default(),
@@ -7116,6 +7206,7 @@ mod tests {
             ready_hint: false,
             tokens: Arc::default(),
             commands: Commands::default(),
+            chores: Commands::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: Arc::default(),
@@ -7430,6 +7521,7 @@ mod tests {
             ready_hint: false,
             tokens: Arc::default(),
             commands: Commands::default(),
+            chores: Commands::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: Arc::default(),
@@ -7676,6 +7768,7 @@ mod tests {
             ready_hint: false,
             tokens: Arc::default(),
             commands: Commands::default(),
+            chores: Commands::default(),
             wakes: Wakes::default(),
             steer_wakes: HashMap::new(),
             draining: Arc::default(),

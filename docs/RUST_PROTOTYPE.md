@@ -8,7 +8,7 @@ fastest harness. The [first measurements](RUST_MEASUREMENTS.md) passed it.
 
 ## Build and validate
 
-Development builds use Rust 1.99.1, pinned in `rust-toolchain.toml` with Clippy
+Development builds use Rust 1.100.0, pinned in `rust-toolchain.toml` with Clippy
 and rustfmt. The declared minimum supported Rust version is 1.95, which the
 atomics' `try_update` needs.
 Dependencies are locked; build outputs and the optional repository-local Cargo
@@ -352,8 +352,19 @@ and `threads` now (`/proc/self/status`, or `proc_pidinfo` on macOS) and
 the service loop held each kind of request, by its `op`, from dispatch to its
 answer or its handoff to a reader: `count`, `held_ms`, `slowest_ms`
 and a `held` histogram over the store's `buckets_us`, which it
-reports beside them. One map entry per op the daemon has seen, touched only
-by the loop, so no lock.
+reports beside them, with `waited_ms` and a `waited` histogram, how long
+each request waited for the loop from its line's read to its dispatch.
+One map entry per op the daemon has seen, touched only by the loop, so no
+lock. `loop` reports the same holds for the loop's own work between
+requests: `reap` (a turn's task ended), `start_ready`, `resume`, `wake`,
+`admission` (a queued admission answered), `lapse`, `holds`, `expire` and
+`reload`. `runtime` reports the async runtime's `workers`, `busy_ms` (time
+they ran rather than parked), `parks`, `alive_tasks` and `queued_tasks`,
+kept by tokio as it runs. `hub` counts the events published (`durable`,
+`live`), the copies `delivered` to followers' queues (replayed ones too),
+and the followers `dropped` for falling behind. Each provider pool adds what it did to its
+calls: `admitted`, `waited` (admitted after waiting in the gate) with
+`waited_ms`, `parked`, `closed` (a refusal closed the pool) and `overloads`.
 
 A budget counts one of two measures, named by `budget_counts`: `tokens`, the
 default, is the provider's usage, every call's input and output, the history
@@ -1838,7 +1849,7 @@ none for a person's) and, in `prompts`, its `text` within the read's
 and their prompt says `quotes_more` and `truncated`; Sonny's approver reads a quote of the person's own words as
 consent only in a prompt the person sent, and any other as asking for
 nothing.
-`{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
+`{"op":"prompts","bot","turn","bytes"?,"persons"?,"persons_each"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with
 `from` or `origin`, and `prompts_more` when steers were left out; the calls it started, each with its argument preview,
@@ -1866,7 +1877,19 @@ answers. Refused calls and
 their own, so a long prompt still leaves the calls (and the files they
 wrote) to read. Text that does not fit is cut and marked
 `truncated`, and each steer, call, and earlier prompt also counts 64
-bytes, so many short entries stay within `bytes` too. A fork keeps the source's binding, instructions,
+bytes, so many short entries stay within `bytes` too. With `persons`
+(bytes, at most 256 KiB), the read also lists the person's own earlier
+words to the bot under `persons`, as Codex's reviewer keeps every message
+its person wrote apart from the transcript: the messages it took in
+before the turn that no bot, client or other person wrote, newest first,
+each `{message, text, steer?}` whole within `persons_each` bytes (all of
+`persons` when absent; Sonny's reviewer asks 3,600, Codex's 900 tokens)
+or left out whole, with `persons_more` when some were left out
+(protocol 71). They have their own budget, so notes a client sent never
+crowd the person's words out of `earlier`; a partial index
+(`messages_persons`) keeps the read to the person's messages alone, at
+most 256 of them are looked at, and one whose length alone is past
+`persons_each` is passed over unread. A fork keeps the source's binding, instructions,
 and tools, and takes no text of its own; the source is never changed. Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
 and turn IDs, not the illustrative numbers. Names are immutable bot identities
 within one store; rename/alias operations are not implemented. A fork starts

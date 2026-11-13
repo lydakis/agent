@@ -78,6 +78,11 @@ pub const RECENT_SPAN: Duration = Duration::from_secs(24 * 60 * 60);
 const RECENT_EVENTS: usize = 2_000;
 const RECENT_BYTES: u64 = 4 * 1024 * 1024;
 const RECENT_EVENT_BYTES: usize = 16 * 1024;
+/// Past those, the newest event of each topic is kept however old, so a
+/// pull request quiet for days still has its last word: at most this
+/// many topics and bytes more.
+const RECENT_TOPICS: usize = 200;
+const RECENT_TOPIC_BYTES: u64 = RECENT_BYTES / 8;
 /// The fields every event has, which the note says on its own.
 const OWN: [&str; 6] = ["text", "id", "topic", "from", "url", "steer"];
 /// How the note to the subscriber starts, which Sonny shows folded.
@@ -388,6 +393,36 @@ struct Lasting {
     seen: Arc<tokio::sync::Mutex<Seen>>,
 }
 
+impl Lasting {
+    /// As a source starts in a new lookout: down, as its log `keeps`
+    /// says the last one told, so its first run that works says it is
+    /// back, to its subscribers and to the notes that show it.
+    fn after(keeps: &Path) -> Lasting {
+        let lasting = Lasting::default();
+        if let Some(since) = still_down(keeps)
+            && let Ok(mut health) = lasting.health.lock()
+        {
+            health.failed = DOWN_AFTER;
+            health.since_ms = Some(since);
+            health.told = Some(std::time::Instant::now());
+        }
+        lasting
+    }
+}
+
+/// When the source whose log is `keeps` started failing, while the
+/// lookout's newest word on it there is that it is down.
+fn still_down(keeps: &Path) -> Option<u128> {
+    let text = std::fs::read_to_string(keeps).ok()?;
+    let word = (text.lines().rev())
+        .filter(|line| line.contains("\"lookout\""))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|kept| kept["lookout"] == true)?;
+    let down = word["id"].as_str()?.starts_with("lookout.down.");
+    let since = word["since_ms"].as_u64().or(word["at_ms"].as_u64())?;
+    down.then_some(u128::from(since))
+}
+
 impl Runner {
     pub fn new(dir: PathBuf, sent: Sender<Said>) -> Runner {
         Runner {
@@ -507,7 +542,9 @@ impl Runner {
                     self.poked.clone(),
                 )),
                 false => {
-                    let lasting = self.lasting.entry(source.name.clone()).or_default().clone();
+                    let lasting = (self.lasting.entry(source.name.clone()))
+                        .or_insert_with(|| Lasting::after(&keeps))
+                        .clone();
                     tokio::spawn(run(
                         source.clone(),
                         every,
@@ -744,10 +781,18 @@ async fn run(
             return;
         };
         let told = (health.lock().ok()).and_then(|mut health| {
-            health.after(&source, failed, stderr, std::time::Instant::now())
+            let told = health.after(&source, failed, stderr, std::time::Instant::now())?;
+            Some((told, health.since_ms))
         });
         match told {
-            Some(told) => place.send(Said::Event(Box::new(told))),
+            Some((told, since_ms)) => {
+                // Kept beside what it printed, so a note that shows the
+                // source says it is down, and since when.
+                if let Some(file) = shape.keeps.clone() {
+                    shapes::append(file, lookout_line(&told, since_ms));
+                }
+                place.send(Said::Event(Box::new(told)))
+            }
             // Given back before it sleeps, so it holds no place meanwhile.
             None => drop(place),
         }
@@ -1063,6 +1108,17 @@ pub fn recent_file(dir: &Path, source: &str) -> PathBuf {
     dir.join(".recent").join(format!("{source}.jsonl"))
 }
 
+/// The lookout's word on a source as kept beside what it printed: only
+/// what says it is down or back, and since when it fails.
+fn lookout_line(told: &Event, since_ms: Option<u128>) -> String {
+    let mut kept = json!({"source": told.source, "id": told.id, "text": told.text,
+        "lookout": true, "at_ms": told.at_ms as u64, "seq": told.seq});
+    if let Some(since) = since_ms {
+        kept["since_ms"] = json!(since as u64);
+    }
+    kept.to_string()
+}
+
 /// An event as kept to test filters on: whole, or with its fields cut as
 /// a shape's examples are when they are too big, which it then says.
 fn recent_line(event: &Event) -> String {
@@ -1307,25 +1363,44 @@ fn add_lines(path: &Path, lines: &str) -> Option<u64> {
 /// Cut a file of what a source printed lately to what it keeps: the
 /// newest events within `RECENT_SPAN` of `now_ms`, at most `RECENT_EVENTS`
 /// of them and three quarters of `RECENT_BYTES`, so it is not cut again
-/// at once.
+/// at once; and past those, each other topic's newest event, at most
+/// `RECENT_TOPICS` of them in `RECENT_TOPIC_BYTES`.
 fn trim(path: &Path, now_ms: u128) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
     let since = now_ms.saturating_sub(RECENT_SPAN.as_millis());
-    let fresh = |line: &&str| {
-        serde_json::from_str::<Value>(line)
-            .ok()
-            .and_then(|kept| kept["at_ms"].as_u64())
-            .is_some_and(|at| u128::from(at) >= since)
-    };
     let (mut kept, mut bytes) = (Vec::new(), 0);
-    for line in text.lines().rev().take(RECENT_EVENTS) {
-        bytes += line.len() as u64 + 1;
-        if bytes > RECENT_BYTES * 3 / 4 || !fresh(&line) {
+    let mut topics = std::collections::HashSet::new();
+    let mut lately = true;
+    let (mut older, mut older_bytes) = (0, 0);
+    for line in text.lines().rev() {
+        let size = line.len() as u64 + 1;
+        let read = serde_json::from_str::<Value>(line).ok();
+        let at = read.as_ref().and_then(|kept| kept["at_ms"].as_u64());
+        let topic = read
+            .as_ref()
+            .and_then(|kept| kept["topic"].as_str().map(str::to_owned));
+        lately = lately
+            && kept.len() < RECENT_EVENTS
+            && bytes + size <= RECENT_BYTES * 3 / 4
+            && at.is_some_and(|at| u128::from(at) >= since);
+        if lately {
+            bytes += size;
+            topics.extend(topic);
+            kept.push(line);
+            continue;
+        }
+        let Some(topic) = topic else {
+            continue;
+        };
+        if older >= RECENT_TOPICS || older_bytes + size > RECENT_TOPIC_BYTES {
             break;
         }
-        kept.push(line);
+        if topics.insert(topic) {
+            (older, older_bytes) = (older + 1, older_bytes + size);
+            kept.push(line);
+        }
     }
     kept.reverse();
     let mut body = kept.join("\n");
@@ -1797,6 +1872,43 @@ mod tests {
     }
 
     #[test]
+    fn each_topics_newest_event_is_kept_past_the_day() {
+        let dir = std::env::temp_dir().join(format!("lookout-topics-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = recent_file(&dir, "prs");
+        let now = super::super::epoch_ms();
+        let day = RECENT_SPAN.as_millis();
+        let event = |text: &str, topic: Option<&str>, at: u128| {
+            let printed = json!({"text": text, "topic": topic});
+            recent_line(&Event {
+                at_ms: at,
+                ..Event::parse("prs", &printed.to_string(), at).unwrap()
+            })
+        };
+        let lines = [
+            event("#1 opened", Some("1"), now - 3 * day),
+            event("#2 opened", Some("2"), now - 3 * day),
+            event("#1 green", Some("1"), now - 2 * day),
+            event("no topic", None, now - 2 * day),
+            event("#2 merged", Some("2"), now - 1),
+            event("#3 opened", Some("3"), now - 1),
+        ];
+        add_lines(&file, &(lines.join("\n") + "\n"));
+        trim(&file, now);
+        let left: Vec<String> = (std::fs::read_to_string(&file).unwrap().lines())
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        // The day's events, and #1's last word from before it, in order.
+        assert_eq!(left, ["#1 green", "#2 merged", "#3 opened"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn examples_come_only_from_events_the_caller_hears() {
         let dir = std::env::temp_dir().join(format!("lookout-examples-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2155,6 +2267,16 @@ mod tests {
         let down = next_event(&mut got).await;
         assert!(down.text.contains("is down"), "{}", down.text);
         assert_eq!(down.fields["stderr"], json!(["boom"]));
+        // Kept beside what it printed, with since when, for a note to show.
+        shapes::written();
+        let kept = std::fs::read_to_string(recent_file(&dir.join("state"), "poll")).unwrap();
+        let word: Value = serde_json::from_str(kept.lines().last().unwrap()).unwrap();
+        let since = word["since_ms"].as_u64().unwrap();
+        assert!(word["lookout"] == true && since <= word["at_ms"].as_u64().unwrap());
+        assert!(
+            word["id"].as_str().unwrap().starts_with("lookout.down."),
+            "{word}"
+        );
         // Fixed, it starts again and is heard to work.
         edit("echo fine\n", 3);
         runner.set(vec![source]);
@@ -2163,6 +2285,39 @@ mod tests {
             texts.push(next_event(&mut got).await.text);
         }
         assert!(texts.iter().any(|t| t.contains("works again")), "{texts:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_source_down_before_the_lookout_started_is_heard_to_work_again() {
+        let dir = std::env::temp_dir().join(format!("lookout-down-before-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let keeps = recent_file(&dir.join("state"), "poll");
+        std::fs::create_dir_all(keeps.parent().unwrap()).unwrap();
+        let down = json!({"source": "poll", "id": "lookout.down.9", "text": "down",
+            "lookout": true, "at_ms": 9000, "since_ms": 5000, "seq": 1});
+        std::fs::write(&keeps, format!("{down}\n")).unwrap();
+        assert_eq!(still_down(&keeps), Some(5000));
+        let (sent, mut got) = tokio::sync::mpsc::channel(16);
+        let mut runner = Runner::new(dir.join("state"), sent);
+        let source = Source {
+            name: "poll".into(),
+            command: "echo fine".into(),
+            every: Some("1h".into()),
+            digest: None,
+            steer: None,
+            watch: Vec::new(),
+            icon: None,
+            wants: None,
+        };
+        runner.set(vec![source]);
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            texts.push(next_event(&mut got).await.text);
+        }
+        assert!(texts.iter().any(|t| t.contains("works again")), "{texts:?}");
+        shapes::written();
+        assert_eq!(still_down(&keeps), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
