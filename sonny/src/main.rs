@@ -95,6 +95,7 @@ mod switch;
 mod t3;
 mod table;
 mod task;
+mod template;
 mod term;
 #[cfg(test)]
 mod testing;
@@ -2511,6 +2512,8 @@ async fn run() -> Result<(), String> {
     app.pinned = settings.project_color.clone();
     set_measure(settings.text_width);
     margin::set_limits(settings.margin_notes, settings.margin_note_lines);
+    app.blanks.store = Some(app.options.store.clone());
+    app.set_template_settings(&settings);
     app.zen = zen::focus(app.reactions_key.as_deref());
     app.margin_opens = settings.margin_opens;
     app.agent_opens = settings.agent_opens;
@@ -3771,6 +3774,8 @@ type Reads = (
 struct Counted {
     mark: Option<u64>,
     read: Option<((status::Counts, std::collections::HashSet<String>), Reads)>,
+    /// The tasks as template notes' `tasks()` gives them, when read.
+    tasks: Option<Vec<Value>>,
 }
 
 /// A mark of where the agents `pattern` names stand, as the daemon lists
@@ -4304,6 +4309,9 @@ struct App {
     /// How many of the project's agents each of `/status`'s groups lists,
     /// as its last read found: what the footer shows.
     counts: Option<status::Counts>,
+    /// What template notes are filled from: the tasks that read found,
+    /// the store, the person's sources and notes.
+    blanks: margin::Blanks,
     /// The agents that read gave a row, which its counts count already.
     status_bots: std::collections::HashSet<String>,
     /// The footer's own read of them, under way, and when the last began.
@@ -6051,6 +6059,7 @@ impl App {
             references: HashMap::new(),
             references_read: None,
             counts: None,
+            blanks: margin::Blanks::default(),
             status_bots: std::collections::HashSet::new(),
             counting: None,
             counted_at: None,
@@ -8088,6 +8097,7 @@ impl App {
     /// done again only once that, or a note, changed.
     fn fold_notes(&mut self, beside: bool) {
         let workspace = std::path::PathBuf::from(&self.workspace);
+        self.margin_blanks();
         if !beside {
             self.margin.freshen(&workspace);
         }
@@ -9005,6 +9015,34 @@ impl App {
         }));
     }
 
+    /// The tasks as `/status` read them now, for template notes'
+    /// `tasks()`: counted as a change only where they differ.
+    fn tasks_read(&mut self, tasks: Vec<Value>) {
+        if *self.blanks.tasks != tasks {
+            self.blanks.tasks = std::sync::Arc::new(tasks);
+            self.blanks.tasks_read += 1;
+        }
+    }
+
+    /// The person's own notes and sources as the config has them now.
+    fn set_template_settings(&mut self, settings: &settings::Settings) {
+        let notes = std::sync::Arc::new(settings.notes.clone());
+        if *self.blanks.notes != *notes {
+            self.blanks.notes = notes;
+        }
+        // Kept as it was when the same, so notes fill again only once one
+        // is added or taken away.
+        if *self.blanks.sources != settings.sources {
+            self.blanks.sources = std::sync::Arc::new(settings.sources.clone());
+        }
+    }
+
+    /// What template notes are filled from, handed to the margin before
+    /// it is drawn or looked at: it may have been loaded again since.
+    fn margin_blanks(&mut self) {
+        self.margin.set_blanks(self.blanks.clone());
+    }
+
     /// The other bots' notes the margin shows, read again every few
     /// seconds while their bots are there: what each shows is kept once
     /// its bot is gone.
@@ -9041,6 +9079,9 @@ impl App {
             && let Ok(Some(counted)) = job.await
         {
             self.counted_mark = counted.mark;
+            if let Some(tasks) = counted.tasks {
+                self.tasks_read(tasks);
+            }
             if let Some(((counts, bots), (latest, seen))) = counted.read {
                 self.counts = Some(counts);
                 self.status_bots = bots;
@@ -9072,6 +9113,7 @@ impl App {
                 return Some(Counted {
                     mark: Some(mark),
                     read: None,
+                    tasks: None,
                 });
             }
             let view = StatusView {
@@ -9093,6 +9135,7 @@ impl App {
                     (status::counts(&read.rows), status::bots(&read.rows)),
                     (latest, seen),
                 )),
+                tasks: Some(status::tasks(&read.rows)),
             })
         }));
     }
@@ -11195,6 +11238,7 @@ impl App {
         .await?;
         self.counts = Some(status::counts(&read.rows));
         self.status_bots = status::bots(&read.rows);
+        self.tasks_read(status::tasks(&read.rows));
         // The windows' names and the footer say what this read, as it is
         // newer than what they had. A running agent's question is read
         // from its last few items here, so its events keep theirs.
@@ -12974,6 +13018,7 @@ impl App {
             self.margin_opens = settings.margin_opens;
             self.agent_opens = settings.agent_opens;
             margin::set_limits(settings.margin_notes, settings.margin_note_lines);
+            self.set_template_settings(&settings);
             if self.verbose != settings.verbose || self.words_only == settings.steps {
                 self.verbose = settings.verbose;
                 self.words_only = !settings.steps;
@@ -15677,6 +15722,7 @@ impl App {
         {
             let live = self.running.as_ref().map(|running| running.turn);
             let width = (pane::margin_room(at.width).saturating_sub(1) as usize).min(measure());
+            self.margin_blanks();
             let (lines, marks) = self.margin.lines(width, &workspace, live);
             if let Some(pane) = &mut self.pane {
                 pane.set_margin(lines, marks);
