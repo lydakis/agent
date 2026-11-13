@@ -258,6 +258,8 @@ fn sandboxed(args: &[String]) -> Result<i32> {
         owned: agent_client::OWN_COPIES
             .map(std::path::PathBuf::from)
             .to_vec(),
+        // And reaches no daemon's socket and writes no daemon's store.
+        known: agent_client::config::daemons(),
         ..Daemon::default()
     };
     agent_runtime::sandbox::available()?;

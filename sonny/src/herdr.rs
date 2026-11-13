@@ -451,14 +451,13 @@ impl Herdr {
         Ok(herdr)
     }
 
-    /// Run `command` in a new pane's shell: in its place (`exec`), so the
-    /// pane goes with it, unless it is to be read once it exits.
-    fn start(&self, pane: &str, label: &str, command: &[String], keep: bool) -> Result<(), String> {
+    /// Run `command` in a new pane's shell, in its place (`exec`), so the
+    /// pane goes with it.
+    fn start(&self, pane: &str, label: &str, command: &[String]) -> Result<(), String> {
         self.rename_block(pane, label);
-        let mut line: Vec<String> = command.iter().map(|w| quote(w)).collect();
-        if !keep {
-            line.insert(0, "exec".into());
-        }
+        let line: Vec<String> = std::iter::once("exec".to_owned())
+            .chain(command.iter().map(|w| quote(w)))
+            .collect();
         self.call(&["pane", "run", pane, &line.join(" ")])?;
         Ok(())
     }
@@ -505,26 +504,21 @@ impl Backend for Herdr {
         let _ = self.call(&["tab", "rename", window, name]);
     }
 
-    fn window(
-        &self,
-        label: &str,
-        name: &str,
-        cwd: &Path,
-        command: &[String],
-        keep: bool,
-    ) -> Result<String, String> {
-        let cwd = cwd.to_string_lossy();
-        let mut args = vec!["tab", "create", "--workspace", &self.workspace];
-        args.extend(["--label", name, "--no-focus"]);
-        if keep {
-            args.extend(["--cwd", &cwd]);
-        }
-        let made = self.call(&args)?;
+    fn window(&self, label: &str, name: &str, command: &[String]) -> Result<String, String> {
+        let made = self.call(&[
+            "tab",
+            "create",
+            "--workspace",
+            &self.workspace,
+            "--label",
+            name,
+            "--no-focus",
+        ])?;
         let pane = made["root_pane"]["pane_id"]
             .as_str()
             .ok_or("herdr tab create: no pane_id")?
             .to_owned();
-        self.start(&pane, label, command, keep)?;
+        self.start(&pane, label, command)?;
         Ok(pane)
     }
 
@@ -532,11 +526,8 @@ impl Backend for Herdr {
         &self,
         anchor: &str,
         side: &str,
-        small: bool,
         label: &str,
-        cwd: &Path,
         command: &[String],
-        keep: bool,
     ) -> Result<String, String> {
         // Herdr splits to the right or down; the other sides are those,
         // swapped.
@@ -547,18 +538,14 @@ impl Backend for Herdr {
             "above" => ("down", true),
             _ => return Err(format!("no side {side}: right, left, above or below")),
         };
-        let cwd = cwd.to_string_lossy();
-        let mut args = vec!["pane", "split", anchor, "--direction", direction];
-        // The ratio is the first pane's share, and a swap leaves the
-        // shares where they are: swapped, the new pane is the first.
-        if small {
-            args.extend(["--ratio", if swap { "0.35" } else { "0.65" }]);
-        }
-        if keep {
-            args.extend(["--cwd", &cwd]);
-        }
-        args.push("--no-focus");
-        let made = self.call(&args)?;
+        let made = self.call(&[
+            "pane",
+            "split",
+            anchor,
+            "--direction",
+            direction,
+            "--no-focus",
+        ])?;
         let pane = made["pane"]["pane_id"]
             .as_str()
             .ok_or("herdr pane split: no pane_id")?
@@ -573,7 +560,7 @@ impl Backend for Herdr {
                 anchor,
             ]);
         }
-        self.start(&pane, label, command, keep)?;
+        self.start(&pane, label, command)?;
         Ok(pane)
     }
 
@@ -774,7 +761,7 @@ if out is not None:
     }
 
     #[test]
-    fn an_agent_finds_its_leads_workspace_and_its_commands_close_with_it() {
+    fn an_agent_finds_its_leads_workspace_and_closes_there() {
         let (bin, dir) = fake(
             "home",
             json!({
@@ -795,15 +782,17 @@ if out is not None:
             ("w1", "Herdr workspace home")
         );
         let mut layout = Layout::new(Box::new(herdr));
-        let cwd = Path::new("/work");
+        let below = crate::mux::Placement::Split {
+            side: "below".into(),
+            beside: "graft.fix".into(),
+        };
+        let sonny = [
+            "/bin/sonny".to_owned(),
+            "--agent".into(),
+            "graft.it's".into(),
+        ];
         layout
-            .split(
-                "graft.fix",
-                "tests",
-                cwd,
-                &["cargo".into(), "test it's".into()],
-                Some("below"),
-            )
+            .place("graft.tests", "tests", &sonny, &below)
             .unwrap();
         let calls = calls(&dir);
         let n = calls.len();
@@ -816,20 +805,21 @@ if out is not None:
                     "w1:p2",
                     "--direction",
                     "down",
-                    "--ratio",
-                    "0.65",
-                    "--cwd",
-                    "/work",
                     "--no-focus"
                 ]
                 .map(str::to_owned)
                 .to_vec(),
-                ["pane", "rename", "w1:p11", "graft.fix/tests"]
+                ["pane", "rename", "w1:p11", "graft.tests"]
                     .map(str::to_owned)
                     .to_vec(),
-                ["pane", "run", "w1:p11", r"cargo 'test it'\''s'"]
-                    .map(str::to_owned)
-                    .to_vec(),
+                [
+                    "pane",
+                    "run",
+                    "w1:p11",
+                    r"exec /bin/sonny --agent 'graft.it'\''s'"
+                ]
+                .map(str::to_owned)
+                .to_vec(),
             ]
         );
         // A task's own Sonny runs in its pane's place.
@@ -845,7 +835,7 @@ if out is not None:
         assert_eq!(last[3], "exec /bin/sonny --agent graft.docs");
         assert_eq!(
             labels(&dir),
-            ["graft.lead", "graft.fix", "graft.fix/tests", "graft.docs"]
+            ["graft.lead", "graft.fix", "graft.tests", "graft.docs"]
         );
         assert!(
             super::tests::calls(&dir)
@@ -853,14 +843,14 @@ if out is not None:
                 .all(|c| !c.contains(&"w2".to_owned()))
         );
 
-        layout.close("graft.fix");
-        assert_eq!(labels(&dir), ["graft.lead", "graft.docs"]);
+        layout.close("graft.tests");
+        assert_eq!(labels(&dir), ["graft.lead", "graft.fix", "graft.docs"]);
     }
 
     #[test]
-    fn a_small_split_above_or_left_is_small_once_swapped() {
+    fn a_split_above_or_left_is_one_below_or_right_swapped() {
         let (bin, dir) = fake(
-            "small",
+            "swapped",
             json!({
                 "n": 10,
                 "workspaces": [{"workspace_id": "w1", "label": "shop"}],
@@ -871,20 +861,15 @@ if out is not None:
         );
         let herdr = Herdr::open(bin, "shop", None, None).unwrap();
         let mut layout = Layout::new(Box::new(herdr));
-        let serve = ["serve".to_owned()];
-        layout
-            .split(
-                "shop.lead",
-                "server",
-                Path::new("/work"),
-                &serve,
-                Some("above"),
-            )
-            .unwrap();
+        let sonny = ["sonny".to_owned()];
+        let above = crate::mux::Placement::Split {
+            side: "above".into(),
+            beside: "shop.lead".into(),
+        };
+        layout.place("shop.fix", "fix", &sonny, &above).unwrap();
         let calls = calls(&dir);
         let split = calls.iter().find(|c| c[..2] == ["pane", "split"]).unwrap();
-        // Herdr gives the first pane the ratio; the new one is swapped there.
-        assert_eq!(split[3..7], ["--direction", "down", "--ratio", "0.35"]);
+        assert_eq!(split[3..], ["--direction", "down", "--no-focus"]);
         assert!(calls.iter().any(|c| c[..2] == ["pane", "swap"]));
     }
 
@@ -944,24 +929,6 @@ if out is not None:
         let sleep = ["sh".to_owned(), "-c".into(), "echo task; sleep 60".into()];
         assert!(layout.show("sonnycheck.fix", "fix", &sleep).unwrap());
         assert!(!layout.show("sonnycheck.fix", "fix", &sleep).unwrap());
-        let tests = layout
-            .split(
-                "sonnycheck.fix",
-                "tests",
-                Path::new("/tmp"),
-                &["echo".into(), "it's done".into()],
-                Some("below"),
-            )
-            .unwrap();
-        layout
-            .split(
-                "sonnycheck.lead",
-                "server",
-                Path::new("/tmp"),
-                &["echo".into(), "serving".into()],
-                None,
-            )
-            .unwrap();
         let left = Placement::Split {
             side: "left".into(),
             beside: "sonnycheck.lead".into(),
@@ -974,26 +941,7 @@ if out is not None:
         let places = layout.places();
         println!("windows: {windows:?}\nplaces: {places:?}");
         let check = Herdr::open(find().unwrap(), "sonnycheck", None, None).unwrap();
-        // `pane read` prints the pane's text, not JSON.
-        let read = Command::new(find().unwrap())
-            .args([
-                "pane",
-                "read",
-                &tests,
-                "--source",
-                "recent-unwrapped",
-                "--lines",
-                "20",
-            ])
-            .output()
-            .unwrap();
-        let read = String::from_utf8_lossy(&read.stdout);
-        println!("tests pane: {read}");
         assert_eq!(places["sonnycheck.docs"].1.as_ref().unwrap().0, "left of");
-        assert_eq!(
-            places["sonnycheck.fix/tests"].1.as_ref().unwrap().0,
-            "below"
-        );
         layout.close("sonnycheck.fix");
         let left: Vec<String> = check
             .blocks()
