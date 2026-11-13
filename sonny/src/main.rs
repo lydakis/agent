@@ -68,6 +68,7 @@ mod place;
 mod plan;
 mod project;
 mod prompt;
+mod ps;
 mod reactions;
 mod recall;
 mod resolved;
@@ -3693,7 +3694,7 @@ fn hold(unsent: &mut Vec<String>, record: String) {
 /// `/agents` and `/ps` also open `/status`, `/automations` and `/lookout`
 /// open `/background`, `/forum` opens `/commons`, and `/settings` opens
 /// `/config`, unlisted.
-const COMMANDS: [(&str, &str); 30] = [
+const COMMANDS: [(&str, &str); 31] = [
     ("/side", "Start a side chat with a copy of this agent"),
     ("/model", "Pick the model and effort"),
     (
@@ -3728,6 +3729,10 @@ const COMMANDS: [(&str, &str); 30] = [
         "Show or close the agent's notes beside the conversation",
     ),
     ("/background", "Run or remove automations and follows"),
+    (
+        "/ps",
+        "Show the commands the agents left running, and stop one",
+    ),
     ("/commons", "Read what the agents of every project share"),
     ("/sky", "Watch every agent light up as they talk"),
     ("/usage", "Show the tokens the agents spent, over time"),
@@ -3891,6 +3896,8 @@ struct Watch {
     usage: Option<usage::View>,
     /// `/audit` holds it instead.
     audit: Option<audit::View>,
+    /// `/ps` holds it instead.
+    ps: Option<ps::View>,
     /// `/commons` holds it instead.
     commons: Option<commons::View>,
     /// `/sky` holds it instead.
@@ -6476,6 +6483,7 @@ impl App {
                     w.read.elapsed() > Duration::from_secs(2)
                         || w.usage.as_ref().is_some_and(usage::View::due)
                         || w.audit.as_ref().is_some_and(audit::View::due)
+                        || w.ps.as_ref().is_some_and(ps::View::due)
                 })
             {
                 self.reread().await;
@@ -10939,6 +10947,7 @@ impl App {
             background: None,
             usage: None,
             audit: None,
+            ps: None,
             commons: None,
             sky: None,
             picked: None,
@@ -10982,6 +10991,7 @@ impl App {
             background: Some(view),
             usage: None,
             audit: None,
+            ps: None,
             commons: None,
             sky: None,
             picked: None,
@@ -11050,6 +11060,7 @@ impl App {
             background: None,
             usage: Some(view),
             audit: None,
+            ps: None,
             commons: None,
             sky: None,
             picked: None,
@@ -11076,6 +11087,7 @@ impl App {
             background: None,
             usage: None,
             audit: Some(view),
+            ps: None,
             commons: None,
             sky: None,
             picked: None,
@@ -11090,6 +11102,76 @@ impl App {
     async fn read_audit(&self, view: &mut audit::View) {
         let read = self.client.request("audit", view.query()).await;
         view.loaded(read.map_err(|error| error.to_string()));
+    }
+
+    /// The commands the project's agents left running, or every agent's,
+    /// oldest first: `/ps` in the pane, as `/status` is, until Esc.
+    async fn ps(&mut self) {
+        let scope = self.scope();
+        let project = scope.project.clone();
+        let mut view = ps::View::new(scope);
+        self.read_ps(&mut view).await;
+        self.watch = Some(Watch {
+            project,
+            rows: Vec::new(),
+            read: Instant::now(),
+            alerts: Vec::new(),
+            open: Vec::new(),
+            background: None,
+            usage: None,
+            audit: None,
+            ps: Some(view),
+            commons: None,
+            sky: None,
+            picked: None,
+            pick: None,
+            helpers: Vec::new(),
+            more: false,
+        });
+        self.open_pane(pane::Pane::card("ps", STATUS_KEYS));
+    }
+
+    /// `view` read from the daemon again.
+    async fn read_ps(&self, view: &mut ps::View) {
+        // Every page, as the daemon hands them, into one list.
+        let (mut query, mut rows) = (view.query(), Vec::new());
+        let read = loop {
+            match self.client.request("processes", query.clone()).await {
+                Ok(mut page) => {
+                    if let Some(found) = page["processes"].as_array_mut() {
+                        rows.append(found);
+                    }
+                    match page.get("next_after") {
+                        Some(after) if !after.is_null() => query["after"] = after.clone(),
+                        _ => break Ok(json!({"processes": rows})),
+                    }
+                }
+                Err(error) => break Err(error.to_string()),
+            }
+        };
+        view.loaded(read);
+    }
+
+    /// Stop `bot`'s command `handle` from `/ps`, beside the window, which
+    /// answers meanwhile: what it came to shows on the card, and the list
+    /// is read again at once.
+    fn stop_process(&mut self, bot: String, handle: String) {
+        let Some(view) = self.watch.as_mut().and_then(|w| w.ps.as_mut()) else {
+            return;
+        };
+        let said = view.stopping(&handle);
+        let (client, woken) = (self.client.clone(), self.woken.clone());
+        tokio::spawn(async move {
+            let stopped = client
+                .request("stop_process", json!({"bot": bot, "handle": handle}))
+                .await;
+            let words = match stopped {
+                Ok(_) => format!("stopped {handle} of {bot}'s"),
+                Err(error) => format!("could not stop {handle}: {error}"),
+            };
+            *said.lock().unwrap_or_else(|e| e.into_inner()) = Some(words);
+            woken.notify_one();
+        });
     }
 
     /// What the agents of every project share: `/commons` in the pane,
@@ -11108,6 +11190,7 @@ impl App {
             background: None,
             usage: None,
             audit: None,
+            ps: None,
             commons: Some(commons::View::open(&home)),
             sky: None,
             picked: None,
@@ -11130,6 +11213,7 @@ impl App {
             background: None,
             usage: None,
             audit: None,
+            ps: None,
             commons: None,
             sky: Some(sky::View::open(self.options.socket.clone(), self.store())),
             picked: None,
@@ -11173,6 +11257,16 @@ impl App {
         {
             view.reload();
             watch.read = Instant::now();
+            return;
+        }
+        if let Some(mut view) = self.watch.as_mut().and_then(|w| w.ps.take()) {
+            if view.due() {
+                self.read_ps(&mut view).await;
+            }
+            if let Some(watch) = &mut self.watch {
+                watch.ps = Some(view);
+                watch.read = Instant::now();
+            }
             return;
         }
         if let Some(mut view) = self.watch.as_mut().and_then(|w| w.audit.take()) {
@@ -12031,6 +12125,7 @@ impl App {
             && watch.background.is_none()
             && watch.usage.is_none()
             && watch.audit.is_none()
+            && watch.ps.is_none()
             && watch.commons.is_none()
         {
             let bots = card_bots(watch, self.width.max(40));
@@ -12143,6 +12238,33 @@ impl App {
                 }
                 return true;
             }
+            // `/ps` takes its own keys: a pick, its stop, whose.
+            if self.pane_keys
+                && pane.is_card()
+                && let Some(view) = self.watch.as_mut().and_then(|w| w.ps.as_mut())
+            {
+                match key.code {
+                    _ if switches(key) || key.code == KeyCode::Tab => self.pane_keys = false,
+                    _ if copy && let Some(text) = pane.screen.selected() => {
+                        pane.screen.unselect();
+                        self.copied(&text);
+                    }
+                    KeyCode::PageUp => pane.screen.page(true),
+                    KeyCode::PageDown | KeyCode::Char(' ') => pane.screen.page(false),
+                    KeyCode::Home => pane.screen.hold(usize::MAX),
+                    KeyCode::End => pane.screen.latest(),
+                    _ => match view.key(*key) {
+                        ps::Key::Stay => {}
+                        ps::Key::Close => self.close_pane(true),
+                        ps::Key::Open(bot) => {
+                            self.close_pane(true);
+                            self.open_agent(&bot, false);
+                        }
+                        ps::Key::Stop { bot, handle } => self.stop_process(bot, handle),
+                    },
+                }
+                return true;
+            }
             // `/audit` takes its own keys: the filters, whose, a pick.
             if self.pane_keys
                 && pane.is_card()
@@ -12222,6 +12344,7 @@ impl App {
                             && watch.background.is_none()
                             && watch.usage.is_none()
                             && watch.audit.is_none()
+                            && watch.ps.is_none()
                             && watch.commons.is_none()
                             && watch.sky.is_none() =>
                     {
@@ -12234,6 +12357,7 @@ impl App {
                             && watch.background.is_none()
                             && watch.usage.is_none()
                             && watch.audit.is_none()
+                            && watch.ps.is_none()
                             && watch.commons.is_none()
                             && watch.sky.is_none()
                             && let Some(bot) = watch.pick.and_then(|pick| {
@@ -13654,7 +13778,16 @@ impl App {
             self.toggle_margin();
             return;
         }
-        if matches!(prompt.as_str(), "/status" | "/agents" | "/ps") {
+        if prompt == "/ps" {
+            self.input.clear();
+            if self.options.side.is_some() {
+                self.notice = Some("/ps is for the agent itself, not a side chat".into());
+            } else {
+                self.ps().await;
+            }
+            return;
+        }
+        if matches!(prompt.as_str(), "/status" | "/agents") {
             self.input.clear();
             // The side chat already holds the screen /status would take.
             if self.options.side.is_some() {
@@ -15629,6 +15762,7 @@ impl App {
         let listing = watch.background.is_none()
             && watch.usage.is_none()
             && watch.audit.is_none()
+            && watch.ps.is_none()
             && watch.commons.is_none()
             && watch.sky.is_none();
         let bots = card_bots(watch, self.width.max(40));
@@ -16211,6 +16345,28 @@ impl App {
                         pane.screen.show_row(0, 0);
                     }
                 } else if watch.picked != Some(at) {
+                    watch.picked = Some(at);
+                    pane.screen.keep_in_view(at, 2);
+                }
+            } else if let Some(view) = &watch.ps {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let lines: Vec<Line<'static>> = view
+                    .card(width, now_ms)
+                    .into_iter()
+                    .map(|line| {
+                        let mut spans = vec![Span::raw(" ")];
+                        spans.extend(line.spans);
+                        Line::from(spans).style(line.style)
+                    })
+                    .collect();
+                pane.set_card(lines, &view.keys());
+                pane.foot = None;
+                if let Some(at) = view.picked_row()
+                    && watch.picked != Some(at)
+                {
                     watch.picked = Some(at);
                     pane.screen.keep_in_view(at, 2);
                 }
@@ -26556,6 +26712,7 @@ mod tests {
             background: None,
             usage: None,
             audit: None,
+            ps: None,
             commons: None,
             sky: None,
             picked: None,
@@ -27014,6 +27171,7 @@ mod tests {
             background: None,
             usage: None,
             audit: None,
+            ps: None,
             commons: None,
             sky: None,
             picked: None,

@@ -278,6 +278,27 @@ fn live_check(template: &str, data: &Data) -> Result<(), String> {
     }
 }
 
+/// An automation's live message filled from `folder`, sources read
+/// where `store`'s lookout keeps them (this Sonny's store when none): the
+/// blanks a live fact has.
+pub fn fill_message(message: &str, folder: &Path, store: Option<&Path>) -> Result<String, String> {
+    live(message, &message_data(folder, store))
+}
+
+/// Why an automation's `message` could never fill as a live one, or
+/// nothing: [`live_check`]'s refusals.
+pub fn check_message(message: &str, folder: &Path, store: Option<&Path>) -> Result<(), String> {
+    live_check(message, &message_data(folder, store))
+}
+
+fn message_data(folder: &Path, store: Option<&Path>) -> Data {
+    let mut data = Live::data(folder);
+    if let Some(store) = store {
+        data.store = Some(store.to_owned());
+    }
+    data
+}
+
 impl agent_client::memory::Fill for Live {
     fn check(&self, template: &str, folder: &Path) -> Result<(), String> {
         live_check(template, &Self::data(folder))
