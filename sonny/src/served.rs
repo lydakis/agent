@@ -791,15 +791,16 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .ok_or(("memory_refused", "no HOME".to_owned()))?;
-            // A task in a folder of its own works for its lead's project.
-            let here = crate::task::source_folder(&here).unwrap_or(here);
+            // A task in a folder of its own works for its lead's project,
+            // and a live fact's file blanks read its own folder.
+            let project = crate::task::source_folder(&here).unwrap_or_else(|| here.clone());
             if arguments["changed"] == true {
-                return crate::said::changed(&home, &here)
+                return crate::said::changed(&home, &project)
                     .await
                     .map(|said| said.to_string())
                     .map_err(|e| ("memory_refused", e));
             }
-            agent_client::memory::call(&home, &here, arguments)
+            agent_client::memory::call_in(&home, &project, &here, arguments)
                 .map(|said| said.to_string())
                 .map_err(|e| ("memory_refused", e))
         }

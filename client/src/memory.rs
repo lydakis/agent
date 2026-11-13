@@ -105,6 +105,13 @@ pub fn cli(args: &[String]) -> i32 {
 /// `check`, `changed` or `cleanup` (`start` or `finish`); with none,
 /// `show`. `user` or `project` picks the scope.
 pub fn call(home: &Path, cwd: &Path, arguments: &Value) -> Result<Value, String> {
+    call_in(home, cwd, cwd, arguments)
+}
+
+/// [`call`] for an agent whose project is found from `cwd` while it works
+/// in `folder`, as a task in a folder of its own works for its lead's
+/// project: a live fact's file blanks read `folder`.
+pub fn call_in(home: &Path, cwd: &Path, folder: &Path, arguments: &Value) -> Result<Value, String> {
     let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
     let mut scope = Vec::new();
     if arguments["user"] == true {
@@ -161,7 +168,7 @@ pub fn call(home: &Path, cwd: &Path, arguments: &Value) -> Result<Value, String>
         args.extend(["--".to_owned(), text(&save["text"])]);
     }
     // The text is the call's own: a lone "-" is that text, not stdin.
-    run(&home.join(".agents/memory"), cwd, &args, &|| {
+    run_in(&home.join(".agents/memory"), cwd, folder, &args, &|| {
         Ok("-".to_owned())
     })
 }
@@ -194,13 +201,25 @@ fn run(
     args: &[String],
     stdin: &dyn Fn() -> Result<String, String>,
 ) -> Result<Value, String> {
+    run_in(root, cwd, cwd, args, stdin)
+}
+
+/// [`run`], finding the project from `cwd` and filling a live fact's file
+/// blanks from `folder`.
+fn run_in(
+    root: &Path,
+    cwd: &Path,
+    folder: &Path,
+    args: &[String],
+    stdin: &dyn Fn() -> Result<String, String>,
+) -> Result<Value, String> {
     let var = |key: &str| std::env::var(key).ok();
     let caller = caller(
         var("AGENT_AUTOMATION"),
         var("AGENT_BOT_ID"),
         var("AGENT_STORE"),
     );
-    run_as(root, cwd, args, stdin, caller.as_deref())
+    run_as_in(root, cwd, folder, args, stdin, caller.as_deref())
 }
 
 /// Who changes memory, as an open cleanup tells its own changes from
@@ -223,9 +242,23 @@ fn caller(
 }
 
 /// [`run`] for `caller`, the agent's id, or none for the person.
+#[cfg(test)]
 fn run_as(
     root: &Path,
     cwd: &Path,
+    args: &[String],
+    stdin: &dyn Fn() -> Result<String, String>,
+    caller: Option<&str>,
+) -> Result<Value, String> {
+    run_as_in(root, cwd, cwd, args, stdin, caller)
+}
+
+/// [`run`] for `caller`, finding the project from `cwd` and filling a live
+/// fact's file blanks from `folder`.
+fn run_as_in(
+    root: &Path,
+    cwd: &Path,
+    folder: &Path,
     args: &[String],
     stdin: &dyn Fn() -> Result<String, String>,
     caller: Option<&str>,
@@ -333,7 +366,7 @@ fn run_as(
             };
             let index = |dir: PathBuf| {
                 let text = std::fs::read_to_string(dir.join(INDEX)).unwrap_or_default();
-                json!({"dir": dir, "index": head(&filled_lines(&text, cwd))})
+                json!({"dir": dir, "index": head(&filled_lines(&text, folder))})
             };
             let mut shown = json!({"user": index(root.to_path_buf()), "project": null});
             if let Some(name) = project {
@@ -364,7 +397,7 @@ fn run_as(
             };
             let dir = scope()?;
             let path = dir.join(format!("{}.md", fact.name));
-            save(&dir, cwd, fact, live, counts, &text, &|now| {
+            save(&dir, folder, fact, live, counts, &text, &|now| {
                 noted(root, caller, &path, now)
             })
         }
@@ -372,11 +405,11 @@ fn run_as(
         // as `show` lists both: unscoped, a read finds either, and outside
         // a project the person's. A scope given is the only one read.
         ("read", Some(name), [None, None, None], None) if !scoped => match project() {
-            Err(error) if error.starts_with("project_unknown: ") => read(root, cwd, &name),
+            Err(error) if error.starts_with("project_unknown: ") => read(root, folder, &name),
             Err(error) => Err(error),
-            Ok(None) => read(root, cwd, &name),
-            Ok(Some(project)) => match read(&root.join("projects").join(project), cwd, &name) {
-                Err(error) if error.starts_with("fact_not_found: ") => read(root, cwd, &name)
+            Ok(None) => read(root, folder, &name),
+            Ok(Some(project)) => match read(&root.join("projects").join(project), folder, &name) {
+                Err(error) if error.starts_with("fact_not_found: ") => read(root, folder, &name)
                     .map_err(|e| match e.starts_with("fact_not_found: ") {
                         true => format!(
                             "fact_not_found: {name}: no such fact in this project or the person's"
@@ -386,7 +419,7 @@ fn run_as(
                 found => found,
             },
         },
-        ("read", Some(name), [None, None, None], None) => read(&scope()?, cwd, &name),
+        ("read", Some(name), [None, None, None], None) => read(&scope()?, folder, &name),
         ("rm", Some(name), [None, None, None], None) => {
             let dir = scope()?;
             let path = dir.join(format!("{name}.md"));
@@ -2349,6 +2382,11 @@ mod tests {
                 .unwrap()
                 .contains("The folder is {{ x }}")
         );
+        // A task working in a folder of its own fills from that folder,
+        // though its project is found from its lead's.
+        let task = home.join("task");
+        let read = call_in(&home, &here, &task, &json!({"read": "where", "user": true})).unwrap();
+        assert_eq!(read["filled"], "The folder is task\n, as of now.");
         // An agent's index line fills to one line; the file keeps the blank.
         let index = std::fs::read_to_string(root.join(INDEX)).unwrap();
         let filled = filled_lines(&index, &here);
