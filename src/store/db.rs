@@ -16053,12 +16053,13 @@ fn migrate_by_columns(conn: &Connection, from: i32) -> Result<()> {
         conn.execute_batch("ALTER TABLE bots ADD COLUMN cache_bot INTEGER;")?;
     }
     if !conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='fallbacks')",
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name IN ('fallbacks','fallback'))",
         [],
         |r| r.get::<_, bool>(0),
     )? {
         // 27 -> 28: server-side fallbacks become a bot's choice, off unless
         // asked for, and the store draws an identity once for cache keys.
+        // A store past 60 has `fallback` in its place and gets neither.
         conn.execute_batch(
             "ALTER TABLE bots ADD COLUMN fallbacks INTEGER NOT NULL DEFAULT 0;
              CREATE TABLE IF NOT EXISTS store(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -17048,6 +17049,17 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
                  DROP TABLE IF EXISTS notes;",
             )?;
         }
+    }
+
+    // Upgrades from 60 to 73 added `bots.fallbacks` back after 59 -> 60
+    // dropped it; any upgrade drops it again.
+    let has: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='fallbacks')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has {
+        conn.execute_batch("ALTER TABLE bots DROP COLUMN fallbacks;")?;
     }
 
     Ok(())
