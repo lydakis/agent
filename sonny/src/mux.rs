@@ -1100,7 +1100,7 @@ impl Layout {
     }
 
     /// Close the block this Sonny runs in, when it is `bot`'s, as its lead
-    /// labeled it: the task window the lead would close. One the person
+    /// labeled it, as the lead would ([`Layout::close`]). One the person
     /// switched to `bot`, or opened on it by hand, is left as it is.
     /// Whether it closed.
     pub fn close_own(&mut self, bot: &str) -> bool {
@@ -1110,9 +1110,7 @@ impl Layout {
         if !(self.listed().iter()).any(|b| b.id == mine && b.label == bot) {
             return false;
         }
-        self.blocks.remove(bot);
-        self.used.remove(bot);
-        self.close_block(&mine);
+        self.close(bot);
         true
     }
 

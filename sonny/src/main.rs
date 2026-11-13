@@ -5551,8 +5551,9 @@ impl Fleet {
             // Resolved, a question it left open is set aside.
             self.needs.forget(task);
             self.ended.remove(task);
-            let in_use = (self.began.remove(task))
-                .is_some_and(|began| used::since((self.used_when)(task), began));
+            // Kept until new work: marked done again, it is still in use.
+            let in_use = (self.began.get(task))
+                .is_some_and(|began| used::since((self.used_when)(task), *began));
             if !in_use {
                 self.close(task);
             }
@@ -10428,9 +10429,11 @@ impl App {
                 }
                 let empty = detail == EMPTY;
                 let running = self.running.take();
+                // Only a turn that ended well can leave the task done: one
+                // that failed or stopped stays open to be looked at.
                 if let Some(running) = &running {
                     self.kept.began = Some(running.started);
-                    self.kept.ended = Some(running.turn);
+                    self.kept.ended = (status == "completed").then_some(running.turn);
                 }
                 let note = running.as_ref().is_some_and(|r| r.note);
                 let seconds = running.map(|r| r.started.elapsed().as_secs());
@@ -24923,6 +24926,10 @@ mod tests {
         // away; the other closes as it is done.
         assert_eq!(windowed(&fleet), ["calc.a"]);
         assert!(!fleet.doing.contains_key("calc.a"));
+        // Its lead marks it done again: still in use, it stays.
+        fleet.resolved("calc.a");
+        fleet.layout.settle();
+        assert_eq!(windowed(&fleet), ["calc.a"]);
     }
 
     #[tokio::test]
@@ -24979,6 +24986,19 @@ mod tests {
         app.done_resting(true);
         assert!(app.kept.closing);
         assert_eq!(done(&mut app), 1);
+        // One that marked itself done and then failed stays to be looked
+        // at, as its lead leaves it.
+        app.kept.closing = false;
+        app.daemon(turn_event("accepted", 9, json!({}))).await;
+        resolved::keep(&app.store(), "b", 9, "c4").unwrap();
+        app.daemon(turn_event(
+            "turn_finished",
+            9,
+            json!({"status": "failed", "error": "x"}),
+        ))
+        .await;
+        app.done_resting(true);
+        assert!(!app.kept.closing && !app.kept.showing);
     }
 
     #[tokio::test]
