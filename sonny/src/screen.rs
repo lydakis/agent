@@ -1754,11 +1754,14 @@ impl Screen {
                     true => Style::new().fg(Color::Black).bg(Color::Yellow),
                     false => Style::new().fg(Color::Yellow).underlined(),
                 };
-                for row in start.0.max(top)..=end.0.min(bottom - 1) {
+                let rows = (self.shown.iter().enumerate())
+                    .take(end.0.min(bottom - 1) + 1)
+                    .skip(start.0.max(top));
+                for (row, shown) in rows {
                     let from = if row == start.0 { start.1 } else { 0 };
                     let to = match row == end.0 {
                         true => end.1,
-                        false => self.shown[row].line.width(),
+                        false => shown.line.width(),
                     };
                     let y = area.y + (row - top) as u16;
                     for x in from..to.min(area.width as usize) {
@@ -1822,14 +1825,17 @@ impl Screen {
         }
         if let Some(selection) = &self.selection {
             let (start, end) = self.extent(selection);
-            for row in start.0.max(top)..=end.0.min(bottom.saturating_sub(1)) {
+            let rows = (self.shown.iter().enumerate())
+                .take(end.0.min(bottom.saturating_sub(1)) + 1)
+                .skip(start.0.max(top));
+            for (row, shown) in rows {
                 if row < start.0 || row >= bottom {
                     continue;
                 }
                 let from = if row == start.0 { start.1 } else { 0 };
                 let to = match row == end.0 {
                     true => end.1,
-                    false => self.shown[row].line.width().max(from + 1),
+                    false => shown.line.width().max(from + 1),
                 };
                 let y = area.y + (row - top) as u16;
                 for x in from..to.min(area.width as usize) {
@@ -2012,8 +2018,8 @@ impl Screen {
             to += 1;
         }
         let mut rows = Buffer::empty(Rect::new(0, 0, drawn.width, (to - from) as u16));
-        for row in from..to {
-            rows.set_line(0, (row - from) as u16, &self.shown[row].line, drawn.width);
+        for (y, shown) in self.shown[from..to].iter().enumerate() {
+            rows.set_line(0, y as u16, &shown.line, drawn.width);
         }
         let cuts: Vec<bool> = (from..to).map(cut).collect();
         let mut links: Vec<(u16, u16, u16, String)> = Vec::new();
@@ -2036,12 +2042,12 @@ impl Screen {
         // A row its line links opens there across its text, whatever was
         // read from its words but the agents they name, which open the
         // agent: found first, they are what a click on them finds.
-        for row in top..bottom {
-            let Some(url) = &self.shown[row].link else {
+        for (y, shown) in self.shown[top..bottom].iter().enumerate() {
+            let Some(url) = &shown.link else {
                 continue;
             };
-            let y = drawn.y + (row - top) as u16;
-            let text: String = (self.shown[row].line.spans.iter())
+            let y = drawn.y + y as u16;
+            let text: String = (shown.line.spans.iter())
                 .map(|span| span.content.as_ref())
                 .collect();
             let from = text.width() - text.trim_start().width();
@@ -2052,10 +2058,10 @@ impl Screen {
             }
         }
         // A picture opens what it was drawn from, bigger, in the pane.
-        for row in top..bottom {
-            let y = drawn.y + (row - top) as u16;
+        for (y, shown) in self.shown[top..bottom].iter().enumerate() {
+            let y = drawn.y + y as u16;
             let mut x = 0;
-            for span in &self.shown[row].line.spans {
+            for span in &shown.line.spans {
                 let width = span.width();
                 if let Some(url) = crate::image::id(span).and_then(crate::image::source) {
                     let to = (x + width).min(drawn.width as usize);
@@ -2067,9 +2073,9 @@ impl Screen {
             }
         }
         // Buttons on parts of a row, over whatever else is there.
-        for row in top..bottom {
-            let y = drawn.y + (row - top) as u16;
-            for (from, to, url) in &self.shown[row].buttons {
+        for (y, shown) in self.shown[top..bottom].iter().enumerate() {
+            let y = drawn.y + y as u16;
+            for (from, to, url) in &shown.buttons {
                 let to = (*to).min(drawn.width);
                 if *from >= to {
                     continue;
@@ -2328,8 +2334,7 @@ impl Screen {
     fn text(&self, start: Spot, end: Spot) -> String {
         // Each line, and whether it starts at its row's start.
         let mut lines: Vec<(String, bool)> = Vec::new();
-        for row in start.0..=end.0 {
-            let shown = &self.shown[row];
+        for (row, shown) in self.shown.iter().enumerate().take(end.0 + 1).skip(start.0) {
             let cells = cells(&shown.line);
             if cells
                 .iter()
