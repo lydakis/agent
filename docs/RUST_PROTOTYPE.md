@@ -1820,7 +1820,7 @@ none for a person's) and, in `prompts`, its `text` within the read's
 and their prompt says `quotes_more` and `truncated`; Sonny's approver reads a quote of the person's own words as
 consent only in a prompt the person sent, and any other as asking for
 nothing.
-`{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
+`{"op":"prompts","bot","turn","bytes"?,"persons"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with
 `from` or `origin`, and `prompts_more` when steers were left out; the calls it started, each with its argument preview,
@@ -1848,7 +1848,16 @@ answers. Refused calls and
 their own, so a long prompt still leaves the calls (and the files they
 wrote) to read. Text that does not fit is cut and marked
 `truncated`, and each steer, call, and earlier prompt also counts 64
-bytes, so many short entries stay within `bytes` too. A fork keeps the source's binding, instructions,
+bytes, so many short entries stay within `bytes` too. With `persons`
+(bytes, at most 256 KiB), the read also lists the person's own earlier
+words to the bot under `persons`, as Codex's reviewer keeps every message
+its person wrote apart from the transcript: the messages it took in
+before the turn that no bot, client or other person wrote, newest first,
+each `{message, text, steer?}` whole within 3,600 bytes (Codex's 900
+tokens) or left out whole, with `persons_more` when some were left out
+(protocol 69). They have their own budget, so notes a client sent never
+crowd the person's words out of `earlier`, and a partial index
+(`messages_persons`) keeps the read to the person's messages alone. A fork keeps the source's binding, instructions,
 and tools, and takes no text of its own; the source is never changed. Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
 and turn IDs, not the illustrative numbers. Names are immutable bot identities
 within one store; rename/alias operations are not implemented. A fork starts

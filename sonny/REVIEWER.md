@@ -146,6 +146,20 @@ this replaced:
   honored goes in their AGENTS.md (`~/.agents/AGENTS.md` for all their
   work), which the reviewer trusts; a running agent's reviewer reads it
   as the agent was given it.
+- **The reviewer keeps the person's own words in view** (2026-11-13), as
+  Codex keeps every message its person wrote in the session apart from
+  the transcript, each whole within 900 tokens or left out, with a notice
+  when some were. Earlier prompts are kept newest first within their
+  share, so on a busy lead the lookout's notes pushed the person's older
+  words, their answers to asks among them, out of reach. The daemon's
+  `prompts` read now lists the person's own earlier words to the bot
+  apart (`persons`, by a partial index of the person's messages), and the
+  state gains `persons_words`: those the earlier prompts do not show,
+  newest first, each whole, within 8,000 tokens, with `persons_words_cut`
+  when some were left out. Words to an agent that delegated the turn come
+  too, naming it (`agent`), as Codex's reviewer gets the words its
+  sub-agent inherited. They are trusted as the person's other words are,
+  and later words may take back what earlier ones allowed.
 - **Only escapes reach the reviewer, and it may look before it answers**
   (2026-10-28, once the daemon's sandbox landed). A sandboxed bot's
   commands, writes, and edits inside its sandbox run unreviewed; the reviewer

@@ -51,6 +51,10 @@ const IN_FLIGHT: usize = 64;
 /// Text one `prompts` read returns: past the judge's whole state limit.
 /// The prompts of a round's delegating turns share it too.
 const PROMPT_BYTES: usize = 128 * 1024;
+/// The person's own earlier words one round reads, apart from the
+/// prompts, to the bot and to the bots that delegated its turn: what the
+/// judge's share of them holds.
+const PERSONS_BYTES: usize = policy::PERSONS_TOKENS * 3;
 /// How many delegations deep the approver follows up to the person's
 /// words, and how many delegating turns it reads for one round; past either
 /// the words above are left out, and the judge is told.
@@ -1025,9 +1029,11 @@ async fn intent(
     let read = client
         .request(
             "prompts",
-            json!({"bot":bot,"turn":turn,"bytes":PROMPT_BYTES}),
+            json!({"bot":bot,"turn":turn,"bytes":PROMPT_BYTES,"persons":PERSONS_BYTES}),
         )
         .await?;
+    let mut persons = Persons::default();
+    persons.add(None, &read);
     // The read keeps the turn's prompt and its newest steers, as Codex's
     // reviewer keeps the newest: what it left out or cut is older, and the
     // judge is told some was.
@@ -1044,6 +1050,7 @@ async fn intent(
                 by: by_origin(prompt),
                 text,
                 refused: refused(&prompt["refused"]),
+                message: None,
             }),
             Some(from) => {
                 persons_above(
@@ -1053,12 +1060,14 @@ async fn intent(
                     &mut budget,
                     &mut request,
                     &mut left_out,
+                    &mut persons,
                 )
                 .await?;
                 request.push(Words {
                     by: By::Model,
                     text,
                     refused: refused(&prompt["refused"]),
+                    message: None,
                 });
             }
         }
@@ -1251,15 +1260,22 @@ async fn intent(
         .flatten()
         .flat_map(|prompt| {
             let quotes = quoted(prompt["quotes"].clone(), prompt);
-            std::iter::once(prompt.clone()).chain(quotes)
+            // A prompt shown whole is one `persons_words` need not repeat;
+            // a quote is another message's words.
+            let message = (prompt["truncated"] != true)
+                .then(|| prompt["message"].as_i64())
+                .flatten();
+            std::iter::once((prompt.clone(), message))
+                .chain(quotes.into_iter().map(|quote| (quote, None)))
         })
-        .map(|prompt| Words {
+        .map(|(prompt, message)| Words {
             by: match prompt.get("from") {
                 Some(_) => By::Model,
                 None => by_origin(&prompt),
             },
             text: prompt_text(&prompt),
             refused: refused(&prompt["refused"]),
+            message,
         })
         .collect();
     let judged: Vec<&str> = calls
@@ -1350,7 +1366,52 @@ async fn intent(
         transcript,
         instructions,
         decisions,
+        persons_cut: persons.more,
+        persons: persons.finish(),
     })
+}
+
+/// The person's own earlier words a round's reads listed apart, to the
+/// bot and to each bot that delegated its turn, within one budget.
+#[derive(Default)]
+struct Persons {
+    words: Vec<policy::PersonsWords>,
+    more: bool,
+    spent: usize,
+}
+
+impl Persons {
+    /// What is left of the round's budget for them.
+    fn left(&self) -> usize {
+        PERSONS_BYTES.saturating_sub(self.spent)
+    }
+
+    /// The person's words a `prompts` read listed, written to `agent`, or
+    /// to the bot judged when none.
+    fn add(&mut self, agent: Option<&str>, read: &Value) {
+        self.more |= read["persons_more"] == true;
+        for said in read["persons"].as_array().into_iter().flatten() {
+            let (Some(message), Some(text)) = (said["message"].as_i64(), said["text"].as_str())
+            else {
+                continue;
+            };
+            self.spent += text.len();
+            self.words.push(policy::PersonsWords {
+                agent: agent.map(str::to_owned),
+                message,
+                text: text.to_owned(),
+            });
+        }
+    }
+
+    /// Newest first across the bots: message numbers are the store's own,
+    /// one count for every bot. A delegating turn read twice lists its
+    /// words once.
+    fn finish(mut self) -> Vec<policy::PersonsWords> {
+        self.words.sort_by(|a, b| b.message.cmp(&a.message));
+        self.words.dedup_by(|a, b| a.message == b.message);
+        self.words
+    }
 }
 
 /// The bot's own history the judge is shown, read newest first until the
@@ -1550,6 +1611,7 @@ async fn persons_above(
     budget: &mut usize,
     request: &mut Vec<Words>,
     left_out: &mut bool,
+    persons: &mut Persons,
 ) -> std::result::Result<(), Unjudged> {
     // Each delegating turn's prompts in order; a model-written one is
     // replaced by the prompts above it, depth first.
@@ -1560,7 +1622,7 @@ async fn persons_above(
             if levels.len() >= CHAIN {
                 *left_out = true;
             } else {
-                match delegated(client, &from, visited, budget).await? {
+                match delegated(client, &from, visited, budget, persons).await? {
                     Above::Prompts { prompts, more } => {
                         *left_out |= more;
                         levels.push(prompts.into_iter());
@@ -1584,6 +1646,7 @@ async fn persons_above(
                 by: by_origin(&prompt),
                 text: prompt_text(&prompt),
                 refused: refused(&prompt["refused"]),
+                message: None,
             }),
         }
     }
@@ -1600,12 +1663,14 @@ enum Above {
 }
 
 /// The prompts of the turn `from` names, unless it was read already or is
-/// gone, read within what is left of the round's `budget`.
+/// gone, read within what is left of the round's `budget`; with them, the
+/// person's earlier words to its bot, within what is left of theirs.
 async fn delegated(
     client: &Client,
     from: &Value,
     visited: &mut HashSet<(String, i64)>,
     budget: &mut usize,
+    persons: &mut Persons,
 ) -> std::result::Result<Above, Unjudged> {
     let (Some(bot), Some(turn)) = (from["bot"].as_str(), from["turn"].as_i64()) else {
         return Ok(Above::None);
@@ -1617,11 +1682,15 @@ async fn delegated(
         return Ok(Above::Cut);
     }
     match client
-        .request("prompts", json!({"bot":bot,"turn":turn,"bytes":*budget}))
+        .request(
+            "prompts",
+            json!({"bot":bot,"turn":turn,"bytes":*budget,"persons":persons.left()}),
+        )
         .await
     {
         Ok(mut read) => Ok(match read["prompts"].take() {
             Value::Array(prompts) => {
+                persons.add(Some(bot), &read);
                 let prompts = with_replies(prompts);
                 *budget = budget.saturating_sub(prompt_bytes(&prompts));
                 // Older steers left out: the newest are kept.

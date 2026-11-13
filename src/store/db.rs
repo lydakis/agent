@@ -2771,6 +2771,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS messages_queued ON messages(bot,id) WHERE status='queued';
             CREATE INDEX IF NOT EXISTS messages_steers ON messages(bot,id) WHERE status='queued' AND delivery='steer';
             CREATE INDEX IF NOT EXISTS messages_attached ON messages(bot,id) WHERE status='attached';
+            CREATE INDEX IF NOT EXISTS messages_persons ON messages(bot,id)
+                WHERE status='taken' AND from_bot IS NULL AND origin IS NULL AND person IS NULL;
             CREATE INDEX IF NOT EXISTS messages_due ON messages(due_ms) WHERE status='attached' AND due_ms IS NOT NULL;
             CREATE INDEX IF NOT EXISTS messages_held ON messages(due_ms) WHERE status='ready' AND held IS NOT NULL;
             CREATE INDEX IF NOT EXISTS messages_ready ON messages(id) WHERE status='ready';
@@ -9884,6 +9886,10 @@ impl Database {
     /// What each listed call and earlier prompt counts against `bytes` for
     /// its fields, so many short entries cannot outgrow a reply.
     pub const PROMPTS_ENTRY: usize = 64;
+    /// The most of one of the person's messages a `prompts` read lists
+    /// under `persons`: Codex keeps each of its person's retained words
+    /// whole within 900 tokens, or leaves it out.
+    pub const PROMPTS_PERSON_BYTES: usize = 3600;
     /// The most bytes of file names a `prompts` read lists as `written` by
     /// the calls it leaves out.
     pub const PROMPTS_WRITTEN: usize = 8 * 1024;
@@ -10058,10 +10064,32 @@ impl Database {
     /// `calls_more`, and `more` say older steers, calls, and earlier prompts
     /// were left out.
     pub fn prompts(&self, name: &str, turn: i64, bytes: usize) -> Result<Value> {
-        if !(1..=Self::PROMPTS_BYTES).contains(&bytes) {
+        self.prompts_and_persons(name, turn, bytes, 0)
+    }
+    /// [`Self::prompts`], and with `persons` above 0 the person's own
+    /// earlier words to the bot, as Codex's reviewer keeps every message
+    /// its person wrote in the session apart from the transcript: the
+    /// messages it took in before the turn that no bot, client or other
+    /// person wrote, newest first, each with its number, whole within
+    /// `PROMPTS_PERSON_BYTES` or left out whole, their text counting
+    /// against `persons` and each `PROMPTS_ENTRY`. `persons_more` says some
+    /// were left out. Their own budget, so others' words before the turn,
+    /// such as notes a client sent, never crowd the person's out; those
+    /// listed under `earlier` are listed again.
+    pub fn prompts_and_persons(
+        &self,
+        name: &str,
+        turn: i64,
+        bytes: usize,
+        persons: usize,
+    ) -> Result<Value> {
+        if !(1..=Self::PROMPTS_BYTES).contains(&bytes) || persons > Self::PROMPTS_BYTES {
             return fail_with(
                 "invalid_limit",
-                format!("bytes from 1 to {}", Self::PROMPTS_BYTES),
+                format!(
+                    "bytes from 1 to {0}, persons from 0 to {0}",
+                    Self::PROMPTS_BYTES
+                ),
             );
         }
         let row = self
@@ -10323,11 +10351,53 @@ impl Database {
                 }
             }
         }
-        Ok(
-            json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
-            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,
-            "written":written,"written_more":written_more,"earlier":earlier,"more":more}),
-        )
+        let mut read = json!({"bot":name,"turn":turn,"status":turn_status_name(&status),
+            "workspace":workspace,"prompts":prompts,"prompts_more":prompts_more,"calls":calls,
+            "calls_more":calls_more,"written":written,"written_more":written_more,
+            "earlier":earlier,"more":more});
+        if persons > 0 {
+            let (said, more) = self.persons(name, turn, persons)?;
+            read["persons"] = json!(said);
+            read["persons_more"] = json!(more);
+        }
+        Ok(read)
+    }
+    /// The person's own words to `name` before `turn` that fit `left`,
+    /// newest first, and whether any were left out: by the partial index
+    /// of the person's messages, so the read walks theirs alone.
+    fn persons(&self, name: &str, turn: i64, mut left: usize) -> Result<(Vec<Value>, bool)> {
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT m.id,m.turn<>m.id,{MESSAGE_TEXT} FROM messages m {MESSAGE_NODE}
+             WHERE m.bot=? AND m.id<? AND m.status='taken' AND m.from_bot IS NULL
+               AND m.origin IS NULL AND m.person IS NULL
+             ORDER BY m.id DESC"
+        ))?;
+        let mut rows = statement.query(params![name, turn])?;
+        let (mut said, mut more) = (Vec::new(), false);
+        while let Some(r) = rows.next()? {
+            if left < Self::PROMPTS_ENTRY {
+                more = true;
+                break;
+            }
+            let text: String = r.get::<_, Option<String>>(2)?.unwrap_or_default();
+            // Whole or not at all: a cut could leave a grant without the
+            // limit that follows it.
+            if text.len() > Self::PROMPTS_PERSON_BYTES {
+                more = true;
+                continue;
+            }
+            if Self::PROMPTS_ENTRY + text.len() > left {
+                more = true;
+                break;
+            }
+            left -= Self::PROMPTS_ENTRY + text.len();
+            let mut entry = json!({"message":r.get::<_, i64>(0)?,"text":text});
+            if r.get::<_, bool>(1)? {
+                entry["steer"] = json!(true);
+            }
+            said.push(entry);
+        }
+        Ok((said, more))
     }
     /// One prompt of a `prompts` read, cut to the budget left: its words,
     /// who wrote them, and the words it quotes, each with who wrote them.
