@@ -51,7 +51,28 @@ const READS: &str = ".reads";
 /// asked to check that it still holds: Codex drops a memory unused for 30,
 /// Copilot one unused for 28.
 const UNREAD_DAYS: i64 = 30;
-const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory search WORDS... [SCOPE]\n       memory save NAME --type user|feedback|project|reference|work --description TEXT --source TEXT [--external] [--confirmed N] [--pushed-back N] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory said [SINCE_MS]   (Sonny: what the person wrote to any agent since then)\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         each run starts an agent on --model; without it, the model scheduled before\n         SCOPE: --user | --project NAME; none: the project of this folder";
+const USAGE: &str = "usage: memory show [SCOPE]\n       memory read NAME [SCOPE]\n       memory search WORDS... [SCOPE]\n       memory save NAME --type user|feedback|project|reference|work --description TEXT --source TEXT [--external] [--live true|false] [--confirmed N] [--pushed-back N] [SCOPE] -- TEXT|-\n       memory rm NAME [SCOPE]\n       memory index [SCOPE]\n       memory check [SCOPE]\n       memory said [SINCE_MS]   (Sonny: what the person wrote to any agent since then)\n       memory changed | cleanup start | cleanup finish\n       memory schedule [--model PROVIDER/MODEL [--effort LEVEL]] [--cron 'MIN HOUR DAY MONTH WEEKDAY']\n         each run starts an agent on --model; without it, the model scheduled before\n         SCOPE: --user | --project NAME; none: the project of this folder";
+
+/// What fills a live fact's blanks: Sonny's templates, which the daemon
+/// links none of. Unset, as in `agent`, a live fact reads as it is written.
+pub trait Fill: Send + Sync {
+    /// Why `template` cannot be a live fact's, or nothing; `folder` is
+    /// where a file blank reads.
+    fn check(&self, template: &str, folder: &Path) -> Result<(), String>;
+    /// `template` with its blanks filled now, or why it could not be.
+    fn fill(&self, template: &str, folder: &Path) -> Result<String, String>;
+}
+
+static FILL: std::sync::OnceLock<&'static dyn Fill> = std::sync::OnceLock::new();
+
+/// Fill live facts with `fill` from now on, in this process.
+pub fn fill_with(fill: &'static dyn Fill) {
+    let _ = FILL.set(fill);
+}
+
+/// The most a live fact's description fills to in an index's head: it
+/// stays one line, as every description is.
+const LIVE_LINE: usize = 300;
 
 /// `memory show|read|search|save|rm|index|check|changed|cleanup|schedule`,
 /// as `~/.agent/memory` runs it.
@@ -103,6 +124,9 @@ pub fn call(home: &Path, cwd: &Path, arguments: &Value) -> Result<Value, String>
         }
         if save["external"] == true {
             args.push("--external".to_owned());
+        }
+        if let Some(live) = save["live"].as_bool() {
+            args.extend(["--live".to_owned(), live.to_string()]);
         }
         for (key, flag) in [
             ("confirmed", "--confirmed"),
@@ -222,12 +246,21 @@ fn run_as(
     let mut fields = [None, None, None];
     let mut scope = None;
     let mut external = false;
+    let mut live = None;
     let mut counts = [None, None];
     let mut it = flags.iter();
     while let Some(arg) = it.next() {
         let slot = match arg.as_str() {
             "--external" if verb == "save" && !external => {
                 external = true;
+                continue;
+            }
+            "--live" if verb == "save" && live.is_none() => {
+                live = match it.next().map(String::as_str) {
+                    Some("true") => Some(true),
+                    Some("false") => Some(false),
+                    _ => return Err(usage()),
+                };
                 continue;
             }
             count @ ("--confirmed" | "--pushed-back") if verb == "save" => {
@@ -300,7 +333,7 @@ fn run_as(
             };
             let index = |dir: PathBuf| {
                 let text = std::fs::read_to_string(dir.join(INDEX)).unwrap_or_default();
-                json!({"dir": dir, "index": head(&text)})
+                json!({"dir": dir, "index": head(&filled_lines(&text, cwd))})
             };
             let mut shown = json!({"user": index(root.to_path_buf()), "project": null});
             if let Some(name) = project {
@@ -325,12 +358,13 @@ fn run_as(
                 source,
                 verified: today(),
                 external,
+                live: live.unwrap_or_default(),
                 confirmed: counts[0].unwrap_or_default(),
                 pushed_back: counts[1].unwrap_or_default(),
             };
             let dir = scope()?;
             let path = dir.join(format!("{}.md", fact.name));
-            save(&dir, fact, counts, &text, &|now| {
+            save(&dir, cwd, fact, live, counts, &text, &|now| {
                 noted(root, caller, &path, now)
             })
         }
@@ -338,22 +372,21 @@ fn run_as(
         // as `show` lists both: unscoped, a read finds either, and outside
         // a project the person's. A scope given is the only one read.
         ("read", Some(name), [None, None, None], None) if !scoped => match project() {
-            Err(error) if error.starts_with("project_unknown: ") => read(root, &name),
+            Err(error) if error.starts_with("project_unknown: ") => read(root, cwd, &name),
             Err(error) => Err(error),
-            Ok(None) => read(root, &name),
-            Ok(Some(project)) => match read(&root.join("projects").join(project), &name) {
-                Err(error) if error.starts_with("fact_not_found: ") => {
-                    read(root, &name).map_err(|e| match e.starts_with("fact_not_found: ") {
+            Ok(None) => read(root, cwd, &name),
+            Ok(Some(project)) => match read(&root.join("projects").join(project), cwd, &name) {
+                Err(error) if error.starts_with("fact_not_found: ") => read(root, cwd, &name)
+                    .map_err(|e| match e.starts_with("fact_not_found: ") {
                         true => format!(
                             "fact_not_found: {name}: no such fact in this project or the person's"
                         ),
                         false => e,
-                    })
-                }
+                    }),
                 found => found,
             },
         },
-        ("read", Some(name), [None, None, None], None) => read(&scope()?, &name),
+        ("read", Some(name), [None, None, None], None) => read(&scope()?, cwd, &name),
         ("rm", Some(name), [None, None, None], None) => {
             let dir = scope()?;
             let path = dir.join(format!("{name}.md"));
@@ -450,6 +483,10 @@ struct Fact {
     /// Saved in a turn that read outside content, a web page, a search or
     /// an MCP server, so it may carry words no person wrote.
     external: bool,
+    /// Its text holds blanks, filled each time it is read, and its
+    /// description once when an agent starts: data it points at rather
+    /// than copies, so it never goes stale.
+    live: bool,
     /// How many times the person confirmed what the fact says, and pushed
     /// back on it, as ExpeL's insights and ACE's playbook bullets keep
     /// helpful and harmful counts, so a later agent sees its weight.
@@ -460,7 +497,7 @@ struct Fact {
 impl Fact {
     fn render(&self, body: &str) -> String {
         format!(
-            "---\nname: {}\ndescription: {}\ntype: {}\nsource: {}\nverified: {}\n{}{}---\n\n{}\n",
+            "---\nname: {}\ndescription: {}\ntype: {}\nsource: {}\nverified: {}\n{}{}{}---\n\n{}\n",
             self.name,
             self.description,
             self.kind,
@@ -471,6 +508,7 @@ impl Fact {
             } else {
                 ""
             },
+            if self.live { "live: true\n" } else { "" },
             self.counts(|key, n| format!("{key}: {n}\n")),
             body.trim()
         )
@@ -490,11 +528,12 @@ impl Fact {
 
     fn line(&self) -> String {
         format!(
-            "- {} ({}, verified {}{}{}): {}\n",
+            "- {} ({}, verified {}{}{}{}): {}\n",
             self.name,
             self.kind,
             self.verified,
             if self.external { ", external" } else { "" },
+            if self.live { ", live" } else { "" },
             self.counts(|key, n| format!(", {} {n}", key.replace('_', " "))),
             self.description
         )
@@ -531,6 +570,11 @@ impl Fact {
                 None => false,
                 Some(&"true") => true,
                 Some(other) => return Err(format!("external is true or absent, not {other}")),
+            },
+            live: match fields.get("live") {
+                None => false,
+                Some(&"true") => true,
+                Some(other) => return Err(format!("live is true or absent, not {other}")),
             },
             confirmed: count(&fields, "confirmed")?,
             pushed_back: count(&fields, "pushed_back")?,
@@ -782,9 +826,14 @@ type Note<'a> = &'a dyn Fn(Option<&str>) -> Result<(), String>;
 
 /// Save `fact`; a count left out (`None` in `counts`) keeps the one the
 /// fact had, so an agent rewording a fact does not reset its weight.
+/// Save `fact` in `dir`, its counts and whether it is live kept from the
+/// fact it replaces where `counts` and `live` leave them out. A live fact
+/// whose blanks would not fill from `folder` is refused.
 fn save(
     dir: &Path,
+    folder: &Path,
     mut fact: Fact,
+    live: Option<bool>,
     counts: [Option<u32>; 2],
     body: &str,
     note: Note,
@@ -801,6 +850,13 @@ fn save(
     {
         fact.confirmed = counts[0].unwrap_or(had.confirmed);
         fact.pushed_back = counts[1].unwrap_or(had.pushed_back);
+        fact.live = live.unwrap_or(had.live);
+    }
+    if let Some(fill) = FILL.get().filter(|_| fact.live) {
+        for (what, template) in [("description", fact.description.as_str()), ("text", body)] {
+            fill.check(template, folder)
+                .map_err(|why| format!("memory_template: the {what} of a live fact: {why}"))?;
+        }
     }
     let text = fact.render(body);
     if text.len() > LIMIT {
@@ -860,7 +916,9 @@ fn reads(dir: &Path) -> serde_json::Map<String, Value> {
 }
 
 /// One fact's whole file, recorded as read today.
-fn read(dir: &Path, name: &str) -> Result<Value, String> {
+/// The fact `name` in `dir`, its whole file, with a live one's text filled
+/// from `folder` as it stands now; the read is recorded.
+fn read(dir: &Path, folder: &Path, name: &str) -> Result<Value, String> {
     valid_name(name)?;
     let file = format!("{name}.md");
     let path = dir.join(&file);
@@ -880,7 +938,7 @@ fn read(dir: &Path, name: &str) -> Result<Value, String> {
     if text.len() > LIMIT {
         return Err(invalid(format!("larger than {LIMIT} bytes")));
     }
-    Fact::parse(&file, &text).map_err(invalid)?;
+    let fact = Fact::parse(&file, &text).map_err(invalid)?;
     // Locked only to record it, so a read of no fact makes no folder.
     let _lock = lock(dir)?;
     let mut all = reads(dir);
@@ -892,7 +950,53 @@ fn read(dir: &Path, name: &str) -> Result<Value, String> {
     let last = today();
     all.insert(name.to_owned(), json!({"last": last, "count": count}));
     write(&dir.join(READS), &Value::Object(all).to_string())?;
-    Ok(json!({"read": name, "path": path, "text": text, "reads": count}))
+    let mut found = json!({"read": name, "path": path, "text": text, "reads": count});
+    if let Some(fill) = FILL.get().filter(|_| fact.live) {
+        let body = text
+            .split_once("\n---\n")
+            .map_or("", |(_, body)| body)
+            .trim();
+        match fill.fill(body, folder) {
+            Ok(filled) => found["filled"] = json!(filled),
+            Err(why) => found["unfilled"] = json!(why),
+        }
+    }
+    Ok(found)
+}
+
+/// `index` with each live fact's description filled from `folder`, as an
+/// agent starting there reads it: one line each, at most [`LIVE_LINE`]
+/// bytes. A description that does not fill stays as it is written.
+pub fn filled_lines(index: &str, folder: &Path) -> String {
+    let Some(fill) = FILL.get() else {
+        return index.to_owned();
+    };
+    let mut out = String::with_capacity(index.len());
+    for line in index.split_inclusive('\n') {
+        let live = (line.strip_prefix("- "))
+            .and_then(|rest| rest.split_once("): "))
+            .filter(|(meta, _)| meta.split(", ").any(|part| part == "live"));
+        let Some((meta, description)) = live else {
+            out.push_str(line);
+            continue;
+        };
+        match fill.fill(description.trim_end(), folder) {
+            Ok(filled) => {
+                let mut one: String = filled.split_whitespace().collect::<Vec<_>>().join(" ");
+                if one.len() > LIVE_LINE {
+                    let mut end = LIVE_LINE - 3;
+                    while !one.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    one.truncate(end);
+                    one.push_str("...");
+                }
+                out.push_str(&format!("- {meta}): {one}\n"));
+            }
+            Err(_) => out.push_str(line),
+        }
+    }
+    out
 }
 
 fn remove(dir: &Path, name: &str, note: Note) -> Result<Value, String> {
@@ -2139,6 +2243,143 @@ mod tests {
     }
 
     #[test]
+    fn a_live_fact_is_marked_in_its_file_and_index_and_keeps_the_mark_until_a_save_says_false() {
+        let home = temp("live");
+        let root = home.join(".agents/memory");
+        let run_ = |line: &[&str]| run(&root, &root, &args(line), &no_stdin);
+        let save = |live: &[&str], text: &str| {
+            let mut line = vec!["save", "release", "--user", "--type", "project"];
+            line.extend(["--description", "open release PRs: {{ file('prs') }}"]);
+            line.extend(["--source", "the person, 2026-11-13"]);
+            line.extend(live);
+            line.extend(["--", text]);
+            run_(&line)
+        };
+        let file = || std::fs::read_to_string(root.join("release.md")).unwrap();
+        let index = || std::fs::read_to_string(root.join(INDEX)).unwrap();
+        save(&["--live", "true"], "Open now: {{ file('prs') }}").unwrap();
+        assert!(file().contains("\nlive: true\n---\n"), "{}", file());
+        assert!(
+            index().contains("- release (project, verified ")
+                && index().contains(", live): open release PRs: {{ file('prs') }}\n"),
+            "{}",
+            index()
+        );
+        // A save that leaves it out keeps it, as a cleanup's rewording does.
+        save(&[], "Still open: {{ file('prs') }}").unwrap();
+        assert!(file().contains("live: true") && file().contains("Still open"));
+        // False makes it plain again.
+        save(&["--live", "false"], "Plain now.").unwrap();
+        assert!(!file().contains("live") && !index().contains(", live"));
+        let usage = save(&["--live", "yes"], "x").unwrap_err();
+        assert!(usage.starts_with("usage: "), "{usage}");
+        // The tool's call is the script's.
+        let saved = call(
+            &home,
+            &home,
+            &json!({"user": true, "save": {"name": "release", "type": "project",
+                "description": "d", "source": "s", "text": "t", "live": true}}),
+        )
+        .unwrap();
+        assert_eq!(saved["saved"], "release");
+        assert!(file().contains("live: true"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Fills `{{ x }}` with the folder's name; refuses a template that
+    /// says `bad`, and fails one that says `later`, as a file not written
+    /// yet does.
+    struct Folder;
+
+    impl Fill for Folder {
+        fn check(&self, template: &str, _: &Path) -> Result<(), String> {
+            match template.contains("bad") {
+                true => Err("no source named bad".into()),
+                false => Ok(()),
+            }
+        }
+
+        fn fill(&self, template: &str, folder: &Path) -> Result<String, String> {
+            if template.contains("later") {
+                return Err("no file named later".into());
+            }
+            let name = folder.file_name().unwrap().to_string_lossy();
+            Ok(template.replace("{{ x }}", &format!("{name}\n")))
+        }
+    }
+
+    #[test]
+    fn a_live_fact_fills_when_read_and_its_index_line_when_an_agent_starts() {
+        // Only live facts are filled, and only this test saves one that
+        // these fill, so other tests read as before.
+        fill_with(&Folder);
+        let home = temp("live-filled");
+        let root = home.join(".agents/memory");
+        let here = home.join("calc");
+        std::fs::create_dir_all(&here).unwrap();
+        let save = |name: &str, description: &str, text: &str| {
+            let line = [
+                "save",
+                name,
+                "--user",
+                "--type",
+                "project",
+                "--description",
+                description,
+                "--source",
+                "s",
+                "--live",
+                "true",
+                "--",
+                text,
+            ];
+            run(&root, &here, &args(&line), &no_stdin)
+        };
+        save(
+            "where",
+            "works in {{ x }}",
+            "The folder is {{ x }}, as of now.",
+        )
+        .unwrap();
+        let read = run(&root, &here, &args(&["read", "where", "--user"]), &no_stdin).unwrap();
+        assert_eq!(read["filled"], "The folder is calc\n, as of now.");
+        assert!(
+            read["text"]
+                .as_str()
+                .unwrap()
+                .contains("The folder is {{ x }}")
+        );
+        // An agent's index line fills to one line; the file keeps the blank.
+        let index = std::fs::read_to_string(root.join(INDEX)).unwrap();
+        let filled = filled_lines(&index, &here);
+        assert!(filled.contains(", live): works in calc\n"), "{filled}");
+        assert!(index.contains(", live): works in {{ x }}\n"));
+        // A description that does not fill stays as written; a text that
+        // does not fill says why beside the fact.
+        save("soon", "after {{ later }}", "Read {{ later }}.").unwrap();
+        let index = std::fs::read_to_string(root.join(INDEX)).unwrap();
+        assert!(filled_lines(&index, &here).contains(", live): after {{ later }}\n"));
+        let read = run(&root, &here, &args(&["read", "soon", "--user"]), &no_stdin).unwrap();
+        assert_eq!(read["unfilled"], "no file named later");
+        // A blank that could never fill is refused, and nothing is saved.
+        let refused = save("never", "d", "{{ bad }}").unwrap_err();
+        assert!(
+            refused.starts_with("memory_template: the text of a live fact: no source named bad"),
+            "{refused}"
+        );
+        assert!(!root.join("never.md").exists());
+        // `show` gives the heads as a new agent would read them.
+        let shown = run(&root, &here, &args(&["show", "--user"]), &no_stdin).unwrap();
+        assert!(
+            shown["user"]["index"]
+                .as_str()
+                .unwrap()
+                .contains("works in calc\n")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn an_unscoped_read_finds_the_persons_fact_from_a_project_and_from_outside_one() {
         let home = temp("read-scopes");
         let root = home.join(".agents/memory");
@@ -2225,6 +2466,7 @@ mod tests {
                 source: "the person, 2020-01-01".into(),
                 verified: verified.into(),
                 external: false,
+                live: false,
                 confirmed: 0,
                 pushed_back: 0,
             };

@@ -22,7 +22,8 @@ Agents read memory at the start of work and save to it as they go.
 
 Each index line is `- NAME (TYPE, verified DATE): DESCRIPTION`, with
 `, external` after the date for a fact saved in a turn that had read a web
-page, a search or an MCP server, and `, confirmed N` or `, pushed back N`
+page, a search or an MCP server, `, live` for a live fact (below), and
+`, confirmed N` or `, pushed back N`
 for a fact the person confirmed or pushed back on that many times. A fact
 confirmed again and again weighs more than one said once. The fact itself
 is `NAME.md` in the same folder.
@@ -79,8 +80,8 @@ below. Every reply is one JSON object on stdout; a failure is one
 "$HOME/.agent/memory" show [SCOPE]
 "$HOME/.agent/memory" read NAME [SCOPE]
 "$HOME/.agent/memory" search WORDS... [SCOPE]
-"$HOME/.agent/memory" save NAME --type TYPE --description TEXT --source TEXT [--external] [--confirmed N] [--pushed-back N] [SCOPE] -- TEXT
-"$HOME/.agent/memory" save NAME --type TYPE --description TEXT --source TEXT [--external] [--confirmed N] [--pushed-back N] [SCOPE] -- - <<'EOF'
+"$HOME/.agent/memory" save NAME --type TYPE --description TEXT --source TEXT [--external] [--live true|false] [--confirmed N] [--pushed-back N] [SCOPE] -- TEXT
+"$HOME/.agent/memory" save NAME --type TYPE --description TEXT --source TEXT [--external] [--live true|false] [--confirmed N] [--pushed-back N] [SCOPE] -- - <<'EOF'
 longer text
 EOF
 "$HOME/.agent/memory" rm NAME [SCOPE]
@@ -132,6 +133,37 @@ when it first opens a lead, and it stays off once the person removes it.
 `~/.agents/memory` is then a local git repository
 whose history keeps memory as it was before and after each cleanup. Leave the `cleanup` and `changed`
 commands to that agent.
+
+## Live facts
+
+A fact that would copy state that changes, such as which pull requests
+are open or what the last build said, goes stale the day after it is
+saved. Save the lasting part in words and let a blank fill the moving
+part: `live` true in `save` (`--live true` for the script) makes the
+fact's text and description templates, Markdown with blanks as Jinja
+writes them:
+
+- `source('NAME').latest.text`, `.at` and `.events` (newest first): what
+  one of the person's sources printed lately; `.up` and `.down_since`
+  while it is down
+- `file('PATH')`: a file in your folder, `| fromjson` making JSON fields
+  of it
+- `now()`, and `| ago` and `| time` for a time in seconds
+
+```
+The release thread owns merge order and the cut. Open release PRs:
+{{ source('release-prs').latest.text }} ({{ source('release-prs').latest.at | ago }})
+```
+
+A blank never runs a command or reaches the network: for data no source
+covers, keep a file current from your own commands and read it with
+`file`. Tasks are not blanks here; a fact outlives them. `read` gives the
+template as `text` and the fact as it fills now as `filled` (or why it
+does not, as `unfilled`), and an agent starting gets each live
+description filled once, as it stands then. A save is refused
+(`memory_template`) when the text does not read as a template or names
+a source the person has not set up. A save that leaves `live` out keeps
+the mark the fact had; `false` makes it plain text again.
 
 ## What to save, and what not to
 

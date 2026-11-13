@@ -270,14 +270,7 @@ pub async fn answer(
                 store: Some(store),
                 // The ones the person set up, as the window has them: the
                 // commons keeps nothing a blank reads.
-                sources: std::sync::Arc::new(
-                    (crate::lookout::sources::configured()
-                        .unwrap_or_default()
-                        .into_iter())
-                    .filter(|source| !source.command.is_empty())
-                    .map(|source| source.name)
-                    .collect(),
-                ),
+                sources: crate::template::configured_sources(),
                 folder: workspace,
                 now: SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)

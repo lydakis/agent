@@ -435,7 +435,8 @@ fn memory() -> Value {
                 "confirmed": {"type": "integer", "minimum": 0,
                     "description": "How many times the person confirmed what a feedback fact says; left out, the fact keeps the count it had."},
                 "pushed_back": {"type": "integer", "minimum": 0,
-                    "description": "How many times the person pushed back on it; left out, the fact keeps the count it had."}
+                    "description": "How many times the person pushed back on it; left out, the fact keeps the count it had."},
+                "live": {"type": "boolean"}
             },
             "required": ["name", "type", "description", "source", "text"],
             "additionalProperties": false

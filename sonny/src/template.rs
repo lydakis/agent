@@ -89,6 +89,69 @@ pub fn render(template: &str, data: &Data) -> (Result<String, String>, Reads) {
     (rendered, reads)
 }
 
+/// The sources the person set up whose events a blank reads: the commons
+/// keeps none.
+pub fn configured_sources() -> Arc<Vec<String>> {
+    Arc::new(
+        (crate::lookout::sources::configured()
+            .unwrap_or_default()
+            .into_iter())
+        .filter(|source| !source.command.is_empty())
+        .map(|source| source.name)
+        .collect(),
+    )
+}
+
+/// Live memory facts' blanks, filled as a read or a new agent finds them:
+/// the person's sources, files in the agent's folder and the clock. Not
+/// tasks, which a fact outlives.
+pub struct Live;
+
+impl Live {
+    fn data(folder: &Path) -> Data {
+        Data {
+            store: (crate::STORE.get().cloned())
+                .or_else(|| crate::daemon_paths(None, None).ok().map(|(store, _)| store)),
+            sources: configured_sources(),
+            folder: folder.to_owned(),
+            tasks: Default::default(),
+            now: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64),
+        }
+    }
+}
+
+/// A live fact's `template` filled from `data`, or why not.
+fn live(template: &str, data: &Data) -> Result<String, String> {
+    let (filled, reads) = render(template, data);
+    if reads.tasks {
+        return Err("tasks() and task() fill margin notes only: a fact outlives its tasks".into());
+    }
+    filled
+}
+
+/// Why `template` cannot be a live fact's: it does not read as one, or
+/// names a source never set up or the tasks. What a later read may fill,
+/// such as a file not written yet, does not refuse it.
+fn live_check(template: &str, data: &Data) -> Result<(), String> {
+    check(template)?;
+    match live(template, data) {
+        Err(why) if why.contains("no source named ") || why.contains("tasks()") => Err(why),
+        _ => Ok(()),
+    }
+}
+
+impl agent_client::memory::Fill for Live {
+    fn check(&self, template: &str, folder: &Path) -> Result<(), String> {
+        live_check(template, &Self::data(folder))
+    }
+
+    fn fill(&self, template: &str, folder: &Path) -> Result<String, String> {
+        live(template, &Self::data(folder))
+    }
+}
+
 /// Where a render writes: it stops the render once past [`OUTPUT`], so a
 /// loop that prints much never holds more than that.
 struct Capped(Vec<u8>);
@@ -376,6 +439,36 @@ mod tests {
         );
         assert!(reads.tasks && reads.clock);
         assert!(reads.sources.is_empty() && reads.files.is_empty());
+    }
+
+    #[test]
+    fn a_live_fact_fills_from_sources_files_and_the_clock_but_never_from_tasks() {
+        let dir = tempfile_dir("live-fact");
+        let data = Data {
+            sources: Arc::new(vec!["ci".into()]),
+            ..data(&dir)
+        };
+        // A file not written yet fills later: the fact is kept, and a read
+        // says why it does not fill now.
+        let fact = "PRs open: {{ file('prs.txt') }}, as of {{ 999_940 | ago }}";
+        assert_eq!(live_check(fact, &data), Ok(()));
+        assert!(live(fact, &data).unwrap_err().contains("prs.txt"));
+        std::fs::write(dir.join("prs.txt"), "#886").unwrap();
+        assert_eq!(live(fact, &data).unwrap(), "PRs open: #886, as of 1m ago");
+        // A source with no events yet fills too.
+        assert_eq!(live_check("{{ source('ci').latest }}", &data), Ok(()));
+        // Refused: a source never set up, the tasks, and what is no
+        // template at all.
+        let refused = live_check("{{ source('deploys').latest }}", &data).unwrap_err();
+        assert!(refused.contains("no source named deploys"), "{refused}");
+        for tasks in ["{{ tasks() | length }}", "{{ task('calc.add').state }}"] {
+            let refused = live_check(tasks, &data).unwrap_err();
+            assert!(
+                refused.starts_with("tasks() and task() fill margin notes only"),
+                "{refused}"
+            );
+        }
+        assert!(live_check("{{ open", &data).is_err());
     }
 
     #[test]

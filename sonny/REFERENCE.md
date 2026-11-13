@@ -1486,7 +1486,8 @@ At each start Sonny writes what every agent leans on: the
 `memory`, `memory-cleanup`, `plan` and `automation` skills, as normal skills
 in `~/.agents/skills` (replacing links the Agent app left there), and
 `~/.agent/memory` and `~/.agent/automation`, scripts that run this Sonny as
-`sonny memory ...` (facts saved for later agents, in `~/.agents/memory`)
+`sonny memory ...` (facts saved for later agents, in `~/.agents/memory`;
+a live fact's blanks are filled as it is read, as a template note's are)
 and `sonny automation ...` (jobs that wake an agent, which Sonny's scheduler
 runs), which other harnesses and scripts run too; Sonny's own agents use the
 `memory` and `automations` tools instead, which the tool host answers outside

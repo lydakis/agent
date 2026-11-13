@@ -2037,6 +2037,9 @@ fn main() -> std::process::ExitCode {
     lookout::subs::at_start();
     haiku::at_start();
     config::at_start();
+    // Live memory facts are filled wherever Sonny reads memory or composes
+    // a new agent's instructions.
+    agent_client::memory::fill_with(&template::Live);
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         // The tool host runs this for each call of a tool Sonny answers.
