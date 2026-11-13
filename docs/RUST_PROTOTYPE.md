@@ -2449,7 +2449,7 @@ detail, so a reader that only says how many are held, as Sonny's alerts
 do, reads one page whatever the fleet's size (protocol 48; before, one
 answer held every turn and went past the frame limit near 6,000 agents).
 A page is bounded by bytes too, as `pauses` pages are.
-`{"op":"processes","bot":NAME?}` lists what runs for `bot`, a name or a
+`{"op":"processes","bot":NAME?,"after":CURSOR?}` lists what runs for `bot`, a name or a
 GLOB pattern of names, or for every bot (protocol 72): each background
 command, terminal and detached command still running, and each call a
 message lifted that waits on, by bot and oldest first, as `{processes:
@@ -2459,7 +2459,11 @@ bytes (a lifted call's, or its tool's name); `pid` is a detached
 command's, which leads its session and process group, so it is the one
 pid outside a sandbox's namespace that names it. The rows come from the
 running rows' partial index, so the read costs what runs, not the
-history. `{"op":"stop_process","bot":NAME,"handle":"proc:N"}` stops it as
+history. A page holds at most 128; when more follow, `next_after` is the
+last row's `{bot, handle}`, passed back as `after` for the next page. It
+places the next page whether or not that row is still there, so a command
+that ends between pages, its row pruned with its turn, does not break the
+listing. `{"op":"stop_process","bot":NAME,"handle":"proc:N"}` stops it as
 its agent's `write_stdin` with `kill: true` does and answers as that does,
 `{handle, stopped: true, ran}`; a handle that is not a command of that
 bot's still running answers `process_not_running`. `agent ps [--bot NAME]`

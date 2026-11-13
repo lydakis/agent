@@ -20737,13 +20737,17 @@ fn running_commands_are_listed_and_a_detached_one_outlives_a_restart() {
             0
         );
         // Pages follow on from a handle, by bot, oldest first.
-        let page = db.processes(None, Some(terminal)).unwrap();
+        let page = db.processes(None, Some(("shop.lead", terminal))).unwrap();
         let rest: Vec<&str> = (page.processes.iter())
             .map(|row| row["bot"].as_str().unwrap())
             .collect();
         assert_eq!(rest, ["shop.lead"], "{page:?}");
         assert!(page.next_after.is_none());
-        assert!(db.processes(None, Some(999_999)).is_err());
+        // The cursor places the page without its row, which may be gone.
+        let gone = db.processes(None, Some(("shop.lead", 999_999))).unwrap();
+        assert_eq!(gone.processes.len(), 0, "{gone:?}");
+        let gone = db.processes(None, Some(("other", 999_999))).unwrap();
+        assert_eq!(gone.processes.len(), 3, "{gone:?}");
         // A call a message lifted is listed as waiting until it runs, and
         // then as what it runs, from when it started.
         let raw = Connection::open(&path).unwrap();
@@ -20792,8 +20796,17 @@ fn running_commands_are_listed_and_a_detached_one_outlives_a_restart() {
             agent_runtime::store::PROCESSES_PAGE
         );
         let after = first.next_after.clone().unwrap();
-        let after: i64 = after.as_str().unwrap()["proc:".len()..].parse().unwrap();
-        let second = db.processes(None, Some(after)).unwrap();
+        let last = first.processes.last().unwrap();
+        assert_eq!(after, json!({"bot": last["bot"], "handle": last["handle"]}));
+        let id: i64 = after["handle"].as_str().unwrap()["proc:".len()..]
+            .parse()
+            .unwrap();
+        // The row the cursor names ends and goes before the next page.
+        db.process_finish(id, &json!({"exit_code":0}), false, &[], &[])
+            .unwrap();
+        let second = db
+            .processes(None, Some((after["bot"].as_str().unwrap(), id)))
+            .unwrap();
         assert!(second.next_after.is_none());
         assert_eq!(
             first.processes.len() + second.processes.len(),

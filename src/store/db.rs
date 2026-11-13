@@ -11996,25 +11996,18 @@ impl Database {
     /// by bot and oldest first, read through the running rows' index
     /// alone: its handle, bot, turn and call, kind, the start of its
     /// command, when it started, and a detached command's pid.
-    /// A page holds at most `PROCESSES_PAGE` of them, after the one whose
-    /// handle is `after`; `next_after` is set when more follow.
-    pub fn processes(&self, bot: Option<&str>, after: Option<i64>) -> Result<ProcessesPage> {
-        // Pages follow the index's order, which a handle alone does not
-        // place: its bot does, read by its key.
-        let from = match after {
-            Some(id) => {
-                let bot: Option<String> = self
-                    .conn
-                    .prepare_cached("SELECT bot FROM processes WHERE id=?")?
-                    .query_row([id], |r| r.get(0))
-                    .optional()?;
-                match bot {
-                    Some(bot) => (bot, id),
-                    None => return fail("invalid_handle"),
-                }
-            }
-            None => (String::new(), 0),
-        };
+    /// A page holds at most `PROCESSES_PAGE` of them, after `after`, a bot
+    /// and an id; `next_after` is set when more follow, the last row's bot
+    /// and handle.
+    pub fn processes(
+        &self,
+        bot: Option<&str>,
+        after: Option<(&str, i64)>,
+    ) -> Result<ProcessesPage> {
+        // Pages follow the index's order, by bot and then id, which the
+        // cursor carries whole: the row it names may be gone by the next
+        // page, pruned with its turn.
+        let from = after.unwrap_or(("", 0));
         let mut rows = self.conn.prepare_cached(
             "SELECT id,bot,turn,call_id,kind,command,started_ms,detached,call FROM processes
              WHERE status='running' AND (?1 IS NULL OR bot GLOB ?1) AND (bot,id)>(?2,?3)
@@ -12049,7 +12042,8 @@ impl Database {
         let mut processes: Vec<Value> = found.collect::<rusqlite::Result<_>>()?;
         let next_after = (processes.len() > PROCESSES_PAGE as usize).then(|| {
             processes.truncate(PROCESSES_PAGE as usize);
-            processes[PROCESSES_PAGE as usize - 1]["handle"].clone()
+            let last = &processes[PROCESSES_PAGE as usize - 1];
+            json!({"bot": last["bot"], "handle": last["handle"]})
         });
         Ok(ProcessesPage {
             processes,

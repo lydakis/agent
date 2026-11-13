@@ -737,12 +737,13 @@ enum Command {
     /// What runs for the bots `bot` names, a name or a GLOB pattern, or
     /// for every bot: each background, terminal and detached command still
     /// running and each call a message lifted that waits on, by bot and
-    /// oldest first, a page at a time after the handle `after`. A read.
+    /// oldest first, a page at a time after `after`, the last page's
+    /// `next_after`. A read.
     Processes {
         #[serde(default)]
         bot: Option<String>,
         #[serde(default)]
-        after: Option<String>,
+        after: Option<ProcessesAfter>,
     },
     /// Stop `bot`'s command `handle` (`proc:N`), as its agent's
     /// `write_stdin` with kill does: a command is killed with all it
@@ -751,6 +752,15 @@ enum Command {
         bot: String,
         handle: String,
     },
+}
+/// Where a `processes` page ends: the last row's bot and handle, which
+/// place the next page in the listing's order whether or not that row is
+/// still there.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessesAfter {
+    bot: String,
+    handle: String,
 }
 /// How long the service loop held each kind of request: from its
 /// dispatch to its answer or its handoff to a reader, so a request that
@@ -5001,15 +5011,21 @@ impl Service {
                 if bot.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
                     return fail_with("invalid_bot", "bot must be 1 to 128 bytes");
                 }
-                let after = match after.as_deref().map(handles::Handle::parse) {
+                let after = match after {
                     None => None,
-                    Some(Ok(handles::Handle::Process(id))) => Some(id),
-                    Some(_) => {
-                        return fail_with("invalid_handle", "after must be a proc:N handle");
-                    }
+                    Some(ProcessesAfter { bot, handle }) => match handles::Handle::parse(&handle) {
+                        Ok(handles::Handle::Process(id)) => Some((bot, id)),
+                        _ => {
+                            return fail_with(
+                                "invalid_handle",
+                                "after must be a page's next_after, {bot, handle: proc:N}",
+                            );
+                        }
+                    },
                 };
                 store
                     .read("processes", move |db| {
+                        let after = after.as_ref().map(|(bot, id)| (bot.as_str(), *id));
                         Ok(serde_json::to_value(db.processes(bot.as_deref(), after)?)?)
                     })
                     .await
