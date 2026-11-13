@@ -1410,7 +1410,8 @@ turn of the task numbered after that one reopens it.
 ![/status after m: what each agent tracks at the right edge, the picked task's model, profile and latest step under it, Idle opened](../docs/sonny/status-more.png)
 
 Settings Sonny keeps for every folder are in `~/.agent/config.toml`'s
-`[sonny]`, which `/config` shows: the chime (`chime`, on by default) and
+`[sonny]`, which `/config` shows: the chime (`chime`, off by default; `/sound` or
+`chime = true` turns it on) and
 the view (`steps` and `verbose`, both off by default), besides the efforts and the side chat
 above. `/config` lists the keys under their table's name, a value set in
 the file plain and a default muted, so what you changed stands out.
