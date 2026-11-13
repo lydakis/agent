@@ -62,7 +62,7 @@ pub const BUTTON: &str = "sonny:";
 /// What a row is, so the client finds it again to change what is drawn
 /// around it: where a message ends, the reactions under it, the rows of a
 /// group of calls drawn as one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Tag {
     /// The last row of the message at this node, the bot's or the person's.
     End(i64),
@@ -78,6 +78,9 @@ pub enum Tag {
     Note(u64),
     /// A `plan` call, by the client's number for it.
     Plan(u64),
+    /// A block the agent shows live with the `live` tool, by the client's
+    /// number for it.
+    Live(u64),
     /// A question's card, by the client's number for it.
     Ask(u64),
     /// A call waiting on the person, written out, then folded to its
@@ -644,6 +647,29 @@ impl Screen {
         (self.top..self.top + self.drawn)
             .contains(&at)
             .then(|| self.area.y + (at - self.top) as u16)
+    }
+
+    /// The tags on rows drawn in the view or within a view of it, and on
+    /// the newest rows, not laid out yet: what live blocks are kept filled
+    /// in, however many more the conversation holds.
+    pub fn tags_near_view(&self) -> std::collections::HashSet<Tag> {
+        let tall = self.drawn.max(1);
+        let near = self.top.saturating_sub(tall)..self.top + self.drawn + tall;
+        let mut tags = std::collections::HashSet::new();
+        let mut row = 0;
+        for (at, shown) in self.shown.iter().enumerate() {
+            if shown.first && at > 0 {
+                row += 1;
+            }
+            if near.contains(&at)
+                && let Some(tag) = self.rows.get(row).and_then(|row| row.tag)
+            {
+                tags.insert(tag);
+            }
+        }
+        let laid = self.wrapped.min(self.rows.len());
+        tags.extend(self.rows[laid..].iter().filter_map(|row| row.tag));
+        tags
     }
 
     /// Whether a row is tagged `tag`.

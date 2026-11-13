@@ -774,6 +774,23 @@ async fn called(name: &str, arguments: &Value) -> Answer {
             client.close().await;
             marked.map_err(|e| ("not_marked", e))
         }
+        name if name == crate::live::TOOL => {
+            let template = (arguments["markdown"].as_str())
+                .ok_or(("invalid_arguments", "markdown is required".to_owned()))?;
+            let (store, _) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
+            let data = crate::template::Data {
+                store: Some(store),
+                sources: crate::template::configured_sources(),
+                folder: here,
+                // The host does not read where the tasks stand: a blank
+                // that names one is filled in the window.
+                tasks: Default::default(),
+                now: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64),
+            };
+            crate::live::answer(template, &data)
+        }
         name if name == crate::margin::TOOL => {
             let (store, socket) = crate::daemon_paths(None, None).map_err(|e| ("no_store", e))?;
             let (client, _events) = Client::connect(&socket)
