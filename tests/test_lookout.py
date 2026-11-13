@@ -154,7 +154,7 @@ class LookoutTests(ModelFixture):
         woke = prompt['text']
         self.assertIn(f'- calc.fix: calc.fix/{turn}, the person wrote the words quoted from it below', woke)
         self.assertIn("The words quoted below are the person's own, from the turns named.", woke)
-        self.assertNotIn('This cuts into your turn', woke)
+        self.assertNotIn('This joins your running turn', woke)
         # The note is the lookout's; the person's words, copied by the
         # daemon from their turn, stay theirs.
         self.assertEqual(prompt['origin'], 'lookout.tasks')
@@ -199,7 +199,7 @@ class LookoutTests(ModelFixture):
         self.assertIsNotNone(prompt, 'the person\'s words did not reach the busy lead')
         woke = prompt['text']
         self.assertEqual([quote['text'] for quote in prompt['quotes']], ['stop, use the other branch'])
-        self.assertIn('This cuts into your turn because the person wrote in a task', woke)
+        self.assertIn('This joins your running turn because the person wrote in a task', woke)
         events = self.daemon.request('events', bot='calc.lead', after=0, limit=256)['result']['events']
         steered = [e for e in events if e['event'] == 'queued'
                    and str(e['data'].get('request_id', '')).startswith('lookout-')]
