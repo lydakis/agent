@@ -39,9 +39,7 @@ fn encode(raw: &[u8]) -> Option<Vec<u8>> {
     (out.len() < raw.len() - raw.len() / 8).then_some(out)
 }
 
-/// The most a retained stream's file holds: `SPILL_BYTES` of output, each
-/// invalid byte made at most three, as a stored copy's are.
-const FILE_RETAINED_BYTES: u64 = 3 * crate::tools::SPILL_BYTES;
+use crate::tools::FILE_RETAINED_BYTES;
 
 pub(super) fn put(db: &Connection, turn: i64, call: &str, stream: &str, raw: &[u8]) -> Result<()> {
     let encoded = encode(raw);

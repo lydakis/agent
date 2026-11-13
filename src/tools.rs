@@ -975,35 +975,44 @@ impl BlockStream {
     fn feed(&mut self, text: &str, blocks: &[String], last: bool) -> String {
         const BEGIN: &str = "-----BEGIN ";
         const END: &str = "-----END ";
-        let mut out = String::new();
-        let mut text = std::mem::take(&mut self.held) + text;
+        let mut out = String::with_capacity(text.len());
+        let text = std::mem::take(&mut self.held) + text;
+        let bytes = text.as_bytes();
+        // Read on from `at`: nothing before it is moved again.
+        let mut at = 0;
         loop {
-            if let Some(body) = &mut self.body {
-                body.push_str(&text);
-                match body.find(END) {
+            if let Some(tail) = &mut self.body {
+                // The end's marker, maybe begun in the last text's end.
+                let mut probe = tail.as_bytes().to_vec();
+                probe.extend_from_slice(&bytes[at..(at + END.len() - 1).min(bytes.len())]);
+                let across = (probe.windows(END.len()))
+                    .position(|w| w == END.as_bytes())
+                    .map(|p| at + p + END.len() - tail.len());
+                let end = across.or_else(|| text[at..].find(END).map(|n| at + n + END.len()));
+                match end {
                     Some(end) => {
                         // As `redact_blocks` goes on: past the end's marker.
                         out.push_str(REDACTED);
                         out.push('\n');
                         out.push_str(END);
-                        text = body.split_off(end + END.len());
+                        self.body = None;
+                        at = end;
+                        continue;
+                    }
+                    None if last => {
+                        // A key cut off by its stream's end is still a key.
+                        out.push_str(REDACTED);
                         self.body = None;
                     }
                     None => {
-                        if last {
-                            // A key cut off by its stream's end is still a key.
-                            out.push_str(REDACTED);
-                            self.body = None;
-                        } else {
-                            let keep = floor_char(body, body.len().saturating_sub(END.len() - 1));
-                            body.drain(..keep);
-                        }
-                        return out;
+                        tail.push_str(&text[at..]);
+                        let keep = floor_char(tail, tail.len().saturating_sub(END.len() - 1));
+                        tail.drain(..keep);
                     }
                 }
-                continue;
+                return out;
             }
-            let Some(begin) = text.find(BEGIN) else {
+            let Some(begin) = text[at..].find(BEGIN).map(|n| at + n) else {
                 // The end may begin a block's marker.
                 let keep = match last {
                     true => 0,
@@ -1012,50 +1021,60 @@ impl BlockStream {
                         .find(|&n| text.ends_with(&BEGIN[..n]))
                         .unwrap_or(0),
                 };
-                self.held = text.split_off(text.len() - keep);
-                out.push_str(&text);
+                let cut = (text.len() - keep).max(at);
+                out.push_str(&text[at..cut]);
+                self.held = text[cut..].to_owned();
                 return out;
             };
-            out.push_str(&text[..begin]);
-            text.drain(..begin);
-            let Some(dashes) = text[BEGIN.len()..]
+            out.push_str(&text[at..begin]);
+            at = begin;
+            let Some(dashes) = text[at + BEGIN.len()..]
                 .find("-----")
                 .map(|n| BEGIN.len() + n + 5)
             else {
                 if last {
                     // No header ends: `redact_blocks` stops here.
-                    out.push_str(&text);
+                    out.push_str(&text[at..]);
                     return out;
                 }
-                if text.len() > HEADER_HOLD {
-                    // No key's header: told as it is, and read on past it.
-                    out.push_str(&text[..BEGIN.len()]);
-                    text.drain(..BEGIN.len());
-                    continue;
-                }
-                self.held = text;
+                // No header ends after this block's start, nor so after any
+                // later one: past `HEADER_HOLD` they are no key's and are
+                // told as they are; the last such start is held.
+                let from = ceil_char(&text, text.len().saturating_sub(HEADER_HOLD)).max(at);
+                let held = match text[from..].find(BEGIN) {
+                    Some(n) => from + n,
+                    None => text.len(),
+                };
+                out.push_str(&text[at..held]);
+                self.held = text[held..].to_owned();
                 return out;
             };
-            let header = match &text.as_bytes()[dashes..] {
+            let header = match &bytes[at + dashes..] {
                 [b'\r', b'\n', ..] => dashes + 2,
                 [b'\n', ..] => dashes + 1,
                 [b'\r'] | [] if !last => {
                     // The line's end may follow.
-                    self.held = text;
+                    self.held = text[at..].to_owned();
                     return out;
                 }
                 _ => dashes,
             };
-            out.push_str(&text[..header]);
-            let named = blocks
-                .iter()
-                .any(|block| text[..header].contains(block.as_str()));
-            text.drain(..header);
-            if named {
+            let header = &text[at..at + header];
+            out.push_str(header);
+            at += header.len();
+            if blocks.iter().any(|block| header.contains(block.as_str())) {
                 self.body = Some(String::new());
             }
         }
     }
+}
+
+/// The first char boundary of `text` at or after `at`.
+fn ceil_char(text: &str, mut at: usize) -> usize {
+    while !text.is_char_boundary(at) {
+        at += 1;
+    }
+    at
 }
 
 /// The last char boundary of `text` at or before `at`.
@@ -2913,7 +2932,7 @@ impl Registry {
     ) -> impl Future<Output = Result<Outcome>> + Send + 'static {
         let registry = self.clone();
         async move {
-            let (stdout, stderr, exit, elapsed) = {
+            let (mut stdout, mut stderr, exit, elapsed) = {
                 // Held until the command and the sandbox around it are
                 // gone, and taken before the slot, so no slot waits on it.
                 // Both go before the output is redacted, so a result
@@ -2937,6 +2956,8 @@ impl Registry {
                 )
                 .await?
             };
+            // The streams' files are finished with no process slot held.
+            tokio::join!(stdout.settle(), stderr.settle());
             let bytes = stdout.len() + stderr.len();
             registry
                 .off_runtime(bytes, move |registry| {
@@ -2981,7 +3002,7 @@ impl Registry {
                 drop(queued);
                 // The slot and the sandbox's hold go once the command is
                 // done, before its output is redacted.
-                let (stdout, stderr, exit, elapsed) = {
+                let (mut stdout, mut stderr, exit, elapsed) = {
                     let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
                     let _held = crate::sandbox::hold_for(sandbox.as_deref()).await;
                     shell(
@@ -2995,6 +3016,8 @@ impl Registry {
                     )
                     .await?
                 };
+                // The streams' files are finished with no process slot held.
+                tokio::join!(stdout.settle(), stderr.settle());
                 let bytes = stdout.len() + stderr.len();
                 registry
                     .off_runtime(bytes, move |registry| {
@@ -3245,10 +3268,17 @@ pub fn page_file(file: &str, offset: usize, limit: usize) -> Result<Option<Strin
     else {
         return Ok(None);
     };
-    if !opened.metadata()?.is_file() {
+    let found = opened.metadata()?;
+    if !found.is_file() {
         return Ok(None);
     }
-    let mut reader = std::io::BufReader::with_capacity(256 << 10, opened);
+    // One that is larger was not written here; one that grows after is
+    // read only as far as it was.
+    if found.len() > FILE_RETAINED_BYTES {
+        return fail("storage_error");
+    }
+    let mut reader =
+        std::io::BufReader::with_capacity(256 << 10, std::io::Read::take(opened, found.len()));
     // The page's lines, as `str::lines` reads them; each kept to just past
     // the page's bound, which is all `page` needs to refuse a longer one,
     // and none kept once the page is full.
@@ -3538,6 +3568,10 @@ struct Captured {
     /// The file that holds it, once its writer is done.
     spilled: Option<Spilled>,
 }
+
+/// The most a retained stream's file holds: `SPILL_BYTES` of output, each
+/// invalid byte made at most three, as a stored copy's are.
+pub const FILE_RETAINED_BYTES: u64 = 3 * SPILL_BYTES;
 
 /// Where a command's streams go whole as it runs, once one passes
 /// `ARTIFACT_BYTES`: a file each, `FOLDER/NAME-STREAM`, in the bot's
@@ -4316,8 +4350,8 @@ async fn shell(
     };
     let exit = status.map_or(Exit::TimedOut, Exit::Status);
     let elapsed = started.elapsed();
-    // The files that hold streams past the bound are whole once read.
-    tokio::join!(out.settle(), err.settle());
+    // A stream's file is finished by its caller, once the command's slot
+    // is given back: see `Captured::settle`.
     Ok((out, err, exit, elapsed))
 }
 
@@ -5150,7 +5184,36 @@ mod tests {
             page_file(dir.join("gone").to_str().unwrap(), 1, 1).unwrap(),
             None
         );
+        // One larger than any retained file was not written here: refused
+        // without a read.
+        let large = dir.join("large");
+        std::fs::File::create(&large)
+            .unwrap()
+            .set_len(FILE_RETAINED_BYTES + 1)
+            .unwrap();
+        let refused = page_file(large.to_str().unwrap(), 1, 1).unwrap_err();
+        assert_eq!(refused.code, "storage_error");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// Many blocks in one piece read as the whole: each is passed once.
+    #[test]
+    fn many_blocks_in_one_piece_redact_as_whole() {
+        let credentials = Credentials::default();
+        credentials.redact_also(&[], &["PRIVATE KEY".to_owned()]);
+        let block = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n\
+            -----BEGIN PRIVATE KEY-----\nMIIEsecret\n-----END PRIVATE KEY-----\n";
+        let text = block.repeat((1 << 20) / block.len());
+        let whole = credentials.redact(text.clone());
+        assert!(!whole.contains("MIIEsecret"));
+        for size in [1 << 20, 64 << 10, 4099] {
+            let mut redacting = Redacting::new(credentials.clone());
+            let mut out = String::new();
+            for piece in text.as_bytes().chunks(size) {
+                out.push_str(&redacting.feed(piece));
+            }
+            out.push_str(&redacting.finish());
+            assert!(out == whole, "in pieces of {size}");
+        }
     }
     /// A stream past the bound goes whole to its file in the bot's outputs
     /// folder as the command runs, redacted, every byte of its middle with
