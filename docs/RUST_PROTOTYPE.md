@@ -602,7 +602,7 @@ when it sets either.
 | `speed` (`--speed`) | The tier the bot's own model's calls are served at: `standard`, `fast` or `ultrafast`, each faster one at a higher price per token. A call sends it only to a model that serves it, and runs at standard on any other, as Codex sends a service tier only where its model catalog lists it; the setting is kept as asked, so a bot moved to a model that serves it gets it back. Which model serves which tier is the daemon's list of exact model ids (never read from a name), or the person's `serve --speeds`, announced in `ready` (see [providers](#providers)). The Claude API serves `fast`, its fast mode (sent as `speed` with the `fast-mode-2026-02-01` beta) on Fable 5.2, Mythos 5.2 and Opus 5.5, and on Opus 5 and Opus 4.8 in research preview: twice the price or more, its own rate limit, so its own pool, which learns `anthropic-fast-input-tokens-*` and `anthropic-fast-output-tokens-*`; Bedrock serves Claude at standard only (Claude's fast-mode guide, read 2026-11-10). Each list claims only what its endpoint, region and sign-in are documented to serve. OpenAI's API on a key serves `fast` (sent as `service_tier: priority`) on the models Codex's bundled catalog gives priority, and `ultrafast` on GPT-6.1 Sol and GPT-6 Astra; the ChatGPT sign-in serves what Codex's bundled catalog lists for it, `fast` on those models and no `ultrafast`. Bedrock serves those two `ultrafast` alone, through their `us.` and `global.` profiles in any region, and under their bare `openai.` ids on Mantle in us-east-1 only (Codex's Bedrock catalogs, and Bedrock's model cards). Each call's `usage` event says the tier that served it. A call the provider refuses for its tier (a 400 that names the field or the value sent) fails as `provider_speed_refused`, its detail and facts naming the provider, model, region (Bedrock's, else null) and speed; it is never retried at standard nor run there in its place. Switching it misses the prompt cache once. Calls on another model (a `compaction_model`, a fallback) go at standard. `inspect` reports the setting, `standard` when unset. | `standard` |
 | `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
-| `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
+| `network` (`--network`) | A `workspace-write` bot's commands may use the network. Off, or in `read-only`, the bot is neither offered nor runs `web_fetch` or `web_search` (see [sandbox](#sandbox)). | off |
 | `hold_ms` (`--hold`) | How long a turn waits on a cause a person can fix (a sign-in, a key, a usage limit, a provider down or not set up) before it fails with it ([held turns](#held-turns)), up to 365 days; 0 fails at once. `hold = "5d"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | 5 days |
 | `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
 | `quiet_background` (`--quiet-background`) | The end of a background command no wait collected is left for a wait, untold (see [deferred tool results](#deferred-tool-results)): for a client that collects results itself. Protocol 46. | off |
@@ -2868,8 +2868,12 @@ what is inside it. One whose config is missing, turns on per-worktree config
 or includes other files stays read-only as a whole, since git reads those
 files wherever they are made, and nothing inside it is held in place, so no
 placeholder is made there. Network is
-off unless `network` is set. `danger-full-access`, or no `sandbox`, runs
-unconfined.
+off unless `network` is set, and a bot kept off it (`read-only`, or
+`workspace-write` without `network`) is neither offered nor runs
+`web_fetch` or `web_search`, which the daemon and the provider would
+reach past its sandbox: the tools stay its own, and it is offered them
+again from the call after its network is set. `danger-full-access`, or no
+`sandbox`, runs unconfined.
 
 A Unix socket is a way out of any sandbox: a program listening on one runs
 what it is asked outside, as a browser's daemon launches a browser or Docker

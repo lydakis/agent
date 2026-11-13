@@ -113,7 +113,9 @@ vulnerability, whether or not the code's own documentation agrees.
 - A write or edit is checked by the target's real path and then carried
   out inside the sandbox, so a symlink swapped in after the check cannot
   carry it outside. A protected folder that is a symlink refuses the call.
-- Network is off unless the bot's `network` is set. Off, a bot reaches
+- Network is off unless the bot's `network` is set. Off, a bot is
+  neither offered nor runs `web_fetch` or `web_search`, which the daemon
+  and the provider answer outside the sandbox, and it reaches
   only the Unix sockets its `unix_sockets` names, since a program on a
   socket runs what it is asked outside any sandbox: Seatbelt holds
   commands to those paths on macOS, and on Linux a seccomp filter refuses
