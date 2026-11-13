@@ -102,6 +102,11 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     if start.brief.trim().is_empty() {
         return Err("a task starts with a brief".into());
     }
+    // A folder another daemon's task works in is that task's, however its
+    // name matches: never this one's to take over.
+    if let Some(other) = other_store(name, started_on(start).as_deref()) {
+        return Err(another_store(name, &other));
+    }
     // The daemon's binary in an agent's shell; in a terminal, the one
     // Sonny would start.
     let agent = crate::agent_bin_or_missing()?;
@@ -449,6 +454,13 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
     // one asked for, else what the project tells every task. Only said
     // where it is shown, so a failed write starts the task all the same.
     let store = started_on(start);
+    // Which daemon's task its folder in `~/.agent/worktrees` is, so no
+    // other daemon's lead takes it over or counts it gone.
+    if let Some(store) = &store
+        && home_dir().is_ok_and(|home| place.dir.starts_with(home.join(".agent/worktrees")))
+    {
+        let _ = record_store(name, store);
+    }
     let profile = (start.profile.clone()).or_else(|| crate::project::task_profile(&info).ok());
     if let Some(store) = &store {
         match profile {
@@ -979,6 +991,8 @@ pub fn left_behind(here: &Path, project: &str) -> Vec<(String, Size)> {
         return Vec::new();
     };
     let folders = home.join(".agent/worktrees");
+    // This daemon's store, as the `agent ls` above found it.
+    let store = crate::daemon_paths(None, None).ok().map(|(store, _)| store);
     let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     let here = real(here);
     // The worktrees git lists for the lead's repository, by their real paths.
@@ -996,6 +1010,7 @@ pub fn left_behind(here: &Path, project: &str) -> Vec<(String, Size)> {
         if !name.starts_with(&format!("{project}."))
             || !entry.file_type().is_ok_and(|kind| kind.is_dir())
             || bots.iter().any(|bot| bot["name"] == name.as_str())
+            || other_store(&name, store.as_deref()).is_some()
         {
             continue;
         }
@@ -1171,6 +1186,53 @@ fn repository_of(here: &Path, path: &Path) -> Option<PathBuf> {
 /// branch's part never starts with a dot.
 fn record_of(name: &str) -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".agent/worktrees/.folders").join(name))
+}
+
+/// Where Sonny records which daemon's task each folder it made in
+/// `~/.agent/worktrees` is, by the store that daemon serves: task names
+/// are a project's and a task's, the same on every daemon of the person's,
+/// and their folders one place for all.
+fn store_record_of(name: &str) -> Result<PathBuf, String> {
+    Ok(store_record_in(&home_dir()?, name))
+}
+
+fn store_record_in(home: &Path, name: &str) -> PathBuf {
+    home.join(".agent/worktrees/.stores").join(name)
+}
+
+fn record_store(name: &str, store: &Path) -> std::io::Result<()> {
+    record_store_in(&home_dir().map_err(std::io::Error::other)?, name, store)
+}
+
+fn record_store_in(home: &Path, name: &str, store: &Path) -> std::io::Result<()> {
+    let record = store_record_in(home, name);
+    std::fs::create_dir_all(record.parent().unwrap_or(Path::new("/")))?;
+    std::fs::write(record, format!("{}\n", store.display()))
+}
+
+/// The store of the other daemon whose task the folder `name` is, when it
+/// is there and recorded as another's than `store`'s.
+fn other_store(name: &str, store: Option<&Path>) -> Option<PathBuf> {
+    other_store_in(&home_dir().ok()?, name, store)
+}
+
+fn other_store_in(home: &Path, name: &str, store: Option<&Path>) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(store_record_in(home, name)).ok()?;
+    let theirs = PathBuf::from(text.trim_end_matches('\n'));
+    let folder = home.join(".agent/worktrees").join(name);
+    let same = |store: &Path| {
+        let canonical = |path: &Path| agent_client::socket::canonical_store(path).ok();
+        store == theirs || canonical(store).is_some_and(|ours| Some(ours) == canonical(&theirs))
+    };
+    (folder.exists() && !store.is_some_and(same)).then_some(theirs)
+}
+
+fn another_store(name: &str, store: &Path) -> String {
+    format!(
+        "{name}'s folder is a task's of the daemon serving {}, not this one's; give this \
+         task another name, or remove that one from a window on that daemon",
+        store.display()
+    )
 }
 
 /// What Sonny made a task it keeps a record of: recorded, as whatever the
@@ -1721,6 +1783,9 @@ pub fn remove(
     let agent = crate::agent_bin_or_missing()?;
     let branch = format!("agent/{name}");
     let path = home_dir()?.join(".agent/worktrees").join(name);
+    if let Some(other) = other_store(name, Some(store)) {
+        return Err(another_store(name, &other));
+    }
     let (worktree, folder) = match (path.exists(), recorded(name)) {
         (false, _) => (None, None),
         (true, Some((source, _))) if source != here => {
@@ -1839,6 +1904,9 @@ pub fn remove(
         if let Ok(record) = record_of(name) {
             let _ = std::fs::remove_file(record);
         }
+        if let Ok(record) = store_record_of(name) {
+            let _ = std::fs::remove_file(record);
+        }
         let delete = if discard { "-D" } else { "-d" };
         let ours = git(here, &["rev-parse", "--show-toplevel"])
             .ok()
@@ -1864,6 +1932,9 @@ pub fn remove(
     if let Some(path) = &folder {
         std::fs::remove_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))?;
         if let Ok(record) = record_of(name) {
+            let _ = std::fs::remove_file(record);
+        }
+        if let Ok(record) = store_record_of(name) {
             let _ = std::fs::remove_file(record);
         }
         return Ok(format!("{} folder.", did("deleted")));
@@ -2021,6 +2092,31 @@ mod tests {
             git(&repo, args).unwrap();
         }
         repo
+    }
+
+    #[test]
+    fn a_task_folder_is_its_own_daemon_s_alone() {
+        let home = std::env::temp_dir().join(format!("sonny-stores-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".agent/worktrees/shop.fix")).unwrap();
+        let (main, side) = (home.join("main.sqlite"), home.join("side.sqlite"));
+        // Unrecorded, as a folder made before: nobody else's.
+        assert_eq!(other_store_in(&home, "shop.fix", Some(&main)), None);
+        record_store_in(&home, "shop.fix", &side).unwrap();
+        assert_eq!(
+            other_store_in(&home, "shop.fix", Some(&main)),
+            Some(side.clone())
+        );
+        assert_eq!(other_store_in(&home, "shop.fix", Some(&side)), None);
+        // The same store by another spelling is the same daemon.
+        let spelled = home.join(".agent/../side.sqlite");
+        assert_eq!(other_store_in(&home, "shop.fix", Some(&spelled)), None);
+        // A folder gone takes its claim with it.
+        std::fs::remove_dir(home.join(".agent/worktrees/shop.fix")).unwrap();
+        assert_eq!(other_store_in(&home, "shop.fix", Some(&main)), None);
+        let said = another_store("shop.fix", &side);
+        assert!(said.contains("another name"), "{said}");
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

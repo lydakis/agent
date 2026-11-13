@@ -187,6 +187,14 @@ pub fn when(bot: &str) -> Option<SystemTime> {
     std::fs::metadata(file(bot)?).ok()?.modified().ok()
 }
 
+/// Whether a window marked used at `used` ([`when`]) was used since
+/// `began`: a mark is made at most once an [`EVERY`], so one within an
+/// [`EVERY`] before it may stand for a use after it, as when the person
+/// typed the message that began a turn.
+pub fn since(used: Option<SystemTime>, began: SystemTime) -> bool {
+    used.is_some_and(|used| used + EVERY >= began)
+}
+
 /// The agent is gone: so is its file.
 pub fn forget(bot: &str) {
     for dir in ["used", "held", "aside"] {
@@ -218,6 +226,16 @@ mod tests {
         // A question answered, or a turn started: let go.
         assert_eq!(file_after(false, Some(true), false), Some(false));
         assert_eq!(file_after(false, None, true), Some(false));
+    }
+
+    #[test]
+    fn a_window_marked_within_a_mark_s_spacing_of_a_turn_s_start_was_used_since() {
+        let began = SystemTime::now();
+        assert!(!since(None, began));
+        assert!(since(Some(began + Duration::from_secs(30)), began));
+        // Typed the message that began it, the mark a few seconds older.
+        assert!(since(Some(began - Duration::from_secs(4)), began));
+        assert!(!since(Some(began - EVERY - Duration::from_secs(1)), began));
     }
 
     #[test]
