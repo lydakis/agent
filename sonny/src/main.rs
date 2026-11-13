@@ -3445,6 +3445,9 @@ struct Running {
     /// The effort it runs at, when the daemon said: a boost is this turn's
     /// alone, so the bot's own stays in `App::effort`.
     effort: Option<String>,
+    /// The agent called a tool or wrote since the person's last words
+    /// reached the turn, drawn or not.
+    acted: bool,
 }
 
 /// The lists of a setting's values `/permissions` and `/fast` open over
@@ -5736,6 +5739,7 @@ impl App {
                 phase: "Working".into(),
                 note: false,
                 effort: None,
+                acted: true,
             }),
             calls: HashMap::new(),
             approvals: Vec::new(),
@@ -7048,6 +7052,7 @@ impl App {
                     phase: "Working".into(),
                     note: false,
                     effort: None,
+                    acted: true,
                 });
                 self.turn_began().await;
             }
@@ -9746,6 +9751,15 @@ impl App {
             self.seen_node = self.seen_node.max(node);
             self.first_node.get_or_insert(node);
         }
+        // What the turn did since the person's newest words in it, words
+        // only or zen drawing none of it.
+        if let Some(running) = (self.running.as_mut()).filter(|r| Some(r.turn) == turn) {
+            match kind {
+                "steered" => running.acted = false,
+                "tool_started" | "text_delta" | "message" => running.acted = true,
+                _ => {}
+            }
+        }
         match kind {
             // Changed by this or another client: the footer and the
             // pickers read the bot again.
@@ -9798,6 +9812,7 @@ impl App {
                     phase: "Working".into(),
                     note: from_lookout(data),
                     effort: data["effort"].as_str().map(str::to_owned),
+                    acted: false,
                 });
                 // What this turn runs on and in: the bot may have moved, or
                 // a client chosen another model for it.
@@ -10342,6 +10357,7 @@ impl App {
                 let empty = detail == EMPTY;
                 let running = self.running.take();
                 let note = running.as_ref().is_some_and(|r| r.note);
+                let acted = running.as_ref().is_some_and(|r| r.acted);
                 let seconds = running.map(|r| r.started.elapsed().as_secs());
                 // One that ended on the last call a limit left it says so,
                 // as a fact beside its time.
@@ -10355,7 +10371,6 @@ impl App {
                     (false, "completed") => limit,
                     _ => detail,
                 };
-                let line = transcript::finished(status, shown, seconds);
                 self.close_live();
                 // A turn that only reacted ends as a reaction under the
                 // message, with no line under it.
@@ -10363,9 +10378,22 @@ impl App {
                 let words =
                     (self.live.as_ref()).is_some_and(|live| live.spilled || !live.rows.is_empty());
                 let ended = status == "completed";
-                let only_reacted = !words
-                    && !self.bot_reactions.is_empty()
+                // Nothing drawn since the person's message: the turn did
+                // nothing else before it ended.
+                let untouched = !words
                     && self.answering.as_ref().map(|(_, at, _)| *at) == Some(self.rows_drawn);
+                let only_reacted = untouched && !self.bot_reactions.is_empty();
+                // A refusal says so in plain words, with the provider's
+                // facts, in place of its code; one of the request that
+                // carried the person's words from here and nothing since,
+                // that those never reached the agent.
+                let line = match detail {
+                    "provider_refusal" => {
+                        let reached = !untouched || acted || turn.is_none() || turn != self.yours;
+                        transcript::refused(data, reached, self.prose())
+                    }
+                    _ => vec![transcript::finished(status, shown, seconds)],
+                };
                 if only_reacted {
                     self.draw_bot_reactions();
                 }
@@ -10385,14 +10413,14 @@ impl App {
                     Some(live) if ended && self.words() => self.write_words(live, Words::Reply),
                     None if ended && self.words() => {}
                     Some(live) if !live.spilled && !live.rows.is_empty() && ended => {
-                        self.commit(vec![line]);
+                        self.commit(line);
                         self.write_words(Live { gap: true, ..live }, Words::Reply);
                     }
                     live => {
                         if let Some(live) = live {
                             self.write_words(live, Words::Reply);
                         }
-                        self.commit(vec![line]);
+                        self.commit(line);
                     }
                 }
                 self.draw_bot_reactions();
@@ -18010,6 +18038,7 @@ mod tests {
             phase: "Paused".into(),
             note: false,
             effort: None,
+            acted: false,
         });
         assert_eq!(
             shown(&app),
@@ -18597,6 +18626,7 @@ mod tests {
             phase: "Waiting for your approval".into(),
             note: false,
             effort: None,
+            acted: false,
         });
         // An older lifted call asks for a step while turn 7 waits.
         let step = json!({"call_id": "c1/1", "step_of": "c1", "request": 1, "gates": ["manual"]});
@@ -21090,6 +21120,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refused_turn_says_so_in_plain_words() {
+        let client = daemon_answering(|asked| {
+            json!({"items": [{"node": asked["nodes"][0], "item": {"type": "message",
+                "role": "user", "content": [{"type": "input_text", "text": "please continue"}]}}]})
+        })
+        .await;
+        let mut app = app(client);
+        app.width = 120;
+        let rows = |app: &App| -> Vec<String> {
+            (app.pending.iter())
+                .map(|line| line.to_string())
+                .filter(|row| !row.trim().is_empty())
+                .collect()
+        };
+        let refusal = json!({"status": "failed", "error": "provider_refusal",
+            "detail": "category cyber", "category": "cyber",
+            "explanation": "This request was flagged.", "fallback": null});
+        // The person's words were the request: they never reached the agent.
+        app.yours = Some(1);
+        app.daemon(turn_event("accepted", 1, json!({"node": 1})))
+            .await;
+        app.daemon(turn_event("turn_finished", 1, refusal.clone()))
+            .await;
+        let shown = rows(&app);
+        assert_eq!(
+            shown[shown.len() - 3..],
+            [
+                "✗ The provider declined this request (cyber); your message did not reach the agent.",
+                "  This request was flagged.",
+                "  No fallback is set for this model.",
+            ]
+        );
+        // Declined after the turn did something: no word on the message.
+        app.yours = Some(2);
+        app.daemon(turn_event("accepted", 2, json!({"node": 2})))
+            .await;
+        app.commit(vec![Line::from("• Ran ls")]);
+        app.daemon(turn_event("turn_finished", 2, refusal.clone()))
+            .await;
+        let shown = rows(&app);
+        assert_eq!(
+            shown[shown.len() - 3],
+            "✗ The provider declined this request (cyber)."
+        );
+        // Words only draws no step, but one ran all the same.
+        app.words_only = true;
+        app.yours = Some(3);
+        app.daemon(turn_event("accepted", 3, json!({"node": 3})))
+            .await;
+        app.daemon(turn_event(
+            "tool_started",
+            3,
+            json!({"call_id": "c1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}),
+        ))
+        .await;
+        app.daemon(turn_event("turn_finished", 3, refusal)).await;
+        let shown = rows(&app);
+        assert_eq!(
+            shown[shown.len() - 3],
+            "✗ The provider declined this request (cyber)."
+        );
+    }
+
+    #[tokio::test]
     async fn a_turn_the_lookout_started_ends_quietly_unless_it_speaks() {
         let client = daemon_answering(|_| {
             json!({"items": [{"node": 4, "item": {"type": "message", "role": "assistant",
@@ -21896,6 +21990,7 @@ mod tests {
             phase: "Working".into(),
             note: false,
             effort: None,
+            acted: false,
         });
         assert!(!app.configure().await);
         assert!(asked.lock().unwrap().is_empty());
@@ -21947,6 +22042,7 @@ mod tests {
             phase: "Working".into(),
             note: false,
             effort: None,
+            acted: false,
         });
         let esc = || Event::Key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         // The question asks first: Esc sets it aside, the turn runs on.
@@ -21984,6 +22080,7 @@ mod tests {
             phase: "Working".into(),
             note: false,
             effort: None,
+            acted: false,
         });
         app.yours = Some(1);
         assert!(!app.status_line().to_string().contains("tab to queue"));
@@ -23715,6 +23812,7 @@ mod tests {
             phase: "Working".into(),
             note: false,
             effort: None,
+            acted: false,
         });
         app.tell_status();
         assert_eq!(app.told, Some("working"));
