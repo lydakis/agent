@@ -120,7 +120,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; each agent keeps at most 64, and starting one past them kills the one it started or waited on least recently. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops; each agent keeps at most as many as the daemon's process bound, and starting one past them kills the one it started or waited on least recently. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "workdir":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_BACKGROUND_TIMEOUT_MS},
@@ -2496,9 +2496,11 @@ impl Registry {
     }
 
     /// Count `stopper`'s command toward bot `owner`'s share, as just used.
-    /// One past the share kills the bot's command it used least recently,
-    /// as Codex prunes a session's processes past 64: an agent that loses
-    /// track of what it started cannot hold the process bound forever.
+    /// The share is the process bound (64 by default, Codex's number for a
+    /// session's processes): one past it kills the bot's command it used
+    /// least recently, as Codex prunes, so an agent that loses track of
+    /// what it started cannot hold the whole bound forever. With no bound,
+    /// nothing is pruned.
     pub fn own(&self, stopper: &Stopper, owner: i64) {
         let pruned = {
             let mut stops = self.stops.lock().unwrap();
@@ -2510,7 +2512,7 @@ impl Registry {
             let own = (stops.running.iter())
                 .filter(|(_, stop)| stop.owner == Some(owner))
                 .map(|(id, stop)| (*id, stop.used));
-            let least = match own.clone().count() > MAX_BACKGROUND {
+            let least = match self.budget > 0 && own.clone().count() > self.budget {
                 true => own.min_by_key(|(_, used)| *used).map(|(id, _)| id),
                 false => None,
             };
@@ -2577,7 +2579,7 @@ fn stopped(kill: Kill) -> Error {
                 "its agent killed this command before it finished, so it may have had effects"
             }
             Kill::Pruned => {
-                "its agent started more than 64 background commands, so this one, the one it used least recently, was killed before it finished; it may have had effects"
+                "its agent started more background commands than the daemon's process bound, so this one, the one it used least recently, was killed before it finished; it may have had effects"
             }
         },
     )
@@ -2592,10 +2594,6 @@ enum Kill {
     /// recently.
     Pruned,
 }
-
-/// Background commands one bot keeps running, as Codex keeps a session's:
-/// starting one past this kills the one it used least recently.
-pub const MAX_BACKGROUND: usize = 64;
 
 /// The background commands running, by proc handle.
 #[derive(Default)]
@@ -3864,15 +3862,16 @@ mod tests {
             "-----BEGIN PRIVATE KEY-----\r\n[REDACTED]\n-----END PRIVATE KEY-----\r\n"
         );
     }
-    /// A bot keeps at most 64 background commands, as Codex keeps a
-    /// session's processes: starting one past them kills the one its bot
-    /// used least recently, a wait counting as a use. Another bot's and a
-    /// command no bot owns, such as a detached one, never count.
+    /// A bot keeps at most the process bound's number of background
+    /// commands, as Codex keeps a session's processes: starting one past
+    /// them kills the one its bot used least recently, a wait counting as
+    /// a use. Another bot's and a command no bot owns, such as a detached
+    /// one, never count, and with no bound nothing is pruned.
     #[test]
     fn a_bot_past_its_share_loses_the_command_it_used_least_recently() {
-        let registry = Registry::new("shell").unwrap();
+        let registry = Registry::new("shell").unwrap().with_process_budget(4);
         let pruned = |stopper: &mut Stopper| matches!(stopper.stop.try_recv(), Ok(Kill::Pruned));
-        let mut own: Vec<Stopper> = (1..=MAX_BACKGROUND as i64)
+        let mut own: Vec<Stopper> = (1..=4)
             .map(|id| {
                 let stopper = registry.stopper(id);
                 registry.own(&stopper, 7);
@@ -3885,7 +3884,7 @@ mod tests {
         assert!(own.iter_mut().all(|stopper| !pruned(stopper)));
         // The oldest was waited on since, so the next oldest goes.
         registry.used(&[1]);
-        let mut next = registry.stopper(65);
+        let mut next = registry.stopper(5);
         registry.own(&next, 7);
         assert!(!pruned(&mut own[0]));
         assert!(pruned(&mut own[1]));
@@ -3894,12 +3893,23 @@ mod tests {
         // Gone from those its agent can kill: a kill by its handle finds none.
         assert!(!registry.stop(2));
         assert!(registry.stop(3));
+        let unbounded = Registry::new("shell").unwrap().with_process_budget(0);
+        let mut first = unbounded.stopper(1);
+        unbounded.own(&first, 7);
+        let _rest: Vec<Stopper> = (2..=200)
+            .map(|id| {
+                let stopper = unbounded.stopper(id);
+                unbounded.own(&stopper, 7);
+                stopper
+            })
+            .collect();
+        assert!(!pruned(&mut first));
     }
     /// A running background command its bot pruned is killed, and says why.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_pruned_background_command_is_killed_and_says_so() {
-        let registry = Registry::new("shell").unwrap();
+        let registry = Registry::new("shell").unwrap().with_process_budget(4);
         let (sender, receiver) = tokio::sync::oneshot::channel();
         registry.background(
             registry.stopper(1),
@@ -3912,7 +3922,7 @@ mod tests {
             registry.queue().unwrap(),
             sender,
         );
-        let _later: Vec<Stopper> = (2..=MAX_BACKGROUND as i64 + 1)
+        let _later: Vec<Stopper> = (2..=5)
             .map(|id| {
                 let stopper = registry.stopper(id);
                 registry.own(&stopper, 7);
