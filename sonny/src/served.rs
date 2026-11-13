@@ -2006,7 +2006,7 @@ pub fn stop() {
 
 /// The error codes `sonny tool` answers with, as static names.
 fn code(said: &str) -> &'static str {
-    const CODES: [&str; 22] = [
+    const CODES: [&str; 23] = [
         "not_in_folder",
         "no_caller",
         "invalid_arguments",
@@ -2023,6 +2023,7 @@ fn code(said: &str) -> &'static str {
         "margin_full",
         "margin_note_too_long",
         "margin_unread",
+        "margin_template",
         "not_marked",
         "commons_refused",
         "ask_refused",

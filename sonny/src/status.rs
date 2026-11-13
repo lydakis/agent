@@ -111,6 +111,20 @@ pub fn group(state: &str, running: bool, asking: bool, done: bool) -> Group {
     }
 }
 
+/// The tasks among `rows`, as a template note's `tasks()` gives them:
+/// each its name, agent, state, group (`needs_you`, `working`, `idle`,
+/// `done`), whether a turn runs, its pull request and latest step.
+pub fn tasks(rows: &[Row]) -> Vec<serde_json::Value> {
+    (rows.iter())
+        .filter(|row| row.name != "lead")
+        .map(|row| {
+            serde_json::json!({"name": row.name, "agent": row.bot, "state": row.state,
+                "group": row.group.key(), "running": row.running, "pr": row.pr,
+                "latest": row.latest, "seconds": row.seconds})
+        })
+        .collect()
+}
+
 /// The pull request `text` links last, as `owner/repo#N`: a GitHub pull
 /// or a GitLab merge request.
 pub fn pull_request(text: &str) -> Option<String> {
