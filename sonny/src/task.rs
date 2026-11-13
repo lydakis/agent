@@ -326,17 +326,13 @@ pub fn start(here: &Path, project: &str, starter: &str, start: &Start) -> Result
         for key in kept_keys() {
             setup.env_remove(key);
         }
-        let ran = setup
+        setup
             .current_dir(&place.dir)
             .env("AGENT_SOURCE", &at)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                let tail = child.stderr.take().map(tail).unwrap_or_default();
-                Ok((child.wait()?, tail))
-            });
+            .stderr(Stdio::piped());
+        let ran = run_keeping_tail(&mut setup);
         match ran {
             Ok((status, _)) if status.success() => {}
             Ok((_, tail)) => {
@@ -1703,12 +1699,48 @@ fn provider_keys(specs: &str) -> Vec<String> {
         .collect()
 }
 
+/// Run `command`, its errors piped, to its exit, with the last lines of
+/// its errors ([`tail`]). A process it leaves running in the background
+/// may hold the pipe open for as long as it runs: once `command` exits,
+/// what was read within a second is what is kept, and the reading goes on
+/// in the background until the pipe closes.
+fn run_keeping_tail(
+    command: &mut Command,
+) -> std::io::Result<(std::process::ExitStatus, Vec<String>)> {
+    let mut child = command.spawn()?;
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let (read, done) = std::sync::mpsc::channel::<()>();
+    if let Some(stderr) = child.stderr.take() {
+        let lines = lines.clone();
+        std::thread::spawn(move || {
+            tail_into(stderr, &lines);
+            drop(read);
+        });
+    } else {
+        drop(read);
+    }
+    let status = child.wait()?;
+    let _ = done.recv_timeout(std::time::Duration::from_secs(1));
+    let kept = lines.lock().map(|l| l.iter().cloned().collect());
+    Ok((status, kept.unwrap_or_default()))
+}
+
 /// The last 20 lines with words `stream` writes, each cut to 1000 bytes,
 /// read to its end without keeping the rest.
+#[cfg(test)]
 fn tail(stream: impl std::io::Read) -> Vec<String> {
+    let lines = std::sync::Mutex::new(std::collections::VecDeque::new());
+    tail_into(stream, &lines);
+    lines.into_inner().unwrap().into()
+}
+
+/// [`tail`], kept in `lines` as it is read.
+fn tail_into(
+    stream: impl std::io::Read,
+    lines: &std::sync::Mutex<std::collections::VecDeque<String>>,
+) {
     use std::io::BufRead;
     let mut reader = std::io::BufReader::new(stream);
-    let mut lines = std::collections::VecDeque::new();
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -1721,12 +1753,12 @@ fn tail(stream: impl std::io::Read) -> Vec<String> {
         if text.is_empty() {
             continue;
         }
+        let Ok(mut lines) = lines.lock() else { return };
         if lines.len() == 20 {
             lines.pop_front();
         }
         lines.push_back(text);
     }
-    lines.into()
 }
 
 fn shell_quote(path: &Path) -> String {
@@ -2204,6 +2236,20 @@ mod tests {
             provider_keys("openai=responses,http://x/v1,WORK_KEY local=chat,http://y"),
             ["WORK_KEY"]
         );
+    }
+
+    #[test]
+    fn a_setup_that_leaves_a_process_running_is_not_waited_on() {
+        let started = std::time::Instant::now();
+        let mut setup = Command::new("sh");
+        setup
+            .args(["-c", "sleep 30 & echo broke >&2; exit 3"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let (status, tail) = run_keeping_tail(&mut setup).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!((status.code(), tail), (Some(3), vec!["broke".to_owned()]));
     }
 
     #[test]

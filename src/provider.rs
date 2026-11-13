@@ -1494,8 +1494,10 @@ impl Provider {
             if !quota {
                 reservation.learn(&headers, limits);
             }
-            if matches!(status, 429 | 529) && !quota {
-                refused(&pace, status == 529, retry_after(&headers));
+            if status == 429 && body.ramp {
+                pace.ramp_limited(retry_after(&headers));
+            } else if matches!(status, 429 | 529) && !quota {
+                refused(&pace, status != 429, retry_after(&headers));
             }
             reservation.settle(0);
             let code = if quota {
@@ -2344,6 +2346,9 @@ fn connection_error(error: reqwest::Error) -> Error {
 struct ErrorBody {
     detail: Option<String>,
     quota: bool,
+    /// A refusal for traffic that grew too fast, which Anthropic names
+    /// `ramp_limit_exceeded` in `details.error_code`.
+    ramp: bool,
 }
 
 async fn error_body(response: reqwest::Response) -> Option<ErrorBody> {
@@ -2421,7 +2426,7 @@ fn parse_error_body(body: &[u8], expects_json: bool) -> Option<ErrorBody> {
     match serde_json::from_str::<Value>(text) {
         Ok(value) => Some(ErrorBody {
             // Anthropic's spend cap is a `rate_limit_error` told apart only
-            // by `details.error_code`.
+            // by `details.error_code`, as its ramp limit is.
             quota: [
                 &value["error"]["code"],
                 &value["error"]["type"],
@@ -2429,6 +2434,12 @@ fn parse_error_body(body: &[u8], expects_json: bool) -> Option<ErrorBody> {
             ]
             .iter()
             .any(|field| field.as_str().is_some_and(quota)),
+            ramp: [
+                &value["error"]["code"],
+                &value["error"]["details"]["error_code"],
+            ]
+            .iter()
+            .any(|field| field.as_str() == Some("ramp_limit_exceeded")),
             detail: value
                 .as_str()
                 .or_else(|| value["error"]["message"].as_str())
@@ -2444,6 +2455,7 @@ fn parse_error_body(body: &[u8], expects_json: bool) -> Option<ErrorBody> {
         Err(_) => Some(ErrorBody {
             detail: Some(text.to_owned()),
             quota: false,
+            ramp: false,
         }),
     }
 }
@@ -3669,6 +3681,17 @@ mod tests {
     fn an_error_body_keeps_a_top_level_detail() {
         let body = parse_error_body(br#"{"detail":"Unsupported region."}"#, true).unwrap();
         assert_eq!(body.detail.as_deref(), Some("Unsupported region."));
+    }
+
+    #[test]
+    fn a_ramp_limit_reads_from_the_code_or_its_details() {
+        let nested = br#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down","details":{"error_code":"ramp_limit_exceeded"}}}"#;
+        assert!(parse_error_body(nested, true).unwrap().ramp);
+        let top = br#"{"error":{"code":"ramp_limit_exceeded","message":"slow down"}}"#;
+        assert!(parse_error_body(top, true).unwrap().ramp);
+        let plain =
+            br#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#;
+        assert!(!parse_error_body(plain, true).unwrap().ramp);
     }
 
     #[tokio::test]

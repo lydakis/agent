@@ -5,7 +5,8 @@
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
-    /// Whether finished and waiting work rings. Notifications show either way.
+    /// Whether finished and waiting work rings; off by default.
+    /// Notifications show either way.
     pub chime: bool,
     /// Whether the agent's steps between what is said are drawn, or only
     /// the person's words and the agent's (the default).
@@ -29,6 +30,10 @@ pub struct Settings {
     pub project_colors: bool,
     /// The color each project pins, by project.
     pub project_color: std::collections::BTreeMap<String, String>,
+    /// The person's own margin notes: name, title and template.
+    pub notes: Vec<(String, String, String)>,
+    /// The sources the person set up, by name, for template notes.
+    pub sources: Vec<String>,
 }
 
 impl Default for Settings {
@@ -66,6 +71,12 @@ impl Settings {
             margin_note_lines: sonny.margin_note_lines,
             project_colors: sonny.project_colors,
             project_color: sonny.project_color,
+            notes: (sonny.notes.into_iter())
+                .map(|note| (note.name, note.title, note.template))
+                .collect(),
+            // Only those the person set up keep what they printed for a
+            // blank to read: the commons keeps none.
+            sources: (sonny.sources.into_iter().map(|source| source.name)).collect(),
         }
     }
 
@@ -99,12 +110,13 @@ mod tests {
     fn the_config_says_what_rings_and_what_is_drawn() {
         let sonny = agent_client::config::Sonny::default;
         assert_eq!(Settings::from(sonny()), Settings::default());
-        let quiet = agent_client::config::Sonny {
-            chime: false,
+        assert!(!Settings::default().chime);
+        let loud = agent_client::config::Sonny {
+            chime: true,
             verbose: true,
             ..sonny()
         };
-        let settings = Settings::from(quiet);
-        assert!(!settings.chime && settings.verbose);
+        let settings = Settings::from(loud);
+        assert!(settings.chime && settings.verbose);
     }
 }

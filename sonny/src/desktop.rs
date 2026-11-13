@@ -487,6 +487,9 @@ pub fn tool() -> Option<Value> {
         // The agent's gate judges what acts on the desktop, not the
         // call.
         "steps": true,
+        // A desktop command may run for minutes, so a message for the agent lifts
+        // a call still running past the grace, as it lifts a command.
+        "lift": true,
     }))
 }
 

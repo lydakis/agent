@@ -8,7 +8,7 @@ fastest harness. The [first measurements](RUST_MEASUREMENTS.md) passed it.
 
 ## Build and validate
 
-Development builds use Rust 1.99.1, pinned in `rust-toolchain.toml` with Clippy
+Development builds use Rust 1.100.0, pinned in `rust-toolchain.toml` with Clippy
 and rustfmt. The declared minimum supported Rust version is 1.95, which the
 atomics' `try_update` needs.
 Dependencies are locked; build outputs and the optional repository-local Cargo
@@ -352,8 +352,19 @@ and `threads` now (`/proc/self/status`, or `proc_pidinfo` on macOS) and
 the service loop held each kind of request, by its `op`, from dispatch to its
 answer or its handoff to a reader: `count`, `held_ms`, `slowest_ms`
 and a `held` histogram over the store's `buckets_us`, which it
-reports beside them. One map entry per op the daemon has seen, touched only
-by the loop, so no lock.
+reports beside them, with `waited_ms` and a `waited` histogram, how long
+each request waited for the loop from its line's read to its dispatch.
+One map entry per op the daemon has seen, touched only by the loop, so no
+lock. `loop` reports the same holds for the loop's own work between
+requests: `reap` (a turn's task ended), `start_ready`, `resume`, `wake`,
+`admission` (a queued admission answered), `lapse`, `holds`, `expire` and
+`reload`. `runtime` reports the async runtime's `workers`, `busy_ms` (time
+they ran rather than parked), `parks`, `alive_tasks` and `queued_tasks`,
+kept by tokio as it runs. `hub` counts the events published (`durable`,
+`live`), the copies `delivered` to followers' queues (replayed ones too),
+and the followers `dropped` for falling behind. Each provider pool adds what it did to its
+calls: `admitted`, `waited` (admitted after waiting in the gate) with
+`waited_ms`, `parked`, `closed` (a refusal closed the pool) and `overloads`.
 
 A budget counts one of two measures, named by `budget_counts`: `tokens`, the
 default, is the provider's usage, every call's input and output, the history
@@ -523,6 +534,21 @@ removed `artifact_pruned` (see Retention).
 <a id="retained-outputs"></a>A bot with an `outputs` folder keeps each such
 stream there whole instead, as `TURN-CALL_ID-STREAM`, and its result lists
 those paths as `files` beside `artifacts`, so any command or tool reads them.
+A shell stream that passes 1 MiB is written there as it is read, every byte of
+it, never its first and last 512 KiB alone: memory keeps only what the model is
+shown. Its pieces go through a short line to a writer that writes them in
+batches on blocking workers, so the runtime's thread never waits on the disk
+and a quiet stream holds no worker; a full line makes the command wait, and a
+command that has ended is waited for while its streams wait on the disk. The
+writer redacts as it goes, exactly as the whole would be redacted however the
+stream is cut: each pass (credentials, then secret PEM blocks, then secret
+fields' values) reads the stream byte by byte as it reads a whole text, holding
+only what may still be redacted: the end that may begin a credential, a value
+not yet known to be secret (past 1 MiB it is told as redacted). A secret
+block's body and a secret value are dropped as they come. A stream stops being written at
+1 GiB, and its result says how many bytes the file holds and how many it does
+not. A stream within 1 MiB never reaches the writer: its file is written once,
+after the command, as below.
 The store keeps one row per stream naming the file and none of its bytes
 (schema 68), and `artifact` and `read artifact=` read the file. Each file is
 made new (0600, never through a link) and synced with its folder before the
@@ -535,8 +561,11 @@ removes them. Retention and deletion remove a turn's files once removing its
 records commits; a file removed by hand reads `artifact_not_found`. A daemon
 that dies between writing a file and recording its call leaves the file, which
 no record names.
-Line pages are assembled on the storage worker; only the bounded page crosses
-into the async runtime. Byte-oriented protocol pages continue to use SQL slicing.
+Line pages of a stored copy are assembled on the storage worker; only the
+bounded page crosses into the async runtime. A file's line pages are read on a
+blocking worker a line at a time, up to the page and counted past it, so a file
+of a gigabyte is never held whole. Byte-oriented protocol pages continue to use
+SQL slicing, or read the file's page alone.
 
 ## Limits
 
@@ -602,7 +631,7 @@ when it sets either.
 | `speed` (`--speed`) | The tier the bot's own model's calls are served at: `standard`, `fast` or `ultrafast`, each faster one at a higher price per token. A call sends it only to a model that serves it, and runs at standard on any other, as Codex sends a service tier only where its model catalog lists it; the setting is kept as asked, so a bot moved to a model that serves it gets it back. Which model serves which tier is the daemon's list of exact model ids (never read from a name), or the person's `serve --speeds`, announced in `ready` (see [providers](#providers)). The Claude API serves `fast`, its fast mode (sent as `speed` with the `fast-mode-2026-02-01` beta) on Fable 5.2, Mythos 5.2 and Opus 5.5, and on Opus 5 and Opus 4.8 in research preview: twice the price or more, its own rate limit, so its own pool, which learns `anthropic-fast-input-tokens-*` and `anthropic-fast-output-tokens-*`; Bedrock serves Claude at standard only (Claude's fast-mode guide, read 2026-11-10). Each list claims only what its endpoint, region and sign-in are documented to serve. OpenAI's API on a key serves `fast` (sent as `service_tier: priority`) on the models Codex's bundled catalog gives priority, and `ultrafast` on GPT-6.1 Sol and GPT-6 Astra; the ChatGPT sign-in serves what Codex's bundled catalog lists for it, `fast` on those models and no `ultrafast`. Bedrock serves those two `ultrafast` alone, through their `us.` and `global.` profiles in any region, and under their bare `openai.` ids on Mantle in us-east-1 only (Codex's Bedrock catalogs, and Bedrock's model cards). Each call's `usage` event says the tier that served it. A call the provider refuses for its tier (a 400 that names the field or the value sent) fails as `provider_speed_refused`, its detail and facts naming the provider, model, region (Bedrock's, else null) and speed; it is never retried at standard nor run there in its place. Switching it misses the prompt cache once. Calls on another model (a `compaction_model`, a fallback) go at standard. `inspect` reports the setting, `standard` when unset. | `standard` |
 | `sandbox` (`--sandbox`) | How the bot's commands, writes and edits are confined, by Codex's names: `read-only`, `workspace-write` or `danger-full-access` (see [sandbox](#sandbox)). | none |
 | `writable` (`--writable`, repeatable) | Absolute folders a `workspace-write` bot may write besides its own; each must exist and is stored by its real path. At most 64, 32 KiB as JSON. | none |
-| `network` (`--network`) | A `workspace-write` bot's commands may use the network. | off |
+| `network` (`--network`) | A `workspace-write` bot's commands may use the network. Off, or in `read-only`, the bot is neither offered nor runs `web_fetch` or `web_search` (see [sandbox](#sandbox)). | off |
 | `hold_ms` (`--hold`) | How long a turn waits on a cause a person can fix (a sign-in, a key, a usage limit, a provider down or not set up) before it fails with it ([held turns](#held-turns)), up to 365 days; 0 fails at once. `hold = "5d"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | 5 days |
 | `hide_senders` (`--hide-senders`) | Its model reads what other bots and clients send it without the line naming the sender (see [fleet controllers](#fleet-controllers)); `senders = "hidden"` in `~/.agent/config.toml` sets it on the bots the CLI and Sonny make. | off |
 | `quiet_background` (`--quiet-background`) | The end of a background command no wait collected is left for a wait, untold (see [deferred tool results](#deferred-tool-results)): for a client that collects results itself. Protocol 46. | off |
@@ -1277,8 +1306,9 @@ every background command (whose handle then answers `daemon_paused`, saying
 the same), terminal, and detached command this
 daemon started (the process group each leads, with what it left running
 there after it exited, and on Linux a sandboxed one's whole pid namespace;
-one started before a restart, or an unsandboxed process that left that
-group, is no longer the daemon's to find), and from
+a detached command an earlier daemon started too, found again by its row;
+an unsandboxed process that left that group is no longer the daemon's to
+find), and from
 then no turn starts: a `reject`
 submission answers `daemon_paused`, `queue` and `steer` submissions are
 recorded and wait, automations' runs and notes with them, and parked and paced turns
@@ -1820,7 +1850,7 @@ none for a person's) and, in `prompts`, its `text` within the read's
 and their prompt says `quotes_more` and `truncated`; Sonny's approver reads a quote of the person's own words as
 consent only in a prompt the person sent, and any other as asking for
 nothing.
-`{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
+`{"op":"prompts","bot","turn","bytes"?,"persons"?,"persons_each"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with
 `from` or `origin`, and `prompts_more` when steers were left out; the calls it started, each with its argument preview,
@@ -1848,7 +1878,19 @@ answers. Refused calls and
 their own, so a long prompt still leaves the calls (and the files they
 wrote) to read. Text that does not fit is cut and marked
 `truncated`, and each steer, call, and earlier prompt also counts 64
-bytes, so many short entries stay within `bytes` too. A fork keeps the source's binding, instructions,
+bytes, so many short entries stay within `bytes` too. With `persons`
+(bytes, at most 256 KiB), the read also lists the person's own earlier
+words to the bot under `persons`, as Codex's reviewer keeps every message
+its person wrote apart from the transcript: the messages it took in
+before the turn that no bot, client or other person wrote, newest first,
+each `{message, text, steer?}` whole within `persons_each` bytes (all of
+`persons` when absent; Sonny's reviewer asks 3,600, Codex's 900 tokens)
+or left out whole, with `persons_more` when some were left out
+(protocol 71). They have their own budget, so notes a client sent never
+crowd the person's words out of `earlier`; a partial index
+(`messages_persons`) keeps the read to the person's messages alone, at
+most 256 of them are looked at, and one whose length alone is past
+`persons_each` is passed over unread. A fork keeps the source's binding, instructions,
 and tools, and takes no text of its own; the source is never changed. Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
 and turn IDs, not the illustrative numbers. Names are immutable bot identities
 within one store; rename/alias operations are not implemented. A fork starts
@@ -2407,6 +2449,28 @@ detail, so a reader that only says how many are held, as Sonny's alerts
 do, reads one page whatever the fleet's size (protocol 48; before, one
 answer held every turn and went past the frame limit near 6,000 agents).
 A page is bounded by bytes too, as `pauses` pages are.
+`{"op":"processes","bot":NAME?,"after":CURSOR?}` lists what runs for `bot`, a name or a
+GLOB pattern of names, or for every bot (protocol 72): each background
+command, terminal and detached command still running, and each call a
+message lifted that waits on, by bot and oldest first, as `{processes:
+[{handle, bot, turn, call_id, kind, command, started_ms, pid}]}`. `kind` is `background`,
+`terminal`, `detached` or `call`; `command` is the command's first 512
+bytes (a lifted call's, or its tool's name); `pid` is a detached
+command's, which leads its session and process group, so it is the one
+pid outside a sandbox's namespace that names it. The rows come from the
+running rows' partial index, so the read costs what runs, not the
+history. A page holds at most 128; when more follow, `next_after` is the
+last row's `{bot, handle}`, passed back as `after` for the next page. It
+places the next page whether or not that row is still there, so a command
+that ends between pages, its row pruned with its turn, does not break the
+listing. `{"op":"stop_process","bot":NAME,"handle":"proc:N"}` stops it as
+its agent's `write_stdin` with `kill: true` does and answers as that does,
+`{handle, stopped: true, ran}`; a handle that is not a command of that
+bot's still running answers `process_not_running`. `agent ps [--bot NAME]`
+and `agent stop --bot NAME proc:N` send them, and Sonny's `/ps` lists the
+project's and stops one. A bot whose command still runs is not deleted
+(`bot_busy`, naming the two requests): nothing an agent started runs
+untracked.
 `{"op":"retry_held","bot":NAME?}` tries every held turn again now,
 or only `bot`'s, and answers `{retried: N}`; a sandboxed bot's own socket
 refuses it with `not_permitted`, since what held the turn is the person's to
@@ -2742,7 +2806,13 @@ names one, of up to a day: as Codex's unified exec runs a command, it runs
 until it exits, `write_stdin` with `kill: true` on its handle stops it, or
 the daemon stops, and only a `timeout_ms` it was given ends it with
 `timed_out`. A command a steer moves to the background keeps the timeout it
-started with. Commands are at
+started with. Each bot keeps at most `--max-processes` background commands
+(64 by default, Codex's number for a session's processes), steered ones
+included: starting one past them kills the one the bot started or waited on
+least recently, as Codex prunes, and its handle says it was killed for that
+(`stopped`), so a bot that loses track of what it started cannot hold the
+whole bound forever. Another bot's commands and detached commands never
+count, and with no bound (`--max-processes 0`) nothing is pruned. Commands are at
 most 16 KiB. At most `--max-processes` child processes run at once across the
 service, foreground or background; waiting never counts. Background commands
 the service has accepted but not started are bounded by the same number: when
@@ -2754,10 +2824,11 @@ counts it (one counter, one comparison per accepted command). `stats` reports
 it as `queued_processes`, a subset of `running_processes`, which counts every
 accepted background command whose result is not yet recorded and every
 foreground command running now. stdout and stderr are each
-retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
-omission stated and the full stream is stored as an artifact retrievable through
-the `artifact` operation, or written to the bot's `outputs` folder (see
-[retained outputs](#retained-outputs)). Output is redacted before it is stored or sent,
+retained up to 1 MiB, past that their first and last 512 KiB; beyond 64 KiB the
+model receives a head and tail with the omission stated and the retained stream
+is stored as an artifact retrievable through the `artifact` operation. A bot with
+an `outputs` folder keeps the whole stream there instead, written as the command
+runs, up to 1 GiB (see [retained outputs](#retained-outputs)). Output is redacted before it is stored or sent,
 artifacts included, as every tool's result is: each credential the daemon
 holds, wherever it appears; the value printed after a field name ending in
 one the daemon was started with (`--redact-field`, any case, with or without
@@ -2776,11 +2847,27 @@ timeout is a result, not an error: the output written before the kill, with
 often what the model needs next. Background commands are killed when the
 daemon stops. `detach: true` is the way to leave a service running: the
 command starts in a new session with stdin, stdout and stderr on
-`/dev/null`, and the call returns its pid at once. The daemon writes no log
+`/dev/null`, and the call returns `{handle, detached: true, pid}` at once,
+a `proc:N` handle like a background command's. The daemon writes no log
 for it, since such a file would hold output that never passed credential
-redaction; a command that wants its output redirects it to a file itself. No process slot, timeout, group kill, or
-handle applies to it, so it outlives the turn and the daemon and is outside
-`--max-processes`; stopping it is the bot's job. What does bound it is
+redaction; a command that wants its output redirects it to a file itself. No process slot, timeout, or
+group kill at the call's end applies to it, so it outlives the turn and the daemon and is outside
+`--max-processes`. Its handle is tracked as a background command's is
+(protocol 72, schema 97), as Codex tracks every command it leaves
+running: `write_stdin` with `kill: true` on it, or `stop_process`, ends
+its process group (and on Linux a sandboxed one's pid namespace), `wait`
+on it reports how it ended, and its end is told as a background command's
+once nothing it left in its group runs, `{exit_code, success,
+wall_time_ms}` by its leader's exit. Its row records its pid and when
+that leader started (`/proc` `starttime` on Linux, `proc_pidinfo` on
+macOS), so a daemon started later watches it again and stops it by its
+handle when its leader still runs and started then. A group whose leader
+has gone is not taken for it, since while no daemon watched the group may
+have ended and its id gone to another: such a command, like one that
+ended, is recorded ended then, with `exit_code: null`, and told, and what
+it left running is no longer tracked. A command found again keeps its
+place under `--max-lasting` even past a bound lowered meanwhile: no new
+one starts until enough end. What does bound it is
 `--max-lasting`, shared with terminals as a systemd slice holds a
 service's processes: each detached command retains a slot until its async
 waiter has reaped it and nothing it left in its process group runs (a
@@ -2808,10 +2895,12 @@ until the command ends or the read's time runs out, and the read's result is
 what the command wrote meanwhile. A steer waiting for the boundary keeps the
 read live. Output merges stdout and stderr, as a terminal
 does, keeps its last 64 KiB unread, counting what it drops, and is redacted
-like any other; a secret field's value, cut off at the end of a read, waits
-for the next one so it is redacted whole, while its name and separator are
-shown at once, so a prompt such as `Password: ` reaches the bot, and the
-next read is redacted as read after them. A
+as one stream across its reads, exactly as the whole would be however the
+reads cut it, as a [retained output's](#retained-outputs) file is: what may
+still be redacted (the end that may begin a credential, a value not yet
+known to be secret) waits for the next read, while a field's name and
+separator are shown at once, so a prompt such as `Password: ` reaches the
+bot. A
 terminal takes no process slot and no timeout: it runs until
 it exits or is killed, across turns, and `wait` on its handle reports how it
 ended, with what no write read. It takes a `--max-lasting` slot before it
@@ -2868,8 +2957,12 @@ what is inside it. One whose config is missing, turns on per-worktree config
 or includes other files stays read-only as a whole, since git reads those
 files wherever they are made, and nothing inside it is held in place, so no
 placeholder is made there. Network is
-off unless `network` is set. `danger-full-access`, or no `sandbox`, runs
-unconfined.
+off unless `network` is set, and a bot kept off it (`read-only`, or
+`workspace-write` without `network`) is neither offered nor runs
+`web_fetch` or `web_search`, which the daemon and the provider would
+reach past its sandbox: the tools stay its own, and it is offered them
+again from the call after its network is set. `danger-full-access`, or no
+`sandbox`, runs unconfined.
 
 A Unix socket is a way out of any sandbox: a program listening on one runs
 what it is asked outside, as a browser's daemon launches a browser or Docker
@@ -2919,7 +3012,7 @@ command reaches another bot's. A request on it:
 | `audit_trim` | `not_permitted`: the audit trail is the person's record of what agents did |
 | `create`, `fork` | Made by the caller, whatever `created_by` names (another is `not_permitted`), so the bot inherits its sandbox; its workspace and `writable` folders, and a fork's source's, must be ones the caller may write. A fork with `allow: []`, which only answers, may be of any bot |
 | `submit` | Reads as the caller's: `from` its turn when the request names it (the CLI does, from `AGENT_TURN`), else with its name as `origin`; `from` naming another bot is `not_permitted`. A workspace for a sandboxed bot must be one the caller may write |
-| `delete`, `prune`, `compact`, `interrupt` | The caller itself, or a bot it made; another is `not_permitted` |
+| `delete`, `prune`, `compact`, `interrupt`, `stop_process` | The caller itself, or a bot it made; another is `not_permitted` |
 | Everything else | As on the daemon's socket |
 
 The folder of these sockets stays read-only in every root, so no bot can
@@ -3278,12 +3371,36 @@ model can act on it; the service wakes a parked one then from its own
 schedule, so a waiting call costs a row and no timer. A later call's gate that
 lapses first ends the wait as `tool_unserved` and the turn as it ends one
 waiting on a verdict. A message that joins the turn lifts the wait as it
-lifts a verdict's (see [tool approval](#tool-approval)): the call becomes a
+lifts a verdict's (see [tool approval](#tool-approval)) when the tool is
+declared with `lift` (protocol 70, below) or a step of the call waits on a
+gate: the call becomes a
 `proc:` handle answered `"waits_for":"answer"`, its client still lists,
 takes and answers it, and the answer ends the command, told as
-`{"answer": TEXT}`. An interrupt ends the call as cancelled, like any
+`{"answer": TEXT}`. Any other call keeps the message for its answer. An interrupt ends the call as cancelled, like any
 running call. A call that does not fit its
 parameters is refused at once and waits for no answer.
+
+Protocol version 70 adds `lift` to a tool a client answers (only with
+`answered_by`; `invalid_declare` otherwise), default `false` and reported
+only when `true`. Protocol 64 let a steer lift every call waiting for its
+client's answer, so a client's quick tools (a note, a memory, a reaction)
+came back as `proc:` handles whenever a message arrived, each needing a
+`wait` call, and a refusal could reach the agent only after it had moved
+on. Codex never moves a running tool aside for a new message: the message
+waits for the call to return, and a long command yields on its own. Now a
+steer lifts a call its client answers only when the tool is declared with
+`"lift": true`, a tool whose calls may run for minutes or wait on a person
+(Sonny marks `exec`, `browser` and `desktop`), and only once the call has
+waited the 250 ms grace a foreground `shell` command gets; or, at once,
+when a step of the call waits on a gate, since that is a wait for a
+verdict, which a steer always lifts. Any other call is answered first and
+the steer joins the turn at the next boundary. A call of a tool that
+lifts holds live for the whole grace, whatever the bot's
+`approval_hold_ms`, so it never parks inside it and is lifted live rather
+than parked and woken again; parked, a steer resumes the turn only when the call
+lifts, and a step that starts waiting on a gate while a steer waits wakes
+it (or the live turn) then. Calls waiting for their approval, and `shell`
+commands, are lifted as before.
 
 Protocol version 22 lets a declared tool take free-form text, as
 `apply_patch` does: a tool declared with `grammar`, a Lark grammar its
@@ -3415,9 +3532,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   and resumes the turn only if it parked on that call and the call is now
   decided; a verdict for a call after a `wait` waits in the store.
 - **A message lifts the wait** (protocol 64, schema 91). A steer that
-  joins the turn while a call waits for its verdict, held live (after the
-  same 250 ms grace a foreground `shell` gets) or parked, wakes the turn
-  and lifts the call: one commit writes a `processes` row for it, gives
+  joins the turn while a call waits for its verdict, held live or parked,
+  wakes the turn and lifts the call (a call its client answers only as
+  protocol 70 says, under [answered tools](#declared-tools)): one commit writes a `processes` row for it, gives
   its request `process` (an indexed column), and answers the call with
   `{"handle":"proc:N","background":true,"steered":true,"waits_for":"approval"}`,
   so the round goes on and the turn reads the message. `call_lifted`

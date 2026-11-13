@@ -53,6 +53,46 @@ pub fn submitted(pictures: &[Picture]) -> Option<serde_json::Value> {
     })
 }
 
+/// A composer's words and the pictures behind their placeholders, as a
+/// window kept for the window it becomes after an update: one JSON
+/// object, `{"text", "pictures"}`, each picture in its place (`null` for
+/// one the words no longer show). Read by the next release, so it keeps
+/// this shape.
+pub fn draft(text: &str, pictures: &[Option<Picture>]) -> String {
+    use base64::Engine;
+    let pictures = (pictures.iter().enumerate())
+        .map(|(at, picture)| match picture {
+            Some(p) if text.contains(&placeholder(at + 1)) => serde_json::json!({
+                "media_type": p.media_type,
+                "data": base64::engine::general_purpose::STANDARD.encode(&p.data),
+            }),
+            _ => serde_json::Value::Null,
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({"text": text, "pictures": pictures}).to_string()
+}
+
+/// What [`draft`] kept: the words, and the pictures in their places.
+pub fn undraft(kept: &str) -> (String, Vec<Option<Picture>>) {
+    use base64::Engine;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(kept) else {
+        return (kept.to_owned(), Vec::new());
+    };
+    let text = value["text"].as_str().unwrap_or_default().to_owned();
+    let pictures = (value["pictures"].as_array().into_iter().flatten())
+        .map(|picture| {
+            let media_type = ["image/png", "image/jpeg", "image/gif", "image/webp"]
+                .into_iter()
+                .find(|known| picture["media_type"].as_str() == Some(known))?;
+            let data = (base64::engine::general_purpose::STANDARD)
+                .decode(picture["data"].as_str()?)
+                .ok()?;
+            Some(Picture { media_type, data })
+        })
+        .collect();
+    (text, pictures)
+}
+
 /// The image files a paste names, when every word of it is one that is
 /// there: what a terminal pastes for files dropped on it, with spaces
 /// escaped or quoted, or as `file://` addresses.
@@ -231,6 +271,24 @@ fn from_hex(hex: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_draft_keeps_its_words_and_the_pictures_they_show() {
+        let png = Picture {
+            media_type: "image/png",
+            data: vec![1, 2, 3],
+        };
+        let jpeg = Picture {
+            media_type: "image/jpeg",
+            data: vec![4],
+        };
+        let pictures = [Some(png.clone()), Some(jpeg), None];
+        // The second picture's placeholder was deleted: it is let go.
+        let kept = draft("look at [Image #1]", &pictures);
+        let (text, back) = undraft(&kept);
+        assert_eq!(text, "look at [Image #1]");
+        assert_eq!(back, vec![Some(png), None, None]);
+    }
 
     #[test]
     fn dropped_files_read_as_their_paths() {
