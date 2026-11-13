@@ -105,6 +105,14 @@ its reply. It counts every request's input, the agent's history included, so
 a cap below that history ends every run on its first reply: set one only when
 the person asks for a spending limit.
 
+When a run starts by reading data a source of the person's or a file
+already holds, add it with `live` and put that data in the message as
+blanks, as a live memory fact does: `{{ source('ci').latest.text }}`,
+`{% for pr in source('prs').topics %}...{% endfor %}`, `{{ file('state.json')
+| fromjson }}` read from your folder, `{{ now() | time }}`. Each run then
+starts with the data as it is when it fires, and spends no calls fetching
+it. A message whose blanks do not fill goes as written, with why under it.
+
 ## Monitors
 
 A monitor is a job that watches something for a lead, such as a team

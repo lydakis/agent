@@ -54,6 +54,14 @@ const BOT_APPROVALS: &str = "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a
        AND a.turn IS NOT b.running_turn
      ORDER BY 1 LIMIT ?3";
 
+/// A retained stream for the model's `read`: a page of the store's copy,
+/// or the path of the file that holds it, for the caller to page.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ArtifactLines {
+    Page(String),
+    File(String),
+}
+
 /// How a bot's newest turn that counts ended: one that ran, or one that
 /// failed before it started. A message steered into a running turn, one
 /// riding the next call, and one cancelled while it waited in line never
@@ -595,6 +603,13 @@ impl Settings {
 const INHERITED: [&str; 2] = ["rules", "env"];
 /// The settings that make a bot's sandbox, which change together.
 pub const SANDBOX: [&str; 4] = ["sandbox", "writable", "network", "unix_sockets"];
+
+/// Whether the daemon's tool `name` reaches the web past a bot's sandbox:
+/// `web_fetch`, which the daemon answers, and `web_search`, which the
+/// provider does.
+pub fn web(name: &str) -> bool {
+    matches!(name, "web_fetch" | "web_search")
+}
 /// Every setting's name, as `create` and `configure` take it.
 pub const SETTINGS: [&str; 23] = [
     "context_bytes",
@@ -1001,7 +1016,37 @@ impl Bot {
     }
     /// Whether the bot may call `name`, the daemon's tool or a declared one.
     pub fn may_call(&self, name: &str) -> bool {
+        self.calls(name) || self.declared(name).is_some()
+    }
+    /// Whether `name` is among what the bot may call, whatever its sandbox
+    /// allows now: a web tool an offline bot keeps counts, so a fork's
+    /// allowed list may name it and gets it when the network is set.
+    pub fn entitled(&self, name: &str) -> bool {
         self.callable().iter().any(|tool| tool == name) || self.declared(name).is_some()
+    }
+    /// Whether the bot may call the daemon's tool `name` now: one it may
+    /// call, unless its sandbox keeps it off the network and the tool
+    /// reaches the web, which the daemon and the provider would reach for
+    /// it past the sandbox.
+    pub fn calls(&self, name: &str) -> bool {
+        self.callable().iter().any(|tool| tool == name) && !(self.offline() && web(name))
+    }
+    /// Whether its sandbox keeps it off the network: a read-only one, or a
+    /// workspace-write one without the network.
+    pub fn offline(&self) -> bool {
+        self.sandboxed() && !self.settings.network
+    }
+    /// Its tools as offered to the model now: [`Bot::calls`]'s, so an
+    /// offline bot is offered no web tool, from its next call on.
+    pub fn offered(&self) -> std::borrow::Cow<'_, [String]> {
+        match self.offline() && self.tools.iter().any(|tool| web(tool)) {
+            true => (self.tools.iter())
+                .filter(|tool| !web(tool))
+                .cloned()
+                .collect::<Vec<_>>()
+                .into(),
+            false => self.tools.as_slice().into(),
+        }
     }
     /// The bot id that keys this bot's provider prompt cache.
     pub fn cache_bot(&self) -> i64 {
@@ -2554,12 +2599,69 @@ fn stored_entry(
     event
 }
 
+/// What a process row runs: a background command, a terminal, or a
+/// detached command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessKind {
+    Background,
+    Terminal,
+    /// What finds it again is recorded once it starts (`process_detached`).
+    Detached,
+}
+impl ProcessKind {
+    fn name(self) -> &'static str {
+        match self {
+            ProcessKind::Background => "background",
+            ProcessKind::Terminal => "terminal",
+            ProcessKind::Detached => "detached",
+        }
+    }
+}
+
+/// A detached command an earlier daemon started, as its row keeps it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetachedRow {
+    pub id: i64,
+    pub bot: String,
+    pub turn: i64,
+    pub call_id: String,
+    pub detached: crate::tools::Detached,
+    pub sandboxed: bool,
+    pub started_ms: i64,
+}
+
+/// The most of a command a process row keeps, to list it by: its start.
+const LISTED_COMMAND_BYTES: usize = 512;
+
+/// Running commands a `processes` page lists at most: each row's command
+/// is cut to `LISTED_COMMAND_BYTES`, so a page stays well inside the
+/// largest response the socket sends however its text is escaped.
+pub const PROCESSES_PAGE: i64 = 128;
+
+/// One page of `processes`: the rows, and the handle the next page
+/// follows, when there is one.
+#[derive(Debug, serde::Serialize)]
+pub struct ProcessesPage {
+    pub processes: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<Value>,
+}
+
+/// The start of `command` a process row keeps, cut at a character.
+pub fn listed_command(command: &str) -> &str {
+    let mut end = command.len().min(LISTED_COMMAND_BYTES);
+    while !command.is_char_boundary(end) {
+        end -= 1;
+    }
+    &command[..end]
+}
+
 impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning, stores at versions 1 to 5 and stores from newer
     /// binaries are rejected; an older store from version 6 on is migrated
     /// forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 96;
+    pub const SCHEMA: i32 = 97;
     /// The person's messages a compaction keeps verbatim, newest first:
     /// per-message text, and the total text plus `(ordinal, String)` entry
     /// metadata. Empty entries cost space too, so the retained list cannot
@@ -2771,6 +2873,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS messages_queued ON messages(bot,id) WHERE status='queued';
             CREATE INDEX IF NOT EXISTS messages_steers ON messages(bot,id) WHERE status='queued' AND delivery='steer';
             CREATE INDEX IF NOT EXISTS messages_attached ON messages(bot,id) WHERE status='attached';
+            CREATE INDEX IF NOT EXISTS messages_persons ON messages(bot,id)
+                WHERE status='taken' AND from_bot IS NULL AND origin IS NULL AND person IS NULL;
             CREATE INDEX IF NOT EXISTS messages_due ON messages(due_ms) WHERE status='attached' AND due_ms IS NOT NULL;
             CREATE INDEX IF NOT EXISTS messages_held ON messages(due_ms) WHERE status='ready' AND held IS NOT NULL;
             CREATE INDEX IF NOT EXISTS messages_ready ON messages(id) WHERE status='ready';
@@ -2835,7 +2939,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS answers_paused ON answers(turn) WHERE paused_ms IS NOT NULL;
             CREATE TABLE IF NOT EXISTS processes(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER, told INTEGER, bot TEXT,
-                call TEXT);
+                call TEXT, kind TEXT, command TEXT, started_ms INTEGER, detached TEXT);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
             CREATE INDEX IF NOT EXISTS processes_untold ON processes(bot,id)
                 WHERE told IS NULL AND delivered IS NULL AND status<>'running';
@@ -2874,8 +2978,10 @@ impl Database {
         // does not prove the OS process stopped; never reuse its handle. A
         // call a message lifted, still waiting on its verdict or answer, is
         // a row and nothing running: it waits on.
+        // A detached command outlives the daemon by design: the daemon
+        // that opens the store looks for it again (`detached_running`).
         conn.execute(
-            "UPDATE processes SET status='lost',result=? WHERE status='running'
+            "UPDATE processes SET status='lost',result=? WHERE status='running' AND detached IS NULL
              AND id NOT IN (SELECT process FROM approvals INDEXED BY approvals_lifted WHERE process IS NOT NULL)
              AND id NOT IN (SELECT process FROM answers INDEXED BY answers_lifted WHERE process IS NOT NULL)",
             [json!({"error":"process_lost"}).to_string()],
@@ -3206,8 +3312,9 @@ impl Database {
 
     /// The bot's turn parked on a wait of its own while a steer waits for
     /// it, with the newest queued steer: the steer wakes it. A `wait`'s
-    /// handles are reported pending; a call waiting on its verdict or its
-    /// client's answer is lifted to the background. The daemon's load gate
+    /// handles are reported pending; a call waiting on its verdict, or on
+    /// its client's answer when that lifts (see `wake`), is lifted to the
+    /// background. The daemon's load gate
     /// or a closed pool is not the bot's own wait, so neither is woken.
     pub fn steered_park(&self, name: &str) -> Result<Option<(i64, i64)>> {
         let parked: Option<i64> = self
@@ -8961,11 +9068,13 @@ impl Database {
         ])?;
         let approval = tx.last_insert_rowid();
         tag_approval(&tx, approval, turn, &gates)?;
-        tx.prepare_cached(
-            "UPDATE answers SET paused_ms=MAX(expires_ms-?,0)
-             WHERE turn=? AND call_id=? AND paused_ms IS NULL",
-        )?
-        .execute(params![now_ms as i64, turn, call_id])?;
+        let paused = tx
+            .prepare_cached(
+                "UPDATE answers SET paused_ms=MAX(expires_ms-?,0)
+                 WHERE turn=? AND call_id=? AND paused_ms IS NULL",
+            )?
+            .execute(params![now_ms as i64, turn, call_id])?
+            == 1;
         let tags: Vec<&str> = gates.iter().map(|g| g.tag.as_str()).collect();
         let data = json!({"calls":[{"call_id":id,"step_of":call_id,"request":1,
             "announced_ms":now_ms,"gates":tags,"name":tool,"node":0}]});
@@ -8996,13 +9105,18 @@ impl Database {
             .push(Served::new(&bot.name, turn, cursor, vec![judged], None));
         self.approvals += 1;
         self.steps.insert(approval, turn);
+        // The call now waits on a verdict, which a message for its turn
+        // lifts: the turn hears so, live or parked, if one waits.
+        let steered =
+            paused && !lifted && bot.running_turn == Some(turn) && self.joining_steer(&bot.name)?;
         Ok(Stepped {
             step: Step::Pending {
                 approval,
                 expires_ms,
             },
-            notify: None,
-            wake: false,
+            notify: (steered && bot.status == "running")
+                .then(|| self.live.entry(turn).or_default().notify.clone()),
+            wake: steered && bot.status == "waiting",
             lifted: None,
         })
     }
@@ -10058,10 +10172,38 @@ impl Database {
     /// `calls_more`, and `more` say older steers, calls, and earlier prompts
     /// were left out.
     pub fn prompts(&self, name: &str, turn: i64, bytes: usize) -> Result<Value> {
-        if !(1..=Self::PROMPTS_BYTES).contains(&bytes) {
+        self.prompts_and_persons(name, turn, bytes, 0, 0)
+    }
+    /// [`Self::prompts`], and with `persons` above 0 the person's own
+    /// earlier words to the bot, as Codex's reviewer keeps every message
+    /// its person wrote in the session apart from the transcript: the
+    /// messages it took in before the turn that no bot, client or other
+    /// person wrote, newest first, each with its number, whole within the
+    /// caller's `each` bytes (all of `persons` when 0) or left out whole,
+    /// their text counting against `persons` and each `PROMPTS_ENTRY`.
+    /// `persons_more` says some were left out. Their own budget, so others'
+    /// words before the turn, such as notes a client sent, never crowd the
+    /// person's out; those listed under `earlier` are listed again. At most
+    /// `PROMPTS_SCANNED` of the person's messages are looked at, and one
+    /// whose length alone puts it past `each` is not read.
+    pub fn prompts_and_persons(
+        &self,
+        name: &str,
+        turn: i64,
+        bytes: usize,
+        persons: usize,
+        each: usize,
+    ) -> Result<Value> {
+        if !(1..=Self::PROMPTS_BYTES).contains(&bytes)
+            || persons > Self::PROMPTS_BYTES
+            || each > Self::PROMPTS_BYTES
+        {
             return fail_with(
                 "invalid_limit",
-                format!("bytes from 1 to {}", Self::PROMPTS_BYTES),
+                format!(
+                    "bytes from 1 to {0}, persons and persons_each from 0 to {0}",
+                    Self::PROMPTS_BYTES
+                ),
             );
         }
         let row = self
@@ -10323,11 +10465,75 @@ impl Database {
                 }
             }
         }
-        Ok(
-            json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
-            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,
-            "written":written,"written_more":written_more,"earlier":earlier,"more":more}),
-        )
+        let mut read = json!({"bot":name,"turn":turn,"status":turn_status_name(&status),
+            "workspace":workspace,"prompts":prompts,"prompts_more":prompts_more,"calls":calls,
+            "calls_more":calls_more,"written":written,"written_more":written_more,
+            "earlier":earlier,"more":more});
+        if persons > 0 {
+            let each = if each == 0 { persons } else { each };
+            let (said, more) = self.persons(name, turn, persons, each)?;
+            read["persons"] = json!(said);
+            read["persons_more"] = json!(more);
+        }
+        Ok(read)
+    }
+    /// The person's own words to `name` before `turn` that fit `left`,
+    /// each within `each` bytes, newest first, and whether any were left
+    /// out: by the partial index of the person's messages, so the read
+    /// walks theirs alone, and at most `PROMPTS_SCANNED` of them. A
+    /// message's length is read before its words, so one too long is
+    /// passed over unread: its characters, which its bytes are at least,
+    /// from the message or its node's opening.
+    fn persons(
+        &self,
+        name: &str,
+        turn: i64,
+        mut left: usize,
+        each: usize,
+    ) -> Result<(Vec<Value>, bool)> {
+        let mut listed = self.conn.prepare_cached(
+            "SELECT m.id,m.turn<>m.id,
+                CASE WHEN m.text<>'' OR m.node IS NULL THEN length(CAST(m.text AS BLOB))
+                     ELSE o.chars END
+             FROM messages m LEFT JOIN openings o ON o.node=m.node AND m.text=''
+             WHERE m.bot=? AND m.id<? AND m.status='taken' AND m.from_bot IS NULL
+               AND m.origin IS NULL AND m.person IS NULL
+             ORDER BY m.id DESC",
+        )?;
+        let mut words = self.conn.prepare_cached(&format!(
+            "SELECT {MESSAGE_TEXT} FROM messages m {MESSAGE_NODE} WHERE m.id=?"
+        ))?;
+        let mut rows = listed.query(params![name, turn])?;
+        let (mut said, mut more, mut scanned) = (Vec::new(), false, 0);
+        while let Some(r) = rows.next()? {
+            if left < Self::PROMPTS_ENTRY || scanned == Self::PROMPTS_SCANNED {
+                more = true;
+                break;
+            }
+            scanned += 1;
+            let (id, steer, length): (i64, bool, Option<i64>) = (r.get(0)?, r.get(1)?, r.get(2)?);
+            // Whole or not at all: a cut could leave a grant without the
+            // limit that follows it.
+            let room = each.min(left - Self::PROMPTS_ENTRY);
+            if length.is_some_and(|length| length as usize > room) {
+                more = true;
+                continue;
+            }
+            let text: String = words
+                .query_row([id], |r| r.get::<_, Option<String>>(0))?
+                .unwrap_or_default();
+            if text.len() > room {
+                more = true;
+                continue;
+            }
+            left -= Self::PROMPTS_ENTRY + text.len();
+            let mut entry = json!({"message":id,"text":text});
+            if steer {
+                entry["steer"] = json!(true);
+            }
+            said.push(entry);
+        }
+        Ok((said, more))
     }
     /// One prompt of a `prompts` read, cut to the budget left: its words,
     /// who wrote them, and the words it quotes, each with who wrote them.
@@ -11374,31 +11580,36 @@ impl Database {
             .query_row(params![name, turn], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
         let now = epoch_ms().max(0) as u64;
-        // A message that joins the turn lifts the call it waits on, as it
-        // lifts a `wait`: the turn resumes to take it.
-        if parked
-            .as_ref()
-            .is_some_and(|(_, status, _)| status == "waiting")
-            && self.joining_steer(name)?
-        {
-            return Ok(Wake::Resume);
-        }
         // Parked on an answer: the answer, its deadline, or a later gated
         // call's lapse resumes it.
-        if let Some((_, _, Some(call_id))) = parked {
-            let answer: Option<(bool, i64, bool)> = self
+        if let Some((_, status, Some(call_id))) = parked {
+            let answer: Option<(String, bool, i64, bool)> = self
                 .conn
                 .prepare_cached(
-                    "SELECT output IS NOT NULL,expires_ms,paused_ms IS NOT NULL FROM answers
+                    "SELECT name,output IS NOT NULL,expires_ms,paused_ms IS NOT NULL FROM answers
                      WHERE turn=? AND call_id=?",
                 )?
                 .query_row(params![turn, call_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                 })
                 .optional()?;
-            let Some((answered, expires_ms, paused)) = answer else {
+            let Some((tool, answered, expires_ms, paused)) = answer else {
                 return Ok(Wake::Resume);
             };
+            // A message that joins the turn lifts the call it waits on, as
+            // it lifts a `wait`, when a step of the call waits on a gate or
+            // its tool lifts: the turn resumes to take it. Any other call
+            // is answered first.
+            if status == "waiting"
+                && !answered
+                && self.joining_steer(name)?
+                && (paused
+                    || (self.inspect(name)?)
+                        .declared(&tool)
+                        .is_some_and(|tool| tool.lift))
+            {
+                return Ok(Wake::Resume);
+            }
             // A step waiting on a gate stops the call's time.
             let deadline = (!paused).then_some(expires_ms.max(0) as u64);
             let at = match (self.next_lapse(turn)?, deadline) {
@@ -11682,18 +11893,162 @@ impl Database {
             .optional()?
             .ok_or(Error::new("turn_not_found"))
     }
-    /// Register a background command. Ids are unique for the store's lifetime,
-    /// so a handle never resolves to a later command after a restart.
-    pub fn process_start(&mut self, turn: i64, call_id: &str) -> Result<i64> {
-        if self.conn.execute(
-            "INSERT INTO processes(turn,bot,call_id,status)
-             SELECT id,bot,?2,'running' FROM turns WHERE id=?1",
-            params![turn, call_id],
-        )? != 1
+    /// Register a background command, a terminal or a detached command,
+    /// `kind`, running `command`, as of now. Ids are unique for the store's
+    /// lifetime, so a handle never resolves to a later command after a
+    /// restart.
+    pub fn process_start(
+        &mut self,
+        turn: i64,
+        call_id: &str,
+        kind: ProcessKind,
+        command: &str,
+    ) -> Result<i64> {
+        if self
+            .conn
+            .prepare_cached(
+                "INSERT INTO processes(turn,bot,call_id,status,kind,command,started_ms)
+                 SELECT id,bot,?2,'running',?3,?4,?5 FROM turns WHERE id=?1",
+            )?
+            .execute(params![
+                turn,
+                call_id,
+                kind.name(),
+                listed_command(command),
+                epoch_ms()
+            ])?
+            != 1
         {
             return fail("turn_not_found");
         }
         Ok(self.conn.last_insert_rowid())
+    }
+    /// Detached command `id` started as `detached`, in a sandbox when
+    /// `sandboxed`, running `command`: what finds it again after a
+    /// restart. A call a message lifted that ran as one becomes one here.
+    pub fn process_detached(
+        &mut self,
+        id: i64,
+        detached: crate::tools::Detached,
+        sandboxed: bool,
+        command: &str,
+    ) -> Result<()> {
+        let found = json!({"pid":detached.pid,"since":detached.since,"sandboxed":sandboxed});
+        self.conn
+            .prepare_cached(
+                "UPDATE processes SET kind='detached',detached=?2,command=ifnull(command,?3),
+                 started_ms=ifnull(started_ms,?4) WHERE id=?1 AND status='running'",
+            )?
+            .execute(params![
+                id,
+                found.to_string(),
+                listed_command(command),
+                epoch_ms()
+            ])?;
+        Ok(())
+    }
+    /// Record that `id`, a call a message lifted, now runs as a command
+    /// of `kind`: what it runs and when it started, which its row lacked
+    /// while it waited.
+    pub fn process_running_as(&mut self, id: i64, kind: ProcessKind, command: &str) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "UPDATE processes SET kind=?2,command=ifnull(command,?3),
+                 started_ms=ifnull(started_ms,?4) WHERE id=?1 AND status='running'",
+            )?
+            .execute(params![
+                id,
+                kind.name(),
+                listed_command(command),
+                epoch_ms()
+            ])?;
+        Ok(())
+    }
+    /// The detached commands an earlier daemon started that were running
+    /// when it last knew: each one's handle, bot, turn and call, what finds
+    /// it again, whether a sandbox holds it, and when it started.
+    pub fn detached_running(&self) -> Result<Vec<DetachedRow>> {
+        let mut rows = self.conn.prepare(
+            "SELECT id,bot,turn,call_id,detached,ifnull(started_ms,0) FROM processes
+             WHERE status='running' AND detached IS NOT NULL",
+        )?;
+        let found = rows.query_map([], |r| {
+            let detached: String = r.get(4)?;
+            let detached: Value = serde_json::from_str(&detached).unwrap_or_default();
+            Ok(DetachedRow {
+                id: r.get(0)?,
+                bot: r.get(1)?,
+                turn: r.get(2)?,
+                call_id: r.get(3)?,
+                detached: crate::tools::Detached {
+                    pid: detached["pid"].as_u64().unwrap_or(0) as u32,
+                    since: detached["since"].as_u64(),
+                },
+                sandboxed: detached["sandboxed"].as_bool().unwrap_or(false),
+                started_ms: r.get(5)?,
+            })
+        })?;
+        Ok(found.collect::<rusqlite::Result<_>>()?)
+    }
+    /// What runs for the bots `bot` names, a name or a GLOB pattern of
+    /// them, or every bot's: each command still running, background,
+    /// terminal or detached, and each call a message lifted that waits on,
+    /// by bot and oldest first, read through the running rows' index
+    /// alone: its handle, bot, turn and call, kind, the start of its
+    /// command, when it started, and a detached command's pid.
+    /// A page holds at most `PROCESSES_PAGE` of them, after `after`, a bot
+    /// and an id; `next_after` is set when more follow, the last row's bot
+    /// and handle.
+    pub fn processes(
+        &self,
+        bot: Option<&str>,
+        after: Option<(&str, i64)>,
+    ) -> Result<ProcessesPage> {
+        // Pages follow the index's order, by bot and then id, which the
+        // cursor carries whole: the row it names may be gone by the next
+        // page, pruned with its turn.
+        let from = after.unwrap_or(("", 0));
+        let mut rows = self.conn.prepare_cached(
+            "SELECT id,bot,turn,call_id,kind,command,started_ms,detached,call FROM processes
+             WHERE status='running' AND (?1 IS NULL OR bot GLOB ?1) AND (bot,id)>(?2,?3)
+             ORDER BY bot,id LIMIT ?4",
+        )?;
+        let found = rows.query_map(params![bot, from.0, from.1, PROCESSES_PAGE + 1], |r| {
+            let detached: Option<String> = r.get(7)?;
+            let pid = detached
+                .and_then(|detached| serde_json::from_str::<Value>(&detached).ok())
+                .map(|detached| detached["pid"].clone());
+            let call: Option<String> = r.get(8)?;
+            let kind: Option<String> = r.get(4)?;
+            // A lifted call that waits on runs nothing yet: its tool and
+            // what it was given say what it would run.
+            let command: Option<String> = r.get(5)?;
+            let command = command.or_else(|| {
+                let call: ToolCall = serde_json::from_str(call.as_deref()?).ok()?;
+                let arguments: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+                Some(listed_command(arguments["command"].as_str().unwrap_or(&call.name)).to_owned())
+            });
+            Ok(json!({
+                "handle": format!("proc:{}", r.get::<_, i64>(0)?),
+                "bot": r.get::<_, String>(1)?,
+                "turn": r.get::<_, i64>(2)?,
+                "call_id": r.get::<_, String>(3)?,
+                "kind": kind.as_deref().unwrap_or("call"),
+                "command": command,
+                "started_ms": r.get::<_, Option<i64>>(6)?,
+                "pid": pid,
+            }))
+        })?;
+        let mut processes: Vec<Value> = found.collect::<rusqlite::Result<_>>()?;
+        let next_after = (processes.len() > PROCESSES_PAGE as usize).then(|| {
+            processes.truncate(PROCESSES_PAGE as usize);
+            let last = &processes[PROCESSES_PAGE as usize - 1];
+            json!({"bot": last["bot"], "handle": last["handle"]})
+        });
+        Ok(ProcessesPage {
+            processes,
+            next_after,
+        })
     }
     /// The outcome and its overflow become visible in one transaction.
     /// `failed` is whoever ran it saying the call failed, never read back
@@ -12506,7 +12861,7 @@ impl Database {
             Some(allow) => {
                 let mut allowed: Vec<String> = Vec::with_capacity(allow.len());
                 for tool in allow {
-                    if !parent.may_call(tool) {
+                    if !parent.entitled(tool) {
                         return fail_with(
                             "allow_not_in_source",
                             format!("{source} may not call {tool}"),
@@ -13064,7 +13419,7 @@ impl Database {
             if running {
                 return fail_with(
                     "bot_busy",
-                    "a command it started is running or messages are queued",
+                    "a command it started is running or messages are queued; `processes` lists its commands and `stop_process` ends one",
                 );
             }
             // Preserve identity before freeing the suffix, in the same transaction.
@@ -14141,7 +14496,9 @@ impl Database {
             fail("artifact_not_found")
         }
     }
-    /// A retained stream as text, for the model's own `read`.
+    /// A retained stream as text, for the model's own `read`: a page of
+    /// the store's copy, or the file that holds it, which may run to a
+    /// gigabyte and so is paged by the caller off the storage worker.
     pub fn artifact_lines(
         &self,
         name: &str,
@@ -14150,16 +14507,20 @@ impl Database {
         stream: &str,
         offset: usize,
         limit: usize,
-    ) -> Result<String> {
+    ) -> Result<ArtifactLines> {
         if offset == 0 || !(1..=5000).contains(&limit) {
             return fail("invalid_tool_arguments");
         }
         self.authorize_artifact(name, turn, call_id)?;
+        if let Some(file) = artifact::file(&self.conn, turn, call_id, stream)? {
+            return Ok(ArtifactLines::File(file));
+        }
         let Some((_, data)) = artifact::read(&self.conn, turn, call_id, stream, 0, usize::MAX)?
         else {
             return self.missing_artifact(turn);
         };
         crate::tools::page_lines(&String::from_utf8_lossy(&data), offset, limit)
+            .map(ArtifactLines::Page)
     }
     /// A recorded tool result on the bot's own lineage, as text, for the
     /// model's own `read` of what an elided result's stub names. `checked`
@@ -17029,6 +17390,30 @@ fn migrate_since_73(conn: &Connection, from: i32) -> Result<()> {
             )?;
             if made && !has {
                 conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column};"))?;
+            }
+        }
+    }
+
+    // Schema 97: each process row says what kind of command it is, the
+    // start of that command and when it started, so every running one can
+    // be listed; a detached command's row also says what finds it again
+    // after a restart.
+    if from < 97 {
+        for column in [
+            "kind TEXT",
+            "command TEXT",
+            "started_ms INTEGER",
+            "detached TEXT",
+        ] {
+            let name = column.split_once(' ').map_or(column, |(name, _)| name);
+            let (made, has): (bool, bool) = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='processes'),
+                    EXISTS(SELECT 1 FROM pragma_table_info('processes') WHERE name=?1)",
+                params![name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if made && !has {
+                conn.execute_batch(&format!("ALTER TABLE processes ADD COLUMN {column};"))?;
             }
         }
     }

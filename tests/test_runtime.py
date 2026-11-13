@@ -1365,6 +1365,25 @@ class AnthropicRuntimeTests(unittest.TestCase):
         events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
         self.assertFalse([e for e in events if e['event'].startswith('tool_')])
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_sandbox_off_the_network_is_offered_no_hosted_search(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low',
+                       tools=['echo', 'shell', 'web_search'], settings={'sandbox': 'read-only'})
+
+        def offered(request_id):
+            turn = client.request('submit', bot='Bob', request_id=request_id, prompt='hello')['result']['message']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            return [t.get('name') for t in model.requests.get(timeout=5)['tools']]
+
+        self.assertEqual(offered('r'), ['echo', 'shell'])
+        # Its tools are kept: given the network, it is offered search again.
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['tools'], ['echo', 'shell', 'web_search'])
+        client.request('configure', bot='Bob', settings={'sandbox': 'workspace-write', 'network': True})
+        self.assertEqual(offered('n'), ['echo', 'shell', 'web_search'])
+        client.request('configure', bot='Bob', settings={'network': False})
+        self.assertEqual(offered('w'), ['echo', 'shell'])
+
     def test_an_empty_reply_ends_a_turn_after_a_tool_call_and_after_a_prompt(self):
         client, model, path = self.start()
         client.request('create', bot='Bob', workspace=str(path))
@@ -1513,6 +1532,35 @@ class ModelFixture(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class RuntimeTests(ModelFixture):
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_sandbox_off_the_network_neither_offers_nor_runs_web_fetch(self):
+        client = self.client('echo,shell,web_fetch')
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['echo', 'shell', 'web_fetch'],
+                       settings={'sandbox': 'workspace-write'})
+        # A call it was not offered, as one from before its sandbox went
+        # offline would be, is not run: the daemon would fetch past it.
+        prompt = 'calls:' + json.dumps([['web_fetch', {'url': 'https://example.test/?secret'}]])
+        turn = client.request('submit', bot='Bob', request_id='f', prompt=prompt)['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        first = self.model.requests.get(timeout=3)
+        self.assertEqual([t['name'] for t in first['tools']], ['echo', 'shell'])
+        events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
+        done = [e for e in events if e['event'] == 'tool_completed'][0]
+        output = node_item(client, 'Bob', done['data']['node'])['result']['output']
+        self.assertEqual(json.loads(output)['error'], 'tool_not_available')
+        # The tool is still its own: a fork may be allowed it, as a shadow
+        # copies its source's tools, and inherits the sandbox that holds it.
+        fork = client.request('fork', source='Bob', bot='Shadow', allow=['echo', 'web_fetch'])
+        self.assertEqual(fork['result']['allowed'], ['echo', 'web_fetch'])
+        # Given the network, it is offered the tool again.
+        client.request('configure', bot='Bob', settings={'network': True})
+        while not self.model.requests.empty():
+            self.model.requests.get_nowait()
+        turn = client.request('submit', bot='Bob', request_id='n', prompt='hello')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        offered = self.model.requests.get(timeout=3)
+        self.assertEqual([t['name'] for t in offered['tools']], ['echo', 'shell', 'web_fetch'])
+
     def test_detached_shell_releases_its_daemon_slot_after_exit(self):
         client = self.client('shell', extra=('--max-lasting', '1'))
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
@@ -1542,7 +1590,70 @@ class RuntimeTests(ModelFixture):
             except ProcessLookupError:
                 break
             time.sleep(.01)
+        # Its end is told, as a background command's is, in a turn of its own.
+        told = client.receive(lambda m: m.get('event') == 'queued'
+                              and m.get('data', {}).get('origin') == 'background', 10)
+        self.assertEqual(client.finished(told['message'])['data']['status'], 'completed')
         self.assertTrue(result('detach:true', 'free')['detached'])
+
+    def test_detached_commands_are_listed_stopped_and_found_after_a_restart(self):
+        client = self.client('shell')
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
+
+        def detach(client, command, request_id):
+            turn = client.request('submit', bot='Bob', request_id=request_id,
+                                  prompt=f'detach:{command}')['result']['message']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+            completed = next(e for e in events if e['turn'] == turn and e['event'] == 'tool_completed')
+            output = json.loads(node_item(client, 'Bob', completed['data']['node'])['result']['output'])
+            self.addCleanup(lambda: subprocess.run(['kill', '-9', str(output['pid'])], capture_output=True))
+            return output
+
+        def alive(pid):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            return True
+
+        def until(what, done):
+            deadline = time.monotonic() + 10
+            while not done() and time.monotonic() < deadline:
+                time.sleep(.05)
+            self.assertTrue(done(), what)
+
+        def running(client, bot=None):
+            return client.request('processes', **({'bot': bot} if bot else {}))['result']['processes']
+
+        first = detach(client, 'exec sleep 30', 'first')
+        self.assertTrue(first['handle'].startswith('proc:'))
+        self.assertEqual([(p['handle'], p['bot'], p['kind'], p['command'], p['pid']) for p in running(client, 'B*')],
+                         [(first['handle'], 'Bob', 'detached', 'exec sleep 30', first['pid'])])
+        self.assertEqual(running(client, 'Alice'), [])
+        stopped = client.request('stop_process', bot='Bob', handle=first['handle'])['result']
+        self.assertEqual((stopped['handle'], stopped['stopped']), (first['handle'], True))
+        until('the stopped command ended', lambda: not alive(first['pid']))
+        until('its end was recorded', lambda: running(client) == [])
+        self.assertEqual(client.request('stop_process', bot='Bob', handle=first['handle'])['error'],
+                         'process_not_running')
+        # Another outlives the daemon, and the next one finds it again.
+        second = detach(client, 'exec sleep 30', 'second')
+        client.close(kill=True)
+        self.assertTrue(alive(second['pid']))
+        client = self.client('shell')
+        self.assertEqual([p['handle'] for p in running(client)], [second['handle']])
+        client.request('stop_process', bot='Bob', handle=second['handle'])
+        until('the found command ended', lambda: not alive(second['pid']))
+        waited = client.request('wait', handles=[second['handle']], timeout_ms=5000)['result']
+        self.assertEqual(waited['results'][second['handle']]['error'], 'stopped')
+        # One that ends on its own is told as a background command is.
+        third = detach(client, 'sleep .2; exit 4', 'third')
+        told = client.receive(lambda m: m.get('event') == 'queued'
+                              and m.get('data', {}).get('origin') == 'background', 10)
+        self.assertEqual(client.finished(told['message'])['data']['status'], 'completed')
+        ended = client.request('wait', handles=[third['handle']], timeout_ms=0)['result']['results'][third['handle']]
+        self.assertEqual((ended['exit_code'], ended['success']), (4, False))
 
     def test_shutdown_cancels_pending_retention_without_stdin_eof(self):
         client = self.client()

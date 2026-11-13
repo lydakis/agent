@@ -50,6 +50,22 @@ const COMMANDS: &[Command] = &[
         startup: false,
     },
     Command {
+        name: "ps",
+        about: "Commands still running, a bot's or every bot's: background, terminal and detached, each by its proc handle",
+        usage: "ps [--bot NAME]",
+        flags: "--bot --pretty --no-spawn",
+        settings: "",
+        startup: false,
+    },
+    Command {
+        name: "stop",
+        about: "Stop a bot's running command by its proc handle, with all it started",
+        usage: "stop --bot NAME HANDLE",
+        flags: "--bot --pretty --no-spawn",
+        settings: "",
+        startup: false,
+    },
+    Command {
         name: "ls",
         about: "List the bots",
         usage: "ls [--name GLOB] [--active] [--created-by BOT] [--limit N]",
@@ -172,8 +188,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "start",
         about: "Start the store's daemon if none runs; prints its ready line",
-        usage: "start [OPTIONS]",
-        flags: "--pretty",
+        usage: "start [--replace] [OPTIONS]",
+        flags: "--pretty --replace",
         settings: "",
         startup: true,
     },
@@ -578,6 +594,10 @@ fn print_flags(flags: &str) {
                 "DURATION",
                 "Let running turns finish for up to this long, starting none; default 0",
             ),
+            "--replace" => (
+                "",
+                "Replace the daemon running now with this agent's own, as an upgrade replaces an older one: its running turns park and continue on the new one",
+            ),
             "--approval" => (
                 "MODE",
                 "A new bot's approval: full, manual, or auto; default AGENT_APPROVAL or full",
@@ -796,6 +816,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             flag,
             "--pretty"
                 | "--no-spawn"
+                | "--replace"
                 | "--new"
                 | "--detach"
                 | "--all"
@@ -901,6 +922,10 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     } else if c.name == "login" {
         if positional != 1 {
             return fail_with("usage", "login needs a provider: chatgpt");
+        }
+    } else if c.name == "stop" {
+        if positional != 1 {
+            return fail_with("usage", "stop needs one handle, proc:N, as ps lists it");
         }
     } else if c.name == "sandbox" {
         if positional == 0 {
