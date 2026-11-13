@@ -11485,8 +11485,7 @@ impl App {
                 }
                 let action = match &mut self.pane {
                     Some(pane) if in_pane => {
-                        // A button on its first row: the margin's glance, or
-                        // the arrow back to the margin.
+                        // A button on its first row.
                         if down
                             && pane.on_title(mouse.column, mouse.row)
                             && let Some(button) = pane.head_button(mouse.column)
@@ -12083,17 +12082,6 @@ impl App {
                 self.pane_keys = true;
                 self.margin_back();
             }
-        }
-    }
-
-    /// What runs for the agent, for the margin's first row: its
-    /// background and its context.
-    fn glance(&self) -> margin::Glance {
-        margin::Glance {
-            name: self.bot.clone(),
-            failed: self.failed,
-            context: self.context,
-            window: self.window,
         }
     }
 
@@ -15345,9 +15333,8 @@ impl App {
             let live = self.running.as_ref().map(|running| running.turn);
             let width = (pane::margin_room(at.width).saturating_sub(1) as usize).min(measure());
             let (lines, marks) = self.margin.lines(width, &workspace, live);
-            let glance = self.glance().line();
             if let Some(pane) = &mut self.pane {
-                pane.set_margin(lines, marks, glance);
+                pane.set_margin(lines, marks);
                 if let Some(pin) = self.margin_focus.take() {
                     pane.screen.show_tagged(screen::Tag::Note(pin), 1);
                 }
@@ -16486,9 +16473,9 @@ impl App {
             items.push(Item::new(Slot::Place, vec![place]));
             return footer::lay(items, width);
         }
-        // The margin's glance says these while it is in view.
-        let glancing = (self.pane.as_ref()).is_some_and(|p| p.is_margin() && p.area.width > 0);
-        if self.failed > 0 && !glancing {
+        // Every count stays here whatever the pane shows, so nothing moves
+        // as it changes.
+        if self.failed > 0 {
             let forms = footer::count("✗", Color::Red, self.failed, false);
             items.push(Item::new(Slot::Failed, forms).opens("background"));
         }
@@ -16504,16 +16491,14 @@ impl App {
             items.push(Item::new(Slot::Idle, forms).opens("status"));
         }
         let notes = self.margin.notes().len();
-        if notes > 0 && !glancing {
+        if notes > 0 {
             let forms = vec![vec![Span::raw(format!("✎ {notes}")).dim()], Vec::new()];
             items.push(Item::new(Slot::Notes, forms));
         }
         // How full the next round is, as what is left of its window: no
         // hue while there is room, then yellow, then red, and it never
         // goes once half is used.
-        if let Some(size) = self.context
-            && !glancing
-        {
+        if let Some(size) = self.context {
             let (amount, _, color) = transcript::fullness(size, self.window);
             let words = match self.window.is_some_and(|window| window > 0) {
                 true => " left",
@@ -21388,6 +21373,31 @@ mod tests {
         assert!(app.footer_line(140).to_string().contains("✗ 2"));
         app.failed = 0;
         assert!(!app.footer_line(140).to_string().contains('✗'));
+    }
+
+    #[tokio::test]
+    async fn every_count_stays_in_the_footer_while_the_margin_shows() {
+        let client = daemon_with(json!([])).await;
+        let mut app = app(client);
+        app.failed = 1;
+        app.context = Some(900_000);
+        app.window = Some(1_000_000);
+        let before = app.footer_line(140).to_string();
+        let mut margin = pane::Pane::margin();
+        margin.area = ratatui::layout::Rect::new(104, 0, 40, 30);
+        app.pane = Some(margin);
+        let line = app.footer_line(140);
+        assert_eq!(
+            line.to_string(),
+            before,
+            "nothing moves as the pane changes"
+        );
+        assert!(
+            before.contains("✗ 1") && before.contains("10% left"),
+            "{before}"
+        );
+        let low = line.spans.iter().find(|s| s.content == "10%").unwrap();
+        assert_eq!(low.style.fg, Some(Color::Red), "the warning keeps its hue");
     }
 
     #[tokio::test]
