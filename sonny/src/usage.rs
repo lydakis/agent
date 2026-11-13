@@ -668,7 +668,13 @@ impl View {
         if rest.turns > 0 {
             rows.push(("the rest".to_owned(), rest));
         }
-        let figures = TIME_FIGURES.len();
+        // A pane too narrow for every figure keeps only the turn's length.
+        let full = width >= 4 + 2 + 4 + TIME_FIGURES.len();
+        let shown = match full {
+            true => TIME_FIGURES,
+            false => &TIME_FIGURES[..8],
+        };
+        let figures = shown.len();
         let name_width = (rows.iter().map(|(name, _)| name.width()))
             .max()
             .unwrap_or(0)
@@ -683,7 +689,7 @@ impl View {
             Line::default(),
             Line::from(vec![
                 Span::raw(format!("{:<w$}", "Time", w = name_width + 2 + room)).bold(),
-                Span::raw(TIME_FIGURES).dim(),
+                Span::raw(shown).dim(),
             ]),
         ];
         for (name, took) in &rows {
@@ -699,12 +705,14 @@ impl View {
                 .map(|(n, color)| (n / took.turns.max(1), color));
             spans.extend(hbar(&parts, most, room));
             spans.push(Span::raw(format!(" {:>7}", span(took.each()))));
-            spans.push(Span::raw(format!(" {:>6.1}", took.rounds as f64 / turns)));
-            spans.push(Span::raw(format!(" {:>6.1}", took.calls as f64 / turns)));
-            spans.push(match took.per_second() {
-                Some(rate) => Span::raw(format!(" {rate:>6}")),
-                None => Span::raw(format!(" {:>6}", "-")).dim(),
-            });
+            if full {
+                spans.push(Span::raw(format!(" {:>6.1}", took.rounds as f64 / turns)));
+                spans.push(Span::raw(format!(" {:>6.1}", took.calls as f64 / turns)));
+                spans.push(match took.per_second() {
+                    Some(rate) => Span::raw(format!(" {rate:>6}")),
+                    None => Span::raw(format!(" {:>6}", "-")).dim(),
+                });
+            }
             out.push(Line::from(spans));
         }
         let [(model, _), (tools, _), (rest, _)] = total.parts();
@@ -1237,6 +1245,21 @@ mod tests {
             .filter(|l| text(std::slice::from_ref(l)).contains(" s "))
         {
             assert!(line.width() <= 70, "{card}");
+        }
+        // A narrow pane keeps each row on one line, with its turn's length.
+        for width in 30..=70 {
+            let narrow = view.card(width);
+            let card = text(&narrow);
+            let at = (narrow.iter())
+                .position(|l| text(std::slice::from_ref(l)).starts_with("Time"))
+                .unwrap();
+            let rows: Vec<&Line> = narrow[at..at + 3].iter().collect();
+            assert_eq!(rows.len(), 3, "{width}: {card}");
+            for line in rows {
+                let t = text(std::slice::from_ref(line));
+                assert!(line.width() <= width, "{width}: {card}");
+                assert!(t.starts_with("Time") || t.contains(" s"), "{width}: {card}");
+            }
         }
         assert_eq!(span(42_000), "42 s");
         assert_eq!(span(72_000), "1m 12s");
