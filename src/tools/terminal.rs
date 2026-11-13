@@ -64,6 +64,23 @@ struct State {
     used: Instant,
 }
 
+impl State {
+    /// Keep `bytes`, the command's next output, for the next read: at most
+    /// the last `PREVIEW_BYTES` unread. Whether any were dropped; the
+    /// stream is redacted afresh after a gap, as the text the read tells
+    /// reads, and what it held from before the gap goes with the gap.
+    fn push(&mut self, bytes: &[u8]) -> bool {
+        self.unread.extend_from_slice(bytes);
+        let over = self.unread.len().saturating_sub(PREVIEW_BYTES);
+        if over > 0 {
+            self.unread.drain(..over);
+            self.dropped += over as u64;
+            self.redacting.restart();
+        }
+        over > 0
+    }
+}
+
 impl Terminal {
     /// End the command's whole session: its own group, the job in the
     /// terminal's foreground, and, looked up off the runtime thread, every
@@ -186,8 +203,9 @@ fn report(handle: Option<i64>, text: String, dropped: u64, end: Option<Value>) -
 
 /// What was read, redacted, keeping for the next read the carriage
 /// returns at its end, which a newline may follow; a terminal's line ends
-/// read as plain newlines. The stream holds what more output may still
-/// redact: a character, a credential, or a secret field's value.
+/// read as plain newlines before they are redacted, as a program wrote
+/// them. The stream holds what more output may still redact: a character,
+/// a credential, or a secret field's value.
 fn text(unread: &mut Vec<u8>, redacting: &mut Redacting) -> String {
     let mut whole = unread.len();
     while whole > 0 && unread[whole - 1] == b'\r' {
@@ -195,37 +213,38 @@ fn text(unread: &mut Vec<u8>, redacting: &mut Redacting) -> String {
     }
     let rest = unread.split_off(whole);
     let read = std::mem::replace(unread, rest);
-    lines(&redacting.feed(&read))
+    redacting.feed(&lines(&read))
 }
 
 /// The rest of what was read at the command's end, redacted: nothing more
 /// is held.
 fn last(unread: &mut Vec<u8>, mut redacting: Redacting) -> String {
-    let mut read = redacting.feed(&std::mem::take(unread));
+    let mut read = redacting.feed(&lines(&std::mem::take(unread)));
     read.push_str(&redacting.finish());
-    lines(&read)
+    read
 }
 
-/// `text` with each run of carriage returns before a newline dropped: a
-/// program's own carriage return before the terminal's makes two.
-fn lines(text: &str) -> String {
-    let mut lines = String::with_capacity(text.len());
+/// `bytes` with each run of carriage returns before a newline dropped: a
+/// program's own carriage return before the terminal's makes two. Neither
+/// byte is ever part of a longer character.
+fn lines(bytes: &[u8]) -> Vec<u8> {
+    let mut lines = Vec::with_capacity(bytes.len());
     let mut returns = 0;
-    for c in text.chars() {
-        match c {
-            '\r' => returns += 1,
-            '\n' => {
+    for &b in bytes {
+        match b {
+            b'\r' => returns += 1,
+            b'\n' => {
                 returns = 0;
-                lines.push('\n');
+                lines.push(b'\n');
             }
-            c => {
-                lines.push_str(&"\r".repeat(returns));
+            b => {
+                lines.resize(lines.len() + returns, b'\r');
                 returns = 0;
-                lines.push(c);
+                lines.push(b);
             }
         }
     }
-    lines.push_str(&"\r".repeat(returns));
+    lines.resize(lines.len() + returns, b'\r');
     lines
 }
 
@@ -511,13 +530,7 @@ impl Registry {
                             let dropping = {
                                 let mut state =
                                     terminal.state.lock().unwrap_or_else(|e| e.into_inner());
-                                state.unread.extend_from_slice(&buffer[..n]);
-                                let over = state.unread.len().saturating_sub(PREVIEW_BYTES);
-                                if over > 0 {
-                                    state.unread.drain(..over);
-                                    state.dropped += over as u64;
-                                }
-                                over > 0
+                                state.push(&buffer[..n])
                             };
                             // What no read keeps is drained slowly, as a
                             // command's pipe is: the writer waits on the
@@ -845,7 +858,8 @@ mod tests {
         credentials.redact_also(&["password".to_owned(), "token".to_owned()], &[]);
         let typed = "$ export MY_PASSWORD=abcd1234efgh\r\n$ echo $KEY\r\nsk-secret-1234\r\n\
             {\"token\": \"zz9zz9zz9zz9\"}\r\nPassword: hunter22x\r\n$ ";
-        let whole = lines(&credentials.redact(typed.to_owned()));
+        let typed_lines = String::from_utf8(lines(typed.as_bytes())).unwrap();
+        let whole = credentials.redact(typed_lines);
         for cut in 1..typed.len() {
             for second in [cut + 1, cut + 7, typed.len()] {
                 let second = second.min(typed.len());
@@ -860,6 +874,44 @@ mod tests {
     }
 
     #[test]
+    fn a_value_continued_past_a_terminal_line_end_is_redacted_whole() {
+        let credentials = Credentials::default();
+        credentials.redact_also(&["password".to_owned()], &[]);
+        let typed = b"password=\"abc123\\\r\ndef456\"\r\n";
+        let mut reads = Reads::new(&credentials);
+        assert_eq!(reads.read(typed), "password=\"[REDACTED]\"\n");
+        let mut reads = Reads::new(&credentials);
+        let (head, tail) = typed.split_at(17);
+        let shown = reads.read(head) + &reads.end(tail);
+        assert_eq!(shown, "password=\"[REDACTED]\"\n");
+    }
+
+    #[test]
+    fn output_after_a_gap_is_redacted_afresh() {
+        let credentials = Credentials::default();
+        credentials.redact_also(&["password".to_owned()], &[]);
+        let mut state = super::State {
+            unread: Vec::new(),
+            redacting: Redacting::new(credentials.clone()),
+            dropped: 0,
+            end: None,
+            used: tokio::time::Instant::now(),
+        };
+        // A value that is not secret, left open at the read's end.
+        assert!(!state.push(b"password=\"$"));
+        assert_eq!(
+            text(&mut state.unread, &mut state.redacting),
+            "password=\"$"
+        );
+        // Its end is dropped with what came after it: what is kept reads
+        // as a text of its own, not as more of that value.
+        assert!(!state.push(&vec![b'x'; super::PREVIEW_BYTES]));
+        assert!(state.push(b"_password=abc123def456\n"));
+        let shown = text(&mut state.unread, &mut state.redacting);
+        assert!(shown.ends_with("x_password=[REDACTED]\n"), "{shown}");
+    }
+
+    #[test]
     fn a_field_name_in_any_script_is_matched_without_a_panic() {
         let credentials = Credentials::default();
         credentials.redact_also(&["密码".to_owned()], &[]);
@@ -869,8 +921,8 @@ mod tests {
     #[test]
     fn carriage_returns_before_a_newline_go_in_one_pass() {
         let many = format!("{}\n", "\r".repeat(60_000));
-        assert_eq!(lines(&many), "\n");
-        assert_eq!(lines("a\rb\r\r\nc\r"), "a\rb\nc\r");
+        assert_eq!(lines(many.as_bytes()), b"\n");
+        assert_eq!(lines(b"a\rb\r\r\nc\r"), b"a\rb\nc\r");
     }
 
     /// A terminal that ended stays readable until its handle's result is

@@ -870,6 +870,12 @@ impl Redacting {
         self.pass(&set, read, false)
     }
 
+    /// Begin again after a gap in the stream: what was held, and what was
+    /// read before, no longer bear on what comes next.
+    pub fn restart(&mut self) {
+        *self = Redacting::new(self.credentials.clone());
+    }
+
     /// What is still held, at the stream's end, redacted.
     pub fn finish(mut self) -> String {
         let set = self.credentials.current();
