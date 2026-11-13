@@ -5094,6 +5094,9 @@ impl Fleet {
             // one that started makes the last ending stale.
             self.ended.remove(name);
             if running && name != self.lead {
+                // Its turn began by now at the latest: a window the person
+                // uses from here on is in use once it is done.
+                (self.began.entry(name.to_owned())).or_insert_with(std::time::SystemTime::now);
                 self.show(name, false);
             } else if !running
                 && self
@@ -24878,6 +24881,11 @@ mod tests {
     async fn a_done_task_s_window_the_person_uses_stays_and_others_close() {
         let (client, events) = daemon_with_events(json!({}), |asked| {
             match asked["op"].as_str().unwrap_or("") {
+                "bots" => json!({"bots": [
+                    {"name": "calc.lead", "bot_id": 1, "head": 1},
+                    {"name": "calc.c", "bot_id": 4, "created_by": "calc.lead",
+                        "running_turn": 1, "head": 4},
+                ], "next_after": null}),
                 "approvals" => json!({"approvals": []}),
                 "turns" => json!({"turns": []}),
                 "history_nodes" => json!({"nodes": []}),
@@ -24887,6 +24895,10 @@ mod tests {
         })
         .await;
         let mut fleet = Fleet::in_memory(client, events, "calc", "calc.lead");
+        // A task already running as the lead's window opens has begun by
+        // then.
+        fleet.reconcile().await;
+        assert!(fleet.began.contains_key("calc.c"));
         let read = (agent_client::config::path().as_ref())
             .and_then(|path| std::fs::metadata(path).ok())
             .and_then(|file| file.modified().ok());
