@@ -9089,3 +9089,80 @@ path this change touches; its CPU is level, and the same row read 698
 against 654 ms on the screen above with no lifecycle change, so it is the
 runner's spread. The Sonny rows move both ways at the size of earlier
 screens, and `/ps` costs nothing while closed.
+
+## A pool that knows no allowance ramps back after a refusal
+
+A provider that sends no rate limit headers left the pacer blind: a 429
+closed the pool for its delay, then every parked call went at once, most
+were refused again, and each refusal cost the daemon a park, a resume and
+their store work. The pool now keeps a window of calls in flight after a
+refusal when it knows no allowance: one call, one more for each answered,
+halved by a refusal while open, and growing by one a round past the half.
+It ends once the window passes 1,024. A 429 that names
+`ramp_limit_exceeded` (Anthropic's documented ramp limit) ramps a pool
+even when it knows its allowance. A pool that reads headers paces by them,
+as before.
+
+`bench.scale_screen` with `bench.streaming_model --tpm 300000
+--no-headers`, 2.3 s calls, 45 s windows, 4-CPU Linux cloud box, before
+against after:
+
+| Bots | Measure | Before | After |
+| ---: | --- | ---: | ---: |
+| 64 | turns a second | 5.60 | 5.62 |
+| 64 | calls refused (429) | 3,136 | 20 |
+| 64 | daemon CPU per turn, ms | 22.4 | 1.5 |
+| 64 | store jobs per turn | 280.5 | 8.5 |
+| 64 | turn p50 / p95, s | 2.4 / 26.8 | 4.5 / 20.7 |
+| 256 | turns a second | 6.26 | 6.29 |
+| 256 | calls refused (429) | 18,320 | 51 |
+| 256 | daemon CPU per turn, ms | 15.5 | 2.2 |
+| 256 | store jobs per turn | 149.1 | 10.8 |
+| 256 | turn p50 / p95, s | 19.4 / 47.7 | 27.4 / 37.2 |
+
+The allowance, not the daemon, sets the rate in both. Before, the bots
+that won the retry race finished fast and the rest waited (a low p50, a
+high p95); now they take turns, so the median rises and the tail falls.
+With headers (64 bots, 30 s), both refuse no call and match: 6.5 turns a
+second, 2.9 and 3.0 ms of CPU a turn, 15.0 and 14.7 store jobs a turn.
+
+Daemon screen (`bench.perf_gate`'s benches), same box, base main 3b46309
+against head, two alternating rounds. The benches' model sends headers, so
+this checks the paths every call takes:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 29.256 | 29.098 | -0.5% |
+| admission | burst submit p99, ms | 3.858 | 3.843 | -0.4% |
+| completion | release to terminal p99, ms | 10.158 | 10.159 | +0.0% |
+| footprint | idle RSS, MiB | 16.221 | 16.281 | +0.4% |
+| footprint | per idle bot, KiB | 1.916 | 1.808 | -5.6% |
+| footprint | RSS after a turn each, MiB | 32.59 | 30.873 | -5.3% |
+| footprint | CPU per turn, ms | 0.806 | 0.787 | -2.3% |
+| lifecycle | CPU, s | 0.44 | 0.46 | +4.5% |
+| lifecycle | p95 turn, ms | 579.977 | 578.672 | -0.2% |
+| lifecycle | peak RSS, MiB | 24.686 | 25.066 | +1.5% |
+
+Store work per turn is the same (7.001 jobs a turn on both), and the gate
+warned on no row.
+
+A caller that finds the window full waits in the gate for one of the
+ramp's calls to settle, as a call waiting on a refund from calls in flight
+does. Parking it instead was measured and lost on both counts, 45 s
+windows, same box and settings:
+
+| Bots | How a full window waits | Turns a second | CPU per turn, ms | Store jobs per turn |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | before (no ramp) | 9.40 | 11.7 | 143.1 |
+| 64 | in the gate | 9.33 | 1.7 | 11.0 |
+| 64 | parked for its calls' time | 8.73 | 4.0 | 40.9 |
+| 64 | parked in a queue, a share apart | 8.68 | 2.2 | 14.4 |
+| 256 | before (no ramp) | 7.46 | 11.2 | 105.3 |
+| 256 | in the gate | 7.46 | 2.0 | 10.2 |
+| 256 | parked for its calls' time | 5.62 | 17.9 | 229.3 |
+| 256 | parked in a queue, a share apart | 4.40 | 4.7 | 31.3 |
+
+A parked caller cannot be woken by a settle, so it comes back on a guess:
+too soon and it parks again (the store work), too late and the window sits
+idle (the lost turns). Waiting in the gate holds the bot's active slot
+while it waits, as a refund wait does (#940 follows that up).

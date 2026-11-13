@@ -126,7 +126,39 @@ struct State {
     booked: Booked,
     /// What the pool did to the calls it saw, since the daemon started.
     counts: Counts,
+    /// How many calls the pool lets fly at once after a refusal it could
+    /// not foresee, while it learns again what the provider takes.
+    ramp: Option<Ramp>,
+    /// Ramps begun, so a call admitted under an ended ramp never settles
+    /// into a later one.
+    ramps: u64,
 }
+
+/// After a refusal from a pool that knows no allowance (a provider that
+/// publishes none, as Bedrock), every call parked on it would otherwise go
+/// at once when it reopens, be refused together, and park again. Instead
+/// the pool lets one call fly, and one more for each that is answered,
+/// doubling each round, as a TCP sender's slow start does; a refusal while
+/// it ramps halves the window and growth goes on one call a round. The
+/// window is learned from the provider's own answers and grows without
+/// bound while they succeed: past `RAMP_DONE` the pool lets everything go
+/// again. A refusal that names a ramp limit (Anthropic's
+/// `ramp_limit_exceeded`) ramps a pool whatever it knows.
+struct Ramp {
+    /// Which ramp this is (`State::ramps` when it began).
+    generation: u64,
+    window: u32,
+    /// Where growth turns from doubling to one call a round, once a
+    /// refusal has come while ramping.
+    threshold: Option<u32>,
+    /// Calls this ramp admitted that have not settled.
+    flying: u32,
+    /// Answers counted toward the next call of growth past the threshold.
+    credit: u32,
+}
+
+/// A window this wide lets the pool's calls go as they come.
+const RAMP_DONE: u32 = 1024;
 
 /// What a pool did to its calls, for `stats`: how many it admitted, how
 /// many of those waited in the gate and for how long in all, how many it
@@ -398,6 +430,9 @@ pub struct Reservation<'a> {
     dispatched: bool,
     request_reported: bool,
     pub waited: Duration,
+    /// Admitted under a ramp (its generation), whose window it holds until
+    /// it settles.
+    ramp: Option<u64>,
 }
 impl Reservation<'_> {
     /// Call immediately before polling the HTTP send future.
@@ -449,6 +484,12 @@ impl Reservation<'_> {
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         let mut state = self.pace.state.lock().unwrap();
+        if let Some(generation) = self.ramp
+            && let Some(ramp) = state.ramp.as_mut()
+            && ramp.generation == generation
+        {
+            ramp.flying = ramp.flying.saturating_sub(1);
+        }
         if !self.request_reported {
             state.reserved_requests -= 1;
             if !self.dispatched
@@ -608,6 +649,12 @@ impl Pace {
                         let left = due.map(|(at, _)| at.saturating_duration_since(now));
                         let wait = match left {
                             Some(left) if !left.is_zero() => left,
+                            // A full ramp waits for one of its calls to
+                            // settle, which wakes the gate: like a wait on
+                            // a refund, it is a wait on calls in flight.
+                            _ if state.ramp.as_ref().is_some_and(|r| r.flying >= r.window) => {
+                                Duration::from_secs(60)
+                            }
                             _ => state.admit_or_book(costs, due, now, park_for)?,
                         };
                         if wait.is_zero() {
@@ -615,6 +662,10 @@ impl Pace {
                                 dim.reserved += cost;
                             }
                             state.reserved_requests += 1;
+                            let ramp = state.ramp.as_mut().map(|r| {
+                                r.flying += 1;
+                                r.generation
+                            });
                             let waited = started.elapsed();
                             state.counts.admitted += 1;
                             if waited >= Duration::from_millis(1) {
@@ -629,6 +680,7 @@ impl Pace {
                                 dispatched: false,
                                 request_reported: false,
                                 waited,
+                                ramp,
                             });
                         }
                         wait
@@ -657,8 +709,43 @@ impl Pace {
     /// during a named delay starts the streak. Providers that publish no
     /// allowance, such as Bedrock, are paced by this alone.
     pub fn limited(&self, after: Option<Duration>) {
+        self.refused(after, false);
+    }
+    /// The provider refused because the pool's traffic grew too fast
+    /// (Anthropic's `ramp_limit_exceeded`): closed as `limited`, and let
+    /// back in through a ramp even when it knows its allowance.
+    pub fn ramp_limited(&self, after: Option<Duration>) {
+        self.refused(after, true);
+    }
+    fn refused(&self, after: Option<Duration>, ramp: bool) {
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
+        // Calls already in flight while it is closed were refused by the
+        // same overload: the window narrows once a round.
+        let open = state.blocked_until.is_none_or(|until| until <= now);
+        let blind = state.requests.per_minute.is_none()
+            && state
+                .tokens
+                .iter()
+                .all(|dim| dim.bucket.per_minute.is_none());
+        // A ramp limit starts a ramp whenever none runs, closed or not.
+        match state.ramp.as_mut() {
+            None if ramp || (open && blind) => {
+                state.ramps += 1;
+                state.ramp = Some(Ramp {
+                    generation: state.ramps,
+                    window: 1,
+                    threshold: None,
+                    flying: 0,
+                    credit: 0,
+                })
+            }
+            Some(running) if open && (ramp || blind) => {
+                let half = (running.window / 2).max(1);
+                (running.window, running.threshold, running.credit) = (half, Some(half), 0);
+            }
+            _ => {}
+        }
         let delay = after.unwrap_or_else(|| {
             if state.unnamed_blocks == 0 || state.blocked_until.is_none_or(|until| until <= now) {
                 state.unnamed_blocks = (state.unnamed_blocks + 1).min(6);
@@ -713,6 +800,24 @@ impl Pace {
     pub fn accepted(&self) {
         let mut state = self.state.lock().unwrap();
         state.unnamed_blocks = 0;
+        if let Some(ramp) = state.ramp.as_mut() {
+            match ramp.threshold {
+                Some(threshold) if ramp.window >= threshold => {
+                    ramp.credit += 1;
+                    if ramp.credit >= ramp.window {
+                        ramp.credit = 0;
+                        ramp.window += 1;
+                    }
+                }
+                _ => ramp.window += 1,
+            }
+            let done = ramp.window >= RAMP_DONE;
+            if done {
+                state.ramp = None;
+            }
+            // A wider window may let the gate's head go.
+            self.changed.notify_one();
+        }
         state.overloads.at(Instant::now()).answered += 1;
     }
     /// An overload refused a call. With a delay named it closes the pool as
@@ -1323,6 +1428,109 @@ mod tests {
         tokio::time::advance(Duration::from_secs(6)).await;
         pace.limited(None);
         assert_eq!(left(&pace), 2.0);
+    }
+
+    /// A pool that knows no allowance lets calls back one at a time after a
+    /// refusal, one more for each answered, instead of all at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_blind_pool_ramps_back_after_a_refusal() {
+        let pace = Pace::default();
+        // Before any refusal, a burst goes at once.
+        let burst: Vec<_> = futures_util::future::join_all((0..4).map(|_| sent(&pace, 10)))
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        drop(burst);
+        pace.limited(None);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let first = sent(&pace, 10).await.unwrap();
+        // The window is one call: the next waits for it to settle.
+        let second = tokio::time::timeout(Duration::from_secs(5), sent(&pace, 10)).await;
+        assert!(second.is_err(), "a second call flew beside the first");
+        pace.accepted();
+        // Answered, the window is two.
+        let second = sent(&pace, 10).await.unwrap();
+        drop(first);
+        let third = sent(&pace, 10).await.unwrap();
+        let fourth = tokio::time::timeout(Duration::from_secs(5), sent(&pace, 10)).await;
+        assert!(fourth.is_err(), "the window grew without an answer");
+        drop((second, third));
+        // Answers widen it until it lets everything go again.
+        for _ in 0..RAMP_DONE {
+            pace.accepted();
+        }
+        assert!(pace.state.lock().unwrap().ramp.is_none());
+    }
+
+    /// A refusal while ramping halves the window, once for every call
+    /// refused while the pool was closed, and growth goes on a call a round.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_while_ramping_halves_the_window() {
+        let pace = Pace::default();
+        let window = |pace: &Pace| pace.state.lock().unwrap().ramp.as_ref().map(|r| r.window);
+        pace.limited(None);
+        assert_eq!(window(&pace), Some(1));
+        for _ in 0..7 {
+            pace.accepted();
+        }
+        assert_eq!(window(&pace), Some(8));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        pace.limited(None);
+        // Refused in flight while closed: the same refusal.
+        pace.limited(None);
+        assert_eq!(window(&pace), Some(4));
+        // Past the threshold it grows by one for a window of answers.
+        for _ in 0..3 {
+            pace.accepted();
+        }
+        assert_eq!(window(&pace), Some(4));
+        pace.accepted();
+        assert_eq!(window(&pace), Some(5));
+    }
+
+    /// A call admitted under a ramp that has since ended frees nothing in
+    /// a later one.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_from_an_ended_ramp_holds_no_place_in_a_new_one() {
+        let pace = Pace::default();
+        pace.limited(None);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let old = sent(&pace, 10).await.unwrap();
+        for _ in 0..RAMP_DONE {
+            pace.accepted();
+        }
+        assert!(pace.state.lock().unwrap().ramp.is_none());
+        pace.limited(None);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let new = sent(&pace, 10).await.unwrap();
+        drop(old);
+        let flying = |pace: &Pace| pace.state.lock().unwrap().ramp.as_ref().map(|r| r.flying);
+        assert_eq!(flying(&pace), Some(1));
+        drop(new);
+        assert_eq!(flying(&pace), Some(0));
+    }
+
+    /// A pool that knows its allowance paces by it and does not ramp; a
+    /// ramp limit ramps it all the same.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_blind_pool_or_a_ramp_limit_ramps() {
+        let pace = Pace::default();
+        pace.seed(
+            &headers(&[
+                ("x-ratelimit-limit-tokens", "100000"),
+                ("x-ratelimit-remaining-tokens", "100000"),
+            ]),
+            Limits::Responses,
+        );
+        pace.limited(None);
+        assert!(pace.state.lock().unwrap().ramp.is_none());
+        // A ramp limit refused while the pool is still closed ramps it.
+        pace.ramp_limited(Some(Duration::from_secs(1)));
+        assert_eq!(
+            pace.state.lock().unwrap().ramp.as_ref().map(|r| r.window),
+            Some(1)
+        );
     }
 
     /// Claude's fast mode publishes its own limits, input and output with
