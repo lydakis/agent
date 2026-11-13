@@ -517,7 +517,10 @@ fn finish(last: Last, store: &Path, socket: &Path) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    let replaced = runtime.block_on(switch_daemon(store, socket))?;
+    // A build just installed is the daemon's to run even when it names the
+    // same version: a nightly's next commit does.
+    let installed = matches!(last, Last::From(_));
+    let replaced = runtime.block_on(switch_daemon(store, socket, installed))?;
     // What runs Sonny by its program's path names the path that outlives a
     // release; the scheduler's job is written again when it ran another.
     crate::skills::install_own();
@@ -537,6 +540,7 @@ fn finish(last: Last, store: &Path, socket: &Path) -> Result<(), String> {
         Last::From(from) if from != VERSION => {
             println!("Successfully updated from {from} to version {VERSION}")
         }
+        Last::From(_) => println!("Successfully updated to the newest build of {VERSION}"),
         Last::AsBuilt => println!("Sonny is on version {VERSION}, as built"),
         _ => println!("Sonny is up to date ({VERSION})"),
     }
@@ -544,9 +548,10 @@ fn finish(last: Last, store: &Path, socket: &Path) -> Result<(), String> {
 }
 
 /// The daemon on `socket` made this build's: replaced when it runs
-/// another release, its companions then started on this one. Whether it
-/// was replaced.
-async fn switch_daemon(store: &Path, socket: &Path) -> Result<bool, String> {
+/// another release, or always when `installed` (a build was just
+/// installed), its companions then started on this one. Whether it was
+/// replaced.
+async fn switch_daemon(store: &Path, socket: &Path, installed: bool) -> Result<bool, String> {
     let agent = crate::agent_bin_or_missing()?;
     let own = agent_version(&agent);
     let running = match agent_client::Client::connect(socket).await {
@@ -569,7 +574,7 @@ async fn switch_daemon(store: &Path, socket: &Path) -> Result<bool, String> {
         println!("Daemon: not running; the next window starts {own}");
         return Ok(false);
     };
-    let replace = version.as_deref() != Some(own.as_str());
+    let replace = installed || version.as_deref() != Some(own.as_str());
     if replace {
         crate::start_daemon_replacing(store, socket).map_err(|e| e.to_string())?;
         println!(

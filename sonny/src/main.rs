@@ -2712,9 +2712,11 @@ async fn run() -> Result<(), String> {
         if let Some(place) = place {
             args.extend(["--window-place".into(), mux::Place::encode(&place)]);
         }
+        // The words, and the pictures behind their placeholders: a picture
+        // pasted from the clipboard has no file to come back from.
         let draft = (!app.input.trim().is_empty())
-            .then(|| kept_text(&app.options.store, "draft", &app.input).ok())
-            .flatten();
+            .then(|| attach::draft(&app.input, &app.pictures))
+            .and_then(|draft| kept_text(&app.options.store, "draft", &draft).ok());
         if let Some(draft) = &draft {
             args.extend(["--draft-file".into(), draft.display().to_string()]);
         }
@@ -6085,7 +6087,9 @@ impl App {
         // update: back in the composer, unsent.
         if let Some(file) = self.options.draft.take() {
             if let Ok(draft) = std::fs::read_to_string(&file) {
-                self.input.set(&draft);
+                let (text, pictures) = attach::undraft(&draft);
+                self.input.set(&text);
+                self.pictures = pictures;
             }
             let _ = std::fs::remove_file(&file);
         }
