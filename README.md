@@ -54,7 +54,9 @@ It unpacks `sonny-VERSION-linux-ARCH.tar.gz` (x86_64 or aarch64) under
 sandbox) and ripgrep with the system's package manager when they are
 missing; `PREFIX` installs elsewhere, `SONNY_VERSION` picks a release and
 `SONNY_PACKAGES=0` leaves the system's packages alone. [install.sh](install.sh)
-is short enough to read first.
+is short enough to read first. Later, `sonny update` updates either install
+(Homebrew or this one) to the latest release and switches the running
+daemon and open windows to it.
 
 For Sonny from main without a version tag, use the nightly Homebrew channel
 (macOS or Linux):

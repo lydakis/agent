@@ -339,8 +339,8 @@ start removes the temporary of a write that died before its rename: every
 write takes the lock, so none is under way.
 `~/.agent/automation` is written with its executable mode from the start. When
 Sonny starts from a new place, it writes its path into every definition
-(a Sonny in Homebrew's Cellar goes by its `opt` path, which an upgrade
-keeps).
+(a Sonny in Homebrew's Cellar goes by its `opt` path, and one the release
+tarball unpacked by `PREFIX/opt/sonny`, which an upgrade keeps).
 
 ### The scheduler
 
@@ -819,6 +819,58 @@ someone needs to look at, and that resuming is the person's call.
 when none) and a resume from whoever resumed (the `resumed` notice's `by`),
 from the notices every session hears, and a pause already holding from
 `ready`; a replay has none, since the notices are not events.
+
+## Updating
+
+`sonny update` brings Sonny and its daemon to the latest release, the way
+`codex update` and `claude update` update theirs
+([update.rs](../sonny/src/update.rs)). It tells how Sonny was installed by
+where its program is, as Codex does:
+
+- Homebrew's `sonny` formula: `brew update`, which reads the tap again, then
+  `brew upgrade lydakis/agent/sonny lydakis/agent/agent` when either is
+  behind. The nightly formula is reinstalled when main has moved past the
+  commit it was built from (`git ls-remote`).
+- The release tarball, as install.sh unpacked it under `PREFIX/opt`: the
+  latest release's tarball is downloaded, checked against its published
+  sha256 and, when the GitHub CLI is signed in, against the release
+  workflow's build attestation, unpacked to
+  `PREFIX/opt/sonny-VERSION-linux-ARCH`, and `PREFIX/opt/sonny` and
+  `PREFIX/bin/sonny` are linked to it, each link made beside the old one
+  and moved over it. Earlier versions stay, as install.sh leaves them.
+  `--download` stops once it is unpacked and checked, switching nothing;
+  the next `sonny update` finds it there and links it.
+- Anything else (a checkout's build, `cargo install`) is left to how it was
+  built, and the rest below still runs for this build.
+
+Brew runs from `/`, as Codex runs its updater, so no project's own
+configuration takes part. One update runs at a time, under a lock on
+`~/.agent/sonny/update.lock` that names the process holding it, as Claude
+Code's updater does; and none runs from an agent's shell, since replacing
+the daemon waits on that agent's own turn.
+
+The old Sonny then runs the new one (`sonny update --installed VERSION`,
+which every later release keeps), which does the rest, since only it knows
+how: when the daemon running now is another release, `agent start
+--replace` replaces it with the new one's, whether or not the protocol
+changed (an upgrade that kept the protocol would otherwise leave the old
+daemon running): the old one stops at once, its running turns park and
+continue on the new one, and the new one waits on the store, so nothing
+started meanwhile takes it. Then the companions start on the new Sonny,
+and the scripts in `~/.agent`, every automation and the scheduler's job
+are written again by the path that outlives a release. A line says each
+step; the last is `Successfully updated from OLD to version NEW`, or `Sonny
+is up to date (VERSION)`.
+
+Each open window notes the program it started from. When it loses the
+daemon and the Sonny installed where it runs from is another program
+(`sonny update`, or `brew upgrade` and install.sh run by hand), it reopens
+on that one in place, in the same terminal, with its own arguments, on the
+same agent, and with what was typed in its composer back in it unsent, as
+`/new` hands its first message on in a file; the reopened window says
+`Sonny was updated; this window reopened on VERSION`. A window that meets
+a newer daemon with no newer Sonny installed here still says `Sonny was
+upgraded; reopen this window` and starts nothing.
 
 ## Skills
 

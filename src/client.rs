@@ -114,6 +114,9 @@ struct Options {
     profile: Option<String>,
     detach: bool,
     no_spawn: bool,
+    /// `start --replace`: the daemon running now is replaced, whatever
+    /// its version.
+    replace: bool,
     timeout_ms: Option<u64>,
     /// `shutdown --grace`: milliseconds running turns may take to finish.
     grace_ms: u64,
@@ -198,6 +201,7 @@ fn parse(args: &[String]) -> Result<Options> {
         profile: None,
         detach: false,
         no_spawn: false,
+        replace: false,
         timeout_ms: None,
         grace_ms: 0,
         since_ms: None,
@@ -238,6 +242,7 @@ fn parse(args: &[String]) -> Result<Options> {
         match arg.as_str() {
             "--pretty" => options.pretty = true,
             "--no-spawn" => options.no_spawn = true,
+            "--replace" => options.replace = true,
             "--new" => options.new = true,
             "--agents" => options.agents = true,
             "--no-compaction" => options.compaction_instructions = None,
@@ -959,6 +964,40 @@ fn replace_older(error: &Error, options: &Options, start: &Start) -> Result<Conn
     let Some(pid) = older_daemon(error) else {
         return Err(error.clone());
     };
+    replace(pid, options, start)
+}
+
+/// `start --replace`: the daemon running now replaced by this agent's own
+/// as [`replace_older`] replaces an older one, whatever its version, so
+/// an upgrade that kept the protocol still runs the new build (`sonny
+/// update` asks for this). One older than this agent is replaced as any
+/// start replaces it; a newer one is left alone and refused; none running,
+/// this agent's starts.
+fn replace_running(options: &Options) -> Result<Connection> {
+    let running = match Connection::connect(&options.socket) {
+        Ok(running) => running,
+        Err(error) if error.code == "daemon_protocol_mismatch" => return ensure_daemon(options),
+        Err(_) => return connect_or_start(options),
+    };
+    let pid = (running.ready["pid"].as_u64())
+        .and_then(|pid| i32::try_from(pid).ok())
+        .filter(|pid| *pid > 1)
+        .ok_or(Error::new("daemon_protocol_mismatch"))?;
+    drop(running);
+    let refused = || Error::with("daemon_kept", "the daemon running now was kept");
+    if let Some(why) = kept_older(options) {
+        return Err(kept(refused(), why));
+    }
+    let start = Start::read(options)?;
+    if start.providers.is_empty() {
+        return Err(kept(refused(), NO_PROVIDER_KEPT));
+    }
+    replace(pid, options, &start)
+}
+
+/// Replace the daemon `pid` answering on `options`' socket with one of
+/// this agent's own, as [`replace_older`] says.
+fn replace(pid: i32, options: &Options, start: &Start) -> Result<Connection> {
     let socket = &options.socket;
     // Daemons since 0.6.0 take shutdown with a grace; an older one refuses
     // the field, or does not answer in time, and is sent SIGTERM, which
@@ -1596,7 +1635,11 @@ pub fn main(args: Vec<String>) -> Result<i32> {
                     ),
                 );
             };
-            let (mut ready, refused) = match ensure_daemon(&options) {
+            let started = match options.replace {
+                true => replace_running(&options),
+                false => ensure_daemon(&options),
+            };
+            let (mut ready, refused) = match started {
                 Ok(connection) => (connection.ready, None),
                 Err(error) => match error.facts.as_ref().and_then(|facts| facts.get("ready")) {
                     Some(ready) => (ready.clone(), Some(error)),

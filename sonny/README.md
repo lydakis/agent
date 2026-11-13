@@ -20,6 +20,10 @@ latest one into `~/.local`:
 
     curl -fsSL https://raw.githubusercontent.com/lydakis/agent/main/install.sh | sh
 
+`sonny update` updates either install to the latest release, replaces the
+running daemon with the new one (its running turns continue on it) and has
+open windows reopen on it ([docs/SONNY.md](../docs/SONNY.md#updating)).
+
 For main without a version tag, `brew install lydakis/agent/sonny-nightly`
 fetches current main and builds Sonny and its matching daemon together. If
 stable Sonny is installed, run `brew unlink sonny` first. Update with

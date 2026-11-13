@@ -289,6 +289,41 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(extra.returncode, 2)
         self.assertIn('takes no positional arguments', extra.stderr)
 
+    def test_start_replace_switches_the_running_daemon_to_this_agent(self):
+        # `sonny update` switches to a new build that kept the protocol:
+        # `start --replace` stops the running daemon at once and starts this
+        # agent's own on the same store, which keeps every bot. From inside a
+        # bot's turn it keeps the daemon and says so; with none running, it
+        # starts one.
+        self.agent('run', *self.common, '--new', '--bot', 'Bob', 'hello')
+        first = json.loads(self.agent('start', *self.common[:4]).stdout)
+        kept = subprocess.run(
+            [*self.base, 'start', '--replace', *self.common[:4]],
+            env={**clean_env(), 'AGENT_BOT_ID': '7'}, capture_output=True, text=True,
+            timeout=30, cwd=self.path)
+        self.assertEqual(kept.returncode, 1, kept.stderr)
+        self.assertIn('daemon_kept', kept.stderr)
+        self.assertEqual(json.loads(self.agent('start', '--store', str(self.store)).stdout)['pid'],
+                         first['pid'])
+        replaced = json.loads(self.agent('start', '--replace', *self.common[:4]).stdout)
+        self.assertNotEqual(replaced['pid'], first['pid'])
+        self.assertEqual(replaced['version'], first['version'])
+        # Gone, or a zombie no init reaped yet.
+        try:
+            state = Path(f"/proc/{first['pid']}/stat").read_text().rsplit(')', 1)[1].split()[0]
+        except (FileNotFoundError, ProcessLookupError):
+            state = None
+        if sys.platform == 'darwin':
+            with self.assertRaises(ProcessLookupError):
+                os.kill(first['pid'], 0)
+        else:
+            self.assertIn(state, (None, 'Z'))
+        bots = json.loads(self.agent('ls', '--store', str(self.store)).stdout)
+        self.assertIn('Bob', [bot['name'] for bot in bots])
+        self.agent('shutdown', '--store', str(self.store))
+        started = json.loads(self.agent('start', '--replace', *self.common[:4]).stdout)
+        self.assertEqual(started['event'], 'ready')
+
     def test_a_daemon_opening_its_store_says_it_starts_and_clients_wait_for_it(self):
         # Another process writing the store holds its opening up, as a long
         # upgrade would; the store is the daemon's all the same.
