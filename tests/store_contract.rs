@@ -17062,6 +17062,151 @@ fn calls_are_timed_by_the_model_that_answered_and_the_daemon_by_turn() {
     assert_eq!(usage["bots"][0]["daemon_ms"], 20);
 }
 
+/// A store at `path` with Bob's turn, timed when `model_ms` is not 0, that
+/// ran a command and a read together, started 1 and 0.5 s before they ended,
+/// 2 s into the turn.
+fn clocked_turn(path: &std::path::Path, db: &mut Database, model_ms: u64, request: &str) -> i64 {
+    let turn = db
+        .begin(
+            "Bob",
+            request,
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let shell_id = format!("s{request}");
+    let read_id = format!("r{request}");
+    let (item, shell) = shell_call(&format!("fc_{request}"), &shell_id, "ls");
+    let read = read_call(&read_id);
+    db.append(turn, vec![item], &[shell.clone(), read.clone()], None)
+        .unwrap();
+    db.tool_start(turn, &shell, false, false).unwrap();
+    db.tool_start(turn, &read, false, false).unwrap();
+    let conn = Connection::open(path).unwrap();
+    conn.execute(
+        "UPDATE turns SET started_ms=started_ms-2000 WHERE id=?1",
+        [turn],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE audit SET at_ms=at_ms-1000 WHERE turn=?1 AND call_id=?2",
+        rusqlite::params![turn, shell_id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE audit SET at_ms=at_ms-500 WHERE turn=?1 AND call_id=?2",
+        rusqlite::params![turn, read_id],
+    )
+    .unwrap();
+    db.tool_finish(turn, &shell_id, &result("ok")).unwrap();
+    db.tool_finish(turn, &read_id, &result("ok")).unwrap();
+    let usage = Usage {
+        input_tokens: 100,
+        output_tokens: 40,
+        model_ms,
+        first_token_ms: model_ms / 4,
+        ..Usage::default()
+    };
+    db.append(turn, vec![assistant("done")], &[], Some(&usage))
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    turn
+}
+
+#[test]
+fn each_turn_counts_its_calls_and_their_time_once() {
+    let path = std::env::temp_dir().join(format!("agent-clock-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let tools = ["shell".to_owned(), "read".to_owned()];
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            tools: &tools,
+            ..binding()
+        },
+    )
+    .unwrap();
+    clocked_turn(&path, &mut db, 2_000, "1");
+    // A turn with no timed call is left out of the time.
+    clocked_turn(&path, &mut db, 0, "2");
+    let usage = db.usage(None, 0, None, 64).unwrap();
+    let time = &usage["time"];
+    // The two calls ran together: 1 s, not 1.5.
+    let tool_ms = time["tool_ms"].as_i64().unwrap();
+    assert!((1_000..1_400).contains(&tool_ms), "{time}");
+    assert_eq!(
+        [
+            &time["turns"],
+            &time["model_rounds"],
+            &time["tool_calls"],
+            &time["timed_rounds"],
+            &time["timed_output_tokens"],
+            &time["model_ms"],
+            &time["first_token_ms"],
+        ],
+        [
+            &json!(1),
+            &json!(2),
+            &json!(2),
+            &json!(1),
+            &json!(40),
+            &json!(2_000),
+            &json!(500)
+        ]
+    );
+    // From its start to its end, which takes in its calls.
+    assert!(time["turn_ms"].as_i64().unwrap() >= tool_ms, "{time}");
+    assert_eq!(usage["bots"][0]["time"], *time);
+    assert_eq!(usage["turns"], 2);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn schema_97_clocks_the_timed_turns_from_the_audit_trail() {
+    let path = std::env::temp_dir().join(format!("agent-clock-97-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let tools = ["shell".to_owned(), "read".to_owned()];
+        db.create(
+            "Bob",
+            Some("/synthetic"),
+            Binding {
+                tools: &tools,
+                ..binding()
+            },
+        )
+        .unwrap();
+        clocked_turn(&path, &mut db, 0, "1");
+        clocked_turn(&path, &mut db, 2_000, "2");
+    }
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE turns DROP COLUMN tool_calls;
+         ALTER TABLE turns DROP COLUMN tool_ms;
+         ALTER TABLE turns DROP COLUMN tools_until_ms;
+         PRAGMA user_version=96;",
+    )
+    .unwrap();
+    let db = Database::initialize(conn).unwrap();
+    let usage = db.usage(None, 0, None, 64).unwrap();
+    let time = &usage["time"];
+    let tool_ms = time["tool_ms"].as_i64().unwrap();
+    assert!((1_000..1_400).contains(&tool_ms), "{time}");
+    assert_eq!(
+        [&time["turns"], &time["tool_calls"], &time["model_ms"]],
+        [&json!(1), &json!(2), &json!(2_000)]
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn schema_95_starts_earlier_spend_untimed() {
     let path = std::env::temp_dir().join(format!("agent-timed-95-{}.sqlite", std::process::id()));

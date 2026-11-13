@@ -8766,3 +8766,18 @@ swung by 16% to 33% on earlier screens with no Sonny change; Sonny's only
 change is three fields in the tools it declares. The 10x1 lookout row is
 one timer tick of 6.25 ms over a thousand deltas, and the same measure fell
 10% at 10x10 in the same run.
+
+## Each turn's tool calls and their time (protocol 71, schema 97)
+
+A turn keeps how many of its calls ran to their end and their time, calls
+that ran together once, so `usage` can say where a finished turn's time went.
+What each path does now:
+
+- **A call that ends**: one more update of its turn's row by key, reading its
+  audit row's start by key, in the commit that already ends the call. No new
+  store job.
+- **`usage`**: one more grouped statement over the window's finished turns
+  and their models' rows, in the same snapshot, on a reader connection.
+- **Opening a schema 96 store**: one pass over the audit trail from the first
+  timed turn's start (found by a binary search on ids), and one update per
+  turn that ran calls.
