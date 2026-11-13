@@ -728,23 +728,23 @@ impl Pace {
                 .tokens
                 .iter()
                 .all(|dim| dim.bucket.per_minute.is_none());
-        if open && (ramp || blind) {
-            match state.ramp.as_mut() {
-                None => {
-                    state.ramps += 1;
-                    state.ramp = Some(Ramp {
-                        generation: state.ramps,
-                        window: 1,
-                        threshold: None,
-                        flying: 0,
-                        credit: 0,
-                    })
-                }
-                Some(ramp) => {
-                    let half = (ramp.window / 2).max(1);
-                    (ramp.window, ramp.threshold, ramp.credit) = (half, Some(half), 0);
-                }
+        // A ramp limit starts a ramp whenever none runs, closed or not.
+        match state.ramp.as_mut() {
+            None if ramp || (open && blind) => {
+                state.ramps += 1;
+                state.ramp = Some(Ramp {
+                    generation: state.ramps,
+                    window: 1,
+                    threshold: None,
+                    flying: 0,
+                    credit: 0,
+                })
             }
+            Some(running) if open && (ramp || blind) => {
+                let half = (running.window / 2).max(1);
+                (running.window, running.threshold, running.credit) = (half, Some(half), 0);
+            }
+            _ => {}
         }
         let delay = after.unwrap_or_else(|| {
             if state.unnamed_blocks == 0 || state.blocked_until.is_none_or(|until| until <= now) {
@@ -1525,7 +1525,7 @@ mod tests {
         );
         pace.limited(None);
         assert!(pace.state.lock().unwrap().ramp.is_none());
-        tokio::time::advance(Duration::from_secs(2)).await;
+        // A ramp limit refused while the pool is still closed ramps it.
         pace.ramp_limited(Some(Duration::from_secs(1)));
         assert_eq!(
             pace.state.lock().unwrap().ramp.as_ref().map(|r| r.window),
