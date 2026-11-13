@@ -4629,6 +4629,7 @@ impl Turn {
                     match self
                         .background(
                             &call.call_id,
+                            record.bot_id,
                             command,
                             Prepared::folder(workspace, workdir.as_deref()),
                             timeout_ms,
@@ -4845,7 +4846,8 @@ impl Turn {
                         Ran::Done(Err(error)) => failure(error),
                         Ran::Lifted(run) => {
                             let outputs = self.outputs(record, workspace);
-                            self.lift_shell(&call.call_id, run, &place, outputs).await?
+                            self.lift_shell(&call.call_id, record.bot_id, run, &place, outputs)
+                                .await?
                         }
                     }
                 }
@@ -5086,7 +5088,8 @@ impl Turn {
                         let outputs = self.outputs(record, workspace);
                         return (
                             call_id.clone(),
-                            self.lift_shell(&call_id, run, &place, outputs).await,
+                            self.lift_shell(&call_id, record.bot_id, run, &place, outputs)
+                                .await,
                         );
                     }
                 }
@@ -5717,16 +5720,16 @@ impl Turn {
         // inherited from a fork's source is not its to collect. An owned
         // command stays owned, so checking before the wait parks is enough.
         if !processes.is_empty() {
-            let bot = self.bot.clone();
+            let (bot, ids) = (self.bot.clone(), processes.clone());
             let refused = self
                 .store
-                .op("unowned_process", move |db| {
-                    db.unowned_process(&bot, &processes)
-                })
+                .op("unowned_process", move |db| db.unowned_process(&bot, &ids))
                 .await?;
             if let Some(error) = refused {
                 return Ok(ControlFlow::Continue(failure(error)));
             }
+            // Waited on, as Codex counts a poll: the last its bot prunes.
+            self.registry.used(&processes);
         }
         // A steer waiting for the next boundary makes the wait a poll: it
         // reports what resolved, and the rest pending.
@@ -5838,6 +5841,7 @@ impl Turn {
     async fn background(
         &self,
         call_id: &str,
+        owner: i64,
         command: String,
         workspace: PathBuf,
         timeout_ms: Option<u64>,
@@ -5855,6 +5859,7 @@ impl Turn {
         let (sender, receiver) = oneshot::channel();
         self.registry.background(
             self.registry.stopper(id),
+            owner,
             command,
             workspace,
             timeout_ms,
@@ -5876,6 +5881,7 @@ impl Turn {
     async fn lift_shell<F>(
         &self,
         call_id: &str,
+        owner: i64,
         run: std::pin::Pin<Box<F>>,
         place: &Place,
         outputs: Option<Outputs>,
@@ -5889,9 +5895,10 @@ impl Turn {
             .op("process_start", move |db| db.process_start(turn, &started))
             .await?;
         let (sender, receiver) = oneshot::channel();
-        let run = self
-            .registry
-            .until_stopped(self.registry.stopper(id), self.registry.until_pulled(run));
+        // It runs on as a background command, and counts as one.
+        let stopper = self.registry.stopper(id);
+        self.registry.own(&stopper, owner);
+        let run = (self.registry).until_stopped(stopper, self.registry.until_pulled(run));
         // Counted as the process it is now, not as a foreground command too.
         place.lift();
         tokio::spawn(async move {
@@ -6120,6 +6127,7 @@ impl Lifts {
             }) => match self.registry.queue() {
                 Ok(queued) => self.registry.background(
                     stopper,
+                    bot.bot_id,
                     command,
                     Prepared::folder(&workspace, workdir.as_deref()),
                     timeout_ms,
