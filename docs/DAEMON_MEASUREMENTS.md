@@ -8707,8 +8707,8 @@ runner, alternating rounds. #896, base main 4e17d3b against head 9c31bb5:
 | lifecycle | p95 turn, ms | 706.6 | 578.011 | -18.2% |
 | lifecycle | peak RSS, MiB | 24.594 | 24.496 | -0.4% |
 
-Every row is inside the runner's spread and the gate warned on none. The
-two moves past 5% go opposite ways for the same per-idle-bot figure across
+No row rose past the gate's 15% warning, and the one move that size is the
+lifecycle p95 falling. The two moves past 5% otherwise go opposite ways for the same per-idle-bot figure across
 the two screens (+5.7%, -5.5%), and completion p99 at +4.8% is 0.47 ms on a
 path neither change touches. Sonny's rows are left out: neither PR changes
 Sonny.
