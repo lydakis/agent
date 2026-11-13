@@ -4,8 +4,8 @@ use agent_runtime::{
     provider::{ModelTokens, ToolCall, Usage},
     store::{
         Answered, Binding, Blocked, Bot, CacheTtl, CompactionPlan, ContextUsage, Counts, Database,
-        Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Lifted, Limit, Planning, QuoteRef,
-        Settings, Strip, TurnBudget, TurnOptions, Wake,
+        Decision, Delivery, Fork, Gate, Gated, Halt, Halted, Lifted, Limit, Planning, ProcessKind,
+        QuoteRef, Settings, Strip, TurnBudget, TurnOptions, Wake,
     },
     tools::{Declared, Inherit, Outcome},
 };
@@ -8091,7 +8091,9 @@ fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
     db.append(turn, vec![item], std::slice::from_ref(&bg), None)
         .unwrap();
     db.tool_start(turn, &bg, false, false).unwrap();
-    let process = db.process_start(turn, "bg").unwrap();
+    let process = db
+        .process_start(turn, "bg", ProcessKind::Background, "")
+        .unwrap();
     db.tool_finish(turn, "bg", &result(&format!("proc:{process}")))
         .unwrap();
     // The fork's history holds the handle, but the command is Bob's.
@@ -9138,7 +9140,10 @@ fn completion_retention_passes_turns_whose_processes_still_run() {
             )
             .unwrap()
             .turn;
-        processes.push(db.process_start(turn, "bg").unwrap());
+        processes.push(
+            db.process_start(turn, "bg", ProcessKind::Background, "")
+                .unwrap(),
+        );
         db.append(turn, vec![assistant("launched")], &[], None)
             .unwrap();
         db.finish(turn, None).unwrap();
@@ -9432,7 +9437,9 @@ fn retention_keeps_running_processes_until_their_results_commit() {
         )
         .unwrap()
         .turn;
-    let process = db.process_start(turn, "bg").unwrap();
+    let process = db
+        .process_start(turn, "bg", ProcessKind::Background, "")
+        .unwrap();
     db.append(turn, vec![assistant("launched")], &[], None)
         .unwrap();
     db.finish(turn, None).unwrap();
@@ -16356,7 +16363,9 @@ fn an_expired_fork_still_running_a_command_holds_back_no_other() {
     db.append(turn, vec![item], std::slice::from_ref(&bg), None)
         .unwrap();
     db.tool_start(turn, &bg, false, false).unwrap();
-    let process = db.process_start(turn, "bg").unwrap();
+    let process = db
+        .process_start(turn, "bg", ProcessKind::Background, "")
+        .unwrap();
     db.tool_finish(turn, "bg", &result(&format!("proc:{process}")))
         .unwrap();
     db.append(turn, vec![assistant("started")], &[], None)
@@ -17702,10 +17711,18 @@ fn a_background_command_no_wait_collected_is_told_once_its_bot_rests() {
         )
         .unwrap()
         .turn;
-    let waited = db.process_start(first, "shell-1").unwrap();
-    let seen = db.process_start(first, "tty-1").unwrap();
-    let late = db.process_start(first, "shell-2").unwrap();
-    let during = db.process_start(first, "shell-3").unwrap();
+    let waited = db
+        .process_start(first, "shell-1", ProcessKind::Background, "")
+        .unwrap();
+    let seen = db
+        .process_start(first, "tty-1", ProcessKind::Background, "")
+        .unwrap();
+    let late = db
+        .process_start(first, "shell-2", ProcessKind::Background, "")
+        .unwrap();
+    let during = db
+        .process_start(first, "shell-3", ProcessKind::Background, "")
+        .unwrap();
     // While its turn runs, an end waits for the turn's end.
     db.process_finish(
         waited,
@@ -17786,7 +17803,9 @@ fn started_in_background(db: &mut Database, bot: &str, id: &str) -> i64 {
     ))
     .unwrap()
     .turn;
-    let process = db.process_start(turn, &format!("{id}-shell")).unwrap();
+    let process = db
+        .process_start(turn, &format!("{id}-shell"), ProcessKind::Background, "")
+        .unwrap();
     db.finish(turn, None).unwrap();
     process
 }
@@ -17843,7 +17862,10 @@ fn notes_of_many_ended_commands_each_fit_the_bots_context() {
     .turn;
     let long = "why ".repeat(100);
     let ids: Vec<i64> = (0..4)
-        .map(|n| db.process_start(turn, &format!("shell-{n}")).unwrap())
+        .map(|n| {
+            db.process_start(turn, &format!("shell-{n}"), ProcessKind::Background, "")
+                .unwrap()
+        })
         .collect();
     for id in &ids {
         db.process_finish(
@@ -17976,8 +17998,12 @@ fn schema_76_tells_no_bot_of_commands_that_ended_before() {
             )
             .unwrap()
             .turn;
-        let ended = db.process_start(turn, "shell-1").unwrap();
-        let running = db.process_start(turn, "shell-2").unwrap();
+        let ended = db
+            .process_start(turn, "shell-1", ProcessKind::Background, "")
+            .unwrap();
+        let running = db
+            .process_start(turn, "shell-2", ProcessKind::Background, "")
+            .unwrap();
         db.process_finish(ended, &json!({"exit_code":0}), false, &[], &[])
             .unwrap();
         (ended, running)
@@ -20522,4 +20548,103 @@ fn retention_keeps_the_ending_of_the_message_it_ends() {
         .iter()
         .any(|e| e["message"] == note);
     assert!(!left);
+}
+
+#[test]
+fn running_commands_are_listed_and_a_detached_one_outlives_a_restart() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-processes-listed-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let detached = agent_runtime::tools::Detached {
+        pid: 4242,
+        since: Some(77),
+    };
+    let (background, terminal, service, ended) = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("shop.lead", Some("/synthetic"), binding())
+            .unwrap();
+        db.create("other", Some("/synthetic"), binding()).unwrap();
+        let begin = |db: &mut Database, bot: &str| {
+            db.begin(
+                bot,
+                "r1",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn
+        };
+        let turn = begin(&mut db, "shop.lead");
+        let background = db
+            .process_start(turn, "shell-1", ProcessKind::Background, "cargo build")
+            .unwrap();
+        let terminal = db
+            .process_start(turn, "tty-1", ProcessKind::Terminal, "python3")
+            .unwrap();
+        // A command longer than a row keeps is listed by its start.
+        let long = format!("npm run dev {}", "x".repeat(4096));
+        let service = db
+            .process_start(turn, "detach-1", ProcessKind::Detached, &long)
+            .unwrap();
+        db.process_detached(service, detached, true, "").unwrap();
+        // One that ended is not listed, nor one that never recorded its
+        // start, which a restart loses.
+        let ended = db
+            .process_start(turn, "shell-2", ProcessKind::Background, "true")
+            .unwrap();
+        db.process_finish(ended, &json!({"exit_code":0}), false, &[], &[])
+            .unwrap();
+        let other = begin(&mut db, "other");
+        db.process_start(other, "detach-2", ProcessKind::Detached, "sleep 9")
+            .unwrap();
+        let listed = db.processes(Some("shop.*")).unwrap();
+        let handles: Vec<&str> = listed
+            .iter()
+            .map(|row| row["handle"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            handles,
+            [
+                format!("proc:{background}"),
+                format!("proc:{terminal}"),
+                format!("proc:{service}")
+            ]
+        );
+        assert_eq!(listed[0]["kind"], "background");
+        assert_eq!(listed[0]["command"], "cargo build");
+        assert_eq!(listed[0]["bot"], "shop.lead");
+        assert!(listed[0]["started_ms"].as_i64().unwrap() > 0);
+        assert_eq!(listed[0]["pid"], Value::Null);
+        assert_eq!(listed[1]["kind"], "terminal");
+        assert_eq!(listed[2]["kind"], "detached");
+        assert_eq!(listed[2]["pid"], 4242);
+        assert_eq!(listed[2]["command"].as_str().unwrap().len(), 512);
+        assert_eq!(db.processes(None).unwrap().len(), 4);
+        assert_eq!(db.processes(Some("nobody")).unwrap().len(), 0);
+        (background, terminal, service, ended)
+    };
+    // The daemon stopped: its background command and terminal went with
+    // it, the detached command did not, and the next daemon finds it.
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let listed = db.processes(None).unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["handle"], format!("proc:{service}"));
+    let rows = db.detached_running().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].id, rows[0].bot.as_str(), rows[0].call_id.as_str()),
+        (service, "shop.lead", "detach-1")
+    );
+    assert_eq!((rows[0].detached, rows[0].sandboxed), (detached, true));
+    assert_eq!(
+        db.process_result(background).unwrap().unwrap().0,
+        "lost",
+        "{terminal} {ended}"
+    );
+    drop(db);
+    std::fs::remove_file(path).unwrap();
 }

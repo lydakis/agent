@@ -8655,3 +8655,25 @@ not touch: Sonny's only change is one label in the transcript's match on
 tool names. The same lookout note p95 fell 14% at the other size in the
 same run, and quiet window CPU has swung by 16% and 33% on earlier screens
 with no Sonny change (above), so both are the runner's spread.
+
+## Tracked detached commands (protocol 69, schema 97)
+
+A detached command is a `proc:N` handle now, recorded with its pid and its
+leader's start so a later daemon finds it again, and `processes` lists what
+runs. What each path costs:
+
+- **A background command or terminal start**: the same one `process_start`
+  job, which now also writes the kind, the command's first 512 bytes and
+  the start time into the row it already wrote. No new job, no new index.
+- **A foreground command**: a copy of at most 512 bytes of its command,
+  kept for the row a steer would make; nothing else.
+- **A detached command**: two store jobs (its row before it starts, its
+  pid and start after), on a path no screen runs; the one watcher task it
+  had, which now also listens for a stop on its handle.
+- **Daemon start**: one read of the running rows' partial index for
+  detached rows, and per row a `/proc` stat read and a group probe off the
+  runtime thread.
+- **`processes`**: a read through `processes_running`, so it costs what
+  runs, not the history. Sonny's `/ps` reads it every two seconds only
+  while it is open.
+- **An idle bot**: nothing.

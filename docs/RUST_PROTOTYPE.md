@@ -1277,8 +1277,9 @@ every background command (whose handle then answers `daemon_paused`, saying
 the same), terminal, and detached command this
 daemon started (the process group each leads, with what it left running
 there after it exited, and on Linux a sandboxed one's whole pid namespace;
-one started before a restart, or an unsandboxed process that left that
-group, is no longer the daemon's to find), and from
+a detached command an earlier daemon started too, found again by its row;
+an unsandboxed process that left that group is no longer the daemon's to
+find), and from
 then no turn starts: a `reject`
 submission answers `daemon_paused`, `queue` and `steer` submissions are
 recorded and wait, automations' runs and notes with them, and parked and paced turns
@@ -2407,6 +2408,24 @@ detail, so a reader that only says how many are held, as Sonny's alerts
 do, reads one page whatever the fleet's size (protocol 48; before, one
 answer held every turn and went past the frame limit near 6,000 agents).
 A page is bounded by bytes too, as `pauses` pages are.
+`{"op":"processes","bot":NAME?}` lists what runs for `bot`, a name or a
+GLOB pattern of names, or for every bot (protocol 69): each background
+command, terminal and detached command still running, and each call a
+message lifted that waits on, by bot and oldest first, as `{processes:
+[{handle, bot, turn, call_id, kind, command, started_ms, pid}]}`. `kind` is `background`,
+`terminal`, `detached` or `call`; `command` is the command's first 512
+bytes (a lifted call's, or its tool's name); `pid` is a detached
+command's, which leads its session and process group, so it is the one
+pid outside a sandbox's namespace that names it. The rows come from the
+running rows' partial index, so the read costs what runs, not the
+history. `{"op":"stop_process","bot":NAME,"handle":"proc:N"}` stops it as
+its agent's `write_stdin` with `kill: true` does and answers as that does,
+`{handle, stopped: true, ran}`; a handle that is not a command of that
+bot's still running answers `process_not_running`. `agent ps [--bot NAME]`
+and `agent stop --bot NAME proc:N` send them, and Sonny's `/ps` lists the
+project's and stops one. A bot whose command still runs is not deleted
+(`bot_busy`, naming the two requests): nothing an agent started runs
+untracked.
 `{"op":"retry_held","bot":NAME?}` tries every held turn again now,
 or only `bot`'s, and answers `{retried: N}`; a sandboxed bot's own socket
 refuses it with `not_permitted`, since what held the turn is the person's to
@@ -2776,11 +2795,24 @@ timeout is a result, not an error: the output written before the kill, with
 often what the model needs next. Background commands are killed when the
 daemon stops. `detach: true` is the way to leave a service running: the
 command starts in a new session with stdin, stdout and stderr on
-`/dev/null`, and the call returns its pid at once. The daemon writes no log
+`/dev/null`, and the call returns `{handle, detached: true, pid}` at once,
+a `proc:N` handle like a background command's. The daemon writes no log
 for it, since such a file would hold output that never passed credential
-redaction; a command that wants its output redirects it to a file itself. No process slot, timeout, group kill, or
-handle applies to it, so it outlives the turn and the daemon and is outside
-`--max-processes`; stopping it is the bot's job. What does bound it is
+redaction; a command that wants its output redirects it to a file itself. No process slot, timeout, or
+group kill at the call's end applies to it, so it outlives the turn and the daemon and is outside
+`--max-processes`. Its handle is tracked as a background command's is
+(protocol 69, schema 97), as Codex tracks every command it leaves
+running: `write_stdin` with `kill: true` on it, or `stop_process`, ends
+its process group (and on Linux a sandboxed one's pid namespace), `wait`
+on it reports how it ended, and its end is told as a background command's
+once nothing it left in its group runs, `{exit_code, success,
+wall_time_ms}` by its leader's exit. Its row records its pid and when
+that leader started (`/proc` `starttime` on Linux, `proc_pidinfo` on
+macOS), so a daemon started later watches it again and stops it by its
+handle: a group still running whose leader, if there, started then is the
+same command, since the kernel gives no new process a group id a member
+holds; one that ended while no daemon watched is recorded ended then,
+with `exit_code: null`, and told. What does bound it is
 `--max-lasting`, shared with terminals as a systemd slice holds a
 service's processes: each detached command retains a slot until its async
 waiter has reaped it and nothing it left in its process group runs (a
@@ -2919,7 +2951,7 @@ command reaches another bot's. A request on it:
 | `audit_trim` | `not_permitted`: the audit trail is the person's record of what agents did |
 | `create`, `fork` | Made by the caller, whatever `created_by` names (another is `not_permitted`), so the bot inherits its sandbox; its workspace and `writable` folders, and a fork's source's, must be ones the caller may write. A fork with `allow: []`, which only answers, may be of any bot |
 | `submit` | Reads as the caller's: `from` its turn when the request names it (the CLI does, from `AGENT_TURN`), else with its name as `origin`; `from` naming another bot is `not_permitted`. A workspace for a sandboxed bot must be one the caller may write |
-| `delete`, `prune`, `compact`, `interrupt` | The caller itself, or a bot it made; another is `not_permitted` |
+| `delete`, `prune`, `compact`, `interrupt`, `stop_process` | The caller itself, or a bot it made; another is `not_permitted` |
 | Everything else | As on the daemon's socket |
 
 The folder of these sockets stays read-only in every root, so no bot can

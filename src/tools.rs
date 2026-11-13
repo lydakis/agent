@@ -120,7 +120,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing tracks it and only a daemon pause kills it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
+                "Run a noninteractive bash command (sh where bash is not installed) in the workspace, or in workdir when given (relative to the workspace unless absolute). stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with up to 1 MiB of it retained: past that, its first and last 512 KiB, and the command keeps running. Default timeout 120 s, maximum 600 s; with background=true there is no timeout unless timeout_ms sets one, of up to a day. A command that times out is killed and returns its output so far with timed_out. Every result reports wall_time_ms. Commands run with no terminal: TERM=dumb, NO_COLOR=1, and cat as the pager; AI_AGENT=agent tells tools an agent runs them. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. If no wait collects it, its end comes as a message once no turn of yours runs: {\"finished\":{\"proc:N\":{how it ended}}}; wait on the handle reads the output. A steer that arrives while a command runs moves it to the background: the result is its proc handle with steered=true, and the command keeps running. A background command runs until it exits, its timeout_ms passes, kill=true on its handle stops it, or the daemon stops. With detach=true the command starts in its own session and a proc handle and its pid are returned at once; it outlives the turn and the daemon and runs until it exits, a pause, or kill=true on its handle. Its output is discarded unless the command redirects it to a file; its end comes as a background command's does. \"$AGENT_BIN\" ps --bot \"$AGENT_BOT\" lists your commands still running. With tty=true it runs in a terminal, for a REPL or a program that prompts: the result is what it wrote within yield_time_ms (default 1000) and, while it runs, a proc handle for write_stdin.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "workdir":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_BACKGROUND_TIMEOUT_MS},
@@ -174,14 +174,14 @@ impl Tool {
                 "required":["url"],"additionalProperties":false}),
             ),
             Tool::WriteStdin => (
-                "Type into a terminal that shell started with tty=true, and return what it wrote since the last read, stdout and stderr together, which echoes what was typed. A terminal runs until it exits or is killed, across turns; wait on its handle reports how it ended. chars is typed as it is: end a line with \\n, and send a control key as its character, such as \\u0003 for Ctrl-C or \\u0004 for Ctrl-D; empty chars only reads. It waits yield_time_ms for output, 250 by default after typing and 5000 when only reading, at most 30000; a command that ends sooner returns at once with its exit_code. kill=true ends the command and every process it started; on a background command's proc handle, or a call a message moved to the background while it waited for approval or an answer, kill=true stops it (a call still waiting never runs).",
+                "Type into a terminal that shell started with tty=true, and return what it wrote since the last read, stdout and stderr together, which echoes what was typed. A terminal runs until it exits or is killed, across turns; wait on its handle reports how it ended. chars is typed as it is: end a line with \\n, and send a control key as its character, such as \\u0003 for Ctrl-C or \\u0004 for Ctrl-D; empty chars only reads. It waits yield_time_ms for output, 250 by default after typing and 5000 when only reading, at most 30000; a command that ends sooner returns at once with its exit_code. kill=true ends the command and every process it started; on a background or detached command's proc handle, or a call a message moved to the background while it waited for approval or an answer, kill=true stops it (a call still waiting never runs).",
                 json!({"type":"object","properties":{"handle":{"type":"string"},
                 "chars":{"type":"string","maxLength":INPUT_BYTES},
                 "yield_time_ms":{"type":"integer","minimum":0,"maximum":MAX_YIELD_MS},"kill":{"type":"boolean"}},
                 "required":["handle"],"additionalProperties":false}),
             ),
             Tool::Wait => (
-                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background shell, or a call a message moved to the background). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
+                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'BOT/N' (a message sent to a peer agent, numbered as run gives it) or 'proc:N' (a background or detached shell, or a call a message moved to the background). Each result reports the outcome: for a message that opened a turn, that turn's status and final text, with before_steer, the last text it wrote before it was steered, when it ended on a reply to a steer; for one another turn took in, status taken and that turn's number, to wait on in turn; or a process's output and exit code.
  With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending. A steer ends the wait at once with steered=true: unresolved handles are reported pending and stay valid, so wait again to keep waiting.",
                 json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
                 "timeout_ms":{"type":"integer","minimum":0,"maximum":MAX_WAIT_TIMEOUT_MS},"any":{"type":"boolean"}},
@@ -1049,7 +1049,9 @@ pub enum Prepared {
         background: bool,
         workdir: Option<String>,
     },
-    /// A command in its own session, neither tracked nor killed.
+    /// A command in its own session that outlives the turn and the
+    /// daemon, on a proc handle. Resolved by the runtime; the registry
+    /// starts one untracked.
     Detach {
         command: String,
         workdir: Option<String>,
@@ -2073,9 +2075,15 @@ impl Registry {
             Prepared::Shell {
                 background: true, ..
             } => fail("background_requires_runtime"),
+            // Untracked: what a runtime starts has a proc handle, from
+            // `detached`.
             Prepared::Detach { command, workdir } => {
                 let folder = Prepared::folder(workspace, workdir.as_deref());
-                detach(&command, &folder, self, environment, sandbox).await
+                let Detached { pid, .. } =
+                    detach(&command, &folder, self, environment, sandbox, None).await?;
+                Ok(Outcome::text(
+                    json!({"detached":true,"pid":pid}).to_string(),
+                ))
             }
             Prepared::Wait { .. } => fail("wait_requires_runtime"),
             Prepared::Terminal { .. } | Prepared::WriteStdin { .. } => {
@@ -2485,6 +2493,78 @@ impl Registry {
     pub fn stop(&self, id: i64) -> bool {
         let stop = self.stops.lock().unwrap().remove(&id);
         stop.is_some_and(|stop| stop.send(()).is_ok())
+    }
+
+    /// Start detached command `command` in `workspace` as background
+    /// command `id`, whose `stopper` stops it: it outlives turns and the
+    /// daemon, and its end goes to `done` once nothing it left in its
+    /// group runs, if this daemon still does. One that does not start
+    /// sends its error there too.
+    pub async fn detached(
+        &self,
+        stopper: Stopper,
+        command: &str,
+        workspace: &Path,
+        environment: &[(String, String)],
+        sandbox: Option<Arc<Policy>>,
+        done: tokio::sync::oneshot::Sender<Result<Outcome>>,
+    ) -> Result<Detached> {
+        let tracked = Tracked { stopper, done };
+        detach(
+            command,
+            workspace,
+            self,
+            environment,
+            sandbox,
+            Some(tracked),
+        )
+        .await
+    }
+
+    /// Watch again detached command `detached`, which an earlier daemon
+    /// started, by its `stopper`, as `detached` watches one it starts: its
+    /// lasting slot is taken again when one is free, as it runs either way.
+    /// False, sending nothing, when it no longer runs.
+    #[cfg(unix)]
+    pub async fn adopt(
+        &self,
+        stopper: Stopper,
+        detached: Detached,
+        sandboxed: bool,
+        elapsed: Duration,
+        done: tokio::sync::oneshot::Sender<Result<Outcome>>,
+    ) -> bool {
+        let runs = tokio::task::spawn_blocking(move || still_runs(detached))
+            .await
+            .unwrap_or(false);
+        if !runs {
+            return false;
+        }
+        let permit = self.lasting().ok().flatten();
+        let started = std::time::Instant::now()
+            .checked_sub(elapsed)
+            .unwrap_or_else(std::time::Instant::now);
+        tokio::spawn(watch_detached(
+            self.pulls.subscribe(),
+            None,
+            detached.pid,
+            sandboxed,
+            started,
+            Some(Tracked { stopper, done }),
+            Box::new(permit),
+        ));
+        true
+    }
+    #[cfg(not(unix))]
+    pub async fn adopt(
+        &self,
+        _: Stopper,
+        _: Detached,
+        _: bool,
+        _: Duration,
+        _: tokio::sync::oneshot::Sender<Result<Outcome>>,
+    ) -> bool {
+        false
     }
 
     /// `run`, a command a steer moved to the background, ended as the pull
@@ -3053,12 +3133,33 @@ fn sh(
     Ok(process)
 }
 
+/// A detached command once started: its pid, which leads its session and
+/// process group, and what tells that leader from a later process given
+/// the same pid, recorded with its handle so a daemon started later can
+/// still find it and stop it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Detached {
+    pub pid: u32,
+    /// When the leader started, as the kernel counts it; none where it
+    /// could not be read.
+    pub since: Option<u64>,
+}
+
+/// What a tracked detached command reports its end to, and what stops it
+/// on its handle.
+pub struct Tracked {
+    pub stopper: Stopper,
+    pub done: tokio::sync::oneshot::Sender<Result<Outcome>>,
+}
+
 /// Start a command in a new session for a service that must outlive the
 /// turn and the daemon. Its output is discarded: a log the daemon wrote would
 /// bypass credential redaction, so a command that wants one redirects itself.
-/// No process slot or handle applies to it, and only the pull cord kills its
-/// session. An async waiter reaps it on exit; its detached slot is released
-/// once nothing it left in its group runs either.
+/// No process slot applies to it; a lasting one does. Tracked, it is a proc
+/// handle its agent or a person stops, and its end goes to `done` once
+/// nothing it left in its group runs; the pull cord kills it either way. An
+/// async waiter reaps it on exit; its lasting slot is released once nothing
+/// it left in its group runs either.
 #[cfg(unix)]
 async fn detach(
     command: &str,
@@ -3066,7 +3167,50 @@ async fn detach(
     registry: &Registry,
     environment: &[(String, String)],
     sandbox: Option<Arc<Policy>>,
-) -> Result<Outcome> {
+    tracked: Option<Tracked>,
+) -> Result<Detached> {
+    let spawned = spawn_detached(command, workspace, registry, environment, sandbox).await;
+    let (child, detached, sandboxed, started, held) = match spawned {
+        Ok(spawned) => spawned,
+        // A command that never started ends here, as its own call says.
+        Err(error) => {
+            if let Some(tracked) = tracked {
+                let _ = tracked.done.send(Err(error.clone()));
+            }
+            return Err(error);
+        }
+    };
+    tokio::spawn(watch_detached(
+        registry.pulls.subscribe(),
+        Some(child),
+        detached.pid,
+        sandboxed,
+        started,
+        tracked,
+        held,
+    ));
+    Ok(detached)
+}
+
+/// A detached command started: its child, what finds it, whether a
+/// sandbox holds it, when it started, and what it holds while it runs.
+#[cfg(unix)]
+type Spawned = (
+    tokio::process::Child,
+    Detached,
+    bool,
+    std::time::Instant,
+    Box<dyn Send>,
+);
+
+#[cfg(unix)]
+async fn spawn_detached(
+    command: &str,
+    workspace: &Path,
+    registry: &Registry,
+    environment: &[(String, String)],
+    sandbox: Option<Arc<Policy>>,
+) -> Result<Spawned> {
     use std::process::Stdio;
     let mut process = sh(
         command,
@@ -3098,66 +3242,192 @@ async fn detach(
     // The bot's socket listens while anything the command left in its
     // group runs, not only while the command itself does.
     let listening = sandbox.as_ref().and_then(|policy| policy.listening.clone());
-    let mut child = process.spawn().map_err(|e| not_started(e, workspace))?;
+    let started = std::time::Instant::now();
+    let child = process.spawn().map_err(|e| not_started(e, workspace))?;
     let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
-    // It outlives turns and the daemon, but not the pull cord: a pull ends
-    // the process group it leads, and a sandbox's namespace, as it ends
-    // every other command an agent runs.
-    let mut pulls = registry.pulls.subscribe();
-    let group = -(pid as i32);
-    // SAFETY: kill with a negative pid signals the process group setsid made
-    // this child lead; it touches no memory.
-    let signal = move |signal| unsafe { libc::kill(group, signal) } == 0;
-    tokio::spawn(async move {
-        let pulled = tokio::select! {
-            _ = child.wait() => false,
-            Ok(()) = pulls.changed() => {
-                if sandboxed {
-                    end_namespace(pid).await;
-                }
-                signal(libc::SIGKILL);
-                let _ = child.wait().await;
-                true
-            }
-        };
-        // What it left running in its group, as `cmd &` leaves, is still
-        // the pull's to end, and still holds the command's place: looked
-        // for each second until the group is empty, so a launcher that
-        // starts a service and exits does not hand its slot to the next
-        // while the service runs. The kernel keeps a group's id from new
-        // processes while any member lives, so only that last second could
-        // see it reused.
-        let members = move || async move {
-            tokio::task::spawn_blocking(move || group_members(-group))
-                .await
-                .unwrap_or(Members::Gone)
-        };
-        // Where only exited members answer, a walk of /proc is no one
-        // moment and can miss a member forked while it read: three walks a
-        // second apart must agree that nothing runs.
-        let mut exited = 0;
-        while !pulled && exited < 3 {
-            match members().await {
-                Members::Gone => break,
-                Members::Running => exited = 0,
-                Members::Exited => exited += 1,
-            }
-            if exited == 3 {
-                break;
-            }
-            tokio::select! {
-                Ok(()) = pulls.changed() => {
-                    signal(libc::SIGKILL);
-                    break;
-                }
-                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-            }
+    // Read off the runtime thread, as every file is.
+    let since = tokio::task::spawn_blocking(move || leader_since(pid))
+        .await
+        .ok()
+        .flatten();
+    let held: Box<dyn Send> = Box::new((permit, held, listening));
+    Ok((child, Detached { pid, since }, sandboxed, started, held))
+}
+
+/// Watch detached command `pid` until nothing it left in its group runs:
+/// its own `child` when this daemon started it, or one an earlier daemon
+/// did, found again. A pull of the cord or a stop on its handle kills the
+/// group, and with `sandboxed` the pid namespace it runs in; `held` (its
+/// lasting slot, what its sandbox keeps in place) goes with its end, which
+/// goes to `tracked`'s `done`.
+#[cfg(unix)]
+async fn watch_detached(
+    mut pulls: watch::Receiver<u64>,
+    child: Option<tokio::process::Child>,
+    pid: u32,
+    sandboxed: bool,
+    started: std::time::Instant,
+    tracked: Option<Tracked>,
+    held: Box<dyn Send>,
+) {
+    let group = pid as i32;
+    let (mut stop, listed, done) = match tracked {
+        Some(Tracked { stopper, done }) => {
+            let Stopper { stop, listed } = stopper;
+            (Some(stop), Some(listed), Some(done))
         }
-        drop((permit, held, listening));
+        None => (None, None, None),
+    };
+    let end = async || {
+        if sandboxed {
+            end_namespace(pid).await;
+        }
+        // SAFETY: kill with a negative pid signals the process group setsid
+        // made this command lead; it touches no memory.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    };
+    // How it ended, once it did: the leader's own status, when this daemon
+    // is its parent, and what ended it otherwise.
+    let mut ended: Option<Result<Option<std::process::ExitStatus>>> = None;
+    if let Some(mut child) = child {
+        ended = tokio::select! {
+            // Its end is the group's, below; the leader's status is what
+            // it says of how it went.
+            status = child.wait() => Some(Ok(status.ok())),
+            Ok(()) = pulls.changed() => {
+                end().await;
+                let _ = child.wait().await;
+                Some(Err(stopped_by_pause()))
+            }
+            () = stopped(&mut stop) => {
+                end().await;
+                let _ = child.wait().await;
+                Some(Err(stopped_by_agent()))
+            }
+        };
+    }
+    // What it left running in its group, as `cmd &` leaves, is still the
+    // pull's or its handle's to end, and still holds the command's place:
+    // looked for each second until the group is empty, so a launcher that
+    // starts a service and exits does not hand its slot to the next while
+    // the service runs. The kernel keeps a group's id from new processes
+    // while any member lives, so only that last second could see it reused.
+    let members = move || async move {
+        tokio::task::spawn_blocking(move || group_members(group))
+            .await
+            .unwrap_or(Members::Gone)
+    };
+    // Where only exited members answer, a walk of /proc is no one moment
+    // and can miss a member forked while it read: three walks a second
+    // apart must agree that nothing runs.
+    let mut exited = 0;
+    while !matches!(ended, Some(Err(_))) && exited < 3 {
+        match members().await {
+            Members::Gone => break,
+            Members::Running => exited = 0,
+            Members::Exited => exited += 1,
+        }
+        if exited == 3 {
+            break;
+        }
+        tokio::select! {
+            Ok(()) = pulls.changed() => {
+                end().await;
+                ended = Some(Err(stopped_by_pause()));
+            }
+            () = stopped(&mut stop) => {
+                end().await;
+                ended = Some(Err(stopped_by_agent()));
+            }
+            () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+    }
+    drop((held, listed));
+    let Some(done) = done else { return };
+    let wall_time_ms = started.elapsed().as_millis() as u64;
+    let _ = done.send(match ended {
+        Some(Err(error)) => Err(error),
+        Some(Ok(Some(status))) => Ok(Outcome {
+            failed: !status.success(),
+            ..Outcome::text(
+                json!({"exit_code":status.code(),"success":status.success(),
+                    "wall_time_ms":wall_time_ms})
+                .to_string(),
+            )
+        }),
+        // An earlier daemon was its parent: how its leader exited went
+        // with it.
+        _ => Ok(Outcome::text(
+            json!({"exit_code":null,"wall_time_ms":wall_time_ms}).to_string(),
+        )),
     });
-    Ok(Outcome::text(
-        json!({"detached":true,"pid":pid}).to_string(),
-    ))
+}
+
+/// Until a stop comes on a detached command's handle; never without one,
+/// or once what would send it is gone.
+async fn stopped(stop: &mut Option<tokio::sync::oneshot::Receiver<()>>) {
+    if let Some(receiver) = stop {
+        let got = receiver.await;
+        // A finished receiver is never polled again.
+        *stop = None;
+        if got.is_ok() {
+            return;
+        }
+    }
+    std::future::pending().await
+}
+
+/// When process `pid` started, as the kernel counts it: what tells a
+/// detached command's leader from a later process given its pid.
+#[cfg(target_os = "linux")]
+fn leader_since(pid: u32) -> Option<u64> {
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let after = &stat[stat.iter().rposition(|&b| b == b')')? + 1..];
+    // `starttime` is the stat file's 22nd field, the 20th after comm.
+    let field = after
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .nth(19)?;
+    std::str::from_utf8(field).ok()?.parse().ok()
+}
+#[cfg(target_os = "macos")]
+fn leader_since(pid: u32) -> Option<u64> {
+    // SAFETY: a zeroed proc_bsdinfo is valid; proc_pidinfo fills it.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is a proc_bsdinfo of `size` bytes this function owns.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (read == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn leader_since(_: u32) -> Option<u64> {
+    None
+}
+
+/// Whether detached command `detached`, which an earlier daemon started,
+/// still runs: its group has a member, and its leader, when there, is the
+/// process that started then and not a later one given its pid. A leader
+/// gone with its group still running is the group it led: the kernel
+/// gives no new process a group id while a member holds it.
+#[cfg(unix)]
+fn still_runs(detached: Detached) -> bool {
+    let group = detached.pid as i32;
+    if matches!(group_members(group), Members::Gone) {
+        return false;
+    }
+    // SAFETY: kill with signal 0 only checks the process.
+    let leader = unsafe { libc::kill(group, 0) } == 0;
+    !leader
+        || detached.since.is_none()
+        || leader_since(detached.pid).is_none_or(|since| Some(since) == detached.since)
 }
 
 /// What is left of a detached command's process group.
@@ -3268,7 +3538,8 @@ async fn detach(
     _: &Registry,
     _: &[(String, String)],
     _: Option<Arc<Policy>>,
-) -> Result<Outcome> {
+    _: Option<Tracked>,
+) -> Result<Detached> {
     fail("shell_platform_unsupported")
 }
 

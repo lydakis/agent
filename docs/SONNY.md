@@ -1106,6 +1106,15 @@ names its kind (`memory` file, `exec` mcp, `browser`,
 newest first, `a` for every agent's, `t`, `p` and `w` to filter by kind,
 place and who approved, Enter to open a row's agent.
 
+`/ps` shows the commands the project's agents left running, as Codex's
+`/ps` shows its background terminals: each background command, terminal,
+detached service and call waiting on its approval, oldest first, with its
+agent, how long it has run, a detached one's pid and the start of its
+command, read from the daemon's `processes` every two seconds while it is
+open. `a` shows every agent's, Enter opens a row's agent, and `x` twice
+stops the picked one with all it started (`stop_process`), beside the
+window.
+
 ## Links
 
 A link lets the agents of a host use another machine's browser, MCP servers

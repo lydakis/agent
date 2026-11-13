@@ -1,6 +1,6 @@
 # CLI contract
 
-Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
+Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `ps`, `stop`, `wait`, `ls`,
 `inspect`, `turns`, `usage`, `audit`, `rm`, `prune`, `approvals`, `answer`, `held`, `retry`, `models`, `companion`, `start`, `stats`,
 `shutdown`, and `serve`. All named
 bots use the same commands. There is no parent/child command hierarchy.
@@ -332,7 +332,11 @@ object per line. `run` follows its bot live before it submits, so a turn that
 answers before the submit is answered still prints its text whole, and its
 output is that turn's events (#613); a resent `--request-id` follows the turn
 it made from the turn's start. Snapshot commands return compact JSON objects; `ls` and `turns`
-return arrays. Every command prints its reply: `interrupt` the turn view,
+return arrays. `ps` prints `{processes: [...]}`, the commands still
+running for `--bot` (a name or a GLOB pattern) or every bot, each by its
+`proc:N` handle with its kind, the start of its command, when it started
+and a detached command's pid; `stop --bot NAME proc:N` stops one with all
+it started. Every command prints its reply: `interrupt` the turn view,
 `answer` what it answered, and `shutdown` `{"stopped":true,"pid":N}` once the
 daemon is gone. Every client command takes `--pretty`; `serve` runs until
 stopped and prints no reply to render.

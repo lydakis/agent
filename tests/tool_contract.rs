@@ -1677,3 +1677,103 @@ async fn terminals_hold_a_lasting_permit_and_end_their_whole_session() {
     assert_eq!(error.code, "terminal_not_running");
     tools.end_terminals();
 }
+
+/// A detached command started on a handle ends by it, says how it ended
+/// when it ends on its own, and a later registry, as a daemon started
+/// again is, finds it by its pid and start and stops it too.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tracked_detached_command_stops_on_its_handle_and_is_found_again() {
+    use agent_runtime::tools::Detached;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    let tools = Registry::new("shell").unwrap().with_lasting_budget(4);
+    let dir = std::env::temp_dir().join(format!("agent-detach-tracked-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let gone = async |pid: i32| {
+        for _ in 0..500 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    };
+    // Its own end: how its leader exited.
+    let (done, ended) = oneshot::channel();
+    tools
+        .detached(tools.stopper(1), "exit 3", &dir, &[], None, done)
+        .await
+        .unwrap();
+    let outcome = ended.await.unwrap().unwrap();
+    let output: Value = serde_json::from_str(&outcome.output).unwrap();
+    assert_eq!(
+        (output["exit_code"].as_i64(), outcome.failed),
+        (Some(3), true)
+    );
+    // Stopped on its handle, with what it started.
+    let (done, ended) = oneshot::channel();
+    let started = tools
+        .detached(tools.stopper(2), "exec sleep 30", &dir, &[], None, done)
+        .await
+        .unwrap();
+    let pid = started.pid as i32;
+    assert_eq!(unsafe { libc::getsid(pid) }, pid);
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        assert!(started.since.is_some());
+    }
+    assert!(tools.stop(2));
+    assert_eq!(ended.await.unwrap().unwrap_err().code, "stopped");
+    assert!(gone(pid).await, "the stopped command still runs");
+    assert!(!tools.stop(2), "a stopped handle stops nothing again");
+    // A command that does not start says so on its handle too.
+    let (done, ended) = oneshot::channel();
+    let missing = dir.join("missing");
+    let error = tools
+        .detached(tools.stopper(3), "true", &missing, &[], None, done)
+        .await
+        .unwrap_err();
+    assert_eq!(ended.await.unwrap().unwrap_err(), error);
+    // Found again by a later registry.
+    let (done, first_end) = oneshot::channel();
+    let first = tools
+        .detached(tools.stopper(4), "exec sleep 30", &dir, &[], None, done)
+        .await
+        .unwrap();
+    let later = Registry::new("shell").unwrap();
+    // A process given its pid that started at another time is not it.
+    let (done, _) = oneshot::channel();
+    let other = Detached {
+        pid: first.pid,
+        since: first.since.map(|since| since + 1),
+    };
+    if first.since.is_some() {
+        assert!(
+            !later
+                .adopt(later.stopper(4), other, false, Duration::ZERO, done)
+                .await
+        );
+    }
+    let (done, ended) = oneshot::channel();
+    assert!(
+        later
+            .adopt(later.stopper(4), first, false, Duration::from_secs(5), done)
+            .await
+    );
+    assert_eq!(later.lasting_running(), 1);
+    assert!(later.stop(4));
+    assert_eq!(ended.await.unwrap().unwrap_err().code, "stopped");
+    assert!(gone(first.pid as i32).await);
+    // The registry that started it sees its end as an end by a signal.
+    let output: Value = serde_json::from_str(&first_end.await.unwrap().unwrap().output).unwrap();
+    assert_eq!(output["exit_code"], Value::Null);
+    // One that has ended is not found again.
+    let (done, _) = oneshot::channel();
+    assert!(
+        !later
+            .adopt(later.stopper(5), first, false, Duration::ZERO, done)
+            .await
+    );
+    assert_eq!(later.lasting_running(), 0);
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -1564,6 +1564,22 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "follow" => follow(&options),
         "fork" => fork(&options),
         "interrupt" => interrupt(&options),
+        "ps" => {
+            let mut connection = connect_running(&options)?;
+            let running = connection.request("processes", json!({"bot": options.bot}))?;
+            print_json(&running, options.pretty)?;
+            Ok(0)
+        }
+        "stop" => {
+            let bot = (options.bot.clone()).ok_or(Error::with("usage", "stop needs --bot"))?;
+            let mut connection = connect_running(&options)?;
+            let stopped = connection.request(
+                "stop_process",
+                json!({"bot": bot, "handle": options.positional[0]}),
+            )?;
+            print_json(&stopped, options.pretty)?;
+            Ok(0)
+        }
         "wait" => wait(&options),
         "inspect" => inspect(&options),
         "turns" => turns(&options),
