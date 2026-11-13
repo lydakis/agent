@@ -5093,10 +5093,12 @@ impl Fleet {
             // A turn that ended while away is not known by number, and
             // one that started makes the last ending stale.
             self.ended.remove(name);
-            if running && name != self.lead {
-                // Its turn began by now at the latest: a window the person
-                // uses from here on is in use once it is done.
+            // Its newest turn began by now at the latest, running or not: a
+            // window the person uses from here on is in use once it is done.
+            if name != self.lead {
                 (self.began.entry(name.to_owned())).or_insert_with(std::time::SystemTime::now);
+            }
+            if running && name != self.lead {
                 self.show(name, false);
             } else if !running
                 && self
@@ -24911,6 +24913,7 @@ mod tests {
                     {"name": "calc.lead", "bot_id": 1, "head": 1},
                     {"name": "calc.c", "bot_id": 4, "created_by": "calc.lead",
                         "running_turn": 1, "head": 4},
+                    {"name": "calc.d", "bot_id": 5, "created_by": "calc.lead", "head": 5},
                 ], "next_after": null}),
                 "approvals" => json!({"approvals": []}),
                 "turns" => json!({"turns": []}),
@@ -24921,10 +24924,11 @@ mod tests {
         })
         .await;
         let mut fleet = Fleet::in_memory(client, events, "calc", "calc.lead");
-        // A task already running as the lead's window opens has begun by
-        // then.
+        // A task running as the lead's window opens, or at rest, began
+        // its newest turn by then.
         fleet.reconcile().await;
         assert!(fleet.began.contains_key("calc.c"));
+        assert!(fleet.began.contains_key("calc.d"));
         let read = (agent_client::config::path().as_ref())
             .and_then(|path| std::fs::metadata(path).ok())
             .and_then(|file| file.modified().ok());
