@@ -8710,3 +8710,50 @@ Linux cloud box gave 29.3 to 32.9 MiB on base and 28.9 to 36.0 on head,
 both with a median of 31.3. The Sonny rows are untouched by the change.
 
 The next ceiling is the store's single writer (#900).
+
+## Person's words in the reviewer (protocol 71)
+
+The `prompts` read takes a second budget, `persons`, for the person's own
+earlier words (`persons_each` bounds each message). The reviewer asks for
+it once a round, and once more for each agent that delegated the work.
+The listing reads ids and byte lengths through the partial index
+`messages_persons`, looks at most 256 rows, and loads a body only when it
+fits, so a read is bounded however long the conversation grows. Nothing on
+the turn path changes: a turn, a submit, and an end run the same store
+jobs as before.
+
+Daemon and Sonny screen (`bench.perf_gate`), the Perf workflow's Linux
+runner, base main a6dd08c against head 77fa056, alternating rounds:
+
+| Bench | Measure | Base | Head | Change |
+| --- | --- | ---: | ---: | ---: |
+| admission | lone submit CPU, ms | 37.855 | 36.942 | -2.4% |
+| admission | burst submit p99, ms | 4.294 | 4.364 | +1.6% |
+| completion | release to terminal p99, ms | 12.048 | 11.725 | -2.7% |
+| footprint | idle RSS, MiB | 15.992 | 16.154 | +1.0% |
+| footprint | per idle bot, KiB | 1.736 | 1.914 | +10.3% |
+| footprint | RSS after a turn each, MiB | 34.824 | 36.354 | +4.4% |
+| footprint | CPU per turn, ms | 1.019 | 1.032 | +1.2% |
+| sonny | lookout CPU per 1k deltas at 10x1, ms | 18.75 | 12.5 | -33.3% |
+| sonny | lookout CPU per 1k deltas at 10x10, ms | 5.625 | 5.0 | -11.1% |
+| sonny | lookout CPU per 1k deltas at 10x100, ms | 4.94 | 5.0 | +1.2% |
+| sonny | lookout CPU per 1k deltas at 100x10, ms | 5.685 | 5.56 | -2.2% |
+| sonny | lookout seated at 100x10, s | 0.1 | 0.1 | +0.0% |
+| sonny | lookout note p95 at 10x100, ms | 2405.5 | 2438.5 | +1.4% |
+| sonny | lookout note p95 at 100x10, ms | 2442.5 | 2433.0 | -0.4% |
+| sonny | quiet window CPU, ms/s | 0.99 | 0.98 | -1.0% |
+| sonny | quiet window reads, KiB/s | 0.25 | 0.25 | +0.0% |
+| sonny | quiet window requests, /s | 0.71 | 0.705 | -0.7% |
+| sonny | quiet window RSS, MiB | 23.8 | 23.35 | -1.9% |
+| sonny | sky replay CPU per 1k lines, ms | 13.535 | 13.66 | +0.9% |
+| sonny | sky replay RSS, MiB | 78.9 | 74.25 | -5.9% |
+| lifecycle | CPU, s | 0.525 | 0.55 | +4.8% |
+| lifecycle | p95 turn, ms | 605.557 | 577.208 | -4.7% |
+| lifecycle | peak RSS, MiB | 24.525 | 23.994 | -2.2% |
+
+The gate passed with no warning, so store work per turn did not rise. The
+per idle bot row is a 0.18 KiB move on a 2 KiB figure, inside the 1.60 to
+2.04 KiB this row has shown on earlier screens (above); the change adds
+nothing to an idle bot. The index is partial: only a message the person
+wrote enters it, when its turn takes it, beside the message indexes that
+write already updates.
