@@ -25165,6 +25165,7 @@ mod tests {
             phase: "Working".into(),
             note: false,
             effort: None,
+            acted: false,
         });
         app.key(Event::FocusLost).await;
         assert!(!app.kept.closing && !app.kept.showing);
