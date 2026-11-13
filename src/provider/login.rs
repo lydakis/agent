@@ -180,7 +180,8 @@ pub struct Login {
     path: PathBuf,
     token_url: reqwest::Url,
     redaction: Option<Credentials>,
-    state: Mutex<State>,
+    /// Shared with the task an exchange runs in, which installs its pair.
+    state: Arc<Mutex<State>>,
     /// One refresh at a time within the daemon; a file lock covers others.
     /// Shared with the task an exchange runs in, which holds it to the end.
     refreshing: Arc<tokio::sync::Mutex<()>>,
@@ -203,10 +204,10 @@ impl Login {
             path: path.to_owned(),
             token_url: reqwest::Url::parse(TOKEN_URL).expect("a valid URL"),
             redaction,
-            state: Mutex::new(State {
+            state: Arc::new(Mutex::new(State {
                 saved: saved.clone(),
                 refreshed: None,
-            }),
+            })),
             refreshing: Arc::new(tokio::sync::Mutex::new(())),
         };
         login.redact(&saved);
@@ -256,7 +257,12 @@ impl Login {
         };
         if just_refreshed {
             // Not refreshed again, but a sign-in since is taken.
-            return Ok(match read_off(&self.path).await {
+            let on_disk = read_off(&self.path).await;
+            // Another call may have taken a replacement meanwhile.
+            if self.held().saved.access_token != refused.token {
+                return Ok(true);
+            }
+            return Ok(match on_disk {
                 Ok(on_disk) if on_disk.access_token != refused.token && !on_disk.due() => {
                     self.install(on_disk, false);
                     true
@@ -292,17 +298,19 @@ impl Login {
         // the rotated pair is still saved, and the next use takes it from
         // the file.
         let (client, url, path) = (client.clone(), self.token_url.clone(), self.path.clone());
-        let fresh = tokio::spawn(async move {
+        let (state, redaction) = (self.state.clone(), self.redaction.clone());
+        tokio::spawn(async move {
             let _locks = (turn, file);
             let fresh = tokio::time::timeout(DEADLINE, exchange(&client, &url, &path, &on_disk))
                 .await
                 .unwrap_or_else(|_| Err(Error::new("provider_connection_timeout")))?;
+            // Redacted before it reaches the file anyone's tools can read.
+            redact(redaction.as_ref(), &fresh);
             write_off(&path, &fresh).await?;
-            Ok::<_, Error>(fresh)
+            Ok(install(&state, fresh, true))
         })
         .await
-        .map_err(|_| Error::new("provider_login_unavailable"))??;
-        Ok(self.install(fresh, true))
+        .map_err(|_| Error::new("provider_login_unavailable"))?
     }
 }
 
@@ -381,24 +389,34 @@ async fn exchange(
 impl Login {
     fn install(&self, saved: Saved, refreshed: bool) -> Session {
         self.redact(&saved);
-        let token = saved.access_token.clone();
-        let mut state = self.held();
-        state.saved = saved;
-        state.refreshed = refreshed.then(Instant::now);
-        Session { token }
+        install(&self.state, saved, refreshed)
     }
 
     fn redact(&self, saved: &Saved) {
-        if let Some(redaction) = &self.redaction {
-            redaction.set(TOKEN_NAME, &saved.access_token);
-            redaction.set(REFRESH_NAME, &saved.refresh_token);
-            redaction.set(ID_NAME, &saved.id_token);
-        }
+        redact(self.redaction.as_ref(), saved);
     }
 
     #[cfg(test)]
     pub(crate) fn expire_now(&self) {
         self.held().saved.expires_at = 0;
+    }
+}
+
+/// Hold `saved` as the token set to send.
+fn install(state: &Mutex<State>, saved: Saved, refreshed: bool) -> Session {
+    let token = saved.access_token.clone();
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    state.saved = saved;
+    state.refreshed = refreshed.then(Instant::now);
+    Session { token }
+}
+
+/// Have every tool's output hide `saved`'s tokens.
+fn redact(redaction: Option<&Credentials>, saved: &Saved) {
+    if let Some(redaction) = redaction {
+        redaction.set(TOKEN_NAME, &saved.access_token);
+        redaction.set(REFRESH_NAME, &saved.refresh_token);
+        redaction.set(ID_NAME, &saved.id_token);
     }
 }
 
@@ -611,7 +629,8 @@ pub(crate) mod tests {
             );
             socket.write_all(reply.as_bytes()).await.unwrap();
         });
-        let login = Login::open(&path, None)
+        let credentials = Credentials::default();
+        let login = Login::open(&path, Some(credentials.clone()))
             .unwrap()
             .with_token_url(&url)
             .unwrap();
@@ -632,6 +651,11 @@ pub(crate) mod tests {
         })
         .await
         .expect("the rotated pair is saved");
+        // Hidden from every tool already, though no call has taken it yet.
+        assert_eq!(
+            credentials.redact("second refresh-second".into()),
+            "[REDACTED] [REDACTED]"
+        );
         // The next use takes it from the file, with no second exchange.
         assert_eq!(login.current(&client).await.unwrap().token, "second");
         std::fs::remove_dir_all(dir).unwrap();
