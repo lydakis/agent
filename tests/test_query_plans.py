@@ -55,14 +55,12 @@ class QueryPlanTests(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         source = (root / 'src/store/db.rs').read_text().split('#[cfg(test)]', 1)[0]
         ddl = source.split('tx.execute_batch("', 1)[1].split('")?;', 1)[0]
-        where = ("WHERE m.bot=? AND m.id<? AND m.status='taken' AND m.from_bot IS NULL\n"
-                 "               AND m.origin IS NULL AND m.person IS NULL")
-        self.assertIn(where, source)
-        query = 'SELECT m.id FROM messages m ' + ' '.join(where.split()) + ' ORDER BY m.id DESC'
+        [query] = [q for q in statements(source) if 'o.chars' in q and 'm.person IS NULL' in q]
         conn = sqlite3.connect(':memory:')
         conn.executescript(ddl)
         steps = [row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + query, ('Ann', 9))]
-        self.assertEqual(steps, ['SEARCH m USING INDEX messages_persons (bot=? AND id<?)'], steps)
+        self.assertEqual(steps, ['SEARCH m USING INDEX messages_persons (bot=? AND id<?)',
+                                 'SEARCH o USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN'], steps)
 
     def test_current_schema_passes_and_missing_indexes_fail(self):
         root = Path(__file__).resolve().parent.parent

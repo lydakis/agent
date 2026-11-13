@@ -55,6 +55,9 @@ const PROMPT_BYTES: usize = 128 * 1024;
 /// prompts, to the bot and to the bots that delegated its turn: what the
 /// judge's share of them holds.
 const PERSONS_BYTES: usize = policy::PERSONS_TOKENS * 3;
+/// The most one of them may take, whole or left out: Codex keeps each of
+/// its person's retained words whole within 900 tokens.
+const PERSON_BYTES: usize = 3_600;
 /// How many delegations deep the approver follows up to the person's
 /// words, and how many delegating turns it reads for one round; past either
 /// the words above are left out, and the judge is told.
@@ -1029,7 +1032,8 @@ async fn intent(
     let read = client
         .request(
             "prompts",
-            json!({"bot":bot,"turn":turn,"bytes":PROMPT_BYTES,"persons":PERSONS_BYTES}),
+            json!({"bot":bot,"turn":turn,"bytes":PROMPT_BYTES,"persons":PERSONS_BYTES,
+                "persons_each":PERSON_BYTES}),
         )
         .await?;
     let mut persons = Persons::default();
@@ -1684,7 +1688,8 @@ async fn delegated(
     match client
         .request(
             "prompts",
-            json!({"bot":bot,"turn":turn,"bytes":*budget,"persons":persons.left()}),
+            json!({"bot":bot,"turn":turn,"bytes":*budget,"persons":persons.left(),
+                "persons_each":PERSON_BYTES}),
         )
         .await
     {

@@ -528,6 +528,10 @@ enum Command {
         /// apart under `persons`; none listed when absent or 0.
         #[serde(default)]
         persons: usize,
+        /// The most bytes one of them may take, whole or left out; all
+        /// of `persons` when absent or 0.
+        #[serde(default)]
+        persons_each: usize,
     },
     /// One page of a retained tool output stream, by byte offset.
     Artifact {
@@ -5632,11 +5636,18 @@ impl Service {
                 turn,
                 bytes,
                 persons,
+                persons_each,
             } => {
                 let reader = store.reader();
                 self.observe(session, output, id, async move {
                     (reader.read("prompts", move |db| {
-                        db.prompts_and_persons(&bot, turn, bytes.unwrap_or(64 * 1024), persons)
+                        db.prompts_and_persons(
+                            &bot,
+                            turn,
+                            bytes.unwrap_or(64 * 1024),
+                            persons,
+                            persons_each,
+                        )
                     }))
                     .await
                 })
