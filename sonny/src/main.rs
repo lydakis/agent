@@ -11428,10 +11428,26 @@ impl App {
         };
         // Answered where no event of theirs reaches this window: what came
         // of each written out here is read from the audit trail.
-        let gone: Vec<(String, i64, String)> = (self.raised.iter())
+        let mut gone: Vec<(String, i64, String)> = (self.raised.iter())
             .map(key)
             .filter(|read| !wanted.contains(read))
             .collect();
+        // Answered here, its final verdict still unheard: another gate may
+        // have decided it since, which no event of theirs tells this window.
+        if self.fleet.is_none() {
+            gone.extend(
+                (self.written.iter())
+                    .filter(|(read, written)| {
+                        read.0 != me
+                            && written.decided.is_some()
+                            && !written.heard
+                            && !wanted.contains(*read)
+                    })
+                    .map(|(read, _)| read.clone()),
+            );
+            gone.sort();
+            gone.dedup();
+        }
         self.raised.retain(|call| wanted.contains(&key(call)));
         self.verdicts_from_audit(gone).await;
         self.raised_read.retain(|read| wanted.contains(read));
@@ -15688,7 +15704,9 @@ impl App {
             Some(no) if by(no) => Some(transcript::Decided::Denied { you: you(no) }),
             // Refused by no one: its time ran out.
             Some(_) => Some(transcript::Decided::Lapsed),
-            None if data["denied"] == true => Some(transcript::Decided::Lapsed),
+            None if data["denied"] == true || data["outcome"] == "expired" => {
+                Some(transcript::Decided::Lapsed)
+            }
             // A step denied with no gate refusing it: its caller stopped
             // waiting, and it never ran.
             None if data["decision"] == "deny" => Some(transcript::Decided::Gone),
@@ -24965,6 +24983,64 @@ mod tests {
         let texts = app.screen.texts();
         assert!(
             texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tasks_request_allowed_here_then_denied_reads_its_final_verdict() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("audit") => json!({"rows": [
+                {"bot": "shop.fix", "turn": 4, "call_id": "c1", "step": null,
+                    "approved": "reviewer", "outcome": "denied"}],
+                "next_before": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.raised
+            .push(json!({"bot": "shop.fix", "turn": 4, "call_id": "c1",
+            "name": "shell", "gates": ["manual", "auto"], "arguments": {"command": "cargo publish"}}));
+        app.show_asked();
+        app.flush();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.raised.clear();
+        app.fold_written();
+        // No fleet: the reviewer's gate denying it is read from the trail.
+        app.raise_approvals().await;
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✗ The reviewer denied cargo publish · shop.fix".to_owned()),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lifted_call_allowed_here_that_expired_timed_out() {
+        let client = daemon_answering(|_| json!({})).await;
+        let mut app = app(client);
+        app.width = 80;
+        app.approvals.push(
+            json!({"turn": 3, "call_id": "c1", "name": "shell", "handle": "proc:9",
+            "gates": ["manual", "auto"], "arguments": {"command": "make deploy"}}),
+        );
+        app.show_asked();
+        app.flush();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.daemon(json!({"event": "lifted_ended", "bot": "b", "turn": 3,
+            "data": {"call_id": "c1", "handle": "proc:9", "outcome": "expired",
+                "failed": true}}))
+            .await;
+        app.fold_written();
+        app.flush();
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✗ Request timed out for make deploy".to_owned()),
             "{texts:?}"
         );
     }
