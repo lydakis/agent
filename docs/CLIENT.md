@@ -80,7 +80,7 @@ Implemented 2026-09-19.
    writes both to `~/.agents/agents` until the person edits them; a
    folder's file of the same name comes first. Either can be set to
    another profile, as Claude Code's `agent` setting picks the profile its
-   main session runs as ([sonny/README.md](../sonny/README.md#roles-for-leads-and-tasks)).
+   main session runs as ([Sonny role reference](../sonny/REFERENCE.md#roles-for-leads-and-tasks)).
 
 Everything a client reads lives under `.agents`, the folder Codex, OpenCode
 and Pi already read skills from (sources read 2026-09-27: Codex 9db8162,

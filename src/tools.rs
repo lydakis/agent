@@ -240,6 +240,15 @@ pub struct Declared {
     /// whose nested calls are each approved, as in Codex's code mode.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub steps: bool,
+    /// Whether a steer lifts a call still waiting for its answer to the
+    /// background once it has waited the grace a foreground command gets,
+    /// as it lifts that command: for a tool whose calls may run long, a
+    /// script say, or wait on a person. Left out, the call is answered
+    /// first and the steer is taken at the next boundary, as Codex takes a
+    /// message once the running tool returns. A call one of whose steps
+    /// waits on a gate is lifted either way, as a gated call is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lift: bool,
     /// What kind of tool it is, one of the audit trail's kinds, which its
     /// calls' rows there name; none when its client says nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -430,10 +439,10 @@ pub fn validate_declared(declared: &[Declared]) -> Result<()> {
                     );
                 }
             }
-            None if tool.expire_ms.is_some() || tool.steps => {
+            None if tool.expire_ms.is_some() || tool.steps || tool.lift => {
                 return fail_with(
                     "invalid_declare",
-                    format!("{name}: expire_ms and steps go with answered_by"),
+                    format!("{name}: expire_ms, steps and lift go with answered_by"),
                 );
             }
             None => {}

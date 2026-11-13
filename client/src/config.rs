@@ -47,7 +47,7 @@
 //! lead_profile = "my-lead"      # the role a new lead starts in, not lead
 //! task_profile = "worker"       # what every other agent is told, not task
 //! side_chat = "answer"          # calls no tool; "fork", the default, may do anything its agent may
-//! chime = false                 # rings when work ends or waits, the default
+//! chime = true                  # rings when work ends or waits; quiet by default
 //! steps = true                  # the agent's steps between what is said; words only by default
 //! verbose = true                # every tool call drawn, not the clean view
 //! text_width = 0                # the widest the conversation is written, 100 by default; 0 the window's whole width
@@ -568,7 +568,8 @@ pub struct Sonny {
     /// The MCP servers Sonny's agents reach, by name.
     pub mcp_servers: BTreeMap<String, McpServer>,
     pub side_chat: SideChat,
-    /// Whether finished and waiting work rings. Notifications show either way.
+    /// Whether finished and waiting work rings; off by default.
+    /// Notifications show either way.
     pub chime: bool,
     /// Whether the conversation shows the agent's steps between what is
     /// said (calls, news in, messages between agents, how long a turn
@@ -873,7 +874,7 @@ impl Default for Sonny {
             sky_haiku_hold: 10,
             tool_processes: 0,
             lookout_waiting: 1024,
-            chime: true,
+            chime: false,
             steps: false,
             verbose: false,
             text_width: TEXT_WIDTH,
@@ -1285,6 +1286,14 @@ pub fn home() -> Option<PathBuf> {
 /// sandboxed command, as each does what it is asked as the person.
 pub fn run() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/run"))
+}
+
+/// Where every daemon of the person's lists its store and socket,
+/// `~/.agent/run/daemons`, so each keeps the others' out of its sandboxes
+/// as it keeps its own: a sandboxed command reaches no daemon but through
+/// its own bot's socket, and writes no daemon's store.
+pub fn daemons() -> Option<PathBuf> {
+    run().map(|run| run.join("daemons"))
 }
 
 /// The person's command rules, `~/.agent/rules`: each `*.rules` file in it
@@ -2730,9 +2739,9 @@ mod tests {
         assert!(parse("[sonny]\ntask_tabs = \"all\"").is_err());
         let closed = parse("[sonny]\nmargin_opens = \"unless-closed\"").unwrap();
         assert_eq!(closed.sonny.margin_opens, MarginOpens::UnlessClosed);
-        assert!(config.sonny.chime && !config.sonny.verbose);
-        let quiet = parse("[sonny]\nchime = false\nverbose = true").unwrap();
-        assert!(!quiet.sonny.chime && quiet.sonny.verbose);
+        assert!(!config.sonny.chime && !config.sonny.verbose);
+        let loud = parse("[sonny]\nchime = true\nverbose = true").unwrap();
+        assert!(loud.sonny.chime && loud.sonny.verbose);
         assert!(parse("senders = \"hidden\"").unwrap().hide_senders);
         assert!(!parse("senders = \"shown\"").unwrap().hide_senders);
         let fallbacks = parse("[fallbacks]\n\"a/big\" = \"a/other\"\n")

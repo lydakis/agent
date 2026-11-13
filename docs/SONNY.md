@@ -1,9 +1,13 @@
 # Sonny's automations, memory, skills and MCP
 
-What Sonny gives every agent beyond its terminal: automations that wake an agent
-when something happens, memory that later agents read, the skills that
-teach agents both, and the person's MCP servers, reached through scripts. [sonny/README.md](../sonny/README.md) covers the terminal
-client itself.
+Sonny gives agents automations, shared memory, skills, and access to your
+MCP servers. This page covers how those capabilities work and how to
+configure them. For installation and everyday controls, start with the
+[Sonny quickstart](../sonny/README.md).
+
+[Automations](#automations) · [Scheduler](#the-scheduler) · [Memory](#memory) ·
+[Commons](#commons) · [Pause](#pause) · [Skills](#skills) ·
+[Tool host](#tool-host) · [MCP servers](#mcp-servers) · [Links](#links)
 
 ## Automations
 
