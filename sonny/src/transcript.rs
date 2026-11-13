@@ -2783,17 +2783,7 @@ fn drawn(
     }
     let patch = (name == "apply_patch").then(|| as_unified(&field("input"), workspace));
     if let Some(patch) = &patch {
-        let (removed, added) = patch.lines().fold((0, 0), |(removed, added), line| {
-            match (
-                line.starts_with("--- "),
-                line.starts_with("+++ "),
-                line.chars().next(),
-            ) {
-                (false, false, Some('-')) => (removed + 1, added),
-                (false, false, Some('+')) => (removed, added + 1),
-                _ => (removed, added),
-            }
-        });
+        let (removed, added) = crate::diff::changes(patch);
         header.spans.push(Span::raw("  "));
         header.spans.extend(crate::diff::counts(removed, added));
     }

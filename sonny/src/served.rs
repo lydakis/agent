@@ -1574,7 +1574,7 @@ async fn script(
         // What the output's budget cuts comes back whole, saved here, where
         // the agent reads it.
         let whole = crate::exec::whole_file();
-        let lent = json!({"input": input, "bot": bot, "timeout_ms": left(call).as_millis() as u64,
+        let lent = json!({"input": input, "bot": bot, "timeout_ms": running(call).as_millis() as u64,
             "whole": whole, "store": client.store().unwrap_or_default()});
         let answer = crate::link::call(&machine, EXEC, lent, Some(&steps)).await?;
         // Up to megabytes, so off the runtime; its owner's alone, as a
@@ -1586,7 +1586,7 @@ async fn script(
         }
         return Ok(answer["answer"].clone());
     }
-    crate::exec::answer(hub, &bot, input, left(call), Some(steps))
+    crate::exec::answer(hub, &bot, input, running(call), Some(steps))
         .await
         .map_err(|e| ("exec_refused", e))
 }
@@ -1725,6 +1725,17 @@ fn left(call: &Value) -> Duration {
     let expires = call["expires_ms"].as_u64().unwrap_or(now);
     Duration::from_millis(expires.saturating_sub(now))
 }
+
+/// The time an `exec` script may run: the call's, less [`ANSWERING`] (at
+/// most half of it), so a script run to its time limit answers with what
+/// it did while the daemon still takes the answer.
+fn running(call: &Value) -> Duration {
+    let left = left(call);
+    left - ANSWERING.min(left / 2)
+}
+
+/// The time kept back from a script's for its answer to reach the daemon.
+const ANSWERING: Duration = Duration::from_secs(2);
 
 /// Whether turn `turn` of `bot` has read outside content so far, so a fact
 /// it saves may carry words no person wrote, as Codex leaves out of memory
@@ -2048,6 +2059,23 @@ fn code(said: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_ends_before_the_daemon_gives_up_on_it() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let call = |expires: u64| json!({"expires_ms": expires});
+        let script = running(&call(now + 600_000));
+        assert!(script <= Duration::from_secs(598) && script > Duration::from_secs(590));
+        // A short call keeps half of its time for the answer.
+        let script = running(&call(now + 2_000));
+        assert!(script <= Duration::from_secs(1) && script > Duration::from_millis(900));
+        assert_eq!(running(&json!({})), Duration::ZERO);
+        // Every other wait is the call's whole time.
+        assert!(left(&call(now + 600_000)) > Duration::from_secs(598));
+    }
 
     #[test]
     fn a_tool_sonny_no_longer_answers_is_told_the_ones_it_does() {
