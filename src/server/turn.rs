@@ -5440,8 +5440,10 @@ impl Turn {
             let lapse = expires_ms.map(|at| {
                 tokio::time::Instant::now() + Duration::from_millis(at.saturating_sub(now_ms()))
             });
-            // A call to lift waits out its grace live, not parked.
-            let held = match liftable && self.lift.is_armed() {
+            // A call of a tool that lifts waits out its grace live, never
+            // parked inside it: a steer that resumes a parked call lifts it
+            // at once, so parking first would cut the grace short.
+            let held = match lifts {
                 true => hold.max(graced),
                 false => hold,
             };

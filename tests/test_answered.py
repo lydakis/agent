@@ -161,10 +161,13 @@ class AnsweredToolTests(ModelFixture):
                 self.assertTrue(created['declared'][0]['lift'])
                 self.model.call_script = [('start_task', {'name': 'fix'})]
                 turn = self.submit(client)
-                if hold:
-                    self.started(client, turn)
-                else:
+                self.started(client, turn)
+                began = time.monotonic()
+                if not hold:
+                    # It holds live for its whole grace before it parks, so
+                    # a steer never lifts it sooner.
                     client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+                    self.assertGreater(time.monotonic() - began, .15)
                 client.request('submit', bot='Lead', request_id='s', prompt='steer:look', delivery='steer')
                 lifted = client.receive(lambda m: m.get('event') == 'call_lifted' and m.get('turn') == turn)['data']
                 self.assertEqual((lifted['call_id'], lifted['waits_for']), ('script-0', 'answer'))

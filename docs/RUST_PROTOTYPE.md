@@ -3299,9 +3299,10 @@ steer lifts a call its client answers only when the tool is declared with
 waited the 250 ms grace a foreground `shell` command gets; or, at once,
 when a step of the call waits on a gate, since that is a wait for a
 verdict, which a steer always lifts. Any other call is answered first and
-the steer joins the turn at the next boundary. Live, the turn holds past
-its 250 ms answer hold until the grace for a call it will lift, rather than
-park and wake again; parked, a steer resumes the turn only when the call
+the steer joins the turn at the next boundary. A call of a tool that
+lifts holds live for the whole grace, whatever the bot's
+`approval_hold_ms`, so it never parks inside it and is lifted live rather
+than parked and woken again; parked, a steer resumes the turn only when the call
 lifts, and a step that starts waiting on a gate while a steer waits wakes
 it (or the live turn) then. Calls waiting for their approval, and `shell`
 commands, are lifted as before.
