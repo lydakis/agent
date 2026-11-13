@@ -1003,8 +1003,11 @@ has something on it, or is off the screen, no time shows.
   Under its heading, `/status` says only what is broken around the
   agents, each with a red `✗`: a companion of the daemon that keeps
   restarting (down and waiting for its next start, or up for less than a
-  minute after a restart), with how it exits and its log, and turns held
-  on something only you can fix, with how to fix it. When all is well it
+  minute after a restart), with how it exits and its log, turns held
+  on something only you can fix, with how to fix it, and a temporary
+  folder every agent's commands share with under a tenth of its space or
+  inodes left (`temp folder /tmp: 3% inodes left`, from the daemon's
+  `stats`, read every 30 seconds). When all is well it
   says nothing; the lookout's own line is in `/background`. Each Sonny start keeps the reviewer again on its own binary
   and build, with the model it has, so an upgrade restarts it with the
   lookout and the tool host.

@@ -71,6 +71,21 @@ class SocketAndCliTests(ModelFixture):
             self.assertEqual(files['limit'], hard)
         self.assertGreater(files['open'], 3)
 
+    def test_stats_report_the_room_left_in_each_temporary_folder(self):
+        temp = self.path / 'temp'
+        temp.mkdir()
+        result = subprocess.run([*self.base, 'run', *self.common, '--new', '--bot', 'Bob', 'hello'],
+                                env=dict(clean_env(), TMPDIR=str(temp)), capture_output=True,
+                                text=True, timeout=30, cwd=self.path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rooms = json.loads(self.agent('stats', '--store', str(self.store)).stdout)['temp']
+        # The daemon's TMPDIR first, then /tmp, each as named.
+        self.assertEqual([room['path'] for room in rooms], [str(temp), '/tmp'])
+        for room in rooms:
+            self.assertGreater(room['bytes_total'], 0)
+            self.assertLessEqual(room['bytes_free'], room['bytes_total'])
+            self.assertEqual(set(room), {'path', 'bytes_free', 'bytes_total', 'inodes_free', 'inodes_total'})
+
     def test_listings_filter_and_stop_at_their_limit(self):
         for bot in ('p.lead', 'p.worker', 'q.lead'):
             self.agent('run', *self.common, '--new', '--bot', bot, 'hello')

@@ -212,6 +212,60 @@ fn temporary() -> &'static [(PathBuf, PathBuf)] {
     })
 }
 
+/// The room left on the file system holding a temporary folder every
+/// agent's commands share: bytes an unprivileged process may still write
+/// and inodes it may still make, beside the totals. A file system that
+/// keeps no inode count (Btrfs, ZFS and APFS report none, or as many as
+/// are free) shows it with a zero total or equal figures.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Room {
+    pub path: PathBuf,
+    pub bytes_free: u64,
+    pub bytes_total: u64,
+    pub inodes_free: u64,
+    pub inodes_total: u64,
+}
+
+/// [`Room`] on each temporary folder a sandboxed command may write
+/// (`$TMPDIR`, then `/tmp`), as named, each file system's folder once by
+/// its real path: one `statvfs` each, read now, so a caller runs it off
+/// the runtime thread.
+pub fn temporary_room() -> Vec<Room> {
+    let mut seen: Vec<&Path> = Vec::new();
+    let mut rooms = Vec::new();
+    for (named, real) in temporary() {
+        if seen.contains(&real.as_path()) {
+            continue;
+        }
+        seen.push(real);
+        if let Some(room) = room(named) {
+            rooms.push(room);
+        }
+    }
+    rooms
+}
+
+fn room(path: &Path) -> Option<Room> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: a zeroed statvfs is valid; statvfs fills it.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a valid pointer to a statvfs this
+    // function owns.
+    if unsafe { libc::statvfs(name.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let unit = stat.f_frsize as u64;
+    #[allow(clippy::unnecessary_cast)]
+    Some(Room {
+        path: path.to_owned(),
+        bytes_free: (stat.f_bavail as u64).saturating_mul(unit),
+        bytes_total: (stat.f_blocks as u64).saturating_mul(unit),
+        inodes_free: stat.f_favail as u64,
+        inodes_total: stat.f_files as u64,
+    })
+}
+
 /// Read what the escape check reads once, and make the placeholders' lock
 /// folder, at start, rather than on the runtime thread when the first call
 /// comes.
@@ -1783,6 +1837,23 @@ pub fn seatbelt(policy: &Policy) -> (String, Vec<(String, PathBuf)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporary_room_reads_each_temporary_file_system_once() {
+        let rooms = temporary_room();
+        // /tmp always exists here; $TMPDIR may be on the same file system.
+        assert!(!rooms.is_empty());
+        for room in &rooms {
+            assert!(room.path.is_absolute());
+            assert!(room.bytes_total > 0 && room.bytes_free <= room.bytes_total);
+        }
+        let real: Vec<PathBuf> = (rooms.iter())
+            .map(|room| std::fs::canonicalize(&room.path).unwrap())
+            .collect();
+        for (at, path) in real.iter().enumerate() {
+            assert!(!real[..at].contains(path), "{path:?} read twice");
+        }
+    }
 
     /// The daemon as the CLI starts it, protecting what its client names.
     fn protecting() -> Daemon {

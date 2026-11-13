@@ -265,6 +265,9 @@ const GUTTER: u16 = 2;
 const TAB: &str = "  tab";
 /// How long a side chat's copy stays once idle.
 const SIDE_EXPIRE: Duration = Duration::from_secs(15 * 60);
+/// How often an open `/status` asks the daemon's `stats` how much room its
+/// temporary folders have left.
+const TEMP_READ: Duration = Duration::from_secs(30);
 /// This window is a side chat (`--side`).
 static SIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Into the alternate screen with the mouse, which Sonny owns while it
@@ -4328,6 +4331,10 @@ struct App {
     /// When what runs for this agent in the background was last read, for
     /// what of it failed.
     behind_read: Option<Instant>,
+    /// The temporary folders low on room as the daemon's `stats` last
+    /// said, and when: read at most every [`TEMP_READ`] while `/status`
+    /// is open, as they fill over minutes, not seconds.
+    temp_read: Option<(Instant, Vec<status::Alert>)>,
     /// How many of what `/background` lists failed since the person last
     /// opened it, as the footer's `✗` says: a count of what is unread, as
     /// a notification badge is, cleared by looking.
@@ -5776,6 +5783,7 @@ impl App {
             pick: 0,
             watch: None,
             behind_read: None,
+            temp_read: None,
             failed: 0,
             failures: Default::default(),
             turns: HashMap::new(),
@@ -10784,9 +10792,10 @@ impl App {
     }
 
     /// What `/status` says is broken around the agents: the daemon's
-    /// companions that are down or keep restarting, and turns held on a
-    /// cause the person can fix. Nothing when all is well.
-    async fn status_alerts(&self) -> Vec<status::Alert> {
+    /// companions that are down or keep restarting, turns held on a cause
+    /// the person can fix, and a temporary folder every agent shares low
+    /// on space or inodes. Nothing when all is well.
+    async fn status_alerts(&mut self) -> Vec<status::Alert> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -10800,6 +10809,20 @@ impl App {
         // counted by the daemon, named from the first page.
         if let Ok(listed) = self.client.request("held", json!({"limit": 64})).await {
             alerts.extend(status::held_alerts(&listed));
+        }
+        // The temporary folders every agent's commands share, from `stats`
+        // at most every TEMP_READ: the rest of what it reads is not needed
+        // here every refresh.
+        if self
+            .temp_read
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= TEMP_READ)
+            && let Ok(stats) = self.client.request("stats", json!({})).await
+        {
+            self.temp_read = Some((Instant::now(), status::temp_alerts(&stats["temp"])));
+        }
+        if let Some((_, temp)) = &self.temp_read {
+            alerts.extend(temp.iter().cloned());
         }
         alerts
     }
