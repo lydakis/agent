@@ -344,6 +344,56 @@ pub fn own_home(verdict: Verdict) -> Verdict {
     }
 }
 
+/// A call's verdict when, outside its sandbox, it may start a daemon: the
+/// judge may refuse it, never allow it, so what it would allow waits for a
+/// person.
+pub fn starts_daemon(verdict: Verdict) -> Verdict {
+    match verdict {
+        Verdict::Allow => Verdict::Doubt(format!(
+            "not allowed on review alone: it may start an agent daemon outside the sandbox, \
+             whose agents the person's windows, approvals and usage don't see, which only the \
+             person may allow. {ASK}"
+        )),
+        denied => denied,
+    }
+}
+
+/// Whether a command's text runs `agent` in a way that may start a daemon
+/// other than the person's own: `agent serve` or `agent start`, or any
+/// `agent` command given a store (`--store`, `AGENT_STORE=`), which starts
+/// that store's daemon when none runs. Read by its words alone, as
+/// [`Home::named_by`] reads a path, so a command that spells it another way
+/// is left to the judge.
+pub fn names_daemon_start(text: &str) -> bool {
+    let quoted = |word: &str| word.trim_matches(|c| "'\"".contains(c)).to_owned();
+    let store_set = text.contains("AGENT_STORE=");
+    text.split(|c| ";|&\n()`".contains(c)).any(|segment| {
+        let words: Vec<String> = segment.split_whitespace().map(quoted).collect();
+        let Some(at) = words
+            .iter()
+            .position(|word| word.rsplit('/').next() == Some("agent"))
+        else {
+            return false;
+        };
+        // Its subcommand: the first word that is no flag nor a flag's value.
+        let mut rest = words[at + 1..].iter();
+        let verb = loop {
+            match rest.next() {
+                Some(flag) if flag.starts_with('-') && !flag.contains('=') => {
+                    rest.next();
+                }
+                Some(flag) if flag.starts_with('-') => {}
+                verb => break verb,
+            }
+        };
+        store_set
+            || verb.is_some_and(|verb| verb == "serve" || verb == "start")
+            || words[at + 1..]
+                .iter()
+                .any(|word| word == "--store" || word.starts_with("--store="))
+    })
+}
+
 /// The agent's home, `~/.agent`, as a planned call may name it. What is
 /// kept there runs outside every sandbox or says how each one is made (the
 /// settings, the command rules, the scheduler's jobs), so the judge's word
@@ -730,6 +780,9 @@ pub struct Planned {
     pub unseen: bool,
     /// It reaches the agent's home ([`Home`]): only a person may allow it.
     pub own_home: bool,
+    /// Outside its sandbox, it may start a daemon
+    /// ([`names_daemon_start`]): only a person may allow it.
+    pub starts_daemon: bool,
 }
 
 /// A call this turn already ran, and how it ended.
@@ -1937,6 +1990,7 @@ mod tests {
                 files: Vec::new(),
                 unseen: false,
                 own_home: false,
+                starts_daemon: false,
             }],
             transcript: transcript.finish(),
             instructions: vec![(
@@ -1986,6 +2040,7 @@ mod tests {
                 files: Vec::new(),
                 unseen: false,
                 own_home: false,
+                starts_daemon: false,
             }],
             decisions,
             ..Intent::default()
@@ -2057,6 +2112,7 @@ mod tests {
                 files: Vec::new(),
                 unseen: false,
                 own_home: false,
+                starts_daemon: false,
             }],
             request: vec![Words {
                 by: By::Person,
@@ -2124,6 +2180,7 @@ mod tests {
                 files: vec![("deploy.sh".into(), "make deploy".into())],
                 unseen: false,
                 own_home: false,
+                starts_daemon: false,
             }],
             allowed: vec![Allowed {
                 tool: "shell".into(),
@@ -2383,6 +2440,37 @@ mod tests {
         assert!(JUDGE_INSTRUCTIONS.contains(
             "Deny sending sensitive data, or a payload that could credibly hold it, to a destination the person has not authorized for that data."
         ));
+    }
+
+    #[test]
+    fn a_command_that_may_start_a_daemon_is_never_allowed_on_the_judge_s_word() {
+        assert!(
+            matches!(starts_daemon(Verdict::Allow), Verdict::Doubt(r) if r.contains("only the person may allow"))
+        );
+        assert_eq!(
+            starts_daemon(Verdict::Deny("no".into())),
+            Verdict::Deny("no".into())
+        );
+        for starts in [
+            "agent serve --store /tmp/side.sqlite --provider openai",
+            "nohup agent start --store /tmp/eval/state.sqlite &",
+            "/opt/homebrew/bin/agent run --store=/tmp/x.sqlite hi",
+            "AGENT_STORE=/tmp/x.sqlite agent ls",
+            "export AGENT_STORE=/tmp/x.sqlite; agent run -",
+            "cd /tmp && ./target/release/agent 'start'",
+        ] {
+            assert!(names_daemon_start(starts), "{starts}");
+        }
+        for not in [
+            "agent ls",
+            "agent run --bot fix 'start the build'",
+            "cargo test serve",
+            "agent-browser start",
+            "echo start; agent ls",
+            "git commit -m 'agent: start using --store'",
+        ] {
+            assert!(!names_daemon_start(not), "{not}");
+        }
     }
 
     #[test]

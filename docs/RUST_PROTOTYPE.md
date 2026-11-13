@@ -1856,7 +1856,7 @@ before the turn that no bot, client or other person wrote, newest first,
 each `{message, text, steer?}` whole within `persons_each` bytes (all of
 `persons` when absent; Sonny's reviewer asks 3,600, Codex's 900 tokens)
 or left out whole, with `persons_more` when some were left out
-(protocol 69). They have their own budget, so notes a client sent never
+(protocol 71). They have their own budget, so notes a client sent never
 crowd the person's words out of `earlier`; a partial index
 (`messages_persons`) keeps the read to the person's messages alone, at
 most 256 of them are looked at, and one whose length alone is past
