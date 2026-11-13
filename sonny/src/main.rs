@@ -15649,6 +15649,11 @@ impl App {
                 })
                 .map(|you| transcript::Decided::Allowed { you, kept: None }),
         };
+        // Folded before its verdict came, as a listing may see the call
+        // gone first: drawn again to say it.
+        if written.folded && written.decided.is_some() {
+            self.draw_written(&key);
+        }
     }
 
     /// Whether `bot`'s call was written out here and is still there to
@@ -24673,6 +24678,25 @@ mod tests {
             "{texts:?}"
         );
         assert!(texts.contains(&"✗ You denied open".to_owned()), "{texts:?}");
+        // Seen gone before its verdict: folded as no longer waiting, then
+        // drawn again once the verdict comes.
+        app.approvals
+            .push(json!({"turn": 6, "call_id": "c2", "name": "shell",
+            "gates": ["manual"], "arguments": {"command": "make deploy"}}));
+        app.show_asked();
+        app.approvals.clear();
+        app.fold_written();
+        let texts = app.screen.texts();
+        assert!(texts.contains(&"⏸ Request for make deploy no longer waits".to_owned()));
+        app.daemon(json!({"event": "tool_started", "bot": "b", "turn": 6,
+            "data": {"call_id": "c2", "name": "shell", "arguments": "{}",
+                "approvals": [{"tag": "manual", "by": "tui", "allow": true}]}}))
+            .await;
+        let texts = app.screen.texts();
+        assert!(
+            texts.contains(&"✓ You allowed make deploy".to_owned()),
+            "{texts:?}"
+        );
     }
 
     #[test]
