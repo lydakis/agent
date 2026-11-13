@@ -192,7 +192,7 @@ class LookoutTests(ModelFixture):
         woke = self.note_for('calc.lead', timeout=10, having=f'calc.docs/{other} completed')
         self.assertIsNotNone(woke, 'news waited for the busy lead to rest')
         self.assertIn('asked by tasks', woke)
-        self.assertIn('This joins your turn as it runs', woke)
+        self.assertIn('This joins your running turn; carry on with your turn after it.', woke)
         # The person's words in a task cut in at once.
         self.daemon.request('submit', bot='calc.fix', request_id='p', prompt='stop, use the other branch')
         prompt = self.prompt_for('calc.lead', having='the person wrote')
