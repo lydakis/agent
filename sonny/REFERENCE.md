@@ -1929,6 +1929,20 @@ way as it is written and refused as `live_template`; one shown in a window
 fills again as what it read changes, while one that goes into a prompt
 fills once as it goes, so the prompt never changes under the model.
 
+An agent can show something live in the conversation too, with its `live`
+tool: asked the time, or which pull requests are open, it gives Markdown
+with the same blanks, drawn as a `◇ live` block where it called the tool
+and kept filled there as a note is. The tool host fills it once as it is
+called and answers what it shows and when, so the agent writes its reply
+knowing what the block says; that answer is all the agent's history keeps,
+however often the block changes after. The host does not know where the
+tasks stand, so a block that reads them answers that it fills only in the
+window, never a count of none. Only blocks in view, or within a
+view of it, are looked at, once a second; one scrolled far back is filled
+again once it comes near.
+
+![A live block in the conversation: the agent asked which pull requests are open answers with a block that follows a source and lists them](../docs/sonny/live-block.png)
+
 ![A note of your own in the margin, filled from its blanks: follows 🛠 ci, tasks, release.json; the CI source's latest run, a release file's state, and the lead's task fix-avg with how long its turn took](../docs/sonny/margin-template-note.png)
 
 A source whose events name a `topic`, such as one per pull request, gives

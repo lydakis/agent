@@ -41,7 +41,7 @@ const EVENTS: usize = 50;
 /// The most topics a source's blank holds, each its newest event.
 const TOPICS: usize = 200;
 /// The most a render writes, cut on a character's edge.
-const OUTPUT: usize = 64 * 1024;
+pub const OUTPUT: usize = 64 * 1024;
 
 /// What a render read: a window watches these and nothing else.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -61,7 +61,8 @@ pub struct Reads {
 /// A file's size and time; none for a file that is not there.
 pub type Stamp = (u64, Option<SystemTime>);
 
-fn stamp_of(path: &Path) -> Stamp {
+/// `path`'s size and time now.
+pub fn stamp(path: &Path) -> Stamp {
     std::fs::metadata(path).map_or((u64::MAX, None), |m| (m.len(), m.modified().ok()))
 }
 
@@ -374,8 +375,9 @@ impl std::io::Write for Capped {
 
 /// Whether a source's log or a file a render read changed since it read
 /// it: stamped before each read, so a change while it filled is a change.
+#[cfg(test)]
 pub fn changed(reads: &Reads) -> bool {
-    (reads.seen.iter()).any(|(path, was)| stamp_of(path) != *was)
+    (reads.seen.iter()).any(|(path, was)| stamp(path) != *was)
 }
 
 /// The environment every template is read in: a blank used that names
@@ -429,7 +431,7 @@ fn blanks(env: &mut Environment<'static>, data: &Data, reads: &Arc<Mutex<Reads>>
     let (r, d) = (reads.clone(), data.clone());
     env.add_function("file", move |path: String| -> Result<String, Error> {
         let path = d.folder.join(path.trim());
-        let stamp = stamp_of(&path);
+        let stamp = stamp(&path);
         read(&r, &|reads| {
             reads.files.insert(path.clone());
             reads.seen.insert(path.clone(), stamp);
@@ -559,7 +561,7 @@ struct Log {
 fn log(file: &Path) -> (Stamp, Arc<Log>) {
     type Cache = HashMap<PathBuf, (Stamp, Arc<Log>)>;
     static READ: OnceLock<Mutex<Cache>> = OnceLock::new();
-    let stamp = stamp_of(file);
+    let stamp = stamp(file);
     if stamp.1.is_none() {
         return (stamp, Arc::default());
     }
