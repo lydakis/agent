@@ -924,7 +924,9 @@ has something on it, or is off the screen, no time shows.
   takes it from its next turn: Sonny reads the folder again when a file
   in it changes. The rules hold for every folder, so a
   program named from the folder it runs in (`./build.sh`) is never
-  offered. Agents can't write the rules folder from their sandbox, and
+  offered, nor, as in Codex, a shell, an interpreter or a wrapper
+  (`bash`, `python3`, `timeout`), which runs whatever follows it. Agents
+  can't write the rules folder from their sandbox, and
   an agent another made goes by its maker's rules. A
   `[sonny] unsandboxed` list from before moves into `default.rules` once.
 
