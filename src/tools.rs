@@ -804,6 +804,26 @@ impl Credentials {
         let open = open_field(text, &set.fields);
         open.name - open.value
     }
+    /// The bytes of a secret field's value open at `text`'s end, and the
+    /// quote it opened with, when one is.
+    /// Only a text that ends in a long run a value could be is read whole
+    /// for its field, the name of which may be past `open_field`'s window.
+    fn open_value(&self, text: &[u8]) -> Option<(usize, Option<u8>)> {
+        let set = self.current();
+        if set.fields.is_empty() {
+            return None;
+        }
+        let run = |stop: fn(&u8) -> bool| text.iter().rev().take_while(|b| !stop(b)).count();
+        let bare = run(|b| {
+            b.is_ascii_whitespace() || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
+        });
+        let quoted = run(|b| matches!(b, b'"' | b'\'' | b'\n'));
+        if bare.max(quoted) <= VALUE_HOLD {
+            return None;
+        }
+        let open = open_field_within(text, &set.fields, text.len());
+        (open.value > 0).then_some((open.value, open.quote))
+    }
     /// `text` redacted as it reads after `before`, already shown: a value
     /// after a field's name shown earlier is still redacted.
     pub fn redact_after(&self, before: &str, text: String) -> String {
@@ -831,7 +851,16 @@ pub struct Redacting {
     held: Vec<u8>,
     /// The end of what was told, redacted: what the next piece reads after.
     told: String,
+    /// Inside a secret field's value too long to hold, told as redacted:
+    /// the rest of it is dropped as it comes, up to its end, as the whole
+    /// text's redaction drops it. Its quote, and whether the last byte read
+    /// escaped the next.
+    skipping: Option<(Option<u8>, bool)>,
 }
+
+/// The most of a secret field's value held back before it is told as
+/// redacted, well within the window a field is looked for in.
+const VALUE_HOLD: usize = 2048;
 
 /// The end of a stream's told text the next piece is redacted after: room
 /// for any field's name and its separator.
@@ -847,6 +876,7 @@ impl Redacting {
             credentials,
             held: Vec::new(),
             told: String::new(),
+            skipping: None,
         }
     }
 
@@ -854,6 +884,37 @@ impl Redacting {
     /// as can be told now, redacted.
     pub fn feed(&mut self, bytes: &[u8]) -> String {
         self.held.extend_from_slice(bytes);
+        if let Some((quote, escaped)) = &mut self.skipping {
+            // As `redact_fields` ends a value.
+            let mut end = None;
+            for (at, &b) in self.held.iter().enumerate() {
+                if std::mem::take(escaped) {
+                    continue;
+                }
+                let ends = match quote {
+                    Some(q) => b == *q || b == b'\n',
+                    None => {
+                        b.is_ascii_whitespace()
+                            || matches!(b, b',' | b';' | b'"' | b'\'' | b'}' | b']')
+                    }
+                };
+                if ends {
+                    end = Some(at);
+                    break;
+                }
+                *escaped = quote.is_some() && b == b'\\';
+            }
+            match end {
+                Some(at) => {
+                    self.held.drain(..at);
+                    self.skipping = None;
+                }
+                None => {
+                    self.held.clear();
+                    return String::new();
+                }
+            }
+        }
         let mut whole = match std::str::from_utf8(&self.held) {
             Err(error) if error.error_len().is_none() => error.valid_up_to(),
             _ => self.held.len(),
@@ -861,6 +922,29 @@ impl Redacting {
         let mut joined = Vec::with_capacity(self.told.len() + whole);
         joined.extend_from_slice(self.told.as_bytes());
         joined.extend_from_slice(&self.held[..whole]);
+        // A value held past its bound is told as redacted now, its rest
+        // dropped as it comes: one longer than the window a field is looked
+        // for in would otherwise go out unredacted.
+        if let Some((value, quote)) = self.credentials.open_value(&joined)
+            && value > VALUE_HOLD
+            && value <= whole
+            && !matches!(self.held[whole - value], b'{' | b'[' | b'$')
+        {
+            let start = whole - value;
+            let escaped = quote.is_some()
+                && (self.held[start..whole].iter().rev())
+                    .take_while(|&&b| b == b'\\')
+                    .count()
+                    % 2
+                    == 1;
+            let read = String::from_utf8_lossy(&self.held[..start]).into_owned();
+            let mut told = self.credentials.redact_after(&self.told, read);
+            told.push_str(REDACTED);
+            self.held.clear();
+            self.skipping = Some((quote, escaped));
+            self.remember(&told);
+            return told;
+        }
         let held = (self.credentials.unfinished(&joined))
             .max(open_block(&joined, &self.credentials.current().blocks))
             .min(whole);
@@ -870,17 +954,25 @@ impl Redacting {
         let read = String::from_utf8(read)
             .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
         let told = self.credentials.redact_after(&self.told, read);
-        self.told.push_str(&told);
+        self.remember(&told);
+        told
+    }
+
+    /// Keep the end of what was `told` for the next piece to read after.
+    fn remember(&mut self, told: &str) {
+        self.told.push_str(told);
         let cut = self.told.len().saturating_sub(TOLD_CONTEXT);
         let cut = (cut..=self.told.len())
             .find(|&at| self.told.is_char_boundary(at))
             .unwrap_or(self.told.len());
         self.told.drain(..cut);
-        told
     }
 
     /// What is still held, at the stream's end, redacted.
     pub fn finish(self) -> String {
+        if self.skipping.is_some() {
+            return String::new();
+        }
         let rest = String::from_utf8_lossy(&self.held).into_owned();
         self.credentials.redact_after(&self.told, rest)
     }
@@ -1038,14 +1130,21 @@ struct Open {
     /// it is not secret, so it is shown: a prompt such as `Password: `
     /// reaches whoever is to answer it.
     value: usize,
+    /// The quote its value opened with, when it has one.
+    quote: Option<u8>,
 }
 
 fn open_field(text: &[u8], fields: &[String]) -> Open {
     const FIELD_HOLD: usize = 4096;
+    open_field_within(text, fields, FIELD_HOLD)
+}
+
+/// `open_field`, looking in the last `window` bytes of `text`.
+fn open_field_within(text: &[u8], fields: &[String], window: usize) -> Open {
     // Four bytes of a field's start, so short words go out as typed.
     const NAME_START: usize = 4;
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
-    let tail = &text[text.len().saturating_sub(FIELD_HOLD)..];
+    let tail = &text[text.len().saturating_sub(window)..];
     let key = |name: &[u8]| field_key(&String::from_utf8_lossy(name));
     let mut i = 0;
     while i < tail.len() {
@@ -1066,7 +1165,10 @@ fn open_field(text: &[u8], fields: &[String]) -> Open {
                     .any(|n| name.as_bytes().ends_with(&field.as_bytes()[..n]))
             });
             let name = if begins { tail.len() - start } else { 0 };
-            return Open { name, value: 0 };
+            return Open {
+                name,
+                ..Open::default()
+            };
         }
         if !fields.iter().any(|field| name.ends_with(field.as_str())) {
             continue;
@@ -1081,7 +1183,10 @@ fn open_field(text: &[u8], fields: &[String]) -> Open {
         }
         let name = tail.len() - start;
         if j == tail.len() {
-            return Open { name, value: 0 };
+            return Open {
+                name,
+                ..Open::default()
+            };
         }
         if !matches!(tail[j], b'=' | b':') {
             continue;
@@ -1104,6 +1209,7 @@ fn open_field(text: &[u8], fields: &[String]) -> Open {
             return Open {
                 name,
                 value: tail.len() - j,
+                quote,
             };
         }
     }
@@ -2394,7 +2500,7 @@ impl Registry {
         let mut preview = |name: &'static str, mut captured: Captured| {
             let spilled = captured.spilled.take();
             let total = captured.len() as u64 + captured.dropped;
-            let (bytes, dropped) = captured.finish();
+            let (bytes, dropped) = captured.finish(spilled.is_some());
             // Reuse the pipe buffer for ordinary UTF-8 output. Invalid
             // bytes still get the same lossy decoding as before.
             let text = String::from_utf8(bytes)
@@ -3019,8 +3125,14 @@ fn truncate(text: &str, dropped: u64) -> String {
     truncated(text, &retained)
 }
 
-/// Head and tail of an oversized output, saying what is `retained`.
+/// Head and tail of an oversized output, saying what is `retained`. One
+/// that redaction left within a preview is shown whole, with the same word.
 fn truncated(text: &str, retained: &str) -> String {
+    if text.len() <= PREVIEW_BYTES {
+        return format!(
+            "{text}\n[... {retained}: see this result's artifacts and read them with the read tool ...]"
+        );
+    }
     let half = PREVIEW_BYTES / 2;
     let head = &text[..boundary(text, half)];
     let tail_start = boundary(text, text.len() - half);
@@ -3196,8 +3308,9 @@ impl Captured {
         }
     }
     /// The kept bytes, with a marker where the middle was dropped, and how
-    /// many bytes that was.
-    fn finish(self) -> (Vec<u8>, u64) {
+    /// many bytes that was. `filed` says the whole stream is in its file,
+    /// where the middle is.
+    fn finish(self, filed: bool) -> (Vec<u8>, u64) {
         let Captured {
             mut head,
             mut tail,
@@ -3212,12 +3325,15 @@ impl Captured {
             dropped += cut as u64;
         }
         if dropped > 0 {
-            head.extend_from_slice(
-                format!(
+            let marker = match filed {
+                true => format!(
+                    "\n[... {dropped} bytes not shown here: they are in this stream's file ...]\n"
+                ),
+                false => format!(
                     "\n[... {dropped} bytes dropped: past 1 MiB only the first and last {KEPT_END} bytes of this stream are kept ...]\n"
-                )
-                .as_bytes(),
-            );
+                ),
+            };
+            head.extend_from_slice(marker.as_bytes());
         }
         head.extend(tail);
         (head, dropped)
@@ -4080,7 +4196,7 @@ mod tests {
         let mut whole = Captured::default();
         whole.head.extend(vec![b'h'; KEPT_END]);
         whole.keep(&vec![b't'; ARTIFACT_BYTES - KEPT_END]);
-        let (bytes, dropped) = whole.finish();
+        let (bytes, dropped) = whole.finish(false);
         assert_eq!((bytes.len(), dropped), (ARTIFACT_BYTES, 0));
 
         let mut over = Captured::default();
@@ -4089,7 +4205,7 @@ mod tests {
             over.keep(&vec![b'm'; 64 * 1024]);
         }
         over.keep(b"end");
-        let (bytes, dropped) = over.finish();
+        let (bytes, dropped) = over.finish(false);
         assert_eq!(dropped, (40 * 64 * 1024 + 3 - KEPT_END) as u64);
         assert!(bytes.len() <= ARTIFACT_BYTES);
         assert!(bytes.starts_with(b"hhhh"));
@@ -4189,6 +4305,7 @@ mod tests {
                 None,
                 registry.queue().unwrap(),
                 sender,
+                None,
             );
             async move {
                 let outcome = receiver.await.unwrap().unwrap();
@@ -4304,6 +4421,55 @@ mod tests {
             assert_eq!(out, whole, "in pieces of {size}");
         }
     }
+    /// A secret field's value longer than the window a field is looked for
+    /// in is redacted whole however it is cut, as the whole text's is.
+    #[test]
+    fn a_long_secret_value_cut_across_pieces_is_redacted_whole() {
+        let credentials = Credentials::default();
+        credentials.redact_also(&["password".to_owned()], &[]);
+        let value: String = (0..100_000)
+            .map(|n| if n % 7 == 0 { '7' } else { 'k' })
+            .collect();
+        for text in [
+            format!("{}\npassword={value} after\nend", "x".repeat(1 << 20)),
+            format!("a \"password\": \"{value}\\\"{value}\", \"n\": 1\nend"),
+        ] {
+            let whole = credentials.redact(text.clone());
+            assert!(!whole.contains("kkkkkkk7"), "whole");
+            for sizes in [vec![1 << 20, 64 << 10], vec![4096], vec![1000], vec![97]] {
+                let mut redacting = Redacting::new(credentials.clone());
+                let (mut out, mut at) = (String::new(), 0);
+                for size in sizes.iter().chain(std::iter::repeat(sizes.last().unwrap())) {
+                    if at >= text.len() {
+                        break;
+                    }
+                    let end = (at + size).min(text.len());
+                    out.push_str(&redacting.feed(&text.as_bytes()[at..end]));
+                    at = end;
+                }
+                out.push_str(&redacting.finish());
+                let differs = (out.bytes().zip(whole.bytes())).position(|(a, b)| a != b);
+                assert!(
+                    out == whole,
+                    "in pieces of {sizes:?}: {} vs {} bytes, from {differs:?}: {:?} vs {:?}",
+                    out.len(),
+                    whole.len(),
+                    String::from_utf8_lossy(
+                        &out.as_bytes()[differs.unwrap_or(0).saturating_sub(20)..]
+                    )
+                    .chars()
+                    .take(80)
+                    .collect::<String>(),
+                    String::from_utf8_lossy(
+                        &whole.as_bytes()[differs.unwrap_or(0).saturating_sub(20)..]
+                    )
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+                );
+            }
+        }
+    }
     #[test]
     fn joined_files_are_removed_together_unless_recorded() {
         let dir = std::env::temp_dir().join(format!("agent-files-join-{}", std::process::id()));
@@ -4399,7 +4565,7 @@ mod tests {
             registry.foreground(
                 command.into(),
                 dir.clone(),
-                60_000,
+                Some(60_000),
                 Vec::new(),
                 None,
                 registry.place(),
@@ -4454,6 +4620,48 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(!Path::new(&file).exists());
+        // Redaction that leaves less than a preview shows it whole, the
+        // file still named.
+        registry
+            .credentials
+            .redact_also(&["password".to_owned()], &[]);
+        let secrets = "for i in $(seq 1 1200); do printf 'password=a%01000d\\n' $i; done";
+        let outcome = registry
+            .foreground(
+                secrets.into(),
+                dir.clone(),
+                Some(60_000),
+                Vec::new(),
+                None,
+                registry.place(),
+                tokio::sync::oneshot::channel().0,
+                Some(spill(true)),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
+        let shown = value["stdout"].as_str().unwrap();
+        assert!(shown.len() < PREVIEW_BYTES, "{}", shown.len());
+        assert!(
+            shown.starts_with("password=[REDACTED]\n"),
+            "{}",
+            &shown[..60]
+        );
+        assert!(shown.contains("bytes not shown here: they are in this stream's file"));
+        assert!(shown.ends_with("the full output is retained: see this result's artifacts and read them with the read tool ...]"));
+        let [(_, file)] = &outcome.files[..] else {
+            panic!("{:?}", &outcome.files[..]);
+        };
+        let whole = std::fs::read_to_string(file).unwrap();
+        assert_eq!(whole, "password=[REDACTED]\n".repeat(1200));
+        let file = file.clone();
+        drop(outcome);
+        for _ in 0..100 {
+            if !Path::new(&file).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         // A folder the bot's commands may write holds nothing.
         let outcome = run(spill(false)).await.unwrap();
         assert!(outcome.files.is_empty());
