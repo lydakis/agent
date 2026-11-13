@@ -118,9 +118,13 @@ pub fn tasks(rows: &[Row]) -> Vec<serde_json::Value> {
     (rows.iter())
         .filter(|row| row.name != "lead")
         .map(|row| {
+            // Times that hold still while nothing changes: when its turn
+            // started, or ended, in seconds, which `| ago` keeps current;
+            // and how long its last turn took, once it is over.
             serde_json::json!({"name": row.name, "agent": row.bot, "state": row.state,
                 "group": row.group.key(), "running": row.running, "pr": row.pr,
-                "latest": row.latest, "seconds": row.seconds})
+                "latest": row.latest, "at": row.at.map(|ms| ms / 1000),
+                "seconds": row.seconds.filter(|_| !row.running)})
         })
         .collect()
 }
@@ -886,6 +890,29 @@ mod tests {
             maker: "calc.lead".into(),
             ..Row::default()
         }
+    }
+
+    #[test]
+    fn tasks_for_blanks_give_times_that_hold_still_while_nothing_changes() {
+        let working = Row {
+            at: Some(5_000),
+            ..row("add", "working", Group::Working)
+        };
+        let done = Row {
+            at: Some(9_000),
+            ..row("sub", "done", Group::Done)
+        };
+        let lead = row("lead", "working", Group::Working);
+        let tasks = tasks(&[lead, working, done]);
+        assert_eq!(tasks.len(), 2, "the lead is not a task");
+        assert_eq!(
+            (tasks[0]["at"].as_u64(), tasks[0]["seconds"].as_u64()),
+            (Some(5), None)
+        );
+        assert_eq!(
+            (tasks[1]["at"].as_u64(), tasks[1]["seconds"].as_u64()),
+            (Some(9), Some(42))
+        );
     }
 
     fn text(card: &Card) -> Vec<String> {
