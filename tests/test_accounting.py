@@ -240,6 +240,18 @@ class AccountingTests(ModelFixture):
         submit = stats['commands']['ops']['submit']
         self.assertEqual((submit['count'], sum(submit['held'])), (1, 1))
         self.assertEqual(len(submit['held']), len(stats['commands']['buckets_us']) + 1)
+        # And how long it waited for the daemon before that.
+        self.assertEqual(sum(submit['waited']), 1)
+        self.assertGreaterEqual(submit['waited_ms'], 0)
+        # The daemon's own work between requests: the turn was reaped.
+        self.assertEqual(stats['loop']['ops']['reap']['count'], 1)
+        self.assertNotIn('waited', stats['loop']['ops']['reap'])
+        runtime = stats['runtime']
+        self.assertTrue(runtime['workers'] >= 1 and runtime['busy_ms'] >= 0, runtime)
+        hub = stats['hub']
+        self.assertTrue(hub['durable'] > 0 and hub['dropped'] == 0, hub)
+        (pool,) = stats['providers']['openai']['pools'].values()
+        self.assertEqual((pool['admitted'], pool['parked'], pool['closed']), (1, 0, 0), pool)
 
     def test_a_cut_reply_s_usage_is_durable_and_the_spent_budget_wraps_its_turn_up(self):
         client = self.client('echo')

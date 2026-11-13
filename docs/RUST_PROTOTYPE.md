@@ -352,8 +352,19 @@ and `threads` now (`/proc/self/status`, or `proc_pidinfo` on macOS) and
 the service loop held each kind of request, by its `op`, from dispatch to its
 answer or its handoff to a reader: `count`, `held_ms`, `slowest_ms`
 and a `held` histogram over the store's `buckets_us`, which it
-reports beside them. One map entry per op the daemon has seen, touched only
-by the loop, so no lock.
+reports beside them, with `waited_ms` and a `waited` histogram, how long
+each request waited for the loop from its line's read to its dispatch.
+One map entry per op the daemon has seen, touched only by the loop, so no
+lock. `loop` reports the same holds for the loop's own work between
+requests: `reap` (a turn's task ended), `start_ready`, `resume`, `wake`,
+`admission` (a queued admission answered), `lapse`, `holds`, `expire` and
+`reload`. `runtime` reports the async runtime's `workers`, `busy_ms` (time
+they ran rather than parked), `parks`, `alive_tasks` and `queued_tasks`,
+kept by tokio as it runs. `hub` counts the events published (`durable`,
+`live`), the copies `delivered` to followers' queues, and the followers
+`dropped` for falling behind. Each provider pool adds what it did to its
+calls: `admitted`, `waited` (admitted after waiting in the gate) with
+`waited_ms`, `parked`, `closed` (a refusal closed the pool) and `overloads`.
 
 A budget counts one of two measures, named by `budget_counts`: `tokens`, the
 default, is the provider's usage, every call's input and output, the history

@@ -13,7 +13,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -212,6 +212,17 @@ pub struct Hub {
     /// the observation lane takes them, so a turn's own reads always find
     /// a connection however many followers are catching up.
     pages: Arc<Semaphore>,
+    counts: Arc<Counts>,
+}
+/// What the hub carried since the daemon started, for `stats`: events
+/// published (durable and live), deliveries to followers' queues, and
+/// followers dropped because their queue was full.
+#[derive(Default)]
+struct Counts {
+    durable: AtomicU64,
+    live: AtomicU64,
+    delivered: AtomicU64,
+    dropped: AtomicU64,
 }
 impl Default for Hub {
     fn default() -> Self {
@@ -231,6 +242,7 @@ impl Default for Hub {
             })),
             published: Arc::default(),
             pages: Arc::new(Semaphore::new(1)),
+            counts: Arc::default(),
         }
     }
 }
@@ -630,13 +642,27 @@ impl Hub {
                 (s.session, s.output.clone())
             };
             if output.try_send(event.clone()).is_err() {
+                self.counts.dropped.fetch_add(1, Ordering::Relaxed);
                 self.close_session(session);
                 output.close();
+            } else {
+                self.counts.delivered.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
+    /// What the hub carried, for `stats`.
+    pub fn stats(&self) -> Value {
+        let count = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        json!({
+            "durable": count(&self.counts.durable),
+            "live": count(&self.counts.live),
+            "delivered": count(&self.counts.delivered),
+            "dropped": count(&self.counts.dropped),
+        })
+    }
     pub async fn durable(&self, bot: &str, entry: Value) -> Result<()> {
         let cursor = entry["cursor"].as_i64();
+        self.counts.durable.fetch_add(1, Ordering::Relaxed);
         self.fan_out(bot, &entry, cursor);
         let mut sent = Ok(());
         for output in self.firehose() {
@@ -644,6 +670,7 @@ impl Hub {
             if sent.is_err() {
                 break;
             }
+            self.counts.delivered.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(cursor) = cursor {
             self.published_to(cursor);
@@ -672,9 +699,11 @@ impl Hub {
         let _ = published.wait_for(|published| *published >= cursor).await;
     }
     pub async fn live(&self, bot: &str, event: Value) -> Result<()> {
+        self.counts.live.fetch_add(1, Ordering::Relaxed);
         self.fan_out(bot, &event, None);
         for output in self.firehose() {
             output.send(event.clone()).await?;
+            self.counts.delivered.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }

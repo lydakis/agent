@@ -8710,3 +8710,33 @@ Linux cloud box gave 29.3 to 32.9 MiB on base and 28.9 to 36.0 on head,
 both with a median of 31.3. The Sonny rows are untouched by the change.
 
 The next ceiling is the store's single writer (#900).
+
+## Stats: waits for the loop, the loop's own work, runtime, hub and pacer counts
+
+`stats` now says where a busy daemon's time goes without a profiler: how
+long each request waited for the service loop before dispatch, how long
+each of the loop's own chores held it, how busy the async runtime was, what
+the event hub carried and dropped, and what each provider pool did to its
+calls (admitted, waited, parked, closed, overloads). What each path pays:
+
+- **A request**: the line's read time travels with it (one `Instant`
+  read); at dispatch, one subtraction and two adds into the op's entry.
+- **A loop chore**: one `Instant` read either side and an update of its
+  entry in a map the loop alone touches.
+- **An event**: two relaxed atomic adds (published, delivered) per
+  follower queue.
+- **A paced call**: three integer adds under the pool lock it already holds.
+- **`stats`**: tokio's own runtime counters, read with a few loads.
+
+`bench.scale_screen`, 2,048 bots streaming back to back, 2.3 s calls spread
+by half, 20 s windows, 4-CPU Linux cloud box, base (the next_ready fix)
+against head, alternating rounds:
+
+| Measure | Base | Head |
+| --- | ---: | ---: |
+| turns a second (ideal 890) | 886, 890 | 884, 888 |
+| `submit` answer p50, ms | 3.4, 3.0 | 3.3, 2.8 |
+| daemon CPU per turn, ms | 1.35, 1.33 | 1.35, 1.33 |
+| runtime thread CPU, % | 48.6, 47.6 | 48.4, 47.8 |
+
+No store job, statement or allocation per call is added.
