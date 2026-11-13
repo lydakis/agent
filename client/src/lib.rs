@@ -114,7 +114,7 @@ pub fn default_tools(
 
 /// The socket protocol's version in `ready`. The daemon and its clients ship
 /// together, so a client refuses a daemon of any other version.
-pub const PROTOCOL: u64 = 71;
+pub const PROTOCOL: u64 = 72;
 /// How long the daemon holds a turn on a cause a person can fix before it
 /// fails with it, for a bot that sets no `hold_ms`: five days, as mail is
 /// retried (RFC 5321 suggests four to five) before it is returned.
@@ -275,6 +275,8 @@ pub struct Client {
     /// `PROVIDER/MODEL` pattern, most specific first.
     speeds: Vec<(String, Vec<String>)>,
     paused: Value,
+    /// `ready.version`: the daemon's release.
+    version: Option<String>,
     /// `ready.limits.depth`: the most generations below the bot that
     /// starts its line a bot may be made at; `None` for no bound.
     max_depth: Option<u64>,
@@ -371,6 +373,7 @@ impl Client {
                 .collect(),
         );
         let paused = ready["paused"].clone();
+        let version = ready["version"].as_str().map(str::to_owned);
         let max_depth = ready["limits"]["depth"].as_u64();
         let pending: Pending = Arc::default();
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -442,6 +445,7 @@ impl Client {
                 providers,
                 speeds,
                 paused,
+                version,
                 max_depth,
                 in_flight: std::sync::OnceLock::new(),
             }),
@@ -460,6 +464,11 @@ impl Client {
     /// same store again, also once its file was replaced.
     pub fn store(&self) -> Option<&str> {
         self.store.as_deref()
+    }
+
+    /// The daemon's release, as its `ready` line names it.
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
     }
 
     /// The identity of the daemon's store file.
@@ -665,6 +674,7 @@ mod tests {
                 ("work/us.openai.gpt-6.1-sol".into(), Vec::new()),
             ]),
             paused: Value::Null,
+            version: None,
             max_depth: None,
             in_flight: std::sync::OnceLock::new(),
         };
@@ -695,6 +705,7 @@ mod tests {
             providers: Value::Null,
             speeds: Vec::new(),
             paused: Value::Null,
+            version: None,
             max_depth: None,
             in_flight: std::sync::OnceLock::new(),
         });
@@ -726,6 +737,7 @@ mod tests {
             providers: Value::Null,
             speeds: Vec::new(),
             paused: Value::Null,
+            version: None,
             max_depth: None,
             in_flight: std::sync::OnceLock::new(),
         });
@@ -771,6 +783,7 @@ mod tests {
             providers: Value::Null,
             speeds: Vec::new(),
             paused: Value::Null,
+            version: None,
             max_depth: None,
             in_flight: std::sync::OnceLock::new(),
         });
@@ -814,6 +827,7 @@ mod tests {
             providers: Value::Null,
             speeds: Vec::new(),
             paused: Value::Null,
+            version: None,
             max_depth: None,
             in_flight: std::sync::OnceLock::new(),
         });

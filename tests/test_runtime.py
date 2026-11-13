@@ -1365,6 +1365,25 @@ class AnthropicRuntimeTests(unittest.TestCase):
         events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
         self.assertFalse([e for e in events if e['event'].startswith('tool_')])
 
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_sandbox_off_the_network_is_offered_no_hosted_search(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), effort='low',
+                       tools=['echo', 'shell', 'web_search'], settings={'sandbox': 'read-only'})
+
+        def offered(request_id):
+            turn = client.request('submit', bot='Bob', request_id=request_id, prompt='hello')['result']['message']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            return [t.get('name') for t in model.requests.get(timeout=5)['tools']]
+
+        self.assertEqual(offered('r'), ['echo', 'shell'])
+        # Its tools are kept: given the network, it is offered search again.
+        self.assertEqual(client.request('inspect', bot='Bob')['result']['tools'], ['echo', 'shell', 'web_search'])
+        client.request('configure', bot='Bob', settings={'sandbox': 'workspace-write', 'network': True})
+        self.assertEqual(offered('n'), ['echo', 'shell', 'web_search'])
+        client.request('configure', bot='Bob', settings={'network': False})
+        self.assertEqual(offered('w'), ['echo', 'shell'])
+
     def test_an_empty_reply_ends_a_turn_after_a_tool_call_and_after_a_prompt(self):
         client, model, path = self.start()
         client.request('create', bot='Bob', workspace=str(path))
@@ -1513,6 +1532,35 @@ class ModelFixture(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class RuntimeTests(ModelFixture):
+    @unittest.skipUnless(shutil.which('bwrap') or sys.platform == 'darwin', 'sandboxes need bubblewrap')
+    def test_a_sandbox_off_the_network_neither_offers_nor_runs_web_fetch(self):
+        client = self.client('echo,shell,web_fetch')
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['echo', 'shell', 'web_fetch'],
+                       settings={'sandbox': 'workspace-write'})
+        # A call it was not offered, as one from before its sandbox went
+        # offline would be, is not run: the daemon would fetch past it.
+        prompt = 'calls:' + json.dumps([['web_fetch', {'url': 'https://example.test/?secret'}]])
+        turn = client.request('submit', bot='Bob', request_id='f', prompt=prompt)['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        first = self.model.requests.get(timeout=3)
+        self.assertEqual([t['name'] for t in first['tools']], ['echo', 'shell'])
+        events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
+        done = [e for e in events if e['event'] == 'tool_completed'][0]
+        output = node_item(client, 'Bob', done['data']['node'])['result']['output']
+        self.assertEqual(json.loads(output)['error'], 'tool_not_available')
+        # The tool is still its own: a fork may be allowed it, as a shadow
+        # copies its source's tools, and inherits the sandbox that holds it.
+        fork = client.request('fork', source='Bob', bot='Shadow', allow=['echo', 'web_fetch'])
+        self.assertEqual(fork['result']['allowed'], ['echo', 'web_fetch'])
+        # Given the network, it is offered the tool again.
+        client.request('configure', bot='Bob', settings={'network': True})
+        while not self.model.requests.empty():
+            self.model.requests.get_nowait()
+        turn = client.request('submit', bot='Bob', request_id='n', prompt='hello')['result']['message']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        offered = self.model.requests.get(timeout=3)
+        self.assertEqual([t['name'] for t in offered['tools']], ['echo', 'shell', 'web_fetch'])
+
     def test_detached_shell_releases_its_daemon_slot_after_exit(self):
         client = self.client('shell', extra=('--max-lasting', '1'))
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])

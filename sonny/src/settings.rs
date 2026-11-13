@@ -30,6 +30,10 @@ pub struct Settings {
     pub project_colors: bool,
     /// The color each project pins, by project.
     pub project_color: std::collections::BTreeMap<String, String>,
+    /// The person's own margin notes: name, title and template.
+    pub notes: Vec<(String, String, String)>,
+    /// The sources the person set up, by name, for template notes.
+    pub sources: Vec<String>,
 }
 
 impl Default for Settings {
@@ -67,6 +71,12 @@ impl Settings {
             margin_note_lines: sonny.margin_note_lines,
             project_colors: sonny.project_colors,
             project_color: sonny.project_color,
+            notes: (sonny.notes.into_iter())
+                .map(|note| (note.name, note.title, note.template))
+                .collect(),
+            // Only those the person set up keep what they printed for a
+            // blank to read: the commons keeps none.
+            sources: (sonny.sources.into_iter().map(|source| source.name)).collect(),
         }
     }
 
